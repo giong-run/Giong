@@ -115,14 +115,15 @@ fetch_kernel() {
     mkdir -p "$dir"
     local base="https://kernel.ubuntu.com/mainline/v$version/amd64/"
     local deb
-    deb="$(curl -fsS "$base" | grep -oE 'linux-image-unsigned-[^"]*-generic_[^"]*_amd64\.deb' | head -n1)"
+    deb="$(curl -fsS --retry 5 --retry-all-errors "$base" | grep -oE 'linux-image-unsigned-[^"]*-generic_[^"]*_amd64\.deb' | head -n1)"
     if [ -z "$deb" ]; then
         echo "no kernel image for $version at $base" >&2
         return 1
     fi
-    curl -fsS -o "$dir/image.deb" "$base$deb"
-    (cd "$dir" && ar x image.deb && tar xf data.tar* ./boot)
-    cp "$dir"/boot/vmlinuz-* "$dir/vmlinuz"
+    # set -e does not reach into a command substitution, so fail explicitly.
+    curl -fsS --retry 5 --retry-all-errors -o "$dir/image.deb" "$base$deb" || return 1
+    (cd "$dir" && ar x image.deb && tar xf data.tar* ./boot) || return 1
+    cp "$dir"/boot/vmlinuz-* "$dir/vmlinuz" || return 1
     rm -rf "$dir/boot" "$dir"/*.tar* "$dir/image.deb" "$dir/debian-binary"
     echo "$dir/vmlinuz"
 }
@@ -138,7 +139,11 @@ fi
 status=0
 for version in "${VERSIONS[@]}"; do
     echo "== Linux $version"
-    kernel="$(fetch_kernel "$version")"
+    if ! kernel="$(fetch_kernel "$version")"; then
+        echo "   could not download kernel $version"
+        status=1
+        continue
+    fi
     log="$WORK/linux-$version.log"
     timeout "${TIMEOUT:-3600}" qemu-system-x86_64 "${accel[@]}" -smp "$CPUS" -m "$MEMORY" \
         -kernel "$kernel" -initrd "$initrd" \
