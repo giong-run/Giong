@@ -1,0 +1,7 @@
+/usr/sbin/mysqld  Ver 8.0.46-0ubuntu0.24.04.5 for Linux on x86_64 ((Ubuntu))
+64 tasks, pools of 16, 3 rounds of 5 s; median, min and max of the rounds
+workload client         ops/s median      min      max  p50 us  p99 us  cpu%  srv%
+point    sqlx                  22849    20305    25092    2529    4170    99   142
+
+list     sqlx                   9174     9047    10631    6173    8799    99   164
+

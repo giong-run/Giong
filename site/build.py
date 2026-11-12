@@ -1113,6 +1113,8 @@ def llms():
         "giong-tls": "TLS on rustls",
         "giong-postgres": "a PostgreSQL client and per-worker pool; statements from every task "
                           "pipeline over a few connections",
+        "giong-mysql": "a MySQL 8 client and per-worker pool; statements from every task "
+                       "pipeline over a few connections",
     }
     api = "".join(
         f"- [{name} API](https://docs.rs/{name}): {crates.get(name, 'API reference')}\n"

@@ -10,10 +10,10 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", ".github/", "scripts/", "assets/", "site/", "docs/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", ".github/", "scripts/", "assets/", "site/", "docs/"]
 
 [workspace]
-members = [".", "giong-http", "giong-tls", "giong-postgres"]
+members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql"]
 exclude = ["bench"]
 
 [dependencies]

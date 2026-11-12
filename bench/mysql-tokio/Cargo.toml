@@ -1,0 +1,17 @@
+[package]
+name = "bench-mysql-tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+mysql_async = { version = "0.36", default-features = false, features = ["minimal", "time"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "mysql", "time"] }
+time = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

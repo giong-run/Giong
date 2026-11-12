@@ -21,6 +21,9 @@ env:
   # binaries the runner image ships (/usr/lib/postgresql/16/bin). Without
   # this they would skip, quietly, if the binaries went missing.
   GIONG_PG_REQUIRED: "1"
+  # The same for giong-mysql and the runner's MySQL 8.0 (/usr/sbin/mysqld,
+  # whose service is left stopped).
+  GIONG_MYSQL_REQUIRED: "1"
 
 jobs:
   lint:

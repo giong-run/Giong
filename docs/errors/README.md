@@ -21,7 +21,7 @@ fn on_error(err: &std::io::Error) {
 }
 ```
 
-giong-tls and giong-postgres use the same codes. A code is never reused or renumbered,
+giong-tls, giong-postgres and giong-mysql use the same codes. A code is never reused or renumbered,
 and its page stays when it is no longer raised.
 
 ## The runtime
@@ -87,3 +87,18 @@ None yet: its errors come from the network, or are HTTP responses sent to the cl
 | [GIONG-E3008](E3008.md) | `PostgresClosed` | PostgreSQL connection closed |
 | [GIONG-E3009](E3009.md) | `PostgresPoolTimeout` | PostgreSQL pool wait timed out |
 | [GIONG-E3010](E3010.md) | `PostgresProtocol` | PostgreSQL protocol error |
+
+## giong-mysql
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E3101](E3101.md) | `MysqlConfig` | invalid MySQL configuration |
+| [GIONG-E3102](E3102.md) | `MysqlConnect` | cannot connect to MySQL |
+| [GIONG-E3103](E3103.md) | `MysqlAuth` | MySQL authentication failed |
+| [GIONG-E3104](E3104.md) | `MysqlServer` | MySQL server error |
+| [GIONG-E3105](E3105.md) | `MysqlType` | MySQL type mismatch |
+| [GIONG-E3106](E3106.md) | `MysqlRowCount` | wrong number of rows |
+| [GIONG-E3107](E3107.md) | `MysqlTooLarge` | MySQL result too large |
+| [GIONG-E3108](E3108.md) | `MysqlClosed` | MySQL connection closed |
+| [GIONG-E3109](E3109.md) | `MysqlPoolTimeout` | MySQL pool wait timed out |
+| [GIONG-E3110](E3110.md) | `MysqlProtocol` | MySQL protocol error |

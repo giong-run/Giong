@@ -10,10 +10,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
-- **Error codes.** Every error that giong, giong-tls and giong-postgres raise starts with
-  a stable code (`GIONG-E0102: no address found for db.internal. Fix: …`), says what went
-  wrong and how to fix it, and ends with a link to the code's page in
-  [docs/errors](docs/errors/README.md): 35 codes. Functions still return `io::Error`;
+- **Error codes.** Every error that giong, giong-tls, giong-postgres and giong-mysql raise
+  starts with a stable code (`GIONG-E0102: no address found for db.internal. Fix: …`), says
+  what went wrong and how to fix it, and ends with a link to the code's page in
+  [docs/errors](docs/errors/README.md): 45 codes. Functions still return `io::Error`;
   `giong::error::code(&err)` finds the `giong::error::Code` in it, down the chain of
   sources, so programs can match on the code instead of the message. Errors passed on from
   the kernel (connection refused, …) are unchanged and have no code.
@@ -112,6 +112,30 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     finite defaults for the connect timeout (10 s), the statement timeout (30 s,
     enforced by the server), the result size (64 MiB), the statement cache (256) and
     the pool wait (5 s).
+- **`giong-mysql`**, a new crate: a MySQL 8 client and connection pool for giong, speaking
+  the client/server protocol itself (no libmysqlclient, nothing from Tokio), with the same
+  shape as giong-postgres.
+  - `Client` with `query`, `query_one`, `query_opt`, `execute`, `insert` (returns the
+    `AUTO_INCREMENT` id), `batch_execute`, `transaction` and `cancel_token` (`KILL QUERY`).
+    Tasks sharing a connection pipeline their statements; every statement is prepared once
+    per connection, kept in a bounded cache, and run with the binary protocol. Messages
+    over 16 MiB are split and joined both ways.
+  - Transactions that cannot end silently: after the server rolls one back (deadlock) or
+    commits it (DDL), its later statements and `commit` fail instead of running outside
+    it.
+  - `Pool`, one per worker, as in giong-postgres.
+  - TLS through `giong-tls`, on by default for remote hosts and always verified.
+    `caching_sha2_password` (fast path; the password itself only over TLS or a Unix
+    socket, or RSA-encrypted with a configured key or, on loopback, the server's) and
+    `mysql_native_password`; `sha256_password` and clear text only over TLS.
+  - `Config::from_url`, strict about unknown parameters and refusing
+    `ssl-mode=PREFERRED`. Sessions run in UTC; session variables can be set when
+    connecting.
+  - Errors with an `ErrorKind` (`GIONG-E3101` to `GIONG-E3110`), MySQL's error number and
+    SQLSTATE; finite defaults for the connect timeout (10 s), the `SELECT` timeout (30 s,
+    enforced by the server), the result size (64 MiB), the statement cache (256) and the
+    pool wait (5 s).
+  - `bench/mysql.sh` compares it with mysql_async and SQLx.
 
 ### Changed
 

@@ -1,0 +1,7 @@
+client,workload,round,ops,p50,p99,cpu,srv
+sqlx,point,1,20305,3289,4170,99,123
+sqlx,list,1,9047,6173,12732,99,146
+sqlx,point,2,25092,2363,4053,100,152
+sqlx,list,2,9174,7280,8799,99,164
+sqlx,point,3,22849,2529,4477,99,142
+sqlx,list,3,10631,5569,8715,98,178

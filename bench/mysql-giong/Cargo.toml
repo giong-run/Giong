@@ -1,0 +1,15 @@
+[package]
+name = "bench-mysql-giong"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+giong = { path = "../.." }
+giong-mysql = { path = "../../giong-mysql" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

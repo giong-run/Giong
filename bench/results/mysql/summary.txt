@@ -1,0 +1,15 @@
+/usr/sbin/mysqld  Ver 8.0.46-0ubuntu0.24.04.5 for Linux on x86_64 ((Ubuntu))
+64 tasks, pools of 4, 5 rounds of 5 s; median, min and max of the rounds
+workload client         ops/s median      min      max  p50 us  p99 us  cpu%  srv%
+point    giong                138125   131250   144357     338    4452    87   282
+point    async                 19042    17971    20163    3260    5520    72   197
+point    async-default         12569    11385    12913    4977    8005    78   186
+point    sqlx                  19213    17965    20344    3163    4275    95   117
+point    giong-client          28937    26574    30098    2075    3331    30   112
+
+list     giong                 34285    31618    36911    1272    6880    74   283
+list     async                  8938     8420     9448    7179   10580    85   179
+list     async-default          6439     5778     6999   10061   13806    79   166
+list     sqlx                   7648     6977     8079    7861   11556    84   124
+list     giong-client          10372     9113    11479    5529    9977    25   109
+

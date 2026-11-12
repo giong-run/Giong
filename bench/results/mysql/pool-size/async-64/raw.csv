@@ -1,0 +1,7 @@
+client,workload,round,ops,p50,p99,cpu,srv
+async,point,1,14149,706,28088,66,264
+async,list,1,7310,3119,41978,77,269
+async,point,2,13731,704,29720,60,256
+async,list,2,6456,3448,39386,83,267
+async,point,3,13400,742,28445,67,262
+async,list,3,7457,3034,38703,80,266
