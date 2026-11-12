@@ -31,11 +31,12 @@ comparison table comes from the README too, and the roadmap from `ROADMAP.md`. W
 benchmark is run again, update the README first and then the page, so the two never
 disagree. Keep the caveats next to the numbers they qualify.
 
-## When the crates reach crates.io
+## Version and crates
 
-Set `ON_CRATES_IO = True` at the top of `build.py` and rebuild. The install commands switch
-from the `v0.2.0` git tag to `cargo add giong`, and docs.rs and crates.io links appear on the
-crate cards, in the docs section and in the footer. For a new release, change `VERSION`.
+The version on the page and the list of crates come from the workspace's `Cargo.toml`
+files, so nothing here changes for a release: `scripts/release.py prepare` rebuilds the
+page as part of the release pull request. `ON_CRATES_IO` at the top of `build.py` switches
+the install commands between crates.io and a git tag; it has been `True` since 0.2.0.
 
 ## Looking at it locally
 
@@ -47,9 +48,16 @@ python3 -m http.server -d site/public 8000    # then open http://localhost:8000
 
 giong.run is served by GitHub Pages from the
 [giong-run/giong-run.github.io](https://github.com/giong-run/giong-run.github.io)
-repository, which holds a copy of `site/public/`. To publish a change, rebuild here, copy
-`site/public/` over the files in that repository (keep its `README.md` and `.nojekyll`),
-and push. Pages rebuilds within a minute.
+repository, which holds a copy of `site/public/`. The
+[Site workflow](../.github/workflows/site.yml) copies it there (keeping that repository's
+`README.md` and `.nojekyll`) whenever `site/` changes on `main`, and at the end of every
+release. It holds back a version that has no published GitHub Release yet, so the page
+never announces a release before crates.io has it. Pages rebuilds within a minute.
+
+The workflow pushes with a deploy key: the `SITE_DEPLOY_KEY` secret in this repository is
+the private half of a key with write access on giong-run.github.io. Without it the workflow
+only checks the page. To deploy by hand instead, copy `site/public/` over the files in that
+repository and push.
 
 The domain's DNS is on Cloudflare, set to "DNS only" so GitHub can issue the certificate:
 four `A` and four `AAAA` records for the apex pointing at GitHub Pages, `www` as a `CNAME`

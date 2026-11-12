@@ -1,0 +1,56 @@
+name: Tag release
+
+# When a push to main changes the workspace version (the merged release pull
+# request), tag the commit vX.Y.Z and start release.yml on that tag.
+#
+# A tag pushed with GITHUB_TOKEN does not trigger `on: push: tags` workflows,
+# so release.yml is started explicitly with workflow_dispatch, which it does
+# allow. Its run is on the tag, so the `release` environment (v* tags only) and
+# crates.io Trusted Publishing see the same thing as for a tag pushed by hand.
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # push the tag
+      actions: write    # start release.yml
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: version
+        run: echo "version=$(python3 scripts/release.py version)" >> "$GITHUB_OUTPUT"
+      - name: Tag and start the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "$tag already exists, so this push is not a release"
+            exit 0
+          fi
+          python3 scripts/release.py check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "giong $VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/$tag"
+          gh workflow run release.yml --ref "$tag"
+          {
+            echo "### Tagged $tag"
+            echo
+            echo "Started the [Release workflow](https://github.com/$GITHUB_REPOSITORY/actions/workflows/release.yml) on $tag."
+          } >> "$GITHUB_STEP_SUMMARY"

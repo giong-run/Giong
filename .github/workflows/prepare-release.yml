@@ -1,0 +1,55 @@
+name: Prepare release
+
+# Opens the release pull request: the three crates bumped to the next version,
+# CHANGELOG.md's "Unreleased" turned into the new section (drafted from the
+# commit messages when it is empty), compare links, README install snippets and
+# the site updated. Review and polish it, then merge it: release-tag.yml tags
+# the merge and release.yml publishes. See docs/RELEASING.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "auto (from the commit types since the last release), patch, minor, major, or an exact version such as 0.3.0 or 0.3.0-rc.1"
+        required: true
+        default: auto
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write       # push release/X.Y.Z
+      pull-requests: write  # open the pull request
+      issues: write         # create the `release` label the first time
+      actions: write        # start CI on the release branch
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # the tags and history the changelog draft is made from
+      - name: Commit as github-actions
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Bump, update the changelog and open the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: python3 scripts/release.py prepare "$VERSION" --pr --dispatch-ci | tee prepare.log
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '### Prepare release'
+            echo
+            echo '```'
+            cat prepare.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -16,7 +16,13 @@ REPO = "https://github.com/giong-run/Giong"
 BLOB = REPO + "/blob/main/"
 TREE = REPO + "/tree/main/"
 SITE = "https://giong.run/"
-VERSION = "0.2.1"
+# The released version and the published crates come from the workspace manifests
+# (through scripts/release.py), so the page follows each release and each new crate
+# without an edit here. scripts/release.py rebuilds the page when it bumps the version.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+import release  # noqa: E402
+
+VERSION = release.workspace_version()
 TAG = "v" + VERSION
 RELEASE = f"{REPO}/releases/tag/{TAG}"
 SECURITY = REPO + "/security/advisories/new"   # GitHub private vulnerability reporting
@@ -28,7 +34,7 @@ AUTHOR_URL = "https://github.com/thekivashyn"
 # Flip to True once giong, giong-http and giong-tls are published on crates.io:
 # the install commands switch to `cargo add giong` and docs.rs links appear.
 ON_CRATES_IO = True
-CRATE_NAMES = ["giong", "giong-http", "giong-tls"]
+CRATE_NAMES = list(release.workspace_crates())
 
 
 # ---------------------------------------------------------------- helpers
