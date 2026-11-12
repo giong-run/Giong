@@ -32,6 +32,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   request-head parser, the chunked decoder, and a whole connection served over an
   in-memory transport, in pieces of random size (`giong-http/fuzz/`). CI fuzzes each
   target for 10 minutes every night, keeping the corpus, and briefly on pull requests.
+- **Verification**: a soak test (`tests/soak.rs`, `scripts/check.sh soak`): every
+  worker serves TCP echo to clients on all workers that close cleanly, abort, half-close
+  or cancel receives, alongside UDP, file and cross-worker traffic; afterwards no
+  descriptor, memory or driver state may be left over. It runs for two hours every
+  night in CI. A one-minute run makes about 1.3 million connections on four workers.
 - **Verification**: the whole suite on real Linux 6.0.19 and 6.1.155 kernels, each
   booted in QEMU from an initramfs (`scripts/kernels.sh`), in CI on every change.
 

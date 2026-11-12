@@ -65,6 +65,7 @@ threads, also run:
 ```bash
 scripts/check.sh tsan        # ThreadSanitizer; needs nightly with the rust-src component
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
+scripts/check.sh soak        # 5 minutes of churn, then checks for leaks (SOAK_SECS=…)
 scripts/kernels.sh           # the suite on real 6.0 and 6.1 kernels in QEMU; needs
                              # qemu-system-x86, busybox-static, cpio (slow without KVM)
 scripts/valgrind.sh          # needs valgrind; takes a few minutes
