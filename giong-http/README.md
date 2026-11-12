@@ -31,6 +31,7 @@ fn main() -> std::io::Result<()> {
 ## What it does
 
 - HTTP/1.1 and HTTP/1.0, keep-alive, pipelining. Responses to pipelined requests leave in a single write; if a handler has to wait, the responses before it are sent first.
+- A body of 32 KiB or more is not copied: it leaves from where it is, right after its head, in one vectored write. This is over TCP and Unix sockets; over TLS the body is still copied after its head.
 - Bodies by `Content-Length` or chunked, received in full before the handler is called. `Expect: 100-continue` is supported.
 - A `Request` shares the connection's receive buffer instead of copying it, so building a request allocates nothing. A handler may keep the request for as long as it likes.
 - Limits on the size of the head (64 KiB) and the body (1 MiB); timeouts for idle connections (60 s), slow requests (30 s, against slowloris) and clients that read slowly (30 s). All of them can be changed on `Server`.

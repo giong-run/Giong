@@ -139,6 +139,18 @@ impl UnixStream {
         self.inner.write_all(buf).await
     }
 
+    /// Writes some bytes of `bufs` with one system call; see
+    /// [`TcpStream::write_vectored`](super::TcpStream::write_vectored).
+    pub async fn write_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<usize>, Vec<B>) {
+        self.inner.write_vectored(bufs).await
+    }
+
+    /// Writes all of `bufs` without copying them into one buffer; see
+    /// [`TcpStream::write_all_vectored`](super::TcpStream::write_all_vectored).
+    pub async fn write_all_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
+        self.inner.write_all_vectored(bufs).await
+    }
+
     /// Shuts down the read half, the write half, or both.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.inner.socket().shutdown(how)

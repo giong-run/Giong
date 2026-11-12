@@ -1,5 +1,8 @@
 //! The response a handler returns, and its wire format.
 
+use std::borrow::Cow;
+use std::mem;
+
 use crate::parse::{is_field_value, is_token_str};
 
 /// A response body.
@@ -8,8 +11,8 @@ pub enum Body {
     /// No body.
     #[default]
     Empty,
-    /// Bytes that live for the whole program: sent without copying into a
-    /// fresh allocation first.
+    /// Bytes that live for the whole program: no allocation, and from 32 KiB
+    /// on they are sent from where they are, without a copy.
     Static(&'static [u8]),
     /// Owned bytes.
     Owned(Vec<u8>),
@@ -21,6 +24,15 @@ impl Body {
             Body::Empty => &[],
             Body::Static(bytes) => bytes,
             Body::Owned(bytes) => bytes,
+        }
+    }
+
+    /// The bytes as a buffer the kernel can send from, without a copy.
+    pub(crate) fn into_cow(self) -> Cow<'static, [u8]> {
+        match self {
+            Body::Empty => Cow::Borrowed(&[]),
+            Body::Static(bytes) => Cow::Borrowed(bytes),
+            Body::Owned(bytes) => Cow::Owned(bytes),
         }
     }
 }
@@ -143,6 +155,34 @@ impl Response {
     pub(crate) fn write_to(&self, out: &mut Vec<u8>, minor: u8, keep_alive: bool, head_only: bool) {
         let body = self.body.as_bytes();
         out.reserve(128 + self.headers.len() + body.len());
+        self.write_head(out, minor, keep_alive);
+        if self.sends_body(head_only) {
+            out.extend_from_slice(body);
+        }
+    }
+
+    /// `true` if the body goes on the wire: not for `HEAD`, 204 or 304.
+    pub(crate) fn sends_body(&self, head_only: bool) -> bool {
+        !head_only && !self.bodiless()
+    }
+
+    /// 204 and 304 never carry a body, so they get no length either.
+    fn bodiless(&self) -> bool {
+        matches!(self.status, 204 | 304)
+    }
+
+    pub(crate) fn body_len(&self) -> usize {
+        self.body.as_bytes().len()
+    }
+
+    pub(crate) fn take_body(&mut self) -> Body {
+        mem::take(&mut self.body)
+    }
+
+    /// Appends the status line and the header fields, up to and including the
+    /// blank line, to `out`.
+    pub(crate) fn write_head(&self, out: &mut Vec<u8>, minor: u8, keep_alive: bool) {
+        out.reserve(128 + self.headers.len());
         out.extend_from_slice(if minor == 0 {
             b"HTTP/1.0 "
         } else {
@@ -154,11 +194,9 @@ impl Response {
         out.extend_from_slice(b"\r\nDate: ");
         out.extend_from_slice(&crate::date::now());
         out.extend_from_slice(b"\r\n");
-        // 204 and 304 never carry a body, so they get no length either.
-        let bodiless = matches!(self.status, 204 | 304);
-        if !bodiless {
+        if !self.bodiless() {
             out.extend_from_slice(b"Content-Length: ");
-            push_number(out, body.len());
+            push_number(out, self.body_len());
             out.extend_from_slice(b"\r\n");
         }
         out.extend_from_slice(&self.headers);
@@ -168,9 +206,6 @@ impl Response {
             out.extend_from_slice(b"Connection: keep-alive\r\n");
         }
         out.extend_from_slice(b"\r\n");
-        if !head_only && !bodiless {
-            out.extend_from_slice(body);
-        }
     }
 }
 
