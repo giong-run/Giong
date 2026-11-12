@@ -1109,7 +1109,7 @@ def llms():
     crates = {
         "giong": "the runtime: executor, io_uring driver, TCP, UDP and Unix sockets, files, "
                  "timers, channels",
-        "giong-http": "a small, strict HTTP/1.1 server; HTTPS behind the `tls` feature",
+        "giong-http": "a small, strict HTTP/1.1 server, HTTPS behind the `tls` feature; an HTTP/1.1 client with a pool per host behind `client`",
         "giong-tls": "TLS on rustls",
         "giong-postgres": "a PostgreSQL client and per-worker pool; statements from every task "
                           "pipeline over a few connections",

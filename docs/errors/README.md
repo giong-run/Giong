@@ -21,8 +21,8 @@ fn on_error(err: &std::io::Error) {
 }
 ```
 
-giong-tls, giong-postgres and giong-mysql use the same codes. A code is never reused or renumbered,
-and its page stays when it is no longer raised.
+giong-http, giong-tls, giong-postgres and giong-mysql use the same codes. A code is never
+reused or renumbered, and its page stays when it is no longer raised.
 
 ## The runtime
 
@@ -56,9 +56,19 @@ and its page stays when it is no longer raised.
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
 
-## giong-http
+## giong-http (its client)
 
-None yet: its errors come from the network, or are HTTP responses sent to the client.
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E1101](E1101.md) | `HttpClientRequest` | invalid HTTP request |
+| [GIONG-E1102](E1102.md) | `HttpClientConnect` | cannot connect to the HTTP server |
+| [GIONG-E1103](E1103.md) | `HttpClientTimeout` | HTTP request timed out |
+| [GIONG-E1104](E1104.md) | `HttpClientTooLarge` | HTTP response too large |
+| [GIONG-E1105](E1105.md) | `HttpClientRedirect` | redirect not followed |
+| [GIONG-E1106](E1106.md) | `HttpClientClosed` | connection closed before the response |
+| [GIONG-E1107](E1107.md) | `HttpClientProtocol` | malformed HTTP response |
+| [GIONG-E1108](E1108.md) | `HttpClientStatus` | HTTP error status |
+| [GIONG-E1109](E1109.md) | `HttpClientDecode` | cannot decode the response body |
 
 ## giong-tls
 

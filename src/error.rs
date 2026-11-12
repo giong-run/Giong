@@ -28,9 +28,9 @@
 //! # }
 //! ```
 //!
-//! The companion crates (giong-tls, giong-postgres, giong-mysql) use the same codes, so
-//! one `match` covers them all. Codes are never reused or renumbered; a code
-//! that is no longer raised keeps its page.
+//! The companion crates (giong-http, giong-tls, giong-postgres, giong-mysql)
+//! use the same codes, so one `match` covers them all. Codes are never reused
+//! or renumbered; a code that is no longer raised keeps its page.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -45,11 +45,10 @@ macro_rules! codes {
         /// A stable code for an error giong raises, shown as `GIONG-E0001`.
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
-        /// `E01xx` networking and name resolution, `E02xx` files, `E1xxx`
-        /// giong-http, `E2xxx` giong-tls, `E30xx` giong-postgres and `E31xx`
-        /// giong-mysql. Each has
-        /// a page under `docs/errors/` in the repository; [`url`](Code::url)
-        /// links to it.
+        /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
+        /// giong-http's client, `E2xxx` giong-tls, `E30xx` giong-postgres and
+        /// `E31xx` giong-mysql. Each has a page under `docs/errors/` in the
+        /// repository; [`url`](Code::url) links to it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         #[non_exhaustive]
         #[repr(u16)]
@@ -142,6 +141,28 @@ codes! {
     // -------------------------------------------------------------- files
     /// A path contains a NUL byte, which Linux paths cannot.
     InvalidPath = 200, InvalidInput, "invalid path";
+
+    // ------------------------------------------------- giong-http client
+    /// The URL, a header, the method or the client's settings are not
+    /// valid; nothing was sent.
+    HttpClientRequest = 1101, InvalidInput, "invalid HTTP request";
+    /// Opening a connection failed: name resolution, TCP, TLS, or the
+    /// connect timeout.
+    HttpClientConnect = 1102, Other, "cannot connect to the HTTP server";
+    /// The request did not finish within its timeout.
+    HttpClientTimeout = 1103, TimedOut, "HTTP request timed out";
+    /// The response was larger than the client's limit.
+    HttpClientTooLarge = 1104, Other, "HTTP response too large";
+    /// A redirect was not followed.
+    HttpClientRedirect = 1105, Other, "redirect not followed";
+    /// The connection closed before the whole response arrived.
+    HttpClientClosed = 1106, ConnectionAborted, "connection closed before the response";
+    /// The server sent something that is not a valid HTTP/1.1 response.
+    HttpClientProtocol = 1107, InvalidData, "malformed HTTP response";
+    /// The response has a 4xx or 5xx status.
+    HttpClientStatus = 1108, Other, "HTTP error status";
+    /// The response body could not be read as asked.
+    HttpClientDecode = 1109, InvalidData, "cannot decode the response body";
 
     // --------------------------------------------------------- giong-tls
     /// No trusted certificate authority: none installed on the machine, or

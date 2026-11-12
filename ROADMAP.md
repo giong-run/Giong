@@ -158,8 +158,8 @@ packet parsers are fuzzed, and a benchmark compares it with mysql_async and SQLx
 
 ## HTTP client and giong-redis 0.1
 
-- [ ] An HTTP/1.1 client in `giong-http` (feature `client`): keep-alive, a pool per host,
-      HTTPS, timeouts, redirects.
+- [x] An HTTP/1.1 client in `giong-http` (feature `client`): keep-alive, a pool per host,
+      HTTPS, timeouts, redirects. Benchmarked against reqwest (`bench/http-client.sh`).
 - [ ] `giong-redis`, a new crate: RESP2 and RESP3, automatic pipelining, a pool per core,
       pub/sub.
 

@@ -19,7 +19,7 @@ load arrives.
 
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and four companion crates:
-> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server),
+> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool)
 > and [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8).
@@ -202,7 +202,7 @@ let runtime = giong::Builder::new()
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
 | Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
 | Errors | Every error giong raises starts with a code (`GIONG-E0102: no address found for …`) and links to its page in [docs/errors](docs/errors/README.md); `error::code(&err)` returns it as a `Code` to match on |
-| HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response` |
+| HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response`; with the `client` feature, `client::Client` (`get`, `post`, ... `send`), `client::Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | MySQL | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
@@ -505,7 +505,8 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
   (August and March 2024); their main branches may differ.
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
-`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh` and `bench/mysql.sh`; two cores with
+`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh` and
+`bench/http-client.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 
@@ -651,13 +652,13 @@ src/
   fs.rs         File, OpenOptions, Metadata, the path operations
   time.rs       timing wheel, sleep, timeout
   sync.rs       mpsc channel
-giong-http/     the HTTP/1.1 server crate (parser, chunked decoding, connections, HTTPS behind the `tls` feature)
+giong-http/     the HTTP/1.1 crate: the server (parser, chunked decoding, connections, HTTPS behind `tls`), the client behind `client`
 giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
 giong-postgres/ the PostgreSQL client crate (wire protocol, authentication, statement cache, Pool)
 giong-mysql/    the MySQL client crate (client/server protocol, authentication, statement cache, Pool)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin
-bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, the programs compared against, results/
+bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, http-client.sh, the programs compared against, results/
 scripts/        check.sh (repeated tests, fallback setups, ThreadSanitizer), valgrind.sh
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```
