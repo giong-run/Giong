@@ -17,6 +17,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   from before the wake-up. It needs state that is shared without a lock (a
   `Mutex` hides it), and on x86 it hit about 70 in a million such wake-ups. The
   flag is now cleared with a swap, which synchronises with the waker.
+- On Linux 6.0 a runtime could fail to start with "giong needs io_uring buffer rings
+  (Linux >= 6.0): Bad address", depending on what happened to be mapped next to the
+  receive buffer ring: 6.0 pins one page more than the ring needs (fixed in 6.1). The
+  ring now has a spare page. Found by running the tests on a real 6.0 kernel.
 
 ### Added
 
@@ -24,6 +28,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   live in `src/notify.rs` and are model-checked with
   [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
   CI job). `tests/wake.rs` runs the lost-wake-up race on real hardware.
+- **Verification**: the whole suite on real Linux 6.0.19 and 6.1.155 kernels, each
+  booted in QEMU from an initramfs (`scripts/kernels.sh`), in CI on every change.
 
 ## [0.2.1] - 2026-11-12
 

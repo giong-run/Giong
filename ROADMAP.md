@@ -52,7 +52,8 @@ features, find out what is actually true.
       physical network card.
 - [ ] Measure scaling from 1 to N workers.
 - [ ] Repeat the Monoio and Glommio comparison on several cores and a physical network.
-- [ ] Run the test suite on real 6.0 and 6.1 kernels.
+- [x] Run the test suite on real 6.0 and 6.1 kernels (in QEMU, in CI; it found that
+      6.0 could fail to start a runtime, now fixed).
 - [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
       wake-up, now fixed).
 - [ ] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser.
