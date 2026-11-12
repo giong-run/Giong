@@ -8,6 +8,27 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- `giong-http` server: more than two blank lines before a request line start the request
+  timeout. A client sending `\r\n` once a minute kept a connection open for ever.
+- `giong-http` client: a kept-alive connection that received anything while idle (a `408
+  Request Timeout` that some servers send before closing, the rest of a body longer than
+  its `Content-Length`) is no longer used. The bytes were read as the response to the next
+  request.
+- `giong-http` client: a `Host` header set by hand is not sent to another origin after a
+  redirect, like `Authorization` and `Cookie`.
+- `giong-http` client: idle connections of an origin that is not asked for again are
+  closed after the idle timeout, and the origin is forgotten. Before, they stayed open,
+  with their entry, for as long as the client lived.
+
+### Security
+
+- `giong-http`: chunk extensions are limited to 16 KiB per body, on the server and in the
+  client. They counted toward no limit, so a peer could send about 4,000 bytes per byte of
+  body, all of it held in memory until the body ended (the flaw of Node.js
+  CVE-2024-22019). Such a request is answered with 400; such a response is an error.
+
 ## [0.3.0] - 2026-11-13
 
 "Prove it": the runtime is checked in ways it was not before, and a service gets the

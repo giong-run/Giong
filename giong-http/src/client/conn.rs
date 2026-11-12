@@ -1,9 +1,13 @@
 //! One connection: opening it, sending a request on it, and reading the
 //! response.
 
+use std::future::Future;
 use std::io;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::{Context, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use giong::net::TcpStream;
@@ -159,13 +163,33 @@ impl Conn {
         }
     }
 
-    /// Whether the server closed the connection, or it failed, while it sat
-    /// idle. Data alone does not count: a TLS server may send session
-    /// tickets after the handshake.
-    pub(crate) fn is_closed_by_peer(&self) -> bool {
+    /// Whether a connection that sat idle can no longer carry a request: the
+    /// server closed it, it failed, or the server sent something nobody
+    /// asked for. Such bytes (a `408 Request Timeout` sent just before the
+    /// server closes, the rest of a body longer than its `Content-Length`)
+    /// would otherwise be read as the response to the next request.
+    pub(crate) fn is_spoiled(&self) -> bool {
+        // What has been received already. Over TLS this decrypts it: session
+        // tickets are taken in and produce no data.
+        let mut recv = pin!(self.stream.recv());
+        let waker = Waker::from(Arc::new(Noop));
+        if recv
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_ready()
+        {
+            // Data, the end of the stream, or an error.
+            return true;
+        }
+        let mut events = libc::POLLRDHUP;
+        if let Stream::Tcp(_) = self.stream {
+            // Bytes the socket holds that have not been received yet. Over
+            // TLS they may be session tickets, which are no response.
+            events |= libc::POLLIN;
+        }
         let mut fd = libc::pollfd {
             fd: self.stream.tcp().as_raw_fd(),
-            events: libc::POLLRDHUP,
+            events,
             revents: 0,
         };
         // SAFETY: `fd` is one valid `pollfd` for a descriptor this connection
@@ -363,6 +387,13 @@ impl Conn {
             ))),
         }
     }
+}
+
+/// Wakes nobody: for looking at what a stream holds without waiting.
+struct Noop;
+
+impl Wake for Noop {
+    fn wake(self: Arc<Self>) {}
 }
 
 fn protocol(what: &str, message: &str) -> Failure {
