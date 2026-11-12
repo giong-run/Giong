@@ -36,10 +36,12 @@ use crate::slab::Slab;
 /// Buffer group id of the worker's receive pool.
 pub(crate) const BGID: u16 = 0;
 
-/// `user_data` of operations whose completion nobody waits for (cancel, close).
+/// `user_data` of operations whose completion nobody waits for, such as cancels.
 const UD_IGNORE: u64 = u64::MAX;
 /// `user_data` of the eventfd read used for cross-thread wake-ups.
 const UD_WAKE: u64 = u64::MAX - 1;
+/// `user_data` of batched closes, which must finish before shutdown cancels I/O.
+const UD_CLOSE: u64 = u64::MAX - 2;
 
 /// Backpressure for multishot receive. Once this many completions are queued
 /// for a stream that is not being read fast enough:
@@ -136,6 +138,8 @@ pub(crate) struct Driver {
     ops: Slab<OpState>,
     /// SQEs pushed whose final CQE has not been seen yet.
     inflight: usize,
+    /// Batched closes whose CQE has not been seen yet.
+    pending_closes: usize,
     pool: Rc<BufPool>,
     /// Scratch space for a batch of CQEs.
     cqes: Vec<(u64, i32, u32)>,
@@ -236,6 +240,7 @@ impl Driver {
             ring,
             ops: Slab::new(),
             inflight: 0,
+            pending_closes: 0,
             pool,
             cqes: Vec::with_capacity(256),
             to_pause: Vec::new(),
@@ -462,8 +467,9 @@ impl Driver {
         self.push(
             opcode::Close::new(types::Fd(fd))
                 .build()
-                .user_data(UD_IGNORE),
+                .user_data(UD_CLOSE),
         );
+        self.pending_closes += 1;
     }
 
     /// ThreadSanitizer builds (`--cfg giong_tsan`, see `scripts/check.sh`) close
@@ -582,6 +588,7 @@ impl Driver {
         match user_data {
             UD_IGNORE => {}
             UD_WAKE => self.wake_armed = false,
+            UD_CLOSE => self.pending_closes -= 1,
             key => {
                 let key = key as usize;
                 let remove = match self.ops.get_mut(key) {
@@ -664,7 +671,7 @@ impl Driver {
 
     // -------------------------------------------------------------- teardown
 
-    /// Cancels everything and waits for the kernel to let go of every buffer.
+    /// Drains batched closes, cancels remaining I/O, and waits for its buffers.
     ///
     /// Returns `true` once no operation is in flight any more. On `false` the
     /// caller must leak the driver and the buffer pool instead of freeing them.
@@ -685,11 +692,15 @@ impl Driver {
             if self.inflight == 0 {
                 return true;
             }
-            // Cancel whatever is still running, then wait briefly for the CQEs.
-            let _ = self.ring.submitter().register_sync_cancel(
-                Some(types::Timespec::from(Duration::from_millis(10))),
-                types::CancelBuilder::any().all(),
-            );
+            // A cancelled close can leave its descriptor open. Retrying a
+            // failed close could also close a reused descriptor, so let the
+            // batched closes finish before cancelling the remaining requests.
+            if self.pending_closes == 0 {
+                let _ = self.ring.submitter().register_sync_cancel(
+                    Some(types::Timespec::from(Duration::from_millis(10))),
+                    types::CancelBuilder::any().all(),
+                );
+            }
             let ts = types::Timespec::from(Duration::from_millis(10));
             let args = types::SubmitArgs::new().timespec(&ts);
             let _ = self.ring.submitter().submit_with_args(1, &args);

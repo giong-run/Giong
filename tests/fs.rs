@@ -342,9 +342,14 @@ fn closed_and_dropped_files_release_their_descriptors() {
             // A close future that is never polled must not leak either.
             drop(File::open(&path).await.unwrap().close());
         }
-        // Dropped files are closed through the ring on the next turn.
-        giong::yield_now().await;
-        giong::yield_now().await;
+        // Yielding lets the driver submit closes but does not wait for them.
+        giong::time::timeout(Duration::from_secs(1), async {
+            while open_fds(&path) > 1 {
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dropped files should close while the runtime is still running");
         assert_eq!(open_fds(&path), 1);
         drop(kept);
     });
@@ -352,6 +357,24 @@ fn closed_and_dropped_files_release_their_descriptors() {
     let file = giong::block_on(async { File::open(&path).await.unwrap() });
     assert_eq!(open_fds(&path), 1);
     drop(file);
+    assert_eq!(open_fds(&path), 0);
+}
+
+#[test]
+fn files_dropped_at_shutdown_release_their_descriptors() {
+    let dir = TempDir::new("shutdown-fds");
+    let path = dir.path("f");
+    std::fs::write(&path, "x").unwrap();
+
+    giong::block_on(async {
+        let mut files = Vec::new();
+        for _ in 0..64 {
+            files.push(File::open(&path).await.unwrap());
+        }
+        // Leave the whole batch of closes for shutdown to drain.
+        drop(files);
+    });
+
     assert_eq!(open_fds(&path), 0);
 }
 

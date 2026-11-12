@@ -8,6 +8,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- Drain pending file and socket closes before cancelling I/O at runtime shutdown
+  to prevent file descriptor leaks.
+
 ## [0.2.0] - 2026-11-12
 
 giong becomes a workspace of three crates: the runtime, an HTTP/1.1 server library and
