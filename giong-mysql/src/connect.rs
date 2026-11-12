@@ -148,6 +148,11 @@ impl ReadBuf {
         self.data.extend_from_slice(chunk);
     }
 
+    /// Nothing is held: no bytes, not even part of a packet.
+    fn is_empty(&self) -> bool {
+        self.start == self.data.len() && self.skip == 0 && self.long.is_none()
+    }
+
     /// Throws away a packet of `len` payload bytes at the front, including
     /// the part that has not arrived yet.
     fn drop_packet(&mut self, len: usize) {
@@ -431,7 +436,10 @@ async fn open(
     }
     caps |= cap::SSL;
     // Nothing else can be buffered: the server waits for this request.
-    if setup.buf.next(SETUP_LIMIT).is_some() {
+    // Bytes held now, even part of a packet, would be read after the
+    // handshake as if they had come through TLS, so someone on the path
+    // could slip them in (the flaw of CVE-2021-23222 in PostgreSQL clients).
+    if !setup.buf.is_empty() {
         return Err(Error::protocol(
             "the server sent more than its greeting before the TLS request",
         ));

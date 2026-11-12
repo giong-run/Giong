@@ -358,3 +358,197 @@ fn a_cancelled_write_poisons_the_connection_instead_of_corrupting_it() {
         );
     });
 }
+
+#[test]
+fn close_notify_is_told_apart_from_a_cut_connection() {
+    // The server echoes what it receives and, at the end of the stream,
+    // reports everything it got and whether the end was a close_notify.
+    let (tx, rx) = mpsc::channel();
+    let serve = move |tls: TlsStream| {
+        let tx = tx.clone();
+        async move {
+            let mut got = Vec::new();
+            while let Ok(data) = tls.recv().await {
+                if data.is_empty() || tls.write_all(data.clone()).await.0.is_err() {
+                    break;
+                }
+                got.extend_from_slice(&data);
+            }
+            let _ = tx.send((got, tls.received_close_notify()));
+        }
+    };
+    let c = certs(rustls::ALL_VERSIONS);
+    let config = c.client.clone();
+    with_server(c.acceptor, serve, move |addr| {
+        let wait = Duration::from_secs(10);
+        // Reading the echo first also reads whatever else the server sent
+        // (TLS 1.3 session tickets), so closing the socket sends a FIN, not a
+        // reset.
+        let exchange = |client: &mut Client, data: &[u8]| {
+            client.write_all(data).unwrap();
+            client.flush().unwrap();
+            let mut back = vec![0u8; data.len()];
+            client.read_exact(&mut back).unwrap();
+            assert_eq!(back, data);
+        };
+
+        // A clean end: close_notify, then the socket.
+        let mut client = connect(addr, &config);
+        exchange(&mut client, b"all of it");
+        client.conn.send_close_notify();
+        while client.conn.wants_write() {
+            client.conn.write_tls(&mut client.sock).unwrap();
+        }
+        drop(client);
+        assert_eq!(
+            rx.recv_timeout(wait).unwrap(),
+            (b"all of it".to_vec(), true)
+        );
+
+        // Cut short: the socket closes without a close_notify, as when
+        // someone on the path injects a FIN.
+        let mut client = connect(addr, &config);
+        exchange(&mut client, b"the first half");
+        client.sock.shutdown(std::net::Shutdown::Both).unwrap();
+        assert_eq!(
+            rx.recv_timeout(wait).unwrap(),
+            (b"the first half".to_vec(), false)
+        );
+    });
+}
+
+/// A socket that writes one byte at a time, so that every TLS record reaches
+/// the server in many pieces.
+struct Trickle(TcpStream);
+
+impl Read for Trickle {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for Trickle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match buf.first() {
+            Some(b) => self.0.write(std::slice::from_ref(b)),
+            None => Ok(0),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[test]
+fn records_split_into_single_bytes_are_put_back_together() {
+    for versions in [
+        &[&rustls::version::TLS12][..],
+        &[&rustls::version::TLS13][..],
+    ] {
+        let c = certs(versions);
+        let config = c.client.clone();
+        with_server(c.acceptor, echo, move |addr| {
+            let tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_nodelay(true).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let conn = ClientConnection::new(config.clone(), name).unwrap();
+            let mut client = StreamOwned::new(conn, Trickle(tcp));
+            let message: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+            client.write_all(&message).unwrap();
+            client.flush().unwrap();
+            let mut back = vec![0u8; message.len()];
+            client.read_exact(&mut back).unwrap();
+            assert!(back == message);
+        });
+    }
+}
+
+#[test]
+fn garbage_after_the_handshake_is_an_error_not_data() {
+    let (tx, rx) = mpsc::channel();
+    let serve = move |tls: TlsStream| {
+        let tx = tx.clone();
+        async move {
+            let mut got = Vec::new();
+            let end = loop {
+                match tls.recv().await {
+                    Ok(data) if data.is_empty() => break Ok(()),
+                    Ok(data) => got.extend_from_slice(&data),
+                    Err(e) => break Err(e.kind()),
+                }
+                let _ = tls.write_all(b"ok".to_vec()).await;
+            };
+            let _ = tx.send((got, end));
+        }
+    };
+    let c = certs(rustls::ALL_VERSIONS);
+    let config = c.client.clone();
+    with_server(c.acceptor, serve, move |addr| {
+        let mut client = connect(addr, &config);
+        client.write_all(b"real").unwrap();
+        client.flush().unwrap();
+        let mut ok = [0u8; 2];
+        client.read_exact(&mut ok).unwrap();
+        // An application-data record header followed by bytes that are not a
+        // valid encryption of anything.
+        let mut forged = vec![0x17, 0x03, 0x03, 0x00, 0x40];
+        forged.extend((0..0x40u8).map(|i| i.wrapping_mul(37)));
+        client.sock.write_all(&forged).unwrap();
+        let (got, end) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(got, b"real", "forged bytes were handed out as data");
+        assert_eq!(end, Err(std::io::ErrorKind::InvalidData));
+        // The server told the client why, then closed: the client is not left
+        // waiting (its read timeout would show as WouldBlock or TimedOut).
+        let mut rest = Vec::new();
+        if let Err(e) = client.sock.read_to_end(&mut rest) {
+            use std::io::ErrorKind::{TimedOut, WouldBlock};
+            assert!(!matches!(e.kind(), WouldBlock | TimedOut), "{e}");
+        }
+    });
+}
+
+#[test]
+fn random_bytes_instead_of_a_handshake_never_hang_or_harm_the_server() {
+    let c = certs(rustls::ALL_VERSIONS);
+    let acceptor = c.acceptor.handshake_timeout(Duration::from_secs(2));
+    let config = c.client.clone();
+    with_server(acceptor, echo, move |addr| {
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for round in 0..40 {
+            let len = 1 + next() as usize % 3000;
+            let mut bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            // Half of them start like a TLS handshake record, to get past the
+            // first check.
+            if round % 2 == 0 && len > 5 {
+                bytes[..3].copy_from_slice(&[0x16, 0x03, 0x01]);
+            }
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let _ = tcp.write_all(&bytes);
+            let start = std::time::Instant::now();
+            let mut sink = Vec::new();
+            let _ = tcp.read_to_end(&mut sink);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "round {round}: the server kept the connection open"
+            );
+            assert!(
+                sink.len() < 64,
+                "round {round}: answered with {} bytes",
+                sink.len()
+            );
+        }
+        let mut client = connect(addr, &config);
+        client.write_all(b"still alive").unwrap();
+        let mut buf = [0u8; 11];
+        client.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"still alive");
+    });
+}

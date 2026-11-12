@@ -597,8 +597,10 @@ Not verified, and you should know it:
   safety rests on the design and on `tests/cancel.rs`.
 - valgrind 3.22 cannot run the multi-threaded tests (it treats `io_uring_enter` as
   non-blocking, so threads starve each other); ThreadSanitizer covers those.
-- `giong-tls` has not had an independent security audit. The cryptography and the protocol
-  are rustls's; giong's part is connecting rustls to the socket.
+- `giong-tls` has had a [security review](docs/reviews/2026-11-giong-tls.md) of its own
+  code and of every crate that uses it, which found and fixed two medium issues, but it was
+  done by the project's AI agent, not by an independent auditor. The cryptography and the
+  protocol are rustls's; giong's part is connecting rustls to the socket.
 
 ## Compared with Monoio and Glommio
 
@@ -635,7 +637,8 @@ to audit.
   sockets, multicast, `set_len`, file locks, `O_DIRECT` with registered buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
-- **`giong-tls` has no kTLS yet,** and no independent audit.
+- **`giong-tls` has no kTLS yet,** and no independent audit (see the
+  [self-review](docs/reviews/2026-11-giong-tls.md)).
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
   sqlx, reqwest) do not run on giong. Crates that only use `std::future` do. For
   PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for MySQL,

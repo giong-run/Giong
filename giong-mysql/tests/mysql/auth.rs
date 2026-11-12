@@ -378,6 +378,43 @@ fn a_server_without_tls_is_refused_when_tls_is_asked_for() {
 }
 
 #[test]
+fn bytes_after_the_greeting_cannot_slip_into_the_tls_stream() {
+    // Whatever arrives between the plaintext greeting and the TLS handshake
+    // would be read afterwards as if it had come through TLS, so someone on
+    // the path could inject it. Even part of a packet is refused. Needs no
+    // MySQL server.
+    giong::block_on(async {
+        let partial: [&[u8]; 2] = [&[1, 0], &[5, 0, 0, 2, 0]];
+        for extra in partial {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let mut hello = greeting(true);
+            hello.extend_from_slice(extra);
+            let _server = giong::spawn(async move {
+                let conn = listener.accept().await.unwrap();
+                conn.write_all(hello).await.0.unwrap();
+                giong::time::sleep(Duration::from_secs(5)).await;
+            });
+            let connector = TlsConnector::with_root_pem(
+                rcgen::generate_simple_self_signed(vec!["localhost".into()])
+                    .unwrap()
+                    .cert
+                    .pem()
+                    .as_bytes(),
+            )
+            .unwrap();
+            let config = Config::new()
+                .host("127.0.0.1")
+                .port(port)
+                .user("u")
+                .tls(Tls::Verify(connector));
+            let e = Client::connect(&config).await.unwrap_err();
+            assert!(e.to_string().contains("more than its greeting"), "{e}");
+        }
+    });
+}
+
+#[test]
 fn a_server_older_than_mysql_8_is_refused() {
     run(|_| async move {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -527,6 +527,9 @@ pub struct TlsStream {
     wire: RefCell<Vec<u8>>,
     /// The peer closed the connection (with or without `close_notify`).
     eof: Cell<bool>,
+    /// The peer ended its side with a `close_notify` alert, so nothing it
+    /// sent was cut off.
+    close_notify: Cell<bool>,
     /// A task is writing TLS records to the socket. Records must not
     /// interleave, so other tasks wait for it in `waiters`.
     sending: Cell<bool>,
@@ -566,6 +569,7 @@ impl TlsStream {
             plain: RefCell::new(Vec::new()),
             wire: RefCell::new(Vec::new()),
             eof: Cell::new(false),
+            close_notify: Cell::new(false),
             sending: Cell::new(false),
             broken: Cell::new(false),
             failed: Cell::new(None),
@@ -626,7 +630,11 @@ impl TlsStream {
                     if !self.sending.get() {
                         return Poll::Ready(());
                     }
-                    self.waiters.borrow_mut().push(cx.waker().clone());
+                    // A task polled again while it waits is listed once.
+                    let mut waiters = self.waiters.borrow_mut();
+                    if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                        waiters.push(cx.waker().clone());
+                    }
                     Poll::Pending
                 })
                 .await;
@@ -699,6 +707,7 @@ impl TlsStream {
                             }
                         }
                         if state.peer_has_closed() {
+                            self.close_notify.set(true);
                             self.eof.set(true);
                             break;
                         }
@@ -724,6 +733,13 @@ impl TlsStream {
 
     /// Receives decrypted data. An empty buffer means that the peer has closed
     /// the connection, with a `close_notify` alert or by closing the socket.
+    ///
+    /// The two are not the same when the end of the stream is what marks
+    /// the end of the data, as in an HTTP response without a length: only
+    /// `close_notify` is authenticated, while anyone on the network path can
+    /// close a TCP connection early and cut the data short (a truncation
+    /// attack). Check [`received_close_notify`](Self::received_close_notify)
+    /// before trusting such data to be complete.
     ///
     /// Cancel safe: dropping the future loses no data. (If it is dropped at
     /// the rare moment a TLS protocol message is being sent, sending fails
@@ -781,6 +797,15 @@ impl TlsStream {
         self.conn.borrow_mut().send_close_notify();
         self.flush_tls().await?;
         self.tcp.shutdown(Shutdown::Write)
+    }
+
+    /// `true` once the peer has ended the connection with a TLS
+    /// `close_notify` alert. `false` while it is open, and if the peer, or
+    /// something on the network path, closed the TCP connection without
+    /// one: data that ends there may have been cut short. See
+    /// [`recv`](Self::recv).
+    pub fn received_close_notify(&self) -> bool {
+        self.close_notify.get()
     }
 
     /// The protocol agreed on through ALPN, if any (for example `http/1.1`).
