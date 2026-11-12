@@ -588,6 +588,8 @@ to audit.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — how we treat each other, and how to report a
   problem.
 - [ROADMAP.md](ROADMAP.md) — milestones and deliberate non-goals.
+- [AGENTS.md](AGENTS.md) — building, testing and changing giong, written for AI coding agents;
+  [giong.run/llms.txt](https://giong.run/llms.txt) points a model at the docs.
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 
 ```

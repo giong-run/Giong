@@ -1,0 +1,39 @@
+# giong
+
+> A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
+> worker owns its ring, tasks and buffers; tasks never move between threads, so futures
+> need not be `Send`. Version 0.2.1.
+
+Facts that are easy to get wrong:
+
+- Linux 6.0 or newer only, with io_uring allowed. It does not build on macOS or Windows.
+  Docker's default seccomp profile blocks io_uring.
+- Buffers are passed by value and handed back, because the kernel uses them after the call:
+  `stream.write_all(buf).await` returns `(io::Result<()>, buf)`.
+- `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may
+  have sent part of its buffer.
+- There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
+- Install with `cargo add giong` (and `giong-http`, `giong-tls`). Libraries need Rust 1.80.
+
+## Docs
+
+- [giong API](https://docs.rs/giong): the runtime: executor, io_uring driver, TCP, UDP and Unix sockets, files, timers, channels
+- [giong-tls API](https://docs.rs/giong-tls): TLS on rustls
+- [giong-http API](https://docs.rs/giong-http): a small, strict HTTP/1.1 server; HTTPS behind the `tls` feature
+- [README](https://github.com/giong-run/Giong/blob/main/README.md): design, benchmarks with their method, limitations
+- [AGENTS.md](https://github.com/giong-run/Giong/blob/main/AGENTS.md): how to build, test and change giong, for coding agents
+- [CONTRIBUTING.md](https://github.com/giong-run/Giong/blob/main/CONTRIBUTING.md): the rules every change follows
+- [ROADMAP.md](https://github.com/giong-run/Giong/blob/main/ROADMAP.md): milestones and deliberate non-goals
+- [CHANGELOG.md](https://github.com/giong-run/Giong/blob/main/CHANGELOG.md): what changed in each release
+
+## Examples
+
+- [examples/echo.rs](https://github.com/giong-run/Giong/blob/main/examples/echo.rs): A TCP echo server on every core.
+- [examples/http.rs](https://github.com/giong-run/Giong/blob/main/examples/http.rs): A small HTTP/1.1 server: keep-alive, pipelining, idle timeouts, a header size limit and graceful shutdown on SIGINT and SIGTERM. The same routes the benchmarks use.
+- [examples/udp_echo.rs](https://github.com/giong-run/Giong/blob/main/examples/udp_echo.rs): A UDP echo server, receiving with multishot `recvmsg`.
+- [examples/cat.rs](https://github.com/giong-run/Giong/blob/main/examples/cat.rs): Prints files to standard output, reading them through io_uring with positional reads.
+
+## Optional
+
+- [Benchmark results](https://github.com/giong-run/Giong/tree/main/bench/results): raw numbers behind the README
+- [giong-http README](https://github.com/giong-run/Giong/blob/main/giong-http/README.md) and [giong-tls README](https://github.com/giong-run/Giong/blob/main/giong-tls/README.md)
