@@ -23,8 +23,10 @@ load arrives.
 > timers, multi-core, graceful shutdown, and two companion crates,
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server) and
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly.
-> 169 tests pass on three io_uring setups; ThreadSanitizer and valgrind are clean. It has
-> **not** run in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
+> 169 tests pass on three io_uring setups and on real 6.0 and 6.1 kernels; ThreadSanitizer
+> and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
+> fuzzed and a soak test churns connections for two hours every night. It has **not** run
+> in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
 
 ## Why giong
 
@@ -494,6 +496,23 @@ Also:
   and giong's threads wait in raw system calls).
 - **The fallback io_uring setups** (`scripts/check.sh fallback`): the whole suite again
   with `GIONG_RING_TIER=coop` (the flags of kernel 6.0) and `basic` (no flags at all).
+- **Real 6.0 and 6.1 kernels** (`scripts/kernels.sh`): the test binaries booted in QEMU
+  on Linux 6.0.19 and 6.1.155, in CI on every change. It found that a runtime could fail
+  to start on 6.0, which pins one page more than the buffer ring needs; fixed.
+- **loom** (`scripts/check.sh loom`): the two handshakes between a worker and the threads
+  that wake its tasks (`src/notify.rs`) are model-checked under every interleaving and
+  memory-ordering outcome loom explores. It found a lost wake-up: a task waiting on state
+  shared without a lock could sleep forever (about 70 in a million cross-thread wake-ups
+  on x86); fixed, and `tests/wake.rs` runs that race on the real CPU.
+- **Coverage-guided fuzzing** (`giong-http/fuzz/`, cargo-fuzz): the request-head parser,
+  the chunked decoder, and whole connections over an in-memory transport, in pieces of
+  random size. 18 million inputs locally without a finding; CI fuzzes every night and keeps
+  the corpus.
+- **Soak** (`scripts/check.sh soak`, `tests/soak.rs`): TCP clients on every worker that
+  close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
+  traffic alongside; afterwards no descriptor, memory or driver state may be left over.
+  30 minutes on four workers: 39.5 million connections, resident memory flat at 15.5–15.7
+  MB. CI runs it for two hours every night.
 - **valgrind memcheck** over the single-threaded tests (`scripts/valgrind.sh`): no invalid
   access, no leak.
 - **Load** on the example HTTP server: over 250,000 connections opened and closed, 5,000
@@ -502,17 +521,15 @@ Also:
 - **Graceful shutdown under load**: SIGTERM during 40 slow requests. Without a grace
   period 156 of 200 requests were answered; with one, 400 of 400.
 - **CI** runs formatting, clippy, the documentation build, a build with Rust 1.80, the
-  repeated tests, the fallback setups and ThreadSanitizer.
+  repeated tests, the fallback setups, ThreadSanitizer, the loom models and the real 6.0
+  and 6.1 kernels on every change, and fuzzing and the soak test every night.
 
 Not verified, and you should know it:
 
-- **No real 6.0 kernel.** The fallback setups were forced on 6.18: that checks giong's code
-  paths without `DEFER_TASKRUN`, not the behaviour of the old kernel itself.
 - Neither sanitizer nor valgrind can see the kernel writing into memory, so cancellation
   safety rests on the design and on `tests/cancel.rs`.
 - valgrind 3.22 cannot run the multi-threaded tests (it treats `io_uring_enter` as
-  non-blocking, so threads starve each other); ThreadSanitizer covers those. The
-  cross-thread wake-up has not been model-checked with loom.
+  non-blocking, so threads starve each other); ThreadSanitizer covers those.
 - `giong-tls` has not had an independent security audit. The cryptography and the protocol
   are rustls's; giong's part is connecting rustls to the socket.
 
