@@ -182,7 +182,29 @@ fn first_tier() -> RingTier {
 }
 
 fn build_ring(entries: u32) -> io::Result<IoUring> {
-    build_ring_from(entries, first_tier())
+    build_ring_from(entries, first_tier()).map_err(explain_setup_error)
+}
+
+/// Where the ways to allow io_uring in containers are written down.
+const DEPLOYMENT_DOC: &str = "https://github.com/giong-run/Giong/blob/main/docs/DEPLOYMENT.md";
+
+/// `io_uring_setup` fails with `EPERM` when a seccomp profile blocks it (as
+/// Docker's default profile does) or the `kernel.io_uring_disabled` sysctl
+/// forbids it, and with `ENOSYS` where the kernel or a sandbox such as gVisor
+/// does not provide it. The bare errno says none of that, so say it here.
+fn explain_setup_error(e: io::Error) -> io::Error {
+    match e.raw_os_error() {
+        Some(libc::EPERM | libc::EACCES | libc::ENOSYS) => io::Error::new(
+            e.kind(),
+            format!(
+                "giong needs io_uring, which is not available here ({e}). It is blocked by \
+                 Docker's default seccomp profile, missing in sandboxes such as gVisor, and \
+                 can be turned off with the kernel.io_uring_disabled sysctl. How to allow it: \
+                 {DEPLOYMENT_DOC}"
+            ),
+        ),
+        _ => e,
+    }
 }
 
 fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
@@ -727,6 +749,24 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A blocked or missing io_uring is explained; other errors pass through.
+    #[test]
+    fn setup_errors_say_why_io_uring_is_missing() {
+        for errno in [libc::EPERM, libc::ENOSYS] {
+            let original = io::Error::from_raw_os_error(errno);
+            let kind = original.kind();
+            let e = explain_setup_error(original);
+            assert_eq!(e.kind(), kind);
+            let text = e.to_string();
+            assert!(
+                text.contains("io_uring") && text.contains(DEPLOYMENT_DOC),
+                "{text}"
+            );
+        }
+        let e = explain_setup_error(io::Error::from_raw_os_error(libc::ENOMEM));
+        assert_eq!(e.raw_os_error(), Some(libc::ENOMEM));
+    }
 
     /// Every setup tier must produce a working ring on a current kernel, so
     /// that `GIONG_RING_TIER` really exercises the older-kernel paths.
