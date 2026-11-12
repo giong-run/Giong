@@ -58,7 +58,8 @@ features, find out what is actually true.
       wake-up, now fixed).
 - [x] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser, the chunked
       decoder and a whole connection, nightly in CI.
-- [ ] Add a soak test: hours of connection churn with fd and memory checks.
+- [x] Add a soak test: hours of connection churn with fd and memory checks (two hours
+      every night in CI).
 - [ ] An independent look at `giong-tls` before anyone relies on it.
 
 **Exit criteria:** published multi-core results with their method, and no open memory- or
