@@ -8,6 +8,42 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- A wake-up from another thread could be lost, leaving the task asleep until
+  something else woke it. The executor cleared a task's "queued" flag with a
+  plain store before polling it; a waker that published new state and then saw
+  the flag still set skipped the enqueue, while the poll could read the state
+  from before the wake-up. It needs state that is shared without a lock (a
+  `Mutex` hides it), and on x86 it hit about 70 in a million such wake-ups. The
+  flag is now cleared with a swap, which synchronises with the waker.
+- On Linux 6.0 a runtime could fail to start with "giong needs io_uring buffer rings
+  (Linux >= 6.0): Bad address", depending on what happened to be mapped next to the
+  receive buffer ring: 6.0 pins one page more than the ring needs (fixed in 6.1). The
+  ring now has a spare page. Found by running the tests on a real 6.0 kernel.
+
+### Added
+
+- **Verification**: the wake-up handshakes between workers and other threads
+  live in `src/notify.rs` and are model-checked with
+  [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
+  CI job). `tests/wake.rs` runs the lost-wake-up race on real hardware.
+- **Verification**: coverage-guided fuzzing of `giong-http` with cargo-fuzz: the
+  request-head parser, the chunked decoder, and a whole connection served over an
+  in-memory transport, in pieces of random size (`giong-http/fuzz/`). CI fuzzes each
+  target for 10 minutes every night, keeping the corpus, and briefly on pull requests.
+- **Verification**: a soak test (`tests/soak.rs`, `scripts/check.sh soak`): every
+  worker serves TCP echo to clients on all workers that close cleanly, abort, half-close
+  or cancel receives, alongside UDP, file and cross-worker traffic; afterwards no
+  descriptor, memory or driver state may be left over. It runs for two hours every
+  night in CI. A one-minute run makes about 1.3 million connections on four workers.
+- **Verification**: the whole suite on real Linux 6.0.19 and 6.1.155 kernels, each
+  booted in QEMU from an initramfs (`scripts/kernels.sh`), in CI on every change.
+- **Benchmarks**: `bench/workers.sh` measures throughput from one worker to N, with CPU
+  time per request and how busy the server and the load generator were, on one machine
+  or with the load generator on another (`LOAD_HOST`; the Rust servers take
+  `BENCH_HOST`).
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

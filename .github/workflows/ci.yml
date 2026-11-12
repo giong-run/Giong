@@ -72,3 +72,44 @@ jobs:
       # address-space randomisation.
       - run: sudo sysctl vm.mmap_rnd_bits=28
       - run: ROUNDS=2 scripts/check.sh tsan
+
+  # Model-check the wake-up handshakes in src/notify.rs with loom, then run the
+  # same race on the runner's real CPUs.
+  loom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/check.sh loom
+
+  # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM).
+  kernels:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["6.0.19", "6.1.155"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install QEMU and a static busybox
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 busybox-static cpio
+      - name: Let QEMU use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/cache@v4
+        with:
+          path: target/kernels/linux-${{ matrix.kernel }}
+          key: kernel-${{ matrix.kernel }}
+      - run: scripts/kernels.sh ${{ matrix.kernel }}
+      - name: Keep the guest's log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.kernel }}-log
+          path: target/kernels/linux-${{ matrix.kernel }}.log

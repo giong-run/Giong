@@ -1,0 +1,13 @@
+workers server         req/s median      min      max  eff. cpu us/req  p99 ms server cpu load cpu  limited by
+1       giong                218857   204129   231404  1.00       4.50    0.82        99%      68%  server
+1       giong-http           186060   182820   199721  1.00       5.31    0.82       100%      57%  server
+1       monoio-tuned         214154   201415   222552  1.00       4.59    0.74        99%      67%  server
+1       tokio-raw            151149   146679   157199  1.00       6.51    0.86        99%      60%  server
+1       glommio              175756   171672   177317  1.00       5.63    0.74       100%      60%  server
+
+2       giong                311059   304839   331393  0.71       5.09    0.73        81%      99%  load generator
+2       giong-http           342759   342344   347124  0.92       5.32    0.93        93%      97%  load generator
+2       monoio-tuned         337591   320809   339944  0.79       4.75    0.61        82%      99%  load generator
+2       tokio-raw            351877   351399   359257  1.16       5.15    0.70        93%      98%  load generator
+2       glommio              226855   221260   239788  0.65       8.69    1.04        99%      96%  server
+

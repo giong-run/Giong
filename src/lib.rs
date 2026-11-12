@@ -72,6 +72,7 @@ compile_error!("giong only supports Linux: it is built directly on io_uring (ker
 mod buf;
 mod driver;
 mod executor;
+mod notify;
 mod op;
 mod runtime;
 mod slab;
