@@ -1,0 +1,30 @@
+[package]
+name = "giong-mysql"
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.80"
+description = "A MySQL client and connection pool for the giong thread-per-core runtime"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://docs.rs/giong-mysql"
+keywords = ["mysql", "database", "io-uring", "async"]
+categories = ["database", "network-programming", "asynchronous"]
+
+[dependencies]
+giong = { path = "..", version = "0.2.1" }
+giong-tls = { path = "../giong-tls", version = "0.2.1" }
+# SHA-1 and SHA-256 for the password scrambles, and the random padding of
+# RSA-OAEP. Already compiled in through rustls, so it adds nothing to the
+# build.
+ring = "0.17"
+# TCP keepalive and TCP_USER_TIMEOUT on the connection, to notice a server
+# that vanished without closing. Already a dependency of giong.
+socket2 = { version = "0.6", features = ["all"] }
+
+[dev-dependencies]
+libc = "0.2"
+rcgen = "0.13"
+
+[package.metadata.docs.rs]
+all-features = true

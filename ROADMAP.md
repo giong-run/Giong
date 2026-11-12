@@ -9,11 +9,11 @@ an item so the work is not duplicated.
 A runtime for **network services on Linux** that makes the fewest possible system calls and
 keeps tail latency low, by committing fully to io_uring and to one thread per core.
 
-By 1.0, a team can write and deploy a real REST API (Postgres, Redis, calls to other HTTPS
-services, HTTPS itself) with giong's crates alone, in an ordinary Docker or Kubernetes
-setup. Each crate that replaces a Tokio-based one is measured against it with a reproducible
-benchmark (tokio-postgres with deadpool, redis-rs, reqwest, axum), and the README says where
-giong does not win.
+By 1.0, a team can write and deploy a real REST API (Postgres or MySQL, Redis, calls to
+other HTTPS services, HTTPS itself) with giong's crates alone, in an ordinary Docker or
+Kubernetes setup. Each crate that replaces a Tokio-based one is measured against it with a
+reproducible benchmark (tokio-postgres with deadpool, mysql_async and SQLx, redis-rs,
+reqwest, axum), and the README says where giong does not win.
 
 ## Agent-first
 
@@ -142,6 +142,20 @@ A new crate: the Postgres v3 protocol on giong.
 **Exit criteria:** the test suite passes against real Postgres 14 to 17 in CI, the protocol
 parser is fuzzed, and a benchmark compares it with tokio-postgres and deadpool.
 
+## giong-mysql 0.1
+
+A new crate: the MySQL client/server protocol on giong, with the same shape as
+giong-postgres.
+
+- [x] Connecting over TCP or a Unix socket, TLS, `caching_sha2_password` (including the
+      RSA exchange) and `mysql_native_password`.
+- [x] Prepared statements with a cache and the binary protocol, transactions, the common
+      data types.
+- [x] Pipelining by default, and a connection pool per core.
+
+**Exit criteria:** the test suite passes against real MySQL 8.0, 8.4 and 9 in CI, the
+packet parsers are fuzzed, and a benchmark compares it with mysql_async and SQLx.
+
 ## HTTP client and giong-redis 0.1
 
 - [ ] An HTTP/1.1 client in `giong-http` (feature `client`): keep-alive, a pool per host,
@@ -204,4 +218,4 @@ A stable API. Requires: a review of every public item against the
 documented, the limitations section of the README reduced to deliberate non-goals, and at
 least one production user reporting back.
 
-MySQL, WebSocket and gRPC come later, when someone needs them.
+WebSocket and gRPC come later, when someone needs them.

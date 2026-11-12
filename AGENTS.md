@@ -8,7 +8,7 @@ disagree, CONTRIBUTING.md wins: report the difference.
 ## What this is
 
 giong is a thread-per-core async runtime for Linux, built on io_uring. One Cargo
-workspace, four crates:
+workspace, five crates:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -16,6 +16,7 @@ workspace, four crates:
 | `giong-http/` | `giong-http` | a strict HTTP/1.1 server library; HTTPS behind the `tls` feature |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
+| `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.

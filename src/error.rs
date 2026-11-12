@@ -28,7 +28,7 @@
 //! # }
 //! ```
 //!
-//! The companion crates (giong-tls, giong-postgres) use the same codes, so
+//! The companion crates (giong-tls, giong-postgres, giong-mysql) use the same codes, so
 //! one `match` covers them all. Codes are never reused or renumbered; a code
 //! that is no longer raised keeps its page.
 
@@ -46,7 +46,8 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E1xxx`
-        /// giong-http, `E2xxx` giong-tls and `E3xxx` giong-postgres. Each has
+        /// giong-http, `E2xxx` giong-tls, `E30xx` giong-postgres and `E31xx`
+        /// giong-mysql. Each has
         /// a page under `docs/errors/` in the repository; [`url`](Code::url)
         /// links to it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -187,6 +188,31 @@ codes! {
     PostgresPoolTimeout = 3009, TimedOut, "PostgreSQL pool wait timed out";
     /// The server sent something that is not the PostgreSQL protocol.
     PostgresProtocol = 3010, InvalidData, "PostgreSQL protocol error";
+
+    // ------------------------------------------------------- giong-mysql
+    /// The configuration or connection URL is not valid.
+    MysqlConfig = 3101, InvalidInput, "invalid MySQL configuration";
+    /// Opening a connection failed: name resolution, TCP, TLS, or the
+    /// connect timeout.
+    MysqlConnect = 3102, Other, "cannot connect to MySQL";
+    /// The server refused the credentials, or the authentication method is
+    /// not supported or not safe on this connection.
+    MysqlAuth = 3103, PermissionDenied, "MySQL authentication failed";
+    /// The server reported an error for a statement; its number says which.
+    MysqlServer = 3104, Other, "MySQL server error";
+    /// A value could not be converted between Rust and MySQL.
+    MysqlType = 3105, InvalidData, "MySQL type mismatch";
+    /// `query_one` found no row or more than one, or `insert` found no
+    /// generated id.
+    MysqlRowCount = 3106, Other, "wrong number of rows";
+    /// A result was larger than the configured maximum.
+    MysqlTooLarge = 3107, Other, "MySQL result too large";
+    /// The connection is closed.
+    MysqlClosed = 3108, ConnectionAborted, "MySQL connection closed";
+    /// No pooled connection became free in time.
+    MysqlPoolTimeout = 3109, TimedOut, "MySQL pool wait timed out";
+    /// The server sent something that is not the MySQL protocol.
+    MysqlProtocol = 3110, InvalidData, "MySQL protocol error";
 }
 
 impl Code {
