@@ -1,0 +1,8 @@
+64 tasks, pool of 8, 3 rounds of 5 s; median, min and max of the rounds
+workload mode    client   ops/s median      min      max  p50 us  p99 us  cpu%  srv%
+point    pool    giong          208623   199806   215054     140    4182    98   272
+
+
+list     pool    giong           48272    47836    52036     614    8798    93   269
+
+

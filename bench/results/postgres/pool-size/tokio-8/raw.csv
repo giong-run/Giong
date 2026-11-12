@@ -1,0 +1,7 @@
+client,workload,mode,round,ops,p50,p99,cpu,srv
+tokio,point,pool,1,67288,897,1522,98,178
+tokio,list,pool,1,23771,2405,3890,98,156
+tokio,point,pool,2,62187,955,1443,99,163
+tokio,list,pool,2,24086,2355,5882,98,170
+tokio,point,pool,3,61465,966,1569,99,157
+tokio,list,pool,3,24850,2395,4080,98,169

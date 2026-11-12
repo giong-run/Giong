@@ -1,0 +1,8 @@
+64 tasks, pool of 16, 3 rounds of 5 s; median, min and max of the rounds
+workload mode    client   ops/s median      min      max  p50 us  p99 us  cpu%  srv%
+point    pool    tokio           72536    69079    77158     821    1376    99   187
+
+
+list     pool    tokio           25194    24817    25818    2359    3619    99   171
+
+

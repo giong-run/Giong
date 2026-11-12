@@ -1,0 +1,15 @@
+[package]
+name = "bench-postgres-giong"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+giong = { path = "../.." }
+giong-postgres = { path = "../../giong-postgres" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

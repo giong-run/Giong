@@ -17,6 +17,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # giong-postgres's tests start a throwaway PostgreSQL server from the
+  # binaries the runner image ships (/usr/lib/postgresql/16/bin). Without
+  # this they would skip, quietly, if the binaries went missing.
+  GIONG_PG_REQUIRED: "1"
 
 jobs:
   lint:

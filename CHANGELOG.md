@@ -67,6 +67,23 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     client certificate for mutual TLS, and clones share a session cache so that
     reconnecting resumes the session.
   - `TlsStream::peer_certificates` and `TlsStream::resumed`.
+- **`giong-postgres`**, a new crate: a PostgreSQL client and connection pool for giong,
+  speaking the wire protocol itself (no libpq, nothing from Tokio).
+  - `Client` with `query`, `query_one`, `query_opt`, `execute`, `batch_execute`,
+    `transaction` and `cancel_token`. Tasks sharing a connection pipeline their
+    statements; every statement is prepared once per connection and kept in a bounded
+    cache, and prepared again by itself after a schema change.
+  - `Pool`, one per worker: statements that stand alone share the least busy
+    connection, `get()` takes one for a transaction and rolls back what is left open
+    when it comes back, and new statements avoid a connection stuck behind a slow one.
+  - TLS through `giong-tls`, on by default for remote hosts and always verified;
+    SCRAM-SHA-256, MD5, and clear-text passwords only over TLS or to this machine.
+  - `Config::from_url`, strict about unknown parameters and about `sslmode` values
+    that would silently fall back to no encryption.
+  - Errors with an `ErrorKind`, the server's SQLSTATE code and every field it sent;
+    finite defaults for the connect timeout (10 s), the statement timeout (30 s,
+    enforced by the server), the result size (64 MiB), the statement cache (256) and
+    the pool wait (5 s).
 
 ### Changed
 
