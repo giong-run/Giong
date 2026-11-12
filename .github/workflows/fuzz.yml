@@ -36,6 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+      # The prebuilt cargo-fuzz is a musl binary and builds for its own target by
+      # default, where the sanitizers cannot link: every cargo fuzz command
+      # below names the glibc target.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -51,13 +54,13 @@ jobs:
           SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
-          cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+          cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
             -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
       - name: Shrink the corpus
         if: success() && github.event_name != 'pull_request'
         working-directory: giong-http
         run: |
-          cargo fuzz cmin ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
+          cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
       - name: Save the corpus
         if: success() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
