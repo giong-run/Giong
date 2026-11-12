@@ -1083,6 +1083,55 @@ def page():
 '''
 
 
+def llms():
+    """llms.txt (https://llmstxt.org): where a language model finds the docs."""
+    crates = {
+        "giong": "the runtime: executor, io_uring driver, TCP, UDP and Unix sockets, files, "
+                 "timers, channels",
+        "giong-http": "a small, strict HTTP/1.1 server; HTTPS behind the `tls` feature",
+        "giong-tls": "TLS on rustls",
+    }
+    api = "".join(
+        f"- [{name} API](https://docs.rs/{name}): {crates.get(name, 'API reference')}\n"
+        for name in CRATE_NAMES)
+    examples = "".join(
+        f"- [examples/{name}.rs]({BLOB}examples/{name}.rs): {desc}\n"
+        for name, desc, _, _ in EXAMPLES)
+    return f"""# giong
+
+> A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
+> worker owns its ring, tasks and buffers; tasks never move between threads, so futures
+> need not be `Send`. Version {VERSION}.
+
+Facts that are easy to get wrong:
+
+- Linux 6.0 or newer only, with io_uring allowed. It does not build on macOS or Windows.
+  Docker's default seccomp profile blocks io_uring.
+- Buffers are passed by value and handed back, because the kernel uses them after the call:
+  `stream.write_all(buf).await` returns `(io::Result<()>, buf)`.
+- `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may
+  have sent part of its buffer.
+- There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
+- Install with `{ADD} giong` (and `giong-http`, `giong-tls`). Libraries need Rust 1.80.
+
+## Docs
+
+{api}- [README]({BLOB}README.md): design, benchmarks with their method, limitations
+- [AGENTS.md]({BLOB}AGENTS.md): how to build, test and change giong, for coding agents
+- [CONTRIBUTING.md]({BLOB}CONTRIBUTING.md): the rules every change follows
+- [ROADMAP.md]({BLOB}ROADMAP.md): milestones and deliberate non-goals
+- [CHANGELOG.md]({BLOB}CHANGELOG.md): what changed in each release
+
+## Examples
+
+{examples}
+## Optional
+
+- [Benchmark results]({TREE}bench/results): raw numbers behind the README
+- [giong-http README]({BLOB}giong-http/README.md) and [giong-tls README]({BLOB}giong-tls/README.md)
+"""
+
+
 if __name__ == "__main__":
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent / "public"
     out.mkdir(parents=True, exist_ok=True)
@@ -1091,6 +1140,7 @@ if __name__ == "__main__":
         "404.html": not_found(),
         "sitemap.xml": sitemap(),
         "robots.txt": f"User-agent: *\nAllow: /\nSitemap: {SITE}sitemap.xml\n",
+        "llms.txt": llms(),
     }
     for name, text in files.items():
         (out / name).write_text(text, encoding="utf-8", newline="\n")
