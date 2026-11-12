@@ -8,6 +8,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **`giong-http`**
+  - `Request::peer_addr`: the client's address, for logging, rate limits and
+    access rules. `None` over a Unix socket. Transports report it through the
+    new `Transport::peer_addr`, which has a default, so existing transports
+    keep compiling.
+  - `Server::max_connections`: the most connections one `serve` call (normally
+    one per worker) keeps open. At the limit the server stops accepting, and new
+    clients wait in the kernel's listen queue instead of being refused.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

@@ -36,6 +36,8 @@ fn main() -> std::io::Result<()> {
 - Body theo `Content-Length` hoặc chunked, nhận đủ rồi mới gọi handler. Hỗ trợ `Expect: 100-continue`.
 - `Request` dùng chung buffer nhận của kết nối thay vì chép ra, nên tạo một request không cấp phát bộ nhớ. Handler giữ request lại bao lâu cũng được.
 - Giới hạn kích thước head (64 KiB) và body (1 MiB); timeout cho kết nối rảnh (60 s), request chậm (30 s, chống slowloris) và client đọc chậm (30 s). Tất cả đều chỉnh được trên `Server`.
+- Giới hạn số kết nối mở tùy chọn (`Server::max_connections`): khi chạm giới hạn, server ngừng nhận kết nối mới, client mới chờ trong hàng đợi listen của kernel cho đến khi có kết nối đóng.
+- `Request::peer_addr` trả về địa chỉ của client (`None` khi chạy qua Unix socket).
 - Tắt êm: request đang xử lý được trả lời kèm `Connection: close`, kết nối rảnh đóng ngay.
 - HTTPS qua feature `tls` (xem dưới).
 - Phục vụ qua Unix socket bằng `Server::serve_unix`, cách thường dùng khi đứng sau một reverse proxy trên cùng máy.
@@ -80,4 +82,4 @@ HTTP/2, body dạng stream (body lớn hơn giới hạn bị từ chối chứ 
 
 ## Kiểm thử
 
-`cargo test -p giong-http --all-features`: 15 unit test (gồm 500.000 đầu vào ngẫu nhiên cho parser và bộ giải mã chunked), 17 test đầu-cuối trên socket thật (một trong số đó qua Unix socket), 9 test HTTPS đầu-cuối với client rustls (TLS 1.2 và 1.3, pipelining, body 3 MB, lỗi 400/413, kết nối rảnh, client không nói TLS, tắt êm, 16 thread client cùng lúc), 5 ví dụ trong tài liệu.
+`cargo test -p giong-http --all-features`: 15 unit test (gồm 500.000 đầu vào ngẫu nhiên cho parser và bộ giải mã chunked), 19 test đầu-cuối trên socket thật (một trong số đó qua Unix socket), 11 test HTTPS đầu-cuối với client rustls (TLS 1.2 và 1.3, pipelining, body 3 MB, lỗi 400/413, kết nối rảnh, client không nói TLS, tắt êm, 16 thread client cùng lúc), 5 ví dụ trong tài liệu.

@@ -1,6 +1,7 @@
 //! The request handed to a handler.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -24,6 +25,7 @@ pub struct Request {
     pub(crate) start: usize,
     pub(crate) head: Head,
     pub(crate) body: BodyBytes,
+    pub(crate) peer: Option<SocketAddr>,
 }
 
 impl Request {
@@ -88,6 +90,16 @@ impl Request {
         self.header(name).and_then(|v| std::str::from_utf8(v).ok())
     }
 
+    /// The address of the client that sent this request, as the connection
+    /// sees it. `None` over a Unix socket.
+    ///
+    /// Behind a reverse proxy this is the proxy's address. The client's own
+    /// address is then in a header such as `X-Forwarded-For`, which is only
+    /// worth believing when it comes from a proxy you run.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
     /// The request body. Empty if the request has none.
     pub fn body(&self) -> &[u8] {
         match &self.body {
@@ -103,6 +115,7 @@ impl fmt::Debug for Request {
             .field("method", &self.method())
             .field("target", &self.target())
             .field("version_minor", &self.version_minor())
+            .field("peer_addr", &self.peer)
             .field("body_len", &self.body().len())
             .finish()
     }
