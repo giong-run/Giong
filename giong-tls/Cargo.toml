@@ -1,6 +1,6 @@
 [package]
 name = "giong-tls"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.80"
 description = "TLS for the giong thread-per-core runtime, built on rustls"
@@ -12,7 +12,7 @@ keywords = ["tls", "rustls", "io-uring", "thread-per-core", "async"]
 categories = ["network-programming", "cryptography"]
 
 [dependencies]
-giong = { path = "..", version = "0.2.0" }
+giong = { path = "..", version = "0.2.1" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
