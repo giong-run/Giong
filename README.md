@@ -17,8 +17,6 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-*[Đọc bằng tiếng Việt](README.vi.md)*
-
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and two companion crates,
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server) and
