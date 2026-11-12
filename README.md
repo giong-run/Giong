@@ -191,7 +191,8 @@ let runtime = giong::Builder::new()
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
 | Configuration | `.workers(n)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
-| TCP | `TcpListener::bind` / `accept`; `TcpStream::connect` / `recv` / `read` / `write` / `write_all` / `shutdown` / `set_nodelay` |
+| TCP | `TcpListener::bind` / `accept`; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `shutdown` / `set_nodelay` |
+| Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
 | Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
 | UDP | `UdpSocket::bind` / `connect`; `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast` |
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir` |
@@ -560,9 +561,12 @@ to audit.
 
 ## Limitations
 
-- **No asynchronous DNS.** `bind` and `connect` resolve names with a blocking call. Also
-  missing: Unix datagram sockets, multicast, reading directories, `set_len`, file locks,
-  `O_DIRECT` with registered buffers.
+- **Name resolution reads files and DNS only.** `connect` and `lookup_host` resolve names
+  without blocking, from `/etc/hosts` and the DNS servers in `/etc/resolv.conf`; other
+  Name Service Switch sources (mDNS, LDAP) are not used. `bind` still resolves with a
+  blocking call, which only matters at startup. Also missing: Unix datagram sockets,
+  multicast, reading directories, `set_len`, file locks, `O_DIRECT` with registered
+  buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
 - **TLS is server side only.** No TLS client, no kTLS, no independent audit of `giong-tls`.

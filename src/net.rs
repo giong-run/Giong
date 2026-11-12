@@ -9,9 +9,13 @@
 //! * Writes take ownership of the buffer and return it with the result.
 //! * Descriptors are closed through the ring, batched with everything else.
 
+mod addr;
+mod dns;
 mod udp;
 mod unix;
 
+pub use addr::{lookup_host, ToSocketAddrs};
+pub use dns::{Resolver, ResolverConfig};
 pub use udp::{Datagram, UdpSocket};
 pub use unix::{UnixListener, UnixStream};
 
@@ -20,7 +24,7 @@ use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::task::{Context, Poll};
 
@@ -339,7 +343,7 @@ impl TcpListener {
     /// Binds to `addr` with `SO_REUSEADDR` and `SO_REUSEPORT` set, so every
     /// worker can bind its own listener to the same port and let the kernel
     /// spread incoming connections across cores.
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+    pub fn bind<A: StdToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut last_err = None;
         for addr in addr.to_socket_addrs()? {
             match Self::bind_addr(addr) {
@@ -427,19 +431,34 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    /// Opens a connection to `addr`.
+    /// Opens a connection to `addr`: a socket address, or a host name and port
+    /// such as `"db.internal:5432"`, resolved without blocking (see
+    /// [`lookup_host`]).
+    ///
+    /// When there are several addresses, they are tried the "Happy Eyeballs"
+    /// way (RFC 8305): IPv6 and IPv4 alternate, each attempt gets 250 ms
+    /// before the next one starts alongside it, and the first connection made
+    /// wins. An address that does not answer therefore costs 250 ms, not a TCP
+    /// timeout. Wrap the call in [`timeout`](crate::time::timeout) to bound
+    /// the whole thing:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # use giong::net::TcpStream;
+    /// # giong::block_on(async {
+    /// let stream = giong::time::timeout(Duration::from_secs(3), TcpStream::connect("db.internal:5432"))
+    ///     .await
+    ///     .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+    /// # Ok::<_, std::io::Error>(())
+    /// # }).unwrap();
+    /// ```
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        let mut last_err = None;
-        for addr in addr.to_socket_addrs()? {
-            match Self::connect_addr(addr).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.unwrap_or_else(unresolved))
+        let addrs = lookup_host(addr).await?;
+        addr::connect_first(addrs, Self::connect_addr).await
     }
 
-    async fn connect_addr(addr: SocketAddr) -> io::Result<Self> {
+    /// Connects to exactly this address, without name resolution.
+    pub(crate) async fn connect_addr(addr: SocketAddr) -> io::Result<Self> {
         let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
         let inner = StreamSocket::connect(sock, addr.into()).await?;
         Ok(Self { inner })
