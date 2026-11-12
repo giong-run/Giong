@@ -39,6 +39,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     clients wait in the kernel's listen queue instead of being refused.
 - [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to allow io_uring in Docker, Docker
   Compose and Kubernetes without turning seccomp off.
+- **Sync**
+  - `sync::oneshot`: a channel for one value, to hand a result back to the task that
+    asked for it, from any worker or thread. `Sender::closed` tells the producer that
+    nobody is waiting any more.
+  - `sync::mpsc::bounded`: a multi-producer channel that holds at most `n` values.
+    `send` waits while it is full, so a fast producer slows down to the consumer's pace;
+    waiting senders get room in arrival order, and a cancelled `send` passes its place on.
 
 ### Changed
 
