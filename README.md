@@ -77,10 +77,13 @@ connection, the same as the others.
 
 - **Linux 6.0 or newer** (6.1+ recommended). Developed and tested on 6.18.
 - Rust 1.80 or newer.
+- io_uring must be allowed. Docker's and containerd's default seccomp profiles block it;
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow just io_uring in Docker,
+  Docker Compose and Kubernetes.
 - giong does **not** build on Windows or macOS: io_uring is a Linux interface. On Windows
   use WSL2 with a 6.x kernel (`uname -r`; run `wsl --update` if it is older), a Linux
-  virtual machine, or Docker started with `--security-opt seccomp=unconfined` (Docker's
-  default profile blocks io_uring).
+  virtual machine, or Docker with the profile from
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Quick start
 

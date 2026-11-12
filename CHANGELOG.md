@@ -8,20 +8,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
-### Fixed
-
-- A wake-up from another thread could be lost, leaving the task asleep until
-  something else woke it. The executor cleared a task's "queued" flag with a
-  plain store before polling it; a waker that published new state and then saw
-  the flag still set skipped the enqueue, while the poll could read the state
-  from before the wake-up. It needs state that is shared without a lock (a
-  `Mutex` hides it), and on x86 it hit about 70 in a million such wake-ups. The
-  flag is now cleared with a swap, which synchronises with the waker.
-- On Linux 6.0 a runtime could fail to start with "giong needs io_uring buffer rings
-  (Linux >= 6.0): Bad address", depending on what happened to be mapped next to the
-  receive buffer ring: 6.0 pins one page more than the ring needs (fixed in 6.1). The
-  ring now has a spare page. Found by running the tests on a real 6.0 kernel.
-
 ### Added
 
 - **Verification**: the wake-up handshakes between workers and other threads
@@ -51,6 +37,29 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   - `Server::max_connections`: the most connections one `serve` call (normally
     one per worker) keeps open. At the limit the server stops accepting, and new
     clients wait in the kernel's listen queue instead of being refused.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to allow io_uring in Docker, Docker
+  Compose and Kubernetes without turning seccomp off.
+
+### Changed
+
+- When io_uring is blocked or missing (Docker's default seccomp profile, gVisor, the
+  `kernel.io_uring_disabled` sysctl), starting a runtime now fails with an error that says
+  so and links to the new [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), instead of a bare
+  "Operation not permitted".
+
+### Fixed
+
+- A wake-up from another thread could be lost, leaving the task asleep until
+  something else woke it. The executor cleared a task's "queued" flag with a
+  plain store before polling it; a waker that published new state and then saw
+  the flag still set skipped the enqueue, while the poll could read the state
+  from before the wake-up. It needs state that is shared without a lock (a
+  `Mutex` hides it), and on x86 it hit about 70 in a million such wake-ups. The
+  flag is now cleared with a swap, which synchronises with the waker.
+- On Linux 6.0 a runtime could fail to start with "giong needs io_uring buffer rings
+  (Linux >= 6.0): Bad address", depending on what happened to be mapped next to the
+  receive buffer ring: 6.0 pins one page more than the ring needs (fixed in 6.1). The
+  ring now has a spare page. Found by running the tests on a real 6.0 kernel.
 
 ## [0.2.1] - 2026-11-12
 
