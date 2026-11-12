@@ -21,6 +21,7 @@ use io_uring::{opcode, types};
 use crate::buf::BufPool;
 use crate::driver::{Driver, Park};
 use crate::executor::{TaskSlot, TaskWaker, MAIN_TASK};
+use crate::notify::Doorbell;
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::time::Timers;
@@ -48,10 +49,8 @@ pub(crate) struct WorkerShared {
     /// Process-wide unique id of this worker instance (never 0).
     pub(crate) uid: usize,
     injector: Mutex<Vec<Inject>>,
-    /// Something is waiting in `injector`.
-    pending: AtomicBool,
-    /// The worker is (about to be) blocked in the kernel.
-    sleeping: AtomicBool,
+    /// Tells the worker that `injector` has items, and wakes it if it sleeps.
+    bell: Doorbell,
     closed: AtomicBool,
     eventfd: OwnedFd,
 }
@@ -66,8 +65,7 @@ impl WorkerShared {
         Ok(Arc::new(Self {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             injector: Mutex::new(Vec::new()),
-            pending: AtomicBool::new(false),
-            sleeping: AtomicBool::new(false),
+            bell: Doorbell::new(),
             closed: AtomicBool::new(false),
             // SAFETY: a fresh descriptor we own.
             eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
@@ -83,10 +81,9 @@ impl WorkerShared {
             }
             queue.push(item);
         }
-        // Dekker-style handshake with the worker's `sleeping`/`pending` check in
-        // `Worker::drive`: at least one side always observes the other.
-        self.pending.store(true, Ordering::SeqCst);
-        if self.sleeping.swap(false, Ordering::SeqCst) {
+        // Handshake with `Doorbell::prepare_park` in `Worker::drive`: at least
+        // one side always observes the other (modelled in `notify`).
+        if self.bell.ring() {
             let one: u64 = 1;
             // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own.
             unsafe {
@@ -342,14 +339,13 @@ impl Worker {
             };
             // Announce that we are going to sleep, then re-check for injected
             // work (see `WorkerShared::inject`).
-            self.shared.sleeping.store(true, Ordering::SeqCst);
-            let mode = if self.shared.pending.load(Ordering::SeqCst) {
+            let mode = if self.shared.bell.prepare_park() {
                 Park::Poll
             } else {
                 wait
             };
             let graveyard = self.driver.borrow_mut().park(mode);
-            self.shared.sleeping.store(false, Ordering::SeqCst);
+            self.shared.bell.unpark();
             // Buffers of cancelled operations: dropped outside the driver borrow.
             drop(graveyard);
 
@@ -369,9 +365,7 @@ impl Worker {
             // Reading the clock costs about as much as the checks, so look at
             // the ring many times per clock read.
             for _ in 0..64 {
-                if self.shared.pending.load(Ordering::Relaxed)
-                    || self.driver.borrow_mut().has_completions()
-                {
+                if self.shared.bell.peek() || self.driver.borrow_mut().has_completions() {
                     return true;
                 }
                 std::hint::spin_loop();
@@ -388,7 +382,7 @@ impl Worker {
     }
 
     fn drain_injected(&self) {
-        if !self.shared.pending.swap(false, Ordering::SeqCst) {
+        if !self.shared.bell.take() {
             return;
         }
         let items = mem::take(&mut *lock(&self.shared.injector));
