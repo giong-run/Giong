@@ -1,6 +1,7 @@
 //! Random inputs for the reply reader and the URL parser.
 
-use crate::resp::{encode, Next, ReadBuf};
+use crate::fuzzing::read_replies;
+use crate::resp::encode;
 use crate::value::Value;
 use crate::Config;
 
@@ -59,28 +60,10 @@ fn value(rng: &mut Rng, depth: usize) -> Value {
 /// Reads `input` delivered in random pieces; returns the replies (`None`
 /// for one over the limit) or the first error.
 fn read(rng: &mut Rng, input: &[u8], limit: usize) -> Result<Vec<Option<Value>>, crate::Error> {
-    let mut buf = ReadBuf::new();
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos < input.len() {
+    read_replies(input, limit, || {
         let max = if rng.below(4) == 0 { 4000 } else { 9 };
-        let n = (1 + rng.below(max) as usize).min(input.len() - pos);
-        buf.extend(&input[pos..pos + n]);
-        pos += n;
-        loop {
-            match buf.next(limit)? {
-                Next::Pending => break,
-                Next::Ready(len) => {
-                    let pushed = buf.is_push();
-                    let v = buf.take(len)?;
-                    assert_eq!(pushed, matches!(v, Value::Push(_)));
-                    out.push(Some(v));
-                }
-                Next::TooLarge => out.push(None),
-            }
-        }
-    }
-    Ok(out)
+        1 + rng.below(max) as usize
+    })
 }
 
 fn same(a: &Value, b: &Value) -> bool {

@@ -1,0 +1,1 @@
+redis+unix:///run/redis.sock?db=1

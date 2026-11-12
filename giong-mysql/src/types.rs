@@ -618,7 +618,9 @@ fn format_temporal(ty: ColumnType, raw: &[u8]) -> Result<String, Error> {
         let get = |i: usize| raw.get(i).copied().unwrap_or(0);
         let negative = get(0) == 1;
         let days = u32::from_le_bytes([get(1), get(2), get(3), get(4)]);
-        let hours = days * 24 + u32::from(get(5));
+        // In u64: a server may send any day count (MySQL's own TIME stops
+        // at 34 days), and u32 arithmetic would overflow.
+        let hours = u64::from(days) * 24 + u64::from(get(5));
         let _ = write!(
             s,
             "{}{:02}:{:02}:{:02}",
@@ -817,5 +819,15 @@ mod tests {
         assert_eq!("ab".to_sql(&mut out).unwrap().ty, ColumnType::VAR_STRING);
         assert_eq!(None::<i32>.to_sql(&mut out).unwrap(), Encoded::NULL);
         assert_eq!(out, [0xFE, 0xFF, 7, 0, 0, 0, 2, b'a', b'b']);
+    }
+
+    #[test]
+    fn a_time_with_any_day_count_is_shown_not_overflowed() {
+        let time = col(ColumnType::TIME, 0, 63);
+        // 0xffff_ffff days: more than u32 hours can hold (found by fuzzing).
+        let raw = [0, 0xff, 0xff, 0xff, 0xff, 23, 59, 58];
+        assert_eq!(String::from_sql(&time, &raw).unwrap(), "103079215103:59:58");
+        let raw = [1, 34, 0, 0, 0, 22, 59, 59];
+        assert_eq!(String::from_sql(&time, &raw).unwrap(), "-838:59:59");
     }
 }

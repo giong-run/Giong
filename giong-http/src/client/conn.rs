@@ -4,7 +4,7 @@
 use std::io;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use giong::net::TcpStream;
 use giong::RecvBuf;
@@ -12,7 +12,8 @@ use giong_tls::{TlsConnector, TlsStream};
 
 use super::error::{Error, ErrorKind};
 use super::head::{parse_head, Framing, Head};
-use super::url::Origin;
+use super::proxy::{Route, Server};
+use super::ClientBuilder;
 use crate::chunked::{Decoder, Progress};
 use crate::parse::find_head_end;
 
@@ -79,19 +80,34 @@ pub(crate) struct Conn {
     pub(crate) idle_since: Instant,
 }
 
-/// The limits that apply while a response is read.
-pub(crate) struct Limits {
-    pub(crate) max_head_size: usize,
-    pub(crate) max_response_size: usize,
+/// A response whose head has been read. Its body is read with
+/// [`Body::read`], on the same connection.
+pub(crate) struct Answer {
+    pub(crate) head: Head,
+    /// Also holds the head's bytes, which `head`'s ranges point into.
+    pub(crate) body: Body,
 }
 
-/// A response read whole.
-pub(crate) struct Exchange {
-    pub(crate) head: Head,
-    /// The head's bytes, then the body (decoded, if it was chunked).
-    pub(crate) data: Vec<u8>,
-    /// The connection can carry another request.
-    pub(crate) reusable: bool,
+/// The body of a response, read as it arrives: the framing (length,
+/// chunked, until the connection closes) is taken off, nothing else.
+pub(crate) struct Body {
+    kind: Kind,
+    /// The head's bytes (the first `head` bytes), then bytes received;
+    /// those from `pos` on are not given out yet. It is the buffer the head
+    /// was read into, so neither the head nor what came with it is copied.
+    buf: Vec<u8>,
+    head: usize,
+    pos: usize,
+    /// The connection can carry another request, as far as known.
+    reusable: bool,
+    done: bool,
+}
+
+enum Kind {
+    Empty,
+    Length(u64),
+    Chunked(Decoder),
+    UntilClose,
 }
 
 /// Why an exchange failed.
@@ -111,23 +127,47 @@ impl Failure {
 }
 
 impl Conn {
-    /// Opens a connection to `origin`, with TLS when it is `https`.
+    /// Opens a connection on `route`: to the origin, or to the proxy (with
+    /// a tunnel through it for `https`), with TLS when the origin is
+    /// `https`.
     pub(crate) async fn open(
-        origin: &Origin,
+        route: &Route,
         tls: Option<&TlsConnector>,
-        connect_timeout: Duration,
+        config: &ClientBuilder,
     ) -> Result<Conn, Error> {
+        let origin = &route.origin;
+        let connect_timeout = config.connect_timeout;
         let connect = async {
-            let tcp = TcpStream::connect((origin.host.as_str(), origin.port))
-                .await
-                .map_err(|e| {
-                    Error::io(
-                        ErrorKind::Connect,
-                        format!("cannot connect to {origin} (is the host name right, and the server up?)"),
-                        e,
-                    )
-                })?;
+            let tcp = match &route.proxy {
+                None => TcpStream::connect((origin.host.as_str(), origin.port))
+                    .await
+                    .map_err(|e| {
+                        Error::io(
+                            ErrorKind::Connect,
+                            format!(
+                                "cannot connect to {origin} (is the host name right, and the server up?)"
+                            ),
+                            e,
+                        )
+                    })?,
+                Some(proxy) => TcpStream::connect((proxy.host.as_str(), proxy.port))
+                    .await
+                    .map_err(|e| {
+                        Error::io(
+                            ErrorKind::Connect,
+                            format!(
+                                "cannot connect to the proxy {proxy} (for {origin}); check the \
+                                 proxy's address, or leave {} out of it with Proxy::no_proxy",
+                                origin.host
+                            ),
+                            e,
+                        )
+                    })?,
+            };
             let _ = tcp.set_nodelay(true);
+            if let (Some(proxy), true) = (&route.proxy, origin.https) {
+                tunnel(&tcp, proxy, route, config.max_head_size).await?;
+            }
             let stream = match tls {
                 None => Stream::Tcp(tcp),
                 Some(connector) => {
@@ -148,14 +188,21 @@ impl Conn {
         };
         match giong::time::timeout(connect_timeout, connect).await {
             Ok(result) => result,
-            Err(_) => Err(Error::new(
-                ErrorKind::Connect,
-                format!(
-                    "connecting to {origin} took longer than the connect timeout of {connect_timeout:?}; \
-                     check that the host is reachable from here (a firewall that drops packets \
-                     looks like this), or raise ClientBuilder::connect_timeout"
-                ),
-            )),
+            Err(_) => {
+                let through = match &route.proxy {
+                    Some(proxy) => format!(" through the proxy {proxy}"),
+                    None => String::new(),
+                };
+                Err(Error::new(
+                    ErrorKind::Connect,
+                    format!(
+                        "connecting to {origin}{through} took longer than the connect timeout of \
+                         {connect_timeout:?}; check that the host is reachable from here (a \
+                         firewall that drops packets looks like this), or raise \
+                         ClientBuilder::connect_timeout"
+                    ),
+                ))
+            }
         }
     }
 
@@ -174,14 +221,15 @@ impl Conn {
         n != 0
     }
 
-    /// Sends `request` and reads the whole response to it.
-    pub(crate) async fn exchange(
+    /// Sends `request` and reads the head of the response to it, after
+    /// any 1xx (informational) responses.
+    pub(crate) async fn send(
         &mut self,
         request: Vec<u8>,
         head_request: bool,
-        limits: &Limits,
+        max_head_size: usize,
         what: &str,
-    ) -> Result<Exchange, Failure> {
+    ) -> Result<Answer, Failure> {
         if let Err(e) = self.stream.write_all(request).await {
             return Err(Failure::NothingReceived(Error::io(
                 ErrorKind::Closed,
@@ -194,15 +242,13 @@ impl Conn {
         let mut scanned: usize = 0;
         let mut informational = 0;
 
-        // The head, after any 1xx (informational) responses.
         let head = loop {
             let found = find_head_end(&buf, scanned.saturating_sub(3));
-            if found.unwrap_or(buf.len()) > limits.max_head_size {
+            if found.unwrap_or(buf.len()) > max_head_size {
                 return Err(Failure::Other(Error::new(
                     ErrorKind::TooLarge,
                     format!(
-                        "{what}: the response head is longer than {} bytes (ClientBuilder::max_head_size)",
-                        limits.max_head_size
+                        "{what}: the response head is longer than {max_head_size} bytes (ClientBuilder::max_head_size)"
                     ),
                 )));
             }
@@ -240,101 +286,22 @@ impl Conn {
             buf.extend_from_slice(&chunk);
         };
 
-        let head_len = head.len;
-        let mut reusable = !head.close;
-        let too_large = |what: &str| {
-            Failure::Other(Error::new(
-                ErrorKind::TooLarge,
-                format!(
-                    "{what}: the response body is larger than {} bytes (ClientBuilder::max_response_size)",
-                    limits.max_response_size
-                ),
-            ))
+        let pos = head.len;
+        let kind = match head.framing(head_request) {
+            Framing::None => Kind::Empty,
+            Framing::Length(n) => Kind::Length(n),
+            Framing::Chunked => Kind::Chunked(Decoder::new(usize::MAX)),
+            Framing::UntilClose => Kind::UntilClose,
         };
-        match head.framing(head_request) {
-            Framing::None => {
-                reusable &= buf.len() == head_len;
-                buf.truncate(head_len);
-            }
-            Framing::Length(n) => {
-                if n > limits.max_response_size as u64 {
-                    return Err(too_large(what));
-                }
-                let want = head_len + n as usize;
-                buf.reserve(want.saturating_sub(buf.len()));
-                while buf.len() < want {
-                    let chunk = self.recv(what, true, "the response body").await?;
-                    buf.extend_from_slice(&chunk);
-                }
-                // Bytes after the body belong to no request.
-                reusable &= buf.len() == want;
-                buf.truncate(want);
-            }
-            Framing::Chunked => {
-                let mut decoder = Decoder::new(limits.max_response_size);
-                loop {
-                    match decoder.feed(&buf[head_len..]) {
-                        Ok(Progress::Done(n)) => {
-                            reusable &= head_len + n == buf.len();
-                            buf.truncate(head_len);
-                            buf.extend_from_slice(&decoder.body);
-                            break;
-                        }
-                        Ok(Progress::NeedMore) => {
-                            let chunk = self.recv(what, true, "the chunked response body").await?;
-                            buf.extend_from_slice(&chunk);
-                        }
-                        Err(413) => return Err(too_large(what)),
-                        Err(_) => {
-                            return Err(protocol(what, "the chunked body is malformed"));
-                        }
-                    }
-                }
-            }
-            Framing::UntilClose => {
-                reusable = false;
-                if buf.len() - head_len > limits.max_response_size {
-                    return Err(too_large(what));
-                }
-                loop {
-                    let chunk = match self.stream.recv().await {
-                        Ok(chunk) => chunk,
-                        Err(e) => {
-                            return Err(Failure::Other(Error::io(
-                                ErrorKind::Closed,
-                                format!("{what}: reading the response body failed"),
-                                e,
-                            )))
-                        }
-                    };
-                    if chunk.is_empty() {
-                        // Without close_notify the body may have been cut
-                        // short on the way (a truncation attack).
-                        if !self.stream.ended_cleanly() {
-                            return Err(Failure::Other(Error::new(
-                                ErrorKind::Closed,
-                                format!(
-                                    "{what}: the server closed the connection without a TLS \
-                                     close_notify, so the response body, which ends where \
-                                     the connection does, may have been cut short"
-                                ),
-                            )));
-                        }
-                        break;
-                    }
-                    if buf.len() - head_len + chunk.len() > limits.max_response_size {
-                        return Err(too_large(what));
-                    }
-                    buf.extend_from_slice(&chunk);
-                }
-            }
-        }
-        self.idle_since = Instant::now();
-        Ok(Exchange {
-            head,
-            data: buf,
-            reusable,
-        })
+        let body = Body {
+            kind,
+            buf,
+            head: pos,
+            pos,
+            reusable: !head.close,
+            done: false,
+        };
+        Ok(Answer { head, body })
     }
 
     /// The next bytes of the response; the end of the stream is an error.
@@ -370,4 +337,256 @@ fn protocol(what: &str, message: &str) -> Failure {
         ErrorKind::Protocol,
         format!("{what}: the response is not valid HTTP/1.1: {message}"),
     ))
+}
+
+/// Asks `proxy` for a tunnel to the route's origin (`CONNECT host:port`)
+/// and reads its answer. The bytes that follow a 2xx answer belong to the
+/// server, so the answer is read without reading past it: the server only
+/// speaks once TLS has, and anything after the answer's head is an error.
+async fn tunnel(
+    tcp: &TcpStream,
+    proxy: &Server,
+    route: &Route,
+    max_head_size: usize,
+) -> Result<(), Error> {
+    let origin = &route.origin;
+    let authority = if origin.host.contains(':') {
+        format!("[{}]:{}", origin.host, origin.port)
+    } else {
+        format!("{}:{}", origin.host, origin.port)
+    };
+    let mut request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+    if let Some(auth) = &proxy.authorization {
+        request.push_str("Proxy-Authorization: ");
+        request.push_str(auth);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    let what = format!("the proxy {proxy}, asked for a tunnel to {authority},");
+    tcp.write_all(request.into_bytes()).await.0.map_err(|e| {
+        Error::io(
+            ErrorKind::Connect,
+            format!("{what} could not be sent the request"),
+            e,
+        )
+    })?;
+    let mut buf = Vec::new();
+    let end = loop {
+        if let Some(end) = find_head_end(&buf, 0) {
+            break end;
+        }
+        if buf.len() > max_head_size {
+            return Err(Error::proxy(
+                None,
+                format!("{what} answered with a head longer than {max_head_size} bytes"),
+            ));
+        }
+        let chunk = tcp.recv().await.map_err(|e| {
+            Error::io(
+                ErrorKind::Connect,
+                format!("{what} failed while answering"),
+                e,
+            )
+        })?;
+        if chunk.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Connect,
+                format!("{what} closed the connection without answering"),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    };
+    let head = parse_head(&buf[..end])
+        .map_err(|m| Error::proxy(None, format!("{what} sent an answer that is not HTTP: {m}")))?;
+    match head.status {
+        200..=299 if buf.len() == end => Ok(()),
+        200..=299 => Err(Error::proxy(
+            Some(head.status),
+            format!("{what} sent bytes after its answer, before TLS began"),
+        )),
+        407 => Err(Error::proxy(
+            Some(407),
+            format!(
+                "{what} asks for credentials (407 Proxy Authentication Required); {}",
+                if proxy.authorization.is_some() {
+                    "the user name and password in the proxy URL were refused"
+                } else {
+                    "put them in the proxy URL: http://user:password@host:port"
+                }
+            ),
+        )),
+        status => Err(Error::proxy(
+            Some(status),
+            format!(
+                "{what} refused it with status {status}{}",
+                match status {
+                    403 =>
+                        "; the proxy's rules do not allow this host or port (add it to \
+                            Proxy::no_proxy if it should be reached directly)",
+                    502 | 504 => "; the proxy could not reach the server",
+                    _ => "",
+                }
+            ),
+        )),
+    }
+}
+
+impl Body {
+    /// Whether the whole body has been read.
+    pub(crate) fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Whether the connection can carry another request: the body was
+    /// read to its end, the server did not ask to close, and nothing came
+    /// after the body.
+    pub(crate) fn reusable(&self) -> bool {
+        self.done && self.reusable
+    }
+
+    /// The head's bytes, which the head's ranges point into. Empty once
+    /// [`Body::take_with_head`] took them.
+    pub(crate) fn head_bytes(&self) -> &[u8] {
+        &self.buf[..self.head]
+    }
+
+    /// The length the server announced, if it did.
+    pub(crate) fn length(&self) -> Option<u64> {
+        match self.kind {
+            Kind::Length(n) if !self.done => Some(n),
+            Kind::Empty => Some(0),
+            _ => None,
+        }
+    }
+
+    /// For a body with a length, read whole: the buffer the head was read
+    /// into, head and all, with as much of the body as came with it, to
+    /// append the rest to. Saves copying what came with the head.
+    pub(crate) fn take_with_head(&mut self) -> Option<Vec<u8>> {
+        let Kind::Length(left) = &mut self.kind else {
+            return None;
+        };
+        if self.done {
+            return None;
+        }
+        let n = (*left).min((self.buf.len() - self.pos) as u64) as usize;
+        let mut data = std::mem::take(&mut self.buf);
+        if data.len() > self.pos + n {
+            // Bytes after the body belong to no request.
+            self.reusable = false;
+            data.truncate(self.pos + n);
+        }
+        *left -= n as u64;
+        self.head = 0;
+        self.pos = 0;
+        Some(data)
+    }
+
+    /// Appends the next bytes of the body to `out`, waiting for them if
+    /// none have arrived. Returns `false`, and appends nothing, once the
+    /// body has ended.
+    pub(crate) async fn read(
+        &mut self,
+        conn: &Conn,
+        out: &mut Vec<u8>,
+        what: &str,
+    ) -> Result<bool, Error> {
+        loop {
+            if self.done {
+                return Ok(false);
+            }
+            match &mut self.kind {
+                Kind::Empty | Kind::Length(0) => {
+                    // Bytes after the body belong to no request.
+                    self.reusable &= self.pos == self.buf.len();
+                    self.buf.truncate(self.head);
+                    self.pos = self.head;
+                    self.done = true;
+                    return Ok(false);
+                }
+                Kind::Length(left) => {
+                    if self.pos == self.buf.len() {
+                        let chunk = conn
+                            .recv(what, true, "the response body")
+                            .await
+                            .map_err(Failure::into_error)?;
+                        let n = (*left).min(chunk.len() as u64) as usize;
+                        out.extend_from_slice(&chunk[..n]);
+                        *left -= n as u64;
+                        self.buf.truncate(self.head);
+                        self.buf.extend_from_slice(&chunk[n..]);
+                        self.pos = self.head;
+                    } else {
+                        let n = (*left).min((self.buf.len() - self.pos) as u64) as usize;
+                        out.extend_from_slice(&self.buf[self.pos..self.pos + n]);
+                        self.pos += n;
+                        *left -= n as u64;
+                    }
+                    return Ok(true);
+                }
+                Kind::Chunked(decoder) => match decoder.feed(&self.buf[self.pos..]) {
+                    Ok(Progress::Done(n)) => {
+                        self.reusable &= self.pos + n == self.buf.len();
+                        self.buf.truncate(self.head);
+                        self.pos = self.head;
+                        self.done = true;
+                        let any = !decoder.body.is_empty();
+                        out.append(&mut decoder.body);
+                        return Ok(any);
+                    }
+                    Ok(Progress::NeedMore) => {
+                        self.pos += decoder.consume();
+                        if !decoder.body.is_empty() {
+                            out.append(&mut decoder.body);
+                            return Ok(true);
+                        }
+                        self.buf.drain(self.head..self.pos);
+                        self.pos = self.head;
+                        let chunk = conn
+                            .recv(what, true, "the chunked response body")
+                            .await
+                            .map_err(Failure::into_error)?;
+                        self.buf.extend_from_slice(&chunk);
+                    }
+                    Err(_) => {
+                        return Err(protocol(what, "the chunked body is malformed").into_error());
+                    }
+                },
+                Kind::UntilClose => {
+                    self.reusable = false;
+                    if self.pos < self.buf.len() {
+                        out.extend_from_slice(&self.buf[self.pos..]);
+                        self.buf.truncate(self.head);
+                        self.pos = self.head;
+                        return Ok(true);
+                    }
+                    let chunk = conn.stream.recv().await.map_err(|e| {
+                        Error::io(
+                            ErrorKind::Closed,
+                            format!("{what}: reading the response body failed"),
+                            e,
+                        )
+                    })?;
+                    if chunk.is_empty() {
+                        // Without close_notify the body may have been cut
+                        // short on the way (a truncation attack).
+                        if !conn.stream.ended_cleanly() {
+                            return Err(Error::new(
+                                ErrorKind::Closed,
+                                format!(
+                                    "{what}: the server closed the connection without a TLS \
+                                     close_notify, so the response body, which ends where \
+                                     the connection does, may have been cut short"
+                                ),
+                            ));
+                        }
+                        self.done = true;
+                        return Ok(false);
+                    }
+                    out.extend_from_slice(&chunk);
+                    return Ok(true);
+                }
+            }
+        }
+    }
 }

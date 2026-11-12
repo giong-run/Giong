@@ -57,6 +57,11 @@ mod connect;
 mod error;
 #[cfg(test)]
 mod fuzz_tests;
+/// Entry points for the fuzz targets in `giong-postgres/fuzz`, built only for them
+/// (`cargo fuzz` sets `--cfg fuzzing`) and the tests. Not part of the API.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzzing;
 mod pool;
 mod protocol;
 mod row;

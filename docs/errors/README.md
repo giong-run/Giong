@@ -69,6 +69,7 @@ reused or renumbered, and its page stays when it is no longer raised.
 | [GIONG-E1107](E1107.md) | `HttpClientProtocol` | malformed HTTP response |
 | [GIONG-E1108](E1108.md) | `HttpClientStatus` | HTTP error status |
 | [GIONG-E1109](E1109.md) | `HttpClientDecode` | cannot decode the response body |
+| [GIONG-E1110](E1110.md) | `HttpClientProxy` | the HTTP proxy refused the request |
 
 ## giong-tls
 

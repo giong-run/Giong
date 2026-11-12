@@ -135,3 +135,60 @@ fn the_response_head_parser_never_panics_and_its_ranges_hold() {
     }
     assert!(parsed > 1_000, "only {parsed} URLs were parsed");
 }
+
+#[cfg(feature = "client")]
+#[test]
+fn compressed_bodies_decode_or_fail_cleanly_whatever_the_bytes() {
+    use crate::client::fuzzing::check_inflate;
+    // A gzip member and a zlib stream of the same text, made by hand from
+    // a stored (uncompressed) deflate block, so this needs no encoder.
+    let text = b"{\"id\":7,\"name\":\"giong\"}";
+    let mut stored = vec![1u8];
+    stored.extend((text.len() as u16).to_le_bytes());
+    stored.extend((!(text.len() as u16)).to_le_bytes());
+    stored.extend(text);
+    let mut gzip = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    gzip.extend(&stored);
+    let mut crc = !0u32;
+    for &b in text {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xedb8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    gzip.extend((!crc).to_le_bytes());
+    gzip.extend((text.len() as u32).to_le_bytes());
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in text {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    let mut zlib = vec![0x78, 0x01];
+    zlib.extend(&stored);
+    zlib.extend(((b << 16) | a).to_be_bytes());
+    // Untouched, both decode.
+    assert!(check_inflate(&[[0u8, 9, 9].as_slice(), &gzip].concat()));
+    assert!(check_inflate(&[[1u8, 9, 9].as_slice(), &zlib].concat()));
+
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut decoded = 0;
+    for round in 0..50_000 {
+        let mut input = if round % 2 == 0 {
+            gzip.clone()
+        } else {
+            zlib.clone()
+        };
+        if round % 7 != 0 {
+            mutate(&mut rng, &mut input);
+        }
+        let how = (rng.below(256) as u8 & !1) | (round % 2) as u8;
+        let limit = (rng.below(64) as u16).to_le_bytes();
+        let data = [[how, limit[0], limit[1]].as_slice(), &input].concat();
+        decoded += usize::from(check_inflate(&data));
+    }
+    assert!(decoded > 1_000, "only {decoded} bodies decoded");
+}

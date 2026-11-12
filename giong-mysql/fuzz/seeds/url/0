@@ -1,0 +1,1 @@
+mysql://app:s%40cret@db.internal:3306/shop?ssl-mode=VERIFY_IDENTITY&connect-timeout=5

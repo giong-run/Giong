@@ -47,8 +47,13 @@ pub enum ErrorKind {
     /// [`Response::error_for_status`](super::Response::error_for_status)
     /// found a 4xx or 5xx status.
     Status,
-    /// The body could not be read as asked, such as text that is not UTF-8.
+    /// The body could not be read as asked: text that is not UTF-8, or a
+    /// compressed body that is damaged or cut short.
     Decode,
+    /// The proxy refused the tunnel to an `https` server (`407 Proxy
+    /// Authentication Required`, `403`...) or did not answer as a proxy
+    /// does. [`Error::status`] has its status, if it sent one.
+    Proxy,
 }
 
 impl ErrorKind {
@@ -64,6 +69,7 @@ impl ErrorKind {
             ErrorKind::Protocol => Code::HttpClientProtocol,
             ErrorKind::Status => Code::HttpClientStatus,
             ErrorKind::Decode => Code::HttpClientDecode,
+            ErrorKind::Proxy => Code::HttpClientProxy,
         }
     }
 }
@@ -96,6 +102,15 @@ impl Error {
         }))
     }
 
+    pub(crate) fn proxy(status: Option<u16>, message: impl Into<String>) -> Self {
+        Self(Arc::new(Inner {
+            kind: ErrorKind::Proxy,
+            message: message.into(),
+            status,
+            source: None,
+        }))
+    }
+
     pub(crate) fn request(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Request, message)
     }
@@ -110,7 +125,8 @@ impl Error {
         self.0.kind.giong_code()
     }
 
-    /// The response's status, for [`ErrorKind::Status`].
+    /// The response's status, for [`ErrorKind::Status`]; the proxy's, for
+    /// [`ErrorKind::Proxy`].
     pub fn status(&self) -> Option<u16> {
         self.0.status
     }
@@ -202,9 +218,10 @@ mod tests {
             ErrorKind::Protocol,
             ErrorKind::Status,
             ErrorKind::Decode,
+            ErrorKind::Proxy,
         ];
         let mut codes: Vec<u16> = kinds.iter().map(|k| k.giong_code().number()).collect();
         codes.dedup();
-        assert_eq!(codes, (1101..=1109).collect::<Vec<_>>());
+        assert_eq!(codes, (1101..=1110).collect::<Vec<_>>());
     }
 }

@@ -13,7 +13,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Error codes.** Every error that giong, giong-http's client, giong-tls, giong-postgres,
   giong-mysql and giong-redis raise starts with a stable code (`GIONG-E0102: no address
   found for db.internal. Fix: …`), says what went wrong and how to fix it, and ends with a
-  link to the code's page in [docs/errors](docs/errors/README.md): 65 codes. Functions still return `io::Error`;
+  link to the code's page in [docs/errors](docs/errors/README.md): 66 codes. Functions still return `io::Error`;
   `giong::error::code(&err)` finds the `giong::error::Code` in it, down the chain of
   sources, so programs can match on the code instead of the message. Errors passed on from
   the kernel (connection refused, …) are unchanged and have no code.
@@ -22,10 +22,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   live in `src/notify.rs` and are model-checked with
   [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
   CI job). `tests/wake.rs` runs the lost-wake-up race on real hardware.
-- **Verification**: coverage-guided fuzzing of `giong-http` with cargo-fuzz: the
-  request-head parser, the chunked decoder, and a whole connection served over an
-  in-memory transport, in pieces of random size (`giong-http/fuzz/`). CI fuzzes each
-  target for 10 minutes every night, keeping the corpus, and briefly on pull requests.
+- **Verification**: coverage-guided fuzzing with cargo-fuzz of everything that reads bytes
+  from the network: in `giong-http`, the request-head parser, the chunked decoder, a whole
+  connection served over an in-memory transport, and the client's response heads, URLs
+  and gzip/deflate decoder (`giong-http/fuzz/`); the PostgreSQL messages, SCRAM exchange
+  and URLs (`giong-postgres/fuzz/`); the MySQL packets, framing, rows and URLs
+  (`giong-mysql/fuzz/`); RESP3 replies and URLs (`giong-redis/fuzz/`). CI fuzzes each of
+  the 15 targets for 10 minutes every night, keeping the corpus, and briefly on pull
+  requests.
+- **Verification**: a `servers` CI job runs the database crates against PostgreSQL 14, 15
+  and 17, MySQL 8.4 and 9.1, Redis 6.2 and 7.4 and Valkey 8.0, besides the PostgreSQL 16,
+  MySQL 8.0 and Redis 7.0 of the other jobs.
 - **Verification**: a soak test (`tests/soak.rs`, `scripts/check.sh soak`): every
   worker serves TCP echo to clients on all workers that close cleanly, abort, half-close
   or cancel receives, alongside UDP, file and cross-worker traffic; afterwards no
@@ -54,8 +61,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     Redirects followed (up to 10; never from HTTPS to HTTP; credentials kept to their
     origin). Every request has a timeout (30 s) and every response a size limit (16 MiB).
     Strict reading: an ambiguous response is an error, and its connection is not used
-    again. Errors have the codes GIONG-E1101 to E1109 and say whether a retry can help
-    (`Error::is_transient`). On one core, with 64 connections, it sends 1.6 to 1.8 times
+    again. HTTP proxies when given one (`ClientBuilder::proxy`, or `Proxy::from_env` for
+    `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY` with host suffixes and address ranges),
+    with `https` through a `CONNECT` tunnel and credentials sent only to the proxy.
+    gzip and deflate bodies are asked for and decompressed, the limit applying to what
+    comes out, so a small "zip bomb" fails instead of filling memory; the gzip checksum
+    is checked and a body cut short is an error. `RequestBuilder::send_streaming` gives
+    a `StreamingResponse` whose body is read piece by piece (`chunk()`), of any size,
+    with the timeout applying to each piece. Errors have the codes GIONG-E1101 to E1110
+    and say whether a retry can help
+    (`Error::is_transient`). On one core, with 64 connections, it sends 1.6 to 2.0 times
     as many requests per second as reqwest, with a lower p99 (`bench/http-client.sh`).
   - A response body of 32 KiB or more is no longer copied after its head: the two go
     out in one vectored write over TCP and Unix sockets. On one worker, a 64 KiB static

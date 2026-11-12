@@ -71,20 +71,28 @@ scripts/kernels.sh           # the suite on real 6.0 and 6.1 kernels in QEMU; ne
 scripts/valgrind.sh          # needs valgrind; takes a few minutes
 ```
 
-A change to the HTTP parser or the connection state machine in `giong-http` should be
-fuzzed for a few minutes (needs nightly and `cargo install cargo-fuzz`):
+A change to code that reads bytes from the network (a parser, a decoder, a connection
+state machine) should be fuzzed for a few minutes (needs nightly and
+`cargo install cargo-fuzz`). Each crate that has such code has a `fuzz/` directory:
 
 ```bash
 cd giong-http
-cargo +nightly fuzz run head        # the request-head parser
-cargo +nightly fuzz run chunked     # the chunked body decoder
-cargo +nightly fuzz run connection  # a whole connection, over an in-memory transport
+cargo +nightly fuzz run head           # the server's request-head parser
+cargo +nightly fuzz run chunked        # the chunked body decoder
+cargo +nightly fuzz run connection     # a whole connection, over an in-memory transport
+cargo +nightly fuzz run response_head  # the client's response-head parser
+cargo +nightly fuzz run url            # URLs and redirect locations
+cargo +nightly fuzz run inflate        # gzip and deflate bodies
+cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
+cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
+cd ../giong-redis && cargo +nightly fuzz run replies       # also: url
 ```
 
-The targets live in `giong-http/fuzz/`, with starting inputs in `fuzz/seeds/`; what they
-check is in `giong-http/src/invariants.rs` and `fuzz/fuzz_targets/connection.rs`. CI
-fuzzes every night and on pull requests that touch `giong-http`. If a target finds a
-crash, add the input as a regression test.
+Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's
+`src/fuzzing.rs` (in `giong-http`, `src/invariants.rs`, `src/client/mod.rs` and
+`fuzz/fuzz_targets/connection.rs`). The randomised tests (`src/fuzz_tests.rs`) run the
+same checks on every `cargo test`. CI fuzzes every night and on pull requests that touch
+these crates. If a target finds a crash, add the input as a regression test.
 
 A change to how a worker is woken from another thread (`src/notify.rs`, the injector,
 `TaskWaker`) needs its loom model updated in the same pull request.

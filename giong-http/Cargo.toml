@@ -15,15 +15,18 @@ categories = ["web-programming::http-server", "web-programming::http-client", "n
 [features]
 # HTTPS through `Server::serve_tls`, using giong-tls (rustls).
 tls = ["dep:giong-tls"]
-# The HTTP/1.1 client in `giong_http::client`, with HTTPS through giong-tls.
-client = ["dep:giong-tls", "dep:libc"]
+# The HTTP/1.1 client in `giong_http::client`, with HTTPS through giong-tls
+# and gzip/deflate bodies decoded with miniz_oxide.
+client = ["dep:giong-tls", "dep:libc", "dep:miniz_oxide"]
 
 [dependencies]
 giong = { path = "..", version = "0.2.1" }
 giong-tls = { path = "../giong-tls", version = "0.2.1", optional = true }
 libc = { version = "0.2", optional = true }
+miniz_oxide = { version = "0.9", optional = true }
 
 [dev-dependencies]
+miniz_oxide = "0.9"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 

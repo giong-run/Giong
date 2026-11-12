@@ -13,7 +13,7 @@ workspace, six crates:
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring driver, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library, HTTPS behind the `tls` feature; an HTTP/1.1 client behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library, HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
@@ -77,8 +77,10 @@ python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the 
 
 Continuous integration requires five checks on every pull request: `lint` (fmt, clippy,
 doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
-CI also runs `loom` and the `kernels` jobs on every pull request, and fuzzes `giong-http`
-and runs the soak test every night.
+CI also runs `loom`, the `kernels` jobs and the database crates against other server
+versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
+`giong-postgres`, `giong-mysql`, `giong-redis`, each in its `fuzz/`) and runs the soak test
+every night.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run; `scripts/check.sh fallback` does this for you.
@@ -106,10 +108,10 @@ run; `scripts/check.sh fallback` does this for you.
    on from the kernel stay as they are. A message that starts with `GIONG-E0102` is
    explained in `docs/errors/E0102.md`. No unbounded defaults: every timeout and size
    limit is finite and documented.
-7. **Wake-ups and the HTTP parser have their own checks.** A change to `src/notify.rs`,
+7. **Wake-ups and the parsers have their own checks.** A change to `src/notify.rs`,
    the injector or `TaskWaker` updates its loom model in the same pull request. A change
-   to the `giong-http` parser or connection state machine is fuzzed for a few minutes
-   first (`giong-http/fuzz/`, commands in CONTRIBUTING.md).
+   to a parser or connection state machine is fuzzed for a few minutes first (each crate's
+   `fuzz/`, commands in CONTRIBUTING.md).
 8. **Performance claims need numbers**: before and after, the median of several runs with
    the spread, the machine and kernel. Never write a number you did not measure.
 

@@ -1,0 +1,1 @@
+mysql://app@/shop?socket=/var/run/mysqld/mysqld.sock

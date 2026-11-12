@@ -161,7 +161,6 @@ fn start(bin: PathBuf) -> Server {
         .args(["--save", ""])
         .args(["--appendonly", "no"])
         .args(["--databases", "16"])
-        .args(["--enable-debug-command", "yes"])
         // Each word of a setting is an argument of its own.
         .args(["--user", "default", "on", "nopass", "~*", "&*", "+@all"])
         .args([
@@ -175,6 +174,11 @@ fn start(bin: PathBuf) -> Server {
         ])
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
+    // DEBUG (for DEBUG SLEEP) is off by default since Redis 7.0, which added
+    // this setting; Redis 6.2 does not know it, and allows DEBUG anyway.
+    if major_version(&bin) >= 7 {
+        cmd.args(["--enable-debug-command", "yes"]);
+    }
     // The server dies with the thread that started it, even when the test
     // binary is killed; the thread waits for it, so lives as long as it.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -230,4 +234,18 @@ fn start(bin: PathBuf) -> Server {
         version,
         dir,
     }
+}
+
+/// The major version `redis-server --version` reports (`v=7.0.15`; Valkey
+/// says `v=8.0.1` too), or 0 if it cannot be read.
+fn major_version(bin: &std::path::Path) -> u32 {
+    let Ok(out) = Command::new(bin).arg("--version").output() else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find_map(|w| w.strip_prefix("v="))
+        .and_then(|v| v.split('.').next())
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0)
 }

@@ -1,15 +1,11 @@
 //! Randomised robustness tests: whatever a server (or a URL, or a key file)
 //! sends, the parsers return a verdict without panicking.
 
-use std::time::SystemTime;
-
 use crate::auth::{self, RsaPublicKey};
 use crate::config::Config;
-use crate::connect::{Message, ReadBuf};
-use crate::error::DbError;
+use crate::fuzzing::{all_columns, check_payload, framing, rows};
 use crate::protocol;
-use crate::row::{Column, RowsBuilder};
-use crate::types::{Bits, ColumnType};
+use crate::row::Column;
 
 /// xorshift64*: deterministic, so a failure can be reproduced from its seed.
 struct Rng(u64);
@@ -107,13 +103,7 @@ fn the_packet_parsers_never_panic() {
     for _ in 0..20_000 {
         let mut input = seeds[rng.below(seeds.len())].clone();
         mutate(&mut rng, &mut input);
-        let _ = protocol::handshake(&input);
-        let _ = protocol::ok(&input);
-        let _ = protocol::err(&input);
-        let _ = DbError::parse(&input);
-        let _ = protocol::column_def(&input);
-        let _ = protocol::prepare_ok(&input);
-        let _ = protocol::is_end_of_rows(&input);
+        check_payload(&input);
     }
 }
 
@@ -128,41 +118,9 @@ fn packets_are_framed_whatever_the_bytes() {
         let mut input = stream.clone();
         mutate(&mut rng, &mut input);
         let limit = [16, 100, 1 << 20][rng.below(3)];
-        let mut buf = ReadBuf::new();
-        let mut at = 0;
         // Fed in pieces of random size, as the network might.
-        while at < input.len() {
-            let n = 1 + rng.below(input.len() - at);
-            buf.extend(&input[at..at + n]);
-            at += n;
-            while let Some(m) = buf.next(limit) {
-                if let Message::Here { payload, .. } = m {
-                    assert!(payload.len() <= limit);
-                    let _ = protocol::ok(buf.bytes(payload.clone()));
-                    buf.consume(&payload);
-                }
-            }
-        }
+        framing(&input, limit, |left| 1 + rng.below(left));
     }
-}
-
-/// Columns of every type, signed and unsigned, text and binary.
-fn all_columns() -> Vec<Column> {
-    let mut cols = Vec::new();
-    for code in [
-        0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 242, 245, 246, 247, 248, 249, 250,
-        251, 252, 253, 254, 255, 100,
-    ] {
-        for (flags, collation) in [(0, 255), (32, 63)] {
-            cols.push(Column::for_tests(
-                "c",
-                ColumnType::from_code(code),
-                flags,
-                collation,
-            ));
-        }
-    }
-    cols
 }
 
 #[test]
@@ -178,27 +136,7 @@ fn rows_and_values_never_panic() {
             payload.push(rng.next() as u8);
         }
         mutate(&mut rng, &mut payload);
-        let mut b = RowsBuilder::default();
-        if b.push(&payload, &cols, 1 << 20).is_err() {
-            continue;
-        }
-        for row in b.finish(cols.clone().into()).into_rows() {
-            for i in 0..n {
-                let _ = row.get::<i64>(i);
-                let _ = row.get::<u64>(i);
-                let _ = row.get::<i8>(i);
-                let _ = row.get::<bool>(i);
-                let _ = row.get::<f64>(i);
-                let _ = row.get::<f32>(i);
-                let _ = row.get::<&str>(i);
-                let _ = row.get::<String>(i);
-                let _ = row.get::<&[u8]>(i);
-                let _ = row.get::<Bits>(i);
-                let _ = row.get::<SystemTime>(i);
-                let _ = row.get::<Option<String>>(i);
-            }
-            let _ = format!("{row:?}");
-        }
+        rows(&payload, &cols);
     }
 }
 

@@ -1,0 +1,1 @@
+postgres://app:secret@db.internal:5432/shop?sslmode=disable&application_name=api
