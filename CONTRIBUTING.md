@@ -64,8 +64,12 @@ threads, also run:
 
 ```bash
 scripts/check.sh tsan        # ThreadSanitizer; needs nightly with the rust-src component
+scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/valgrind.sh          # needs valgrind; takes a few minutes
 ```
+
+A change to how a worker is woken from another thread (`src/notify.rs`, the injector,
+`TaskWaker`) needs its loom model updated in the same pull request.
 
 ## Rules for the code
 

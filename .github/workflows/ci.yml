@@ -72,3 +72,12 @@ jobs:
       # address-space randomisation.
       - run: sudo sysctl vm.mmap_rnd_bits=28
       - run: ROUNDS=2 scripts/check.sh tsan
+
+  # Model-check the wake-up handshakes in src/notify.rs with loom, then run the
+  # same race on the runner's real CPUs.
+  loom:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: scripts/check.sh loom

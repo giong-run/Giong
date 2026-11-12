@@ -8,6 +8,23 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- A wake-up from another thread could be lost, leaving the task asleep until
+  something else woke it. The executor cleared a task's "queued" flag with a
+  plain store before polling it; a waker that published new state and then saw
+  the flag still set skipped the enqueue, while the poll could read the state
+  from before the wake-up. It needs state that is shared without a lock (a
+  `Mutex` hides it), and on x86 it hit about 70 in a million such wake-ups. The
+  flag is now cleared with a swap, which synchronises with the waker.
+
+### Added
+
+- **Verification**: the wake-up handshakes between workers and other threads
+  live in `src/notify.rs` and are model-checked with
+  [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
+  CI job). `tests/wake.rs` runs the lost-wake-up race on real hardware.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.
