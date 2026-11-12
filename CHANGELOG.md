@@ -8,6 +8,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **Networking**
+  - Name resolution that does not block the worker: `net::lookup_host` and
+    `net::Resolver`. Reads `/etc/hosts`, then asks the servers in `/etc/resolv.conf`
+    with `A` and `AAAA` queries in parallel over UDP, again over TCP when an answer is
+    truncated, follows CNAMEs, applies the search list and `ndots` (so Kubernetes
+    service names work), fails over to the next server, and caches answers for their
+    TTL (at most 5 minutes). Reloads the files when they change.
+  - `TcpStream::connect` with several addresses tries them the Happy Eyeballs way
+    (RFC 8305): families alternate and each attempt gets 250 ms before the next starts
+    alongside it, so an address that never answers no longer costs a TCP timeout.
+
+### Changed
+
+- **Breaking:** `TcpStream::connect` takes the new `net::ToSocketAddrs` instead of
+  `std::net::ToSocketAddrs`, and resolves host names without blocking. Socket addresses,
+  `(ip, port)`, `"host:port"`, `(host, port)` and slices of addresses work as before;
+  custom implementations of the standard trait no longer do. `bind` is unchanged.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

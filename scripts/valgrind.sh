@@ -9,6 +9,9 @@
 # and so stalls programs with more than one thread waiting in it:
 #   * tests/multi.rs and tests/spin.rs
 #   * net::interoperates_with_blocking_std_clients
+#   * the tests in tests/dns.rs that ask the fake DNS server, which answers
+#     from its own thread (they time out under valgrind); the unit tests in
+#     src/net/dns.rs cover the parsing and the query ids
 #
 # Note that valgrind cannot see the kernel writing into memory, so a clean run
 # does not by itself prove cancellation safety; tests/cancel.rs covers that.

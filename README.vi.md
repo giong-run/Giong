@@ -131,7 +131,8 @@ Muốn HTTPS thì bật feature `tls` và gọi `serve_tls` với một `giong_t
 |---|---|
 | Khởi chạy | `block_on`, `Builder` (`workers`, `pin_cores`, `spin_before_park`, `recv_buffers`, `shutdown_on_signals`, `shutdown_grace`) |
 | Task | `spawn`, `JoinHandle::abort`, `yield_now`; future không cần `Send` |
-| TCP | `TcpListener`, `TcpStream` (`recv`, `read`, `write`, `write_all`) |
+| TCP | `TcpListener`, `TcpStream` (`connect` phân giải tên không chặn, `recv`, `read`, `write`, `write_all`) |
+| Tên miền | `net::lookup_host`, `net::Resolver` (`/etc/hosts`, rồi DNS qua UDP và TCP, search list, cache) |
 | Unix socket | `UnixListener`, `UnixStream` (giống `TcpStream`, thêm `pair`) |
 | UDP | `UdpSocket` (`recv_from`, `recv` dùng buffer của pool; `read_from`, `read` dùng buffer riêng; `send_to`, `send`) |
 | File | `fs::File` (`read_at`, `write_at`, `write_all_at`, `sync_all`, `metadata`, `close`), `fs::read`, `fs::write`, `rename`, `remove_file`, `create_dir` |
@@ -142,7 +143,7 @@ Muốn HTTPS thì bật feature `tls` và gọi `serve_tls` với một `giong_t
 
 ## Giới hạn hiện tại
 
-- Chưa có DNS bất đồng bộ, HTTP/2, body HTTP dạng stream, TLS phía client.
+- Chưa có HTTP/2, body HTTP dạng stream, TLS phía client. Phân giải tên chỉ dùng `/etc/hosts` và DNS.
 - `giong-tls` chưa được kiểm toán bảo mật độc lập; phần mật mã là của rustls.
 - Không tương thích hệ sinh thái Tokio (hyper, sqlx, reqwest không chạy được).
 - Task không chuyển core.
