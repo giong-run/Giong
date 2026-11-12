@@ -65,6 +65,12 @@ impl Drop for Statement {
     }
 }
 
+/// Why a shared connection was closed under its statements.
+const LEFT_OPEN: &str = "a statement sent through the pool's shared methods (Pool::batch_execute) \
+     left a transaction open on a connection other tasks share, so the connection was closed and \
+     the transaction rolled back, with every statement sent on it since BEGIN, this one included. \
+     Run transactions on a connection of the task's own: pool.get().await?.transaction()";
+
 /// The state shared by a client and its two tasks.
 struct Conn {
     weak: Weak<Conn>,
@@ -75,6 +81,12 @@ struct Conn {
     head_since: Cell<Option<giong::time::Instant>>,
     config: Config,
     key: Option<(i32, i32)>,
+    /// Several tasks send statements on this connection at once (it is among
+    /// a pool's shared connections): none of them may leave a transaction
+    /// open, which would take in the statements of the others.
+    shared: Cell<bool>,
+    /// Woken when nothing is in flight any more, or the connection fails.
+    idle_wakers: RefCell<Vec<Waker>>,
 }
 
 struct State {
@@ -103,6 +115,8 @@ enum Entry {
 /// A request in flight and what has arrived for it.
 struct Slot {
     kind: Kind,
+    /// Sent while the connection was shared.
+    shared: bool,
     inner: RefCell<SlotInner>,
 }
 
@@ -138,9 +152,10 @@ enum Response {
 }
 
 impl Slot {
-    fn new(kind: Kind) -> Rc<Self> {
+    fn new(kind: Kind, shared: bool) -> Rc<Self> {
         Rc::new(Slot {
             kind,
+            shared,
             inner: RefCell::default(),
         })
     }
@@ -221,6 +236,8 @@ impl Client {
             stream,
             config,
             key,
+            shared: Cell::new(false),
+            idle_wakers: RefCell::new(Vec::new()),
             state: RefCell::new(State {
                 out: Vec::new(),
                 writer: None,
@@ -391,6 +408,22 @@ impl Client {
         self.conn.state.borrow().status != b'I'
     }
 
+    /// Marks the connection as shared between tasks, or as one task's own.
+    /// Statements sent while it is shared must not leave a transaction open:
+    /// if one does, the connection is closed, which rolls the transaction
+    /// back, rather than let the statements of other tasks run inside it.
+    pub(crate) fn set_shared(&self, shared: bool) {
+        self.conn.shared.set(shared);
+    }
+
+    /// Wakes `waker` once nothing is in flight, or the connection fails.
+    pub(crate) fn wake_when_idle(&self, waker: &Waker) {
+        let mut wakers = self.conn.idle_wakers.borrow_mut();
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+
     /// Queues a statement whose result nobody waits for.
     pub(crate) fn send_and_forget(&self, sql: &str) {
         if let Ok(slot) = self
@@ -500,7 +533,7 @@ impl Conn {
             st.out.truncate(start);
             return Err(e);
         }
-        let slot = Slot::new(kind);
+        let slot = Slot::new(kind, self.shared.get());
         if st.queue.is_empty() {
             self.head_since.set(Some(giong::time::Instant::now()));
         }
@@ -592,7 +625,15 @@ impl Conn {
                 w.wake();
             }
         }
+        self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
+    }
+
+    fn wake_idle(&self) {
+        let wakers = std::mem::take(&mut *self.idle_wakers.borrow_mut());
+        for w in wakers {
+            w.wake();
+        }
     }
 
     /// Takes apart and handles every whole message in `buf`.
@@ -715,15 +756,30 @@ impl Conn {
                 ));
             }
             Backend::ReadyForQuery(status) => {
+                // A statement sent on a shared connection opened a
+                // transaction (or left a failed one): the statements other
+                // tasks send next would run inside it, and be lost with it.
+                let left_open = slot.shared && status != b'I';
+                if left_open {
+                    inner.error = Some(Error::closed(LEFT_OPEN));
+                }
                 drop(inner);
-                {
+                let idle = {
                     let mut st = self.state.borrow_mut();
                     st.status = status;
                     st.queue.pop_front();
                     self.head_since
                         .set((!st.queue.is_empty()).then(giong::time::Instant::now));
-                }
+                    st.queue.is_empty()
+                };
                 self.complete(&slot);
+                if left_open {
+                    // Closing the connection makes the server roll back.
+                    return Err(Error::closed(LEFT_OPEN));
+                }
+                if idle {
+                    self.wake_idle();
+                }
             }
             other => {
                 return Err(Error::protocol(format!(
