@@ -42,7 +42,8 @@ pub enum ErrorKind {
     /// The server refused the user name or the password.
     Auth,
     /// The server answered the command with an error. [`Error::server`] has
-    /// it.
+    /// it. Also a transaction the server did not run because a watched key
+    /// changed, outside a [`Watch`](crate::Watch).
     Server,
     /// A reply could not be converted to the Rust type asked for, such as a
     /// missing key (nil) read as a `String` instead of an `Option<String>`.
@@ -163,7 +164,9 @@ impl Error {
     }
 
     /// The error the server sent, for [`ErrorKind::Server`] (and for
-    /// [`ErrorKind::Auth`] when the server refused the credentials).
+    /// [`ErrorKind::Auth`] when the server refused the credentials). `None`
+    /// for a transaction that did not run because a watched key changed,
+    /// which the server answers with nil, not an error.
     pub fn server(&self) -> Option<&ServerError> {
         self.0.server.as_ref()
     }

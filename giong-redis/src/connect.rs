@@ -263,7 +263,9 @@ async fn read(config: &Config, stream: &Stream, buf: &mut ReadBuf) -> Result<Val
                 }
                 return buf.take(n);
             }
-            Next::TooLarge => {
+            // A push message nobody waits for: passed over.
+            Next::TooLarge { push: true } => continue,
+            Next::TooLarge { push: false } => {
                 return Err(Error::protocol(
                     "the server sent a reply of more than 1 MiB to the handshake",
                 ))
