@@ -53,7 +53,8 @@ features, find out what is actually true.
 - [ ] Measure scaling from 1 to N workers.
 - [ ] Repeat the Monoio and Glommio comparison on several cores and a physical network.
 - [ ] Run the test suite on real 6.0 and 6.1 kernels.
-- [ ] Model-check the cross-thread wake-up handshake with `loom`.
+- [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
+      wake-up, now fixed).
 - [ ] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser.
 - [ ] Add a soak test: hours of connection churn with fd and memory checks.
 - [ ] An independent look at `giong-tls` before anyone relies on it.
