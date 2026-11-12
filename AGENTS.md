@@ -8,7 +8,7 @@ disagree, CONTRIBUTING.md wins: report the difference.
 ## What this is
 
 giong is a thread-per-core async runtime for Linux, built on io_uring. One Cargo
-workspace, five crates:
+workspace, six crates:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -17,6 +17,7 @@ workspace, five crates:
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
+| `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.
@@ -43,6 +44,12 @@ Where the code is:
 - Stable Rust. The libraries must build on **Rust 1.80**; the tests need a newer compiler
   (rcgen's dependencies). Nightly with the `rust-src` component is needed for
   ThreadSanitizer only.
+- **Database servers, for the database crates' tests.** giong-postgres, giong-mysql and
+  giong-redis start their own throwaway server from the installed binaries (PostgreSQL's
+  `initdb`/`postgres`, `mysqld`, `redis-server`) and skip, with a message, when they are
+  missing. `GIONG_PG_REQUIRED=1`, `GIONG_MYSQL_REQUIRED=1` and `GIONG_REDIS_REQUIRED=1`
+  turn a missing server into a failure, as CI does; each crate's README says where the
+  binaries are looked for.
 
 ## Commands
 

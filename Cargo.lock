@@ -122,6 +122,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "giong-redis"
+version = "0.2.1"
+dependencies = [
+ "giong",
+ "giong-tls",
+ "libc",
+ "rcgen",
+ "socket2",
+]
+
+[[package]]
 name = "giong-tls"
 version = "0.2.1"
 dependencies = [

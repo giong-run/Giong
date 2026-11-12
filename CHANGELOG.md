@@ -10,10 +10,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
-- **Error codes.** Every error that giong, giong-http's client, giong-tls, giong-postgres
-  and giong-mysql raise starts with a stable code (`GIONG-E0102: no address found for
-  db.internal. Fix: …`), says what went wrong and how to fix it, and ends with a link to
-  the code's page in [docs/errors](docs/errors/README.md): 54 codes. Functions still return `io::Error`;
+- **Error codes.** Every error that giong, giong-http's client, giong-tls, giong-postgres,
+  giong-mysql and giong-redis raise starts with a stable code (`GIONG-E0102: no address
+  found for db.internal. Fix: …`), says what went wrong and how to fix it, and ends with a
+  link to the code's page in [docs/errors](docs/errors/README.md): 65 codes. Functions still return `io::Error`;
   `giong::error::code(&err)` finds the `giong::error::Code` in it, down the chain of
   sources, so programs can match on the code instead of the message. Errors passed on from
   the kernel (connection refused, …) are unchanged and have no code.
@@ -149,6 +149,31 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     enforced by the server), the result size (64 MiB), the statement cache (256) and the
     pool wait (5 s).
   - `bench/mysql.sh` compares it with mysql_async and SQLx.
+- **`giong-redis`**, a new crate: a Redis client and connection pool for giong, speaking
+  RESP3 itself (Redis 6 and later, Valkey; nothing from Tokio).
+  - `Client` with `query` for any command (built with `cmd`), read as the Rust type asked
+    for (`FromValue`: `Option<String>`, `i64`, `Vec<(String, f64)>`, `HashMap`, tuples,
+    `Value`...), and methods for the everyday commands (`get`, `set`, `set_ex`, `set_nx`,
+    `del`, `exists`, `expire`, `incr`, `mget`, `hget`, `hset`, `hgetall`, `publish`,
+    `ping`). Tasks sharing a connection pipeline their commands.
+  - `Pipeline`, made atomic (`MULTI`/`EXEC`) with `atomic()`; `Client::watch` for
+    optimistic transactions; `query_blocking` for `BLPOP`, `XREAD ... BLOCK` and the
+    other blocking commands. Commands that would change the connection for the other
+    tasks sharing it (`MULTI`, `SELECT`, `SUBSCRIBE`, `AUTH`...), and blocking commands
+    sent with `query`, are refused before they are sent, with what to use instead.
+  - `PubSub`, on a connection of its own, with patterns; waiting for a message can be
+    cancelled without losing one.
+  - `Pool`, one per worker: commands share the least busy connection, steering away from
+    one stuck behind a slow command; `take()` gives a task a connection to itself, and a
+    connection left in a blocking command is closed rather than returned.
+  - ACL users, TLS through `giong-tls` (`rediss://`, always verified), Unix sockets, and
+    `Config::from_url`, strict about unknown parameters.
+  - Errors with an `ErrorKind` (`GIONG-E3201` to `GIONG-E3211`) and the server's error
+    code (`WRONGTYPE`, `NOSCRIPT`...); finite defaults for the connect timeout (10 s), the
+    response timeout (30 s; a late reply is dropped and the connection stays usable), the
+    reply size (64 MiB; a larger reply is thrown away as it arrives) and the pool wait
+    (5 s).
+  - `bench/redis.sh` compares it with redis-rs and fred.
 
 ### Changed
 

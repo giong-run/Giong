@@ -1,0 +1,38 @@
+Redis 7.0.15 WITHOUT io-threads (its default), on CPUs 0-2; each client on CPU 3; 64 tasks, 5 s per run, 3 runs, raw output:
+
+get giong pool=1 ops=623113 p50_us=98 p99_us=176 cpu=51 sink=4 conns=1
+get redis-rs pool=1 ops=501661 p50_us=118 p99_us=217 cpu=78 sink=0
+get giong pool=2 ops=901048 p50_us=63 p99_us=158 cpu=75 sink=0 conns=2
+get redis-rs pool=2 ops=542400 p50_us=106 p99_us=199 cpu=97 sink=4
+get giong pool=4 ops=845078 p50_us=68 p99_us=162 cpu=87 sink=0 conns=4
+get redis-rs pool=4 ops=477248 p50_us=124 p99_us=246 cpu=98 sink=0
+set giong pool=1 ops=561365 p50_us=106 p99_us=206 cpu=44 sink=8 conns=1
+set redis-rs pool=1 ops=466286 p50_us=132 p99_us=223 cpu=72 sink=0
+set giong pool=2 ops=831992 p50_us=66 p99_us=168 cpu=65 sink=5 conns=2
+set redis-rs pool=2 ops=552379 p50_us=104 p99_us=230 cpu=94 sink=0
+set giong pool=4 ops=823085 p50_us=70 p99_us=180 cpu=74 sink=7 conns=4
+set redis-rs pool=4 ops=548150 p50_us=109 p99_us=207 cpu=97 sink=9
+get giong pool=1 ops=695336 p50_us=83 p99_us=163 cpu=49 sink=4 conns=1
+get redis-rs pool=1 ops=504855 p50_us=117 p99_us=203 cpu=81 sink=4
+get giong pool=2 ops=924831 p50_us=62 p99_us=147 cpu=74 sink=0 conns=2
+get redis-rs pool=2 ops=562436 p50_us=105 p99_us=206 cpu=97 sink=2
+get giong pool=4 ops=984553 p50_us=57 p99_us=142 cpu=93 sink=4 conns=4
+get redis-rs pool=4 ops=453285 p50_us=127 p99_us=288 cpu=96 sink=8
+set giong pool=1 ops=561499 p50_us=108 p99_us=198 cpu=43 sink=0 conns=1
+set redis-rs pool=1 ops=429004 p50_us=141 p99_us=291 cpu=73 sink=4
+set giong pool=2 ops=788444 p50_us=74 p99_us=170 cpu=65 sink=2 conns=2
+set redis-rs pool=2 ops=500496 p50_us=128 p99_us=214 cpu=96 sink=9
+set giong pool=4 ops=775992 p50_us=75 p99_us=178 cpu=77 sink=1 conns=4
+set redis-rs pool=4 ops=502125 p50_us=115 p99_us=239 cpu=97 sink=0
+get giong pool=1 ops=644887 p50_us=96 p99_us=178 cpu=48 sink=4 conns=1
+get redis-rs pool=1 ops=484905 p50_us=124 p99_us=224 cpu=81 sink=6
+get giong pool=2 ops=932852 p50_us=63 p99_us=130 cpu=75 sink=6 conns=2
+get redis-rs pool=2 ops=517023 p50_us=109 p99_us=210 cpu=97 sink=4
+get giong pool=4 ops=799840 p50_us=75 p99_us=163 cpu=81 sink=4 conns=4
+get redis-rs pool=4 ops=470064 p50_us=125 p99_us=238 cpu=98 sink=4
+set giong pool=1 ops=574115 p50_us=104 p99_us=186 cpu=43 sink=2 conns=1
+set redis-rs pool=1 ops=444231 p50_us=140 p99_us=226 cpu=75 sink=6
+set giong pool=2 ops=746941 p50_us=81 p99_us=160 cpu=67 sink=9 conns=2
+set redis-rs pool=2 ops=524303 p50_us=112 p99_us=225 cpu=94 sink=3
+set giong pool=4 ops=731481 p50_us=82 p99_us=186 cpu=80 sink=8 conns=4
+set redis-rs pool=4 ops=486503 p50_us=119 p99_us=247 cpu=98 sink=1

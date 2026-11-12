@@ -1,0 +1,26 @@
+[package]
+name = "giong-redis"
+version = "0.2.1"
+edition = "2021"
+rust-version = "1.80"
+description = "A Redis client, pipelining across tasks, with Pub/Sub and a pool, for the giong thread-per-core runtime"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://docs.rs/giong-redis"
+keywords = ["redis", "valkey", "io-uring", "async", "cache"]
+categories = ["database", "network-programming", "asynchronous"]
+
+[dependencies]
+giong = { path = "..", version = "0.2.1" }
+giong-tls = { path = "../giong-tls", version = "0.2.1" }
+# TCP keepalive and TCP_USER_TIMEOUT on the connection, to notice a server
+# that vanished without closing. Already a dependency of giong.
+socket2 = { version = "0.6", features = ["all"] }
+
+[dev-dependencies]
+libc = "0.2"
+rcgen = "0.13"
+
+[package.metadata.docs.rs]
+all-features = true
