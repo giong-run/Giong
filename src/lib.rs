@@ -77,6 +77,7 @@ mod op;
 mod runtime;
 mod slab;
 
+pub mod error;
 pub mod fs;
 pub mod net;
 pub mod sync;

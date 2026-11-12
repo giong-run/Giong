@@ -12,9 +12,10 @@ use std::task::{Context, Poll};
 use io_uring::{cqueue, opcode, types};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use super::{close_socket, inet_addr, os_err, wait_for_pool, MultiSlot};
+use super::{close_socket, inet_addr, no_addresses, os_err, unexpected, wait_for_pool, MultiSlot};
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
 use crate::driver::{MultiKind, MultiPoll, BGID};
+use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime;
 
@@ -93,7 +94,7 @@ pub struct Datagram {
 impl Datagram {
     /// Splits what a multishot `recvmsg` wrote into a buffer.
     fn parse(buf: RecvBuf) -> io::Result<(Self, SocketAddr)> {
-        let malformed = || io::Error::other("io_uring returned a malformed datagram");
+        let malformed = || unexpected("io_uring returned a malformed datagram");
         if buf.len() < OVERHEAD {
             return Err(malformed());
         }
@@ -166,12 +167,7 @@ impl UdpSocket {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "could not resolve to any address",
-            )
-        }))
+        Err(last_err.unwrap_or_else(no_addresses))
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
@@ -207,12 +203,7 @@ impl UdpSocket {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "could not resolve to any address",
-            )
-        }))
+        Err(last_err.unwrap_or_else(no_addresses))
     }
 
     /// Receives the next datagram and the address it came from.
@@ -258,9 +249,7 @@ impl UdpSocket {
                                 if n < 0 {
                                     Err(os_err(n))
                                 } else {
-                                    Err(io::Error::other(
-                                        "io_uring returned a datagram without a buffer",
-                                    ))
+                                    Err(unexpected("io_uring returned a datagram without a buffer"))
                                 }
                             }
                         });
@@ -297,9 +286,11 @@ impl UdpSocket {
     /// `read_from` fails with `InvalidInput`.
     pub async fn read_from<B: IoBufMut>(&self, mut buf: B) -> (io::Result<(usize, SocketAddr)>, B) {
         if runtime::with_worker(|w| self.recv.is_active(w)) {
-            let err = io::Error::new(
-                io::ErrorKind::InvalidInput,
+            let err = raise(
+                Code::MixedReads,
                 "read_from cannot be used after recv_from on the same socket",
+                "use either recv_from (buffers from the runtime's pool) or read_from (your own \
+                 buffer) on one socket, not both.",
             );
             return (Err(err), buf);
         }
@@ -322,7 +313,9 @@ impl UdpSocket {
         match parse_addr(&name[..(msg.hdr.msg_namelen as usize).min(name.len())]) {
             Some(from) => (Ok((res as usize, from)), buf),
             None => (
-                Err(io::Error::other("datagram from an unknown address family")),
+                Err(unexpected(
+                    "io_uring returned a datagram from an unknown address family",
+                )),
                 buf,
             ),
         }

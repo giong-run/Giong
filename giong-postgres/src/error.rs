@@ -4,15 +4,22 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
+use giong::error::Code;
+
 /// An error from giong-postgres.
 ///
 /// Every error says what happened and, where there is one, what to do about
-/// it. [`kind`](Self::kind) tells errors apart in code; errors the server
+/// it. It is shown with the giong error code of its kind in front, and the
+/// link to that code's page at the end: `GIONG-E3003: password
+/// authentication failed for user "app". See https://…/E3003.md`.
+/// [`kind`](Self::kind) tells errors apart in code; errors the server
 /// reported carry its fields in [`db`](Self::db), with the SQLSTATE code in
 /// [`code`](Self::code).
 ///
 /// Errors are cheap to clone, and convert into [`std::io::Error`], so `?`
-/// works in functions that return `io::Result`.
+/// works in functions that return `io::Result`; there,
+/// [`giong::error::code`] finds the code, and
+/// [`giong::error::Error::get_ref`] gives this error back.
 #[derive(Clone)]
 pub struct Error(Arc<Inner>);
 
@@ -56,6 +63,25 @@ pub enum ErrorKind {
     /// The server sent something this crate cannot understand. The connection
     /// is closed.
     Protocol,
+}
+
+impl ErrorKind {
+    /// The giong error code for errors of this kind, `GIONG-E3001` to
+    /// `GIONG-E3010`.
+    pub fn giong_code(self) -> Code {
+        match self {
+            ErrorKind::Config => Code::PostgresConfig,
+            ErrorKind::Connect => Code::PostgresConnect,
+            ErrorKind::Auth => Code::PostgresAuth,
+            ErrorKind::Db => Code::PostgresServer,
+            ErrorKind::Type => Code::PostgresType,
+            ErrorKind::RowCount => Code::PostgresRowCount,
+            ErrorKind::TooLarge => Code::PostgresTooLarge,
+            ErrorKind::Closed => Code::PostgresClosed,
+            ErrorKind::PoolTimeout => Code::PostgresPoolTimeout,
+            ErrorKind::Protocol => Code::PostgresProtocol,
+        }
+    }
 }
 
 impl Error {
@@ -143,6 +169,13 @@ impl Error {
         self.0.kind
     }
 
+    /// The giong error code, the one shown in front of the message: one
+    /// for each [`ErrorKind`]. For the server's own code, see
+    /// [`code`](Self::code).
+    pub fn giong_code(&self) -> Code {
+        self.0.kind.giong_code()
+    }
+
     /// The error the server reported, for [`ErrorKind::Db`] (and for
     /// [`ErrorKind::Auth`] when the server refused the credentials).
     pub fn db(&self) -> Option<&DbError> {
@@ -157,28 +190,31 @@ impl Error {
     }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Error {
+    /// What happened: the message, the server's error and the cause, without
+    /// the code and the link.
+    fn what(&self) -> String {
         let inner = &self.0;
-        let mut wrote = false;
+        let mut parts = Vec::with_capacity(3);
         if !inner.message.is_empty() {
-            f.write_str(&inner.message)?;
-            wrote = true;
+            parts.push(inner.message.clone());
         }
         if let Some(db) = &inner.db {
-            if wrote {
-                f.write_str(": ")?;
-            }
-            write!(f, "{db}")?;
-            wrote = true;
+            parts.push(db.to_string());
         }
         if let Some(source) = &inner.source {
-            if wrote {
-                f.write_str(": ")?;
-            }
-            write!(f, "{source}")?;
+            parts.push(source.to_string());
         }
-        Ok(())
+        parts.join(": ")
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.giong_code();
+        let what = self.what();
+        let stop = if what.ends_with('.') { "" } else { "." };
+        write!(f, "{code}: {what}{stop} See {}", code.url())
     }
 }
 
@@ -211,7 +247,7 @@ impl From<Error> for io::Error {
             (None, ErrorKind::Closed) => io::ErrorKind::ConnectionAborted,
             (None, _) => io::ErrorKind::Other,
         };
-        io::Error::new(kind, e)
+        io::Error::new(kind, giong::error::Error::wrap(e.giong_code(), e))
     }
 }
 
@@ -354,3 +390,55 @@ impl fmt::Display for DbError {
 }
 
 impl std::error::Error for DbError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shown_with_its_giong_code_and_link() {
+        let e = Error::new(
+            ErrorKind::Auth,
+            "password authentication failed for user \"app\"",
+        );
+        assert_eq!(
+            e.to_string(),
+            "GIONG-E3003: password authentication failed for user \"app\". See \
+             https://github.com/giong-run/Giong/blob/main/docs/errors/E3003.md"
+        );
+        assert_eq!(e.giong_code(), Code::PostgresAuth);
+    }
+
+    #[test]
+    fn the_code_and_the_error_survive_the_conversion_to_io() {
+        let e = Error::new(ErrorKind::PoolTimeout, "no connection became free");
+        let shown = e.to_string();
+        let io: io::Error = e.into();
+        assert_eq!(io.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(io.to_string(), shown);
+        assert_eq!(giong::error::code(&io), Some(Code::PostgresPoolTimeout));
+        let wrapped = io.get_ref().unwrap();
+        let wrapped = wrapped.downcast_ref::<giong::error::Error>().unwrap();
+        let back = wrapped.get_ref().unwrap().downcast_ref::<Error>().unwrap();
+        assert_eq!(back.kind(), ErrorKind::PoolTimeout);
+    }
+
+    #[test]
+    fn every_kind_has_its_own_code() {
+        let kinds = [
+            ErrorKind::Config,
+            ErrorKind::Connect,
+            ErrorKind::Auth,
+            ErrorKind::Db,
+            ErrorKind::Type,
+            ErrorKind::RowCount,
+            ErrorKind::TooLarge,
+            ErrorKind::Closed,
+            ErrorKind::PoolTimeout,
+            ErrorKind::Protocol,
+        ];
+        let codes: std::collections::HashSet<_> = kinds.iter().map(|k| k.giong_code()).collect();
+        assert_eq!(codes.len(), kinds.len());
+        assert!(codes.iter().all(|c| (3001..3100).contains(&c.number())));
+    }
+}

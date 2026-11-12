@@ -1,0 +1,427 @@
+//! Error codes: every error giong raises says what went wrong, how to fix it,
+//! and where to read more.
+//!
+//! Functions keep returning [`io::Error`]. When giong itself raises the error
+//! (rather than passing on one from the kernel, such as "connection refused"),
+//! its message starts with a stable code and ends with a link to that code's
+//! page:
+//!
+//! ```text
+//! GIONG-E0102: no address found for db.internal. Fix: check the spelling of
+//! the name, /etc/hosts, and the DNS servers in /etc/resolv.conf. See
+//! https://github.com/giong-run/Giong/blob/main/docs/errors/E0102.md
+//! ```
+//!
+//! [`code`] reads the code back, so programs (and the agents that write them)
+//! can match on it instead of on the message:
+//!
+//! ```no_run
+//! use giong::error::{self, Code};
+//!
+//! # async fn f() -> std::io::Result<()> {
+//! match giong::net::TcpStream::connect("db.internal:5432").await {
+//!     Ok(stream) => { /* ... */ }
+//!     Err(e) if error::code(&e) == Some(Code::HostNotFound) => { /* ... */ }
+//!     Err(e) => return Err(e),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The companion crates (giong-tls, giong-postgres) use the same codes, so
+//! one `match` covers them all. Codes are never reused or renumbered; a code
+//! that is no longer raised keeps its page.
+
+use std::borrow::Cow;
+use std::error::Error as StdError;
+use std::fmt;
+use std::io;
+
+/// Where the page for every code lives.
+const DOCS: &str = "https://github.com/giong-run/Giong/blob/main/docs/errors";
+
+macro_rules! codes {
+    ($( $(#[$doc:meta])* $name:ident = $number:literal, $kind:ident, $summary:literal; )*) => {
+        /// A stable code for an error giong raises, shown as `GIONG-E0001`.
+        ///
+        /// Codes are grouped by where they come from: `E00xx` the runtime,
+        /// `E01xx` networking and name resolution, `E02xx` files, `E1xxx`
+        /// giong-http, `E2xxx` giong-tls and `E3xxx` giong-postgres. Each has
+        /// a page under `docs/errors/` in the repository; [`url`](Code::url)
+        /// links to it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[non_exhaustive]
+        #[repr(u16)]
+        pub enum Code {
+            $( $(#[$doc])* $name = $number, )*
+        }
+
+        impl Code {
+            /// Every code, in numeric order.
+            pub const ALL: &'static [Code] = &[$(Code::$name),*];
+
+            /// The number in the code: 102 for `GIONG-E0102`.
+            pub const fn number(self) -> u16 {
+                self as u16
+            }
+
+            /// The code with this number, if there is one.
+            pub const fn from_number(number: u16) -> Option<Code> {
+                match number {
+                    $( $number => Some(Code::$name), )*
+                    _ => None,
+                }
+            }
+
+            /// What the code means, in a few words: the title of its page.
+            pub const fn summary(self) -> &'static str {
+                match self {
+                    $( Code::$name => $summary, )*
+                }
+            }
+
+            /// The [`io::ErrorKind`] an [`Error`] with this code gets when it
+            /// is turned into an [`io::Error`].
+            pub const fn kind(self) -> io::ErrorKind {
+                match self {
+                    $( Code::$name => io::ErrorKind::$kind, )*
+                }
+            }
+        }
+    };
+}
+
+codes! {
+    // ------------------------------------------------------------ runtime
+    /// `io_uring_setup` failed: io_uring is blocked by a seccomp profile (as
+    /// in Docker's default one) or the `kernel.io_uring_disabled` sysctl, or
+    /// missing, as in gVisor. The kernel's error kind (`PermissionDenied` or
+    /// `Unsupported`) is kept.
+    IoUringUnavailable = 1, Unsupported, "io_uring is not available";
+    /// The kernel lacks a feature giong needs, such as buffer rings (Linux
+    /// 6.0). The kernel's error kind is kept.
+    KernelTooOld = 2, Unsupported, "the kernel is too old";
+    /// Another runtime in this process already handles `SIGINT` and
+    /// `SIGTERM`.
+    SignalsTaken = 3, AlreadyExists, "another runtime handles the signals";
+    /// A [`Builder`](crate::Builder) setting is out of range.
+    InvalidConfig = 4, InvalidInput, "invalid runtime setting";
+    /// The kernel returned something giong does not expect. A bug in giong
+    /// or in the kernel.
+    Unexpected = 5, Other, "unexpected result from the kernel";
+    /// A one-off read was used on a stream or socket that already has a
+    /// multishot `recv` running.
+    MixedReads = 6, InvalidInput, "read used after recv";
+    /// [`time::timeout`](crate::time::timeout) ran out of time.
+    TimedOut = 7, TimedOut, "the time limit passed";
+
+    // ------------------------------------------------- network and names
+    /// A `"host:port"` string is not one.
+    InvalidAddress = 100, InvalidInput, "invalid address";
+    /// A host name has characters or labels DNS does not allow.
+    InvalidHostName = 101, InvalidInput, "invalid host name";
+    /// The name has no address: not in `/etc/hosts`, and DNS says it does not
+    /// exist or has no `A` or `AAAA` record.
+    HostNotFound = 102, NotFound, "host not found";
+    /// A list of addresses to connect or bind to was empty.
+    NoAddresses = 103, InvalidInput, "no address to use";
+    /// `/etc/resolv.conf` names no DNS server.
+    NoDnsServer = 104, NotFound, "no DNS server configured";
+    /// No DNS server answered in time.
+    DnsTimeout = 105, TimedOut, "DNS server did not answer";
+    /// A DNS server answered with an error, such as `SERVFAIL` or `REFUSED`.
+    DnsServerFailure = 106, Other, "DNS server failed";
+    /// A DNS server sent an answer that cannot be read.
+    DnsBadResponse = 107, InvalidData, "malformed DNS answer";
+
+    // -------------------------------------------------------------- files
+    /// A path contains a NUL byte, which Linux paths cannot.
+    InvalidPath = 200, InvalidInput, "invalid path";
+
+    // --------------------------------------------------------- giong-tls
+    /// No trusted certificate authority: none installed on the machine, or
+    /// none given.
+    NoTrustedRoots = 2001, NotFound, "no trusted certificate authorities";
+    /// A certificate file or PEM data cannot be read or holds no
+    /// certificate.
+    BadCertificateData = 2002, InvalidData, "unreadable certificate data";
+    /// A TLS server name is neither a DNS name nor an IP address.
+    InvalidServerName = 2003, InvalidInput, "invalid TLS server name";
+    /// The peer's certificate was rejected: expired, issued by an authority
+    /// that is not trusted, or not valid for the name.
+    TlsCertificate = 2004, InvalidData, "certificate rejected";
+    /// The peer broke the TLS protocol or sent an alert.
+    TlsProtocol = 2005, InvalidData, "TLS protocol error";
+    /// The TLS handshake did not finish in time.
+    TlsHandshakeTimeout = 2006, TimedOut, "TLS handshake timed out";
+    /// The peer closed the connection during the TLS handshake.
+    TlsHandshakeEof = 2007, UnexpectedEof, "connection closed during the TLS handshake";
+    /// A TLS write failed or was cancelled, so the stream cannot send any
+    /// more.
+    TlsBroken = 2008, BrokenPipe, "TLS stream broken";
+
+    // ---------------------------------------------------- giong-postgres
+    /// The configuration or connection URL is not valid.
+    PostgresConfig = 3001, InvalidInput, "invalid PostgreSQL configuration";
+    /// Opening a connection failed: name resolution, TCP, TLS, or the
+    /// connect timeout.
+    PostgresConnect = 3002, Other, "cannot connect to PostgreSQL";
+    /// The server refused the credentials, or the authentication method is
+    /// not supported.
+    PostgresAuth = 3003, PermissionDenied, "PostgreSQL authentication failed";
+    /// The server reported an error for a statement; its SQLSTATE says which.
+    PostgresServer = 3004, Other, "PostgreSQL server error";
+    /// A value could not be converted between Rust and PostgreSQL.
+    PostgresType = 3005, InvalidData, "PostgreSQL type mismatch";
+    /// `query_one` found no row, or more than one.
+    PostgresRowCount = 3006, Other, "wrong number of rows";
+    /// A result was larger than the configured maximum.
+    PostgresTooLarge = 3007, Other, "PostgreSQL result too large";
+    /// The connection is closed.
+    PostgresClosed = 3008, ConnectionAborted, "PostgreSQL connection closed";
+    /// No pooled connection became free in time.
+    PostgresPoolTimeout = 3009, TimedOut, "PostgreSQL pool wait timed out";
+    /// The server sent something that is not the PostgreSQL protocol.
+    PostgresProtocol = 3010, InvalidData, "PostgreSQL protocol error";
+}
+
+impl Code {
+    /// The page about this code: what it means, why it happens and how to
+    /// fix it.
+    pub fn url(self) -> String {
+        format!("{DOCS}/E{:04}.md", self.number())
+    }
+}
+
+impl fmt::Display for Code {
+    /// `GIONG-E0102`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "GIONG-E{:04}", self.number())
+    }
+}
+
+/// An error giong raised, with its [`Code`], what went wrong, and how to fix
+/// it.
+///
+/// It travels inside an [`io::Error`] (`From<Error> for io::Error` gives it
+/// the code's [`kind`](Code::kind)); [`code`] finds it again. Shown as
+/// `GIONG-E0102: <what went wrong>. Fix: <how to fix it> See <url>`.
+pub struct Error {
+    code: Code,
+    message: Cow<'static, str>,
+    fix: Cow<'static, str>,
+    source: Option<Box<dyn StdError + Send + Sync>>,
+    /// `source` is a companion crate's error that formats itself, code
+    /// included; see [`Error::wrap`].
+    wrapped: bool,
+}
+
+impl Error {
+    /// An error with `code`. `message` says what went wrong, without a
+    /// final full stop; `fix` says what to do about it, in one or two
+    /// sentences.
+    pub fn new(
+        code: Code,
+        message: impl Into<Cow<'static, str>>,
+        fix: impl Into<Cow<'static, str>>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            fix: fix.into(),
+            source: None,
+            wrapped: false,
+        }
+    }
+
+    /// The same error, caused by `source` (often the kernel's error, so its
+    /// `raw_os_error` stays reachable through [`std::error::Error::source`]).
+    pub fn with_source(mut self, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
+        self.source = Some(source.into());
+        self.wrapped = false;
+        self
+    }
+
+    /// Carries a companion crate's own error type, which already shows the
+    /// code, what went wrong and the link, under `code`. It is shown exactly
+    /// as `error` shows itself, and [`get_ref`](Self::get_ref) returns it.
+    pub fn wrap(code: Code, error: impl StdError + Send + Sync + 'static) -> Self {
+        Self {
+            code,
+            message: Cow::Borrowed(""),
+            fix: Cow::Borrowed(""),
+            source: Some(Box::new(error)),
+            wrapped: true,
+        }
+    }
+
+    /// The code.
+    pub fn code(&self) -> Code {
+        self.code
+    }
+
+    /// What went wrong.
+    pub fn message(&self) -> Cow<'_, str> {
+        match (&self.source, self.wrapped) {
+            (Some(inner), true) => Cow::Owned(inner.to_string()),
+            _ => Cow::Borrowed(&self.message),
+        }
+    }
+
+    /// How to fix it; empty for a [wrapped](Self::wrap) error, whose
+    /// message says it.
+    pub fn fix(&self) -> &str {
+        &self.fix
+    }
+
+    /// The error passed to [`wrap`](Self::wrap), for downcasting to the
+    /// companion crate's type.
+    pub fn get_ref(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
+        match (&self.source, self.wrapped) {
+            (Some(inner), true) => Some(inner.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let (Some(inner), true) = (&self.source, self.wrapped) {
+            return fmt::Display::fmt(inner, f);
+        }
+        write!(f, "{}: {}.", self.code, self.message)?;
+        if !self.fix.is_empty() {
+            write!(f, " Fix: {}", self.fix)?;
+        }
+        write!(f, " See {}", self.code.url())
+    }
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Error")
+            .field("code", &self.code)
+            .field("message", &self.message())
+            .field("fix", &self.fix)
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+impl StdError for Error {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match (&self.source, self.wrapped) {
+            // The wrapped error is this error, shown the same way; its
+            // cause is the next one down.
+            (Some(inner), true) => inner.source(),
+            (Some(source), false) => Some(source.as_ref()),
+            (None, _) => None,
+        }
+    }
+}
+
+impl From<Error> for io::Error {
+    fn from(e: Error) -> Self {
+        io::Error::new(e.code.kind(), e)
+    }
+}
+
+/// An [`io::Error`] carrying a new [`Error`], for giong's own errors.
+pub(crate) fn raise(
+    code: Code,
+    message: impl Into<Cow<'static, str>>,
+    fix: impl Into<Cow<'static, str>>,
+) -> io::Error {
+    Error::new(code, message, fix).into()
+}
+
+/// The code of an error giong raised, or `None` for one it passed on (from
+/// the kernel, say) or that came from elsewhere.
+///
+/// Looks at `err` and then down its chain of
+/// [`source`](std::error::Error::source)s, so it also finds the code when
+/// another error wraps giong's.
+pub fn code(err: &io::Error) -> Option<Code> {
+    let mut next: Option<&(dyn StdError + 'static)> = Some(err.get_ref()?);
+    while let Some(e) = next {
+        if let Some(e) = e.downcast_ref::<Error>() {
+            return Some(e.code);
+        }
+        if let Some(e) = e.downcast_ref::<io::Error>() {
+            next = e.get_ref().map(|inner| inner as &(dyn StdError + 'static));
+            continue;
+        }
+        next = e.source();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numbers_are_unique_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for &code in Code::ALL {
+            assert!(seen.insert(code.number()), "{code} is used twice");
+            assert_eq!(Code::from_number(code.number()), Some(code));
+            assert!(!code.summary().is_empty());
+        }
+        assert!(Code::ALL.windows(2).all(|w| w[0] < w[1]), "keep ALL sorted");
+        assert_eq!(Code::from_number(0), None);
+    }
+
+    #[test]
+    fn shows_code_message_fix_and_link() {
+        let e = Error::new(
+            Code::HostNotFound,
+            "no address found for db.internal",
+            "check the spelling.",
+        );
+        assert_eq!(
+            e.to_string(),
+            "GIONG-E0102: no address found for db.internal. Fix: check the spelling. See \
+             https://github.com/giong-run/Giong/blob/main/docs/errors/E0102.md"
+        );
+        let io: io::Error = e.into();
+        assert_eq!(io.kind(), io::ErrorKind::NotFound);
+        assert_eq!(code(&io), Some(Code::HostNotFound));
+    }
+
+    #[test]
+    fn finds_the_code_down_the_chain() {
+        let inner: io::Error = Error::new(Code::DnsTimeout, "no answer", "retry.").into();
+        let outer = io::Error::other(inner);
+        assert_eq!(code(&outer), Some(Code::DnsTimeout));
+        assert_eq!(code(&io::Error::from(io::ErrorKind::NotFound)), None);
+        assert_eq!(code(&io::Error::other("plain")), None);
+    }
+
+    #[derive(Debug)]
+    struct Companion;
+    impl fmt::Display for Companion {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("GIONG-E3003: refused")
+        }
+    }
+    impl StdError for Companion {}
+
+    #[test]
+    fn a_wrapped_error_shows_itself() {
+        let e = Error::wrap(Code::PostgresAuth, Companion);
+        assert_eq!(e.to_string(), "GIONG-E3003: refused");
+        assert!(e.get_ref().unwrap().downcast_ref::<Companion>().is_some());
+        assert!(e.source().is_none());
+        let io = io::Error::new(io::ErrorKind::PermissionDenied, e);
+        assert_eq!(code(&io), Some(Code::PostgresAuth));
+    }
+
+    #[test]
+    fn the_source_stays_reachable() {
+        let os = io::Error::from_raw_os_error(libc::EPERM);
+        let e = Error::new(Code::IoUringUnavailable, "blocked", "allow it.").with_source(os);
+        let source = e.source().unwrap().downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.raw_os_error(), Some(libc::EPERM));
+    }
+}

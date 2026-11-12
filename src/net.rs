@@ -33,6 +33,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
 use crate::driver::{Driver, MultiKind, MultiPoll, BGID};
+use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime::{self, Worker};
 
@@ -230,9 +231,7 @@ impl StreamSocket {
                                 match n {
                                     0 => Ok(RecvBuf::eof()),
                                     n if n < 0 => Err(os_err(n)),
-                                    _ => Err(io::Error::other(
-                                        "io_uring returned data without a buffer",
-                                    )),
+                                    _ => Err(unexpected("io_uring returned data without a buffer")),
                                 }
                             }
                         });
@@ -254,9 +253,11 @@ impl StreamSocket {
 
     pub(crate) async fn read<B: IoBufMut>(&self, mut buf: B) -> (io::Result<usize>, B) {
         if runtime::with_worker(|w| self.recv.is_active(w)) {
-            let err = io::Error::new(
-                io::ErrorKind::InvalidInput,
+            let err = raise(
+                Code::MixedReads,
                 "read cannot be used after recv on the same stream",
+                "use either recv (buffers from the runtime's pool) or read (your own buffer) on \
+                 one stream, not both.",
             );
             return (Err(err), buf);
         }
@@ -408,9 +409,25 @@ impl std::fmt::Debug for TcpListener {
 }
 
 fn unresolved() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidInput,
+    no_addresses()
+}
+
+/// The list of addresses to try was empty.
+pub(crate) fn no_addresses() -> io::Error {
+    raise(
+        Code::NoAddresses,
         "could not resolve to any address",
+        "pass at least one address, or a name that resolves to one.",
+    )
+}
+
+/// The kernel returned something giong does not expect.
+pub(crate) fn unexpected(what: &'static str) -> io::Error {
+    raise(
+        Code::Unexpected,
+        what,
+        "this is a bug in giong or the kernel; please report it with your kernel version \
+         (uname -r) at https://github.com/giong-run/Giong/issues.",
     )
 }
 

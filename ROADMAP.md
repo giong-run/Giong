@@ -111,18 +111,18 @@ thread-safety finding.
 What every client library and service needs before the database and web crates can be
 built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait for 0.3's.
 
-- [ ] Asynchronous DNS resolution (`/etc/hosts`, `resolv.conf`, UDP then TCP, a cache per
+- [x] Asynchronous DNS resolution (`/etc/hosts`, `resolv.conf`, UDP then TCP, a cache per
       worker), and `TcpStream::connect` by name, trying addresses the RFC 8305 way.
-- [ ] The client side of `giong-tls`: the machine's CA certificates or compiled-in ones,
+- [x] The client side of `giong-tls`: the machine's CA certificates or compiled-in ones,
       ALPN, client certificates.
-- [ ] A bounded channel and a oneshot channel in `sync`.
+- [x] A bounded channel and a oneshot channel in `sync`.
 - [ ] `spawn_on` that returns a handle to the spawned task's result.
-- [ ] `giong-http`: the client's address in `Request`, and a limit on open connections.
+- [x] `giong-http`: the client's address in `Request`, and a limit on open connections.
 - [ ] Vectored writes (`writev`) so a response head and body need no copy.
-- [ ] A clear error when io_uring is blocked, and a guide to allowing it in Docker and
+- [x] A clear error when io_uring is blocked, and a guide to allowing it in Docker and
       Kubernetes until the epoll driver exists.
 - [ ] Remaining file operations: reading directories, `fallocate`.
-- [ ] Agent-first groundwork: error codes with their documentation pages and
+- [x] Agent-first groundwork: error codes with their documentation pages and
       `giong::error::code`, `AGENTS.md`, `llms.txt`.
 
 **Exit criteria:** every item above with tests, including cancellation tests for each new

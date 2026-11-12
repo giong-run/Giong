@@ -31,6 +31,7 @@ use std::time::Duration;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use crate::buf::BufPool;
+use crate::error::{Code, Error};
 use crate::slab::Slab;
 
 /// Buffer group id of the worker's receive pool.
@@ -185,23 +186,24 @@ fn build_ring(entries: u32) -> io::Result<IoUring> {
     build_ring_from(entries, first_tier()).map_err(explain_setup_error)
 }
 
-/// Where the ways to allow io_uring in containers are written down.
-const DEPLOYMENT_DOC: &str = "https://github.com/giong-run/Giong/blob/main/docs/DEPLOYMENT.md";
-
 /// `io_uring_setup` fails with `EPERM` when a seccomp profile blocks it (as
 /// Docker's default profile does) or the `kernel.io_uring_disabled` sysctl
 /// forbids it, and with `ENOSYS` where the kernel or a sandbox such as gVisor
 /// does not provide it. The bare errno says none of that, so say it here.
 fn explain_setup_error(e: io::Error) -> io::Error {
     match e.raw_os_error() {
+        // The kernel's kind (PermissionDenied or Unsupported) is kept.
         Some(libc::EPERM | libc::EACCES | libc::ENOSYS) => io::Error::new(
             e.kind(),
-            format!(
-                "giong needs io_uring, which is not available here ({e}). It is blocked by \
-                 Docker's default seccomp profile, missing in sandboxes such as gVisor, and \
-                 can be turned off with the kernel.io_uring_disabled sysctl. How to allow it: \
-                 {DEPLOYMENT_DOC}"
-            ),
+            Error::new(
+                Code::IoUringUnavailable,
+                format!("giong needs io_uring, which is not available here ({e})"),
+                "allow io_uring for this process. Docker's default seccomp profile blocks it, \
+                 sandboxes such as gVisor do not have it, and the kernel.io_uring_disabled \
+                 sysctl turns it off; docs/DEPLOYMENT.md shows how to allow it in Docker and \
+                 Kubernetes.",
+            )
+            .with_source(e),
         ),
         _ => e,
     }
@@ -254,7 +256,12 @@ impl Driver {
                 .map_err(|e| {
                     io::Error::new(
                         e.kind(),
-                        format!("giong needs io_uring buffer rings (Linux >= 6.0): {e}"),
+                        Error::new(
+                            Code::KernelTooOld,
+                            format!("giong needs io_uring buffer rings, from Linux 6.0 ({e})"),
+                            "run on Linux 6.0 or newer (6.1 or newer is faster).",
+                        )
+                        .with_source(e),
                     )
                 })?;
         }
@@ -758,11 +765,13 @@ mod tests {
             let kind = original.kind();
             let e = explain_setup_error(original);
             assert_eq!(e.kind(), kind);
+            assert_eq!(crate::error::code(&e), Some(Code::IoUringUnavailable));
             let text = e.to_string();
-            assert!(
-                text.contains("io_uring") && text.contains(DEPLOYMENT_DOC),
-                "{text}"
-            );
+            assert!(text.starts_with("GIONG-E0001: "), "{text}");
+            assert!(text.contains("docs/DEPLOYMENT.md"), "{text}");
+            let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
+            let source = source.downcast_ref::<io::Error>().unwrap();
+            assert_eq!(source.raw_os_error(), Some(errno));
         }
         let e = explain_setup_error(io::Error::from_raw_os_error(libc::ENOMEM));
         assert_eq!(e.raw_os_error(), Some(libc::ENOMEM));

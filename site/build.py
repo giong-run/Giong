@@ -1135,12 +1135,15 @@ Facts that are easy to get wrong:
 - `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may
   have sent part of its buffer.
 - There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
+- An error giong raises starts with a code, such as `GIONG-E0102`, says how to fix it, and
+  links to its page; `giong::error::code(&err)` returns the code to match on.
 - Install with `{ADD} giong` (and `giong-http`, `giong-tls`). Libraries need Rust 1.80.
 
 ## Docs
 
 {api}- [README]({BLOB}README.md): design, benchmarks with their method, limitations
 - [AGENTS.md]({BLOB}AGENTS.md): how to build, test and change giong, for coding agents
+- [Error codes]({BLOB}docs/errors/README.md): what each `GIONG-E` code means and how to fix it
 - [CONTRIBUTING.md]({BLOB}CONTRIBUTING.md): the rules every change follows
 - [ROADMAP.md]({BLOB}ROADMAP.md): milestones and deliberate non-goals
 - [CHANGELOG.md]({BLOB}CHANGELOG.md): what changed in each release

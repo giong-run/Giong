@@ -81,6 +81,7 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
+use giong::error::Code;
 use giong::net::TcpStream;
 use giong::time::timeout;
 use rustls::client::ResolvesClientCert;
@@ -94,8 +95,60 @@ use rustls::{
 
 pub use rustls;
 
-fn invalid(e: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+fn coded(
+    code: Code,
+    message: impl Into<std::borrow::Cow<'static, str>>,
+    fix: &'static str,
+) -> io::Error {
+    giong::error::Error::new(code, message, fix).into()
+}
+
+/// PEM data or a certificate file that cannot be used.
+fn bad_certificate_data(e: impl std::fmt::Display) -> io::Error {
+    coded(
+        Code::BadCertificateData,
+        e.to_string(),
+        "check that the file or data is PEM (\"-----BEGIN CERTIFICATE-----\") and holds \
+         at least one certificate.",
+    )
+}
+
+/// A private key that cannot be read.
+fn bad_key(e: impl std::fmt::Display) -> io::Error {
+    coded(
+        Code::BadCertificateData,
+        format!("cannot read the private key: {e}"),
+        "check that it is a PEM private key (\"-----BEGIN PRIVATE KEY-----\", or the RSA or \
+         EC forms).",
+    )
+}
+
+/// A certificate and a key that cannot be used together.
+fn mismatched_key(e: rustls::Error) -> io::Error {
+    coded(
+        Code::BadCertificateData,
+        format!("the certificate and the private key cannot be used together: {e}"),
+        "check that the key belongs to the first certificate of the chain, and that its type \
+         (RSA, ECDSA, Ed25519) is supported.",
+    )
+}
+
+/// What rustls reported, with the code that says what to do about it.
+fn tls_error(e: rustls::Error) -> io::Error {
+    match e {
+        rustls::Error::InvalidCertificate(_) => coded(
+            Code::TlsCertificate,
+            format!("the peer's certificate was rejected: {e}"),
+            "check the name you connect to, the certificate's expiry and its chain; a \
+             private authority has to be trusted with TlsConnector::with_roots.",
+        ),
+        e => coded(
+            Code::TlsProtocol,
+            format!("TLS error: {e}"),
+            "check that the other side speaks TLS on this port, and that both sides share a \
+             protocol version and cipher suite.",
+        ),
+    }
 }
 
 /// How long a handshake may take unless configured otherwise.
@@ -105,9 +158,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid)?;
+        .map_err(bad_certificate_data)?;
     if certs.is_empty() {
-        return Err(invalid("no certificate found in the PEM data"));
+        return Err(bad_certificate_data("no certificate found in the PEM data"));
     }
     Ok(certs)
 }
@@ -139,13 +192,13 @@ impl TlsAcceptor {
     /// authentication, and `http/1.1` offered through ALPN.
     pub fn from_pem(cert_chain: &[u8], private_key: &[u8]) -> io::Result<Self> {
         let certs = pem_certs(cert_chain)?;
-        let key = PrivateKeyDer::from_pem_slice(private_key).map_err(invalid)?;
+        let key = PrivateKeyDer::from_pem_slice(private_key).map_err(bad_key)?;
         let mut config = ServerConfig::builder_with_provider(ring())
             .with_safe_default_protocol_versions()
-            .map_err(invalid)?
+            .map_err(tls_error)?
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(invalid)?;
+            .map_err(mismatched_key)?;
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self::new(Arc::new(config)))
     }
@@ -159,7 +212,7 @@ impl TlsAcceptor {
 
     /// Performs the TLS handshake on an accepted connection.
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<TlsStream> {
-        let conn = ServerConnection::new(self.config.clone()).map_err(invalid)?;
+        let conn = ServerConnection::new(self.config.clone()).map_err(tls_error)?;
         TlsStream::new(tcp, conn.into())
             .handshake(self.handshake_timeout)
             .await
@@ -213,11 +266,18 @@ impl TlsConnector {
     /// and 1.3 with rustls' default cipher suites.
     pub fn with_roots(roots: RootCertStore) -> io::Result<Self> {
         if roots.is_empty() {
-            return Err(invalid("no trusted certificate authority given"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                giong::error::Error::new(
+                    Code::NoTrustedRoots,
+                    "no trusted certificate authority given",
+                    "pass at least one certificate, or use TlsConnector::with_system_roots.",
+                ),
+            ));
         }
         let config = ClientConfig::builder_with_provider(ring())
             .with_safe_default_protocol_versions()
-            .map_err(invalid)?
+            .map_err(tls_error)?
             .with_root_certificates(roots)
             .with_no_client_auth();
         Ok(Self::new(Arc::new(config)))
@@ -228,7 +288,7 @@ impl TlsConnector {
     pub fn with_root_pem(pem: &[u8]) -> io::Result<Self> {
         let mut roots = RootCertStore::empty();
         for cert in pem_certs(pem)? {
-            roots.add(cert).map_err(invalid)?;
+            roots.add(cert).map_err(bad_certificate_data)?;
         }
         Self::with_roots(roots)
     }
@@ -287,9 +347,9 @@ impl TlsConnector {
     /// TLS): a certificate chain and its private key, both in PEM format.
     pub fn client_auth(mut self, cert_chain: &[u8], private_key: &[u8]) -> io::Result<Self> {
         let certs = pem_certs(cert_chain)?;
-        let key = PrivateKeyDer::from_pem_slice(private_key).map_err(invalid)?;
-        let key =
-            CertifiedKey::from_der(certs, key, self.config.crypto_provider()).map_err(invalid)?;
+        let key = PrivateKeyDer::from_pem_slice(private_key).map_err(bad_key)?;
+        let key = CertifiedKey::from_der(certs, key, self.config.crypto_provider())
+            .map_err(mismatched_key)?;
         Arc::make_mut(&mut self.config).client_auth_cert_resolver =
             Arc::new(ClientCert(Arc::new(key)));
         Ok(self)
@@ -312,7 +372,7 @@ impl TlsConnector {
     /// [`io::ErrorKind::InvalidData`] and a message saying which it was.
     pub async fn connect(&self, server_name: &str, tcp: TcpStream) -> io::Result<TlsStream> {
         let name = parse_server_name(server_name)?;
-        let conn = ClientConnection::new(self.config.clone(), name).map_err(invalid)?;
+        let conn = ClientConnection::new(self.config.clone(), name).map_err(tls_error)?;
         TlsStream::new(tcp, conn.into())
             .handshake(self.handshake_timeout)
             .await
@@ -337,9 +397,11 @@ fn parse_server_name(name: &str) -> io::Result<ServerName<'static>> {
         return Ok(ServerName::IpAddress(std::net::IpAddr::V6(ip).into()));
     }
     ServerName::try_from(name.to_owned()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
+        coded(
+            Code::InvalidServerName,
             format!("{name:?} is neither a DNS name nor an IP address"),
+            "pass the host name the certificate is for (\"example.com\"), or an IP address, \
+             without a port or a scheme.",
         )
     })
 }
@@ -391,7 +453,16 @@ fn load_roots(
     if file.is_some() || dirs.is_some() {
         if let Some(file) = file {
             roots.add_file(Path::new(file)).map_err(|e| {
-                io::Error::new(e.kind(), format!("cannot read SSL_CERT_FILE {file:?}: {e}"))
+                io::Error::new(
+                    e.kind(),
+                    giong::error::Error::new(
+                        Code::BadCertificateData,
+                        format!("cannot read SSL_CERT_FILE {file:?}: {e}"),
+                        "point SSL_CERT_FILE at a readable PEM file of certificates, or unset \
+                         it to use the system's.",
+                    )
+                    .with_source(e),
+                )
             })?;
         }
         for dir in dirs.map(std::env::split_paths).into_iter().flatten() {
@@ -403,11 +474,11 @@ fn load_roots(
         roots.add_dir(Path::new(dir));
     }
     if roots.store.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no trusted CA certificates found on this machine: install the ca-certificates \
-             package, set SSL_CERT_FILE, or use TlsConnector::with_webpki_roots \
-             (the webpki-roots feature of giong-tls)",
+        return Err(coded(
+            Code::NoTrustedRoots,
+            "no trusted CA certificates found on this machine",
+            "install the ca-certificates package, set SSL_CERT_FILE, or use \
+             TlsConnector::with_webpki_roots (the webpki-roots feature of giong-tls).",
         ));
     }
     Ok(roots.store)
@@ -511,9 +582,11 @@ impl TlsStream {
                     break;
                 }
                 if self.eof.get() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
+                    return Err(coded(
+                        Code::TlsHandshakeEof,
                         "the peer closed the connection during the TLS handshake",
+                        "check that the other side speaks TLS on this port, and whether it \
+                         wants a client certificate or another server name.",
                     ));
                 }
                 self.pump().await?;
@@ -523,9 +596,11 @@ impl TlsStream {
         match timeout(limit, handshake).await {
             Ok(Ok(())) => Ok(self),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "TLS handshake timed out",
+            Err(_) => Err(coded(
+                Code::TlsHandshakeTimeout,
+                format!("the TLS handshake did not finish within {limit:?}"),
+                "check that the other side speaks TLS on this port and is not overloaded, or \
+                 raise handshake_timeout.",
             )),
         }
     }
@@ -537,9 +612,11 @@ impl TlsStream {
                 return Ok(());
             }
             if self.broken.get() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
+                return Err(coded(
+                    Code::TlsBroken,
                     "a TLS write failed or was cancelled; nothing more can be sent",
+                    "open a new connection. A write cancelled half-way (a dropped future, a \
+                     timeout) leaves a partial record behind, so the stream cannot go on.",
                 ));
             }
             if self.sending.get() {
@@ -595,7 +672,12 @@ impl TlsStream {
                 // be drained as the records are fed in.
                 match conn.read_tls(&mut input) {
                     Ok(0) => {
-                        result = Err(invalid("rustls accepted no more TLS data"));
+                        result = Err(coded(
+                            Code::TlsProtocol,
+                            "rustls accepted no more TLS data",
+                            "this is a bug in giong-tls; please report it at \
+                             https://github.com/giong-run/Giong/issues.",
+                        ));
                         break;
                     }
                     Ok(_) => {}
@@ -622,7 +704,7 @@ impl TlsStream {
                         }
                     }
                     Err(e) => {
-                        result = Err(invalid(e));
+                        result = Err(tls_error(e));
                         break;
                     }
                 }
