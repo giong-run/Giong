@@ -60,7 +60,7 @@ fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
 
 #[tokio::main]
 async fn main() {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:3005").await.unwrap();
+    let l = tokio::net::TcpListener::bind(bench_addr(3005)).await.unwrap();
     loop {
         let (mut s, _) = l.accept().await.unwrap();
         let _ = s.set_nodelay(true);
@@ -88,4 +88,11 @@ async fn main() {
             }
         });
     }
+}
+
+/// `BENCH_HOST` (default 127.0.0.1) lets bench/workers.sh drive the server
+/// from another machine.
+fn bench_addr(port: u16) -> String {
+    let host = std::env::var("BENCH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    format!("{host}:{port}")
 }
