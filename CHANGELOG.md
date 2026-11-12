@@ -8,6 +8,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to allow io_uring in Docker, Docker
+  Compose and Kubernetes without turning seccomp off.
+
+### Changed
+
+- When io_uring is blocked or missing (Docker's default seccomp profile, gVisor, the
+  `kernel.io_uring_disabled` sysctl), starting a runtime now fails with an error that says
+  so and links to the new [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), instead of a bare
+  "Operation not permitted".
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

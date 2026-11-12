@@ -80,10 +80,13 @@ Cách đọc cho đúng:
 ## Yêu cầu
 
 - **Linux, kernel 6.0 trở lên** (nên dùng 6.1+). Rust 1.80+.
+- io_uring phải được cho phép. Profile seccomp mặc định của Docker và containerd chặn nó;
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) hướng dẫn chỉ mở io_uring trong Docker, Docker
+  Compose và Kubernetes.
 - **Không chạy trên Windows hay macOS**, vì io_uring chỉ có trên Linux. Trên Windows:
   - WSL2 với kernel 6.x (`uname -r`; nếu còn 5.15 thì chạy `wsl --update`).
   - Máy ảo hoặc server Linux.
-  - Docker, thêm `--security-opt seccomp=unconfined` vì cấu hình mặc định chặn io_uring.
+  - Docker với profile seccomp trong [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Chạy thử
 
