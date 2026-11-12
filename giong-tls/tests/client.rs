@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use giong::error::{code, Code};
 use giong::net::{TcpListener, TcpStream};
 use giong_tls::rustls::pki_types::pem::PemObject;
 use giong_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -235,6 +236,7 @@ fn a_certificate_for_another_name_is_refused() {
         let addr = serve(acceptor, echo);
         let err = connect(&connector, addr, "example.com").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(code(&err), Some(Code::TlsCertificate), "{err}");
         assert!(err.to_string().contains("not valid for name"), "{err}");
     });
 }
@@ -250,6 +252,7 @@ fn a_certificate_from_an_unknown_authority_is_refused() {
         let addr = serve(acceptor, echo);
         let err = connect(&connector, addr, "localhost").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(code(&err), Some(Code::TlsCertificate), "{err}");
         assert!(err.to_string().contains("UnknownIssuer"), "{err}");
     });
 }
@@ -268,6 +271,7 @@ fn an_ip_address_can_be_the_server_name() {
         // The certificate is for 127.0.0.1, not for another address.
         let err = connect(&connector, addr, "127.0.0.2").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(code(&err), Some(Code::TlsCertificate), "{err}");
     });
 }
 
@@ -282,6 +286,7 @@ fn a_server_name_that_is_not_a_name_is_refused_before_the_handshake() {
         for name in ["not a name", "", "exa mple.com", "[nope]"] {
             let err = connect(&connector, addr, name).await.unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name:?}: {err}");
+            assert_eq!(code(&err), Some(Code::InvalidServerName), "{name:?}: {err}");
         }
     });
 }
@@ -355,6 +360,7 @@ fn a_client_certificate_is_presented_when_the_server_asks_for_one() {
         .await;
         let err = refused.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(code(&err), Some(Code::TlsProtocol), "{err}");
         // The server's side may finish a moment after the client's.
         for _ in 0..100 {
             if outcomes.borrow().len() == 2 {
@@ -375,6 +381,7 @@ fn a_client_certificate_must_match_its_key() {
         .client_auth(pki.client_cert.as_bytes(), other.client_key.as_bytes())
         .unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
 }
 
 #[test]
@@ -413,6 +420,7 @@ fn a_server_that_never_answers_times_out() {
         let started = Instant::now();
         let err = connect(&connector, addr, "localhost").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(code(&err), Some(Code::TlsHandshakeTimeout), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
     });
     drop(listener);
@@ -437,6 +445,7 @@ fn a_server_that_hangs_up_during_the_handshake_is_an_error() {
     giong::block_on(async move {
         let err = connect(&connector, addr, "localhost").await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert_eq!(code(&err), Some(Code::TlsHandshakeEof), "{err}");
     });
     server.join().unwrap();
 }
@@ -445,6 +454,8 @@ fn a_server_that_hangs_up_during_the_handshake_is_an_error() {
 fn trust_roots_must_be_certificates() {
     let err = TlsConnector::with_root_pem(b"no pem here").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
     let err = TlsConnector::with_roots(RootCertStore::empty()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    assert_eq!(code(&err), Some(Code::NoTrustedRoots), "{err}");
 }

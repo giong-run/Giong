@@ -42,6 +42,7 @@ use std::time::{Duration, SystemTime};
 use io_uring::{opcode, types};
 
 use crate::buf::{IoBuf, IoBufMut};
+use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime;
 
@@ -50,8 +51,13 @@ fn os_err(res: i32) -> io::Error {
 }
 
 fn c_path(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        raise(
+            Code::InvalidPath,
+            format!("the path {path:?} contains a NUL byte"),
+            "remove the NUL byte; Linux paths cannot contain one.",
+        )
+    })
 }
 
 fn cwd() -> types::Fd {

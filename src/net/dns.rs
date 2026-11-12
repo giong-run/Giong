@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
+use crate::error::{raise, Code};
 use crate::net::{TcpStream, UdpSocket};
 use crate::time::{timeout, Instant};
 
@@ -308,9 +309,11 @@ impl Resolver {
             return Ok(vec![Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()]);
         }
         Err(last_err.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
+            raise(
+                Code::HostNotFound,
                 format!("no address found for {host}"),
+                "check the spelling of the name, /etc/hosts, and the DNS servers in \
+                 /etc/resolv.conf (in a container, the network it is attached to).",
             )
         }))
     }
@@ -348,9 +351,11 @@ impl Resolver {
         let cfg = &self.inner.cfg;
         let servers = &cfg.nameservers;
         if servers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no DNS server configured",
+            return Err(raise(
+                Code::NoDnsServer,
+                "no DNS server is configured",
+                "add a nameserver line to /etc/resolv.conf, or use an address or a name from \
+                 /etc/hosts.",
             ));
         }
         let start = if cfg.rotate {
@@ -390,9 +395,11 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
     let ask = |qtype| async move {
         match timeout(wait, exchange(server, name, qtype)).await {
             Ok(answer) => answer,
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("DNS server {server} did not answer for {name}"),
+            Err(_) => Err(raise(
+                Code::DnsTimeout,
+                format!("DNS server {server} did not answer for {name} within {wait:?}"),
+                "check that the server in /etc/resolv.conf is reachable (firewall, VPN, \
+                 container network); options timeout:N and attempts:N there give it longer.",
             )),
         }
     };
@@ -411,10 +418,15 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
             }
             Ok(answer) if answer.rcode == RCODE_NXDOMAIN => {}
             Ok(answer) => {
-                err = Some(io::Error::other(format!(
-                    "DNS server {server} answered {} for {name}",
-                    rcode_name(answer.rcode)
-                )))
+                err = Some(raise(
+                    Code::DnsServerFailure,
+                    format!(
+                        "DNS server {server} answered {} for {name}",
+                        rcode_name(answer.rcode)
+                    ),
+                    "the server could not or would not answer; try again, or check the \
+                     server's own logs and upstream.",
+                ))
             }
             Err(e) => err = Some(e),
         }
@@ -494,7 +506,11 @@ async fn exchange_tcp(
         if chunk.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("DNS server {server} closed the TCP connection early"),
+                crate::error::Error::new(
+                    Code::DnsBadResponse,
+                    format!("DNS server {server} closed the TCP connection before answering"),
+                    "check the DNS server; a firewall that cuts TCP on port 53 does this.",
+                ),
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -554,10 +570,7 @@ fn validate_name(name: &str) -> io::Result<()> {
     if valid {
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("not a valid host name: {name:?}"),
-        ))
+        Err(invalid_host_name(name))
     }
 }
 
@@ -580,10 +593,7 @@ fn build_query(id: u16, name: &str, qtype: u16) -> io::Result<Vec<u8>> {
     q.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]); // one question
     for label in name.trim_end_matches('.').split('.') {
         if label.is_empty() || label.len() > 63 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("not a valid host name: {name:?}"),
-            ));
+            return Err(invalid_host_name(name));
         }
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
@@ -594,8 +604,22 @@ fn build_query(id: u16, name: &str, qtype: u16) -> io::Result<Vec<u8>> {
     Ok(q)
 }
 
+fn invalid_host_name(name: &str) -> io::Error {
+    raise(
+        Code::InvalidHostName,
+        format!("not a valid host name: {name:?}"),
+        "a host name is letters, digits, '-' and '_' in dot-separated labels of 1 to 63 \
+         characters, 253 characters in all.",
+    )
+}
+
 fn malformed() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "malformed DNS response")
+    raise(
+        Code::DnsBadResponse,
+        "malformed DNS response",
+        "check the DNS server in /etc/resolv.conf; something between giong and it may be \
+         changing the packets.",
+    )
 }
 
 fn read_u16(buf: &[u8], pos: usize) -> io::Result<u16> {

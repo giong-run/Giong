@@ -12,6 +12,8 @@ use std::task::Waker;
 
 use io_uring::types::BufRingEntry;
 
+use crate::error::{raise, Code};
+
 /// A buffer that can be handed to the kernel for the duration of a write.
 ///
 /// io_uring is completion based: the kernel keeps using the buffer until the
@@ -199,15 +201,19 @@ pub(crate) struct BufPool {
 impl BufPool {
     pub(crate) fn new(count: u16, buf_len: usize) -> io::Result<Rc<Self>> {
         if count == 0 || !count.is_power_of_two() || count > 32768 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "recv buffer count must be a power of two between 1 and 32768",
+            return Err(raise(
+                Code::InvalidConfig,
+                format!(
+                    "the recv buffer count must be a power of two from 1 to 32768, not {count}"
+                ),
+                "pass a count in that range to Builder::recv_buffers.",
             ));
         }
         if buf_len == 0 || buf_len > u32::MAX as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid recv buffer size",
+            return Err(raise(
+                Code::InvalidConfig,
+                format!("the recv buffer size must be from 1 byte to 4 GiB, not {buf_len}"),
+                "pass a size in that range to Builder::recv_buffers.",
             ));
         }
         // One page more than the entries need: Linux 6.0 (and 5.19) sizes the
@@ -219,7 +225,11 @@ impl BufPool {
         let ring_len = count as usize * std::mem::size_of::<BufRingEntry>() + page_size();
         let ring = Mapping::new(ring_len)?;
         let mem_size = (count as usize).checked_mul(buf_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "recv buffer pool too large")
+            raise(
+                Code::InvalidConfig,
+                format!("{count} recv buffers of {buf_len} bytes do not fit in memory"),
+                "pass fewer or smaller buffers to Builder::recv_buffers.",
+            )
         })?;
         let mem = Mapping::new(mem_size)?;
 

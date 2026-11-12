@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
+use crate::error::{raise, Code};
 use crate::net::dns;
 use crate::time::{sleep, Instant};
 
@@ -89,9 +90,11 @@ impl Sealed for str {
             return Ok(Target::Resolved(vec![addr]));
         }
         let invalid = || {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
+            raise(
+                Code::InvalidAddress,
                 format!("expected \"host:port\", got {self:?}"),
+                "write the host and the port, as in \"localhost:8080\", \"10.0.0.5:5432\" or \
+                 \"[::1]:443\".",
             )
         };
         let (host, port) = self.rsplit_once(':').ok_or_else(invalid)?;
@@ -191,10 +194,7 @@ where
 {
     let mut queue = interleave(addrs).into_iter();
     let Some(first) = queue.next() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "could not resolve to any address",
-        ));
+        return Err(crate::net::no_addresses());
     };
     let mut running: Vec<Pin<Box<Fut>>> = vec![Box::pin(connect(first))];
     let mut timer = sleep(ATTEMPT_DELAY);

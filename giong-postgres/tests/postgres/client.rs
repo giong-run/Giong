@@ -125,7 +125,11 @@ fn conversion_errors_name_the_parameter_or_column() {
         let client = connect(s).await;
         let e = client.query("SELECT $1::text", &[&1i32]).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Type);
-        assert!(e.to_string().starts_with("parameter $1 (text): "), "{e}");
+        assert!(
+            e.to_string()
+                .starts_with("GIONG-E3005: parameter $1 (text): "),
+            "{e}"
+        );
 
         let e = client
             .query("SELECT $1::int4", &[&3_000_000_000i64])
@@ -144,7 +148,10 @@ fn conversion_errors_name_the_parameter_or_column() {
             .await
             .unwrap();
         let e = row.get::<String>("n").unwrap_err();
-        assert!(e.to_string().starts_with("column \"n\": "), "{e}");
+        assert!(
+            e.to_string().starts_with("GIONG-E3005: column \"n\": "),
+            "{e}"
+        );
         let e = row.get::<String>("t").unwrap_err();
         assert!(e.to_string().contains("Option<"), "{e}");
 

@@ -126,20 +126,20 @@ Integers convert between the three integer types when the value fits and fail wh
 
 ## Errors
 
-`Error` is cheap to clone, implements `std::error::Error`, and converts into `io::Error`. `error.kind()` says what went wrong:
+`Error` is cheap to clone, implements `std::error::Error`, and converts into `io::Error`. `error.kind()` says what went wrong. Each kind has a giong error code, shown in front of the message and linked to its page in [docs/errors](../docs/errors/README.md) (`GIONG-E3003: password authentication failed for user "app". See …`); after `?` into an `io::Error`, `giong::error::code(&err)` finds it:
 
-| `ErrorKind` | Meaning |
-|---|---|
-| `Config` | The configuration or URL is not valid. |
-| `Connect` | Name resolution, TCP, TLS, or the connect timeout. Also an unknown database (`3D000`). |
-| `Auth` | The server refused the credentials, or asked for a method this crate does not support. |
-| `Db` | The server reported an error for the statement; `error.code()` is the SQLSTATE (`23505` for a unique violation...) and `error.db()` has every field. |
-| `Type` | A value could not be converted between Rust and PostgreSQL. The message names the parameter or column and suggests the Rust type to use. |
-| `RowCount` | `query_one` found no row, or more than one. |
-| `TooLarge` | The result was larger than `max_result_size`. The connection stays usable. |
-| `Closed` | The connection is closed. A `Pool` replaces it by itself. |
-| `PoolTimeout` | No pooled connection became free within `wait_timeout`. |
-| `Protocol` | The server sent something this crate cannot understand. The connection is closed. |
+| `ErrorKind` | Code | Meaning |
+|---|---|---|
+| `Config` | [E3001](../docs/errors/E3001.md) | The configuration or URL is not valid. |
+| `Connect` | [E3002](../docs/errors/E3002.md) | Name resolution, TCP, TLS, or the connect timeout. Also an unknown database (`3D000`). |
+| `Auth` | [E3003](../docs/errors/E3003.md) | The server refused the credentials, or asked for a method this crate does not support. |
+| `Db` | [E3004](../docs/errors/E3004.md) | The server reported an error for the statement; `error.code()` is the SQLSTATE (`23505` for a unique violation...) and `error.db()` has every field. |
+| `Type` | [E3005](../docs/errors/E3005.md) | A value could not be converted between Rust and PostgreSQL. The message names the parameter or column and suggests the Rust type to use. |
+| `RowCount` | [E3006](../docs/errors/E3006.md) | `query_one` found no row, or more than one. |
+| `TooLarge` | [E3007](../docs/errors/E3007.md) | The result was larger than `max_result_size`. The connection stays usable. |
+| `Closed` | [E3008](../docs/errors/E3008.md) | The connection is closed. A `Pool` replaces it by itself. |
+| `PoolTimeout` | [E3009](../docs/errors/E3009.md) | No pooled connection became free within `wait_timeout`. |
+| `Protocol` | [E3010](../docs/errors/E3010.md) | The server sent something this crate cannot understand. The connection is closed. |
 
 An error from the server affects only its own statement: the statements that other tasks pipelined on the same connection get their own results.
 

@@ -10,6 +10,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **Error codes.** Every error that giong, giong-tls and giong-postgres raise starts with
+  a stable code (`GIONG-E0102: no address found for db.internal. Fix: …`), says what went
+  wrong and how to fix it, and ends with a link to the code's page in
+  [docs/errors](docs/errors/README.md): 34 codes. Functions still return `io::Error`;
+  `giong::error::code(&err)` finds the `giong::error::Code` in it, down the chain of
+  sources, so programs can match on the code instead of the message. Errors passed on from
+  the kernel (connection refused, …) are unchanged and have no code.
+
 - **Verification**: the wake-up handshakes between workers and other threads
   live in `src/notify.rs` and are model-checked with
   [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
@@ -80,13 +88,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     SCRAM-SHA-256, MD5, and clear-text passwords only over TLS or to this machine.
   - `Config::from_url`, strict about unknown parameters and about `sslmode` values
     that would silently fall back to no encryption.
-  - Errors with an `ErrorKind`, the server's SQLSTATE code and every field it sent;
+  - Errors with an `ErrorKind` (each has its giong code, `GIONG-E3001` to `GIONG-E3010`,
+    shown in front of the message), the server's SQLSTATE code and every field it sent;
     finite defaults for the connect timeout (10 s), the statement timeout (30 s,
     enforced by the server), the result size (64 MiB), the statement cache (256) and
     the pool wait (5 s).
 
 ### Changed
 
+- The messages of errors giong raises itself now start with their code and end with a
+  link (see Added). Their `io::ErrorKind`s are unchanged. `time::Elapsed` turned into an
+  `io::Error` now carries `GIONG-E0007` instead of being a bare `TimedOut`.
 - When io_uring is blocked or missing (Docker's default seccomp profile, gVisor, the
   `kernel.io_uring_disabled` sysctl), starting a runtime now fails with an error that says
   so and links to the new [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), instead of a bare

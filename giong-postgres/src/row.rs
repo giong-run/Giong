@@ -304,7 +304,7 @@ mod tests {
         let e = rows[1].get::<String>("name").unwrap_err();
         assert!(
             e.to_string()
-                .starts_with("column \"name\": the value is NULL"),
+                .starts_with("GIONG-E3005: column \"name\": the value is NULL"),
             "{e}"
         );
         let e = rows[0].get::<String>("id").unwrap_err();

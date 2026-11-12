@@ -20,6 +20,7 @@ use io_uring::{opcode, types};
 
 use crate::buf::BufPool;
 use crate::driver::{Driver, Park};
+use crate::error::Code;
 use crate::executor::{TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::Doorbell;
 use crate::op::Op;
@@ -809,9 +810,11 @@ struct SignalGuard {
 impl SignalGuard {
     fn install() -> io::Result<Self> {
         if SIGNALS_IN_USE.swap(true, Ordering::SeqCst) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "another giong runtime in this process already handles signals",
+            return Err(crate::error::raise(
+                Code::SignalsTaken,
+                "another giong runtime in this process already handles SIGINT and SIGTERM",
+                "turn on Builder::shutdown_on_signals for one runtime only, or run one runtime \
+                 at a time.",
             ));
         }
         // SAFETY: plain libc calls with valid arguments; results are checked.

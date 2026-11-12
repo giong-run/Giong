@@ -91,9 +91,13 @@ run; `scripts/check.sh fallback` does this for you.
 5. **Public items are documented.** Futures are not `Send` by design: tasks stay on their
    worker, and `Rc`/`RefCell` are fine. Buffers are passed by value and handed back, as in
    `write_all(buf)` returning `(io::Result<()>, buf)`.
-6. **Errors explain themselves.** An error giong creates says what went wrong and what to
-   do about it; the io_uring setup error added in #12 is the model. No unbounded
-   defaults: every timeout and size limit is finite and documented.
+6. **Errors explain themselves.** An error giong raises carries a code:
+   `giong::error::Error::new(Code::…, what went wrong, how to fix it)`, turned into an
+   `io::Error`. A new code goes into `src/error.rs` and gets a page in `docs/errors/`
+   (`tests/error_docs.rs` checks both); codes are never reused or renumbered. Errors passed
+   on from the kernel stay as they are. A message that starts with `GIONG-E0102` is
+   explained in `docs/errors/E0102.md`. No unbounded defaults: every timeout and size
+   limit is finite and documented.
 7. **Wake-ups and the HTTP parser have their own checks.** A change to `src/notify.rs`,
    the injector or `TaskWaker` updates its loom model in the same pull request. A change
    to the `giong-http` parser or connection state machine is fuzzed for a few minutes

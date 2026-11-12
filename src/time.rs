@@ -382,9 +382,15 @@ impl fmt::Display for Elapsed {
 
 impl std::error::Error for Elapsed {}
 
+/// An [`io::Error`](std::io::Error) with kind `TimedOut` and code
+/// [`GIONG-E0007`](crate::error::Code::TimedOut).
 impl From<Elapsed> for std::io::Error {
     fn from(_: Elapsed) -> Self {
-        std::io::ErrorKind::TimedOut.into()
+        crate::error::raise(
+            crate::error::Code::TimedOut,
+            "the operation did not finish within the time given to giong::time::timeout",
+            "give it more time, or find out why the operation is slow.",
+        )
     }
 }
 

@@ -13,6 +13,7 @@ fn a_blocked_io_uring_is_explained() {
         let rt = giong::Builder::new().workers(1).build().unwrap();
         let err = rt.run(|_| async {}).unwrap_err();
         println!("run: {err}");
+        println!("code: {:?}", giong::error::code(&err));
         let err = giong::Builder::new().block_on(async {}).unwrap_err();
         println!("block_on: {err}");
         return;
@@ -34,10 +35,19 @@ fn a_blocked_io_uring_is_explained() {
             .lines()
             .find(|l| l.starts_with(&format!("{call}: ")))
             .unwrap_or_else(|| panic!("no {call} line in {stdout}"));
+        assert!(
+            line.starts_with(&format!("{call}: GIONG-E0001: ")),
+            "{line}"
+        );
         assert!(line.contains("giong needs io_uring"), "{line}");
         assert!(line.contains("seccomp"), "{line}");
         assert!(line.contains("docs/DEPLOYMENT.md"), "{line}");
+        assert!(line.contains("docs/errors/E0001.md"), "{line}");
     }
+    assert!(
+        stdout.contains("code: Some(IoUringUnavailable)"),
+        "{stdout}"
+    );
 }
 
 /// Makes `io_uring_setup` fail with `EPERM` in every thread of this process,

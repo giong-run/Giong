@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener, UdpSocket as S
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use giong::error::{code, Code};
 use giong::net::{lookup_host, Resolver, ResolverConfig, TcpListener, TcpStream};
 
 const A: u16 = 1;
@@ -266,6 +267,7 @@ fn a_missing_name_is_not_found() {
         let r = dns.resolver("search a.test\n");
         let err = r.lookup_ip("nothing.here").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound, "{err}");
+        assert_eq!(code(&err), Some(Code::HostNotFound), "{err}");
         // Both the name and the name in the search domain were tried.
         assert!(dns.count("nothing.here") == 2 && dns.count("nothing.here.a.test") == 2);
     });
@@ -286,6 +288,7 @@ fn a_failing_server_is_an_error_not_a_missing_name() {
         let err = r.lookup_ip("broken.test").await.unwrap_err();
         assert_ne!(err.kind(), ErrorKind::NotFound);
         assert!(err.to_string().contains("SERVFAIL"), "{err}");
+        assert_eq!(code(&err), Some(Code::DnsServerFailure), "{err}");
     });
 }
 
@@ -317,6 +320,7 @@ fn a_silent_server_is_skipped_for_the_next_one() {
             .attempts(2);
         let err = Resolver::new(cfg).lookup_ip("up.test").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut, "{err}");
+        assert_eq!(code(&err), Some(Code::DnsTimeout), "{err}");
     });
 }
 
@@ -398,6 +402,7 @@ fn invalid_names_are_refused_before_any_query() {
         for bad in ["", "a..b", "white space", "ví-dụ.vn"] {
             let err = r.lookup_ip(bad).await.unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput, "{bad:?}: {err}");
+            assert_eq!(code(&err), Some(Code::InvalidHostName), "{bad:?}: {err}");
         }
         assert!(dns.names().is_empty());
     });
@@ -466,5 +471,6 @@ fn connect_reports_the_last_error_when_every_address_fails() {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+        assert_eq!(code(&err), Some(Code::NoAddresses), "{err}");
     });
 }
