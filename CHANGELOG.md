@@ -39,6 +39,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   night in CI. A one-minute run makes about 1.3 million connections on four workers.
 - **Verification**: the whole suite on real Linux 6.0.19 and 6.1.155 kernels, each
   booted in QEMU from an initramfs (`scripts/kernels.sh`), in CI on every change.
+- **Benchmarks**: `bench/workers.sh` measures throughput from one worker to N, with CPU
+  time per request and how busy the server and the load generator were, on one machine
+  or with the load generator on another (`LOAD_HOST`; the Rust servers take
+  `BENCH_HOST`).
 
 ## [0.2.1] - 2026-11-12
 

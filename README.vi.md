@@ -22,8 +22,10 @@ viết bằng tiếng Anh. File này là bản tóm tắt.*
 > **Trạng thái: 0.2.** Đủ để viết server thật: TCP, UDP, Unix socket, file, timer, nhiều
 > core, tắt êm, cùng hai crate đi kèm: [`giong-http`](giong-http/README.vi.md) (server
 > HTTP/1.1 nghiêm ngặt) và [`giong-tls`](giong-tls/README.vi.md) (TLS 1.2/1.3 trên rustls)
-> để chạy HTTPS trực tiếp. 169 test đều qua trên cả ba cấu hình io_uring; ThreadSanitizer
-> và valgrind sạch. **Chưa** chạy production, chưa có HTTP/2.
+> để chạy HTTPS trực tiếp. 169 test đều qua trên cả ba cấu hình io_uring và trên kernel 6.0,
+> 6.1 thật; ThreadSanitizer và valgrind sạch, cơ chế đánh thức giữa các thread được kiểm
+> chứng bằng loom, parser HTTP được fuzz và soak test chạy hai giờ mỗi đêm. **Chưa** chạy
+> production, chưa có HTTP/2.
 
 ## Vì sao là giong
 
@@ -147,8 +149,6 @@ Muốn HTTPS thì bật feature `tls` và gọi `serve_tls` với một `giong_t
 - Không tương thích hệ sinh thái Tokio (hyper, sqlx, reqwest không chạy được).
 - Task không chuyển core.
 - Tắt êm phải tự bật bằng `shutdown_grace`; mặc định vẫn là cắt kết nối.
-- Chưa chạy trên kernel 6.0 thật; các đường dự phòng cho kernel cũ được kiểm tra bằng cách
-  ép chạy trên kernel 6.18.
 
 ## Tài liệu khác
 

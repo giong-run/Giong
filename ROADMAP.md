@@ -50,7 +50,8 @@ features, find out what is actually true.
 
 - [ ] Benchmark on a multi-core machine with the load generator on a separate host and a
       physical network card.
-- [ ] Measure scaling from 1 to N workers.
+- [ ] Measure scaling from 1 to N workers. `bench/workers.sh` does it, from a second
+      machine too; on the 4-vCPU VM the load generator saturates at two workers.
 - [ ] Repeat the Monoio and Glommio comparison on several cores and a physical network.
 - [x] Run the test suite on real 6.0 and 6.1 kernels (in QEMU, in CI; it found that
       6.0 could fail to start a runtime, now fixed).
