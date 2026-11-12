@@ -17,14 +17,14 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-*[Đọc bằng tiếng Việt](README.vi.md)*
-
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and two companion crates,
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server) and
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly.
-> 169 tests pass on three io_uring setups; ThreadSanitizer and valgrind are clean. It has
-> **not** run in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
+> 173 tests pass on three io_uring setups and on real 6.0 and 6.1 kernels; ThreadSanitizer
+> and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
+> fuzzed and a soak test churns connections for two hours every night. It has **not** run
+> in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
 
 ## Why giong
 
@@ -77,10 +77,13 @@ connection, the same as the others.
 
 - **Linux 6.0 or newer** (6.1+ recommended). Developed and tested on 6.18.
 - Rust 1.80 or newer.
+- io_uring must be allowed. Docker's and containerd's default seccomp profiles block it;
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow just io_uring in Docker,
+  Docker Compose and Kubernetes.
 - giong does **not** build on Windows or macOS: io_uring is a Linux interface. On Windows
   use WSL2 with a 6.x kernel (`uname -r`; run `wsl --update` if it is older), a Linux
-  virtual machine, or Docker started with `--security-opt seccomp=unconfined` (Docker's
-  default profile blocks io_uring).
+  virtual machine, or Docker with the profile from
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Quick start
 
@@ -188,13 +191,14 @@ let runtime = giong::Builder::new()
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
 | Configuration | `.workers(n)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
-| TCP | `TcpListener::bind` / `accept`; `TcpStream::connect` / `recv` / `read` / `write` / `write_all` / `shutdown` / `set_nodelay` |
+| TCP | `TcpListener::bind` / `accept`; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `shutdown` / `set_nodelay` |
+| Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
 | Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
 | UDP | `UdpSocket::bind` / `connect`; `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast` |
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
-| Across threads | `Handle::spawn_on(worker, \|\| async { .. })`, `sync::mpsc::channel()` |
+| Across threads | `Handle::spawn_on(worker, \|\| async { .. })`, `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsStream` |
 
@@ -372,6 +376,30 @@ other two; 100 connections, three rounds.
 server: in an earlier two-core run giong's workers were only 73–94% busy. Raw Tokio and
 `giong-http` lead on `/json`, giong and Monoio on `/users`, and the rest needs a bigger machine.
 
+### One worker to N
+
+`bench/workers.sh` measures how throughput grows with the number of workers: the server
+gets the first N of its CPUs, the connection count grows with N (64 per worker), and the
+report shows, besides requests per second, the CPU time per request and how busy the
+server's and the load generator's CPUs were, so a run says which side set the number.
+It can drive the server from a second machine over ssh (`LOAD_HOST`, `BENCH_HOST`), which
+is how it should be run. On this 4-vCPU machine (`/json`, three rounds of 6 s):
+
+| Server | 1 worker | 2 workers | CPU per request, 1 → 2 | Limited at 2 by |
+|---|---|---|---|---|
+| giong | 218.9k | 311.1k | 4.50 → 5.09 µs | `wrk` (99% busy; server 81%) |
+| giong-http | 186.1k | 342.8k | 5.31 → 5.32 µs | `wrk` (97%; server 93%) |
+| Monoio (tuned) | 214.2k | 337.6k | 4.59 → 4.75 µs | `wrk` (99%; server 82%) |
+| Raw Tokio | 151.1k | 351.9k | 6.51 → 5.15 µs | `wrk` (98%; server 93%) |
+| Glommio | 175.8k | 226.9k | 5.63 → 8.69 µs | server (99%) |
+
+With one worker every server is the bottleneck; with two, two `wrk` threads on the other
+two vCPUs can no longer keep up, so the two-worker numbers are lower bounds and say
+nothing about scaling. A worker that is not saturated parks and wakes more often, which is
+why giong's CPU per request rises at 81% busy. Real scaling numbers need a machine with
+more cores and a separate load generator (see [What has not been measured](#what-has-not-been-measured)).
+Recorded output: `bench/results/workers/`.
+
 ### HTTPS
 
 `bench/tls.sh`: `giong-http` + `giong-tls` against Axum + `axum-server`, both on rustls with
@@ -428,18 +456,20 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 - **More than two cores, and a physical network.** Everything here is loopback inside a
   4-vCPU virtual machine, where the load generator competes for the same few cores.
+  `bench/workers.sh` is ready for the real run: `BENCH_HOST=<server address>
+  LOAD_HOST=<user@load machine> WORKERS="1 2 4 8 16" bench/workers.sh`.
 - **Disks.** The file benchmark measures cached data only.
 - **Newer Monoio and Glommio.** The comparison uses the latest crates.io releases
   (August and March 2024); their main branches may differ.
 
-Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/syscalls.sh`, `bench/tls.sh` and
-`bench/fs.sh`; two cores with
+Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
+`bench/tls.sh` and `bench/fs.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-169 tests (`cargo test --workspace --all-features`), repeated in release mode on all three
+173 tests (`cargo test --workspace --all-features`), repeated in release mode on all three
 io_uring setups without a failure:
 
 | Suite | What it checks |
@@ -454,7 +484,7 @@ io_uring setups without a failure:
 | `tests/multi.rs` (10) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (9) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
-| `giong-http` (46) | 15 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 17 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket); 9 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
+| `giong-http` (50) | 15 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 19 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 11 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
 | `giong-tls` (8) | TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
 | Other (7) | slab, the io_uring setup tiers, 5 documentation examples |
 
@@ -468,6 +498,23 @@ Also:
   and giong's threads wait in raw system calls).
 - **The fallback io_uring setups** (`scripts/check.sh fallback`): the whole suite again
   with `GIONG_RING_TIER=coop` (the flags of kernel 6.0) and `basic` (no flags at all).
+- **Real 6.0 and 6.1 kernels** (`scripts/kernels.sh`): the test binaries booted in QEMU
+  on Linux 6.0.19 and 6.1.155, in CI on every change. It found that a runtime could fail
+  to start on 6.0, which pins one page more than the buffer ring needs; fixed.
+- **loom** (`scripts/check.sh loom`): the two handshakes between a worker and the threads
+  that wake its tasks (`src/notify.rs`) are model-checked under every interleaving and
+  memory-ordering outcome loom explores. It found a lost wake-up: a task waiting on state
+  shared without a lock could sleep forever (about 70 in a million cross-thread wake-ups
+  on x86); fixed, and `tests/wake.rs` runs that race on the real CPU.
+- **Coverage-guided fuzzing** (`giong-http/fuzz/`, cargo-fuzz): the request-head parser,
+  the chunked decoder, and whole connections over an in-memory transport, in pieces of
+  random size. 18 million inputs locally without a finding; CI fuzzes every night and keeps
+  the corpus.
+- **Soak** (`scripts/check.sh soak`, `tests/soak.rs`): TCP clients on every worker that
+  close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
+  traffic alongside; afterwards no descriptor, memory or driver state may be left over.
+  30 minutes on four workers: 39.5 million connections, resident memory flat at 15.5–15.7
+  MB. CI runs it for two hours every night.
 - **valgrind memcheck** over the single-threaded tests (`scripts/valgrind.sh`): no invalid
   access, no leak.
 - **Load** on the example HTTP server: over 250,000 connections opened and closed, 5,000
@@ -476,17 +523,15 @@ Also:
 - **Graceful shutdown under load**: SIGTERM during 40 slow requests. Without a grace
   period 156 of 200 requests were answered; with one, 400 of 400.
 - **CI** runs formatting, clippy, the documentation build, a build with Rust 1.80, the
-  repeated tests, the fallback setups and ThreadSanitizer.
+  repeated tests, the fallback setups, ThreadSanitizer, the loom models and the real 6.0
+  and 6.1 kernels on every change, and fuzzing and the soak test every night.
 
 Not verified, and you should know it:
 
-- **No real 6.0 kernel.** The fallback setups were forced on 6.18: that checks giong's code
-  paths without `DEFER_TASKRUN`, not the behaviour of the old kernel itself.
 - Neither sanitizer nor valgrind can see the kernel writing into memory, so cancellation
   safety rests on the design and on `tests/cancel.rs`.
 - valgrind 3.22 cannot run the multi-threaded tests (it treats `io_uring_enter` as
-  non-blocking, so threads starve each other); ThreadSanitizer covers those. The
-  cross-thread wake-up has not been model-checked with loom.
+  non-blocking, so threads starve each other); ThreadSanitizer covers those.
 - `giong-tls` has not had an independent security audit. The cryptography and the protocol
   are rustls's; giong's part is connecting rustls to the socket.
 
@@ -516,9 +561,12 @@ to audit.
 
 ## Limitations
 
-- **No asynchronous DNS.** `bind` and `connect` resolve names with a blocking call. Also
-  missing: Unix datagram sockets, multicast, reading directories, `set_len`, file locks,
-  `O_DIRECT` with registered buffers.
+- **Name resolution reads files and DNS only.** `connect` and `lookup_host` resolve names
+  without blocking, from `/etc/hosts` and the DNS servers in `/etc/resolv.conf`; other
+  Name Service Switch sources (mDNS, LDAP) are not used. `bind` still resolves with a
+  blocking call, which only matters at startup. Also missing: Unix datagram sockets,
+  multicast, reading directories, `set_len`, file locks, `O_DIRECT` with registered
+  buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
 - **TLS is server side only.** No TLS client, no kTLS, no independent audit of `giong-tls`.

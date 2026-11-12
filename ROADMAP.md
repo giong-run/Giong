@@ -90,12 +90,17 @@ features, find out what is actually true.
 
 - [ ] Benchmark on a multi-core machine with the load generator on a separate host and a
       physical network card.
-- [ ] Measure scaling from 1 to N workers.
+- [ ] Measure scaling from 1 to N workers. `bench/workers.sh` does it, from a second
+      machine too; on the 4-vCPU VM the load generator saturates at two workers.
 - [ ] Repeat the Monoio and Glommio comparison on several cores and a physical network.
-- [ ] Run the test suite on real 6.0 and 6.1 kernels.
-- [ ] Model-check the cross-thread wake-up handshake with `loom`.
-- [ ] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser.
-- [ ] Add a soak test: hours of connection churn with fd and memory checks.
+- [x] Run the test suite on real 6.0 and 6.1 kernels (in QEMU, in CI; it found that
+      6.0 could fail to start a runtime, now fixed).
+- [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
+      wake-up, now fixed).
+- [x] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser, the chunked
+      decoder and a whole connection, nightly in CI.
+- [x] Add a soak test: hours of connection churn with fd and memory checks (two hours
+      every night in CI).
 - [ ] An independent look at `giong-tls` before anyone relies on it.
 
 **Exit criteria:** published multi-core results with their method, and no open memory- or

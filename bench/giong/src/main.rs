@@ -130,7 +130,7 @@ fn main() {
     let runtime = builder.build().expect("giong runtime");
     runtime
         .run(|_worker| async {
-            let listener = TcpListener::bind("127.0.0.1:3006").expect("bind");
+            let listener = TcpListener::bind(bench_addr(3006)).expect("bind");
             loop {
                 if let Ok(stream) = listener.accept().await {
                     giong::spawn(serve(stream));
@@ -138,4 +138,11 @@ fn main() {
             }
         })
         .expect("giong runtime");
+}
+
+/// `BENCH_HOST` (default 127.0.0.1) lets bench/workers.sh drive the server
+/// from another machine.
+fn bench_addr(port: u16) -> String {
+    let host = std::env::var("BENCH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    format!("{host}:{port}")
 }

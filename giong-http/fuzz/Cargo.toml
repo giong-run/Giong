@@ -1,0 +1,40 @@
+[package]
+name = "giong-http-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+giong = { path = "../.." }
+giong-http = { path = ".." }
+
+# Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "head"
+path = "fuzz_targets/head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connection"
+path = "fuzz_targets/connection.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
