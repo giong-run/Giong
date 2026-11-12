@@ -3,6 +3,27 @@
 Thanks for taking an interest. This file explains how to build and test giong, what a
 change has to satisfy before it is merged, and how to write commits.
 
+## Your first contribution
+
+New here? Welcome. A good way in:
+
+1. Pick an issue labelled
+   [`good first issue`](https://github.com/giong-run/Giong/labels/good%20first%20issue)
+   or [`help wanted`](https://github.com/giong-run/Giong/labels/help%20wanted), or fix a
+   bug you found yourself.
+2. Comment on the issue to say you are working on it, so nobody duplicates the work. A
+   maintainer will assign it to you. If you stop, say so; that is fine.
+3. Set up as described below, reproduce the problem with a test, then fix it.
+4. Open a pull request early, as a draft if it is not finished. Questions in a draft are
+   welcome and are the fastest way to get help.
+
+Pull requests from forks are the normal route. CI on a first-time contributor's pull request
+starts once a maintainer approves the run, so do not worry if the checks wait at first.
+
+Labels you will see: `bug`, `enhancement`, `documentation`, `good first issue`,
+`help wanted`, `confirmed` (a maintainer reproduced it) and the `area: …` labels, which
+name the part of the code involved (`driver`, `fs`, `net`, `http`, `tls`).
+
 ## Before you start
 
 - For anything larger than a small fix, **[open an issue](https://github.com/giong-run/Giong/issues) first** and describe
@@ -159,9 +180,9 @@ can be triggered remotely. Report it privately at
 
 ## Conduct
 
-Be respectful and assume good faith. Criticise code, not people. Harassment and personal
-attacks are not tolerated, and maintainers may remove comments or block participants who
-ignore this.
+Everyone taking part is expected to follow the [code of conduct](CODE_OF_CONDUCT.md). In
+short: be respectful, assume good faith, and criticise code, not people. Report problems to
+conduct@giong.run.
 
 ## Licensing of contributions
 

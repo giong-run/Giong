@@ -536,7 +536,9 @@ to audit.
 
 - Source, issues and discussions: <https://github.com/giong-run/Giong>
 - [CONTRIBUTING.md](CONTRIBUTING.md) — building, required checks, the rules for `unsafe`
-  and cancellation, commit conventions.
+  and cancellation, commit conventions, and how to make a first contribution.
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — how we treat each other, and how to report a
+  problem.
 - [ROADMAP.md](ROADMAP.md) — milestones and deliberate non-goals.
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 
