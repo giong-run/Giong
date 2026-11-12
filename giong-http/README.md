@@ -2,8 +2,6 @@
 
 A small, strict HTTP/1.1 server for the [giong](../README.md) runtime.
 
-*[Đọc bằng tiếng Việt](README.vi.md)*
-
 ```rust
 use std::time::Duration;
 use giong::net::TcpListener;

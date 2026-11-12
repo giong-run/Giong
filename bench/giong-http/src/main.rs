@@ -53,14 +53,21 @@ fn main() -> std::io::Result<()> {
             async move {
                 match tls {
                     Some(acceptor) => {
-                        let listener = TcpListener::bind("127.0.0.1:3010").expect("bind");
+                        let listener = TcpListener::bind(bench_addr(3010)).expect("bind");
                         Server::new().serve_tls(listener, acceptor, handler).await;
                     }
                     None => {
-                        let listener = TcpListener::bind("127.0.0.1:3009").expect("bind");
+                        let listener = TcpListener::bind(bench_addr(3009)).expect("bind");
                         Server::new().serve(listener, handler).await;
                     }
                 }
             }
         })
+}
+
+/// `BENCH_HOST` (default 127.0.0.1) lets bench/workers.sh drive the server
+/// from another machine.
+fn bench_addr(port: u16) -> String {
+    let host = std::env::var("BENCH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    format!("{host}:{port}")
 }

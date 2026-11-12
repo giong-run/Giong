@@ -58,6 +58,8 @@ mod chunked;
 mod date;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(any(test, fuzzing))]
+mod invariants;
 mod parse;
 mod request;
 mod response;
@@ -66,3 +68,11 @@ mod server;
 pub use request::Request;
 pub use response::{Body, Response};
 pub use server::{Server, Transport};
+
+/// Entry points for the fuzz targets in `giong-http/fuzz`. Only built by
+/// `cargo fuzz` (`--cfg fuzzing`); not part of the API.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::invariants::{check_chunked, check_head};
+}

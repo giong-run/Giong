@@ -146,7 +146,7 @@ fn main() {
                     .build()
                     .expect("monoio io_uring runtime");
                 rt.block_on(async {
-                    let listener = TcpListener::bind("127.0.0.1:3007").expect("bind");
+                    let listener = TcpListener::bind(bench_addr(3007)).expect("bind");
                     loop {
                         if let Ok((stream, _)) = listener.accept().await {
                             monoio::spawn(serve(stream));
@@ -159,4 +159,11 @@ fn main() {
     for worker in workers {
         worker.join().expect("monoio worker panicked");
     }
+}
+
+/// `BENCH_HOST` (default 127.0.0.1) lets bench/workers.sh drive the server
+/// from another machine.
+fn bench_addr(port: u16) -> String {
+    let host = std::env::var("BENCH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    format!("{host}:{port}")
 }

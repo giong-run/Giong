@@ -168,6 +168,12 @@ impl Mapping {
     }
 }
 
+fn page_size() -> usize {
+    // SAFETY: plain libc call without pointers.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(size).unwrap_or(4096)
+}
+
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: exactly the region mapped in `new`.
@@ -204,7 +210,14 @@ impl BufPool {
                 "invalid recv buffer size",
             ));
         }
-        let ring = Mapping::new(count as usize * std::mem::size_of::<BufRingEntry>())?;
+        // One page more than the entries need: Linux 6.0 (and 5.19) sizes the
+        // ring as `struct_size(br, bufs, count)`, 16 bytes more than `count`
+        // entries, so for 256 entries or more it pins one page past the end
+        // and fails with EFAULT unless that page happens to be mapped.
+        // Fixed in 6.1 ("io_uring: fix size calculation when registering buf
+        // ring"); found by running the tests on a real 6.0 kernel.
+        let ring_len = count as usize * std::mem::size_of::<BufRingEntry>() + page_size();
+        let ring = Mapping::new(ring_len)?;
         let mem_size = (count as usize).checked_mul(buf_len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "recv buffer pool too large")
         })?;
