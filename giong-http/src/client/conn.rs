@@ -60,6 +60,16 @@ impl Stream {
             Stream::Tls(s) => s.tcp(),
         }
     }
+
+    /// Whether an end of stream just received can be trusted to be the
+    /// server's: over TLS only a `close_notify` alert is authenticated, and
+    /// a TCP close without one may come from anyone on the path.
+    fn ended_cleanly(&self) -> bool {
+        match self {
+            Stream::Tcp(_) => true,
+            Stream::Tls(s) => s.received_close_notify(),
+        }
+    }
 }
 
 /// An open connection to one origin.
@@ -298,6 +308,18 @@ impl Conn {
                         }
                     };
                     if chunk.is_empty() {
+                        // Without close_notify the body may have been cut
+                        // short on the way (a truncation attack).
+                        if !self.stream.ended_cleanly() {
+                            return Err(Failure::Other(Error::new(
+                                ErrorKind::Closed,
+                                format!(
+                                    "{what}: the server closed the connection without a TLS \
+                                     close_notify, so the response body, which ends where \
+                                     the connection does, may have been cut short"
+                                ),
+                            )));
+                        }
                         break;
                     }
                     if buf.len() - head_len + chunk.len() > limits.max_response_size {

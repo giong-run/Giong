@@ -771,6 +771,52 @@ fn a_tls_handshake_that_never_ends_hits_the_connect_timeout() {
     });
 }
 
+#[test]
+fn an_https_body_that_ends_with_the_connection_needs_close_notify() {
+    giong::block_on(async {
+        let (cert, key) = certificate();
+        let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A response without a length, so its body ends where the connection
+        // does; `/clean` ends it with close_notify, `/cut` just closes the
+        // socket, as a FIN forged by someone on the path would.
+        giong::spawn(async move {
+            while let Ok(tcp) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                giong::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut request = Vec::new();
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match tls.recv().await {
+                            Ok(data) if !data.is_empty() => request.extend_from_slice(&data),
+                            _ => return,
+                        }
+                    }
+                    let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nthe whole body";
+                    let _ = tls.write_all(response.to_vec()).await;
+                    if request.starts_with(b"GET /clean ") {
+                        let _ = tls.shutdown().await;
+                    }
+                });
+            }
+        });
+        let client = Client::builder()
+            .tls(TlsConnector::with_root_pem(cert.as_bytes()).unwrap())
+            .build();
+        let clean = format!("https://localhost:{port}/clean");
+        let response = client.get(&clean).send().await.unwrap();
+        assert_eq!(response.text().unwrap(), "the whole body");
+
+        let cut = format!("https://localhost:{port}/cut");
+        let e = client.get(&cut).send().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Closed, "{e}");
+        assert!(e.to_string().contains("close_notify"), "{e}");
+    });
+}
+
 /// The real thing: a public HTTPS API, through the machine's certificate
 /// authorities. Needs the internet, so it runs only when asked:
 /// `cargo test -p giong-http --all-features --test client -- --ignored`.
