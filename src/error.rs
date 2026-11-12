@@ -28,9 +28,10 @@
 //! # }
 //! ```
 //!
-//! The companion crates (giong-http, giong-tls, giong-postgres, giong-mysql)
-//! use the same codes, so one `match` covers them all. Codes are never reused
-//! or renumbered; a code that is no longer raised keeps its page.
+//! The companion crates (giong-http, giong-tls, giong-postgres, giong-mysql,
+//! giong-redis) use the same codes, so one `match` covers them all. Codes are
+//! never reused or renumbered; a code that is no longer raised keeps its
+//! page.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -46,9 +47,9 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
-        /// giong-http's client, `E2xxx` giong-tls, `E30xx` giong-postgres and
-        /// `E31xx` giong-mysql. Each has a page under `docs/errors/` in the
-        /// repository; [`url`](Code::url) links to it.
+        /// giong-http's client, `E2xxx` giong-tls, `E30xx` giong-postgres,
+        /// `E31xx` giong-mysql and `E32xx` giong-redis. Each has a page under
+        /// `docs/errors/` in the repository; [`url`](Code::url) links to it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         #[non_exhaustive]
         #[repr(u16)]
@@ -234,6 +235,32 @@ codes! {
     MysqlPoolTimeout = 3109, TimedOut, "MySQL pool wait timed out";
     /// The server sent something that is not the MySQL protocol.
     MysqlProtocol = 3110, InvalidData, "MySQL protocol error";
+
+    // ------------------------------------------------------- giong-redis
+    /// The configuration or connection URL is not valid.
+    RedisConfig = 3201, InvalidInput, "invalid Redis configuration";
+    /// Opening a connection failed: name resolution, TCP, TLS, the
+    /// handshake, or the connect timeout.
+    RedisConnect = 3202, Other, "cannot connect to Redis";
+    /// The server refused the user name or password.
+    RedisAuth = 3203, PermissionDenied, "Redis authentication failed";
+    /// The server answered a command with an error, such as `WRONGTYPE`.
+    RedisServer = 3204, Other, "Redis server error";
+    /// A reply could not be converted to the Rust type asked for.
+    RedisType = 3205, InvalidData, "Redis type mismatch";
+    /// The command cannot be sent this way, such as `MULTI` or a blocking
+    /// command on a connection other tasks share; nothing was sent.
+    RedisCommand = 3206, InvalidInput, "command refused before sending";
+    /// A reply was larger than the configured maximum.
+    RedisTooLarge = 3207, Other, "Redis reply too large";
+    /// The connection is closed.
+    RedisClosed = 3208, ConnectionAborted, "Redis connection closed";
+    /// No pooled connection became free in time.
+    RedisPoolTimeout = 3209, TimedOut, "Redis pool wait timed out";
+    /// The server sent something that is not RESP.
+    RedisProtocol = 3210, InvalidData, "Redis protocol error";
+    /// The reply did not arrive within the response timeout.
+    RedisTimeout = 3211, TimedOut, "Redis reply timed out";
 }
 
 impl Code {

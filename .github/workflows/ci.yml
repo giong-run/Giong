@@ -24,6 +24,8 @@ env:
   # The same for giong-mysql and the runner's MySQL 8.0 (/usr/sbin/mysqld,
   # whose service is left stopped).
   GIONG_MYSQL_REQUIRED: "1"
+  # And for giong-redis, whose redis-server the jobs below install.
+  GIONG_REDIS_REQUIRED: "1"
 
 jobs:
   lint:
@@ -57,6 +59,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: uname -r
+      - name: Install redis-server
+        # Ubuntu's Redis 7.0. The tests start their own server; the
+        # service apt starts is stopped.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q redis-server
+          sudo systemctl stop redis-server
       - run: scripts/check.sh test
 
   # The io_uring setup tiers used by kernels older than 6.1, forced on the
@@ -66,6 +75,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install redis-server
+        # Ubuntu's Redis 7.0. The tests start their own server; the
+        # service apt starts is stopped.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q redis-server
+          sudo systemctl stop redis-server
       - run: scripts/check.sh fallback
 
   tsan:
@@ -78,6 +94,13 @@ jobs:
       # ThreadSanitizer cannot map its shadow memory with the runner's default
       # address-space randomisation.
       - run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Install redis-server
+        # Ubuntu's Redis 7.0. The tests start their own server; the
+        # service apt starts is stopped.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q redis-server
+          sudo systemctl stop redis-server
       - run: ROUNDS=2 scripts/check.sh tsan
 
   # Model-check the wake-up handshakes in src/notify.rs with loom, then run the

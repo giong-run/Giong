@@ -21,7 +21,7 @@ fn on_error(err: &std::io::Error) {
 }
 ```
 
-giong-http, giong-tls, giong-postgres and giong-mysql use the same codes. A code is never
+giong-http, giong-tls, giong-postgres, giong-mysql and giong-redis use the same codes. A code is never
 reused or renumbered, and its page stays when it is no longer raised.
 
 ## The runtime
@@ -112,3 +112,19 @@ reused or renumbered, and its page stays when it is no longer raised.
 | [GIONG-E3108](E3108.md) | `MysqlClosed` | MySQL connection closed |
 | [GIONG-E3109](E3109.md) | `MysqlPoolTimeout` | MySQL pool wait timed out |
 | [GIONG-E3110](E3110.md) | `MysqlProtocol` | MySQL protocol error |
+
+## giong-redis
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E3201](E3201.md) | `RedisConfig` | invalid Redis configuration |
+| [GIONG-E3202](E3202.md) | `RedisConnect` | cannot connect to Redis |
+| [GIONG-E3203](E3203.md) | `RedisAuth` | Redis authentication failed |
+| [GIONG-E3204](E3204.md) | `RedisServer` | Redis server error |
+| [GIONG-E3205](E3205.md) | `RedisType` | Redis type mismatch |
+| [GIONG-E3206](E3206.md) | `RedisCommand` | command refused before sending |
+| [GIONG-E3207](E3207.md) | `RedisTooLarge` | Redis reply too large |
+| [GIONG-E3208](E3208.md) | `RedisClosed` | Redis connection closed |
+| [GIONG-E3209](E3209.md) | `RedisPoolTimeout` | Redis pool wait timed out |
+| [GIONG-E3210](E3210.md) | `RedisProtocol` | Redis protocol error |
+| [GIONG-E3211](E3211.md) | `RedisTimeout` | Redis reply timed out |

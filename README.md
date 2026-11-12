@@ -18,11 +18,12 @@ then rose a giant: giong costs next to nothing while idle and uses every core th
 load arrives.
 
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
-> timers, multi-core, graceful shutdown, and four companion crates:
+> timers, multi-core, graceful shutdown, and five companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
-> [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool)
-> and [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8).
+> [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
+> [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8)
+> and [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool).
 > 173 tests pass on three io_uring setups and on real 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
 > fuzzed and a soak test churns connections for two hours every night. It has **not** run
@@ -206,6 +207,7 @@ let runtime = giong::Builder::new()
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | MySQL | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
+| Redis | [`giong-redis`](giong-redis/README.md): `Client`, `Pool`, `Config`, `cmd`, `Pipeline`, `PubSub` |
 
 Five things to remember:
 
@@ -469,6 +471,26 @@ One connection shared by every task does about what SQLx does with 64. The crate
 has the full table, including mysql_async's default pool settings and more connections
 than the server has cores.
 
+### Redis
+
+`bench/redis.sh`: [`giong-redis`](giong-redis/README.md#performance) against redis-rs (a
+`MultiplexedConnection`) and fred on Tokio, all three pipelining the commands of 64 tasks,
+each client on one core, the same Redis 7.0 server on the other three. Medians, commands
+per second, and the client core's time per command:
+
+| Client, connections | `GET` 64 B | µs/op | `SET` 64 B | µs/op | `MGET` of 10 | µs/op |
+|---|---|---|---|---|---|---|
+| **giong-redis, 1** | **618k** | **0.78** | **557k** | **0.77** | **219k** | **2.29** |
+| redis-rs, 1 | 448k | 1.76 | 442k | 1.67 | 140k | 4.84 |
+| fred, 1 | 314k | 2.42 | 287k | 2.58 | 110k | 6.91 |
+| **giong-redis, 4** | **881k** | **0.98** | **779k** | **0.99** | **313k** | **2.30** |
+| redis-rs, 4 | 475k | 2.04 | 491k | 1.97 | 198k | 4.96 |
+
+1.3 to 1.9 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
+where about half of every client's core is time in the kernel, giong-redis does twice
+redis-rs on one connection and the same on four. The crate's README has the full tables
+and how many connections to use.
+
 ### File I/O
 
 `bench/fs.sh`: 200,000 operations per measurement, five rounds, all data in the page cache,
@@ -505,7 +527,7 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
   (August and March 2024); their main branches may differ.
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
-`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh` and
+`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh` and
 `bench/http-client.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
@@ -617,7 +639,8 @@ to audit.
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
   sqlx, reqwest) do not run on giong. Crates that only use `std::future` do. For
   PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for MySQL,
-  [`giong-mysql`](giong-mysql/README.md).
+  [`giong-mysql`](giong-mysql/README.md); for Redis, [`giong-redis`](giong-redis/README.md);
+  for HTTP requests, `giong-http`'s client.
 - **Tasks do not migrate.** An overloaded core is not helped by an idle one; spread work
   yourself with `spawn_on` or a channel.
 - **Graceful draining is opt-in.** By default, when a worker's main future returns, the
@@ -656,9 +679,10 @@ giong-http/     the HTTP/1.1 crate: the server (parser, chunked decoding, connec
 giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
 giong-postgres/ the PostgreSQL client crate (wire protocol, authentication, statement cache, Pool)
 giong-mysql/    the MySQL client crate (client/server protocol, authentication, statement cache, Pool)
+giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub, Pool)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin
-bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, http-client.sh, the programs compared against, results/
+bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, the programs compared against, results/
 scripts/        check.sh (repeated tests, fallback setups, ThreadSanitizer), valgrind.sh
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```

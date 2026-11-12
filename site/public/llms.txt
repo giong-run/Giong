@@ -24,6 +24,7 @@ Facts that are easy to get wrong:
 - [giong-http API](https://docs.rs/giong-http): a small, strict HTTP/1.1 server, HTTPS behind the `tls` feature; an HTTP/1.1 client with a pool per host behind `client`
 - [giong-postgres API](https://docs.rs/giong-postgres): a PostgreSQL client and per-worker pool; statements from every task pipeline over a few connections
 - [giong-mysql API](https://docs.rs/giong-mysql): a MySQL 8 client and per-worker pool; statements from every task pipeline over a few connections
+- [giong-redis API](https://docs.rs/giong-redis): a Redis client and per-worker pool: commands from every task pipeline over one connection; pipelines, transactions, Pub/Sub
 - [README](https://github.com/giong-run/Giong/blob/main/README.md): design, benchmarks with their method, limitations
 - [AGENTS.md](https://github.com/giong-run/Giong/blob/main/AGENTS.md): how to build, test and change giong, for coding agents
 - [Error codes](https://github.com/giong-run/Giong/blob/main/docs/errors/README.md): what each `GIONG-E` code means and how to fix it

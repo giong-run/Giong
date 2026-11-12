@@ -160,8 +160,9 @@ packet parsers are fuzzed, and a benchmark compares it with mysql_async and SQLx
 
 - [x] An HTTP/1.1 client in `giong-http` (feature `client`): keep-alive, a pool per host,
       HTTPS, timeouts, redirects. Benchmarked against reqwest (`bench/http-client.sh`).
-- [ ] `giong-redis`, a new crate: RESP2 and RESP3, automatic pipelining, a pool per core,
-      pub/sub.
+- [x] `giong-redis`, a new crate: RESP3, automatic pipelining, a pool per core, pub/sub.
+      Benchmarked against redis-rs and fred (`bench/redis.sh`). RESP2-only servers (Redis 5
+      and older) are not supported: RESP3 has been in every Redis since 6.0 (2020).
 
 **Exit criteria:** the client fetches from a public HTTPS API, `giong-redis` passes against
 a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.

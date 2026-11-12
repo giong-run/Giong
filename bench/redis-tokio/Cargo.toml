@@ -1,0 +1,16 @@
+[package]
+name = "bench-redis-tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+redis = { version = "1", default-features = false, features = ["aio", "tokio-comp"] }
+fred = { version = "10", default-features = false, features = ["i-std"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

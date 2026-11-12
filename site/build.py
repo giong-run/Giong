@@ -1115,6 +1115,8 @@ def llms():
                           "pipeline over a few connections",
         "giong-mysql": "a MySQL 8 client and per-worker pool; statements from every task "
                        "pipeline over a few connections",
+        "giong-redis": "a Redis client and per-worker pool: commands from every task pipeline "
+                       "over one connection; pipelines, transactions, Pub/Sub",
     }
     api = "".join(
         f"- [{name} API](https://docs.rs/{name}): {crates.get(name, 'API reference')}\n"
