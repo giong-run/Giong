@@ -22,7 +22,7 @@ load arrives.
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and two companion crates,
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server) and
-> [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly.
+> [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services.
 > 169 tests pass on three io_uring setups; ThreadSanitizer and valgrind are clean. It has
 > **not** run in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
 
@@ -197,7 +197,7 @@ let runtime = giong::Builder::new()
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
 | Across threads | `Handle::spawn_on(worker, \|\| async { .. })`, `sync::mpsc::channel()` |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response` |
-| TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsStream` |
+| TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
 
 Five things to remember:
 
@@ -505,7 +505,7 @@ Not verified, and you should know it:
 | Multi-core | built-in builder with graceful draining and signals | `#[monoio::main(threads = N)]` | executor pools placed by CPU topology |
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
-| Ecosystem | its own HTTP/1.1 server and server-side TLS; nothing else | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
+| Ecosystem | its own HTTP/1.1 server, and TLS for servers and clients; nothing else | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
 | Size | ~5,400 lines, plus ~2,250 for HTTP and TLS | ~25,000 lines | ~40,500 lines |
 
 Monoio is the mature choice and runs in production at ByteDance; if you need an HTTP
@@ -525,7 +525,7 @@ to audit.
   buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
-- **TLS is server side only.** No TLS client, no kTLS, no independent audit of `giong-tls`.
+- **`giong-tls` has no kTLS yet,** and no independent audit.
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
   sqlx, reqwest) do not run on giong. Crates that only use `std::future` do.
 - **Tasks do not migrate.** An overloaded core is not helped by an idle one; spread work
@@ -561,7 +561,7 @@ src/
   time.rs       timing wheel, sleep, timeout
   sync.rs       mpsc channel
 giong-http/     the HTTP/1.1 server crate (parser, chunked decoding, connections, HTTPS behind the `tls` feature)
-giong-tls/      the server-side TLS crate on rustls (TlsAcceptor, TlsStream)
+giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin
 bench/          run.sh, scale.sh, syscalls.sh, tls.sh, fs.sh, the servers compared against, results/
