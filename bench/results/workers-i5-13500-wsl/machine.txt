@@ -1,0 +1,33 @@
+bench/workers.sh, 1 to 10 workers, run on 2026-11-12 (19:26 to 19:41 UTC)
+
+Command (in bench/, as root):
+  ulimit -l unlimited
+  SERVER_CPUS=0-9 LOAD_CPUS=10-19 WORKERS="1 2 4 6 8 10" ./workers.sh 3 6
+  -> /json, 64 connections per worker, wrk with 10 threads on vCPUs 10-19,
+     three interleaved rounds of 6 s; summary.txt shows the median and range.
+
+Code: giong 407eb2c (main before #32; #32 changed no code these servers use)
+
+Hardware: Intel Core i5-13500 (6 performance cores + 8 efficiency cores,
+  20 threads, 24 MiB L3), 64 GB RAM, desktop.
+Host: Windows 10 Pro 22H2 (10.0.19045), power plan Ultimate Performance.
+  Whole machine 4.6% busy just before the run; no other heavy program running.
+Guest: WSL2 3.0.1, kernel 6.18.40.1-microsoft-standard-WSL2, Ubuntu 24.04
+  (official WSL root filesystem, fresh distro made for this run), 20 vCPUs,
+  23 GB RAM, clocksource hyperv_clocksource_tsc_page, io_uring_disabled=0.
+  WSL shows the vCPUs as 10 cores x 2 threads, which is not the real layout.
+Tools: rustc 1.100.0, wrk 4.1.0 (Debian build, epoll). Server and wrk talk
+  over loopback inside the guest.
+Check before measuring: the test suite passed in the guest (519 tests).
+
+Things that affect how to read the numbers:
+- WSL2 does not pin vCPUs to physical cores. Windows schedules them over the
+  P-cores and E-cores as it likes, and Windows 10 does not know the hybrid
+  layout well. The 1-worker results look too low (2 workers give 2.1x to 2.5x
+  the throughput for four servers), so the "eff." column means little here.
+- At 10 workers the server and wrk keep 20 vCPUs busy on 14 physical cores.
+- The guest's clock jumped when systemd-timesyncd and WSL's own time sync
+  disagreed (the Windows clock was about 72 s fast), which broke wrk's timing
+  in a first attempt (thrown away). systemd-timesyncd was disabled in the
+  guest; afterwards no clock step above 0.5 ms was seen in 3 minutes of
+  watching, and wrk's 6 s runs measured 6.10 s.

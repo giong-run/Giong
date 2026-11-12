@@ -88,11 +88,14 @@ together with the verification that needed no extra hardware.
 The numbers so far come from a 4-vCPU virtual machine over loopback. Before adding more
 features, find out what is actually true.
 
-- [ ] Benchmark on a multi-core machine with the load generator on a separate host and a
-      physical network card.
-- [ ] Measure scaling from 1 to N workers. `bench/workers.sh` does it, from a second
-      machine too; on the 4-vCPU VM the load generator saturates at two workers.
-- [ ] Repeat the Monoio and Glommio comparison on several cores and a physical network.
+- [x] Benchmark on a multi-core machine: 1 to 10 workers on a 14-core i5-13500 under WSL2,
+      over loopback (see the README). The load generator on a separate host and a
+      physical network card move to 0.4.
+- [x] Measure throughput from 1 to N workers with `bench/workers.sh`. Under WSL2 the
+      one-worker baseline is unreliable, so scaling efficiency still needs bare metal
+      (0.4).
+- [x] Repeat the Monoio and Glommio comparison on several cores (same run). On a
+      physical network: 0.4.
 - [x] Run the test suite on real 6.0 and 6.1 kernels (in QEMU, in CI; it found that
       6.0 could fail to start a runtime, now fixed).
 - [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
@@ -114,6 +117,9 @@ thread-safety finding.
 What every client library and service needs before the database and web crates can be
 built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait for 0.3's.
 
+- [ ] Carried over from 0.3: run `bench/workers.sh` on bare-metal Linux with the load
+      generator on a second machine over a physical network card, for scaling efficiency
+      and the Monoio and Glommio comparison on a real network.
 - [x] Asynchronous DNS resolution (`/etc/hosts`, `resolv.conf`, UDP then TCP, a cache per
       worker), and `TcpStream::connect` by name, trying addresses the RFC 8305 way.
 - [x] The client side of `giong-tls`: the machine's CA certificates or compiled-in ones,

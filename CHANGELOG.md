@@ -37,6 +37,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   time per request and how busy the server and the load generator were, on one machine
   or with the load generator on another (`LOAD_HOST`; the Rust servers take
   `BENCH_HOST`).
+- **Benchmarks**: the first multi-core results, from 1 to 10 workers on a 14-core
+  i5-13500 under WSL2 over loopback, for giong, giong-http, Monoio, raw Tokio and
+  Glommio (README, `bench/results/workers-i5-13500-wsl/`). giong had the highest median
+  at 1, 2 and 8 workers, was level with Monoio at 4 and behind it at 6, and peaked at
+  1.50M requests/s with the load generator as the limit. Scaling efficiency is not
+  readable on this setup.
 - **`giong-http`**
   - An HTTP/1.1 client, `giong_http::client`, behind the new `client` feature: `Client`
     (one per worker, clones share it) with `get`, `post`, `put`, `patch`, `delete`,

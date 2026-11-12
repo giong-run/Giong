@@ -425,8 +425,9 @@ FAQ = [
     ("Is it faster than Tokio?",
      "Sometimes, and the page says where. Small responses at 50 connections are a tie. giong "
      "makes about 0.03 system calls per request against 2.05, spends the least CPU per request "
-     "at 5,000 connections, and reads files 5.5 times faster than Tokio on one core. Every number "
-     "comes from one 4-vCPU virtual machine over loopback."),
+     "at 5,000 connections, and reads files 5.5 times faster than Tokio on one core. On 14 cores "
+     "it had the most requests per second at 1, 2 and 8 workers and was level with or behind "
+     "tuned Monoio at 4 and 6. Every number is over loopback on one machine."),
     ("How do I report a security problem?",
      f"Privately, through <a href=\"{SECURITY}\">GitHub's vulnerability reporting</a>, not in a "
      "public issue."),
@@ -496,9 +497,10 @@ T = dict(
     caveats_h="What these numbers do not show",
     caveats=[
         "**One machine.** Everything is loopback inside a 4-vCPU virtual machine, where the load "
-        "generator competes for the same few cores.",
-        "**Not measured:** more than two cores, a physical network, and disks. The file benchmark "
-        "reads cached data only.",
+        "generator competes for the same few cores. The 14-core run in the README (1 to 10 "
+        "workers, peak 1.50M requests/s) is loopback too, on a desktop under WSL2.",
+        "**Not measured:** a physical network, scaling on bare metal, and disks. The file "
+        "benchmark reads cached data only.",
         "**8 KB responses:** giong and Monoio serve 63–64k requests/s, everything else 35–37k. Most "
         "of that gap comes from the virtual machine. On physical hardware expect a smaller one.",
         "**`/compute` is the same for everyone**, as it should be: the time goes into the function, "
