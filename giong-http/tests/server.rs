@@ -710,3 +710,60 @@ fn serves_over_a_unix_socket() {
     thread.join().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn handlers_see_the_client_address() {
+    async fn peer(req: Request) -> Response {
+        Response::text(format!("{:?}", req.peer_addr()))
+    }
+    let server = TestServer::start(Server::new(), peer);
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let expected = format!("{:?}", Some(c.stream.local_addr().unwrap()));
+    assert_eq!(c.reply().text(), expected);
+}
+
+#[test]
+fn at_the_connection_limit_new_clients_wait_their_turn() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    first.send("GET /first HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(first.reply().status, 200);
+
+    // The kernel completes the second handshake, but the server does not
+    // accept the connection while the first one is open.
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let err = second.stream.read(&mut [0u8; 64]).unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err}"
+    );
+
+    // Once the first connection closes, the second one is served.
+    drop(first);
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let r = second.reply();
+    assert!(r.text().starts_with("GET /second "), "{}", r.text());
+
+    // The slot is reused again and again.
+    drop(second);
+    for i in 0..20 {
+        let mut c = server.client();
+        c.send(format!(
+            "GET /{i} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+        ));
+        assert_eq!(c.reply().status, 200);
+        c.expect_closed();
+    }
+}

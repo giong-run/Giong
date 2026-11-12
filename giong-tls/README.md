@@ -2,8 +2,6 @@
 
 TLS for the [giong](../README.md) runtime, built on [rustls](https://github.com/rustls/rustls) (TLS 1.2 and 1.3, cryptography from `ring`, no OpenSSL): `TlsAcceptor` for servers, `TlsConnector` for clients.
 
-*[Đọc bằng tiếng Việt](README.vi.md)*
-
 ```rust
 use giong::net::TcpListener;
 use giong_tls::TlsAcceptor;

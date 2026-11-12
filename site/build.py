@@ -367,30 +367,44 @@ ROADMAP = [
       "`loom` model check of the cross-thread wake-up; `cargo fuzz` of the parser",
       "Soak test; an independent look at `giong-tls`"],
      "published multi-core results with their method, and no open memory- or thread-safety finding"),
-    ("0.4", "Breadth", "planned",
-     ["Vectored writes; streaming bodies in `giong-http`",
-      "TLS client; asynchronous DNS",
-      "Reading directories, `fallocate`; bounded and oneshot channels"],
+    ("0.4", "Foundations for services", "next",
+     ["Asynchronous DNS; `connect` by name, the RFC 8305 way",
+      "TLS client: the machine's or compiled-in roots, ALPN, mutual TLS",
+      "Bounded and oneshot channels; a handle from `spawn_on`; `writev`",
+      "Error codes that say how to fix them; `AGENTS.md` and `llms.txt`"],
      "every item with tests, including cancellation tests"),
-    ("0.5", "Speed", "planned",
-     ["Fixed files, zero-copy send, receive bundles",
-      "Optional `SQPOLL` and NAPI busy polling; kTLS",
-      "Per-worker statistics as a public API"],
-     "a documented, reproducible gain for every option that is merged"),
-    ("0.6", "Ecosystem", "planned",
-     ["HTTP/2 in `giong-http`",
+    ("crates", "What a service needs", "planned",
+     ["`giong-postgres`: SCRAM, TLS, pipelining, a pool per core",
+      "An HTTP client in `giong-http`; `giong-redis` with automatic pipelining",
+      "`giong-web`: router, middleware, JSON, compression; streaming bodies",
+      "`giong-mcp`: a read-only MCP server for coding agents"],
+     "each one passing against the real service in CI and benchmarked against its Tokio counterpart"),
+    ("0.5", "Runs where io_uring is blocked", "planned",
+     ["An epoll driver, chosen when io_uring cannot be set up",
+      "Docker's default seccomp profile works as it is"],
+     "the whole suite passing on both drivers, and the difference measured"),
+    ("0.6", "HTTP/2 and adapters", "planned",
+     ["HTTP/2 in `giong-http`, over TLS with ALPN",
       "Adapters for the `futures-io` / Tokio I/O traits",
       "Decide whether a hyper integration is worth maintaining"],
-     "an HTTPS server serving real browsers over HTTP/2"),
+     "real browsers served over HTTP/2, and `h2spec` passing"),
+    ("0.7", "Speed", "planned",
+     ["Fixed files, zero-copy send, receive bundles",
+      "Optional `SQPOLL` and NAPI busy polling; kTLS"],
+     "a documented, reproducible gain for every option that is merged"),
     ("1.0", "Stable", "planned",
-     ["Every public item documented",
+     ["Every public item reviewed against the agent-first principles",
+      "`cargo-semver-checks` in CI; every public item documented",
       "Limitations reduced to deliberate non-goals",
       "At least one production user reporting back"], ""),
 ]
-NON_GOALS = ["Other operating systems: no epoll, kqueue or IOCP fallback.",
+NON_GOALS = ["Production on other operating systems: Linux only, io_uring first. An epoll driver (0.5) "
+             "covers machines where io_uring is blocked; running on macOS for development may follow.",
              "Work stealing: tasks stay on the worker that created them.",
-             "A general-purpose runtime: giong is not trying to replace Tokio for every workload.",
-             "`Send` futures as a requirement: the API stays usable with `Rc` and `RefCell`."]
+             "Every workload: giong covers network services and the clients they need, not everything "
+             "Tokio is used for.",
+             "`Send` futures as a requirement: the API stays usable with `Rc` and `RefCell`.",
+             "Macros that hide control flow, and unbounded defaults."]
 
 FAQ = [
     ("Is giong ready for production?",
@@ -1090,6 +1104,57 @@ def page():
 '''
 
 
+def llms():
+    """llms.txt (https://llmstxt.org): where a language model finds the docs."""
+    crates = {
+        "giong": "the runtime: executor, io_uring driver, TCP, UDP and Unix sockets, files, "
+                 "timers, channels",
+        "giong-http": "a small, strict HTTP/1.1 server; HTTPS behind the `tls` feature",
+        "giong-tls": "TLS on rustls",
+        "giong-postgres": "a PostgreSQL client and per-worker pool; statements from every task "
+                          "pipeline over a few connections",
+    }
+    api = "".join(
+        f"- [{name} API](https://docs.rs/{name}): {crates.get(name, 'API reference')}\n"
+        for name in CRATE_NAMES)
+    examples = "".join(
+        f"- [examples/{name}.rs]({BLOB}examples/{name}.rs): {desc}\n"
+        for name, desc, _, _ in EXAMPLES)
+    return f"""# giong
+
+> A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
+> worker owns its ring, tasks and buffers; tasks never move between threads, so futures
+> need not be `Send`. Version {VERSION}.
+
+Facts that are easy to get wrong:
+
+- Linux 6.0 or newer only, with io_uring allowed. It does not build on macOS or Windows.
+  Docker's default seccomp profile blocks io_uring.
+- Buffers are passed by value and handed back, because the kernel uses them after the call:
+  `stream.write_all(buf).await` returns `(io::Result<()>, buf)`.
+- `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may
+  have sent part of its buffer.
+- There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
+- Install with `{ADD} giong` (and `giong-http`, `giong-tls`). Libraries need Rust 1.80.
+
+## Docs
+
+{api}- [README]({BLOB}README.md): design, benchmarks with their method, limitations
+- [AGENTS.md]({BLOB}AGENTS.md): how to build, test and change giong, for coding agents
+- [CONTRIBUTING.md]({BLOB}CONTRIBUTING.md): the rules every change follows
+- [ROADMAP.md]({BLOB}ROADMAP.md): milestones and deliberate non-goals
+- [CHANGELOG.md]({BLOB}CHANGELOG.md): what changed in each release
+
+## Examples
+
+{examples}
+## Optional
+
+- [Benchmark results]({TREE}bench/results): raw numbers behind the README
+- [giong-http README]({BLOB}giong-http/README.md) and [giong-tls README]({BLOB}giong-tls/README.md)
+"""
+
+
 if __name__ == "__main__":
     out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent / "public"
     out.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +1163,7 @@ if __name__ == "__main__":
         "404.html": not_found(),
         "sitemap.xml": sitemap(),
         "robots.txt": f"User-agent: *\nAllow: /\nSitemap: {SITE}sitemap.xml\n",
+        "llms.txt": llms(),
     }
     for name, text in files.items():
         (out / name).write_text(text, encoding="utf-8", newline="\n")
