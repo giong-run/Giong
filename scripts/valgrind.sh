@@ -8,7 +8,10 @@
 # Not covered, because valgrind (3.22) treats io_uring_enter as non-blocking
 # and so stalls programs with more than one thread waiting in it:
 #   * tests/multi.rs and tests/spin.rs
-#   * net::interoperates_with_blocking_std_clients
+#   * net::interoperates_with_blocking_std_clients, and
+#     works_with_the_standard_library_on_the_other_side in tests/udp.rs and
+#     tests/unix.rs: a std socket on its own thread is the other side
+#   * udp::every_worker_can_bind_the_same_port, which runs three workers
 #   * the tests in tests/dns.rs that ask the fake DNS server, which answers
 #     from its own thread (they time out under valgrind); the unit tests in
 #     src/net/dns.rs cover the parsing and the query ids
@@ -23,6 +26,8 @@ command -v valgrind >/dev/null || { echo "valgrind is not installed" >&2; exit 2
 SUITES=("$@")
 [ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix)
 SKIP="interoperates_with_blocking_std_clients"
+SKIP+=" works_with_the_standard_library_on_the_other_side"
+SKIP+=" every_worker_can_bind_the_same_port"
 TIMEOUT=${TIMEOUT:-300}
 
 total=0

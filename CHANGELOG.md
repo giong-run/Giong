@@ -74,6 +74,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   - `TcpStream::connect` with several addresses tries them the Happy Eyeballs way
     (RFC 8305): families alternate and each attempt gets 250 ms before the next starts
     alongside it, so an address that never answers no longer costs a TCP timeout.
+- **Files**
+  - `fs::read_dir` lists a directory: `ReadDir::next_entry` returns `DirEntry`s with
+    the name, path, inode number and type (from the directory itself, so no `stat` per
+    entry on most filesystems), and `metadata()`. io_uring cannot read directories, so
+    each batch of about a hundred entries is a direct `getdents64` call on the worker,
+    which yields to other tasks between batches.
+  - `File::allocate` (`fallocate`) reserves disk space for a range, growing the file if
+    needed, so writes there cannot fail for lack of space.
+  - `Metadata::file_type` and `fs::FileType`.
 - **`giong-tls`**
   - The client side: `TlsConnector::connect(server_name, tcp)` checks the server's
     certificate against trusted authorities and the name (a DNS name sent through
