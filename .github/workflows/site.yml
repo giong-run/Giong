@@ -1,0 +1,75 @@
+name: Site
+
+# Deploys site/public to giong-run/giong-run.github.io, which GitHub Pages serves
+# as giong.run. Runs when site/ changes on main, and at the end of release.yml.
+#
+# It deploys only when the workspace version has a published GitHub Release, so
+# merging a release pull request does not announce a version before crates.io
+# has it; release.yml starts this workflow once the release is out.
+#
+# Pushing to the other repository needs the SITE_DEPLOY_KEY secret: the private
+# half of a deploy key with write access on giong-run.github.io. Without it the
+# job only checks the page and says so.
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: The committed page matches site/build.py
+        run: |
+          python3 site/build.py > /dev/null
+          git diff --exit-code --stat -- site/public \
+            || { echo "::error::site/public is out of date: run python3 site/build.py and commit it"; exit 1; }
+      - id: gate
+        name: The version on the page is released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_KEY: ${{ secrets.SITE_DEPLOY_KEY != '' }}
+        run: |
+          v=$(python3 scripts/release.py version)
+          draft=$(gh release view "v$v" --json isDraft --jq .isDraft 2> /dev/null || echo missing)
+          if [ "$draft" != false ]; then
+            echo "::notice::v$v has no published GitHub Release yet; release.yml deploys the site once it does"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          elif [ "$HAS_KEY" != true ]; then
+            echo "::warning::SITE_DEPLOY_KEY is not set, so giong.run was not deployed (see docs/RELEASING.md)"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.deploy == 'true'
+        with:
+          repository: giong-run/giong-run.github.io
+          ssh-key: ${{ secrets.SITE_DEPLOY_KEY }}
+          path: pages
+      - name: Push to giong-run.github.io
+        if: steps.gate.outputs.deploy == 'true'
+        run: |
+          # That repository keeps its own README.md and .nojekyll.
+          rsync -a --delete --exclude .git --exclude README.md --exclude .nojekyll site/public/ pages/
+          cd pages
+          git add -A
+          if git diff --cached --quiet; then
+            echo "giong.run is already up to date"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "Deploy giong.run from giong-run/Giong@${GITHUB_SHA::7}"
+          git push
+          echo "### Deployed https://giong.run from ${GITHUB_SHA::7}" >> "$GITHUB_STEP_SUMMARY"

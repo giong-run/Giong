@@ -156,21 +156,15 @@ docs: explain how to run under WSL2
 
 ## Releases
 
-Maintainers cut releases: move the `Unreleased` entries under a new version heading with
-the date, bump `version` in the three `Cargo.toml` files (the crates share one version
-number, and `giong-http` and `giong-tls` name the `giong` version they need), and merge
-that change. Then tag the merge commit and push the tag:
+Releases are automated; maintainers start one from the **Prepare release** workflow and
+merge the pull request it opens. Every crate in the workspace shares one version and is
+published together, to crates.io and as a GitHub Release whose notes come from
+`CHANGELOG.md` and thank everyone who contributed. The whole process, including adding a
+new crate, is in [docs/RELEASING.md](docs/RELEASING.md).
 
-```bash
-git tag -a vX.Y.Z -m "giong X.Y.Z"
-git push origin vX.Y.Z
-```
-
-The [release workflow](.github/workflows/release.yml) checks that the tag matches the
-crate versions and that `CHANGELOG.md` has a section for it, publishes the three crates
-to crates.io through Trusted Publishing, and creates the GitHub Release from that
-section. A tag with a suffix such as `v0.3.0-rc.1` becomes a pre-release. If a run fails
-part way, fix the cause and re-run it: crates already published are skipped.
+What that asks of a contributor is in the list above: a `CHANGELOG.md` line under
+`Unreleased` and a pull request title in the commit convention, since both feed the
+release notes.
 
 ## Security
 

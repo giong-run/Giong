@@ -1,0 +1,16 @@
+# How GitHub generates the list of pull requests and new contributors that
+# release.yml appends to each Release (the generate-notes API). The curated
+# text above that list comes from CHANGELOG.md.
+
+changelog:
+  exclude:
+    labels:
+      - release          # the release pull requests themselves
+      - skip-changelog
+    authors:
+      - github-actions[bot]
+  categories:
+    - title: Breaking changes
+      labels: [breaking]
+    - title: Pull requests
+      labels: ["*"]

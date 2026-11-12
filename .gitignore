@@ -20,3 +20,6 @@ vgcore.*
 # Local setup helpers.
 *.bundle
 setup-git.cmd
+
+# Python bytecode (site/build.py imports scripts/release.py).
+__pycache__/
