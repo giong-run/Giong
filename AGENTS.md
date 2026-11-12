@@ -25,7 +25,7 @@ Where the code is:
 | File | Holds |
 |---|---|
 | `src/runtime.rs` | `Builder`, workers, `block_on`, `run`, shutdown, `stats()` |
-| `src/executor.rs` | tasks, `spawn`, `JoinHandle` |
+| `src/executor.rs` | tasks, `spawn`, `JoinHandle`, `RemoteJoinHandle` (for `Handle::spawn_on`) |
 | `src/driver.rs` | io_uring setup, submission and completion, the ring tiers |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets |

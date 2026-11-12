@@ -35,6 +35,7 @@ and its page stays when it is no longer raised.
 | [GIONG-E0005](E0005.md) | `Unexpected` | unexpected result from the kernel |
 | [GIONG-E0006](E0006.md) | `MixedReads` | read used after recv |
 | [GIONG-E0007](E0007.md) | `TimedOut` | the time limit passed |
+| [GIONG-E0008](E0008.md) | `NoSuchWorker` | no such worker |
 
 ## Network and name resolution
 

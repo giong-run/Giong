@@ -21,13 +21,13 @@ use io_uring::{opcode, types};
 use crate::buf::BufPool;
 use crate::driver::{Driver, Park};
 use crate::error::Code;
-use crate::executor::{TaskSlot, TaskWaker, MAIN_TASK};
+use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::Doorbell;
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::time::Timers;
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -917,22 +917,64 @@ impl Handle {
         self.rt.shutdown.load(Ordering::SeqCst)
     }
 
-    /// Runs `f` on the given worker thread and spawns the future it returns
-    /// there. `f` must be `Send`; the future it creates need not be.
+    /// Starts a task on the given worker and returns a handle to its result.
     ///
-    /// Returns `false` if the worker index is out of range or the worker has
-    /// already stopped.
-    pub fn spawn_on<F, Fut>(&self, worker: usize, f: F) -> bool
+    /// `f` is sent to the worker and called there. The future it returns runs
+    /// on that worker and never leaves it, so it need not be `Send`; only `f`
+    /// and the output cross threads. Await the handle from any worker or
+    /// thread, or drop it to let the task run on its own.
+    ///
+    /// The handle resolves to [`JoinError::Cancelled`] when the task is
+    /// aborted, or when the worker has stopped or stops before the task
+    /// finishes. It resolves to [`JoinError::Panic`] when `f` or the future
+    /// panics; the worker carries on.
+    ///
+    /// ```no_run
+    /// let rt = giong::Builder::new().workers(2).build()?;
+    /// let handle = rt.handle();
+    /// rt.run(move |worker| {
+    ///     let handle = handle.clone();
+    ///     async move {
+    ///         if worker == 0 {
+    ///             // Runs on worker 1; the result comes back here.
+    ///             let id = handle.spawn_on(1, || async { giong::worker_id() }).await;
+    ///             assert_eq!(id.unwrap(), 1);
+    ///             handle.shutdown();
+    ///         }
+    ///         giong::shutdown_signal().await;
+    ///     }
+    /// })?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`Code::NoSuchWorker`] if `worker` is not below
+    /// [`workers`](Self::workers).
+    ///
+    /// [`JoinError::Cancelled`]: crate::JoinError::Cancelled
+    /// [`JoinError::Panic`]: crate::JoinError::Panic
+    pub fn spawn_on<F, Fut>(&self, worker: usize, f: F) -> RemoteJoinHandle<Fut::Output>
     where
         F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + 'static,
+        Fut: Future + 'static,
+        Fut::Output: Send + 'static,
     {
-        match self.rt.workers.get(worker) {
-            Some(shared) => shared.inject(Inject::Run(Box::new(move || {
-                crate::spawn(f());
-            }))),
-            None => false,
-        }
+        let Some(shared) = self.rt.workers.get(worker) else {
+            let workers = self.workers();
+            panic!(
+                "{}",
+                crate::error::Error::new(
+                    Code::NoSuchWorker,
+                    format!("spawn_on was given worker {worker}, but the runtime has {workers} (0 to {})", workers.saturating_sub(1)),
+                    "pass an index below Handle::workers(), such as `i % handle.workers()`.",
+                )
+            );
+        };
+        let (handle, job) = RemoteJoinHandle::new(f);
+        // A stopped worker drops the job, which cancels the handle.
+        shared.inject(Inject::Run(job));
+        handle
     }
 }
 

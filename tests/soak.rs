@@ -287,16 +287,17 @@ async fn cross_worker(workers: usize, deadline: Instant, counters: Arc<Counters>
     while Instant::now() < deadline {
         let target = (giong::worker_id() + 1) % workers;
         let (tx, mut rx) = giong::sync::mpsc::channel::<usize>();
-        let sent = handle.spawn_on(target, move || async move {
+        let task = handle.spawn_on(target, move || async move {
             let _ = tx.send(giong::worker_id());
+            giong::worker_id()
         });
-        if !sent {
-            counters.unexpected("spawn_on", "rejected");
-            break;
-        }
         match timeout(Duration::from_secs(5), rx.recv()).await {
-            Ok(Some(id)) if id == target => Counters::bump(&counters.cross_worker),
+            Ok(Some(id)) if id == target => {}
             other => counters.unexpected("cross worker", format!("{other:?}")),
+        }
+        match timeout(Duration::from_secs(5), task).await {
+            Ok(Ok(id)) if id == target => Counters::bump(&counters.cross_worker),
+            other => counters.unexpected("spawn_on", format!("{other:?}")),
         }
         sleep(Duration::from_micros(100)).await;
     }

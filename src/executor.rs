@@ -14,11 +14,12 @@ use std::future::{poll_fn, Future};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::notify::RunFlag;
-use crate::runtime::{self, Inject, Worker, WorkerShared};
+use crate::runtime::{self, lock, Inject, Worker, WorkerShared};
 
 pub(crate) struct TaskSlot {
     /// `None` while the task is being polled.
@@ -239,6 +240,185 @@ impl<T> fmt::Debug for JoinHandle<T> {
             .field("finished", &self.is_finished())
             .finish()
     }
+}
+
+// -------------------------------------------------------------- remote tasks
+
+/// What a [`RemoteJoinHandle`] shares with its task on another worker.
+struct RemoteState<T> {
+    /// Set by [`RemoteJoinHandle::abort`] (under `inner`'s lock); the task
+    /// reads it before every poll.
+    aborted: AtomicBool,
+    inner: Mutex<RemoteInner<T>>,
+}
+
+struct RemoteInner<T> {
+    result: Option<Result<T, JoinError>>,
+    finished: bool,
+    /// Wakes whoever awaits the handle.
+    join_waker: Option<Waker>,
+    /// Wakes the task, so that it sees an abort.
+    task_waker: Option<Waker>,
+}
+
+impl<T> RemoteState<T> {
+    fn complete(&self, result: Result<T, JoinError>) {
+        let waker = {
+            let mut inner = lock(&self.inner);
+            if inner.finished {
+                return;
+            }
+            inner.finished = true;
+            inner.result = Some(result);
+            inner.task_waker = None;
+            inner.join_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Records the task's waker. Returns `true` if the task is aborted: the
+    /// check runs under the same lock as [`RemoteJoinHandle::abort`], so an
+    /// abort either sees this waker or is seen here.
+    fn register(&self, waker: &Waker) -> bool {
+        let mut inner = lock(&self.inner);
+        inner.task_waker = Some(waker.clone());
+        self.aborted.load(Ordering::Acquire)
+    }
+}
+
+/// Completes the remote state as cancelled if it is dropped unfinished: the
+/// worker refused the job or stopped before running it, or the task was
+/// dropped (aborted, or the worker shut down).
+struct RemoteGuard<T>(Arc<RemoteState<T>>);
+
+impl<T> Drop for RemoteGuard<T> {
+    fn drop(&mut self) {
+        self.0.complete(Err(JoinError::Cancelled));
+    }
+}
+
+/// A handle to a task started on another worker with
+/// [`Handle::spawn_on`](crate::Handle::spawn_on). Awaiting it yields the
+/// task's output.
+///
+/// Unlike [`JoinHandle`], it is `Send` and `Sync` (when the output is): await
+/// it on any worker, or on a thread outside the runtime. The task itself never
+/// leaves the worker it was started on.
+///
+/// Dropping the handle detaches the task: it keeps running in the background.
+pub struct RemoteJoinHandle<T> {
+    state: Arc<RemoteState<T>>,
+}
+
+impl<T: Send + 'static> RemoteJoinHandle<T> {
+    /// The handle, and the job that the target worker runs to start the task.
+    pub(crate) fn new<F, Fut>(f: F) -> (Self, Box<dyn FnOnce() + Send>)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+    {
+        let state = Arc::new(RemoteState {
+            aborted: AtomicBool::new(false),
+            inner: Mutex::new(RemoteInner {
+                result: None,
+                finished: false,
+                join_waker: None,
+                task_waker: None,
+            }),
+        });
+        let guard = RemoteGuard(state.clone());
+        let job = Box::new(move || {
+            let guard = guard;
+            if guard.0.aborted.load(Ordering::Acquire) {
+                return;
+            }
+            match panic::catch_unwind(AssertUnwindSafe(f)) {
+                Ok(fut) => drop(spawn(run_remote(fut, guard))),
+                Err(payload) => guard.0.complete(Err(JoinError::Panic(payload))),
+            }
+        });
+        (Self { state }, job)
+    }
+}
+
+impl<T> RemoteJoinHandle<T> {
+    /// Cancels the task: its future is dropped on its own worker at the next
+    /// opportunity, and the handle resolves to [`JoinError::Cancelled`]. Works
+    /// from any thread. No-op if the task has already finished.
+    pub fn abort(&self) {
+        let waker = {
+            let mut inner = lock(&self.state.inner);
+            if inner.finished {
+                return;
+            }
+            self.state.aborted.store(true, Ordering::Release);
+            inner.task_waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// `true` once the task has completed, panicked or been cancelled.
+    pub fn is_finished(&self) -> bool {
+        lock(&self.state.inner).finished
+    }
+}
+
+impl<T> Future for RemoteJoinHandle<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut inner = lock(&self.state.inner);
+        if let Some(result) = inner.result.take() {
+            return Poll::Ready(result);
+        }
+        assert!(!inner.finished, "RemoteJoinHandle polled after completion");
+        match &inner.join_waker {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => inner.join_waker = Some(cx.waker().clone()),
+        }
+        Poll::Pending
+    }
+}
+
+impl<T> fmt::Debug for RemoteJoinHandle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteJoinHandle")
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
+
+/// The task behind a [`RemoteJoinHandle`], on its own worker.
+async fn run_remote<Fut: Future>(fut: Fut, guard: RemoteGuard<Fut::Output>) {
+    let result = {
+        let mut fut = pin!(fut);
+        let mut registered: Option<Waker> = None;
+        poll_fn(|cx| {
+            let aborted = match &registered {
+                Some(w) if w.will_wake(cx.waker()) => guard.0.aborted.load(Ordering::Acquire),
+                _ => {
+                    registered = Some(cx.waker().clone());
+                    guard.0.register(cx.waker())
+                }
+            };
+            if aborted {
+                return Poll::Ready(Err(JoinError::Cancelled));
+            }
+            match panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+                Ok(Poll::Pending) => Poll::Pending,
+                Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+                Err(payload) => Poll::Ready(Err(JoinError::Panic(payload))),
+            }
+        })
+        .await
+        // The user's future is dropped here, on its worker, before the handle
+        // learns the result.
+    };
+    guard.0.complete(result);
 }
 
 /// Drops a value, swallowing a panic from its destructor so that one broken

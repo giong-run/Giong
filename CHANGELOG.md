@@ -13,7 +13,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Error codes.** Every error that giong, giong-tls and giong-postgres raise starts with
   a stable code (`GIONG-E0102: no address found for db.internal. Fix: …`), says what went
   wrong and how to fix it, and ends with a link to the code's page in
-  [docs/errors](docs/errors/README.md): 34 codes. Functions still return `io::Error`;
+  [docs/errors](docs/errors/README.md): 35 codes. Functions still return `io::Error`;
   `giong::error::code(&err)` finds the `giong::error::Code` in it, down the chain of
   sources, so programs can match on the code instead of the message. Errors passed on from
   the kernel (connection refused, …) are unchanged and have no code.
@@ -103,6 +103,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `kernel.io_uring_disabled` sysctl), starting a runtime now fails with an error that says
   so and links to the new [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), instead of a bare
   "Operation not permitted".
+- **Breaking:** `Handle::spawn_on` returns a `RemoteJoinHandle` to the task's result
+  instead of a `bool`. The handle is `Send` and `Sync`: await it on any worker or on a
+  plain thread, `abort()` it from anywhere (the future is dropped on its own worker), or
+  drop it to detach the task as before. A job a stopped worker refuses resolves to
+  `JoinError::Cancelled`, where `spawn_on` used to return `false`; a panic in the closure
+  or the task resolves to `JoinError::Panic`. The output must be `Send`. A worker index
+  out of range now panics with `GIONG-E0008` instead of returning `false`.
 - **Breaking:** `TcpStream::connect` takes the new `net::ToSocketAddrs` instead of
   `std::net::ToSocketAddrs`, and resolves host names without blocking. Socket addresses,
   `(ip, port)`, `"host:port"`, `(host, port)` and slices of addresses work as before;
