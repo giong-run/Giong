@@ -47,9 +47,11 @@ tighter the checks around it have to be.
 
 These are deliberate. Proposals that need them will be declined.
 
-- **Other operating systems.** No kqueue or IOCP; giong runs on Linux only. A Linux epoll
-  driver is planned (0.5) for machines where io_uring is blocked, such as Docker's default
-  seccomp profile; io_uring stays the main path and the one the numbers are about.
+- **Production on other operating systems.** Linux is the only platform giong is tuned and
+  measured on, and io_uring stays the main path. A Linux epoll driver is planned (0.5) for
+  machines where io_uring is blocked, such as Docker's default seccomp profile. Running on
+  macOS for development (kqueue) may follow it; Windows (IOCP) not before 1.0, and only if
+  users need it.
 - **Work stealing.** Tasks stay on the worker that created them.
 - **Every workload.** giong covers network services: HTTP, databases, caches and the clients
   they need. It does not try to replace Tokio for everything Tokio is used for.
