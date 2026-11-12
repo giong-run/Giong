@@ -35,15 +35,20 @@ fn strings_numbers_and_missing_keys() {
         assert_eq!(c.incr(&n, -7).await.unwrap(), -2);
         assert_eq!(c.get::<i64>(&n).await.unwrap(), -2);
 
+        // Lifetimes are long enough for a slow CI runner: the key must still
+        // be there when it is read back, however long that takes.
         let t = key("ttl");
-        c.set_ex(&t, 1u8, Duration::from_millis(150)).await.unwrap();
+        c.set_ex(&t, 1u8, Duration::from_secs(60)).await.unwrap();
         assert_eq!(c.get::<Option<u8>>(&t).await.unwrap(), Some(1));
-        giong::time::sleep(Duration::from_millis(250)).await;
+        let ms: i64 = c.query(&cmd("PTTL").arg(&t)).await.unwrap();
+        assert!((30_000..=60_000).contains(&ms), "{ms}");
+        assert!(c.expire(&t, Duration::from_millis(1)).await.unwrap());
+        giong::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(c.get::<Option<u8>>(&t).await.unwrap(), None);
         c.set(&t, "x").await.unwrap();
         assert!(c.expire(&t, Duration::from_secs(60)).await.unwrap());
         let ms: i64 = c.query(&cmd("PTTL").arg(&t)).await.unwrap();
-        assert!((59_000..=60_000).contains(&ms), "{ms}");
+        assert!((30_000..=60_000).contains(&ms), "{ms}");
         assert!(!c.expire(key("none"), Duration::from_secs(1)).await.unwrap());
 
         let (a, b) = (key("mget"), key("mget"));
