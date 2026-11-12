@@ -8,6 +8,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **Sync**
+  - `sync::oneshot`: a channel for one value, to hand a result back to the task that
+    asked for it, from any worker or thread. `Sender::closed` tells the producer that
+    nobody is waiting any more.
+  - `sync::mpsc::bounded`: a multi-producer channel that holds at most `n` values.
+    `send` waits while it is full, so a fast producer slows down to the consumer's pace;
+    waiting senders get room in arrival order, and a cancelled `send` passes its place on.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

@@ -137,7 +137,7 @@ Muốn HTTPS thì bật feature `tls` và gọi `serve_tls` với một `giong_t
 | File | `fs::File` (`read_at`, `write_at`, `write_all_at`, `sync_all`, `metadata`, `close`), `fs::read`, `fs::write`, `rename`, `remove_file`, `create_dir` |
 | Thời gian | `sleep`, `sleep_until`, `timeout` |
 | Tắt | `shutdown_signal`, `until_shutdown`, `is_shutting_down`, `Handle::shutdown` |
-| Chéo thread | `Handle::spawn_on`, `sync::mpsc` |
+| Chéo thread | `Handle::spawn_on`, `sync::mpsc` (không giới hạn hoặc `bounded`), `sync::oneshot` |
 | HTTP, TLS | [`giong-http`](giong-http/README.vi.md), [`giong-tls`](giong-tls/README.vi.md) |
 
 ## Giới hạn hiện tại

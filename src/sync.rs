@@ -5,8 +5,14 @@
 //! messages. giong's wakers are thread-safe, so the receiving task is woken
 //! correctly no matter which thread the message comes from.
 
+mod bounded;
+pub mod oneshot;
+
 pub mod mpsc {
-    //! An unbounded multi-producer, single-consumer channel.
+    //! Multi-producer, single-consumer channels: [`channel`] is unbounded,
+    //! [`bounded`] holds a fixed number of values and makes senders wait.
+
+    pub use super::bounded::{bounded, BoundedReceiver, BoundedSender, TrySendError};
 
     use std::collections::VecDeque;
     use std::fmt;
@@ -55,7 +61,8 @@ pub mod mpsc {
         shared: Arc<Shared<T>>,
     }
 
-    /// Returned by [`Sender::send`] when the receiver is gone; holds the value.
+    /// Returned by [`Sender::send`] and [`BoundedSender::send`] when the receiver
+    /// is gone; holds the value.
     pub struct SendError<T>(pub T);
 
     impl<T> fmt::Debug for SendError<T> {
