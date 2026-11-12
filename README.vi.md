@@ -154,8 +154,7 @@ Muốn HTTPS thì bật feature `tls` và gọi `serve_tls` với một `giong_t
 
 - Mã nguồn và issue: <https://github.com/giong-run/Giong>
 - [README.md](README.md): thiết kế chi tiết, benchmark đầy đủ, kiểm thử, so sánh với Monoio và Glommio.
-- [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), [CHANGELOG.md](CHANGELOG.md),
-  [AGENTS.md](AGENTS.md) (hướng dẫn cho AI agent viết code) và [giong.run/llms.txt](https://giong.run/llms.txt).
+- [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), [CHANGELOG.md](CHANGELOG.md).
 
 ## Giấy phép
 

@@ -103,10 +103,10 @@ run; `scripts/check.sh fallback` does this for you.
   `.github/PULL_REQUEST_TEMPLATE.md`, including how the change was tested.
 - Anything a user would notice gets a line under `## [Unreleased]` in `CHANGELOG.md`
   ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)), grouped by crate.
-- `README.md` has a Vietnamese twin, `README.vi.md`, and so do `giong-http/README.md` and
-  `giong-tls/README.md`. Change both. `scripts/release.py check` verifies the images and
-  install snippets in them, not the test counts or benchmark numbers: update those by hand
-  when a change moves them.
+- Documentation is in English only: the READMEs, the docs and the comments. Each crate has
+  one `README.md`. `scripts/release.py check` verifies the images and install snippets in
+  them, not the test counts or benchmark numbers: update those by hand when a change moves
+  them.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps
