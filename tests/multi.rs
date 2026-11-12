@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,36 +77,181 @@ fn until_shutdown_interrupts_a_pending_future() {
 }
 
 #[test]
-fn spawn_on_runs_work_on_the_chosen_worker() {
+fn spawn_on_runs_work_on_the_chosen_worker_and_returns_its_result() {
     const WORKERS: usize = 4;
     let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
     let handle = rt.handle();
-    let hits = Arc::new(AtomicUsize::new(0));
-    let h = hits.clone();
+    let results = Arc::new(Mutex::new(Vec::new()));
+    let r = results.clone();
     rt.run(move |index| {
         let handle = handle.clone();
-        let hits = h.clone();
+        let results = r.clone();
         async move {
             if index == 0 {
                 // Ask every worker (including ourselves) to run a job.
-                for target in 0..WORKERS {
-                    let hits = hits.clone();
-                    let sent = handle.spawn_on(target, move || async move {
-                        assert_eq!(giong::worker_id(), target);
-                        sleep(Duration::from_millis(1)).await;
-                        if hits.fetch_add(1, Ordering::SeqCst) + 1 == WORKERS {
-                            giong::handle().shutdown();
-                        }
-                    });
-                    assert!(sent);
+                let jobs: Vec<_> = (0..WORKERS)
+                    .map(|target| {
+                        handle.spawn_on(target, move || async move {
+                            sleep(Duration::from_millis(1)).await;
+                            (target, giong::worker_id())
+                        })
+                    })
+                    .collect();
+                for job in jobs {
+                    let result = job.await.unwrap();
+                    results.lock().unwrap().push(result);
                 }
-                assert!(!handle.spawn_on(WORKERS, || async {}));
+                handle.shutdown();
             }
             giong::shutdown_signal().await;
         }
     })
     .unwrap();
-    assert_eq!(hits.load(Ordering::SeqCst), WORKERS);
+    let results = results.lock().unwrap();
+    assert_eq!(*results, (0..WORKERS).map(|w| (w, w)).collect::<Vec<_>>());
+}
+
+#[test]
+fn spawn_on_a_worker_that_does_not_exist_panics_with_its_code() {
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    let payload =
+        std::panic::catch_unwind(AssertUnwindSafe(|| handle.spawn_on(2, || async {}))).unwrap_err();
+    let message = payload.downcast_ref::<String>().unwrap();
+    assert!(
+        message.starts_with("GIONG-E0008: spawn_on was given worker 2, but the runtime has 2"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_remote_task_is_awaited_from_a_plain_thread() {
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    let outside = std::thread::spawn(move || {
+        let task = handle.spawn_on(1, || async {
+            sleep(Duration::from_millis(5)).await;
+            giong::worker_id() + 10
+        });
+        fn send_and_sync<T: Send + Sync>(_: &T) {}
+        send_and_sync(&task);
+        let value = wait(task);
+        handle.shutdown();
+        value
+    });
+    rt.run(|_| giong::shutdown_signal()).unwrap();
+    assert_eq!(outside.join().unwrap().unwrap(), 11);
+}
+
+#[test]
+fn aborting_a_remote_task_drops_it_on_its_own_worker_first() {
+    struct OnDrop(Arc<Mutex<Option<usize>>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(giong::worker_id());
+        }
+    }
+
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    let checked = Arc::new(AtomicUsize::new(0));
+    let c = checked.clone();
+    rt.run(move |index| {
+        let (handle, checked) = (handle.clone(), c.clone());
+        async move {
+            if index == 0 {
+                // Aborted while it waits.
+                let dropped_on = Arc::new(Mutex::new(None));
+                let d = dropped_on.clone();
+                let (started_tx, started_rx) = giong::sync::oneshot::channel();
+                let task = handle.spawn_on(1, move || async move {
+                    let _guard = OnDrop(d);
+                    let _ = started_tx.send(());
+                    sleep(Duration::from_secs(3600)).await;
+                    "finished"
+                });
+                started_rx.await.unwrap();
+                assert!(!task.is_finished());
+                task.abort();
+                let result = timeout(Duration::from_secs(5), task).await.unwrap();
+                assert!(result.unwrap_err().is_cancelled());
+                // The future was dropped on worker 1 before the handle resolved.
+                assert_eq!(*dropped_on.lock().unwrap(), Some(1));
+                checked.fetch_add(1, Ordering::SeqCst);
+
+                // Aborted at once: before or after worker 1 starts it, it is
+                // never allowed to finish.
+                let ran = Arc::new(AtomicUsize::new(0));
+                let r = ran.clone();
+                let task = handle.spawn_on(1, move || async move {
+                    sleep(Duration::from_millis(50)).await;
+                    r.fetch_add(1, Ordering::SeqCst);
+                });
+                task.abort();
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                sleep(Duration::from_millis(100)).await;
+                assert_eq!(ran.load(Ordering::SeqCst), 0);
+                checked.fetch_add(1, Ordering::SeqCst);
+                handle.shutdown();
+            }
+            giong::shutdown_signal().await;
+        }
+    })
+    .unwrap();
+    assert_eq!(checked.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_remote_task_is_cancelled_when_its_worker_stops() {
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    let left = Arc::new(Mutex::new(None));
+    let l = left.clone();
+    let h = handle.clone();
+    rt.run(move |index| {
+        let (handle, left) = (h.clone(), l.clone());
+        async move {
+            if index == 0 {
+                let task = handle.spawn_on(1, || async {
+                    sleep(Duration::from_secs(3600)).await;
+                });
+                // Wait until worker 1 runs it, then stop everything.
+                handle.spawn_on(1, || async {}).await.unwrap();
+                *left.lock().unwrap() = Some(task);
+                handle.shutdown();
+            }
+            giong::shutdown_signal().await;
+        }
+    })
+    .unwrap();
+    let task = left.lock().unwrap().take().unwrap();
+    assert!(task.is_finished());
+    assert!(wait(task).unwrap_err().is_cancelled());
+
+    // The runtime has stopped: a new job is refused, and its handle says so.
+    let late = handle.spawn_on(0, || async { 1 });
+    assert!(late.is_finished());
+    assert!(wait(late).unwrap_err().is_cancelled());
+}
+
+/// Blocks the current (plain) thread on a future.
+fn wait<F: std::future::Future>(fut: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        if let std::task::Poll::Ready(value) = fut.as_mut().poll(&mut cx) {
+            return value;
+        }
+        std::thread::park();
+    }
 }
 
 #[test]
@@ -314,7 +460,7 @@ fn a_sleeping_worker_is_woken_promptly_by_another_thread() {
 }
 
 #[test]
-fn a_panicking_spawn_on_closure_does_not_kill_the_worker() {
+fn a_panicking_spawn_on_job_does_not_kill_the_worker() {
     let rt = giong::Builder::new().workers(2).build().unwrap();
     let handle = rt.handle();
     let done = Arc::new(AtomicUsize::new(0));
@@ -324,15 +470,24 @@ fn a_panicking_spawn_on_closure_does_not_kill_the_worker() {
         async move {
             if index == 0 {
                 // The closure that builds the future blows up on worker 1 ...
-                assert!(
-                    handle.spawn_on(1, || -> std::future::Ready<()> { panic!("factory failed") })
-                );
-                sleep(Duration::from_millis(20)).await;
-                // ... which must still be alive to run the next job.
-                assert!(handle.spawn_on(1, move || async move {
-                    done.store(giong::worker_id() + 10, Ordering::SeqCst);
-                    giong::handle().shutdown();
-                }));
+                let failed = handle
+                    .spawn_on(1, || -> std::future::Ready<()> { panic!("factory failed") })
+                    .await;
+                let payload = failed.unwrap_err().try_into_panic().unwrap();
+                assert_eq!(payload.downcast_ref::<&str>(), Some(&"factory failed"));
+                // ... and so does a task ...
+                let fail = Arc::new(AtomicUsize::new(1));
+                let failed = handle
+                    .spawn_on(1, move || async move {
+                        sleep(Duration::from_millis(1)).await;
+                        assert_eq!(fail.load(Ordering::SeqCst), 0, "task failed");
+                    })
+                    .await;
+                assert!(failed.unwrap_err().is_panic());
+                // ... and worker 1 is still alive to run the next one.
+                let id = handle.spawn_on(1, || async { giong::worker_id() }).await;
+                done.store(id.unwrap() + 10, Ordering::SeqCst);
+                handle.shutdown();
             }
             giong::shutdown_signal().await;
         }

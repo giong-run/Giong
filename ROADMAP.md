@@ -116,7 +116,7 @@ built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait
 - [x] The client side of `giong-tls`: the machine's CA certificates or compiled-in ones,
       ALPN, client certificates.
 - [x] A bounded channel and a oneshot channel in `sync`.
-- [ ] `spawn_on` that returns a handle to the spawned task's result.
+- [x] `spawn_on` that returns a handle to the spawned task's result.
 - [x] `giong-http`: the client's address in `Request`, and a limit on open connections.
 - [ ] Vectored writes (`writev`) so a response head and body need no copy.
 - [x] A clear error when io_uring is blocked, and a guide to allowing it in Docker and

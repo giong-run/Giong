@@ -114,6 +114,10 @@ codes! {
     MixedReads = 6, InvalidInput, "read used after recv";
     /// [`time::timeout`](crate::time::timeout) ran out of time.
     TimedOut = 7, TimedOut, "the time limit passed";
+    /// [`Handle::spawn_on`](crate::Handle::spawn_on) was given a worker index
+    /// the runtime does not have. It panics with this code, since the index
+    /// is a bug in the caller.
+    NoSuchWorker = 8, InvalidInput, "no such worker";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
