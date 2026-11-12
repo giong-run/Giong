@@ -29,14 +29,19 @@
 //!
 //! A [`File`] has no cursor: every read and write names its offset, so one
 //! file can be shared by many tasks without them disturbing each other.
+//!
+//! [`read_dir`] lists a directory. It is the one operation here that does not
+//! go through the ring, as io_uring cannot read directories; its
+//! documentation says what that costs.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr, OsString};
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use io_uring::{opcode, types};
@@ -320,6 +325,29 @@ impl File {
         self.fsync(types::FsyncFlags::DATASYNC).await
     }
 
+    /// Reserves disk space for the bytes `offset..offset + len`
+    /// (`fallocate`), so that writing there later cannot fail for lack of
+    /// space. A shorter file grows to `offset + len`, and the new bytes read
+    /// as zeros; data already in the file is not touched.
+    ///
+    /// Fails with `Unsupported` on a filesystem without `fallocate` (some
+    /// network filesystems).
+    pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
+        let sqe = opcode::Fallocate::new(types::Fd(self.fd), len)
+            .offset(offset)
+            .build();
+        let (res, _, ()) = Op::new(sqe, ()).await;
+        match res {
+            0.. => Ok(()),
+            // The kind is set here, as older standard libraries leave
+            // EOPNOTSUPP uncategorised; the OS error is kept inside.
+            res if -res == libc::EOPNOTSUPP => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, os_err(res)))
+            }
+            res => Err(os_err(res)),
+        }
+    }
+
     async fn fsync(&self, flags: types::FsyncFlags) -> io::Result<()> {
         let sqe = opcode::Fsync::new(types::Fd(self.fd)).flags(flags).build();
         let (res, _, ()) = Op::new(sqe, ()).await;
@@ -436,17 +464,22 @@ impl Metadata {
 
     /// `true` for a regular file.
     pub fn is_file(&self) -> bool {
-        self.mode & libc::S_IFMT == libc::S_IFREG
+        self.file_type().is_file()
     }
 
     /// `true` for a directory.
     pub fn is_dir(&self) -> bool {
-        self.mode & libc::S_IFMT == libc::S_IFDIR
+        self.file_type().is_dir()
     }
 
     /// `true` for a symbolic link (only reported by [`symlink_metadata`]).
     pub fn is_symlink(&self) -> bool {
-        self.mode & libc::S_IFMT == libc::S_IFLNK
+        self.file_type().is_symlink()
+    }
+
+    /// The type of the file.
+    pub fn file_type(&self) -> FileType {
+        FileType(self.mode & libc::S_IFMT)
     }
 
     /// File type and permission bits, as in `st_mode`.
@@ -580,5 +613,224 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Resul
         Err(os_err(res))
     } else {
         Ok(())
+    }
+}
+
+/// What kind of file an entry is: a regular file, a directory, a symbolic
+/// link, or something else (a socket, a pipe, a device).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileType(u32);
+
+impl FileType {
+    /// `true` for a regular file.
+    pub fn is_file(&self) -> bool {
+        self.0 == libc::S_IFREG
+    }
+
+    /// `true` for a directory.
+    pub fn is_dir(&self) -> bool {
+        self.0 == libc::S_IFDIR
+    }
+
+    /// `true` for a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.0 == libc::S_IFLNK
+    }
+
+    /// The type as the `S_IFMT` bits of `st_mode` (`S_IFREG`, `S_IFDIR`, ...).
+    pub fn mode(&self) -> u32 {
+        self.0
+    }
+
+    /// The type a directory entry reports, if the filesystem reports one.
+    fn from_dirent(d_type: u8) -> Option<Self> {
+        let mode = match d_type {
+            libc::DT_REG => libc::S_IFREG,
+            libc::DT_DIR => libc::S_IFDIR,
+            libc::DT_LNK => libc::S_IFLNK,
+            libc::DT_FIFO => libc::S_IFIFO,
+            libc::DT_SOCK => libc::S_IFSOCK,
+            libc::DT_CHR => libc::S_IFCHR,
+            libc::DT_BLK => libc::S_IFBLK,
+            _ => return None,
+        };
+        Some(Self(mode))
+    }
+}
+
+/// How many bytes of entries one `getdents64` call may return. A call holds
+/// up the worker for a time that grows with the entries it returns: at 8 KiB,
+/// some tens of microseconds on a local disk, four times less than at 32 KiB,
+/// for a whole listing a few percent slower.
+const DIR_BATCH: usize = 8 * 1024;
+
+/// Lists the entries of a directory, without `.` and `..`, in the order the
+/// filesystem keeps them.
+///
+/// ```no_run
+/// # async fn demo() -> std::io::Result<()> {
+/// let mut dir = giong::fs::read_dir("/etc").await?;
+/// while let Some(entry) = dir.next_entry().await? {
+///     if entry.file_type().await?.is_file() {
+///         println!("{}", entry.path().display());
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The directory is opened through the ring, but io_uring has no operation
+/// that reads a directory. So each batch of entries (8 KiB of them, about a
+/// hundred names) is read with a direct `getdents64` system call on the
+/// worker thread, and the task yields between batches. On a local
+/// filesystem with the directory cached, a batch takes some tens of
+/// microseconds; on a network filesystem it can hold up the worker for a
+/// round trip.
+pub async fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
+    let path = path.as_ref();
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)
+        .await?;
+    Ok(ReadDir {
+        dir,
+        path: Arc::from(path),
+        buf: Vec::new(),
+        pos: 0,
+        yield_first: false,
+        done: false,
+    })
+}
+
+/// The entries of a directory; see [`read_dir`].
+pub struct ReadDir {
+    dir: File,
+    path: Arc<Path>,
+    /// The last batch of `linux_dirent64` records.
+    buf: Vec<u8>,
+    /// Where the next record starts in `buf`.
+    pos: usize,
+    /// Yield before reading the next batch.
+    yield_first: bool,
+    /// The last batch was empty: the end of the directory.
+    done: bool,
+}
+
+impl ReadDir {
+    /// The next entry, or `None` when there are no more. Cancel safe: if the
+    /// future is dropped, no entry is lost.
+    pub async fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
+        loop {
+            while let Some(entry) = self.parse() {
+                if let Some(entry) = entry {
+                    return Ok(Some(entry));
+                }
+            }
+            if self.done {
+                return Ok(None);
+            }
+            if mem::take(&mut self.yield_first) {
+                // Between batches, let other tasks and the ring run. If this
+                // future is dropped here, the next call reads on without
+                // yielding again, so even a zero timeout makes progress.
+                crate::yield_now().await;
+            }
+            self.read_batch()?;
+        }
+    }
+
+    /// Reads the next record of the batch and moves past it. `None` at the
+    /// end of the batch; `Some(None)` for `.` and `..`.
+    fn parse(&mut self) -> Option<Option<DirEntry>> {
+        // struct linux_dirent64 { u64 d_ino; i64 d_off; u16 d_reclen;
+        //                         u8 d_type; char d_name[]; }
+        let record = self.buf.get(self.pos..)?;
+        let field = |at: usize, len: usize| record.get(at..at + len);
+        let ino = u64::from_ne_bytes(field(0, 8)?.try_into().ok()?);
+        let reclen = u16::from_ne_bytes(field(16, 2)?.try_into().ok()?) as usize;
+        let d_type = *record.get(18)?;
+        let name = record.get(19..reclen)?;
+        let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+        let entry = (name != b"." && name != b"..").then(|| DirEntry {
+            dir: self.path.clone(),
+            name: OsString::from_vec(name.to_vec()),
+            ino,
+            file_type: FileType::from_dirent(d_type),
+        });
+        self.pos += reclen;
+        Some(entry)
+    }
+
+    fn read_batch(&mut self) -> io::Result<()> {
+        self.buf.clear();
+        self.buf.reserve(DIR_BATCH);
+        // SAFETY: the kernel writes at most `capacity` bytes into the buffer.
+        let n = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                self.dir.fd,
+                self.buf.as_mut_ptr(),
+                self.buf.capacity(),
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the kernel wrote `n` bytes, no more than the capacity.
+        unsafe { self.buf.set_len(n as usize) };
+        self.pos = 0;
+        self.yield_first = true;
+        self.done = n == 0;
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ReadDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadDir").field("path", &self.path).finish()
+    }
+}
+
+/// One entry of a directory, from [`ReadDir::next_entry`].
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    dir: Arc<Path>,
+    name: OsString,
+    ino: u64,
+    /// `None` if the filesystem did not say (`DT_UNKNOWN`).
+    file_type: Option<FileType>,
+}
+
+impl DirEntry {
+    /// The entry's name, without the directory.
+    pub fn file_name(&self) -> &OsStr {
+        &self.name
+    }
+
+    /// The directory given to [`read_dir`] joined with the entry's name.
+    pub fn path(&self) -> PathBuf {
+        self.dir.join(&self.name)
+    }
+
+    /// The inode number.
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+
+    /// The type of the entry itself (a symbolic link is not followed). Most
+    /// filesystems report it with the name, so no system call is needed; for
+    /// the others it is looked up through the ring.
+    pub async fn file_type(&self) -> io::Result<FileType> {
+        match self.file_type {
+            Some(file_type) => Ok(file_type),
+            None => Ok(self.metadata().await?.file_type()),
+        }
+    }
+
+    /// Metadata of the entry itself, like [`symlink_metadata`] on
+    /// [`path`](Self::path).
+    pub async fn metadata(&self) -> io::Result<Metadata> {
+        symlink_metadata(self.path()).await
     }
 }

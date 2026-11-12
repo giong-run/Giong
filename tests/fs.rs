@@ -478,3 +478,281 @@ fn a_std_file_can_be_adopted_and_knows_its_length() {
         assert!(empty.is_empty().unwrap());
     });
 }
+
+/// Every entry `read_dir` lists for `dir`, sorted by name.
+async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
+    let mut entries = Vec::new();
+    let mut listing = fs::read_dir(dir).await.unwrap();
+    while let Some(entry) = listing.next_entry().await.unwrap() {
+        entries.push(entry);
+    }
+    entries.sort_by(|a, b| a.file_name().cmp(b.file_name()));
+    entries
+}
+
+#[test]
+fn directories_list_like_the_standard_library() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+
+    let dir = TempDir::new("read-dir");
+    giong::block_on(async {
+        // An empty directory stays empty when asked again.
+        let mut empty = fs::read_dir(&dir.0).await.unwrap();
+        assert!(empty.next_entry().await.unwrap().is_none());
+        assert!(empty.next_entry().await.unwrap().is_none());
+
+        fs::write(dir.path("file"), "12345").await.unwrap();
+        fs::create_dir(dir.path("sub")).await.unwrap();
+        std::os::unix::fs::symlink(dir.path("file"), dir.path("link")).unwrap();
+        std::os::unix::fs::symlink(dir.path("missing"), dir.path("dangling")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.path("socket")).unwrap();
+        // A name that is not UTF-8.
+        let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
+        std::fs::write(dir.0.join(latin1), "").unwrap();
+
+        let ours = list(&dir.0).await;
+        let mut theirs: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        theirs.sort_by_key(|entry| entry.file_name());
+        let names: Vec<_> = ours
+            .iter()
+            .map(|entry| entry.file_name().as_bytes())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                &b"caf\xe9"[..],
+                b"dangling",
+                b"file",
+                b"link",
+                b"socket",
+                b"sub"
+            ]
+        );
+        assert_eq!(ours.len(), theirs.len());
+        for (ours, theirs) in ours.iter().zip(&theirs) {
+            assert_eq!(ours.file_name(), theirs.file_name());
+            assert_eq!(ours.path(), theirs.path());
+            assert_eq!(ours.ino(), theirs.ino());
+            // The entry itself: links are not followed.
+            let kind = ours.file_type().await.unwrap();
+            let std_meta = std::fs::symlink_metadata(theirs.path()).unwrap();
+            assert_eq!(
+                kind.mode(),
+                std_meta.mode() & libc::S_IFMT,
+                "{:?}",
+                ours.path()
+            );
+            let std_kind = theirs.file_type().unwrap();
+            assert_eq!(
+                (kind.is_file(), kind.is_dir(), kind.is_symlink()),
+                (std_kind.is_file(), std_kind.is_dir(), std_kind.is_symlink()),
+            );
+            let meta = ours.metadata().await.unwrap();
+            assert_eq!(meta.file_type(), kind);
+            assert_eq!(meta.len(), std_meta.len());
+        }
+        // An entry outlives its listing, and clones share the directory.
+        let file = ours[2].clone();
+        drop(ours);
+        assert_eq!(file.path(), dir.path("file"));
+        assert_eq!(file.metadata().await.unwrap().len(), 5);
+    });
+}
+
+#[test]
+fn large_directories_are_read_in_batches() {
+    let dir = TempDir::new("read-dir-many");
+    // About 80 bytes per entry, so an 8 KiB batch holds about 100 of them.
+    let names: std::collections::BTreeSet<String> = (0..3_000)
+        .map(|i| format!("entry-{i:05}-{}", "x".repeat(40)))
+        .collect();
+    for name in &names {
+        std::fs::write(dir.path(name), "").unwrap();
+    }
+    giong::block_on(async {
+        let listed: std::collections::BTreeSet<String> = list(&dir.0)
+            .await
+            .iter()
+            .map(|entry| entry.file_name().to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(listed, names);
+
+        // Other tasks run between batches.
+        let ticks = Rc::new(std::cell::Cell::new(0));
+        let ticker = giong::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.set(ticks.get() + 1);
+                    giong::yield_now().await;
+                }
+            }
+        });
+        let mut listing = fs::read_dir(&dir.0).await.unwrap();
+        let mut count = 0;
+        while listing.next_entry().await.unwrap().is_some() {
+            count += 1;
+        }
+        ticker.abort();
+        assert_eq!(count, names.len());
+        assert!(ticks.get() >= 5, "only {} ticks while listing", ticks.get());
+
+        // A listing whose calls are cut short by a zero timeout loses no
+        // entry and still reaches the end.
+        let mut listing = fs::read_dir(&dir.0).await.unwrap();
+        let (mut seen, mut cancelled) = (std::collections::BTreeSet::new(), 0);
+        loop {
+            match timeout(Duration::ZERO, listing.next_entry())
+                .await
+                .map(Result::unwrap)
+            {
+                Ok(Some(entry)) => {
+                    let name = entry.file_name().to_str().unwrap().to_owned();
+                    assert!(seen.insert(name), "{:?} listed twice", entry.file_name());
+                }
+                Ok(None) => break,
+                Err(_) => cancelled += 1,
+            }
+        }
+        assert_eq!(seen, names);
+        assert!(cancelled >= 5, "only {cancelled} calls were cut short");
+    });
+}
+
+#[test]
+fn read_dir_reports_what_it_cannot_list() {
+    let dir = TempDir::new("read-dir-errors");
+    giong::block_on(async {
+        let err = fs::read_dir(dir.path("missing")).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+
+        fs::write(dir.path("file"), "x").await.unwrap();
+        let err = fs::read_dir(dir.path("file")).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+
+        let err = fs::read_dir("bad\0path").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        // An entry removed after it was listed has no metadata.
+        let entry = list(&dir.0).await.pop().unwrap();
+        fs::remove_file(entry.path()).await.unwrap();
+        let err = entry.metadata().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        // Its type was reported with the name, so it is still known.
+        assert!(entry.file_type().await.unwrap().is_file());
+    });
+}
+
+#[test]
+fn dropped_listings_release_their_descriptors() {
+    let dir = TempDir::new("read-dir-fds");
+    for i in 0..1_000 {
+        std::fs::write(dir.path(&format!("{i:04}-{}", "y".repeat(60))), "").unwrap();
+    }
+    giong::block_on(async {
+        for round in 0..20 {
+            let mut listing = fs::read_dir(&dir.0).await.unwrap();
+            assert_eq!(open_fds(&dir.0), 1);
+            // Stop at the start, in the first batch, or in a later one.
+            for _ in 0..round * 50 {
+                listing.next_entry().await.unwrap().unwrap();
+            }
+            drop(listing);
+        }
+        timeout(Duration::from_secs(1), async {
+            while open_fds(&dir.0) > 0 {
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("dropped listings should close their directory");
+    });
+}
+
+#[test]
+fn allocate_reserves_space_without_touching_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = TempDir::new("allocate");
+    let path = dir.path("f");
+    giong::block_on(async {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .await
+            .unwrap();
+        match file.allocate(0, 1 << 20).await {
+            Err(err) if err.kind() == ErrorKind::Unsupported => {
+                eprintln!("skipped: this filesystem has no fallocate ({err})");
+                return;
+            }
+            res => res.unwrap(),
+        }
+        // The file grows, the space is reserved, and the new bytes are zeros.
+        assert_eq!(file.len().unwrap(), 1 << 20);
+        assert!(std::fs::metadata(&path).unwrap().blocks() * 512 >= 1 << 20);
+        let data = fs::read(&path).await.unwrap();
+        assert_eq!(data.len(), 1 << 20);
+        assert!(data.iter().all(|&b| b == 0));
+
+        // Inside the file: data stays and the length does not change.
+        let pattern = payload(8192, 7);
+        file.write_all_at(pattern.clone(), 4096).await.0.unwrap();
+        file.allocate(0, 16384).await.unwrap();
+        assert_eq!(file.len().unwrap(), 1 << 20);
+        let (res, buf) = file.read_at(Vec::with_capacity(8192), 4096).await;
+        assert_eq!(res.unwrap(), 8192);
+        assert_eq!(buf, pattern);
+
+        // Past the end, with a gap: the file grows to the end of the range.
+        file.allocate(2 << 20, 4096).await.unwrap();
+        assert_eq!(file.len().unwrap(), (2 << 20) + 4096);
+
+        // The kernel's own errors come back as they are.
+        let err = file.allocate(0, 0).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        let read_only = File::open(&path).await.unwrap();
+        let err = read_only.allocate(0, 1).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+    });
+}
+
+#[test]
+fn allocations_dropped_mid_flight_are_cleaned_up() {
+    let dir = TempDir::new("allocate-cancel");
+    let path = dir.path("f");
+    giong::block_on(async {
+        let file = File::create(&path).await.unwrap();
+        // Each call is submitted on its first poll and dropped right after.
+        let mut abandoned = 0;
+        for i in 0..50u64 {
+            match timeout(Duration::ZERO, file.allocate(i << 16, 1 << 16)).await {
+                Err(_) => abandoned += 1,
+                Ok(Err(err)) if err.kind() == ErrorKind::Unsupported => {
+                    eprintln!("skipped: this filesystem has no fallocate ({err})");
+                    return;
+                }
+                Ok(res) => res.unwrap(),
+            }
+        }
+        assert!(abandoned > 0, "expected some allocations to be in flight");
+        timeout(Duration::from_secs(5), async {
+            while giong::stats().tracked_ops > 0 {
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("abandoned allocations should complete and be forgotten");
+        // Whatever ran left a consistent file, and the next call works.
+        assert!(file.len().unwrap() <= 50 << 16);
+        file.allocate(0, 50 << 16).await.unwrap();
+        assert_eq!(file.len().unwrap(), 50 << 16);
+        file.close().await.unwrap();
+    });
+}

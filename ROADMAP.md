@@ -121,7 +121,7 @@ built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait
 - [x] Vectored writes (`writev`) so a response head and body need no copy.
 - [x] A clear error when io_uring is blocked, and a guide to allowing it in Docker and
       Kubernetes until the epoll driver exists.
-- [ ] Remaining file operations: reading directories, `fallocate`.
+- [x] Remaining file operations: reading directories, `fallocate`.
 - [x] Agent-first groundwork: error codes with their documentation pages and
       `giong::error::code`, `AGENTS.md`, `llms.txt`.
 

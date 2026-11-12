@@ -196,7 +196,7 @@ let runtime = giong::Builder::new()
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
 | Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
 | UDP | `UdpSocket::bind` / `connect`; `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast` |
-| Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir` |
+| Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
 | Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
@@ -586,9 +586,10 @@ to audit.
 - **Name resolution reads files and DNS only.** `connect` and `lookup_host` resolve names
   without blocking, from `/etc/hosts` and the DNS servers in `/etc/resolv.conf`; other
   Name Service Switch sources (mDNS, LDAP) are not used. `bind` still resolves with a
-  blocking call, which only matters at startup. Also missing: Unix datagram sockets,
-  multicast, reading directories, `set_len`, file locks, `O_DIRECT` with registered
-  buffers.
+  blocking call, which only matters at startup. `fs::read_dir` reads each batch of
+  entries with a direct system call on the worker (io_uring cannot read directories):
+  quick on a local disk, a network round trip on NFS. Also missing: Unix datagram
+  sockets, multicast, `set_len`, file locks, `O_DIRECT` with registered buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
 - **`giong-tls` has no kTLS yet,** and no independent audit.
