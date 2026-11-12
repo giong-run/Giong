@@ -34,6 +34,8 @@ fn main() -> std::io::Result<()> {
 - Bodies by `Content-Length` or chunked, received in full before the handler is called. `Expect: 100-continue` is supported.
 - A `Request` shares the connection's receive buffer instead of copying it, so building a request allocates nothing. A handler may keep the request for as long as it likes.
 - Limits on the size of the head (64 KiB) and the body (1 MiB); timeouts for idle connections (60 s), slow requests (30 s, against slowloris) and clients that read slowly (30 s). All of them can be changed on `Server`.
+- An optional cap on open connections (`Server::max_connections`): at the cap the server stops accepting, and new clients wait in the kernel's listen queue until a connection closes.
+- `Request::peer_addr` gives the client's address (`None` over a Unix socket).
 - Graceful shutdown: a request in progress is answered with `Connection: close`, an idle connection is closed at once.
 - HTTPS through the `tls` feature (see below).
 - Serving over a Unix socket with `Server::serve_unix`, the usual setup behind a reverse proxy on the same machine.
@@ -78,4 +80,4 @@ HTTP/2, streaming bodies (a body over the limit is refused, not passed on piece 
 
 ## Tests
 
-`cargo test -p giong-http --all-features`: 15 unit tests (including 500,000 random inputs for the parser and the chunked decoder), 17 end-to-end tests on real sockets (one of them over a Unix socket), 9 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 5 documentation examples.
+`cargo test -p giong-http --all-features`: 15 unit tests (including 500,000 random inputs for the parser and the chunked decoder), 19 end-to-end tests on real sockets (one of them over a Unix socket), 11 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 5 documentation examples.

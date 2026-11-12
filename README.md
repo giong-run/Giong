@@ -21,7 +21,7 @@ load arrives.
 > timers, multi-core, graceful shutdown, and two companion crates,
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server) and
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly.
-> 169 tests pass on three io_uring setups and on real 6.0 and 6.1 kernels; ThreadSanitizer
+> 173 tests pass on three io_uring setups and on real 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
 > fuzzed and a soak test churns connections for two hours every night. It has **not** run
 > in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
@@ -465,7 +465,7 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-169 tests (`cargo test --workspace --all-features`), repeated in release mode on all three
+173 tests (`cargo test --workspace --all-features`), repeated in release mode on all three
 io_uring setups without a failure:
 
 | Suite | What it checks |
@@ -480,7 +480,7 @@ io_uring setups without a failure:
 | `tests/multi.rs` (10) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (9) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
-| `giong-http` (46) | 15 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 17 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket); 9 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
+| `giong-http` (50) | 15 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 19 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 11 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
 | `giong-tls` (8) | TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
 | Other (7) | slab, the io_uring setup tiers, 5 documentation examples |
 

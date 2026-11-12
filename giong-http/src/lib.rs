@@ -35,7 +35,8 @@
 //! * Request bodies with `Content-Length` or chunked encoding, fully received
 //!   before the handler runs; `Expect: 100-continue`.
 //! * Limits on head and body size, timeouts for idle connections, slow
-//!   requests and slow readers.
+//!   requests and slow readers, and an optional cap on open connections.
+//! * The client's address on every request ([`Request::peer_addr`]).
 //! * Graceful shutdown: requests in progress are answered, idle connections
 //!   close.
 //! * Strict parsing. Requests that a proxy in front might read differently
