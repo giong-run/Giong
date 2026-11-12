@@ -70,6 +70,21 @@ scripts/kernels.sh           # the suite on real 6.0 and 6.1 kernels in QEMU; ne
 scripts/valgrind.sh          # needs valgrind; takes a few minutes
 ```
 
+A change to the HTTP parser or the connection state machine in `giong-http` should be
+fuzzed for a few minutes (needs nightly and `cargo install cargo-fuzz`):
+
+```bash
+cd giong-http
+cargo +nightly fuzz run head        # the request-head parser
+cargo +nightly fuzz run chunked     # the chunked body decoder
+cargo +nightly fuzz run connection  # a whole connection, over an in-memory transport
+```
+
+The targets live in `giong-http/fuzz/`, with starting inputs in `fuzz/seeds/`; what they
+check is in `giong-http/src/invariants.rs` and `fuzz/fuzz_targets/connection.rs`. CI
+fuzzes every night and on pull requests that touch `giong-http`. If a target finds a
+crash, add the input as a regression test.
+
 A change to how a worker is woken from another thread (`src/notify.rs`, the injector,
 `TaskWaker`) needs its loom model updated in the same pull request.
 

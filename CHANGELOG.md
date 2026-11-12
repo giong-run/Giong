@@ -28,6 +28,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   live in `src/notify.rs` and are model-checked with
   [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
   CI job). `tests/wake.rs` runs the lost-wake-up race on real hardware.
+- **Verification**: coverage-guided fuzzing of `giong-http` with cargo-fuzz: the
+  request-head parser, the chunked decoder, and a whole connection served over an
+  in-memory transport, in pieces of random size (`giong-http/fuzz/`). CI fuzzes each
+  target for 10 minutes every night, keeping the corpus, and briefly on pull requests.
 - **Verification**: the whole suite on real Linux 6.0.19 and 6.1.155 kernels, each
   booted in QEMU from an initramfs (`scripts/kernels.sh`), in CI on every change.
 

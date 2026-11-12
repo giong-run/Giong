@@ -56,7 +56,8 @@ features, find out what is actually true.
       6.0 could fail to start a runtime, now fixed).
 - [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
       wake-up, now fixed).
-- [ ] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser.
+- [x] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser, the chunked
+      decoder and a whole connection, nightly in CI.
 - [ ] Add a soak test: hours of connection churn with fd and memory checks.
 - [ ] An independent look at `giong-tls` before anyone relies on it.
 
