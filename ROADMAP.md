@@ -6,24 +6,64 @@ an item so the work is not duplicated.
 
 ## Goal
 
-A runtime for **network servers on Linux** that makes the fewest possible system calls and
+A runtime for **network services on Linux** that makes the fewest possible system calls and
 keeps tail latency low, by committing fully to io_uring and to one thread per core.
+
+By 1.0, a team can write and deploy a real REST API (Postgres, Redis, calls to other HTTPS
+services, HTTPS itself) with giong's crates alone, in an ordinary Docker or Kubernetes
+setup. Each crate that replaces a Tokio-based one is measured against it with a reproducible
+benchmark (tokio-postgres with deadpool, redis-rs, reqwest, axum), and the README says where
+giong does not win.
+
+## Agent-first
+
+More and more code is written by AI agents, so giong is built for them to use correctly on
+the first try and to fix on their own when they get something wrong. That means removing
+vague conveniences and implicit defaults, never safety: the faster code is written, the
+tighter the checks around it have to be.
+
+1. **Errors explain themselves.** Every error giong raises carries a stable code
+   (`GIONG-E0001`…), says what went wrong and how to fix it, and links to a page about it.
+   Functions keep returning `io::Error`; `giong::error::code(&err)` lets code, and agents,
+   match on the code instead of the message.
+2. **One obvious, correct way.** No macros and no magic. Types strict enough that a mistake
+   is a compile error: enums instead of flags and strings, `Duration` instead of a number of
+   milliseconds, `#[must_use]` on futures and handles. No implicit defaults: every timeout
+   and size limit is finite, documented, and visible in `Debug` output.
+3. **Verification is the law.** Tests, cancellation tests, ThreadSanitizer, `loom`, fuzzing
+   and soak tests run in CI and block merging; `cargo-semver-checks` guards the API. Machines
+   check the work, so human review is not the bottleneck.
+4. **Documentation machines can read.** `AGENTS.md` in the repository; `llms.txt` and
+   `llms-full.txt` on giong.run, generated from the docs; a runnable example for every public
+   API. Doctests are the source of truth.
+5. **Observable from the inside.** Per-worker statistics, connection-pool statistics and
+   per-route latency, and structured logs as JSON lines. The runtime adds no dependency for
+   this; `tracing` is an optional feature.
+6. **An MCP server, `giong-mcp`.** Attached to a running service, it lets an agent read the
+   state of workers, tasks, connections, pools, statistics and profiles. Read-only, listening
+   on localhost or a Unix socket, and only when the service turns it on.
 
 ## Non-goals
 
 These are deliberate. Proposals that need them will be declined.
 
-- **Other operating systems.** No epoll, kqueue or IOCP fallback.
+- **Production on other operating systems.** Linux is the only platform giong is tuned and
+  measured on, and io_uring stays the main path. A Linux epoll driver is planned (0.5) for
+  machines where io_uring is blocked, such as Docker's default seccomp profile. Running on
+  macOS for development (kqueue) may follow it; Windows (IOCP) not before 1.0, and only if
+  users need it.
 - **Work stealing.** Tasks stay on the worker that created them.
-- **A general-purpose runtime.** giong is not trying to replace Tokio for every workload.
+- **Every workload.** giong covers network services: HTTP, databases, caches and the clients
+  they need. It does not try to replace Tokio for everything Tokio is used for.
 - **`Send` futures as a requirement.** The API stays usable with `Rc` and `RefCell`.
+- **Macros that hide control flow, and unbounded defaults.** See [Agent-first](#agent-first).
 
 ## 0.1 — Foundation (done)
 
 Executor, io_uring driver, TCP, UDP, files, timers, thread-per-core runtime, busy-poll
 mode, cross-thread channel, cancellation safety, backpressure, tests and benchmarks. See [CHANGELOG.md](CHANGELOG.md).
 
-## 0.2 — A runtime you can serve from (this release)
+## 0.2 — A runtime you can serve from (done)
 
 0.2 took the pieces a real service needs first, wherever they stood in the earlier plan,
 together with the verification that needed no extra hardware.
@@ -50,31 +90,101 @@ features, find out what is actually true.
 
 - [ ] Benchmark on a multi-core machine with the load generator on a separate host and a
       physical network card.
-- [ ] Measure scaling from 1 to N workers.
+- [ ] Measure scaling from 1 to N workers. `bench/workers.sh` does it, from a second
+      machine too; on the 4-vCPU VM the load generator saturates at two workers.
 - [ ] Repeat the Monoio and Glommio comparison on several cores and a physical network.
-- [ ] Run the test suite on real 6.0 and 6.1 kernels.
-- [ ] Model-check the cross-thread wake-up handshake with `loom`.
-- [ ] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser.
-- [ ] Add a soak test: hours of connection churn with fd and memory checks.
+- [x] Run the test suite on real 6.0 and 6.1 kernels (in QEMU, in CI; it found that
+      6.0 could fail to start a runtime, now fixed).
+- [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
+      wake-up, now fixed).
+- [x] Coverage-guided fuzzing (`cargo fuzz`) of the `giong-http` parser, the chunked
+      decoder and a whole connection, nightly in CI.
+- [x] Add a soak test: hours of connection churn with fd and memory checks (two hours
+      every night in CI).
 - [ ] An independent look at `giong-tls` before anyone relies on it.
 
 **Exit criteria:** published multi-core results with their method, and no open memory- or
 thread-safety finding.
 
-## 0.4 — Breadth
+## 0.4 — Foundations for services
 
-- [ ] Vectored writes (`writev`) so a response head and body need no copy.
-- [ ] Streaming request and response bodies in `giong-http`.
-- [ ] The client side of `giong-tls`.
-- [ ] Remaining file operations: reading directories, `fallocate`.
-- [ ] Asynchronous DNS resolution (today `bind` and `connect` resolve names blocking).
+What every client library and service needs before the database and web crates can be
+built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait for 0.3's.
+
+- [ ] Asynchronous DNS resolution (`/etc/hosts`, `resolv.conf`, UDP then TCP, a cache per
+      worker), and `TcpStream::connect` by name, trying addresses the RFC 8305 way.
+- [ ] The client side of `giong-tls`: the machine's CA certificates or compiled-in ones,
+      ALPN, client certificates.
 - [ ] A bounded channel and a oneshot channel in `sync`.
 - [ ] `spawn_on` that returns a handle to the spawned task's result.
+- [ ] `giong-http`: the client's address in `Request`, and a limit on open connections.
+- [ ] Vectored writes (`writev`) so a response head and body need no copy.
+- [ ] A clear error when io_uring is blocked, and a guide to allowing it in Docker and
+      Kubernetes until the epoll driver exists.
+- [ ] Remaining file operations: reading directories, `fallocate`.
+- [ ] Agent-first groundwork: error codes with their documentation pages and
+      `giong::error::code`, `AGENTS.md`, `llms.txt`.
 
 **Exit criteria:** every item above with tests, including cancellation tests for each new
 operation.
 
-## 0.5 — Speed
+## giong-postgres 0.1
+
+A new crate: the Postgres v3 protocol on giong.
+
+- [ ] Connecting, SCRAM-SHA-256 (with `ring`, already a dependency through rustls), TLS.
+- [ ] Parameterised queries, prepared statements with a cache, transactions, the common
+      data types.
+- [ ] Pipelining by default: queries from many requests on one core share one write.
+- [ ] A connection pool per core, with no `Arc` or `Mutex` between threads.
+- [ ] Per-worker and per-pool statistics as a public API, in `giong` and here.
+
+**Exit criteria:** the test suite passes against real Postgres 14 to 17 in CI, the protocol
+parser is fuzzed, and a benchmark compares it with tokio-postgres and deadpool.
+
+## HTTP client and giong-redis 0.1
+
+- [ ] An HTTP/1.1 client in `giong-http` (feature `client`): keep-alive, a pool per host,
+      HTTPS, timeouts, redirects.
+- [ ] `giong-redis`, a new crate: RESP2 and RESP3, automatic pipelining, a pool per core,
+      pub/sub.
+
+**Exit criteria:** the client fetches from a public HTTPS API, `giong-redis` passes against
+a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
+
+## giong-web 0.1 and giong-mcp 0.1
+
+- [ ] Streaming request and response bodies in `giong-http`.
+- [ ] `giong-web`, a new crate: a router with path parameters, middleware (logging,
+      timeouts, CORS, request ids, compression), JSON through `serde` behind a feature.
+- [ ] Structured logs as JSON lines, and an optional `tracing` feature.
+- [ ] `giong-mcp`, a new crate: the MCP server described under
+      [Agent-first](#agent-first).
+
+**Exit criteria:** a complete example REST API (CRUD on Postgres, a Redis cache, HTTPS) in
+the repository, and a benchmark of it against the same API on axum.
+
+## 0.5 — Runs where io_uring is blocked
+
+Starts once 0.3 is done, because both change the driver and the wake-up path.
+
+- [ ] An epoll driver, chosen automatically when io_uring cannot be set up, or by an
+      environment variable. The worker still blocks in one place that a wake-up from another
+      thread can interrupt.
+
+**Exit criteria:** the whole test suite passes on both drivers, giong runs in Docker with
+the default seccomp profile, and the difference in performance is measured and published.
+
+## 0.6 — HTTP/2 and adapters
+
+- [ ] HTTP/2 in `giong-http`, over TLS with ALPN.
+- [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
+      over the transport can run on giong.
+- [ ] Decide, based on demand, whether a hyper integration is worth maintaining.
+
+**Exit criteria:** an HTTPS server serving real browsers over HTTP/2, and `h2spec` passing.
+
+## 0.7 — Speed
 
 Each item lands only with a benchmark showing what it buys.
 
@@ -84,20 +194,14 @@ Each item lands only with a benchmark showing what it buys.
 - [ ] Optional `SQPOLL` mode.
 - [ ] Optional NAPI busy polling.
 - [ ] Kernel TLS (kTLS) for `giong-tls`.
-- [ ] Per-worker statistics (tasks, operations, buffer pool pressure) as a public API.
 
 **Exit criteria:** a documented, reproducible gain for every option that is merged.
 
-## 0.6 — Ecosystem
-
-- [ ] HTTP/2 in `giong-http`.
-- [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
-      over the transport can run on giong.
-- [ ] Decide, based on demand, whether a hyper integration is worth maintaining.
-
-**Exit criteria:** an HTTPS server serving real browsers over HTTP/2.
-
 ## 1.0
 
-A stable API. Requires: every public item documented, the limitations section of the
-README reduced to deliberate non-goals, and at least one production user reporting back.
+A stable API. Requires: a review of every public item against the
+[Agent-first](#agent-first) principles, `cargo-semver-checks` in CI, every public item
+documented, the limitations section of the README reduced to deliberate non-goals, and at
+least one production user reporting back.
+
+MySQL, WebSocket and gRPC come later, when someone needs them.

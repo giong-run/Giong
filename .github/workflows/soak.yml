@@ -1,0 +1,28 @@
+name: Soak
+
+# Two hours of connection churn, UDP, file and cross-worker traffic every night
+# (tests/soak.rs), then checks that no descriptor, memory or driver state was
+# left behind. Run it by hand with another duration from the Actions tab.
+
+on:
+  schedule:
+    - cron: "41 2 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to run
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: uname -r && nproc
+      - name: Soak
+        run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak

@@ -6,6 +6,7 @@ rust-version = "1.80"
 description = "A small, strict HTTP/1.1 server for the giong thread-per-core runtime"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+exclude = ["fuzz/"]
 repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong-http"
 keywords = ["http", "server", "io-uring", "thread-per-core", "async"]
@@ -26,6 +27,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 [[test]]
 name = "tls"
 required-features = ["tls"]
+
+[lints.rust]
+# Set by `cargo fuzz` (see fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [package.metadata.docs.rs]
 all-features = true

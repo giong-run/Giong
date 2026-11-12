@@ -11,9 +11,18 @@ documentation = "https://docs.rs/giong-tls"
 keywords = ["tls", "rustls", "io-uring", "thread-per-core", "async"]
 categories = ["network-programming", "cryptography"]
 
+[features]
+# `TlsConnector::with_webpki_roots`: Mozilla's root certificates compiled in,
+# for machines without a CA bundle (container images built `FROM scratch`).
+webpki-roots = ["dep:webpki-roots"]
+
 [dependencies]
 giong = { path = "..", version = "0.2.1" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 rcgen = "0.13"
+
+[package.metadata.docs.rs]
+all-features = true

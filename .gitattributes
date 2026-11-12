@@ -21,3 +21,6 @@ bench/** linguist-vendored=true
 *.ico binary
 *.jpg binary
 *.bundle binary
+
+# Fuzzing inputs are raw bytes (CRLF included).
+giong-http/fuzz/seeds/** binary

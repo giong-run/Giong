@@ -29,6 +29,7 @@ Where the code is:
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
+| `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
 ## The machine you need
@@ -58,12 +59,17 @@ cargo +1.80.0 check --workspace --all-features   # the minimum Rust version, lib
 scripts/check.sh test        # release build, every test 5 times; ROUNDS=1 for one pass
 scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
+scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
+scripts/check.sh soak        # minutes of connection churn, then checks for leaks
+scripts/kernels.sh           # the suite on real 6.0 and 6.1 kernels in QEMU (slow)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 ```
 
 Continuous integration requires five checks on every pull request: `lint` (fmt, clippy,
 doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
+CI also runs `loom` and the `kernels` jobs on every pull request, and fuzzes `giong-http`
+and runs the soak test every night.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run; `scripts/check.sh fallback` does this for you.
@@ -87,7 +93,11 @@ run; `scripts/check.sh fallback` does this for you.
 6. **Errors explain themselves.** An error giong creates says what went wrong and what to
    do about it; the io_uring setup error added in #12 is the model. No unbounded
    defaults: every timeout and size limit is finite and documented.
-7. **Performance claims need numbers**: before and after, the median of several runs with
+7. **Wake-ups and the HTTP parser have their own checks.** A change to `src/notify.rs`,
+   the injector or `TaskWaker` updates its loom model in the same pull request. A change
+   to the `giong-http` parser or connection state machine is fuzzed for a few minutes
+   first (`giong-http/fuzz/`, commands in CONTRIBUTING.md).
+8. **Performance claims need numbers**: before and after, the median of several runs with
    the spread, the machine and kernel. Never write a number you did not measure.
 
 ## Changes, commits and pull requests

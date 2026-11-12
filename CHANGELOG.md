@@ -8,6 +8,91 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **Verification**: the wake-up handshakes between workers and other threads
+  live in `src/notify.rs` and are model-checked with
+  [loom](https://github.com/tokio-rs/loom) (`scripts/check.sh loom`, and a new
+  CI job). `tests/wake.rs` runs the lost-wake-up race on real hardware.
+- **Verification**: coverage-guided fuzzing of `giong-http` with cargo-fuzz: the
+  request-head parser, the chunked decoder, and a whole connection served over an
+  in-memory transport, in pieces of random size (`giong-http/fuzz/`). CI fuzzes each
+  target for 10 minutes every night, keeping the corpus, and briefly on pull requests.
+- **Verification**: a soak test (`tests/soak.rs`, `scripts/check.sh soak`): every
+  worker serves TCP echo to clients on all workers that close cleanly, abort, half-close
+  or cancel receives, alongside UDP, file and cross-worker traffic; afterwards no
+  descriptor, memory or driver state may be left over. It runs for two hours every
+  night in CI. A one-minute run makes about 1.3 million connections on four workers.
+- **Verification**: the whole suite on real Linux 6.0.19 and 6.1.155 kernels, each
+  booted in QEMU from an initramfs (`scripts/kernels.sh`), in CI on every change.
+- **Benchmarks**: `bench/workers.sh` measures throughput from one worker to N, with CPU
+  time per request and how busy the server and the load generator were, on one machine
+  or with the load generator on another (`LOAD_HOST`; the Rust servers take
+  `BENCH_HOST`).
+- **`giong-http`**
+  - `Request::peer_addr`: the client's address, for logging, rate limits and
+    access rules. `None` over a Unix socket. Transports report it through the
+    new `Transport::peer_addr`, which has a default, so existing transports
+    keep compiling.
+  - `Server::max_connections`: the most connections one `serve` call (normally
+    one per worker) keeps open. At the limit the server stops accepting, and new
+    clients wait in the kernel's listen queue instead of being refused.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): how to allow io_uring in Docker, Docker
+  Compose and Kubernetes without turning seccomp off.
+- **Sync**
+  - `sync::oneshot`: a channel for one value, to hand a result back to the task that
+    asked for it, from any worker or thread. `Sender::closed` tells the producer that
+    nobody is waiting any more.
+  - `sync::mpsc::bounded`: a multi-producer channel that holds at most `n` values.
+    `send` waits while it is full, so a fast producer slows down to the consumer's pace;
+    waiting senders get room in arrival order, and a cancelled `send` passes its place on.
+- **Networking**
+  - Name resolution that does not block the worker: `net::lookup_host` and
+    `net::Resolver`. Reads `/etc/hosts`, then asks the servers in `/etc/resolv.conf`
+    with `A` and `AAAA` queries in parallel over UDP, again over TCP when an answer is
+    truncated, follows CNAMEs, applies the search list and `ndots` (so Kubernetes
+    service names work), fails over to the next server, and caches answers for their
+    TTL (at most 5 minutes). Reloads the files when they change.
+  - `TcpStream::connect` with several addresses tries them the Happy Eyeballs way
+    (RFC 8305): families alternate and each attempt gets 250 ms before the next starts
+    alongside it, so an address that never answers no longer costs a TCP timeout.
+- **`giong-tls`**
+  - The client side: `TlsConnector::connect(server_name, tcp)` checks the server's
+    certificate against trusted authorities and the name (a DNS name sent through
+    SNI, or an IP address). Trust the machine's certificate authorities
+    (`with_system_roots`, which honours `SSL_CERT_FILE` and `SSL_CERT_DIR` and knows
+    where the common distributions keep their bundle), Mozilla's compiled in
+    (`with_webpki_roots`, behind the new `webpki-roots` feature), or your own
+    (`with_root_pem`, `with_roots`). `alpn` offers protocols, `client_auth` presents a
+    client certificate for mutual TLS, and clones share a session cache so that
+    reconnecting resumes the session.
+  - `TlsStream::peer_certificates` and `TlsStream::resumed`.
+
+### Changed
+
+- When io_uring is blocked or missing (Docker's default seccomp profile, gVisor, the
+  `kernel.io_uring_disabled` sysctl), starting a runtime now fails with an error that says
+  so and links to the new [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), instead of a bare
+  "Operation not permitted".
+- **Breaking:** `TcpStream::connect` takes the new `net::ToSocketAddrs` instead of
+  `std::net::ToSocketAddrs`, and resolves host names without blocking. Socket addresses,
+  `(ip, port)`, `"host:port"`, `(host, port)` and slices of addresses work as before;
+  custom implementations of the standard trait no longer do. `bind` is unchanged.
+
+### Fixed
+
+- A wake-up from another thread could be lost, leaving the task asleep until
+  something else woke it. The executor cleared a task's "queued" flag with a
+  plain store before polling it; a waker that published new state and then saw
+  the flag still set skipped the enqueue, while the poll could read the state
+  from before the wake-up. It needs state that is shared without a lock (a
+  `Mutex` hides it), and on x86 it hit about 70 in a million such wake-ups. The
+  flag is now cleared with a swap, which synchronises with the waker.
+- On Linux 6.0 a runtime could fail to start with "giong needs io_uring buffer rings
+  (Linux >= 6.0): Bad address", depending on what happened to be mapped next to the
+  receive buffer ring: 6.0 pins one page more than the ring needs (fixed in 6.1). The
+  ring now has a spare page. Found by running the tests on a real 6.0 kernel.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

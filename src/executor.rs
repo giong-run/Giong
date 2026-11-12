@@ -14,10 +14,10 @@ use std::future::{poll_fn, Future};
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
+use crate::notify::RunFlag;
 use crate::runtime::{self, Inject, Worker, WorkerShared};
 
 pub(crate) struct TaskSlot {
@@ -39,7 +39,7 @@ pub(crate) struct TaskWaker {
     shared: Arc<WorkerShared>,
     id: usize,
     /// Set while the task sits in a run queue, so each wake enqueues it once.
-    queued: AtomicBool,
+    queued: RunFlag,
 }
 
 /// Run-queue id of the worker's main future, which lives on the stack of
@@ -52,12 +52,13 @@ impl TaskWaker {
         Arc::new(Self {
             shared,
             id: MAIN_TASK,
-            queued: AtomicBool::new(true),
+            queued: RunFlag::new(true),
         })
     }
 
+    /// Called right before the task is polled (see [`RunFlag::begin_poll`]).
     pub(crate) fn clear_queued(&self) {
-        self.queued.store(false, Ordering::Release);
+        self.queued.begin_poll();
     }
 }
 
@@ -67,7 +68,7 @@ impl Wake for TaskWaker {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        if self.queued.swap(true, Ordering::AcqRel) {
+        if !self.queued.try_enqueue() {
             return;
         }
         if runtime::current_uid() == self.shared.uid {
@@ -284,7 +285,7 @@ impl Worker {
             shared: self.shared.clone(),
             id: slot,
             // Enqueued right below.
-            queued: AtomicBool::new(true),
+            queued: RunFlag::new(true),
         });
         let task = Task {
             waker: Waker::from(waker_state.clone()),
@@ -322,7 +323,7 @@ impl Worker {
             // A stale wake-up for a slot that is empty (or being polled).
             let Some(mut task) = task else { continue };
 
-            task.state.queued.store(false, Ordering::Release);
+            task.state.clear_queued();
             let finished = {
                 let mut cx = Context::from_waker(&task.waker);
                 // The task wrapper already catches panics from the user's future;
