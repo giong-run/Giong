@@ -101,7 +101,10 @@ features, find out what is actually true.
       decoder and a whole connection, nightly in CI.
 - [x] Add a soak test: hours of connection churn with fd and memory checks (two hours
       every night in CI).
-- [ ] An independent look at `giong-tls` before anyone relies on it.
+- [x] A security review of `giong-tls` and the crates that use it
+      ([report](docs/reviews/2026-11-giong-tls.md); it found and fixed two medium issues).
+      It was done by the project's AI agent: a review by an outside person is still wanted
+      before anyone relies on `giong-tls` for something that matters.
 
 **Exit criteria:** published multi-core results with their method, and no open memory- or
 thread-safety finding.

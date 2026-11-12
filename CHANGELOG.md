@@ -107,6 +107,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     client certificate for mutual TLS, and clones share a session cache so that
     reconnecting resumes the session.
   - `TlsStream::peer_certificates` and `TlsStream::resumed`.
+  - `TlsStream::received_close_notify`: whether the peer ended the connection with a
+    TLS `close_notify` alert, or the TCP connection merely closed, which anyone on the
+    path can cause. Check it before trusting data that ends where the connection ends.
 - **`giong-postgres`**, a new crate: a PostgreSQL client and connection pool for giong,
   speaking the wire protocol itself (no libpq, nothing from Tokio).
   - `Client` with `query`, `query_one`, `query_opt`, `execute`, `batch_execute`,
@@ -184,6 +187,20 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (Linux >= 6.0): Bad address", depending on what happened to be mapped next to the
   receive buffer ring: 6.0 pins one page more than the ring needs (fixed in 6.1). The
   ring now has a spare page. Found by running the tests on a real 6.0 kernel.
+
+### Security
+
+- A [security review of giong-tls](docs/reviews/2026-11-giong-tls.md) and of every crate
+  that uses it found two issues in code that is new in this release, both fixed before it
+  shipped:
+  - The `giong-http` client accepted an HTTPS response body that ends where the
+    connection ends (no `Content-Length`, not chunked) when the TCP connection closed
+    without a TLS `close_notify`, so someone on the path could cut it short. Such a
+    response is now an error (`GIONG-E1106`).
+  - `giong-mysql` kept part of a packet received after the plaintext greeting and read it
+    after the TLS handshake as if it had come through TLS, so someone on the path could
+    slip bytes into the encrypted session (the flaw of CVE-2021-23222 in PostgreSQL
+    clients). Any byte left over before the handshake now ends the connection.
 
 ## [0.2.1] - 2026-11-12
 

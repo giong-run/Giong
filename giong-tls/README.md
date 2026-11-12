@@ -77,6 +77,7 @@ fn main() -> std::io::Result<()> {
 | `.alpn(&[b"h2", b"http/1.1"])`, `.client_auth(cert, key)` | Protocols to offer through ALPN; a client certificate for servers that ask for one (mutual TLS). |
 | `connector.connect(name, tcp)` | Runs the handshake, checking that the certificate is valid for `name` (a DNS name, sent through SNI, or an IP address). A certificate for another name, expired, or from an unknown authority fails with `InvalidData` and a message saying which. Clones of a connector share a session cache, so reconnecting resumes the session. |
 | `tls.recv()` | Decrypted data. An empty buffer means the peer closed. |
+| `tls.received_close_notify()` | Whether the peer ended the connection with `close_notify`. Without it, the TCP connection merely closed, which anyone on the path can cause: check it before trusting data that ends where the connection ends. |
 | `tls.write_all(buf)` | Encrypts and sends all of `buf`, then hands the buffer back, like `TcpStream::write_all`. |
 | `tls.shutdown()` | Sends `close_notify`, then closes the sending direction. |
 | `tls.alpn_protocol()`, `tls.tcp()` | The protocol agreed through ALPN; the TCP socket underneath. |
@@ -88,6 +89,7 @@ Four things to remember:
 2. `write_all()` is not. If the future is dropped in the middle of a TLS record, the record stream has been cut, so every later send returns an error instead of sending corrupt data. Data the peer already sent can still be received.
 3. One task may receive while another sends on the same `TlsStream`; records are never interleaved.
 4. Data that arrived intact is always returned before an error that happened after it.
+5. An empty `recv()` is the end of the stream, with or without `close_notify`. If the end of the stream is what marks the end of your data (an HTTP response without a length), check `received_close_notify()`: otherwise someone on the path could cut the data short.
 
 ## Performance
 
@@ -95,8 +97,8 @@ Measured with `bench/tls.sh` on one core, with the same rustls and `ring` on bot
 
 ## Not there yet
 
-kTLS, reloading certificates while running (you can do it yourself through `ServerConfig::cert_resolver`), checking certificate revocation on the client side (rustls can, through `TlsConnector::new` with your own verifier). The crate has had no independent security audit; the cryptography and the protocol are rustls's.
+kTLS, reloading certificates while running (you can do it yourself through `ServerConfig::cert_resolver`), checking certificate revocation on the client side (rustls can, through `TlsConnector::new` with your own verifier). The crate has had a [security review](../docs/reviews/2026-11-giong-tls.md) by the project's AI agent, which found and fixed two issues in its users, but no independent audit yet; the cryptography and the protocol are rustls's.
 
 ## Tests
 
-`cargo test -p giong-tls --all-features`: 7 server tests on real sockets with a rustls client (TLS 1.2 and 1.3, 4 MB in each direction, ALPN, `recv` cancelled over and over, two tasks sending at once, a write cancelled half way, broken or stalled handshakes); 14 client tests against giong's own server and a blocking rustls server (TLS 1.2 and 1.3 with 4 MB each way, a certificate for another name, an unknown authority, an IP address as the name, ALPN, mutual TLS with and without a client certificate, session resumption, a server that never answers or hangs up mid-handshake); 6 unit tests for finding the machine's certificates and parsing server names; 3 documentation examples. Nine end-to-end HTTPS tests live in `giong-http` (`cargo test -p giong-http --features tls`).
+`cargo test -p giong-tls --all-features`: 11 server tests on real sockets with a rustls client (TLS 1.2 and 1.3, 4 MB in each direction, ALPN, `recv` cancelled over and over, two tasks sending at once, a write cancelled half way, broken or stalled handshakes, records arriving one byte at a time, a forged record after the handshake, random bytes instead of a handshake, `close_notify` told apart from a cut connection); 14 client tests against giong's own server and a blocking rustls server (TLS 1.2 and 1.3 with 4 MB each way, a certificate for another name, an unknown authority, an IP address as the name, ALPN, mutual TLS with and without a client certificate, session resumption, a server that never answers or hangs up mid-handshake); 6 unit tests for finding the machine's certificates and parsing server names; 3 documentation examples. Nine end-to-end HTTPS tests live in `giong-http` (`cargo test -p giong-http --features tls`).
