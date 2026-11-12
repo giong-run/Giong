@@ -8,10 +8,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-12
+
+A patch release: a file descriptor leak at shutdown, and the logo on crates.io.
+
 ### Fixed
 
 - Drain pending file and socket closes before cancelling I/O at runtime shutdown
-  to prevent file descriptor leaks.
+  to prevent file descriptor leaks
+  ([#4](https://github.com/giong-run/Giong/issues/4), thanks to
+  [@alejandrodev-vn](https://github.com/alejandrodev-vn)).
+- The README logo now uses absolute URLs, so its dark-mode variant also loads on
+  crates.io (relative paths only resolve on GitHub).
 
 ## [0.2.0] - 2026-11-12
 
@@ -157,6 +165,7 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/giong-run/Giong/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/giong-run/Giong/releases/tag/v0.1.0
