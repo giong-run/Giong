@@ -313,7 +313,7 @@ RUN_SH = '''cargo run --release          # listens on port 8080
 curl localhost:8080/health   # ok'''
 
 FROM_SOURCE_SH = '''git clone https://github.com/giong-run/Giong.git && cd Giong
-cargo test --workspace --all-features   # the whole suite, all three crates'''
+cargo test --workspace --all-features   # the whole suite, every crate'''
 
 # The programs in examples/, with the first line of their doc comment.
 EXAMPLES = [
@@ -528,8 +528,8 @@ T = dict(
         ("Old kernels", "Three ring setups, tried in order: `DEFER_TASKRUN` (6.1+), `COOP_TASKRUN` "
                         "(6.0), no flags. The fallbacks are tested on every change by forcing them."),
     ],
-    crates=("crates", "Three crates, one version number",
-            "The runtime, and the two layers a service needs on top of it. Together they serve HTTPS "
+    crates=("crates", "Four crates, one version number",
+            "The runtime, and the layers a service needs on top of it. Together they serve HTTPS "
             "at 144.8k requests/s on one core, against 81.0k for Axum on the same rustls."),
     crate=[
         ("giong", "The runtime: TCP, UDP, Unix sockets, files, timers, a cross-thread channel and "
@@ -551,6 +551,13 @@ T = dict(
           "A cancelled write poisons the sending side instead of corrupting the record stream",
           "ALPN and a handshake timeout"],
          "about <b>390</b> lines · <b>8</b> tests · TLS costs 4% on `/json`"),
+        ("giong-postgres", "A PostgreSQL client and pool. The statements of every task pipeline "
+                           "over a few connections.",
+         ["`Client::connect`, `query`, `execute`, `transaction`, `cancel_token`",
+          "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
+          "Every statement prepared once per connection and cached",
+          "TLS verified by default for remote hosts; SCRAM-SHA-256"],
+         "about <b>5,300</b> lines · <b>73</b> tests · 2.6× deadpool's statements per core"),
     ],
     verified=("verified", "What has been checked, and what has not",
               "A runtime that hands buffers to the kernel has to earn trust. This is the evidence "

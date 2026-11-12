@@ -73,6 +73,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "giong-postgres"
+version = "0.2.1"
+dependencies = [
+ "giong",
+ "giong-tls",
+ "libc",
+ "rcgen",
+ "ring",
+ "socket2",
+]
+
+[[package]]
 name = "giong-tls"
 version = "0.2.1"
 dependencies = [

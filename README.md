@@ -20,9 +20,10 @@ load arrives.
 *[Đọc bằng tiếng Việt](README.vi.md)*
 
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
-> timers, multi-core, graceful shutdown, and two companion crates,
-> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server) and
-> [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services.
+> timers, multi-core, graceful shutdown, and three companion crates:
+> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server),
+> [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
+> and [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool).
 > 169 tests pass on three io_uring setups; ThreadSanitizer and valgrind are clean. It has
 > **not** run in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
 
@@ -86,7 +87,7 @@ connection, the same as the others.
 
 ```bash
 git clone https://github.com/giong-run/Giong.git && cd Giong
-cargo test --workspace --all-features   # the whole suite, all three crates
+cargo test --workspace --all-features   # the whole suite, every crate
 cargo run --release --example echo      # TCP echo server on port 7000
 cargo run --release --example http      # hand-written HTTP/1.1 server on port 3006
 cargo run --release --example udp_echo  # UDP echo server on port 7001
@@ -198,6 +199,7 @@ let runtime = giong::Builder::new()
 | Across threads | `Handle::spawn_on(worker, \|\| async { .. })`, `sync::mpsc::channel()` |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
+| PostgreSQL | [`giong-postgres`](giong-postgres/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 
 Five things to remember:
 
@@ -400,6 +402,25 @@ rounds. The server's core was 98–101% busy in every row, so the server was the
 - One connection per request is not measured for plain HTTP: on loopback that test runs
   out of client ports (TIME_WAIT) at about 28,000 per second and measures the client.
 
+### PostgreSQL
+
+`bench/postgres.sh`: [`giong-postgres`](giong-postgres/README.md#performance) against
+tokio-postgres with deadpool-postgres, each client on one core, the same PostgreSQL 16
+server on the other three, 64 tasks issuing statements back to back. Medians, statements
+per second:
+
+| Client, connections | One row by key | p99 | 100 rows | p99 |
+|---|---|---|---|---|
+| **giong-postgres, 3** | **240.7k** | **0.52 ms** | **54.8k** | **2.0 ms** |
+| tokio-postgres + deadpool, 4 | 53.1k | 1.9 ms | 21.7k | 4.4 ms |
+| tokio-postgres + deadpool, 64 (its best) | 93.8k | 1.5 ms | 28.6k | 4.1 ms |
+
+Statements from every task share the pool's connections and are pipelined, so one client
+core does 2.6 times the work of deadpool at its best. Over one shared connection both
+libraries pipeline and the server's single backend is the limit; there the two are within
+the spread of the rounds, giong-postgres 8–11% lower at the median. The crate's README has the full table, including what happens with more
+connections than the server has cores.
+
 ### File I/O
 
 `bench/fs.sh`: 200,000 operations per measurement, five rounds, all data in the page cache,
@@ -433,8 +454,8 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 - **Newer Monoio and Glommio.** The comparison uses the latest crates.io releases
   (August and March 2024); their main branches may differ.
 
-Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/syscalls.sh`, `bench/tls.sh` and
-`bench/fs.sh`; two cores with
+Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/syscalls.sh`, `bench/tls.sh`,
+`bench/fs.sh` and `bench/postgres.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 
@@ -527,7 +548,8 @@ to audit.
   before it calls the handler; one over the limit is refused.
 - **`giong-tls` has no kTLS yet,** and no independent audit.
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
-  sqlx, reqwest) do not run on giong. Crates that only use `std::future` do.
+  sqlx, reqwest) do not run on giong. Crates that only use `std::future` do. For
+  PostgreSQL, use [`giong-postgres`](giong-postgres/README.md).
 - **Tasks do not migrate.** An overloaded core is not helped by an idle one; spread work
   yourself with `spawn_on` or a channel.
 - **Graceful draining is opt-in.** By default, when a worker's main future returns, the
@@ -562,9 +584,10 @@ src/
   sync.rs       mpsc channel
 giong-http/     the HTTP/1.1 server crate (parser, chunked decoding, connections, HTTPS behind the `tls` feature)
 giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
+giong-postgres/ the PostgreSQL client crate (wire protocol, authentication, statement cache, Pool)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin
-bench/          run.sh, scale.sh, syscalls.sh, tls.sh, fs.sh, the servers compared against, results/
+bench/          run.sh, scale.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, the programs compared against, results/
 scripts/        check.sh (repeated tests, fallback setups, ThreadSanitizer), valgrind.sh
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```
