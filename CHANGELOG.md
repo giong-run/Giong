@@ -8,6 +8,20 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **`giong-tls`**
+  - The client side: `TlsConnector::connect(server_name, tcp)` checks the server's
+    certificate against trusted authorities and the name (a DNS name sent through
+    SNI, or an IP address). Trust the machine's certificate authorities
+    (`with_system_roots`, which honours `SSL_CERT_FILE` and `SSL_CERT_DIR` and knows
+    where the common distributions keep their bundle), Mozilla's compiled in
+    (`with_webpki_roots`, behind the new `webpki-roots` feature), or your own
+    (`with_root_pem`, `with_roots`). `alpn` offers protocols, `client_auth` presents a
+    client certificate for mutual TLS, and clones share a session cache so that
+    reconnecting resumes the session.
+  - `TlsStream::peer_certificates` and `TlsStream::resumed`.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.

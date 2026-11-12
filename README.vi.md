@@ -22,7 +22,7 @@ viết bằng tiếng Anh. File này là bản tóm tắt.*
 > **Trạng thái: 0.2.** Đủ để viết server thật: TCP, UDP, Unix socket, file, timer, nhiều
 > core, tắt êm, cùng hai crate đi kèm: [`giong-http`](giong-http/README.vi.md) (server
 > HTTP/1.1 nghiêm ngặt) và [`giong-tls`](giong-tls/README.vi.md) (TLS 1.2/1.3 trên rustls)
-> để chạy HTTPS trực tiếp. 169 test đều qua trên cả ba cấu hình io_uring; ThreadSanitizer
+> để chạy HTTPS trực tiếp và kết nối tới dịch vụ TLS. 169 test đều qua trên cả ba cấu hình io_uring; ThreadSanitizer
 > và valgrind sạch. **Chưa** chạy production, chưa có HTTP/2.
 
 ## Vì sao là giong
@@ -142,7 +142,7 @@ Muốn HTTPS thì bật feature `tls` và gọi `serve_tls` với một `giong_t
 
 ## Giới hạn hiện tại
 
-- Chưa có DNS bất đồng bộ, HTTP/2, body HTTP dạng stream, TLS phía client.
+- Chưa có DNS bất đồng bộ, HTTP/2, body HTTP dạng stream.
 - `giong-tls` chưa được kiểm toán bảo mật độc lập; phần mật mã là của rustls.
 - Không tương thích hệ sinh thái Tokio (hyper, sqlx, reqwest không chạy được).
 - Task không chuyển core.
