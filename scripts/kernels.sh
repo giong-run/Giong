@@ -73,6 +73,14 @@ for bin in "${BINARIES[@]}"; do
 done
 printf '127.0.0.1 localhost\n::1 localhost\n' >"$root/etc/hosts"
 printf 'hosts: files\n' >"$root/etc/nsswitch.conf"
+# giong-tls loads the system's CA bundle; give the guest the host's.
+for bundle in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt; do
+    if [ -f "$bundle" ]; then
+        mkdir -p "$root/etc/ssl/certs"
+        cp "$bundle" "$root/etc/ssl/certs/ca-certificates.crt"
+        break
+    fi
+done
 # TEST_ARGS="--test-threads=1 name" is passed to every test binary.
 printf '%s\n' "${TEST_ARGS:-}" >"$root/etc/test-args"
 
