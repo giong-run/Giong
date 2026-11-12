@@ -270,9 +270,10 @@ Every server implements the same three routes (`bench/`): `/json` (a 27-byte bod
 program, with the same minimal HTTP parser, so they compare runtimes; `giong-http` is the
 library, with strict parsing, a `Date` header, timeouts and limits. Each server is pinned
 to its own core and `wrk` runs on another. Servers are measured in interleaved rounds and
-the tables show the median, with the range in parentheses. Machine: a 4-vCPU virtual
-machine (Xeon 2.1 GHz), Linux 6.18, Rust 1.97, Node 22, Bun 1.4, Tokio 1.54, Monoio 0.2.4,
-Glommio 0.9.0, wrk 4.1.
+the tables show the median, with the range in parentheses. Machine, except for the
+14-core run under [One worker to N](#one-worker-to-n): a 4-vCPU virtual machine (Xeon
+2.1 GHz), Linux 6.18, Rust 1.97, Node 22, Bun 1.4, Tokio 1.54, Monoio 0.2.4, Glommio
+0.9.0, wrk 4.1.
 
 "Monoio (tuned)" is Monoio with `DEFER_TASKRUN` passed through `uring_builder`. Monoio's
 default ring has no such flag and is about 20% slower on the small response; comparing
@@ -390,22 +391,58 @@ gets the first N of its CPUs, the connection count grows with N (64 per worker),
 report shows, besides requests per second, the CPU time per request and how busy the
 server's and the load generator's CPUs were, so a run says which side set the number.
 It can drive the server from a second machine over ssh (`LOAD_HOST`, `BENCH_HOST`), which
-is how it should be run. On this 4-vCPU machine (`/json`, three rounds of 6 s):
+is how it should be run.
 
-| Server | 1 worker | 2 workers | CPU per request, 1 → 2 | Limited at 2 by |
-|---|---|---|---|---|
-| giong | 218.9k | 311.1k | 4.50 → 5.09 µs | `wrk` (99% busy; server 81%) |
-| giong-http | 186.1k | 342.8k | 5.31 → 5.32 µs | `wrk` (97%; server 93%) |
-| Monoio (tuned) | 214.2k | 337.6k | 4.59 → 4.75 µs | `wrk` (99%; server 82%) |
-| Raw Tokio | 151.1k | 351.9k | 6.51 → 5.15 µs | `wrk` (98%; server 93%) |
-| Glommio | 175.8k | 226.9k | 5.63 → 8.69 µs | server (99%) |
+**On 14 cores.** An Intel i5-13500 desktop (6 performance cores and 8 efficiency cores,
+20 threads, 64 GB) running Linux 6.18 under WSL2 on Windows 10. The server gets vCPUs 0–9,
+`wrk` gets 10–19 with ten threads, and they talk over loopback; `/json`, three rounds of
+6 s. Requests per second, median (the range for giong):
 
-With one worker every server is the bottleneck; with two, two `wrk` threads on the other
-two vCPUs can no longer keep up, so the two-worker numbers are lower bounds and say
-nothing about scaling. A worker that is not saturated parks and wakes more often, which is
-why giong's CPU per request rises at 81% busy. Real scaling numbers need a machine with
-more cores and a separate load generator (see [What has not been measured](#what-has-not-been-measured)).
-Recorded output: `bench/results/workers/`.
+| Server | 1 worker | 2 | 4 | 6 | 8 | 10 |
+|---|---|---|---|---|---|---|
+| giong | 178k (165–181k) | 437k (414–462k) | 934k (818k–1.04M) | 1.24M (1.22–1.34M) | 1.50M (1.37–1.50M) ¹ | 1.33M ¹ |
+| giong-http | 161k | 371k | 776k | 1.01M | 1.26M | 1.26M |
+| Monoio (tuned) | 167k | 352k | 928k | 1.30M | 1.30M | 1.35M ¹ |
+| Raw Tokio | 131k | 323k | 777k | 1.07M | 1.03M ² | 1.16M ² |
+| Glommio | 172k | 322k | 768k | 1.06M | 984k | 1.13M |
+
+CPU time per request, in µs:
+
+| Server | 1 | 2 | 4 | 6 | 8 | 10 |
+|---|---|---|---|---|---|---|
+| giong | 5.58 | 4.58 | 4.29 | 4.79 | 5.26 | 6.66 |
+| giong-http | 6.21 | 5.42 | 5.17 | 5.95 | 6.26 | 7.60 |
+| Monoio (tuned) | 5.95 | 5.70 | 4.33 | 4.55 | 5.91 | 6.64 |
+| Raw Tokio | 7.65 | 6.19 | 5.09 | 5.41 | 6.66 | 6.60 |
+| Glommio | 5.80 | 6.24 | 5.24 | 5.68 | 8.11 | 8.75 |
+
+¹ `wrk` was the limit (its CPUs 94–97% busy), so the number is a lower bound.
+² Neither side was saturated (server 76–86% busy).
+
+- **From 1 to 6 workers every server was the limit** (its CPUs 95–100% busy), so these
+  rows measure the servers. giong had the highest median at 1 worker (Monoio's best round
+  was higher) and was clearly ahead at 2, level with Monoio at 4 (the ranges overlap) and
+  behind it at 6 (1.24M against 1.30M; Monoio's range was 876k–1.33M).
+- **giong used the least CPU per request from 1 to 4 workers** (tied with Monoio at 4):
+  4.3–5.6 µs, against 5.1–7.7 µs for raw Tokio.
+- **The highest number of the run, 1.50M requests/s, was giong at 8 workers**, with `wrk`
+  as the limit.
+- **At 10 workers the machine is overloaded**: server and `wrk` keep 20 vCPUs busy on 14
+  physical cores, everything flattens or drops, and p99 goes above 2 ms.
+
+This run says nothing reliable about scaling efficiency. Going from one worker to two
+gives 2.1 to 2.5 times the throughput for four of the five servers, which means the
+one-worker numbers are too low, not that two workers do more than twice the work: WSL2
+does not pin vCPUs to physical cores, and Windows 10 may run a lone busy vCPU on an
+efficiency core. Some rows also vary by up to a third between rounds. The numbers needed
+for that are from bare-metal Linux with the load generator on a second machine (see
+[What has not been measured](#what-has-not-been-measured)). Recorded output, with the
+machine details and how the run was checked: `bench/results/workers-i5-13500-wsl/`.
+
+**On 4 vCPUs** (the virtual machine used for the other tables), two `wrk` threads on the
+other two vCPUs could no longer keep up once the server had two workers, so that run only
+shows the one-worker numbers (giong 218.9k, Monoio 214.2k, giong-http 186.1k, Glommio
+175.8k, raw Tokio 151.1k). Recorded output: `bench/results/workers/`.
 
 ### HTTPS
 
@@ -518,10 +555,11 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 ### What has not been measured
 
-- **More than two cores, and a physical network.** Everything here is loopback inside a
-  4-vCPU virtual machine, where the load generator competes for the same few cores.
-  `bench/workers.sh` is ready for the real run: `BENCH_HOST=<server address>
-  LOAD_HOST=<user@load machine> WORKERS="1 2 4 8 16" bench/workers.sh`.
+- **A physical network, and scaling on bare metal.** Everything here is loopback on one
+  machine. The multi-core run is on a desktop under WSL2, where the load generator shares
+  the machine and vCPUs are not pinned to cores. `bench/workers.sh` is ready for the real
+  run: `BENCH_HOST=<server address> LOAD_HOST=<user@load machine> WORKERS="1 2 4 8 16"
+  bench/workers.sh`.
 - **Disks.** The file benchmark measures cached data only.
 - **Newer Monoio and Glommio.** The comparison uses the latest crates.io releases
   (August and March 2024); their main branches may differ.

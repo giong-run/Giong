@@ -1,0 +1,37 @@
+workers server         req/s median      min      max  eff. cpu us/req  p99 ms server cpu load cpu  limited by
+1       giong                178346   164869   180845  1.00       5.58    0.60       100%      11%  server
+1       giong-http           160559   160048   171913  1.00       6.21    0.63       100%      10%  server
+1       monoio-tuned         167180   154073   195551  1.00       5.95    0.54       100%      10%  server
+1       tokio-raw            130671   130074   130803  1.00       7.65    0.58       100%       7%  server
+1       glommio              172390   160553   172621  1.00       5.80    0.45       100%       9%  server
+
+2       giong                437074   414149   461993  1.23       4.58    0.48       100%      25%  server
+2       giong-http           370860   358641   378906  1.15       5.42    0.76       100%      29%  server
+2       monoio-tuned         351582   347838   374503  1.05       5.70    0.56       100%      22%  server
+2       tokio-raw            322775   310392   334371  1.24       6.19    0.70        99%      27%  server
+2       glommio              322015   315289   364772  0.93       6.24    0.59       100%      26%  server
+
+4       giong                934222   818468  1037842  1.31       4.29    0.81        99%      76%  server
+4       giong-http           775922   691470   779765  1.21       5.17    0.74        99%      68%  server
+4       monoio-tuned         928485   892962   949975  1.39       4.33    0.62        99%      76%  server
+4       tokio-raw            777138   702000   819834  1.49       5.09    0.88        98%      74%  server
+4       glommio              768291   724251   806947  1.11       5.24    0.69       100%      70%  server
+
+6       giong               1236082  1224594  1338818  1.16       4.79    0.87        98%      91%  server
+6       giong-http          1009772   952063  1117280  1.05       5.95    0.89        99%      82%  server
+6       monoio-tuned        1295527   875957  1329345  1.29       4.55    0.74        97%      92%  server
+6       tokio-raw           1066918   984034  1158243  1.36       5.41    0.89        95%      86%  server
+6       glommio             1058048  1017331  1112473  1.02       5.68    0.68        99%      92%  server
+
+8       giong               1496735  1372728  1497685  1.05       5.26    0.91        97%      97%  load generator
+8       giong-http          1256415  1203203  1298130  0.98       6.26    1.23        98%      92%  server
+8       monoio-tuned        1299680  1221284  1389403  0.97       5.91    1.61        96%      94%  server
+8       tokio-raw           1030094   987428  1192815  0.99       6.66    1.76        86%      84%  neither (network or latency)
+8       glommio              984084   963974  1125046  0.71       8.11    1.99        98%      91%  server
+
+10      giong               1326758  1246735  1431180  0.74       6.66    2.88        89%      95%  load generator
+10      giong-http          1261653  1078530  1307035  0.79       7.60    2.34        95%      93%  server
+10      monoio-tuned        1353340  1324181  1376628  0.81       6.64    2.30        89%      94%  load generator
+10      tokio-raw           1155871  1128378  1202656  0.88       6.60    1.39        76%      87%  neither (network or latency)
+10      glommio             1126880  1033705  1165067  0.65       8.75    2.60        97%      94%  server
+
