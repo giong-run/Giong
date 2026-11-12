@@ -1,0 +1,105 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes the three crates to crates.io and creates the
+# GitHub Release, with the notes taken from that version's CHANGELOG.md section.
+#
+# crates.io uses Trusted Publishing: each crate trusts this repository, this
+# workflow file and the `release` environment, and the job exchanges its OIDC
+# token for a short-lived publish token. No crates.io secret is stored here.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: version
+        name: Tag matches the crate versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for crate in giong giong-tls giong-http; do
+            v=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')
+            if [ "$v" != "$tag" ]; then
+              echo "::error::$crate is at $v but the tag is $GITHUB_REF_NAME"
+              exit 1
+            fi
+          done
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+      - name: CHANGELOG.md has a section for this version
+        run: |
+          grep -q "^## \[${{ steps.version.outputs.version }}\]" CHANGELOG.md \
+            || { echo "::error::CHANGELOG.md has no '## [${{ steps.version.outputs.version }}]' heading"; exit 1; }
+      - run: cargo publish --workspace --dry-run
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      # One crate at a time, in dependency order, skipping versions already on
+      # crates.io so that a failed run can simply be re-run.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          for crate in giong giong-tls giong-http; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -A "giong-release (github.com/giong-run/Giong)" \
+              "https://crates.io/api/v1/crates/$crate/$VERSION")
+            if [ "$code" = 200 ]; then
+              echo "$crate $VERSION is already on crates.io"
+            else
+              cargo publish -p "$crate"
+            fi
+          done
+
+  github-release:
+    needs: [verify, publish]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+            exit 0
+          fi
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          flags=""
+          case "$VERSION" in *-*) flags="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "giong $VERSION" --notes-file notes.md $flags

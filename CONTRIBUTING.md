@@ -137,8 +137,19 @@ docs: explain how to run under WSL2
 
 Maintainers cut releases: move the `Unreleased` entries under a new version heading with
 the date, bump `version` in the three `Cargo.toml` files (the crates share one version
-number, and `giong-http` and `giong-tls` name the `giong` version they need), tag the
-commit `vX.Y.Z`, and publish with `cargo publish --workspace`.
+number, and `giong-http` and `giong-tls` name the `giong` version they need), and merge
+that change. Then tag the merge commit and push the tag:
+
+```bash
+git tag -a vX.Y.Z -m "giong X.Y.Z"
+git push origin vX.Y.Z
+```
+
+The [release workflow](.github/workflows/release.yml) checks that the tag matches the
+crate versions and that `CHANGELOG.md` has a section for it, publishes the three crates
+to crates.io through Trusted Publishing, and creates the GitHub Release from that
+section. A tag with a suffix such as `v0.3.0-rc.1` becomes a pre-release. If a run fails
+part way, fix the cause and re-run it: crates already published are skipped.
 
 ## Security
 
