@@ -1,0 +1,18 @@
+64 tasks, 5 rounds of 5 s; median, min and max of the rounds
+scheme workload client     req/s median      min      max  p50 us  p99 us  cpu%  srv%
+http   json     giong             89937    69151    93489     672    1167    99    67
+http   json     giong-64         113696   108773   122614     575    1113    98    79
+http   json     reqwest           61833    59053    70865     940    2221    99    54
+
+http   users    giong             72366    67236    78744     839    1394    98   190
+http   users    giong-64          95579    78908    96901     658    1179    98   220
+http   users    reqwest           56771    47329    59905    1055    2418    99   155
+
+https  json     giong             78048    74363    78875     784    1355    99    76
+https  json     giong-64         105537    91248   107068     632    1227    99    95
+https  json     reqwest           60646    57758    69201     976    1920    99    70
+
+https  users    giong             59737    53088    64152     987    1661    98   169
+https  users    giong-64          71009    62015    74888     862    1794    98   194
+https  users    reqwest           45393    41143    51776    1330    2221    99   135
+

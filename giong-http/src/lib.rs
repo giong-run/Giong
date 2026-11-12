@@ -1,7 +1,8 @@
 //! # giong-http
 //!
 //! A small, strict HTTP/1.1 server for the [giong] thread-per-core
-//! runtime.
+//! runtime, and (with the `client` feature) an HTTP/1.1 client: see
+//! `giong_http::client`.
 //!
 //! ```no_run
 //! use giong::net::TcpListener;
@@ -51,10 +52,17 @@
 //!
 //! With the `tls` feature, [`Server::serve_tls`] serves the same handlers over
 //! TLS, using the `giong-tls` crate (rustls).
+//!
+//! ## Client
+//!
+//! With the `client` feature, `giong_http::client::Client` sends requests,
+//! over HTTP or HTTPS, with a pool of kept-alive connections for each origin.
 
 #![warn(missing_docs)]
 
 mod chunked;
+#[cfg(feature = "client")]
+pub mod client;
 mod date;
 #[cfg(test)]
 mod fuzz_tests;

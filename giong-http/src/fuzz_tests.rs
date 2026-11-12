@@ -87,3 +87,51 @@ fn the_chunked_decoder_never_panics_and_ignores_how_input_is_split() {
     }
     assert!(completed > 1_000, "only {completed} inputs decoded");
 }
+
+#[cfg(feature = "client")]
+#[test]
+fn the_response_head_parser_never_panics_and_its_ranges_hold() {
+    use crate::client::fuzzing::{check_response_head, check_url};
+    let seeds: &[&[u8]] = &[
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\n\r\n",
+        b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nX-Empty:\r\n\r\n",
+        b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n",
+    ];
+    let mut rng = Rng(0x94D0_49BB_1331_11EB);
+    let mut accepted = 0;
+    for round in 0..200_000 {
+        let mut input = seeds[round % seeds.len()].to_vec();
+        mutate(&mut rng, &mut input);
+        accepted += usize::from(check_response_head(&input));
+    }
+    assert!(accepted > 1_000, "only {accepted} heads were accepted");
+
+    let urls: &[&[u8]] = &[
+        b"https://api.example.com:8443/v1/users?id=7#top",
+        b"http://[::1]:3000/a/./b/../c?x=1",
+        b"http://127.0.0.1/",
+    ];
+    let locations: &[&[u8]] = &[
+        b"../g?y",
+        b"//other/x",
+        b"/abs",
+        b"?q",
+        b"https://h:1/p",
+        b"a b/\xc3\xa9",
+    ];
+    let mut parsed = 0;
+    for round in 0..100_000 {
+        let mut url = urls[round % urls.len()].to_vec();
+        let mut location = locations[rng.below(locations.len())].to_vec();
+        mutate(&mut rng, &mut url);
+        if round % 2 == 0 {
+            mutate(&mut rng, &mut location);
+        }
+        parsed += usize::from(check_url(
+            &String::from_utf8_lossy(&url),
+            &String::from_utf8_lossy(&location),
+        ));
+    }
+    assert!(parsed > 1_000, "only {parsed} URLs were parsed");
+}

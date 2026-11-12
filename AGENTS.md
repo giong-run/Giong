@@ -13,7 +13,7 @@ workspace, five crates:
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring driver, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library; HTTPS behind the `tls` feature |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library, HTTPS behind the `tls` feature; an HTTP/1.1 client behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
@@ -51,7 +51,7 @@ Run these from the repository root. All tests use loopback; none needs the inter
 ```bash
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
-cargo test -p giong-http --features tls          # giong-http's HTTPS tests need the feature
+cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings

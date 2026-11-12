@@ -10,10 +10,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
-- **Error codes.** Every error that giong, giong-tls, giong-postgres and giong-mysql raise
-  starts with a stable code (`GIONG-E0102: no address found for db.internal. Fix: …`), says
-  what went wrong and how to fix it, and ends with a link to the code's page in
-  [docs/errors](docs/errors/README.md): 45 codes. Functions still return `io::Error`;
+- **Error codes.** Every error that giong, giong-http's client, giong-tls, giong-postgres
+  and giong-mysql raise starts with a stable code (`GIONG-E0102: no address found for
+  db.internal. Fix: …`), says what went wrong and how to fix it, and ends with a link to
+  the code's page in [docs/errors](docs/errors/README.md): 54 codes. Functions still return `io::Error`;
   `giong::error::code(&err)` finds the `giong::error::Code` in it, down the chain of
   sources, so programs can match on the code instead of the message. Errors passed on from
   the kernel (connection refused, …) are unchanged and have no code.
@@ -38,6 +38,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   or with the load generator on another (`LOAD_HOST`; the Rust servers take
   `BENCH_HOST`).
 - **`giong-http`**
+  - An HTTP/1.1 client, `giong_http::client`, behind the new `client` feature: `Client`
+    (one per worker, clones share it) with `get`, `post`, `put`, `patch`, `delete`,
+    `head` and `request`, and a `RequestBuilder` for headers, a body, `json` and a
+    per-request timeout. A pool of kept-alive connections for each origin, at most 16 by
+    default, handed out first come, first served; an idle connection the server closed
+    is not used, and an idempotent request that meets a connection closing under it is
+    sent once more. HTTPS through giong-tls, verified against the machine's authorities.
+    Redirects followed (up to 10; never from HTTPS to HTTP; credentials kept to their
+    origin). Every request has a timeout (30 s) and every response a size limit (16 MiB).
+    Strict reading: an ambiguous response is an error, and its connection is not used
+    again. Errors have the codes GIONG-E1101 to E1109 and say whether a retry can help
+    (`Error::is_transient`). On one core, with 64 connections, it sends 1.6 to 1.8 times
+    as many requests per second as reqwest, with a lower p99 (`bench/http-client.sh`).
   - A response body of 32 KiB or more is no longer copied after its head: the two go
     out in one vectored write over TCP and Unix sockets. On one worker, a 64 KiB static
     body is served 40% faster and a 1 MiB one 78% faster (an owned 1 MiB body: 2.2
