@@ -372,6 +372,30 @@ other two; 100 connections, three rounds.
 server: in an earlier two-core run giong's workers were only 73–94% busy. Raw Tokio and
 `giong-http` lead on `/json`, giong and Monoio on `/users`, and the rest needs a bigger machine.
 
+### One worker to N
+
+`bench/workers.sh` measures how throughput grows with the number of workers: the server
+gets the first N of its CPUs, the connection count grows with N (64 per worker), and the
+report shows, besides requests per second, the CPU time per request and how busy the
+server's and the load generator's CPUs were, so a run says which side set the number.
+It can drive the server from a second machine over ssh (`LOAD_HOST`, `BENCH_HOST`), which
+is how it should be run. On this 4-vCPU machine (`/json`, three rounds of 6 s):
+
+| Server | 1 worker | 2 workers | CPU per request, 1 → 2 | Limited at 2 by |
+|---|---|---|---|---|
+| giong | 218.9k | 311.1k | 4.50 → 5.09 µs | `wrk` (99% busy; server 81%) |
+| giong-http | 186.1k | 342.8k | 5.31 → 5.32 µs | `wrk` (97%; server 93%) |
+| Monoio (tuned) | 214.2k | 337.6k | 4.59 → 4.75 µs | `wrk` (99%; server 82%) |
+| Raw Tokio | 151.1k | 351.9k | 6.51 → 5.15 µs | `wrk` (98%; server 93%) |
+| Glommio | 175.8k | 226.9k | 5.63 → 8.69 µs | server (99%) |
+
+With one worker every server is the bottleneck; with two, two `wrk` threads on the other
+two vCPUs can no longer keep up, so the two-worker numbers are lower bounds and say
+nothing about scaling. A worker that is not saturated parks and wakes more often, which is
+why giong's CPU per request rises at 81% busy. Real scaling numbers need a machine with
+more cores and a separate load generator (see [What has not been measured](#what-has-not-been-measured)).
+Recorded output: `bench/results/workers/`.
+
 ### HTTPS
 
 `bench/tls.sh`: `giong-http` + `giong-tls` against Axum + `axum-server`, both on rustls with
@@ -428,12 +452,14 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 - **More than two cores, and a physical network.** Everything here is loopback inside a
   4-vCPU virtual machine, where the load generator competes for the same few cores.
+  `bench/workers.sh` is ready for the real run: `BENCH_HOST=<server address>
+  LOAD_HOST=<user@load machine> WORKERS="1 2 4 8 16" bench/workers.sh`.
 - **Disks.** The file benchmark measures cached data only.
 - **Newer Monoio and Glommio.** The comparison uses the latest crates.io releases
   (August and March 2024); their main branches may differ.
 
-Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/syscalls.sh`, `bench/tls.sh` and
-`bench/fs.sh`; two cores with
+Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
+`bench/tls.sh` and `bench/fs.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 
