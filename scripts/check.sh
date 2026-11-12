@@ -6,7 +6,12 @@
 #                               by kernels older than 6.1 (COOP_TASKRUN, no flags)
 #   scripts/check.sh tsan       all tests under ThreadSanitizer (needs nightly
 #                               with the rust-src component)
-#   scripts/check.sh all        everything above
+#   scripts/check.sh loom       model-check the wake-up handshakes (src/notify.rs)
+#                               with loom, then run the same race on this CPU
+#   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
+#                               then checks for leaked descriptors, memory and
+#                               driver state (tests/soak.rs)
+#   scripts/check.sh all        everything above except soak
 #
 # ROUNDS=n changes how often each test binary is repeated.
 set -euo pipefail
@@ -51,11 +56,26 @@ run_tsan() {
     done
 }
 
+run_loom() {
+    echo "== loom models"
+    RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/loom" \
+        cargo test --release --quiet --lib notify
+    echo "== lost wake-up race on real hardware"
+    cargo test --release --quiet --test wake -- --ignored
+}
+
+run_soak() {
+    echo "== soak for ${SOAK_SECS:-300} s"
+    GIONG_SOAK_SECS="${SOAK_SECS:-300}" cargo test --release --quiet --test soak -- --ignored --nocapture
+}
+
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback ;;
     tsan) run_tsan ;;
-    all) run_test; run_fallback; run_tsan ;;
-    *) echo "usage: $0 [test|fallback|tsan|all]" >&2; exit 2 ;;
+    loom) run_loom ;;
+    soak) run_soak ;;
+    all) run_test; run_fallback; run_tsan; run_loom ;;
+    *) echo "usage: $0 [test|fallback|tsan|loom|soak|all]" >&2; exit 2 ;;
 esac
 echo "ok"

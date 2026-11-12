@@ -1,14 +1,14 @@
 //! The accept loop and the per-connection state machine.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::mem;
-use std::net::Shutdown;
+use std::net::{Shutdown, SocketAddr};
 use std::ops::Deref;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -69,6 +69,12 @@ pub trait Transport: 'static {
     /// Closes the sending direction, so the peer sees the end of the stream
     /// while the server can still read what it sends.
     fn close_write(&self) -> impl Future<Output = ()>;
+
+    /// The address of the remote end, if the transport has one. Handlers see
+    /// it as [`Request::peer_addr`]. The default is `None`.
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        None
+    }
 }
 
 impl Transport for TcpStream {
@@ -84,6 +90,10 @@ impl Transport for TcpStream {
 
     async fn close_write(&self) {
         let _ = self.shutdown(Shutdown::Write);
+    }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        TcpStream::peer_addr(self).ok()
     }
 }
 
@@ -118,6 +128,10 @@ impl Transport for giong_tls::TlsStream {
     async fn close_write(&self) {
         let _ = self.shutdown().await;
     }
+
+    fn peer_addr(&self) -> Option<SocketAddr> {
+        self.tcp().peer_addr().ok()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +142,7 @@ struct Config {
     max_head_size: usize,
     max_body_size: usize,
     shutdown_linger: Duration,
+    max_connections: usize,
 }
 
 /// An HTTP/1.1 server. Configure it, then call [`serve`](Server::serve) from
@@ -178,6 +193,7 @@ impl Server {
                 max_head_size: 64 * 1024,
                 max_body_size: 1024 * 1024,
                 shutdown_linger: Duration::from_millis(100),
+                max_connections: usize::MAX,
             },
         }
     }
@@ -227,6 +243,20 @@ impl Server {
         self
     }
 
+    /// Most connections one [`serve`](Self::serve) call keeps open at once
+    /// (default: no limit). Normally every worker makes its own call, so the
+    /// limit applies per worker.
+    ///
+    /// At the limit the server stops accepting until a connection closes.
+    /// New clients wait in the kernel's listen queue meanwhile instead of
+    /// being refused, and the server never runs out of file descriptors or
+    /// memory because of the number of clients. Connections handed to
+    /// [`serve_connection`](Self::serve_connection) are not counted.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.cfg.max_connections = max.max(1);
+        self
+    }
+
     /// Accepts connections on `listener` and answers their requests with
     /// `handler` until the runtime is asked to shut down.
     ///
@@ -244,9 +274,10 @@ impl Server {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
-        self.accept_loop(accept, |stream: TcpStream| {
+        self.accept_loop(accept, |stream: TcpStream, slot| {
             let _ = stream.set_nodelay(true);
-            drop(giong::spawn(Conn::new(stream, cfg).run(handler.clone())));
+            let conn = Conn::new(stream, cfg).run(handler.clone());
+            drop(giong::spawn(slot.hold(conn)));
         })
         .await;
     }
@@ -272,8 +303,9 @@ impl Server {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
-        self.accept_loop(accept, |stream: UnixStream| {
-            drop(giong::spawn(Conn::new(stream, cfg).run(handler.clone())));
+        self.accept_loop(accept, |stream: UnixStream, slot| {
+            let conn = Conn::new(stream, cfg).run(handler.clone());
+            drop(giong::spawn(slot.hold(conn)));
         })
         .await;
     }
@@ -308,28 +340,36 @@ impl Server {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
-        self.accept_loop(accept, |stream: TcpStream| {
+        self.accept_loop(accept, |stream: TcpStream, slot| {
             let _ = stream.set_nodelay(true);
             let (acceptor, handler) = (acceptor.clone(), handler.clone());
-            drop(giong::spawn(async move {
+            drop(giong::spawn(slot.hold(async move {
                 // A failed handshake (a port scan, a plain-HTTP client, an
                 // unknown protocol version) just ends the connection.
                 if let Ok(tls) = acceptor.accept(stream).await {
                     Conn::new(tls, cfg).run(handler).await;
                 }
-            }));
+            })));
         })
         .await;
     }
 
     /// Accepts until a shutdown is requested, then for a moment longer.
-    async fn accept_loop<S, A>(&self, accept: impl Fn() -> A, spawn: impl Fn(S))
+    /// Waits for a free slot before each accept when `max_connections` is set.
+    async fn accept_loop<S, A>(&self, accept: impl Fn() -> A, spawn: impl Fn(S, Slot))
     where
         A: Future<Output = io::Result<S>>,
     {
-        while let Some(accepted) = giong::until_shutdown(accept()).await {
+        let slots = Rc::new(Slots::new(self.cfg.max_connections));
+        // Cancel safe: a slot taken by a dropped future is given back, and
+        // `accept` itself loses no connection.
+        let next = || async {
+            let slot = slots.take().await;
+            accept().await.map(|stream| (stream, slot))
+        };
+        while let Some(accepted) = giong::until_shutdown(next()).await {
             match accepted {
-                Ok(stream) => spawn(stream),
+                Ok((stream, slot)) => spawn(stream, slot),
                 // For example EMFILE: back off instead of spinning.
                 Err(_) => sleep(Duration::from_millis(50)).await,
             }
@@ -338,8 +378,8 @@ impl Server {
         let deadline = Instant::now() + self.cfg.shutdown_linger;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            match timeout(left, accept()).await {
-                Ok(Ok(stream)) => spawn(stream),
+            match timeout(left, next()).await {
+                Ok(Ok((stream, slot))) => spawn(stream, slot),
                 _ => break,
             }
         }
@@ -357,6 +397,59 @@ impl Server {
     }
 }
 
+/// The open connections of one accept loop, against its limit. Only the
+/// accept loop waits for a slot, so one waker is enough.
+struct Slots {
+    open: Cell<usize>,
+    max: usize,
+    waiter: Cell<Option<Waker>>,
+}
+
+impl Slots {
+    fn new(max: usize) -> Self {
+        Self {
+            open: Cell::new(0),
+            max,
+            waiter: Cell::new(None),
+        }
+    }
+
+    /// Waits until fewer than `max` connections are open, then takes a slot.
+    async fn take(self: &Rc<Self>) -> Slot {
+        poll_fn(|cx| {
+            if self.open.get() < self.max {
+                self.open.set(self.open.get() + 1);
+                Poll::Ready(Slot(self.clone()))
+            } else {
+                self.waiter.set(Some(cx.waker().clone()));
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+/// One open connection; frees its slot when dropped.
+struct Slot(Rc<Slots>);
+
+impl Slot {
+    /// Keeps the slot taken for as long as `fut` runs.
+    async fn hold<F: Future>(self, fut: F) -> F::Output {
+        let _slot = self;
+        fut.await
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let slots = &self.0;
+        slots.open.set(slots.open.get() - 1);
+        if let Some(waker) = slots.waiter.take() {
+            waker.wake();
+        }
+    }
+}
+
 /// Why a connection stops reading requests.
 enum End {
     /// Close without a response: end of stream, idle timeout, I/O error.
@@ -368,6 +461,8 @@ enum End {
 struct Conn<T> {
     stream: T,
     cfg: Config,
+    /// The client's address, looked up once per connection.
+    peer: Option<SocketAddr>,
     /// Received bytes. Shared with the requests handed to the handler, so it
     /// is only modified in place once those have been dropped.
     buf: Rc<Vec<u8>>,
@@ -386,6 +481,7 @@ struct Conn<T> {
 impl<T: Transport> Conn<T> {
     fn new(stream: T, cfg: Config) -> Self {
         Self {
+            peer: stream.peer_addr(),
             stream,
             cfg,
             buf: Rc::new(Vec::new()),
@@ -512,6 +608,7 @@ impl<T: Transport> Conn<T> {
             start: self.pos,
             head,
             body,
+            peer: self.peer,
         };
         self.pos += total;
         self.scanned = 0;

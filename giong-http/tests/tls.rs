@@ -438,3 +438,28 @@ fn many_tls_connections_at_once() {
         thread.join().unwrap();
     }
 }
+
+#[test]
+fn handlers_see_the_client_address_over_tls() {
+    async fn peer(req: Request) -> Response {
+        Response::text(format!("{:?}", req.peer_addr()))
+    }
+    let server = TestServer::start(Server::new(), peer);
+    let mut c = server.client();
+    let expected = format!("{:?}", Some(c.stream.sock.local_addr().unwrap()));
+    c.send("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(c.reply().text(), expected);
+}
+
+#[test]
+fn the_connection_limit_counts_tls_connections() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    first.send("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(first.reply().text(), "GET /first body=");
+    drop(first);
+    // The slot comes back when the first session ends.
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(second.reply().text(), "GET /second body=");
+}
