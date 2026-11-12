@@ -1,5 +1,6 @@
 //! TCP: accept, recv (multishot + provided buffers), read, write, close.
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::rc::Rc;
@@ -156,6 +157,71 @@ fn connect_refused() {
         let err = TcpStream::connect(addr).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
         assert_eq!(giong::stats().tracked_ops, 0);
+    });
+}
+
+#[test]
+fn vectored_writes_send_every_piece_in_order() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = Rc::new(l.accept().await.unwrap());
+
+        // 3,001 pieces (one sendmsg takes 1,024), static, owned and empty,
+        // and 6 MiB in one of them, so the socket buffer fills and sends end
+        // part-way through a piece.
+        let mut pieces: Vec<Cow<'static, [u8]>> = Vec::new();
+        for i in 0..3000u64 {
+            pieces.push(match i % 3 {
+                0 => Cow::Borrowed(b"static;"),
+                1 => Cow::Owned(payload((i % 700) as usize, i)),
+                _ => Cow::Borrowed(b""),
+            });
+            if i == 1500 {
+                pieces.push(Cow::Owned(payload(6 << 20, 99)));
+            }
+        }
+        let expected = pieces.concat();
+        let reader = {
+            let s = s.clone();
+            let len = expected.len();
+            giong::spawn(async move { recv_exact(&s, len).await })
+        };
+        let (res, back) = c.write_all_vectored(pieces).await;
+        res.unwrap();
+        assert_eq!(back.len(), 3001);
+        assert!(reader.await.unwrap() == expected);
+
+        // Nothing to send is not an error and sends nothing.
+        let (res, _) = c.write_vectored(Vec::<Vec<u8>>::new()).await;
+        assert_eq!(res.unwrap(), 0);
+        let (res, _) = c.write_all_vectored(vec![Vec::new(), Vec::new()]).await;
+        res.unwrap();
+        // A short one goes out whole.
+        let (res, back) = c.write_vectored(vec![b"ab".to_vec(), b"cd".to_vec()]).await;
+        assert_eq!(res.unwrap(), 4);
+        assert_eq!(back, [b"ab".to_vec(), b"cd".to_vec()]);
+        assert_eq!(recv_exact(&s, 4).await, b"abcd");
+    });
+}
+
+#[test]
+fn vectored_writes_to_a_closed_peer_are_an_error_not_a_signal() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        drop(l.accept().await.unwrap());
+        sleep(Duration::from_millis(20)).await;
+        let mut failed = false;
+        for _ in 0..50 {
+            let pieces = vec![vec![0u8; 32 * 1024], vec![1u8; 32 * 1024]];
+            if c.write_all_vectored(pieces).await.0.is_err() {
+                failed = true;
+                break;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert!(failed, "writes to a closed peer kept succeeding");
     });
 }
 

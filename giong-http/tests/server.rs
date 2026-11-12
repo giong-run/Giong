@@ -166,10 +166,16 @@ impl Client {
     }
 }
 
+/// A body large enough to be sent without copying it after its head.
+const BIG: &[u8] = &[b'z'; 100_000];
+
 /// Echoes what it understood of the request.
 async fn echo(req: Request) -> Response {
     if req.path() == "/empty" {
         return Response::new(204);
+    }
+    if req.path() == "/big" {
+        return Response::new(200).body(BIG);
     }
     let text = format!(
         "{} {} q={:?} v=1.{} ua={:?} body={}",
@@ -286,6 +292,57 @@ fn large_bodies_survive_in_both_directions() {
     let mut expected = body;
     expected.reverse();
     assert!(r.body == expected);
+}
+
+#[test]
+fn large_and_small_responses_mix_in_a_pipeline() {
+    async fn sized(req: Request) -> Response {
+        match req.path().strip_prefix("/owned/") {
+            Some(len) => {
+                let len: usize = len.parse().unwrap();
+                Response::new(200).body((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>())
+            }
+            None => echo(req).await,
+        }
+    }
+    let server = TestServer::start(Server::new(), sized);
+    let mut c = server.client();
+    // Around the size where bodies stop being copied, static and owned, with
+    // HEAD and small responses in between, all in one batch.
+    let paths = [
+        "/small",
+        "/big",
+        "/owned/32767",
+        "/owned/32768",
+        "/small",
+        "/owned/300000",
+        "/big",
+    ];
+    let mut batch = String::new();
+    for path in paths {
+        batch.push_str(&format!("GET {path} HTTP/1.1\r\nHost: t\r\n\r\n"));
+    }
+    batch.push_str("HEAD /big HTTP/1.1\r\nHost: t\r\n\r\n");
+    batch.push_str("GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    c.send(batch);
+    for path in paths {
+        let r = c.reply();
+        assert_eq!(r.status, 200, "{path}");
+        match path {
+            "/big" => assert!(r.body == BIG),
+            "/small" => assert!(r.text().starts_with("GET /small "), "{}", r.text()),
+            owned => {
+                let len: usize = owned["/owned/".len()..].parse().unwrap();
+                assert!(r.body.iter().copied().eq((0..len).map(|i| (i % 251) as u8)));
+            }
+        }
+    }
+    let head = c.reply_to(true);
+    assert_eq!(head.header("content-length"), Some("100000"));
+    let last = c.reply();
+    assert_eq!(last.header("connection"), Some("close"));
+    assert!(last.body == BIG);
+    c.expect_closed();
 }
 
 #[test]
@@ -681,16 +738,24 @@ fn serves_over_a_unix_socket() {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    // Two requests on one connection, the second one closing it.
+    // Three requests on one connection, the last one closing it.
     stream
         .write_all(
             b"POST /unix HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nhi\
+              GET /big HTTP/1.1\r\nHost: t\r\n\r\n\
               GET /bye HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .unwrap();
     let mut all = String::new();
     stream.read_to_string(&mut all).unwrap();
-    assert_eq!(all.matches("HTTP/1.1 200 OK\r\n").count(), 2, "{all}");
+    assert_eq!(all.matches("HTTP/1.1 200 OK\r\n").count(), 3, "{all}");
+    let big = std::str::from_utf8(BIG).unwrap();
+    assert!(
+        all.contains(&format!(
+            "Content-Length: 100000\r\n\r\n{big}HTTP/1.1 200 OK\r\n"
+        )),
+        "the large body is not whole, or not in its place"
+    );
     assert!(
         all.contains("POST /unix q=None v=1.1 ua=None body=hi"),
         "{all}"

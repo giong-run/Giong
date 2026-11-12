@@ -1,6 +1,7 @@
 //! Buffers: the ownership-passing buffer traits used by single-shot I/O, and the
 //! kernel-shared buffer ring ("provided buffers") used by multishot receive.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::ops::Deref;
@@ -128,6 +129,17 @@ unsafe impl IoBuf for &'static str {
     }
     fn len(&self) -> usize {
         str::len(self)
+    }
+}
+
+// SAFETY: borrowed bytes are `'static`; owned ones live on the heap, which
+// stays put when the `Cow` moves. Lets one vectored write mix the two.
+unsafe impl IoBuf for Cow<'static, [u8]> {
+    fn as_ptr(&self) -> *const u8 {
+        <[u8]>::as_ptr(self)
+    }
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
     }
 }
 

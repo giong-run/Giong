@@ -1,5 +1,6 @@
 //! The accept loop and the per-connection state machine.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
 use std::io;
@@ -17,10 +18,13 @@ use giong::time::{sleep, timeout};
 use crate::chunked::{Decoder, Progress};
 use crate::parse::{find_head_end, parse_head};
 use crate::request::{BodyBytes, Request};
-use crate::response::Response;
+use crate::response::{Body, Response};
 
 /// Responses to pipelined requests are sent together, up to this many bytes.
 const FLUSH_AT: usize = 64 * 1024;
+/// A body at least this large is not copied after its head: the two go out
+/// in one vectored write instead (see `Transport::write_all_with_body`).
+const SEPARATE_BODY_AT: usize = 32 * 1024;
 /// After an error response, how long the connection keeps discarding input so
 /// that the client can read the response instead of getting a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
@@ -66,6 +70,27 @@ pub trait Transport: 'static {
     /// Sends all of `buf` and hands it back.
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)>;
 
+    /// Sends all of `head`, then all of `body`, and hands `head` back. The
+    /// server uses it for large bodies.
+    ///
+    /// The default copies the body after the head and calls
+    /// [`write_all`](Self::write_all). [`TcpStream`] and [`UnixStream`] send
+    /// both with one vectored write instead, without the copy.
+    fn write_all_with_body(
+        &self,
+        head: Vec<u8>,
+        body: Body,
+    ) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
+        async move {
+            let mut head = head;
+            let len = head.len();
+            head.extend_from_slice(&body.into_cow());
+            let (res, mut head) = self.write_all(head).await;
+            head.truncate(len);
+            (res, head)
+        }
+    }
+
     /// Closes the sending direction, so the peer sees the end of the stream
     /// while the server can still read what it sends.
     fn close_write(&self) -> impl Future<Output = ()>;
@@ -88,6 +113,12 @@ impl Transport for TcpStream {
         TcpStream::write_all(self, buf)
     }
 
+    async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
+        let bufs = vec![Cow::Owned(head), body.into_cow()];
+        let (res, bufs) = TcpStream::write_all_vectored(self, bufs).await;
+        (res, into_head(bufs))
+    }
+
     async fn close_write(&self) {
         let _ = self.shutdown(Shutdown::Write);
     }
@@ -106,6 +137,12 @@ impl Transport for UnixStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         UnixStream::write_all(self, buf)
+    }
+
+    async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
+        let bufs = vec![Cow::Owned(head), body.into_cow()];
+        let (res, bufs) = UnixStream::write_all_vectored(self, bufs).await;
+        (res, into_head(bufs))
     }
 
     async fn close_write(&self) {
@@ -458,6 +495,14 @@ enum End {
     Status(u16),
 }
 
+/// The head buffer back from a vectored write of `[head, body]`.
+fn into_head(mut bufs: Vec<Cow<'static, [u8]>>) -> Vec<u8> {
+    match bufs.swap_remove(0) {
+        Cow::Owned(head) => head,
+        Cow::Borrowed(_) => Vec::new(),
+    }
+}
+
 struct Conn<T> {
     stream: T,
     cfg: Config,
@@ -472,6 +517,8 @@ struct Conn<T> {
     scanned: usize,
     /// Responses not sent yet.
     out: Vec<u8>,
+    /// A large body to send right after `out`, which ends with its head.
+    body: Body,
     /// The server is shutting down: answer what arrives, then close.
     closing: bool,
     /// Deadline for the request currently being received.
@@ -488,6 +535,7 @@ impl<T: Transport> Conn<T> {
             pos: 0,
             scanned: 0,
             out: Vec::new(),
+            body: Body::Empty,
             closing: false,
             deadline: None,
         }
@@ -534,11 +582,20 @@ impl<T: Transport> Conn<T> {
             self.closing |= giong::is_shutting_down();
             let keep_alive = wants_keep_alive && !self.closing;
             self.reserve_out();
-            resp.write_to(&mut self.out, minor, keep_alive, head_only);
+            let mut resp = resp;
+            if resp.sends_body(head_only) && resp.body_len() >= SEPARATE_BODY_AT {
+                // Sent from where it is, right after its head.
+                resp.write_head(&mut self.out, minor, keep_alive);
+                self.body = resp.take_body();
+            } else {
+                resp.write_to(&mut self.out, minor, keep_alive, head_only);
+            }
             if !keep_alive {
                 break;
             }
-            if self.out.len() >= FLUSH_AT && self.flush().await.is_err() {
+            // Nothing may be appended after a separate body: send it now.
+            let send_now = self.out.len() >= FLUSH_AT || !matches!(self.body, Body::Empty);
+            if send_now && self.flush().await.is_err() {
                 return;
             }
         }
@@ -713,7 +770,14 @@ impl<T: Transport> Conn<T> {
             return Ok(());
         }
         let out = mem::take(&mut self.out);
-        match timeout(self.cfg.write_timeout, self.stream.write_all(out)).await {
+        let wrote = match mem::take(&mut self.body) {
+            Body::Empty => timeout(self.cfg.write_timeout, self.stream.write_all(out)).await,
+            body => {
+                let write = self.stream.write_all_with_body(out, body);
+                timeout(self.cfg.write_timeout, write).await
+            }
+        };
+        match wrote {
             Ok((Ok(()), mut out)) => {
                 out.clear();
                 self.out = out;

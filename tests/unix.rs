@@ -115,6 +115,27 @@ fn megabytes_in_both_directions_over_a_pair() {
 }
 
 #[test]
+fn vectored_writes_over_a_pair() {
+    giong::block_on(async {
+        let (a, b) = UnixStream::pair().unwrap();
+        let pieces: Vec<Vec<u8>> = (0..2000).map(|i| payload(i * 3, i as u64)).collect();
+        let expected = pieces.concat();
+        let b = Rc::new(b);
+        let reader = {
+            let (b, len) = (b.clone(), expected.len());
+            giong::spawn(async move { recv_exact(&b, len).await })
+        };
+        let (res, back) = a.write_all_vectored(pieces).await;
+        res.unwrap();
+        assert_eq!(back.len(), 2000);
+        assert!(reader.await.unwrap() == expected);
+        let (res, _) = a.write_vectored(vec![&b"x"[..], &b"y"[..]]).await;
+        assert_eq!(res.unwrap(), 2);
+        assert_eq!(recv_exact(&b, 2).await, b"xy");
+    });
+}
+
+#[test]
 fn recv_is_cancel_safe() {
     giong::block_on(async {
         let (a, b) = UnixStream::pair().unwrap();

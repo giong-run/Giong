@@ -37,6 +37,10 @@ use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime::{self, Worker};
 
+/// The most buffers one `sendmsg` takes (`IOV_MAX` on Linux); a vectored
+/// write with more sends them in several calls.
+const IOV_MAX: usize = 1024;
+
 pub(crate) fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
 }
@@ -292,6 +296,78 @@ impl StreamSocket {
         (Ok(()), buf)
     }
 
+    pub(crate) async fn write_vectored<B: IoBuf>(
+        &self,
+        bufs: Vec<B>,
+    ) -> (io::Result<usize>, Vec<B>) {
+        self.send_vectored_from(bufs, 0).await
+    }
+
+    pub(crate) async fn write_all_vectored<B: IoBuf>(
+        &self,
+        mut bufs: Vec<B>,
+    ) -> (io::Result<()>, Vec<B>) {
+        let total: usize = bufs.iter().map(IoBuf::len).sum();
+        let mut written = 0;
+        while written < total {
+            let (res, b) = self.send_vectored_from(bufs, written).await;
+            bufs = b;
+            match res {
+                Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), bufs),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return (Err(e), bufs),
+            }
+        }
+        (Ok(()), bufs)
+    }
+
+    /// One `sendmsg` of the bytes of `bufs`, taken as one sequence, from
+    /// `offset` on.
+    async fn send_vectored_from<B: IoBuf>(
+        &self,
+        bufs: Vec<B>,
+        offset: usize,
+    ) -> (io::Result<usize>, Vec<B>) {
+        let mut iov = Vec::with_capacity(bufs.len().min(IOV_MAX));
+        let mut skip = offset;
+        for buf in &bufs {
+            let len = buf.len();
+            if skip >= len {
+                skip -= len;
+                continue;
+            }
+            iov.push(libc::iovec {
+                // SAFETY: `skip < len`, so the pointer stays within the buffer.
+                iov_base: unsafe { buf.as_ptr().add(skip) }.cast_mut().cast(),
+                iov_len: len - skip,
+            });
+            skip = 0;
+            if iov.len() == IOV_MAX {
+                break;
+            }
+        }
+        if iov.is_empty() {
+            return (Ok(0), bufs);
+        }
+        // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
+        let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+        let sqe = opcode::SendMsg::new(types::Fd(self.sock.as_raw_fd()), &*msg)
+            .flags(libc::MSG_NOSIGNAL as u32)
+            .build();
+        // The header, the iovec array (on the heap) and the buffers all stay
+        // where they are while the kernel reads them, even if this future is
+        // dropped: `Op` keeps them until the operation completes.
+        let (res, _, (bufs, _iov, _msg)) = Op::new(sqe, (bufs, iov, msg)).await;
+        if res < 0 {
+            (Err(os_err(res)), bufs)
+        } else {
+            (Ok(res as usize), bufs)
+        }
+    }
+
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
         let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
@@ -521,6 +597,26 @@ impl TcpStream {
     /// Writes all of `buf`. The buffer is handed back so it can be reused.
     pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
         self.inner.write_all(buf).await
+    }
+
+    /// Writes some bytes of `bufs`, taken as one sequence, with one system
+    /// call, returning how many were written.
+    pub async fn write_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<usize>, Vec<B>) {
+        self.inner.write_vectored(bufs).await
+    }
+
+    /// Writes all of `bufs`, one after the other, without copying them into
+    /// one buffer first: each `sendmsg` takes up to 1024 of them. The buffers
+    /// are handed back so they can be reused.
+    ///
+    /// Use it to send a header and a large body that live in different
+    /// buffers. Small pieces are faster copied into one buffer and sent with
+    /// [`write_all`](Self::write_all).
+    ///
+    /// Not cancel safe: if the future is dropped, part of the data may have
+    /// been sent.
+    pub async fn write_all_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
+        self.inner.write_all_vectored(bufs).await
     }
 
     /// Shuts down the read half, the write half, or both.

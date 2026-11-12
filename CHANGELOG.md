@@ -38,6 +38,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   or with the load generator on another (`LOAD_HOST`; the Rust servers take
   `BENCH_HOST`).
 - **`giong-http`**
+  - A response body of 32 KiB or more is no longer copied after its head: the two go
+    out in one vectored write over TCP and Unix sockets. On one worker, a 64 KiB static
+    body is served 40% faster and a 1 MiB one 78% faster (an owned 1 MiB body: 2.2
+    times as fast); smaller bodies are copied as before, which measured faster for
+    owned bodies of 16 KiB. `Transport::write_all_with_body` sends a head and a body;
+    its default copies as before, so existing transports keep compiling.
   - `Request::peer_addr`: the client's address, for logging, rate limits and
     access rules. `None` over a Unix socket. Transports report it through the
     new `Transport::peer_addr`, which has a default, so existing transports
@@ -55,6 +61,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     `send` waits while it is full, so a fast producer slows down to the consumer's pace;
     waiting senders get room in arrival order, and a cancelled `send` passes its place on.
 - **Networking**
+  - Vectored writes: `TcpStream::write_vectored` and `write_all_vectored` (and the same
+    on `UnixStream`) send several buffers one after the other with one `sendmsg`, up to
+    1,024 per call, instead of copying them into one. `IoBuf` is implemented for
+    `Cow<'static, [u8]>`, so static and owned pieces can go in the same call.
   - Name resolution that does not block the worker: `net::lookup_host` and
     `net::Resolver`. Reads `/etc/hosts`, then asks the servers in `/etc/resolv.conf`
     with `A` and `AAAA` queries in parallel over UDP, again over TCP when an answer is

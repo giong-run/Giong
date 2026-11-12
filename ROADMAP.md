@@ -118,7 +118,7 @@ built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait
 - [x] A bounded channel and a oneshot channel in `sync`.
 - [x] `spawn_on` that returns a handle to the spawned task's result.
 - [x] `giong-http`: the client's address in `Request`, and a limit on open connections.
-- [ ] Vectored writes (`writev`) so a response head and body need no copy.
+- [x] Vectored writes (`writev`) so a response head and body need no copy.
 - [x] A clear error when io_uring is blocked, and a guide to allowing it in Docker and
       Kubernetes until the epoll driver exists.
 - [ ] Remaining file operations: reading directories, `fallocate`.

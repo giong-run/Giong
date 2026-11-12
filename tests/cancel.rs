@@ -75,6 +75,39 @@ fn dropping_an_in_flight_read_keeps_its_buffer_alive() {
 }
 
 #[test]
+fn dropping_an_in_flight_vectored_write_keeps_its_buffers_alive() {
+    giong::block_on(async {
+        let (c, s) = pair().await;
+        // Fill the socket buffers so writes stay pending, then abandon them.
+        let mut abandoned = 0;
+        for _ in 0..20 {
+            let pieces: Vec<Vec<u8>> = (0..4).map(|_| vec![7u8; 1024 * 1024]).collect();
+            if timeout(Duration::from_millis(2), c.write_all_vectored(pieces))
+                .await
+                .is_err()
+            {
+                abandoned += 1;
+            }
+        }
+        assert!(abandoned > 0, "expected at least one write to block");
+        // Drain on the other side; every byte that arrives must be a 7.
+        let mut total = 0usize;
+        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
+            if data.is_empty() {
+                break;
+            }
+            assert!(data.iter().all(|&b| b == 7));
+            total += data.len();
+        }
+        assert!(total > 0);
+        drop((c, s));
+        sleep(Duration::from_millis(20)).await;
+        let stats = giong::stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
 fn dropping_an_in_flight_write_keeps_its_buffer_alive() {
     giong::block_on(async {
         let (c, s) = pair().await;
