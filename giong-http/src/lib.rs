@@ -71,6 +71,7 @@ pub mod client;
 mod date;
 #[cfg(test)]
 mod fuzz_tests;
+mod heap;
 #[cfg(any(test, fuzzing))]
 mod invariants;
 mod parse;

@@ -312,6 +312,7 @@ impl Uring {
                     )
                 })?;
         }
+        pool.start_ring();
         Ok(Self {
             ring,
             ops: Slab::new(),
@@ -658,9 +659,13 @@ impl Uring {
                         .user_data(UD_IGNORE),
                 );
             }
-            if mem::take(&mut self.starved) {
+            // Free buffers that are not in the ring yet go in before the
+            // kernel can take more; only when there are none is the data of
+            // streams nobody is reading moved out of the pool.
+            if mem::take(&mut self.starved) && self.pool.no_spare() {
                 self.evacuate();
             }
+            self.pool.refill();
         }
         self.cqes = batch;
     }
@@ -707,8 +712,10 @@ impl Uring {
                             let paused = !more && mem::replace(&mut m.pausing, false);
                             let recv = m.kind == MultiKind::Recv;
                             if recv && res == -libc::ENOBUFS {
-                                // The pool ran dry. Not an error for the reader (its
-                                // next poll re-arms); free up buffers after this batch.
+                                // The ring ran dry. Not an error for the reader (its
+                                // next poll re-arms); keep more buffers in the ring,
+                                // and free up buffers after this batch.
+                                self.pool.ran_dry();
                                 self.starved = true;
                                 Self::release(&self.pool, m.kind, res, flags);
                             } else if paused && res == -libc::ECANCELED {

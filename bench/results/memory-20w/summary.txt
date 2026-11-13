@@ -1,0 +1,15 @@
+10000 connections, 20 worker threads per server; load: 5000 busy connections
+
+server                 open     idle  pending   KiB per connection
+giong-http                -        -        -
+giong-http-epoll          -        -        -
+axum                      -        -        -
+tokio-raw                 -        -        -
+go                        -        -        -
+
+server              peak MiB     req/s   under load
+giong-http              50.3    357607
+giong-http-epoll        14.3    330696
+axum                   124.2    211357
+tokio-raw               63.5    302697
+go                     184.0    141709

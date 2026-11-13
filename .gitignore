@@ -30,3 +30,6 @@ site/public/*/index.html
 site/public/llms.txt
 site/public/robots.txt
 site/public/sitemap.xml
+
+# The Go benchmark server (bench/memory.sh builds it).
+bench/go-http/bench-go-http

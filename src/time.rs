@@ -9,8 +9,8 @@
 //! Timer resolution is one millisecond; a timer never fires early.
 
 use std::fmt;
-use std::future::{poll_fn, Future};
-use std::pin::{pin, Pin};
+use std::future::Future;
+use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -398,16 +398,53 @@ impl From<Elapsed> for std::io::Error {
 ///
 /// Dropping an in-flight I/O future is safe: the operation is cancelled and
 /// its buffer is kept alive until the kernel confirms.
-pub async fn timeout<F: Future>(duration: Duration, fut: F) -> Result<F::Output, Elapsed> {
-    let mut fut = pin!(fut);
-    let mut delay = pin!(sleep(duration));
-    poll_fn(|cx| {
-        if let Poll::Ready(value) = fut.as_mut().poll(cx) {
+pub fn timeout<F: Future>(duration: Duration, fut: F) -> Timeout<F> {
+    Timeout {
+        fut,
+        delay: sleep(duration),
+    }
+}
+
+/// Future returned by [`timeout`]: `Ok` with the output of the future it
+/// wraps, or `Err(Elapsed)` if the time ran out first.
+///
+/// It is only as large as the wrapped future plus a [`Sleep`], so wrapping
+/// the I/O of every connection in a timeout costs no extra memory.
+#[must_use = "futures do nothing unless awaited"]
+pub struct Timeout<F> {
+    /// Pinned with the `Timeout`: never moved out.
+    fut: F,
+    delay: Sleep,
+}
+
+impl<F> Timeout<F> {
+    /// The instant at which the time runs out.
+    pub fn deadline(&self) -> Instant {
+        self.delay.deadline()
+    }
+}
+
+impl<F: Future> Future for Timeout<F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `fut` is structurally pinned: it is only reached through
+        // the pinned reference made here and never moved. `Sleep` is `Unpin`.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        if let Poll::Ready(value) = fut.poll(cx) {
             return Poll::Ready(Ok(value));
         }
-        delay.as_mut().poll(cx).map(|()| Err(Elapsed))
-    })
-    .await
+        Pin::new(&mut this.delay).poll(cx).map(|()| Err(Elapsed))
+    }
+}
+
+impl<F> fmt::Debug for Timeout<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Timeout")
+            .field("deadline", &self.delay.deadline())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

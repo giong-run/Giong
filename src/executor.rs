@@ -11,8 +11,9 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::future::{poll_fn, Future};
+use std::mem::ManuallyDrop;
 use std::panic::{self, AssertUnwindSafe};
-use std::pin::{pin, Pin};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -340,7 +341,7 @@ impl<T: Send + 'static> RemoteJoinHandle<T> {
             }
             match panic::catch_unwind(AssertUnwindSafe(f)) {
                 Ok(fut) => drop(runtime::with_worker(|w| {
-                    w.spawn_local(run_remote(fut, guard), location)
+                    w.spawn_local(RemoteTask::new(fut, guard), location)
                 })),
                 Err(payload) => guard.0.complete(Err(JoinError::Panic(payload))),
             }
@@ -398,33 +399,111 @@ impl<T> fmt::Debug for RemoteJoinHandle<T> {
     }
 }
 
-/// The task behind a [`RemoteJoinHandle`], on its own worker.
-async fn run_remote<Fut: Future>(fut: Fut, guard: RemoteGuard<Fut::Output>) {
-    let result = {
-        let mut fut = pin!(fut);
-        let mut registered: Option<Waker> = None;
-        poll_fn(|cx| {
-            let aborted = match &registered {
-                Some(w) if w.will_wake(cx.waker()) => guard.0.aborted.load(Ordering::Acquire),
-                _ => {
-                    registered = Some(cx.waker().clone());
-                    guard.0.register(cx.waker())
-                }
-            };
-            if aborted {
-                return Poll::Ready(Err(JoinError::Cancelled));
+/// The future a spawned task runs: the user's future, whose result goes to
+/// the [`JoinHandle`].
+///
+/// Written out by hand rather than as an `async` block: the block would keep
+/// the future it captured and the copy it pins for the `.await` side by side,
+/// and every task would take twice the memory its future needs. A server
+/// holds one task per connection, so that was most of what an idle
+/// connection cost.
+struct LocalTask<F: Future> {
+    /// Pinned with the task: never moved out.
+    fut: F,
+    /// `None` once the result has been delivered.
+    guard: Option<CancelOnDrop<F::Output>>,
+}
+
+impl<F: Future> Future for LocalTask<F> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: `fut` is structurally pinned (it is only ever reached
+        // through `Pin::new_unchecked` below and dropped in place); `guard`
+        // is not pinned and may move.
+        let this = unsafe { self.get_unchecked_mut() };
+        if this.guard.is_none() {
+            return Poll::Ready(());
+        }
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        let result = match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
+            Ok(Poll::Pending) => return Poll::Pending,
+            Ok(Poll::Ready(value)) => Ok(value),
+            Err(payload) => Err(JoinError::Panic(payload)),
+        };
+        if let Some(guard) = this.guard.take() {
+            guard.0.complete(result);
+        }
+        Poll::Ready(())
+    }
+}
+
+/// The task behind a [`RemoteJoinHandle`], on its own worker. Written out by
+/// hand for the same reason as [`LocalTask`].
+struct RemoteTask<Fut: Future> {
+    /// Pinned with the task. Dropped in place as soon as it finishes, on its
+    /// worker, before the handle learns the result.
+    fut: ManuallyDrop<Fut>,
+    /// `None` once the result has been delivered and `fut` dropped.
+    guard: Option<RemoteGuard<Fut::Output>>,
+    /// The waker last registered with the shared state.
+    registered: Option<Waker>,
+}
+
+impl<Fut: Future> RemoteTask<Fut> {
+    fn new(fut: Fut, guard: RemoteGuard<Fut::Output>) -> Self {
+        Self {
+            fut: ManuallyDrop::new(fut),
+            guard: Some(guard),
+            registered: None,
+        }
+    }
+}
+
+impl<Fut: Future> Future for RemoteTask<Fut> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: as in `LocalTask`: `fut` is structurally pinned and only
+        // dropped in place, the other fields are not pinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        let Some(guard) = &this.guard else {
+            return Poll::Ready(());
+        };
+        let aborted = match &this.registered {
+            Some(w) if w.will_wake(cx.waker()) => guard.0.aborted.load(Ordering::Acquire),
+            _ => {
+                this.registered = Some(cx.waker().clone());
+                guard.0.register(cx.waker())
             }
-            match panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
-                Ok(Poll::Pending) => Poll::Pending,
-                Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
-                Err(payload) => Poll::Ready(Err(JoinError::Panic(payload))),
+        };
+        let result = if aborted {
+            Err(JoinError::Cancelled)
+        } else {
+            let fut = unsafe { Pin::new_unchecked(&mut *this.fut) };
+            match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
+                Ok(Poll::Pending) => return Poll::Pending,
+                Ok(Poll::Ready(value)) => Ok(value),
+                Err(payload) => Err(JoinError::Panic(payload)),
             }
-        })
-        .await
-        // The user's future is dropped here, on its worker, before the handle
-        // learns the result.
-    };
-    guard.0.complete(result);
+        };
+        let guard = this.guard.take().expect("checked above");
+        // SAFETY: dropped in place exactly once: `guard` is `None` from now
+        // on, which is what `Drop` checks.
+        unsafe { ManuallyDrop::drop(&mut this.fut) };
+        guard.0.complete(result);
+        Poll::Ready(())
+    }
+}
+
+impl<Fut: Future> Drop for RemoteTask<Fut> {
+    fn drop(&mut self) {
+        if self.guard.is_some() {
+            // SAFETY: not dropped yet (see `poll`); dropping in place keeps
+            // the pinning promise.
+            unsafe { ManuallyDrop::drop(&mut self.fut) };
+        }
+    }
 }
 
 /// Drops a value, swallowing a panic from its destructor so that one broken
@@ -443,19 +522,9 @@ impl Worker {
             waker: RefCell::new(None),
             finished: Cell::new(false),
         });
-        let guard = CancelOnDrop(state.clone());
-        let wrapped = Box::pin(async move {
-            let guard = guard;
-            let mut fut = pin!(fut);
-            let result = poll_fn(|cx| {
-                match panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
-                    Ok(Poll::Pending) => Poll::Pending,
-                    Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
-                    Err(payload) => Poll::Ready(Err(JoinError::Panic(payload))),
-                }
-            })
-            .await;
-            guard.0.complete(result);
+        let wrapped = Box::pin(LocalTask {
+            fut,
+            guard: Some(CancelOnDrop(state.clone())),
         });
 
         let uid = self.next_task_uid.get();
@@ -614,4 +683,23 @@ pub async fn yield_now() {
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Ready;
+    use std::mem;
+
+    type Big = Ready<[u8; 4096]>;
+
+    /// A task is as large as its future plus the handle to its result: the
+    /// wrappers do not keep a second copy of the future (an `async` block
+    /// around it did, and every connection of a server paid twice).
+    #[test]
+    fn task_wrappers_add_no_copy_of_the_future() {
+        let future = mem::size_of::<Big>();
+        assert!(mem::size_of::<LocalTask<Big>>() <= future + 16);
+        assert!(mem::size_of::<RemoteTask<Big>>() <= future + 32);
+    }
 }

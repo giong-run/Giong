@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::future::{poll_fn, Future};
+use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
@@ -817,6 +817,12 @@ impl Builder {
     /// The pool only needs to cover the connections that receive data within
     /// one turn of the event loop; when it runs short, giong falls back to
     /// heap copies instead of failing.
+    ///
+    /// `count` is an upper bound, not what a worker uses. The memory is
+    /// reserved, not touched; free buffers are reused most recent first, and
+    /// with io_uring a worker lends the kernel 16 of them at first and twice
+    /// as many each time a turn of the event loop takes most of those. A
+    /// worker serving a few connections touches a few buffers.
     pub fn recv_buffers(mut self, count: usize, size: usize) -> Self {
         self.buf_count = count.clamp(1, 32768).next_power_of_two() as u16;
         self.buf_size = size.max(64);
@@ -1593,16 +1599,48 @@ pub fn is_shutting_down() -> bool {
 /// }
 /// # }
 /// ```
-pub async fn until_shutdown<F: Future>(fut: F) -> Option<F::Output> {
-    let mut fut = pin!(fut);
-    let mut signal = pin!(shutdown_signal());
-    poll_fn(|cx| {
-        if signal.as_mut().poll(cx).is_ready() {
+///
+/// # Panics
+///
+/// Panics when called outside of a giong runtime.
+pub fn until_shutdown<F: Future>(fut: F) -> UntilShutdown<F> {
+    UntilShutdown {
+        fut,
+        signal: shutdown_signal(),
+    }
+}
+
+/// Future returned by [`until_shutdown`]: `Some` with the output of the
+/// future it wraps, or `None` if a shutdown was requested first. Only as
+/// large as the wrapped future plus a [`ShutdownSignal`].
+#[must_use = "futures do nothing unless awaited"]
+pub struct UntilShutdown<F> {
+    /// Pinned with the `UntilShutdown`: never moved out.
+    fut: F,
+    signal: ShutdownSignal,
+}
+
+impl<F: Future> Future for UntilShutdown<F> {
+    type Output = Option<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `fut` is structurally pinned: it is only reached through
+        // the pinned reference made here and never moved. `ShutdownSignal`
+        // is `Unpin`.
+        let this = unsafe { self.get_unchecked_mut() };
+        if Pin::new(&mut this.signal).poll(cx).is_ready() {
             return Poll::Ready(None);
         }
-        fut.as_mut().poll(cx).map(Some)
-    })
-    .await
+        unsafe { Pin::new_unchecked(&mut this.fut) }
+            .poll(cx)
+            .map(Some)
+    }
+}
+
+impl<F> std::fmt::Debug for UntilShutdown<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UntilShutdown").finish_non_exhaustive()
+    }
 }
 
 // ------------------------------------------------------------------- debugging
@@ -1617,7 +1655,7 @@ pub struct Stats {
     pub tracked_ops: usize,
     /// SQEs whose final completion has not been seen yet.
     pub inflight: usize,
-    /// Receive buffers currently available to the kernel.
+    /// Receive buffers not in use (lent to the kernel, or spare).
     pub free_recv_buffers: usize,
     /// Size of the receive buffer pool.
     pub recv_buffers: usize,

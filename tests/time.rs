@@ -110,3 +110,12 @@ fn sleep_can_be_reset() {
         assert!(start.elapsed() < Duration::from_millis(500));
     });
 }
+
+/// `timeout` adds a timer to the future it wraps, and no second copy of it.
+#[test]
+fn a_timeout_is_as_large_as_its_future_plus_a_timer() {
+    type Big = std::future::Ready<[u8; 4096]>;
+    let size = std::mem::size_of::<giong::time::Timeout<Big>>();
+    let parts = std::mem::size_of::<Big>() + std::mem::size_of::<giong::time::Sleep>();
+    assert!(size <= parts + 8, "{size} bytes for {parts} bytes of parts");
+}
