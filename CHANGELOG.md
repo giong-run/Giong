@@ -139,6 +139,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
+  registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
+  the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
+  130 ns an enter costs). `DriverChoice` lists it as `registered-ring`.
 - **giong**: on Linux 6.12 and newer, stream receives fill the worker's pool buffers piece
   by piece (a buffer ring with `IOU_PBUF_RING_INC`) instead of taking a whole 8 KiB buffer
   each, so connections that each send a little share a few buffers. With 20 workers and

@@ -136,17 +136,26 @@ pub enum IoUringFeature {
     /// 6.12). Many connections that each send a little then share a few
     /// buffers, which keeps the memory a busy worker touches small.
     PackedBuffers,
+    /// The worker enters the kernel through its thread's registered ring
+    /// table (`IORING_REGISTER_RING_FDS`, Linux 5.18) instead of the ring's
+    /// descriptor, which spares the kernel looking the descriptor up on
+    /// every `io_uring_enter`.
+    RegisteredRing,
 }
 
 impl IoUringFeature {
     /// Every feature, in the order [`DriverChoice::io_uring_features`] lists
     /// them.
-    pub const ALL: &'static [IoUringFeature] = &[IoUringFeature::PackedBuffers];
+    pub const ALL: &'static [IoUringFeature] = &[
+        IoUringFeature::PackedBuffers,
+        IoUringFeature::RegisteredRing,
+    ];
 
     /// A stable short name, such as `"packed-buffers"`.
     pub const fn name(self) -> &'static str {
         match self {
             IoUringFeature::PackedBuffers => "packed-buffers",
+            IoUringFeature::RegisteredRing => "registered-ring",
         }
     }
 }

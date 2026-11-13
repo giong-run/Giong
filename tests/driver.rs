@@ -432,9 +432,17 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         if kernel_version() >= (6, 12) {
             assert!(got.contains(&"packed-buffers"), "{got:?}");
         }
+        if kernel_version() >= (5, 18) {
+            assert!(got.contains(&"registered-ring"), "{got:?}");
+        }
     }
 
-    // Turned off, one by one and all at once.
+    // Turned off, one by one and all at once. Each child sets its own
+    // GIONG_IO_URING_OFF, so this compares against the full set only when this
+    // run has nothing turned off itself.
+    if std::env::var_os("GIONG_IO_URING_OFF").is_some() {
+        return;
+    }
     for off in IoUringFeature::ALL.iter().map(|f| f.name()).chain(["all"]) {
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
