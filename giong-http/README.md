@@ -1,6 +1,6 @@
 # giong-http
 
-A small, strict HTTP/1.1 server and client for the [giong](../README.md) runtime.
+A small, strict HTTP/1.1 and HTTP/2 server, and an HTTP/1.1 client, for the [giong](../README.md) runtime.
 
 ```rust
 use std::time::Duration;
@@ -30,6 +30,7 @@ fn main() -> std::io::Result<()> {
 
 ## What it does
 
+- HTTP/2, over TLS (chosen through ALPN, as browsers do) and over plain TCP with prior knowledge, for the same handlers. See "HTTP/2" below.
 - HTTP/1.1 and HTTP/1.0, keep-alive, pipelining. Responses to pipelined requests leave in a single write; if a handler has to wait, the responses before it are sent first.
 - A body of 32 KiB or more is not copied: it leaves from where it is, right after its head, in one vectored write over TCP and Unix sockets. Over TLS it is not copied after its head either: rustls takes the head and then the body, and with kernel TLS both go to the kernel in one vectored write.
 - Bodies by `Content-Length` or chunked, received in full before the handler is called. `Expect: 100-continue` is supported.
@@ -125,6 +126,72 @@ To have the kernel encrypt and decrypt the records once rustls has done the hand
 
 To serve over another kind of connection (a different TLS layer, a fake connection in a test), implement the `Transport` trait and call `Server::serve_connection`.
 
+## HTTP/2
+
+The server speaks HTTP/2 ([RFC 9113](https://www.rfc-editor.org/rfc/rfc9113)) with the handlers it already has. Over TLS, `serve_tls` offers `h2` and `http/1.1` through ALPN and each client picks: browsers, curl and gRPC clients pick `h2`. Without TLS, a connection that opens with the HTTP/2 preface is served over HTTP/2 ("prior knowledge", the way gRPC clients and proxies such as Envoy talk to backends), and any other over HTTP/1.1, so one port serves both. `Server::http2(false)` turns it off.
+
+```sh
+cargo run --release -p giong-http --features tls --example h2
+curl -k --http2 https://localhost:8443/
+curl --http2-prior-knowledge http://localhost:8080/bytes?n=100000 -o /dev/null
+```
+
+What a handler sees:
+
+- Each stream is a `Request` like any other, and `Request::version()` is `Version::Http2`. `:authority` becomes the `Host` header (a `Host` that differs from it is refused), and the `cookie` fields a client sends apart are joined into one. A [`giong-web`](../giong-web/README.md) app serves HTTP/2 without a change.
+- Streams are served at once and answered as their handlers finish; a slow handler holds up no other stream. Each handler runs in its connection's task, like an HTTP/1.1 one, on the same core.
+- The response is written as HEADERS and DATA frames. Its headers are sent in lowercase, without those HTTP/2 forbids (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`); a streamed body (`Body::channel`) goes out as DATA frames instead of chunks.
+- A stream the client resets (`RST_STREAM`) drops its handler at once, as a dropped future: whatever it was waiting on is cancelled. A handler that answers before the request body has all arrived has its response sent, then the rest of the body is refused with `RST_STREAM(NO_ERROR)`; the connection stays open.
+- Streamed request bodies (`Handler::stream_body`), `Expect: 100-continue` and request trailers work as over HTTP/1.1. Graceful shutdown sends a GOAWAY, and the streams in progress finish within the grace period.
+- Not done: server push, and priorities (the server says so with `SETTINGS_NO_RFC7540_PRIORITIES` and serves streams in turn). Extended CONNECT (WebSockets over HTTP/2) is not supported.
+
+### Limits
+
+Every resource a client can make the server hold is bounded. A client that goes past a limit loses its stream or its connection; a connection ends with a GOAWAY whose debug data starts with a `GIONG-E` code, which has a page in [docs/errors](../docs/errors/README.md).
+
+| Attack | What the server does | Code |
+|---|---|---|
+| Many streams at once | Beyond `max_concurrent_streams` (default 100), new streams are refused with `REFUSED_STREAM`. | |
+| Rapid reset ([CVE-2023-44487](https://nvd.nist.gov/vuln/detail/CVE-2023-44487)): open streams and reset them at once | Streams reset by the client or refused draw on a budget that refills over time (a burst of twice `max_concurrent_streams`, at least 100, refilled at `max_concurrent_streams` a second, at least 50). Overdrawn: GOAWAY `ENHANCE_YOUR_CALM`. A handler stops at its stream's reset, so the work a reset leaves behind is nothing. | `GIONG-E1116` |
+| Floods of frames that do no work (CVE-2019-9512, 9515, 9518): PING, SETTINGS, PRIORITY, empty DATA or CONTINUATION, WINDOW_UPDATE with nothing to send, frames for closed streams | A budget of 1,000 such frames, refilled at 500 a second. Overdrawn: GOAWAY `ENHANCE_YOUR_CALM`. | `GIONG-E1117` |
+| CONTINUATION flood ([VU#421644](https://kb.cert.org/vuls/id/421644)): a header block that never ends | A header block may not be larger than `max_head_size` (at least 16 KiB), and no other frame may come between its pieces. | `GIONG-E1118` |
+| HPACK bomb: a small block that decodes into a huge header list | The decoded list counts against `max_head_size`; past it, that stream is answered with `431`. The dynamic table is the 4 KiB the protocol starts with. | |
+| Large bodies on many streams | A stream may send 64 KiB of its body, then gets more only as the handler takes it (streamed) or up to `max_body_size`. Together, the bodies a connection holds stay within the larger of `max_body_size` and 1 MiB: past it, only the oldest stream still receiving gets more, so bodies arrive in turn instead of at once. | |
+| A client that does not read ([CVE-2019-9517](https://nvd.nist.gov/vuln/detail/CVE-2019-9517)) | With 256 KiB of output waiting (answers to PING and SETTINGS included), the server stops reading the connection. A stream that the client's flow control keeps from sending for longer than `write_timeout` is reset with `CANCEL`. | |
+| Protocol errors | The connection ends with GOAWAY and the error RFC 9113 calls for; a malformed request ends its stream only. | `GIONG-E1115` |
+
+Timeouts are the same as for HTTP/1.1: `request_timeout` for a request's head and body, `write_timeout` for each write, `idle_timeout` while no stream is open (then a GOAWAY).
+
+### Checked
+
+- [h2spec](https://github.com/summerwind/h2spec) passes all 147 cases over TLS in strict mode; CI runs it on every pull request, over TLS and on the plain port.
+- Two fuzz targets run every night: `hpack` decodes header blocks, encodes them again and compares, and does the same for Huffman codes; `h2` plays whole connections from a client that mostly follows the protocol and checks every frame the server writes against RFC 9113 and the client's flow control. The same checks run in `cargo test` on 100,000 header blocks and 3,000 connections.
+- 16 end-to-end tests on real sockets, with a client that writes its frames by hand: requests with and without bodies, trailers, `100 Continue`, streamed bodies both ways, the client's flow control, the body budget, a reset that drops its handler, every limit in the table, idle connections, graceful shutdown, HTTP/1.1 and HTTP/2 on one port. 19 unit tests of frames, HPACK (every example in RFC 7541) and requests.
+
+### Performance
+
+Measured with `bench/h2.sh` against axum 0.8 on hyper's HTTP/2 (through `axum-server` for HTTPS). Both use rustls with the `ring` provider and set `TCP_NODELAY`. The server has one core of a 4-vCPU virtual machine (Xeon 2.3 GHz, Linux 6.18) and h2load (nghttp2) the other three. `json` is a 27-byte answer and `users` an 8.5 KiB one, each over 48 connections with 10 streams at once; `json-mux` is the 27-byte answer over 3 connections with 100 streams each, the way a browser loads a page. Medians of 5 rounds of 5 s, with the range in brackets; requests per second:
+
+| Server | `json` | `users` | `json-mux` |
+|---|---|---|---|
+| **giong-http**, HTTPS | **501.9k** (450–518k) | **58.0k** (52–69k) | **720.1k** (706–802k) |
+| axum, HTTPS | 131.0k (126–137k) | 23.3k (22–26k) | 184.5k (149–190k) |
+| **giong-http**, prior knowledge | **557.3k** (533–580k) | **69.9k** (62–74k) | **696.5k** (618–740k) |
+| axum, prior knowledge | 138.9k (126–146k) | 23.0k (22–26k) | 158.0k (152–171k) |
+
+- **3.8 to 4.4 times axum's requests per second on small answers, 2.5 to 3.0 times on 8.5 KiB ones.** The server's core is the limit in every case (97–100% busy), and no request failed. h2load's mean time per request follows: 0.83 ms against 3.63 ms for `json` over HTTPS, 8.1 against 20.5 ms for `users`.
+- Our reading, not profiled: with 10 or 100 streams in flight on a connection, one read brings many requests and one write takes many answers, much as pipelining does over HTTP/1.1, and giong-http turns that batching into requests served as it does for pipelined ones ([giong-web's benchmark](../giong-web/README.md#performance)). hyper gains far less from either.
+- Not measured yet: several cores, a load generator on another machine, request bodies.
+
+Memory per connection, measured with `bench/hold` over HTTP/2 with prior knowledge: 5,000 connections on one worker thread, the server's resident memory before and after, divided by 5,000. KiB, the same in all 5 rounds within 0.2%:
+
+| Server | Idle (one request answered) | One request in progress | Each further request in progress |
+|---|---|---|---|
+| **giong-http** | **4.2** | **5.9** | **1.1** |
+| axum | 23.8 | 23.0 | 2.0 |
+
+An idle connection gives its buffers back, so what it keeps is its task, its HPACK tables and its state; an idle HTTP/1.1 connection still costs 1.9 KiB. Results are in `bench/results/h2/`.
+
 ## Client
 
 The `client` feature adds an HTTP/1.1 client, `giong_http::client` (HTTPS included, through giong-tls):
@@ -186,8 +253,8 @@ Results are in `bench/results/http-client/`.
 
 ## Not there yet
 
-HTTP/2. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2.
+Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2.
 
 ## Tests
 
-`cargo test -p giong-http --all-features`: 46 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, and 50,000 damaged gzip and deflate bodies), 21 end-to-end tests of the server on real sockets (one of them over a Unix socket), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 11 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 12 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.
+`cargo test -p giong-http --all-features`: 53 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, and 3,000 HTTP/2 connections whose every frame is checked), 35 HTTP/2 tests (16 end-to-end on real sockets with a client that writes its frames by hand, 19 of frames, HPACK and requests), 21 end-to-end tests of the server on real sockets (one of them over a Unix socket), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 11 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 12 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.
