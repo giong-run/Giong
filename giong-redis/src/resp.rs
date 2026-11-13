@@ -357,7 +357,14 @@ fn starts_push(data: &[u8]) -> bool {
     // Attributes come before what they describe.
     while data.get(pos) == Some(&b'|') {
         pos += 1;
-        let Some(pairs) = line(data, &mut pos).ok().and_then(number) else {
+        // Counted like the reader counts them, so that a count the reader
+        // has not checked yet (the reply is being thrown away) cannot be
+        // negative or overflow.
+        let pairs = line(data, &mut pos).ok().and_then(number);
+        let Some(pairs) = pairs
+            .and_then(|n| u64::try_from(n).ok())
+            .filter(|&n| n < MAX_COUNT)
+        else {
             return false;
         };
         for _ in 0..2 * pairs {
@@ -829,5 +836,25 @@ mod tests {
             panic!()
         };
         assert!(!buf.is_push());
+    }
+
+    #[test]
+    fn an_attribute_count_out_of_range_in_a_reply_thrown_away_is_no_push() {
+        // Found by the `replies` fuzz target: `2 * pairs` overflowed.
+        for count in [
+            "9223372036854775807",
+            "-9223372036854775807",
+            "-1",
+            "4294967296",
+        ] {
+            let reply = format!("|{count}\r\n>1\r\n+a\r\n");
+            assert!(!starts_push(reply.as_bytes()), "{count}");
+        }
+        // The reply is over the limit before the reader reaches the second
+        // attribute's count, so only `starts_push` looks at it.
+        let input = b"|1\r\n+\r\n+\r\n|9223372036854775807\r\n+k\r\n";
+        for piece in 1..=input.len() {
+            let _ = read_all(input, 1, piece);
+        }
     }
 }
