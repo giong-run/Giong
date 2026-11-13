@@ -9,6 +9,42 @@ use std::time::Duration;
 use giong::net::{TcpListener, TcpStream};
 use giong::time::{sleep, timeout};
 
+/// Lets this process open at least `needed` descriptors, by raising the soft
+/// limit up to the hard one. Shells start with a soft limit of 1024 (Ubuntu's
+/// included), which the tests below need more than; the tests running
+/// alongside open some, too.
+fn allow_open_files(needed: u64) {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain system calls with a valid `rlimit`.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim), 0);
+        if lim.rlim_cur >= needed {
+            return;
+        }
+        assert!(
+            lim.rlim_max >= needed,
+            "this test needs {needed} open files, and the hard limit is {} (ulimit -Hn)",
+            lim.rlim_max
+        );
+        // As much as allowed, so that the other tests have room too; the
+        // kernel caps it at fs.nr_open, so fall back to what is needed.
+        let hard = lim.rlim_max;
+        lim.rlim_cur = hard;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            lim.rlim_cur = needed;
+            assert_eq!(
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 fn listener() -> (TcpListener, SocketAddr) {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
@@ -277,6 +313,8 @@ fn dropping_a_stream_closes_the_connection() {
 #[test]
 fn accept_many_connections() {
     const N: usize = 500;
+    // Both ends of every connection, and room for the other tests.
+    allow_open_files(2 * N as u64 + 1024);
     giong::block_on(async {
         let (l, addr) = listener();
         let server = giong::spawn(async move {
@@ -391,6 +429,9 @@ fn accept_backlog_is_bounded_and_no_connection_is_lost() {
     // the multishot accept must pause, leave the rest in the kernel's listen
     // backlog, and resume once the application catches up.
     const N: usize = 1300;
+    // Every client, up to 1024 accepted sockets queued in the driver, and
+    // room for the other tests.
+    allow_open_files(N as u64 + 1024 + 1024);
     giong::block_on(async {
         let (l, addr) = listener();
         // Arm the multishot accept, then stop accepting for a while.

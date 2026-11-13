@@ -121,6 +121,10 @@ codes! {
     /// the runtime does not have. It panics with this code, since the index
     /// is a bug in the caller.
     NoSuchWorker = 8, InvalidInput, "no such worker";
+    /// A kernel from 6.0 on refused to register an io_uring buffer ring,
+    /// even with giong's workarounds for the kernel bugs it knows. The
+    /// kernel's error kind is kept.
+    BufferRingRefused = 9, Unsupported, "the kernel refused io_uring buffer rings";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.

@@ -11,7 +11,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use giong::observe::{self, Location, PollProfile, Snapshot, WorkerState};
-use giong::Handle;
+use giong::{ChosenBy, DriverChoice, Handle};
 use serde_json::{json, Map, Value};
 
 use crate::proc;
@@ -303,8 +303,18 @@ fn overview(state: &State) -> Value {
     let watch = state.watch.borrow();
     let mut workers = Vec::new();
     let mut warnings = Vec::new();
+    // Workers that fell back to epoll, with the reason the first one gave.
+    let mut on_epoll = 0;
+    let mut epoll_reason = None;
     for w in 0..target.workers() {
         let p = target.pulse(w);
+        let choice = target.driver_choice(w);
+        if let Some(c) = &choice {
+            if let (ChosenBy::Automatic, Some(e)) = (c.chosen_by, &c.io_uring_error) {
+                on_epoll += 1;
+                epoll_reason.get_or_insert_with(|| e.clone());
+            }
+        }
         let blocked = watch.blocked(w, now);
         let rates = watch.rates(w);
         if let Some(b) = blocked {
@@ -314,12 +324,20 @@ fn overview(state: &State) -> Value {
             "worker": w,
             "state": worker_state(p.state),
             "driver": p.driver.map(|d| d.name()),
+            "driver_choice": choice.as_ref().map(driver_choice_json),
             "tasks": p.tasks,
             "runnable": p.runnable,
             "busy": rates.map(|r| round(r.busy, 2)),
             "polls_per_s": rates.map(|r| r.polls_per_s.round()),
             "blocked": blocked_json(blocked, now),
         }));
+    }
+    if let Some(reason) = epoll_reason {
+        warnings.push(format!(
+            "{on_epoll} of {} workers run on the epoll driver, because io_uring cannot be used \
+             here: {reason}",
+            target.workers()
+        ));
     }
     let process = proc::process();
     if let (Some(open), Some(limit)) = (process["open_fds"].as_u64(), process["fd_limit"].as_u64())
@@ -341,6 +359,25 @@ fn overview(state: &State) -> Value {
         },
         "workers": workers,
         "warnings": warnings,
+    })
+}
+
+/// How a worker got its driver: who chose it, why not io_uring, and the
+/// kernel bugs giong works around.
+fn driver_choice_json(c: &DriverChoice) -> Value {
+    json!({
+        "chosen_by": match c.chosen_by {
+            ChosenBy::Builder => "builder",
+            ChosenBy::Environment => "GIONG_DRIVER",
+            _ => "automatic",
+        },
+        "io_uring_error": c.io_uring_error,
+        "io_uring_error_code": c.io_uring_error_code.map(|code| code.to_string()),
+        "kernel_workarounds": c
+            .kernel_workarounds
+            .iter()
+            .map(|w| json!({ "name": w.name(), "description": w.description() }))
+            .collect::<Vec<_>>(),
     })
 }
 

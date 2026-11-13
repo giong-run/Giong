@@ -289,9 +289,14 @@ Each worker runs on one of two I/O drivers, behind the same API:
 
 `Builder::driver(DriverKind::IoUring)`, or `GIONG_DRIVER=io_uring`, makes the runtime fail
 to start where io_uring is missing ([GIONG-E0001](docs/errors/E0001.md)) instead of falling
-back; `DriverKind::Epoll`, or `GIONG_DRIVER=epoll`, chooses epoll anywhere.
-`giong::driver_kind()` tells which one a worker got. The whole test suite runs on both, and
-in CI also inside a Docker container with the default profile and on a real 5.15 kernel.
+back; `DriverKind::Epoll`, or `GIONG_DRIVER=epoll`, chooses epoll anywhere. A fallback
+is said once on stderr, with the reason, and `giong::driver_choice()` tells which driver
+a worker got, who chose it and why. Kernel bugs that would cost io_uring are worked
+around: Ubuntu 24.04's 6.8 kernels from 6.8.0-135 on refuse correctly formed buffer rings,
+and giong registers its ring the way they accept ([DEPLOYMENT.md](docs/DEPLOYMENT.md#ubuntu-2404)).
+The whole test suite runs on both drivers, and in CI also inside a Docker container with
+the default profile, on a real 5.15 kernel and on Ubuntu 24.04's own kernel; CI fails if
+giong would not choose io_uring where it should.
 
 | | io_uring | epoll |
 |---|---|---|

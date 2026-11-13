@@ -172,13 +172,31 @@ fn overview_workers_tasks_and_sources() {
         assert_eq!(o["process"]["pid"], std::process::id());
         assert!(o["process"]["rss_bytes"].as_u64().unwrap() > 0);
         assert_eq!(o["workers"].as_array().unwrap().len(), 2);
+        let choice = giong::Builder::new()
+            .block_on(async { giong::driver_choice() })
+            .unwrap();
+        assert_eq!(o["workers"][0]["driver"], choice.kind.name());
+        let c = &o["workers"][0]["driver_choice"];
+        assert!(c["chosen_by"].is_string(), "{o}");
         assert_eq!(
-            o["workers"][0]["driver"],
-            giong::Builder::new()
-                .block_on(async { giong::driver_kind().name() })
-                .unwrap()
+            c["io_uring_error"].as_str(),
+            choice.io_uring_error.as_deref()
         );
-        assert!(o["warnings"].as_array().unwrap().is_empty(), "{o}");
+        // Where io_uring is blocked (CI's Docker job), giong says why it runs
+        // on epoll; anywhere else, nothing is wrong.
+        let warnings = o["warnings"].as_array().unwrap();
+        match &choice.io_uring_error {
+            Some(e) => {
+                assert_eq!(warnings.len(), 1, "{o}");
+                let w = warnings[0].as_str().unwrap();
+                assert!(
+                    w.starts_with("2 of 2 workers run on the epoll driver"),
+                    "{w}"
+                );
+                assert!(w.ends_with(e.as_str()), "{w}");
+            }
+            None => assert!(warnings.is_empty(), "{o}"),
+        }
 
         let w = tool(addr, "workers", json!({}));
         let w0 = &w["workers"][0];
@@ -227,9 +245,9 @@ fn a_blocked_worker_is_reported_with_its_task() {
             thread::sleep(Duration::from_millis(500));
 
             let o = tool(addr, "overview", json!({}));
-            let warnings = o["warnings"].as_array().unwrap();
+            let warnings = not_about_the_driver(&o);
             assert_eq!(warnings.len(), 1, "{o}");
-            let warning = warnings[0].as_str().unwrap();
+            let warning = warnings[0];
             assert!(
                 warning.starts_with("worker 1 has been inside one poll"),
                 "{warning}"
@@ -260,9 +278,21 @@ fn a_blocked_worker_is_reported_with_its_task() {
             giong::block_on(async { blocker.await.unwrap() });
             thread::sleep(Duration::from_millis(300));
             let o = tool(addr, "overview", json!({}));
-            assert!(o["warnings"].as_array().unwrap().is_empty(), "{o}");
+            assert!(not_about_the_driver(&o).is_empty(), "{o}");
         },
     );
+}
+
+/// The overview's warnings, less the one that says why giong runs on epoll
+/// (CI runs these tests in a container that blocks io_uring, too).
+fn not_about_the_driver(overview: &Value) -> Vec<&str> {
+    overview["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .filter(|w| !w.contains("because io_uring cannot be used here"))
+        .collect()
 }
 
 #[test]

@@ -11,13 +11,13 @@ use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::buf::BufPool;
-use crate::driver::{Driver, DriverKind, Io, Park};
+use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
@@ -91,6 +91,8 @@ pub(crate) struct WorkerShared {
     bell: Doorbell,
     closed: AtomicBool,
     eventfd: OwnedFd,
+    /// How the worker's driver was chosen; set once the driver is up.
+    driver_choice: OnceLock<DriverChoice>,
 }
 
 impl WorkerShared {
@@ -109,6 +111,7 @@ impl WorkerShared {
             closed: AtomicBool::new(false),
             // SAFETY: a fresh descriptor we own.
             eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            driver_choice: OnceLock::new(),
         }))
     }
 
@@ -311,6 +314,8 @@ impl RuntimeShared {
 struct Config {
     /// `None`: io_uring where the kernel allows it, epoll elsewhere.
     driver: Option<DriverKind>,
+    /// Where `driver` came from.
+    chosen_by: ChosenBy,
     spin: Option<Duration>,
     ring_entries: u32,
     buf_count: u16,
@@ -375,13 +380,16 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let driver = Driver::new(
+        let (driver, choice) = Driver::new(
             cfg.driver,
+            cfg.chosen_by,
             cfg.ring_entries,
             pool.clone(),
             shared.eventfd.as_raw_fd(),
         )?;
         shared.counters.set_driver(driver.kind());
+        // A worker instance is built once, so the slot is always empty here.
+        let _ = shared.driver_choice.set(choice);
         Ok(Rc::new(Self {
             index,
             shared,
@@ -892,12 +900,16 @@ impl Builder {
     /// The settings each worker starts from. Reads `GIONG_DRIVER` when no
     /// driver was named.
     fn config(&self) -> io::Result<Config> {
-        let driver = match self.driver {
-            Some(kind) => Some(kind),
-            None => crate::driver::kind_from_env()?,
+        let (driver, chosen_by) = match self.driver {
+            Some(kind) => (Some(kind), ChosenBy::Builder),
+            None => match crate::driver::kind_from_env()? {
+                Some(kind) => (Some(kind), ChosenBy::Environment),
+                None => (None, ChosenBy::Automatic),
+            },
         };
         Ok(Config {
             driver,
+            chosen_by,
             spin: self.spin,
             ring_entries: self.ring_entries,
             buf_count: self.buf_count,
@@ -1381,6 +1393,32 @@ impl Handle {
         self.rt.least_loaded(self.local_index())
     }
 
+    /// How worker `worker` got its I/O driver (see [`DriverChoice`]), read
+    /// from any thread; `None` until the worker has started.
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`Code::NoSuchWorker`] if `worker` is not below
+    /// [`workers`](Self::workers).
+    pub fn driver_choice(&self, worker: usize) -> Option<DriverChoice> {
+        let Some(shared) = self.rt.workers.get(worker) else {
+            let workers = self.workers();
+            panic!(
+                "{}",
+                crate::error::Error::new(
+                    Code::NoSuchWorker,
+                    format!(
+                        "driver_choice was given worker {worker}, but the runtime has {workers} \
+                         (0 to {})",
+                        workers.saturating_sub(1)
+                    ),
+                    "pass an index below Handle::workers().",
+                )
+            );
+        };
+        shared.driver_choice.get().cloned()
+    }
+
     /// What worker `worker` is doing and has done, read from any thread
     /// without disturbing it: see [`observe::Pulse`].
     ///
@@ -1485,6 +1523,30 @@ pub fn worker_id() -> usize {
 /// Panics when called outside of a giong runtime.
 pub fn driver_kind() -> DriverKind {
     with_worker(|w| w.driver_kind)
+}
+
+/// How the worker the current task is running on got its I/O driver: which
+/// one, who chose it, why io_uring is not used if giong fell back to epoll,
+/// and the kernel bugs giong works around. Its `Display` form is one line,
+/// for a startup log:
+///
+/// ```no_run
+/// giong::block_on(async {
+///     println!("giong driver: {}", giong::driver_choice());
+/// });
+/// ```
+///
+/// # Panics
+///
+/// Panics when called outside of a giong runtime.
+pub fn driver_choice() -> DriverChoice {
+    with_worker(|w| {
+        w.shared
+            .driver_choice
+            .get()
+            .cloned()
+            .expect("giong: a running worker has a driver")
+    })
 }
 
 /// Index of the worker the current thread runs, or `None` outside of a giong
