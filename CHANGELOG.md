@@ -71,6 +71,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   more: `days * 24` overflowed a `u32`. MySQL's own `TIME` stops at 34 days, so only a
   broken or hostile server sends such a value. Found by the new `rows` fuzz target.
 
+### Security
+
+- `giong`: `localhost` and names under `.localhost` resolve to the loopback addresses
+  without asking DNS (RFC 6761). Before, they went through the search list first, so a
+  wildcard record in a search domain, or a forged answer, could point `localhost` at
+  another machine, which `giong-postgres` and `giong-mysql` then trusted as local: no TLS,
+  the password sent in the clear, MySQL's RSA key fetched unverified. A hosts file entry
+  for such a name is used only if it is a loopback address.
+
 ## [0.3.0] - 2026-11-13
 
 "Prove it": the runtime is checked in ways it was not before, and a service gets the
