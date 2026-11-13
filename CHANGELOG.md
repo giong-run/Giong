@@ -8,6 +8,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-13
+
+A fix release. A UDP socket bound to port 0 now has its port to itself: until now it could
+share the port with another socket of the same user and lose datagrams to it. This bug
+caused the rare UDP failures in 0.4.0's CI. The other causes of failing CI runs are fixed
+too: a close path used only by ThreadSanitizer builds, and tests that reused ports or
+depended on timing.
+
 ### Fixed
 
 - **giong**: a `UdpSocket` bound to port 0 could get a port that another UDP socket of the
@@ -804,7 +812,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/giong-run/Giong/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/giong-run/Giong/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
