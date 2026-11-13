@@ -34,8 +34,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
   and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
   Unix sockets read and write). A file that turns out shorter than announced is the new
-  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. Bare-metal
-  numbers are in the `giong-tls` README.
+  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
+  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
+  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
+  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
+  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
+  `giong-tls` README has the table and when to turn it on. Recorded in
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
 - **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
   data, on both drivers (giong-tls sends TLS alerts and key updates through it).
 - **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header

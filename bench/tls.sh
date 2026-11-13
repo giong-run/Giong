@@ -151,14 +151,14 @@ for r in rows:
     if r["endpoint"] not in endpoints: endpoints.append(r["endpoint"])
 
 med = statistics.median
-print(f"{'endpoint':<10}{'server':<17}{'req/s median':>13}{'min':>10}{'max':>10}"
+print(f"{'endpoint':<13}{'server':<17}{'req/s median':>13}{'min':>10}{'max':>10}"
       f"{'p50 ms':>9}{'p99 ms':>9}{'cpu%':>6}{'us/req':>9}{'errors':>8}")
 for ep in endpoints:
     for s in servers:
         sel = [r for r in rows if r["server"] == s and r["endpoint"] == ep]
         if not sel: continue
         rps = [float(r["rps"]) for r in sel]
-        print(f"{ep:<10}{s:<17}{med(rps):13.0f}{min(rps):10.0f}{max(rps):10.0f}"
+        print(f"{ep:<13}{s:<17}{med(rps):13.0f}{min(rps):10.0f}{max(rps):10.0f}"
               f"{med(to_ms(r['p50']) for r in sel):9.2f}{med(to_ms(r['p99']) for r in sel):9.2f}"
               f"{med(int(r['cpu']) for r in sel):6.0f}{med(float(r['us_per_req']) for r in sel):9.2f}"
               f"{sum(int(r['errors']) for r in sel):8d}")

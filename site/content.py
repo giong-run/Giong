@@ -483,7 +483,9 @@ LIMITS = [
     ("Not Tokio's ecosystem", "Crates that need the Tokio runtime (hyper, sqlx, reqwest) do not run "
                               "on giong. Crates that only use `std::future` do."),
     ("No HTTP/2", "`giong-http` speaks HTTP/1.1. A request body over the limit is refused."),
-    ("No kTLS", "TLS runs in user space on rustls, and certificates are not reloaded for you."),
+    ("TLS without an audit", "`giong-tls` has had no independent audit, and certificates are not "
+                             "reloaded for you. Kernel TLS is off by default: it beats rustls for "
+                             "large files sent with `sendfile`, not for small responses."),
     ("Running tasks stay put", "New work can go to the least busy worker (`spawn_balanced`, "
                                "`bind_balanced`), but a task never moves once it has started."),
     ("Some gaps", "Names come from `/etc/hosts` and DNS, not mDNS or LDAP. Also missing: Unix "

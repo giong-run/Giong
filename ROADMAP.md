@@ -239,7 +239,9 @@ Each item lands only with a benchmark showing what it buys.
 - [ ] Receive bundles (several buffers per completion).
 - [ ] Optional `SQPOLL` mode.
 - [ ] Optional NAPI busy polling.
-- [ ] Kernel TLS (kTLS) for `giong-tls`.
+- [x] Kernel TLS (kTLS) for `giong-tls`: +36% serving 1 MiB files over HTTPS with `sendfile`
+  on bare metal; slower than rustls from memory, so off by default
+  ([numbers](giong-tls/README.md#when-it-pays-off)).
 
 **Exit criteria:** a documented, reproducible gain for every option that is merged.
 

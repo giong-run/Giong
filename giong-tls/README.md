@@ -129,9 +129,29 @@ What the kernel needs, checked once per process on throwaway loopback sockets (`
 
 Two more cases stay in the process under `Auto` and fail under `Required`: a configuration that allows 0-RTT data, and a stream on which `TcpStream::recv` was used before the handshake (giong may hold bytes the kernel would never see; read a plaintext greeting with `TcpStream::read` instead). Once the kernel has taken a connection it behaves as before: session tickets reach the client's session cache, alerts and `close_notify` are handled as rustls handles them, renegotiation is refused, a tampered record is an error, `recv` is cancel safe, and a cancelled `write_all` stops the stream from sending.
 
+### When it pays off
+
+Kernel TLS is not faster by itself. Measured on bare metal (AMD EPYC 4345P, Linux 7.0, loopback, the server on one core, TLS 1.3 with AES-256-GCM, medians of five rounds; `bench/tls.sh` and `bench/http-client.sh`, recorded in [`bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`](../bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/summary.txt)):
+
+| What the server sends | rustls in the process | Kernel TLS | |
+|---|---|---|---|
+| **1 MiB from a file** (`send_file`, `Body::file`) | 4,484 req/s, 223 µs CPU each | **6,104 req/s, 164 µs** | **+36%** |
+| 64 KiB from a file | 62,927 | 55,763 | −11% |
+| 1 MiB from memory | 5,038 | 4,101 | −19% |
+| 64 KiB from memory | 69,989 | 54,693 | −22% |
+| A small JSON response | 414,168 | 347,206 | −16% |
+| An 8 KB JSON response | 100,697 | 96,931 | −4% |
+| A new connection per request | 14,306 | 13,255 | −7% |
+
+On the receiving side (giong-http's client on one core) the kernel decrypting 64 KiB bodies gives +11% (63,273 → 70,492 req/s), 1 MiB bodies +6% with noisy rounds, and small JSON responses −8%. For comparison, nginx 1.24 on the same machine serves the 1 MiB file at 6,039 req/s with kernel TLS and `sendfile` (166 µs of CPU each), and at 3,547 with OpenSSL in the process.
+
+Why: rustls with `ring`'s AES-GCM is fast, and data sent from memory has to be copied into pages the kernel allocates and zeroes for every record, which costs more than it saves. With `sendfile` nothing is copied: the profile of the 1 MiB file shows the ~20% that rustls spends copying (`pread`, then `send`) gone and the kernel's AVX-512 AES-GCM encrypting straight from the page cache. The next cost is page zeroing on allocation (`kernel_init_pages`, 11% of the kernel TLS server's time with `init_on_alloc=1`, Ubuntu's default); booting with `init_on_alloc=0` should remove most of it, which has not been measured. At 64 KiB per response the kernel's fixed costs still outweigh the copy saved; the crossover is somewhere between 64 KiB and 1 MiB.
+
+So `Ktls::Off` stays the default. Use `Ktls::Auto` on a server whose large responses (hundreds of KiB and up) come from files through `send_file` or giong-http's `Body::file`, and on a client that downloads large bodies. Keep rustls in the process for small responses and for bodies built in memory. `bench/tls.sh` measures your own sizes: `SERVERS="giong-http-tls giong-http-ktls" ENDPOINTS="file64k file1m" bench/tls.sh`.
+
 ## Performance
 
-Measured with `bench/tls.sh` on one core, with the same rustls and `ring` on both sides: HTTPS through `giong-http` reaches 144.8k req/s on `/json` against 81.0k for Axum + rustls; compared with plain HTTP on giong, TLS costs 4% on `/json` and 14% with an 8 KB response. Handshakes per second are level (7.1k against 7.3k), because that part is almost entirely cryptography. Details and how to read the numbers are in the [main README](../README.md#https).
+Measured with `bench/tls.sh` on one core, with the same rustls and `ring` on both sides: HTTPS through `giong-http` reaches 144.8k req/s on `/json` against 81.0k for Axum + rustls; compared with plain HTTP on giong, TLS costs 4% on `/json` and 14% with an 8 KB response. Handshakes per second are level (7.1k against 7.3k), because that part is almost entirely cryptography. Details and how to read the numbers are in the [main README](../README.md#https); kernel TLS has its own numbers [above](#when-it-pays-off).
 
 ## Not there yet
 

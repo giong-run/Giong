@@ -591,6 +591,16 @@ rounds. The server's core was 98–101% busy in every row, so the server was the
 - One connection per request is not measured for plain HTTP: on loopback that test runs
   out of client ports (TIME_WAIT) at about 28,000 per second and measures the client.
 
+**Kernel TLS pays off for large files, not for data in memory.** On bare metal (EPYC
+4345P, Linux 7.0, the server on one core), giong-http serving a 1 MiB file with
+`Body::file` and kernel TLS reaches 6,104 req/s against 4,484 with rustls in the process
+(+36%, and 164 µs of CPU per request against 223): `sendfile` lets the kernel encrypt
+straight from the page cache. nginx with kernel TLS and `sendfile` does 6,039 on the
+same machine. With 64 KiB files, with bodies from memory and with small responses the
+kernel is 4–22% slower than rustls, so `Ktls::Off` stays the default. A client receiving
+64 KiB bodies gains 11% from letting the kernel decrypt. The whole table and a profile
+are in the [`giong-tls` README](giong-tls/README.md#when-it-pays-off).
+
 ### PostgreSQL
 
 `bench/postgres.sh`: [`giong-postgres`](giong-postgres/README.md#performance) against
@@ -824,8 +834,7 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
 - **`giong-tls` has had no independent audit** (see the
-  [self-review](docs/reviews/2026-11-giong-tls.md)), and kernel TLS does not yet send
-  files straight from the page cache (`sendfile`).
+  [self-review](docs/reviews/2026-11-giong-tls.md)).
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
   sqlx, reqwest) do not run on giong. Crates that only use `std::future` do. For
   PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for MySQL,
