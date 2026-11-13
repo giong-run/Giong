@@ -191,6 +191,24 @@ codes! {
     /// away, or the response is to a `HEAD` request or has a status without
     /// a body.
     HttpBodyNotSent = 1114, BrokenPipe, "response body not sent";
+    /// The other end broke the HTTP/2 protocol. The server closes the
+    /// connection with a GOAWAY frame whose debug data carries this code
+    /// and the rule that was broken.
+    Http2Protocol = 1115, InvalidData, "HTTP/2 protocol error";
+    /// An HTTP/2 client cancelled (or had refused) more streams than the
+    /// server allows in a short time, the pattern of the "rapid reset"
+    /// attack. The server closes the connection with `ENHANCE_YOUR_CALM`.
+    Http2TooManyResets = 1116, ConnectionAborted, "too many HTTP/2 streams reset";
+    /// An HTTP/2 client sent more frames that do no work (PING, SETTINGS,
+    /// PRIORITY, empty DATA or CONTINUATION frames, WINDOW_UPDATE frames
+    /// with nothing to send, frames for closed streams, unknown frame
+    /// types) than the server allows in a short time. The server closes
+    /// the connection with `ENHANCE_YOUR_CALM`.
+    Http2Flood = 1117, ConnectionAborted, "too many HTTP/2 control frames";
+    /// An HTTP/2 header block (HEADERS and its CONTINUATION frames) grew
+    /// past the limit before it ended. The server closes the connection
+    /// with `ENHANCE_YOUR_CALM`.
+    Http2HeadersTooLarge = 1118, InvalidData, "HTTP/2 header block too large";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with

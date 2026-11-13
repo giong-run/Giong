@@ -1,8 +1,8 @@
 //! # giong-http
 //!
-//! A small, strict HTTP/1.1 server for the [giong] thread-per-core
-//! runtime, and (with the `client` feature) an HTTP/1.1 client: see
-//! `giong_http::client`.
+//! A small, strict HTTP/1.1 and HTTP/2 server for the [giong]
+//! thread-per-core runtime, and (with the `client` feature) an HTTP/1.1
+//! client: see `giong_http::client`.
 //!
 //! ```no_run
 //! use giong::net::TcpListener;
@@ -33,6 +33,13 @@
 //!
 //! * HTTP/1.1 and HTTP/1.0, keep-alive, pipelining (responses to pipelined
 //!   requests are sent in one write).
+//! * HTTP/2 (RFC 9113), chosen through ALPN over TLS and with prior
+//!   knowledge over plain TCP, for the same handlers: every stream is a
+//!   [`Request`] like any other ([`Request::version`] tells them apart).
+//!   Flow control, HPACK, trailers, `Expect: 100-continue` and streamed
+//!   bodies both ways; limits against rapid reset, frame floods,
+//!   CONTINUATION floods, HPACK bombs and stalled readers, each with its
+//!   `GIONG-E` code. See [`Server::http2`].
 //! * Request bodies with `Content-Length` or chunked encoding, fully received
 //!   before the handler runs; `Expect: 100-continue`.
 //! * Bodies that do not fit in memory: a handler can read the request body
@@ -50,12 +57,15 @@
 //!
 //! ## What it does not do (yet)
 //!
-//! HTTP/2, compression, routing (see the `giong-web` crate for the last two).
+//! Compression, routing (see the `giong-web` crate), server push, and
+//! HTTP/2 in the client.
 //!
 //! ## HTTPS
 //!
 //! With the `tls` feature, [`Server::serve_tls`] serves the same handlers over
-//! TLS, using the `giong-tls` crate (rustls).
+//! TLS, using the `giong-tls` crate (rustls). The server offers `h2` and
+//! `http/1.1` through ALPN, so browsers get HTTP/2; with
+//! [`Server::http2(false)`](Server::http2) it offers only `http/1.1`.
 //!
 //! ## Client
 //!
@@ -71,6 +81,7 @@ pub mod client;
 mod date;
 #[cfg(test)]
 mod fuzz_tests;
+mod h2;
 mod heap;
 #[cfg(any(test, fuzzing))]
 mod invariants;
@@ -80,7 +91,7 @@ mod response;
 mod server;
 
 pub use body::{BodySender, BodyStream, StreamBody};
-pub use request::Request;
+pub use request::{Request, Version};
 pub use response::{reason_phrase, Body, FileBody, Response};
 pub use server::{Handler, Server, Transport};
 
@@ -91,5 +102,8 @@ pub use server::{Handler, Server, Transport};
 pub mod fuzzing {
     #[cfg(feature = "client")]
     pub use crate::client::fuzzing::{check_inflate, check_response_head, check_url};
-    pub use crate::invariants::{check_chunked, check_head};
+    pub use crate::invariants::{
+        check_chunked, check_h2_output, check_head, check_hpack, check_huffman, h2_connection,
+        h2_input,
+    };
 }

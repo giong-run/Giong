@@ -17,6 +17,7 @@ use giong::time::{sleep, timeout};
 
 use crate::body::{Failure, Next, Pipe, StreamBody};
 use crate::chunked::{Decoder, Progress};
+use crate::h2::PREFACE;
 use crate::heap::HeapFuture;
 use crate::parse::{find_head_end, parse_head};
 use crate::request::{BodyBytes, Request};
@@ -59,7 +60,7 @@ thread_local! {
     };
 }
 
-fn take_buffer() -> Vec<u8> {
+pub(crate) fn take_buffer() -> Vec<u8> {
     BUFFERS
         .with(|pool| {
             let mut pool = pool.borrow_mut();
@@ -70,7 +71,7 @@ fn take_buffer() -> Vec<u8> {
         .unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE))
 }
 
-fn give_buffer(mut buf: Vec<u8>) {
+pub(crate) fn give_buffer(mut buf: Vec<u8>) {
     buf.clear();
     let capacity = buf.capacity();
     if capacity == 0 || capacity > POOL_MAX_BUFFER {
@@ -327,14 +328,16 @@ where
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Config {
-    idle_timeout: Duration,
-    request_timeout: Duration,
-    write_timeout: Duration,
-    max_head_size: usize,
-    max_body_size: usize,
-    shutdown_linger: Duration,
-    max_connections: usize,
+pub(crate) struct Config {
+    pub(crate) idle_timeout: Duration,
+    pub(crate) request_timeout: Duration,
+    pub(crate) write_timeout: Duration,
+    pub(crate) max_head_size: usize,
+    pub(crate) max_body_size: usize,
+    pub(crate) shutdown_linger: Duration,
+    pub(crate) max_connections: usize,
+    pub(crate) http2: bool,
+    pub(crate) max_concurrent_streams: u32,
 }
 
 /// An HTTP/1.1 server. Configure it, then call [`serve`](Server::serve) from
@@ -365,7 +368,7 @@ struct Config {
 /// ```
 #[derive(Clone, Debug)]
 pub struct Server {
-    cfg: Config,
+    pub(crate) cfg: Config,
 }
 
 impl Default for Server {
@@ -386,6 +389,8 @@ impl Server {
                 max_body_size: 1024 * 1024,
                 shutdown_linger: Duration::from_millis(100),
                 max_connections: usize::MAX,
+                http2: true,
+                max_concurrent_streams: 100,
             },
         }
     }
@@ -450,13 +455,50 @@ impl Server {
         self
     }
 
+    /// Whether to speak HTTP/2 (default: yes).
+    ///
+    /// Over TLS ([`serve_tls`](Self::serve_tls)) the server offers `h2` and
+    /// `http/1.1` through ALPN, and each client picks; browsers pick `h2`.
+    /// Without TLS, a connection that starts with the HTTP/2 preface is
+    /// served over HTTP/2 ("prior knowledge", as gRPC clients and proxies
+    /// such as Envoy speak to backends), and any other over HTTP/1.1.
+    /// Handlers are the same either way: [`Request::version`] tells them
+    /// apart.
+    ///
+    /// `false` serves HTTP/1.1 only, and offers only `http/1.1` through
+    /// ALPN.
+    ///
+    /// [`Request::version`]: crate::Request::version
+    pub fn http2(mut self, enabled: bool) -> Self {
+        self.cfg.http2 = enabled;
+        self
+    }
+
+    /// Most requests one HTTP/2 connection may have in progress at once
+    /// (default: 100, the least RFC 9113 recommends). Further streams are
+    /// refused with `REFUSED_STREAM`, and the client retries them later.
+    ///
+    /// Memory for request bodies does not grow with it as it would with as
+    /// many connections. Each stream may send 64 KiB of its body before
+    /// the server grants more; beyond that, the bodies one connection holds
+    /// share a budget of the larger of
+    /// [`max_body_size`](Self::max_body_size) and 1 MiB. The oldest stream
+    /// still receiving always gets more, so that past the budget bodies are
+    /// received in turn instead of together.
+    pub fn max_concurrent_streams(mut self, max: u32) -> Self {
+        self.cfg.max_concurrent_streams = max.max(1);
+        self
+    }
+
     /// Accepts connections on `listener` and answers their requests with
     /// `handler` until the runtime is asked to shut down.
     ///
     /// Each connection runs as its own task on the current worker. When a
     /// shutdown is requested, the listener stops accepting, idle connections
     /// are closed, and requests being handled are finished and answered with
-    /// `Connection: close`, within the grace period configured on the runtime.
+    /// `Connection: close` (over HTTP/2: a GOAWAY, after which the streams
+    /// in progress finish), within the grace period configured on the
+    /// runtime.
     ///
     /// A handler that panics takes down its connection only.
     pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
@@ -523,6 +565,13 @@ impl Server {
     ) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
+        // The server says which protocols it speaks, whatever the acceptor
+        // was configured with.
+        let acceptor = if cfg.http2 {
+            acceptor.alpn(&[b"h2", b"http/1.1"])
+        } else {
+            acceptor.alpn(&[b"http/1.1"])
+        };
         let accept = || listener.accept();
         self.accept_loop(accept, |stream: TcpStream, slot| {
             let _ = stream.set_nodelay(true);
@@ -530,7 +579,16 @@ impl Server {
             drop(giong::spawn(async move {
                 // A failed handshake (a port scan, a plain-HTTP client, an
                 // unknown protocol version) just ends the connection.
-                if let Ok(tls) = acceptor.accept(stream).await {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                if tls.alpn_protocol().as_deref() == Some(b"h2") {
+                    let _slot = slot;
+                    let peer = Transport::peer_addr(&tls);
+                    // On the heap, so that HTTP/1.1 connections do not
+                    // carry the larger HTTP/2 state.
+                    HeapFuture::new(serve_h2(tls, cfg, peer, handler)).await;
+                } else {
                     Conn::new(tls, cfg, Some(slot)).serve(handler).await;
                 }
             }));
@@ -625,12 +683,25 @@ impl Drop for Slot {
     }
 }
 
+/// An HTTP/2 connection chosen through ALPN: its own task body.
+#[cfg(feature = "tls")]
+async fn serve_h2<T: Transport, H: Handler>(
+    stream: T,
+    cfg: Config,
+    peer: Option<SocketAddr>,
+    handler: Rc<H>,
+) {
+    crate::h2::serve(&stream, cfg, peer, &*handler, Vec::new()).await;
+}
+
 /// Why a connection stops reading requests.
 enum End {
     /// Close without a response: end of stream, idle timeout, I/O error.
     Close,
     /// Answer with this error status, then close.
     Status(u16),
+    /// The connection starts with the HTTP/2 preface: hand it over.
+    Http2,
 }
 
 /// A request body read as it arrives (see `Handler::stream_body`).
@@ -721,6 +792,9 @@ struct Conn<T> {
     closing: bool,
     /// Deadline for the request currently being received.
     deadline: Option<Instant>,
+    /// Nothing has been parsed yet: the connection may still turn out to be
+    /// HTTP/2 with prior knowledge.
+    first: bool,
     /// The connection's place under `max_connections`, given back when the
     /// connection is dropped. Declared last, so that the stream is closed
     /// first.
@@ -740,6 +814,7 @@ impl<T: Transport> Conn<T> {
             body: Body::Empty,
             closing: false,
             deadline: None,
+            first: true,
             _slot: slot,
         }
     }
@@ -762,6 +837,13 @@ impl<T: Transport> Conn<T> {
             let (req, streamed) = match self.next_request(handler).await {
                 Ok(next) => next,
                 Err(End::Close) => break,
+                Err(End::Http2) => {
+                    let input = self.buf[self.pos..].to_vec();
+                    self.release_read_buffer_all();
+                    let h2 = crate::h2::serve(&self.stream, self.cfg, self.peer, handler, input);
+                    HeapFuture::new(h2).await;
+                    return;
+                }
                 Err(End::Status(status)) => {
                     self.reserve_out();
                     Response::new(status).write_to(&mut self.out, 1, false, false);
@@ -1080,6 +1162,19 @@ impl<T: Transport> Conn<T> {
                 blank_lines += 1;
             }
             let data = &self.buf[self.pos..];
+            if self.first && self.cfg.http2 && !data.is_empty() {
+                // HTTP/2 with prior knowledge: the preface, before anything
+                // else was sent on the connection.
+                let n = data.len().min(PREFACE.len());
+                if data[..n] == PREFACE[..n] {
+                    if n == PREFACE.len() {
+                        return Err(End::Http2);
+                    }
+                    self.read_more(false).await?;
+                    continue;
+                }
+                self.first = false;
+            }
             if let Some(end) = find_head_end(data, self.scanned) {
                 if end > self.cfg.max_head_size {
                     return Err(End::Status(431));
@@ -1261,6 +1356,12 @@ impl<T: Transport> Conn<T> {
         if self.out.capacity() == 0 {
             self.out = take_buffer();
         }
+    }
+
+    /// Hands the read buffer back, whatever is left in it.
+    fn release_read_buffer_all(&mut self) {
+        self.pos = self.buf.len();
+        self.release_read_buffer();
     }
 
     /// Hands the read buffer back to the worker's pool if all of it has
