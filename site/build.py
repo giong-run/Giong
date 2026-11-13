@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generates site/public/index.html.
 
-Every number comes from the README of release 0.2 and bench/results/ in the
+Every number comes from the README of release 0.3 and bench/results/ in the
 repository. Change a number in CHARTS or in the text tables T below, run
 `python3 site/build.py`, and the page in site/public/ follows.
 """
@@ -329,7 +329,7 @@ EXAMPLES = [
 ]
 
 # From "Compared with Monoio and Glommio" in the README. Versions as measured there.
-COMPARE_HEAD = ["", "giong 0.2", "Monoio 0.2.4", "Glommio 0.9.0"]
+COMPARE_HEAD = ["", "giong 0.3", "Monoio 0.2.4", "Glommio 0.9.0"]
 COMPARE = [
     ("Platforms", "Linux ≥ 6.0", "Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS)",
      "Linux ≥ 5.8, needs a raised memlock limit"),
@@ -345,9 +345,11 @@ COMPARE = [
     ("Scheduling", "FIFO", "FIFO", "weighted queues with latency classes"),
     ("I/O", "TCP, UDP, Unix sockets, files", "TCP, UDP, Unix sockets, files",
      "TCP, UDP, Unix sockets, Direct I/O files"),
-    ("Ecosystem", "its own HTTP/1.1 server and server-side TLS; nothing else",
+    ("Ecosystem", "its own HTTP/1.1 server and client, TLS for both sides, DNS, PostgreSQL, MySQL "
+                  "and Redis clients",
      "TLS, HTTP, codecs, Tokio compatibility layer", "channels, semaphores, rate control"),
-    ("Size", "~5,400 lines, plus ~2,250 for HTTP and TLS", "~25,000 lines", "~40,500 lines"),
+    ("Size", "~8,800 lines, plus ~5,500 for HTTP and TLS and ~17,000 for the database clients",
+     "~25,000 lines", "~40,500 lines"),
 ]
 
 # From ROADMAP.md. (version, name, state, items, exit criteria)
@@ -356,25 +358,26 @@ ROADMAP = [
      ["Executor, io_uring driver, TCP, UDP, files, timers",
       "Thread-per-core runtime, busy-poll mode, cross-thread channel",
       "Cancellation safety, backpressure, tests and benchmarks"], ""),
-    ("0.2", "A runtime you can serve from", "current",
+    ("0.2", "A runtime you can serve from", "done",
      ["Graceful connection draining on shutdown",
       "Unix sockets, multishot UDP, more file operations",
       "`giong-http` and `giong-tls`, HTTPS in `giong-http`",
       "ThreadSanitizer and ring fallbacks in CI; 500,000 random parser inputs"], ""),
-    ("0.3", "Prove it", "next",
-     ["Multi-core benchmarks on a physical network, 1 to N workers",
+    ("0.3", "Prove it", "done",
+     ["A multi-core benchmark, 1 to 10 workers on 14 cores",
       "The suite on real 6.0 and 6.1 kernels",
       "`loom` model check of the cross-thread wake-up; `cargo fuzz` of the parser",
-      "Soak test; an independent look at `giong-tls`"],
+      "Soak test; a security review of `giong-tls`"],
      "published multi-core results with their method, and no open memory- or thread-safety finding"),
-    ("0.4", "Foundations for services", "next",
-     ["Asynchronous DNS; `connect` by name, the RFC 8305 way",
+    ("0.4", "Foundations for services", "current",
+     ["Scaling on bare metal and a physical network, carried over from 0.3",
+      "Asynchronous DNS; `connect` by name, the RFC 8305 way",
       "TLS client: the machine's or compiled-in roots, ALPN, mutual TLS",
       "Bounded and oneshot channels; a handle from `spawn_on`; `writev`",
       "Error codes that say how to fix them; `AGENTS.md` and `llms.txt`"],
      "every item with tests, including cancellation tests"),
-    ("crates", "What a service needs", "planned",
-     ["`giong-postgres`: SCRAM, TLS, pipelining, a pool per core",
+    ("crates", "What a service needs", "current",
+     ["`giong-postgres` and `giong-mysql`: TLS, pipelining, a pool per core",
       "An HTTP client in `giong-http`; `giong-redis` with automatic pipelining",
       "`giong-web`: router, middleware, JSON, compression; streaming bodies",
       "`giong-mcp`: a read-only MCP server for coding agents"],
@@ -408,7 +411,7 @@ NON_GOALS = ["Production on other operating systems: Linux only, io_uring first.
 
 FAQ = [
     ("Is giong ready for production?",
-     "Not yet. 0.2 is complete enough to write real servers and is tested hard (see "
+     "Not yet. 0.3 is complete enough to write real services and is tested hard (see "
      "<a href=\"#verified\">what has been checked</a>), but it has not run in production. 1.0 "
      "waits for, among other things, at least one production user reporting back."),
     ("Does it run on macOS or Windows?",
@@ -544,45 +547,63 @@ T = dict(
         ("Old kernels", "Three ring setups, tried in order: `DEFER_TASKRUN` (6.1+), `COOP_TASKRUN` "
                         "(6.0), no flags. The fallbacks are tested on every change by forcing them."),
     ],
-    crates=("crates", "Four crates, one version number",
+    crates=("crates", "Six crates, one version number",
             "The runtime, and the layers a service needs on top of it. Together they serve HTTPS "
             "at 144.8k requests/s on one core, against 81.0k for Axum on the same rustls."),
     crate=[
-        ("giong", "The runtime: TCP, UDP, Unix sockets, files, timers, a cross-thread channel and "
+        ("giong", "The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and "
                   "graceful shutdown.",
          ["`Builder::new().workers(n)`, one worker per core",
           "`TcpListener`, `TcpStream`, `UdpSocket`, `UnixListener`, `UnixStream`",
-          "`fs::File` with `read_at` and `write_at`, `fs::read`, `rename`, `remove_file`",
-          "`time::sleep`, `timeout`, `spawn`, `Handle::spawn_on`, `sync::mpsc`"],
-         "about <b>5,400</b> lines · <b>115</b> tests"),
-        ("giong-http", "A small, strict HTTP/1.1 server with one async handler.",
+          "`fs::File` with `read_at` and `write_at`, `fs::read`, `read_dir`, `rename`",
+          "`net::lookup_host` without blocking; `sync::mpsc`, `bounded`, `oneshot`; `spawn_on`"],
+         "about <b>8,800</b> lines · <b>188</b> tests"),
+        ("giong-http", "A small, strict HTTP/1.1 server with one async handler, and a client.",
          ["Keep-alive, pipelining, bodies by `Content-Length` or chunked",
           "Limits on head and body size; timeouts for idle, slow and slow-reading clients",
           "Answers `400` to any request a proxy in front could read differently",
-          "`Server::serve`, `serve_unix`, `serve_tls`"],
-         "about <b>1,850</b> lines · <b>46</b> tests, among them 500,000 random inputs for the parser"),
-        ("giong-tls", "Server-side TLS 1.2 and 1.3 on rustls with `ring`. No OpenSSL.",
-         ["`TlsAcceptor::from_pem(cert, key)`, or bring your own `rustls::ServerConfig`",
+          "`Server::serve`, `serve_unix`, `serve_tls`; a pooled HTTPS `Client` behind `client`"],
+         "about <b>4,500</b> lines · <b>81</b> tests · the parser fuzzed every night"),
+        ("giong-tls", "TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
+         ["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
           "`recv()` is cancel safe",
           "A cancelled write poisons the sending side instead of corrupting the record stream",
-          "ALPN and a handshake timeout"],
-         "about <b>390</b> lines · <b>8</b> tests · TLS costs 4% on `/json`"),
+          "ALPN, client certificates and a handshake timeout"],
+         "about <b>960</b> lines · <b>34</b> tests · TLS costs 4% on `/json`"),
         ("giong-postgres", "A PostgreSQL client and pool. The statements of every task pipeline "
                            "over a few connections.",
          ["`Client::connect`, `query`, `execute`, `transaction`, `cancel_token`",
           "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
           "Every statement prepared once per connection and cached",
           "TLS verified by default for remote hosts; SCRAM-SHA-256"],
-         "about <b>5,300</b> lines · <b>73</b> tests · 2.6× deadpool's statements per core"),
+         "about <b>5,400</b> lines · <b>76</b> tests · 2.6× deadpool's statements per core"),
+        ("giong-mysql", "A MySQL 8 client and pool, built the same way as giong-postgres.",
+         ["`Client::connect`, `query`, `execute`, `transaction`",
+          "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
+          "Prepared statements on the binary protocol, cached per connection",
+          "TLS; `caching_sha2_password` and `mysql_native_password`"],
+         "about <b>6,300</b> lines · <b>83</b> tests · 4.7× SQLx's statements per core"),
+        ("giong-redis", "A Redis client and pool on RESP3. The commands of every task pipeline "
+                        "over one connection.",
+         ["Typed commands, `query` for any other, `Pipeline` for a batch",
+          "Transactions with `watch`; Pub/Sub",
+          "A `Pool` per worker; `take()` for a connection of your own",
+          "TLS; Redis 6 or newer (RESP3)"],
+         "about <b>5,200</b> lines · <b>67</b> tests · 1.4× redis-rs's `GET`s per core"),
     ],
     verified=("verified", "What has been checked, and what has not",
               "A runtime that hands buffers to the kernel has to earn trust. This is the evidence "
               "so far, and the gaps in it."),
     checked_h="Checked", unchecked_h="Not checked, and you should know it",
     checked=[
-        "**169 tests** across the three crates, repeated in release mode on all three io_uring setups "
+        "**529 tests** across the six crates, repeated in release mode on all three io_uring setups "
         "without a failure.",
-        "**ThreadSanitizer** over 157 tests: no data race.",
+        "**ThreadSanitizer** over the tests: no data race. **loom** model-checks the cross-thread "
+        "wake-up; it found a lost wake-up, now fixed.",
+        "**Real Linux 6.0 and 6.1 kernels** in QEMU on every change; they found a start failure "
+        "on 6.0, now fixed.",
+        "**Fuzzing** of the HTTP parser and whole connections every night, and a **two-hour soak "
+        "test** for leaked descriptors and memory.",
         "**valgrind memcheck** over the single-threaded tests: no invalid access, no leak.",
         "**Load:** over 250,000 connections opened and closed, 5,000 at once, the client killed "
         "abruptly six times. File descriptors return to the idle count and memory does not grow "
@@ -590,38 +611,36 @@ T = dict(
         "**Graceful shutdown under load:** SIGTERM during 40 slow requests. With a grace period, "
         "400 of 400 were answered; without one, 156 of 200.",
         "**CI** runs formatting, clippy, the documentation build, a build with Rust 1.80, the "
-        "repeated tests, the fallback setups and ThreadSanitizer.",
+        "repeated tests, the fallback setups, ThreadSanitizer, loom and the old kernels.",
     ],
     unchecked=[
         "giong has **not run in production**.",
-        "**No real 6.0 kernel.** The fallback setups were forced on 6.18. That checks giong's code "
-        "paths, not the behaviour of the old kernel itself.",
+        "**No bare-metal scaling numbers.** The multi-core benchmark ran under WSL2 over loopback.",
         "Neither sanitizer nor valgrind can see the kernel writing into memory, so cancellation "
         "safety rests on the design and on `tests/cancel.rs`.",
-        "The cross-thread wake-up has not been model-checked with loom.",
-        "`giong-tls` has had **no independent security audit**. The cryptography and the protocol "
-        "are rustls's; giong's part is connecting rustls to the socket.",
+        "`giong-tls` has had **no independent security audit**, only a review by the project's AI "
+        "agent. The cryptography and the protocol are rustls's.",
     ],
     limits=("limits", "When giong is the wrong choice",
-            "0.2 is complete enough to write real servers. It is also young, narrow on purpose, "
+            "0.3 is complete enough to write real services. It is also young, narrow on purpose, "
             "and Linux only."),
     limit=[
-        ("Linux only", "Kernel 6.0 or newer. There is no epoll, kqueue or IOCP fallback, and there "
-                       "will not be one."),
+        ("Linux only", "Kernel 6.0 or newer. An epoll driver for machines where io_uring is blocked "
+                       "is planned for 0.5; there will be no kqueue or IOCP."),
         ("Not Tokio's ecosystem", "Crates that need the Tokio runtime (hyper, sqlx, reqwest) do not "
                                   "run on giong. Crates that only use `std::future` do."),
         ("No HTTP/2", "`giong-http` speaks HTTP/1.1 and receives a body in full before it calls the "
                       "handler. A body over the limit is refused, not streamed."),
-        ("TLS is server side only", "No TLS client, no kTLS, no certificate reload built in."),
+        ("No kTLS", "TLS runs in user space on rustls, and certificates are not reloaded for you."),
         ("Tasks do not migrate", "An overloaded core is not helped by an idle one. Spread work "
                                  "yourself with `spawn_on` or a channel."),
-        ("No asynchronous DNS", "`bind` and `connect` resolve names with a blocking call. Also "
-                                "missing: Unix datagram sockets, multicast, reading directories."),
+        ("Files and DNS only", "Names come from `/etc/hosts` and DNS, not mDNS or LDAP. Also "
+                               "missing: Unix datagram sockets, multicast, file locks."),
     ],
     else_h="Pick something else when",
     else_p=[
-        "**Monoio** is the mature choice and runs in production at ByteDance. If you need an HTTP "
-        "client, HTTP/2 or Tokio-compatible crates today, use it.",
+        "**Monoio** is the mature choice and runs in production at ByteDance. If you need HTTP/2 "
+        "or Tokio-compatible crates today, use it.",
         "**Glommio** is built for storage engines: Direct I/O and priority scheduling are its "
         "strengths.",
         "**Tokio** is the general-purpose runtime. giong is not trying to replace it for every workload.",
@@ -641,7 +660,7 @@ T = dict(
              "how each one is built, not a ranking."),
     roadmap_sec=("roadmap", "Where giong is going",
                  "Milestones in order, with no dates: a milestone is done when its exit criteria are "
-                 "met. 0.3 is about measuring, not features."),
+                 "met. 0.3 was about measuring, not features."),
     nongoals_h="Deliberate non-goals",
     resources=("docs & community", "Read more, ask, contribute",
                "giong is open source and developed in the open on GitHub. Open an issue before "
