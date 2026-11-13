@@ -623,4 +623,14 @@ impl Driver {
             Driver::Epoll(d) => d.tracked_ops(),
         }
     }
+
+    /// Received bytes moved from pool buffers to the heap so far, because
+    /// their reader fell behind while the pool ran low, or the pool ran out.
+    /// The epoll driver reads only when asked, so it never does.
+    pub(crate) fn recv_copied(&self) -> u64 {
+        match self {
+            Driver::Uring(d) => d.recv_copied(),
+            Driver::Epoll(_) => 0,
+        }
+    }
 }

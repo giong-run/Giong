@@ -1729,6 +1729,9 @@ pub struct Stats {
     pub recv_buffers: usize,
     /// Armed timers.
     pub timers: usize,
+    /// Received bytes the driver moved from pool buffers to the heap so far,
+    /// because their reader fell behind while the pool ran low.
+    pub recv_copied: u64,
 }
 
 #[doc(hidden)]
@@ -1742,6 +1745,7 @@ pub fn stats() -> Stats {
             free_recv_buffers: w.pool.free(),
             recv_buffers: w.pool.count() as usize,
             timers: w.timers.borrow().len(),
+            recv_copied: driver.recv_copied(),
         }
     })
 }

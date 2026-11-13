@@ -141,6 +141,38 @@ fn large_transfer_is_intact_in_both_directions() {
 }
 
 #[test]
+fn a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies() {
+    // One stream, written 256 KiB at a time: dozens of receives complete
+    // between two turns of the event loop. None of it may be moved out of
+    // the pool while the pool has room (a backlog limit of 8 per stream
+    // once copied most of such a transfer).
+    const LEN: usize = 64 * 1024 * 1024;
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    let writer = std::thread::spawn(move || {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let chunk = vec![5u8; 256 * 1024];
+        for _ in 0..LEN / chunk.len() {
+            s.write_all(&chunk).unwrap();
+        }
+    });
+    giong::block_on(async move {
+        let l = TcpListener::from_std(std_listener);
+        let s = l.accept().await.unwrap();
+        let mut got = 0;
+        while got < LEN {
+            let data = s.recv().await.unwrap();
+            assert!(!data.is_empty(), "EOF after {got} bytes");
+            assert!(data.iter().all(|&b| b == 5));
+            got += data.len();
+        }
+        let stats = giong::stats();
+        assert_eq!(stats.recv_copied, 0, "{stats:?}");
+    });
+    writer.join().unwrap();
+}
+
+#[test]
 fn recv_reports_eof_and_keeps_reporting_it() {
     giong::block_on(async {
         let (l, addr) = listener();

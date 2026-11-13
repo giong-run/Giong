@@ -44,29 +44,30 @@ const UD_WAKE: u64 = u64::MAX - 1;
 /// `user_data` of batched closes, which must finish before shutdown cancels I/O.
 const UD_CLOSE: u64 = u64::MAX - 2;
 
-/// Backpressure for multishot receive. Once this many completions are queued
-/// for a stream that is not being read fast enough:
+/// Backpressure for multishot receive. Once a stream has this many
+/// completions its reader has not taken yet:
 ///
-/// * the multishot receive is paused (cancelled; re-armed when the queue has
-///   been drained), which pushes back on the peer through TCP flow control, and
-/// * anything that still arrives is copied to the heap so that its pool buffer
-///   can be recycled immediately.
+/// * its multishot receive is paused (cancelled; re-armed when the queue has
+///   been drained), which pushes back on the peer through TCP flow control,
+///   and
+/// * while the pool runs low (under a quarter of its buffers free), what
+///   still arrives for it is copied to the heap so that its pool buffer can
+///   be recycled at once.
 ///
-/// Together with [`Uring::evacuate`] this guarantees that slow or stalled
-/// connections cannot pin the shared buffer pool.
-const RECV_BACKLOG_LIMIT: usize = 8;
+/// The limit is an eighth of the pool, and at least 8: a busy stream fills
+/// dozens of buffers between two turns of the event loop, and a reader that
+/// keeps up should get them all without copies or pauses. (A limit of 8 for
+/// every pool copied most of a bulk transfer out of the pool.) Together with
+/// [`Uring::evacuate`] this guarantees that slow or stalled connections
+/// cannot pin the shared buffer pool.
+fn recv_backlog_limit(pool: &BufPool) -> usize {
+    (pool.count() as usize / 8).max(8)
+}
 
 /// A multishot accept is paused once this many accepted connections are
 /// waiting for the application; further connections then wait in the
 /// kernel's listen backlog instead of piling up as open descriptors.
 const ACCEPT_BACKLOG_LIMIT: usize = 1024;
-
-fn backlog_limit(kind: MultiKind) -> usize {
-    match kind {
-        MultiKind::Accept => ACCEPT_BACKLOG_LIMIT,
-        MultiKind::Recv => RECV_BACKLOG_LIMIT,
-    }
-}
 
 enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
@@ -128,6 +129,10 @@ pub(crate) struct Uring {
     starved: bool,
     /// Queued receive completions that hold a piece of a pool buffer.
     pooled_queued: usize,
+    /// [`recv_backlog_limit`] of the pool.
+    recv_limit: usize,
+    /// Received bytes moved out of the pool to the heap.
+    recv_copied: u64,
     /// io_uring features this ring uses.
     features: Vec<IoUringFeature>,
     /// Resources of cancelled operations, handed to the event loop to drop
@@ -482,6 +487,7 @@ impl Uring {
             pool.set_registered(RingId::Packed);
             features.push(IoUringFeature::PackedBuffers);
         }
+        let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
@@ -494,6 +500,8 @@ impl Uring {
             to_pause: Vec::new(),
             starved: false,
             pooled_queued: 0,
+            recv_limit,
+            recv_copied: 0,
             graveyard: Vec::new(),
             wake_fd,
             wake_buf: Box::new(0),
@@ -738,6 +746,7 @@ impl Uring {
                 if let Queued::Piece { bid, off, len } = *item {
                     *item = Queued::Heap(pool.copy_out(bid, off, len));
                     pool.release(bid);
+                    self.recv_copied += u64::from(len);
                 }
             }
         }
@@ -959,15 +968,23 @@ impl Uring {
                                 // The cancellation we asked for when pausing.
                                 Self::release(&self.pool, m.kind, item);
                             } else {
-                                let limit = backlog_limit(m.kind);
+                                let limit = match m.kind {
+                                    MultiKind::Accept => ACCEPT_BACKLOG_LIMIT,
+                                    MultiKind::Recv => self.recv_limit,
+                                };
+                                let pool_low = self.pool.free() * 4 < self.pool.count() as usize;
                                 match item {
-                                    Queued::Piece { bid, off, len } if m.queue.len() >= limit => {
-                                        // Nobody is keeping up with this stream: do not
-                                        // let it sit on pool buffers.
+                                    Queued::Piece { bid, off, len }
+                                        if m.queue.len() >= limit && pool_low =>
+                                    {
+                                        // Nobody is keeping up with this stream, and
+                                        // others need buffers: do not let it sit on
+                                        // pool buffers.
                                         m.queue.push_back(Queued::Heap(
                                             self.pool.copy_out(bid, off, len),
                                         ));
                                         self.pool.release(bid);
+                                        self.recv_copied += u64::from(len);
                                     }
                                     item => {
                                         if let Queued::Piece { .. } = item {
@@ -1050,6 +1067,11 @@ impl Uring {
     /// Number of tracked operations (used by tests to detect leaks).
     pub(crate) fn tracked_ops(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Received bytes moved out of the pool to the heap so far.
+    pub(crate) fn recv_copied(&self) -> u64 {
+        self.recv_copied
     }
 
     /// Kernel bugs worked around while setting the ring up.
