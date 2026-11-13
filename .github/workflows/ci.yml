@@ -55,6 +55,10 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    env:
+      # giong must choose io_uring by itself on the runner: if a runner kernel
+      # ever refuses it, the run fails instead of quietly testing epoll only.
+      GIONG_TEST_EXPECT_DRIVER: io_uring
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -156,6 +160,8 @@ jobs:
   # (GIONG_DRIVER=epoll).
   fallback:
     runs-on: ubuntu-24.04
+    env:
+      GIONG_TEST_EXPECT_DRIVER: io_uring
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -201,6 +207,8 @@ jobs:
 
   tsan:
     runs-on: ubuntu-24.04
+    env:
+      GIONG_TEST_EXPECT_DRIVER: io_uring
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -230,13 +238,20 @@ jobs:
       - run: scripts/check.sh loom
 
   # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM),
-  # and on 5.15, whose io_uring lacks buffer rings: giong runs on epoll there.
+  # on 5.15, whose io_uring lacks buffer rings: giong runs on epoll there, and
+  # on the kernel Ubuntu 24.04 ships, whose buffer-ring bug (6.8.0-135 and
+  # later) giong works around to stay on io_uring. Each run checks the driver
+  # giong chose by itself and the kernel bugs it had to work around.
   kernels:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        kernel: ["5.15.225", "6.0.19", "6.1.155"]
+        include:
+          - { kernel: "5.15.225", workarounds: "" }
+          - { kernel: "6.0.19", workarounds: "" }
+          - { kernel: "6.1.155", workarounds: "" }
+          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -255,6 +270,8 @@ jobs:
           path: target/kernels/linux-${{ matrix.kernel }}
           key: kernel-${{ matrix.kernel }}
       - run: scripts/kernels.sh ${{ matrix.kernel }}
+        env:
+          GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS: ${{ matrix.workarounds }}
       - name: Keep the guest's log
         if: always()
         uses: actions/upload-artifact@v4

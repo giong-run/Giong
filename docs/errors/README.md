@@ -36,6 +36,7 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | [GIONG-E0006](E0006.md) | `MixedReads` | read used after recv |
 | [GIONG-E0007](E0007.md) | `TimedOut` | the time limit passed |
 | [GIONG-E0008](E0008.md) | `NoSuchWorker` | no such worker |
+| [GIONG-E0009](E0009.md) | `BufferRingRefused` | the kernel refused io_uring buffer rings |
 
 ## Network and name resolution
 

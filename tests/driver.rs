@@ -4,19 +4,29 @@
 use std::cell::Cell;
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use giong::error::{self, Code};
 use giong::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
-use giong::DriverKind;
+use giong::{ChosenBy, DriverKind};
 
 /// `true` if io_uring works here (it is blocked, for instance, under
-/// `scripts/no-io-uring.py` or in a container).
+/// `scripts/no-io-uring.py` or in a container). Where CI says it must work
+/// (`GIONG_TEST_EXPECT_DRIVER=io_uring`), not working is a failure instead
+/// of a reason to test epoll only.
 fn io_uring_available() -> bool {
-    giong::Builder::new()
+    let res = giong::Builder::new()
         .driver(DriverKind::IoUring)
-        .block_on(async {})
-        .is_ok()
+        .block_on(async {});
+    if let Err(e) = &res {
+        assert_ne!(
+            std::env::var("GIONG_TEST_EXPECT_DRIVER").as_deref(),
+            Ok("io_uring"),
+            "io_uring must work here, but: {e}"
+        );
+    }
+    res.is_ok()
 }
 
 #[test]
@@ -164,17 +174,98 @@ fn a_task_whose_io_never_waits_still_lets_others_run() {
     }
 }
 
-/// CI's container job sets `GIONG_TEST_EXPECT_DRIVER=epoll`: inside Docker's
-/// default seccomp profile, the default runtime must have chosen epoll.
+/// CI says which driver giong must choose by itself on each machine
+/// (`GIONG_TEST_EXPECT_DRIVER`): `epoll` inside Docker's default seccomp
+/// profile and on 5.15, `io_uring` everywhere else, including kernels with
+/// bugs giong works around. A job meant to test io_uring then fails loudly
+/// instead of quietly testing epoll. The choice is made in a child process
+/// without `GIONG_DRIVER`, which the epoll rounds of `scripts/check.sh` set.
 #[test]
 fn the_default_driver_is_the_expected_one() {
+    if std::env::var_os(CHILD).is_some() {
+        let choice = giong::Builder::new()
+            .block_on(async { giong::driver_choice() })
+            .unwrap();
+        println!("kind: {}", choice.kind);
+        println!("choice: {choice}");
+        return;
+    }
     let Ok(expected) = std::env::var("GIONG_TEST_EXPECT_DRIVER") else {
         return;
     };
-    let got = giong::Builder::new()
-        .block_on(async { giong::driver_kind() })
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "the_default_driver_is_the_expected_one",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env_remove("GIONG_DRIVER")
+        .output()
         .unwrap();
-    assert_eq!(got.name(), expected);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!("kind: {expected}\n")),
+        "expected giong to choose {expected} by itself, but: {stdout}"
+    );
+}
+
+/// `driver_choice` says who chose the driver, and with nothing named, that
+/// giong chose io_uring where it works.
+#[test]
+fn driver_choice_says_who_chose() {
+    if std::env::var_os(CHILD).is_some() {
+        let choice = giong::Builder::new()
+            .block_on(async { giong::driver_choice() })
+            .unwrap();
+        println!("chosen by: {:?}", choice.chosen_by);
+        println!("kind: {}", choice.kind);
+        return;
+    }
+    let named = giong::Builder::new()
+        .driver(DriverKind::Epoll)
+        .block_on(async { giong::driver_choice() })
+        .unwrap();
+    assert_eq!(named.kind, DriverKind::Epoll);
+    assert_eq!(named.chosen_by, ChosenBy::Builder);
+    assert_eq!(named.io_uring_error, None);
+    assert_eq!(named.to_string(), "epoll (named by Builder::driver)");
+
+    let out = child_with_env("driver_choice_says_who_chose", "epoll");
+    assert!(out.contains("chosen by: Environment"), "{out}");
+    assert!(out.contains("kind: epoll"), "{out}");
+
+    if io_uring_available() && std::env::var_os("GIONG_DRIVER").is_none() {
+        let rt = giong::Builder::new().workers(2).build().unwrap();
+        let handle = rt.handle();
+        assert_eq!(handle.driver_choice(0), None, "not started yet");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        rt.run(move |w| {
+            let sink = sink.clone();
+            async move { sink.lock().unwrap().push((w, giong::driver_choice())) }
+        })
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for (w, auto) in seen.iter() {
+            assert_eq!(auto.kind, DriverKind::IoUring);
+            assert_eq!(auto.chosen_by, ChosenBy::Automatic);
+            assert_eq!(auto.io_uring_error, None);
+            assert_eq!(auto.io_uring_error_code, None);
+            // Kept after the runtime has stopped.
+            assert_eq!(handle.driver_choice(*w).as_ref(), Some(auto));
+            let line = auto.to_string();
+            assert!(
+                line.starts_with("io_uring (chosen automatically)"),
+                "{line}"
+            );
+            for k in &auto.kernel_workarounds {
+                assert!(line.contains(k.description()), "{line}");
+            }
+        }
+    }
 }
 
 /// Sends `ping` over `stream` and reads the echo; `true` if that took less
