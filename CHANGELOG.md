@@ -13,7 +13,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 Foundations for services, and a look inside them. giong now runs where io_uring is
 blocked or missing (Docker and Kubernetes with their default seccomp profiles, gVisor,
 kernels before 6.0) on an epoll driver it falls back to by itself, about as fast as Tokio
-there. `giong-http` streams bodies both ways, `giong-web` gains `tracing`, and an example
+there, and it says when and why it does. On Ubuntu 24.04's own 6.8 kernels, whose
+backported bug rejects every io_uring buffer ring, it now runs on io_uring at full speed.
+`giong-http` streams bodies both ways, `giong-web` gains `tracing`, and an example
 REST API built only on giong's crates (PostgreSQL, Redis, HTTPS) serves 1.5 to 2.1 times
 as many requests per second as the same API on axum. The new `giong-mcp` lets an AI agent
 look inside a running service and names the task that blocks a worker. An idle
@@ -24,6 +26,18 @@ argument's type written.
 
 ### Added
 
+- **giong**: `giong::driver_choice()` (on a worker) and `Handle::driver_choice(worker)`
+  (from any thread) say which driver a worker runs on, whether `Builder::driver`,
+  `GIONG_DRIVER` or giong chose it, why io_uring is not used when giong fell back to epoll
+  (the full `GIONG-E…` error), and which kernel bugs giong works around. Falling back to
+  epoll by itself is also said once per process on stderr, with the reason; naming a
+  driver chooses without it. `giong-mcp`'s `overview` shows the choice for each worker
+  and warns when workers fell back to epoll.
+- **Verification**: CI's `test`, `fallback` and `tsan` jobs fail if giong would not choose
+  io_uring by itself on the runner (`GIONG_TEST_EXPECT_DRIVER=io_uring`), instead of quietly
+  testing epoll only, and the whole suite also runs on Ubuntu 24.04's own kernel
+  (6.8.0-147) in QEMU: `scripts/kernels.sh ubuntu-6.8.0-147` boots any kernel Ubuntu ships.
+  Every QEMU run checks the driver giong chose and the kernel bugs it worked around.
 - **An epoll driver**, so that giong runs where io_uring is blocked or missing: in a
   Docker container with the default seccomp profile, in Kubernetes with `RuntimeDefault`,
   under gVisor, with the `kernel.io_uring_disabled` sysctl, and on kernels older than 6.0
@@ -286,6 +300,22 @@ argument's type written.
 
 ### Fixed
 
+- **io_uring on Ubuntu 24.04's own kernels.** Ubuntu's 6.8 kernels from 6.8.0-135 on
+  (and the AWS, Azure, GCP and Oracle 6.8 kernels and the 6.8 HWE kernel of 22.04 built
+  from them) refuse every correctly formed io_uring buffer ring: a backport of "io_uring/kbuf: use mem_is_zero()" inverted
+  the check on its reserved fields, so the kernel rejects zeroed ones and accepts others.
+  giong 0.3 would not start there, calling the kernel too old, and with the epoll driver
+  alone it would have run on epoll without saying so. It now recognises the bug with a probe that changes nothing and registers its
+  ring the way that kernel accepts, so io_uring runs at full speed; on correct kernels
+  nothing changes. `giong::driver_choice()` lists it under `kernel_workarounds`
+  (`KernelWorkaround::BufferRingReservedCheck`). Found on Ubuntu 24.04 bare-metal
+  machines (6.8.0-147); checked on 6.8.0-134 (no bug), -135, -147 and -149.
+- A kernel from 6.0 on that refuses buffer rings for another reason is no longer called
+  too old: the error is the new `GIONG-E0009` and names the kernel release
+  (`GIONG-E0002` stays for kernels older than 6.0).
+- Tests: `accept_many_connections` and `accept_backlog_is_bounded_and_no_connection_is_lost`
+  failed with "too many open files" under the 1024 soft limit that shells start with;
+  they raise the soft limit up to the hard one.
 - `giong-http` server: more than two blank lines before a request line start the request
   timeout. A client sending `\r\n` once a minute kept a connection open for ever.
 - `giong-http` client: a kept-alive connection that received anything while idle (a `408

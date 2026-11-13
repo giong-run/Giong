@@ -4,10 +4,19 @@
 #   scripts/kernels.sh                 the default list below
 #   scripts/kernels.sh 6.0.19 6.1.155  any versions built by Ubuntu's mainline
 #                                      kernel archive (kernel.ubuntu.com/mainline)
+#   scripts/kernels.sh ubuntu-6.8.0-147
+#                                      a kernel Ubuntu ships (linux-image-unsigned-
+#                                      <version>-generic from archive.ubuntu.com)
 #   TEST_BINARIES="target/release/deps/net-…" scripts/kernels.sh 6.0.19
 #                                      only those binaries
 #   TEST_ARGS="--test-threads=1" scripts/kernels.sh
 #                                      arguments for every test binary
+#
+# The guest also checks which driver giong chooses by itself: epoll on kernels
+# older than 6.0, io_uring from 6.0 on (GIONG_TEST_EXPECT_DRIVER overrides
+# that), so a kernel that quietly puts giong on epoll fails the run. With
+# GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS set (names separated by commas, or empty
+# for none), it also checks which kernel bugs giong had to work around.
 #
 # The test binaries are built on the host, then packed into an initramfs with
 # a static busybox and the shared libraries they need; the guest boots that
@@ -93,6 +102,16 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /tmp
 ip link set lo up
+# What the tests expect of this kernel, from the kernel command line.
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in
+        giong.expect_driver=*) export GIONG_TEST_EXPECT_DRIVER="${arg#*=}" ;;
+        giong.expect_workarounds=*) export GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS="${arg#*=}" ;;
+    esac
+done
+# A line of its own: the console's escape codes end up in front of the first one.
+echo
+echo "GIONG-EXPECT driver=${GIONG_TEST_EXPECT_DRIVER:-} workarounds=${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS-unchecked}"
 # The tests open thousands of sockets; init starts with a limit of 1024.
 ulimit -n 65536
 export TMPDIR=/tmp HOME=/tmp RUST_BACKTRACE=1
@@ -123,9 +142,20 @@ fetch_kernel() {
         return
     fi
     mkdir -p "$dir"
-    local base="https://kernel.ubuntu.com/mainline/v$version/amd64/"
-    local deb
-    deb="$(curl -fsS --retry 5 --retry-all-errors "$base" | grep -oE 'linux-image-unsigned-[^"]*-generic_[^"]*_amd64\.deb' | head -n1)"
+    local base pattern deb
+    case "$version" in
+        ubuntu-*)
+            # A kernel as Ubuntu ships it, with Ubuntu's own patches.
+            base="https://archive.ubuntu.com/ubuntu/pool/main/l/linux/"
+            local release="${version#ubuntu-}"
+            pattern="linux-image-unsigned-${release//./\\.}-generic_[^\"]*_amd64\.deb"
+            ;;
+        *)
+            base="https://kernel.ubuntu.com/mainline/v$version/amd64/"
+            pattern='linux-image-unsigned-[^"]*-generic_[^"]*_amd64\.deb'
+            ;;
+    esac
+    deb="$(curl -fsS --retry 5 --retry-all-errors "$base" | grep -oE "$pattern" | head -n1)"
     if [ -z "$deb" ]; then
         echo "no kernel image for $version at $base" >&2
         return 1
@@ -155,12 +185,24 @@ for version in "${VERSIONS[@]}"; do
         continue
     fi
     log="$WORK/linux-$version.log"
+    release="${version#ubuntu-}"
+    expect="${GIONG_TEST_EXPECT_DRIVER:-}"
+    if [ -z "$expect" ]; then
+        case "$release" in
+            [0-5].*) expect=epoll ;;
+            *) expect=io_uring ;;
+        esac
+    fi
+    cmdline="console=ttyS0 quiet panic=-1 oops=panic giong.expect_driver=$expect"
+    if [ -n "${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS+set}" ]; then
+        cmdline+=" giong.expect_workarounds=$GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS"
+    fi
     timeout "${TIMEOUT:-3600}" qemu-system-x86_64 "${accel[@]}" -smp "$CPUS" -m "$MEMORY" \
         -kernel "$kernel" -initrd "$initrd" \
-        -append "console=ttyS0 quiet panic=-1 oops=panic" \
+        -append "$cmdline" \
         -nographic -no-reboot </dev/null | tr -d '\r' | tee "$log" |
         grep --line-buffered -E '^GIONG-|panicked|FAILED|test result: FAILED' || true
-    if ! grep -q "GIONG-KERNEL $version" "$log"; then
+    if ! grep -q "GIONG-KERNEL $release" "$log"; then
         echo "   the guest did not report kernel $version (see $log)"
         status=1
     elif ! grep -q '^GIONG-DONE failed=0$' "$log"; then

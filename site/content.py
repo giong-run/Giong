@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=217,
+        layer="runtime", tests=223,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
@@ -172,7 +172,7 @@ AGENTS = dict(
 
 CHECKED = [
     "Tests repeated in release mode on all three io_uring setups and on epoll",
-    "Real Linux 5.15, 6.0 and 6.1 kernels in QEMU, and Docker's default profile, on every change",
+    "Real Linux 5.15, 6.0, 6.1 and Ubuntu 24.04 kernels in QEMU, and Docker's default profile, on every change",
     "ThreadSanitizer: no data race",
     "`loom` model check of the cross-thread wake-up",
     "Parsers fuzzed every night; a two-hour soak test",

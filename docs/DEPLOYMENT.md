@@ -9,9 +9,20 @@ told: in a Docker container with the default seccomp profile, in Kubernetes with
 `RuntimeDefault` profile, under gVisor, with the `kernel.io_uring_disabled` sysctl set,
 or on a kernel older than 6.0. Every API works the same way on both drivers; epoll makes
 more system calls per request, and file operations run on a pool of blocking threads.
-`giong::driver_kind()` tells which driver a worker got; log it at startup if you want to
-know. The [README](../README.md#two-drivers-io_uring-and-epoll) has the measured
-difference.
+When giong falls back by itself it says so once on stderr, with the reason (the same
+`GIONG-E…` error a runtime that insists on io_uring would get). `giong::driver_choice()`
+tells which driver a worker got, who chose it, and why io_uring is not used; log it at
+startup:
+
+```rust
+giong::block_on(async {
+    eprintln!("giong driver: {}", giong::driver_choice());
+    // io_uring (chosen automatically)
+});
+```
+
+`giong-mcp`'s `overview` shows the same for each worker. The
+[README](../README.md#two-drivers-io_uring-and-epoll) has the measured difference.
 
 So a container needs no special settings to run giong. Allow io_uring, as this page shows,
 when you want its speed:
@@ -34,6 +45,18 @@ cat /proc/sys/kernel/io_uring_disabled  # Linux 6.6+: 0 = allowed
 `1` only for privileged processes and members of the group in `kernel.io_uring_group`,
 `2` for nobody. Set it with `sysctl -w kernel.io_uring_disabled=0`, or put the service's
 user in that group.
+
+## Ubuntu 24.04
+
+Ubuntu's 6.8 kernels from 6.8.0-135 on have a bug that makes them refuse every correctly
+formed io_uring buffer ring, which giong's io_uring driver needs: a backport inverted a
+check on the request's reserved fields. The AWS, Azure, GCP and Oracle 6.8 kernels built
+from them have it too, as does the 6.8 HWE kernel of Ubuntu 22.04. giong recognises the bug and registers its ring
+the way those kernels accept, so io_uring works there at full speed, and
+`giong::driver_choice()` lists the workaround (`buffer-ring-reserved-check`). Nothing to
+do on your side. Other software that uses buffer rings through liburing fails on those
+kernels with `EINVAL`. The 7.0 HWE kernel (`linux-generic-hwe-24.04`) does not have the
+bug.
 
 ## Docker
 

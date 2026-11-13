@@ -27,7 +27,9 @@
 //!   seccomp profile blocks io_uring, under gVisor, or on a kernel older than
 //!   6.0, a worker runs on epoll instead, by itself and with the same API.
 //!   [`Builder::driver`] or `GIONG_DRIVER` choose explicitly, and
-//!   [`driver_kind`] tells which one a worker got.
+//!   [`driver_choice`] tells which one a worker got and why. Known kernel
+//!   bugs that would cost io_uring, such as the one in Ubuntu 24.04's 6.8
+//!   kernels, are worked around ([`KernelWorkaround`]).
 //! * **A latency dial.** [`Builder::spin_before_park`] lets a worker watch its
 //!   ring instead of sleeping, for services where microseconds matter more
 //!   than an idle core.
@@ -92,10 +94,10 @@ pub mod sync;
 pub mod time;
 
 pub use buf::{IoBuf, IoBufMut, RecvBuf};
-pub use driver::DriverKind;
+pub use driver::{ChosenBy, DriverChoice, DriverKind, KernelWorkaround};
 pub use executor::{spawn, yield_now, JoinError, JoinHandle, RemoteJoinHandle};
 pub use runtime::{
-    block_on, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,
+    block_on, driver_choice, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,
     until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,
 };
 

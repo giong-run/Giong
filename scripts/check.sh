@@ -19,6 +19,8 @@
 #   scripts/check.sh all        everything above except seccomp and soak
 #
 # ROUNDS=n changes how often each test binary is repeated.
+# GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
+# giong would not choose io_uring by itself, instead of testing epoll only.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROUNDS="${ROUNDS:-5}"
@@ -51,7 +53,7 @@ run_seccomp() {
     cargo test --release --quiet --workspace --all-features --no-run
     for round in $(seq 1 "$ROUNDS"); do
         echo "== io_uring blocked by seccomp: round $round/$ROUNDS"
-        env -u GIONG_DRIVER python3 scripts/no-io-uring.py \
+        env -u GIONG_DRIVER GIONG_TEST_EXPECT_DRIVER=epoll python3 scripts/no-io-uring.py \
             cargo test --release --quiet --workspace --all-features
     done
 }

@@ -23,14 +23,14 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::io;
 use std::mem;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
-use super::{Io, MultiIo, MultiKind, MultiPoll, Park};
+use super::{Io, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park};
 use crate::buf::BufPool;
 use crate::error::{Code, Error};
 use crate::slab::Slab;
@@ -113,6 +113,8 @@ enum OpState {
 
 pub(crate) struct Uring {
     ring: IoUring,
+    /// Kernel bugs worked around while setting the ring up.
+    workarounds: Vec<KernelWorkaround>,
     ops: Slab<OpState>,
     /// SQEs pushed whose final CQE has not been seen yet.
     inflight: usize,
@@ -290,30 +292,159 @@ fn sqe_for(io: &Io) -> squeue::Entry {
     }
 }
 
+/// `IORING_REGISTER_PBUF_RING` and `IORING_UNREGISTER_PBUF_RING`.
+const REGISTER_PBUF_RING: libc::c_uint = 22;
+const UNREGISTER_PBUF_RING: libc::c_uint = 23;
+
+/// `struct io_uring_buf_reg`, the argument of both. The `io-uring` crate
+/// always zeroes `resv`, which the kernels in [`registers_with_reserved_bits`]
+/// refuse, so giong fills it in itself.
+#[repr(C)]
+#[derive(Default)]
+struct BufReg {
+    ring_addr: u64,
+    ring_entries: u32,
+    bgid: u16,
+    flags: u16,
+    resv: [u64; 3],
+}
+
+const _: () = assert!(mem::size_of::<BufReg>() == 40);
+
+/// `io_uring_register(2)` with a [`BufReg`].
+fn register_pbuf(ring_fd: RawFd, opcode: libc::c_uint, reg: &BufReg) -> io::Result<()> {
+    // SAFETY: `reg` is a valid `io_uring_buf_reg`, which the kernel copies
+    // before the call returns; one argument, as both opcodes require.
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring_fd,
+            opcode,
+            reg as *const BufReg,
+            1,
+        )
+    };
+    if res < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `true` if this kernel refuses buffer-ring requests whose reserved fields
+/// are zero and accepts them when they are not: the inverse of what every
+/// correct kernel does (see [`KernelWorkaround::BufferRingReservedCheck`]).
+///
+/// It asks the kernel to unregister a buffer group that does not exist,
+/// once with zeroed reserved fields and once with one set. A correct kernel
+/// answers `ENOENT` to the first (nothing to unregister), and kernels without
+/// buffer rings answer `EINVAL` to both. Only a kernel with the inverted
+/// check answers `EINVAL`, then `ENOENT`. Neither call changes anything.
+fn registers_with_reserved_bits(ring_fd: RawFd) -> bool {
+    let probe = |resv: u64| {
+        let reg = BufReg {
+            // Not registered: registering BGID has just failed, and giong
+            // uses no other group.
+            bgid: u16::MAX,
+            resv: [resv, 0, 0],
+            ..BufReg::default()
+        };
+        register_pbuf(ring_fd, UNREGISTER_PBUF_RING, &reg)
+            .err()
+            .and_then(|e| e.raw_os_error())
+    };
+    probe(0) == Some(libc::EINVAL) && probe(1) == Some(libc::ENOENT)
+}
+
+/// Registers `pool` as the ring's buffer group [`BGID`], working around the
+/// kernel bugs that stand in the way. Returns the workarounds it needed.
+///
+/// # Safety
+///
+/// The pool's ring memory must stay alive, at the same address, for as long
+/// as `ring`: the kernel keeps it pinned and reads it.
+unsafe fn register_buf_ring(ring: &IoUring, pool: &BufPool) -> io::Result<Vec<KernelWorkaround>> {
+    let fd = ring.as_raw_fd();
+    let mut reg = BufReg {
+        ring_addr: pool.ring_addr(),
+        ring_entries: u32::from(pool.count()),
+        bgid: BGID,
+        ..BufReg::default()
+    };
+    let err = match register_pbuf(fd, REGISTER_PBUF_RING, &reg) {
+        Ok(()) => return Ok(Vec::new()),
+        Err(e) => e,
+    };
+    if err.raw_os_error() == Some(libc::EINVAL) && registers_with_reserved_bits(fd) {
+        // The reserved fields mean nothing to these kernels beyond the
+        // inverted check; any non-zero value gets past it.
+        reg.resv[0] = 1;
+        if register_pbuf(fd, REGISTER_PBUF_RING, &reg).is_ok() {
+            return Ok(vec![KernelWorkaround::BufferRingReservedCheck]);
+        }
+    }
+    Err(buffer_ring_error(&kernel_release(), err))
+}
+
+/// The running kernel's release (`uname -r`), or `"unknown"`.
+fn kernel_release() -> String {
+    // SAFETY: `utsname` is plain data, for which all zeroes is a valid value.
+    let mut u: libc::utsname = unsafe { mem::zeroed() };
+    // SAFETY: `uname` fills the struct it is given, which is of its type.
+    if unsafe { libc::uname(&mut u) } != 0 {
+        return "unknown".into();
+    }
+    // SAFETY: `release` is a NUL-terminated string inside `u`.
+    unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `(major, minor)` of a kernel release such as `6.8.0-147-generic`.
+fn kernel_version(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// The error for a kernel that would not register a buffer ring, even with
+/// the workarounds: too old if it is older than 6.0, refused otherwise.
+fn buffer_ring_error(release: &str, e: io::Error) -> io::Error {
+    let kind = e.kind();
+    let old = kernel_version(release).is_some_and(|v| v < (6, 0));
+    let err = if old {
+        Error::new(
+            Code::KernelTooOld,
+            format!(
+                "giong's io_uring driver needs buffer rings, from Linux 6.0, and this kernel \
+                 is {release} ({e})"
+            ),
+            "run on Linux 6.0 or newer (6.1 or newer is faster), or let giong use its epoll \
+             driver by not asking for io_uring (Builder::driver, GIONG_DRIVER).",
+        )
+    } else {
+        Error::new(
+            Code::BufferRingRefused,
+            format!("this kernel ({release}) refused to register an io_uring buffer ring ({e})"),
+            "let giong use its epoll driver by not asking for io_uring (Builder::driver, \
+             GIONG_DRIVER). A kernel from 6.0 on should accept the ring, so this may be a \
+             kernel bug giong does not know yet: please report it with the output of uname -r \
+             at https://github.com/giong-run/Giong/issues.",
+        )
+    };
+    io::Error::new(kind, err.with_source(e))
+}
+
 impl Uring {
     pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
         let ring = build_ring(entries)?;
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
-        unsafe {
-            ring.submitter()
-                .register_buf_ring_with_flags(pool.ring_addr(), pool.count(), BGID, 0)
-                .map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        Error::new(
-                            Code::KernelTooOld,
-                            format!("giong needs io_uring buffer rings, from Linux 6.0 ({e})"),
-                            "run on Linux 6.0 or newer (6.1 or newer is faster), or let giong \
-                             use its epoll driver by not asking for io_uring (Builder::driver, \
-                             GIONG_DRIVER).",
-                        )
-                        .with_source(e),
-                    )
-                })?;
-        }
+        let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
         pool.start_ring();
         Ok(Self {
+            workarounds,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -814,6 +945,11 @@ impl Uring {
     pub(crate) fn tracked_ops(&self) -> usize {
         self.ops.len()
     }
+
+    /// Kernel bugs worked around while setting the ring up.
+    pub(crate) fn workarounds(&self) -> &[KernelWorkaround] {
+        &self.workarounds
+    }
 }
 
 #[cfg(test)]
@@ -838,6 +974,78 @@ mod tests {
         }
         let e = explain_setup_error(io::Error::from_raw_os_error(libc::ENOMEM));
         assert_eq!(e.raw_os_error(), Some(libc::ENOMEM));
+    }
+
+    #[test]
+    fn kernel_versions_are_read_from_the_release() {
+        assert_eq!(kernel_version("6.8.0-147-generic"), Some((6, 8)));
+        assert_eq!(kernel_version("5.15.225-0515225-generic"), Some((5, 15)));
+        assert_eq!(kernel_version("7.0.0-1017-azure"), Some((7, 0)));
+        assert_eq!(kernel_version("6.18.44-fc-v445"), Some((6, 18)));
+        assert_eq!(kernel_version("6"), None);
+        assert_eq!(kernel_version("unknown"), None);
+    }
+
+    /// A refused buffer ring is "too old" only on a kernel older than 6.0;
+    /// on a newer one the error names the kernel instead of blaming its age.
+    #[test]
+    fn a_refused_buffer_ring_names_the_kernel() {
+        let einval = || io::Error::from_raw_os_error(libc::EINVAL);
+        let e = buffer_ring_error("5.15.0-100-generic", einval());
+        assert_eq!(crate::error::code(&e), Some(Code::KernelTooOld));
+        assert!(
+            e.to_string().contains("this kernel is 5.15.0-100-generic"),
+            "{e}"
+        );
+
+        for release in ["6.8.0-147-generic", "unknown"] {
+            let e = buffer_ring_error(release, einval());
+            assert_eq!(crate::error::code(&e), Some(Code::BufferRingRefused));
+            let text = e.to_string();
+            assert!(text.starts_with("GIONG-E0009: "), "{text}");
+            assert!(text.contains(&format!("this kernel ({release})")), "{text}");
+            assert!(!text.contains("too old"), "{text}");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
+            let source = source.downcast_ref::<io::Error>().unwrap();
+            assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
+        }
+    }
+
+    /// The buffer ring registers on any kernel from 6.0 on, and the
+    /// workaround for the inverted reserved-field check is used exactly when
+    /// the probe finds that check: never on a correct kernel.
+    #[test]
+    fn the_buffer_ring_registers_with_a_workaround_only_where_needed() {
+        let Ok(ring) = build_ring_from(64, RingTier::Basic) else {
+            eprintln!("skipped: io_uring is not available here");
+            return;
+        };
+        let pool = BufPool::new(64, 1024).unwrap();
+        // SAFETY: `pool` outlives `ring` (dropped first, below).
+        let res = unsafe { register_buf_ring(&ring, &pool) };
+        let release = kernel_release();
+        match res {
+            Ok(w) => {
+                let inverted = registers_with_reserved_bits(ring.as_raw_fd());
+                assert_eq!(
+                    w.contains(&KernelWorkaround::BufferRingReservedCheck),
+                    inverted,
+                    "{release}: {w:?}"
+                );
+                // scripts/kernels.sh boots kernels whose bugs are known.
+                if let Ok(names) = std::env::var("GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS") {
+                    let got: Vec<&str> = w.iter().map(|w| w.name()).collect();
+                    assert_eq!(got.join(","), names, "{release}");
+                }
+            }
+            // Older than 6.0: no buffer rings to work around.
+            Err(e) => {
+                assert_eq!(crate::error::code(&e), Some(Code::KernelTooOld), "{e}");
+                assert!(kernel_version(&release).is_some_and(|v| v < (6, 0)), "{e}");
+            }
+        }
+        drop(ring);
     }
 
     /// Every setup tier must produce a working ring on a current kernel, so

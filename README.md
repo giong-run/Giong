@@ -289,9 +289,14 @@ Each worker runs on one of two I/O drivers, behind the same API:
 
 `Builder::driver(DriverKind::IoUring)`, or `GIONG_DRIVER=io_uring`, makes the runtime fail
 to start where io_uring is missing ([GIONG-E0001](docs/errors/E0001.md)) instead of falling
-back; `DriverKind::Epoll`, or `GIONG_DRIVER=epoll`, chooses epoll anywhere.
-`giong::driver_kind()` tells which one a worker got. The whole test suite runs on both, and
-in CI also inside a Docker container with the default profile and on a real 5.15 kernel.
+back; `DriverKind::Epoll`, or `GIONG_DRIVER=epoll`, chooses epoll anywhere. A fallback
+is said once on stderr, with the reason, and `giong::driver_choice()` tells which driver
+a worker got, who chose it and why. Kernel bugs that would cost io_uring are worked
+around: Ubuntu 24.04's 6.8 kernels from 6.8.0-135 on refuse correctly formed buffer rings,
+and giong registers its ring the way they accept ([DEPLOYMENT.md](docs/DEPLOYMENT.md#ubuntu-2404)).
+The whole test suite runs on both drivers, and in CI also inside a Docker container with
+the default profile, on a real 5.15 kernel and on Ubuntu 24.04's own kernel; CI fails if
+giong would not choose io_uring where it should.
 
 | | io_uring | epoll |
 |---|---|---|
@@ -702,7 +707,7 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-714 tests across the eight crates and the example API (`cargo test --workspace
+720 tests across the eight crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
 database clients, giong-web, giong-mcp and the example API describe theirs in their
@@ -720,7 +725,7 @@ READMEs.
 | `tests/multi.rs` (14) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (10) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
-| `tests/driver.rs` (7), `tests/blocked.rs` (2) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
+| `tests/driver.rs` (8), `tests/blocked.rs` (3) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (8) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time; poll profiles by spawn location; sources reported until dropped |
 | `giong-http` (131) | 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 51 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 21 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 end-to-end tests of request and response bodies streamed both ways; 11 end-to-end HTTPS tests with a rustls client; 12 documentation examples |
 | `giong-tls` (34) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |

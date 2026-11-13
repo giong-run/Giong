@@ -28,6 +28,7 @@ use std::any::Any;
 use std::io;
 use std::os::fd::RawFd;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -65,6 +66,115 @@ impl DriverKind {
 impl std::fmt::Display for DriverKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.name())
+    }
+}
+
+/// Who picked a worker's driver: see [`DriverChoice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChosenBy {
+    /// [`Builder::driver`](crate::Builder::driver) named it.
+    Builder,
+    /// The `GIONG_DRIVER` environment variable named it.
+    Environment,
+    /// Nothing named a driver, so giong chose: io_uring where it works,
+    /// epoll elsewhere.
+    Automatic,
+}
+
+/// A bug in the running kernel that giong works around: see
+/// [`DriverChoice::kernel_workarounds`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum KernelWorkaround {
+    /// The kernel refuses to register an io_uring buffer ring whose reserved
+    /// fields are zero, as every correct caller sends them, and accepts one
+    /// whose reserved fields are not. Ubuntu's 6.8 kernels from 6.8.0-135
+    /// on carry this bug, as do the AWS, Azure, GCP and Oracle 6.8 kernels
+    /// and the 6.8 HWE kernel of Ubuntu 22.04 built from them: a backport of
+    /// "io_uring/kbuf: use mem_is_zero()" inverted the check. giong first confirms the inversion with a probe
+    /// that changes nothing, then registers with a reserved field set, and
+    /// io_uring works at full speed. Without this, those kernels would put
+    /// giong on epoll.
+    BufferRingReservedCheck,
+}
+
+impl KernelWorkaround {
+    /// A stable short name: `"buffer-ring-reserved-check"`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            KernelWorkaround::BufferRingReservedCheck => "buffer-ring-reserved-check",
+        }
+    }
+
+    /// One sentence on the bug.
+    pub const fn description(self) -> &'static str {
+        match self {
+            KernelWorkaround::BufferRingReservedCheck => {
+                "this kernel refuses io_uring buffer rings with zeroed reserved fields (an \
+                 inverted check, as in Ubuntu's 6.8.0-135 and later), so giong registers its \
+                 ring with a reserved field set"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for KernelWorkaround {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Which I/O driver a worker runs on, who chose it, and why io_uring is not
+/// used when giong fell back to epoll. Read it with
+/// [`driver_choice`](crate::driver_choice) on the worker, or
+/// [`Handle::driver_choice`](crate::Handle::driver_choice) from any thread;
+/// `giong-mcp`'s `overview` shows it too.
+///
+/// Its [`Display`](std::fmt::Display) form is one line for a log:
+///
+/// ```text
+/// io_uring (chosen automatically)
+/// epoll (chosen automatically): io_uring cannot be used here: GIONG-E0001: giong needs io_uring, …
+/// io_uring (chosen automatically), working around a kernel bug: this kernel refuses …
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DriverChoice {
+    /// The driver the worker runs on.
+    pub kind: DriverKind,
+    /// Who chose it.
+    pub chosen_by: ChosenBy,
+    /// When giong fell back to epoll by itself: the error that setting up
+    /// io_uring gave, as a runtime that names io_uring would have returned
+    /// it (`GIONG-E0001: …`, with how to fix it). `None` otherwise.
+    pub io_uring_error: Option<String>,
+    /// The code of that error, when giong raised it.
+    pub io_uring_error_code: Option<Code>,
+    /// Bugs of this kernel that giong works around to run io_uring.
+    pub kernel_workarounds: Vec<KernelWorkaround>,
+}
+
+impl std::fmt::Display for DriverChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let by = match self.chosen_by {
+            ChosenBy::Builder => "named by Builder::driver",
+            ChosenBy::Environment => "named by GIONG_DRIVER",
+            ChosenBy::Automatic => "chosen automatically",
+        };
+        write!(f, "{} ({by})", self.kind)?;
+        if let Some(e) = &self.io_uring_error {
+            write!(f, ": io_uring cannot be used here: {e}")?;
+        }
+        for (i, w) in self.kernel_workarounds.iter().enumerate() {
+            let sep = if i == 0 {
+                ", working around a kernel bug: "
+            } else {
+                "; "
+            };
+            write!(f, "{sep}{}", w.description())?;
+        }
+        Ok(())
     }
 }
 
@@ -241,35 +351,63 @@ pub(crate) fn kind_from_env() -> io::Result<Option<DriverKind>> {
 fn io_uring_unusable(e: &io::Error) -> bool {
     matches!(
         crate::error::code(e),
-        Some(Code::IoUringUnavailable | Code::KernelTooOld)
+        Some(Code::IoUringUnavailable | Code::KernelTooOld | Code::BufferRingRefused)
     ) || matches!(
         e.raw_os_error(),
         Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL)
     )
 }
 
+/// Says once per process, on stderr, that giong fell back to epoll and why:
+/// the fallback costs speed, and nobody would know otherwise. Naming a
+/// driver takes the choice away from giong, and the line with it.
+fn report_fallback(e: &io::Error) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "giong: running on the epoll driver, because io_uring cannot be used here: {e} \
+             (name a driver with Builder::driver or GIONG_DRIVER to choose one yourself; \
+             giong::driver_choice() tells what a worker got)"
+        );
+    }
+}
+
 impl Driver {
     /// Sets up the driver `choice` names, or io_uring with epoll as the
-    /// fallback when it is `None`.
+    /// fallback when it is `None`. `chosen_by` says where `choice` came from.
     pub(crate) fn new(
         choice: Option<DriverKind>,
+        chosen_by: ChosenBy,
         entries: u32,
         pool: Rc<BufPool>,
         wake_fd: RawFd,
-    ) -> io::Result<Self> {
-        match choice {
-            Some(DriverKind::IoUring) => {
-                Ok(Driver::Uring(uring::Uring::new(entries, pool, wake_fd)?))
-            }
-            Some(DriverKind::Epoll) => Ok(Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?)),
+    ) -> io::Result<(Self, DriverChoice)> {
+        let mut io_uring_error = None;
+        let driver = match choice {
+            Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool, wake_fd)?),
+            Some(DriverKind::Epoll) => Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?),
             None => match uring::Uring::new(entries, pool.clone(), wake_fd) {
-                Ok(ring) => Ok(Driver::Uring(ring)),
+                Ok(ring) => Driver::Uring(ring),
                 Err(e) if io_uring_unusable(&e) => {
-                    Ok(Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?))
+                    let driver = Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?);
+                    report_fallback(&e);
+                    io_uring_error = Some(e);
+                    driver
                 }
-                Err(e) => Err(e),
+                Err(e) => return Err(e),
             },
-        }
+        };
+        let choice = DriverChoice {
+            kind: driver.kind(),
+            chosen_by,
+            io_uring_error_code: io_uring_error.as_ref().and_then(crate::error::code),
+            io_uring_error: io_uring_error.map(|e| e.to_string()),
+            kernel_workarounds: match &driver {
+                Driver::Uring(d) => d.workarounds().to_vec(),
+                Driver::Epoll(_) => Vec::new(),
+            },
+        };
+        Ok((driver, choice))
     }
 
     pub(crate) fn kind(&self) -> DriverKind {
