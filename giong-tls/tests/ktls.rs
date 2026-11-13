@@ -717,6 +717,11 @@ fn a_kernel_tls_client_follows_a_server_changing_keys() {
             s.conn.refresh_traffic_keys().unwrap();
             s.write_all(&buf).unwrap();
         }
+        // Stay open until the client is done: its answering KeyUpdate must
+        // not run into a closed socket.
+        let mut rest = Vec::new();
+        s.read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
     });
     let connector = pki.connector(Some(suites::TLS13_AES_256_GCM_SHA384), Ktls::Required);
     run(async move {
@@ -728,6 +733,7 @@ fn a_kernel_tls_client_follows_a_server_changing_keys() {
             res.unwrap();
             assert_eq!(recv_exactly(&tls, 100).await, vec![n; 100]);
         }
+        tls.shutdown().await.unwrap();
     });
     server.join().unwrap();
 }

@@ -1461,8 +1461,12 @@ impl TlsStream {
                 Control::Done => {}
                 Control::Warn(description) => self.send_alert(ALERT_WARNING, description).await,
                 Control::KeyUpdateOwed => {
+                    // Answer now, so the peer can move on. If the answer
+                    // cannot be sent (the peer may already have closed), the
+                    // stream can no longer send, and later sends say so; what
+                    // the peer sent before closing is still received.
                     let sending = self.lock_send().await;
-                    self.pay_key_update().await?;
+                    let _ = self.pay_key_update().await;
                     sending.done();
                 }
                 Control::Fail(e, alert) => {
