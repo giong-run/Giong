@@ -8,12 +8,13 @@ use crate::value::Value;
 use crate::Config;
 
 /// Reads `input` delivered in pieces whose sizes `piece` picks; returns
-/// the replies (`None` for one over `limit`) or the first error.
+/// the replies (`Err(push)` for one over `limit`, `push` saying whether it
+/// was a push message) or the first error.
 pub(crate) fn read_replies(
     input: &[u8],
     limit: usize,
     mut piece: impl FnMut() -> usize,
-) -> Result<Vec<Option<Value>>, crate::Error> {
+) -> Result<Vec<Result<Value, bool>>, crate::Error> {
     let mut buf = ReadBuf::new();
     let mut out = Vec::new();
     let mut pos = 0;
@@ -28,9 +29,9 @@ pub(crate) fn read_replies(
                     let pushed = buf.is_push();
                     let v = buf.take(len)?;
                     assert_eq!(pushed, matches!(v, Value::Push(_)));
-                    out.push(Some(v));
+                    out.push(Ok(v));
                 }
-                Next::TooLarge => out.push(None),
+                Next::TooLarge { push } => out.push(Err(push)),
             }
         }
     }

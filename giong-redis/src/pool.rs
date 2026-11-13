@@ -176,10 +176,7 @@ impl Pool {
     pub async fn query<T: FromValue>(&self, cmd: &Cmd) -> Result<T, Error> {
         // Refused before a connection is opened for it.
         cmd.check(false, false)?;
-        let client = self.shared().await?;
-        let result = client.query(cmd).await;
-        self.release(client);
-        result
+        self.shared().await?.query(cmd).await
     }
 
     /// Sends one of the command methods' commands on a shared connection.
@@ -188,19 +185,13 @@ impl Pool {
         name: &'static str,
         args: &[&dyn ToArg],
     ) -> Result<T, Error> {
-        let client = self.shared().await?;
-        let result = client.query_raw(name, args).await;
-        self.release(client);
-        result
+        self.shared().await?.query_raw(name, args).await
     }
 
     /// Sends a pipeline on a shared connection; see [`Client::pipeline`].
     pub async fn pipeline<T: FromValue>(&self, pipe: &Pipeline) -> Result<T, Error> {
         pipe.check(pipe.is_atomic())?;
-        let client = self.shared().await?;
-        let result = client.pipeline(pipe).await;
-        self.release(client);
-        result
+        self.shared().await?.pipeline(pipe).await
     }
 
     commands!();
@@ -274,7 +265,7 @@ impl Pool {
     /// is passed over while another will do: commands queue behind it in
     /// order, so a slow one would hold up everything sent after it on that
     /// connection.
-    async fn shared(&self) -> Result<Rc<Client>, Error> {
+    async fn shared(&self) -> Result<Lent<'_>, Error> {
         let client = self
             .acquire(|st, max| {
                 let room = st.shared.len() + st.taken + st.connecting < max;
@@ -310,19 +301,18 @@ impl Pool {
                 }
             })
             .await?;
-        Ok(match client {
+        let client = match client {
             Ok(c) => c,
             Err(new) => {
                 let c = Rc::new(new);
                 self.inner.state.borrow_mut().shared.push(c.clone());
                 c
             }
+        };
+        Ok(Lent {
+            pool: self,
+            client: Some(client),
         })
-    }
-
-    fn release(&self, client: Rc<Client>) {
-        drop(client);
-        self.notify();
     }
 
     /// Wakes every task waiting for a connection, to look again.
@@ -408,6 +398,29 @@ impl std::fmt::Debug for Pool {
             .field("max_size", &self.inner.max_size)
             .field("stats", &self.stats())
             .finish()
+    }
+}
+
+/// A shared connection lent to one command or pipeline. Dropping it, when
+/// the reply came or the future was dropped, tells waiting tasks to look
+/// again: the connection may have become free to take.
+struct Lent<'a> {
+    pool: &'a Pool,
+    client: Option<Rc<Client>>,
+}
+
+impl Deref for Lent<'_> {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        self.client = None;
+        self.pool.notify();
     }
 }
 

@@ -347,6 +347,24 @@ fn watch_runs_the_transaction_only_when_the_keys_did_not_change() {
             .unwrap();
         assert_eq!(v, 11);
         assert!(c.watch::<&str>(&[]).await.is_err());
+
+        // A watch left behind (forgotten here) makes EXEC answer nil: an
+        // atomic pipeline says it did not run rather than return nothing.
+        std::mem::forget(c.watch(&[&k]).await.unwrap());
+        other.set(&k, 20).await.unwrap();
+        let e = c
+            .pipeline::<()>(&Pipeline::new().add(cmd("INCR").arg(&k)).atomic())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Server);
+        assert!(e.to_string().contains("did not run"), "{e}");
+        assert_eq!(other.get::<i64>(&k).await.unwrap(), 20);
+        // EXEC ended the watch.
+        let (v,): (i64,) = c
+            .pipeline(&Pipeline::new().add(cmd("INCR").arg(&k)).atomic())
+            .await
+            .unwrap();
+        assert_eq!(v, 21);
     });
 }
 
@@ -458,6 +476,60 @@ fn a_reply_over_the_limit_fails_alone() {
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::TooLarge);
         assert_eq!(small.get::<String>(&k).await.unwrap(), "ok");
+        assert!(!small.is_closed());
+    });
+}
+
+#[test]
+fn a_push_message_over_the_limit_is_not_taken_for_a_reply() {
+    run(|server| async move {
+        let small = Rc::new(
+            Client::connect(&server.tcp().max_reply_size(1000))
+                .await
+                .unwrap(),
+        );
+        let other = Client::connect(&server.tcp()).await.unwrap();
+        let prefix = key("tracked");
+        // Invalidations come as push messages, on the same connection.
+        let () = small
+            .query(
+                &cmd("CLIENT")
+                    .arg("TRACKING")
+                    .arg("ON")
+                    .arg("BCAST")
+                    .arg("PREFIX")
+                    .arg(&prefix),
+            )
+            .await
+            .unwrap();
+        let counter = key("counter");
+        // Each write of a long key sends `small` an invalidation over its
+        // limit, while its own commands are in flight.
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let c = small.clone();
+            let counter = counter.clone();
+            tasks.push(giong::spawn(async move {
+                let v = c.query::<i64>(&cmd("INCR").arg(&counter)).await;
+                (i, v)
+            }));
+            let long = format!("{prefix}:{i}:{}", "x".repeat(2000));
+            other.set(&long, i).await.unwrap();
+        }
+        let mut seen = Vec::new();
+        for t in tasks {
+            let (i, v) = t.await.unwrap();
+            seen.push(v.unwrap_or_else(|e| panic!("INCR {i}: {e}")));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (1..=20).collect::<Vec<i64>>());
+        // One more, arriving with nothing in flight.
+        other
+            .set(&format!("{prefix}:{}", "y".repeat(2000)), 1)
+            .await
+            .unwrap();
+        giong::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(small.incr(&counter, 1).await.unwrap(), 21);
         assert!(!small.is_closed());
     });
 }
