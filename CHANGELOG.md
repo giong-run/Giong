@@ -38,7 +38,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   - `ErrorKind::Proxy` (`GIONG-E1110`) for a proxy that refuses a request or a tunnel: a
     407 says how to give credentials, a 403 suggests `no_proxy`, and 502 and 504 are
     transient. A proxy that cannot be reached is `Connect` (`GIONG-E1102`), and its
-    message names the proxy. 66 error codes in all.
+    message names the proxy. 68 error codes in all.
 - **Verification**: coverage-guided fuzzing of every parser that reads bytes from the
   network, with 12 new cargo-fuzz targets (15 in all): the client's response heads, URLs
   and gzip/deflate decoder in `giong-http`; the PostgreSQL messages, SCRAM exchange and
@@ -66,10 +66,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
-- **`giong-mysql`**: reading a `TIME` value as a `String` panicked in debug builds, and
-  gave a wrong value in release builds, when its day count was about 179 million or
-  more: `days * 24` overflowed a `u32`. MySQL's own `TIME` stops at 34 days, so only a
-  broken or hostile server sends such a value. Found by the new `rows` fuzz target.
 - `giong-http` server: more than two blank lines before a request line start the request
   timeout. A client sending `\r\n` once a minute kept a connection open for ever.
 - `giong-http` client: a kept-alive connection that received anything while idle (a `408
@@ -81,6 +77,29 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - `giong-http` client: idle connections of an origin that is not asked for again are
   closed after the idle timeout, and the origin is forgotten. Before, they stayed open,
   with their entry, for as long as the client lived.
+- `giong-postgres` and `giong-mysql`: transactions no longer run on the connections a
+  pool shares. `Pool::query`, `query_one`, `query_opt` and `execute` (and `insert` in
+  giong-mysql) refuse `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and
+  the other transaction statements (MySQL also `XA`, `LOCK` and `UNLOCK`) before sending
+  anything, with the new error codes `GIONG-E3011` and `GIONG-E3111`
+  (`ErrorKind::Statement`). Before, `pool.execute("BEGIN", &[])` left a connection that
+  other tasks share inside a transaction: their statements ran in it and were never
+  committed, though they had been told they succeeded. A `Pool::batch_execute` that leaves
+  a transaction open (or, in MySQL, autocommit off) now closes its connection, which rolls
+  the transaction back, and fails with `ErrorKind::Closed`, as do the statements pipelined
+  behind it.
+- `giong-postgres` and `giong-mysql`: a `PooledClient` given back while a statement is
+  still in flight (its future dropped by a timeout) queues a `ROLLBACK` first. If that
+  statement was `BEGIN`, the connection went back to the shared pool inside a
+  transaction, because the last answer still said there was none. giong-mysql closes a
+  connection given back with autocommit off.
+- `giong-postgres` and `giong-mysql`: `Pool::get` waiting for a connection is woken when a
+  statement whose future was dropped frees it. It waited out the wait timeout and failed
+  with `PoolTimeout`.
+- `giong-postgres`: rows without columns (`SELECT FROM t`) are counted; `query` returned
+  none.
+- `giong-mysql`: a `TIME` with more days than MySQL allows no longer overflows when it is
+  read as text.
 
 ### Security
 

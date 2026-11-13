@@ -98,6 +98,7 @@ reused or renumbered, and its page stays when it is no longer raised.
 | [GIONG-E3008](E3008.md) | `PostgresClosed` | PostgreSQL connection closed |
 | [GIONG-E3009](E3009.md) | `PostgresPoolTimeout` | PostgreSQL pool wait timed out |
 | [GIONG-E3010](E3010.md) | `PostgresProtocol` | PostgreSQL protocol error |
+| [GIONG-E3011](E3011.md) | `PostgresStatement` | statement refused before sending |
 
 ## giong-mysql
 
@@ -113,6 +114,7 @@ reused or renumbered, and its page stays when it is no longer raised.
 | [GIONG-E3108](E3108.md) | `MysqlClosed` | MySQL connection closed |
 | [GIONG-E3109](E3109.md) | `MysqlPoolTimeout` | MySQL pool wait timed out |
 | [GIONG-E3110](E3110.md) | `MysqlProtocol` | MySQL protocol error |
+| [GIONG-E3111](E3111.md) | `MysqlStatement` | statement refused before sending |
 
 ## giong-redis
 

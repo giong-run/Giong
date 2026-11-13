@@ -213,6 +213,9 @@ codes! {
     PostgresPoolTimeout = 3009, TimedOut, "PostgreSQL pool wait timed out";
     /// The server sent something that is not the PostgreSQL protocol.
     PostgresProtocol = 3010, InvalidData, "PostgreSQL protocol error";
+    /// The statement cannot be sent this way, such as `BEGIN` on the
+    /// connections a pool shares between tasks; nothing was sent.
+    PostgresStatement = 3011, InvalidInput, "statement refused before sending";
 
     // ------------------------------------------------------- giong-mysql
     /// The configuration or connection URL is not valid.
@@ -238,6 +241,9 @@ codes! {
     MysqlPoolTimeout = 3109, TimedOut, "MySQL pool wait timed out";
     /// The server sent something that is not the MySQL protocol.
     MysqlProtocol = 3110, InvalidData, "MySQL protocol error";
+    /// The statement cannot be sent this way, such as `START TRANSACTION`
+    /// on the connections a pool shares between tasks; nothing was sent.
+    MysqlStatement = 3111, InvalidInput, "statement refused before sending";
 
     // ------------------------------------------------------- giong-redis
     /// The configuration or connection URL is not valid.
