@@ -37,7 +37,7 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       # Crate versions agree, README images use absolute URLs that resolve on
-      # crates.io, CHANGELOG.md is well formed and site/public is up to date.
+      # crates.io, CHANGELOG.md is well formed and the site builds without a broken link.
       - run: python3 scripts/release.py check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --all-features --no-deps
