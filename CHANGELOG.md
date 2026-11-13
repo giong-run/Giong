@@ -24,6 +24,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Security
 
+- `giong`: `localhost` and names under `.localhost` resolve to the loopback addresses
+  without asking DNS (RFC 6761). Before, they went through the search list first, so a
+  wildcard record in a search domain, or a forged answer, could point `localhost` at
+  another machine, which `giong-postgres` and `giong-mysql` then trusted as local: no TLS,
+  the password sent in the clear, MySQL's RSA key fetched unverified. A hosts file entry
+  for such a name is used only if it is a loopback address.
 - `giong-http`: chunk extensions are limited to 16 KiB per body, on the server and in the
   client. They counted toward no limit, so a peer could send about 4,000 bytes per byte of
   body, all of it held in memory until the body ended (the flaw of Node.js

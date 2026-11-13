@@ -395,6 +395,50 @@ fn the_hosts_file_comes_first() {
 }
 
 #[test]
+fn localhost_names_never_reach_dns() {
+    // A DNS server that would answer for localhost under the search domain,
+    // as a wildcard record or a forged reply could: the database clients
+    // treat `localhost` as this machine (no TLS, passwords sent in the clear),
+    // so the answer must not be used, or even asked for.
+    let evil = Reply::Records(vec![a("localhost.corp.example", [203, 0, 113, 9], 300)]);
+    let dns = FakeDns::start(vec![
+        (("localhost.corp.example", A), evil.clone()),
+        (("localhost", A), evil.clone()),
+        (("db.localhost.corp.example", A), evil),
+    ]);
+    giong::block_on(async {
+        let r = dns.resolver("search corp.example\noptions ndots:1\n");
+        let loopback = ips(&["::1", "127.0.0.1"]);
+        for name in [
+            "localhost",
+            "LocalHost.",
+            "db.localhost",
+            "api.dev.localhost.",
+        ] {
+            assert_eq!(r.lookup_ip(name).await.unwrap(), loopback, "{name}");
+        }
+        assert!(dns.names().is_empty(), "asked DNS for {:?}", dns.names());
+
+        // The hosts file still decides which loopback addresses, but cannot
+        // point a localhost name anywhere else.
+        let hosts =
+            "127.0.0.1 localhost\n10.1.2.3 localhost app.localhost\n127.0.0.2 app.localhost\n";
+        let cfg = ResolverConfig::parse("search corp.example\n", hosts).nameservers([dns.addr]);
+        let r = Resolver::new(cfg);
+        assert_eq!(r.lookup_ip("localhost").await.unwrap(), ips(&["127.0.0.1"]));
+        assert_eq!(
+            r.lookup_ip("app.localhost").await.unwrap(),
+            ips(&["127.0.0.2"])
+        );
+        assert!(dns.names().is_empty(), "asked DNS for {:?}", dns.names());
+
+        // A name that merely ends in "localhost" is an ordinary name.
+        let err = r.lookup_ip("notlocalhost").await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound, "{err}");
+    });
+}
+
+#[test]
 fn invalid_names_are_refused_before_any_query() {
     let dns = FakeDns::start(vec![]);
     giong::block_on(async {
