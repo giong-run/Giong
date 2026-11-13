@@ -51,13 +51,20 @@ fn main() -> std::io::Result<()> {
         .run(move |_| {
             let tls = tls.clone();
             async move {
+                // BALANCED=1: listeners hand new connections to less busy
+                // workers (bench/balance.sh).
+                let bind = if std::env::var_os("BALANCED").is_some() {
+                    TcpListener::bind_balanced
+                } else {
+                    TcpListener::bind
+                };
                 match tls {
                     Some(acceptor) => {
-                        let listener = TcpListener::bind(bench_addr(3010)).expect("bind");
+                        let listener = bind(bench_addr(3010)).expect("bind");
                         Server::new().serve_tls(listener, acceptor, handler).await;
                     }
                     None => {
-                        let listener = TcpListener::bind(bench_addr(3009)).expect("bind");
+                        let listener = bind(bench_addr(3009)).expect("bind");
                         Server::new().serve(listener, handler).await;
                     }
                 }

@@ -26,11 +26,11 @@ Where the code is:
 
 | File | Holds |
 |---|---|
-| `src/runtime.rs` | `Builder`, workers, `block_on`, `run`, shutdown, `stats()` |
+| `src/runtime.rs` | `Builder`, workers, `block_on`, `run`, shutdown, `stats()`, load hints and `spawn_balanced` |
 | `src/executor.rs` | tasks, `spawn`, `JoinHandle`, `RemoteJoinHandle` (for `Handle::spawn_on`) |
 | `src/driver.rs` | io_uring setup, submission and completion, the ring tiers |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
-| `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets |
+| `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |

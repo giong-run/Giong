@@ -52,7 +52,9 @@ These are deliberate. Proposals that need them will be declined.
   machines where io_uring is blocked, such as Docker's default seccomp profile. Running on
   macOS for development (kqueue) may follow it; Windows (IOCP) not before 1.0, and only if
   users need it.
-- **Work stealing.** Tasks stay on the worker that created them.
+- **Work stealing.** A task that has started stays on its worker, so tasks need not be
+  `Send`. Balancing happens where new work starts: `Handle::spawn_balanced` and
+  `TcpListener::bind_balanced`.
 - **Every workload.** giong covers network services: HTTP, databases, caches and the clients
   they need. It does not try to replace Tokio for everything Tokio is used for.
 - **`Send` futures as a requirement.** The API stays usable with `Rc` and `RefCell`.
@@ -133,6 +135,10 @@ built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait
 - [x] Remaining file operations: reading directories, `fallocate`.
 - [x] Agent-first groundwork: error codes with their documentation pages and
       `giong::error::code`, `AGENTS.md`, `llms.txt`.
+- [x] Load balancing across workers without moving running tasks: `Handle::spawn_balanced`
+      (jobs wait in a shared queue for the first idle worker), `TcpListener::bind_balanced`
+      (a busy worker hands new connections to a less busy one) and
+      `Handle::least_loaded_worker`.
 
 **Exit criteria:** every item above with tests, including cancellation tests for each new
 operation.

@@ -22,7 +22,7 @@ use crate::buf::BufPool;
 use crate::driver::{Driver, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
-use crate::notify::Doorbell;
+use crate::notify::{Doorbell, JobCount};
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::time::Timers;
@@ -43,12 +43,48 @@ pub(crate) enum Inject {
     Run(Box<dyn FnOnce() + Send>),
     /// A shutdown was requested: wake the worker's shutdown waiters.
     Shutdown,
+    /// Look at the runtime's queue of balanced jobs (see
+    /// [`Handle::spawn_balanced`]); nothing else to do.
+    Poke,
+}
+
+/// How busy a worker is, published for other threads choosing where to
+/// send work. The numbers are hints: a worker writes `queued` and `tasks`
+/// between batches of tasks, with no clock reads and no ordering, and
+/// readers may see them a little late. `incoming` is kept apart from them,
+/// so that a worker writing its counts never erases work sent to it that it
+/// has not taken in yet.
+///
+/// On a cache line of its own, so that a worker updating it does not slow
+/// down threads that touch its injector.
+#[repr(align(64))]
+pub(crate) struct Load {
+    /// Tasks waiting in the run queue, as of the last batch.
+    queued: AtomicUsize,
+    /// Live tasks, plus connections this worker kept since it last counted.
+    tasks: AtomicUsize,
+    /// Work other threads have sent to this worker (a `spawn_on` closure, a
+    /// connection handed over by a balanced listener) that it has not taken
+    /// in yet. Raised by the sender before the work is visible, lowered by
+    /// the worker when it takes it.
+    incoming: AtomicUsize,
+}
+
+impl Load {
+    fn new() -> Self {
+        Self {
+            queued: AtomicUsize::new(0),
+            tasks: AtomicUsize::new(0),
+            incoming: AtomicUsize::new(0),
+        }
+    }
 }
 
 /// The part of a worker that other threads may touch.
 pub(crate) struct WorkerShared {
     /// Process-wide unique id of this worker instance (never 0).
     pub(crate) uid: usize,
+    pub(crate) load: Load,
     injector: Mutex<Vec<Inject>>,
     /// Tells the worker that `injector` has items, and wakes it if it sleeps.
     bell: Doorbell,
@@ -65,6 +101,7 @@ impl WorkerShared {
         }
         Ok(Arc::new(Self {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
+            load: Load::new(),
             injector: Mutex::new(Vec::new()),
             bell: Doorbell::new(),
             closed: AtomicBool::new(false),
@@ -112,6 +149,12 @@ impl WorkerShared {
 pub(crate) struct RuntimeShared {
     workers: Vec<Arc<WorkerShared>>,
     shutdown: AtomicBool,
+    /// Where the next search for the least loaded worker starts.
+    next_pick: AtomicUsize,
+    /// Jobs from [`Handle::spawn_balanced`] that no worker has taken yet.
+    jobs: Mutex<VecDeque<Box<dyn FnOnce() + Send>>>,
+    /// How many jobs wait in `jobs`, readable without the lock.
+    jobs_len: JobCount,
 }
 
 impl RuntimeShared {
@@ -122,7 +165,122 @@ impl RuntimeShared {
         Ok(Arc::new(Self {
             workers,
             shutdown: AtomicBool::new(false),
+            next_pick: AtomicUsize::new(0),
+            jobs: Mutex::new(VecDeque::new()),
+            jobs_len: JobCount::new(),
         }))
+    }
+
+    /// The worker that looks least busy: the lowest sum of live tasks,
+    /// runnable tasks (so a runnable task counts twice) and work sent to it
+    /// that it has not taken in yet, plus one for a worker that is awake,
+    /// since it is running something. Ties go to
+    /// `local` (the caller's own worker), then to the first one found from a
+    /// starting point that moves on every call.
+    fn least_loaded(&self, local: Option<usize>) -> usize {
+        self.least_loaded_of(local, |_| true).unwrap_or(0)
+    }
+
+    /// [`least_loaded`](Self::least_loaded) among the workers for which
+    /// `eligible` is true; `None` if there is none.
+    pub(crate) fn least_loaded_of(
+        &self,
+        local: Option<usize>,
+        eligible: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        let n = self.workers.len();
+        let start = self.next_pick.fetch_add(1, Ordering::Relaxed);
+        let mut best = local.filter(|&i| i < n && eligible(i));
+        let mut best_score = best.map(|i| self.score(i));
+        for k in 0..n {
+            let i = (start + k) % n;
+            if Some(i) == local || !eligible(i) {
+                continue;
+            }
+            let s = self.score(i);
+            if best_score.map_or(true, |b| s < b) {
+                best = Some(i);
+                best_score = Some(s);
+            }
+        }
+        best
+    }
+
+    /// Number of workers.
+    pub(crate) fn workers(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// How busy worker `i` looks; see [`least_loaded`](Self::least_loaded).
+    pub(crate) fn score(&self, i: usize) -> usize {
+        let w = &self.workers[i];
+        let awake = usize::from(!w.bell.looks_asleep());
+        w.load.tasks.load(Ordering::Relaxed)
+            + w.load.queued.load(Ordering::Relaxed)
+            + w.load.incoming.load(Ordering::Relaxed)
+            + awake
+    }
+
+    /// Counts work about to be sent to `worker` from any thread, before it
+    /// is visible to the worker, so that the next choice in the same burst
+    /// takes it into account. The worker calls [`received`](Self::received)
+    /// when it takes the work in.
+    pub(crate) fn sending(&self, worker: usize) {
+        self.workers[worker]
+            .load
+            .incoming
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Worker `worker` has taken in one piece of work counted by
+    /// [`sending`](Self::sending).
+    pub(crate) fn received(&self, worker: usize) {
+        self.workers[worker]
+            .load
+            .incoming
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Counts one more task on `worker`, which must be the current thread's
+    /// worker, until it next writes its real count: for work it takes on
+    /// several times in one batch, such as connections a balanced listener
+    /// keeps.
+    pub(crate) fn count_local(&self, worker: usize) {
+        self.workers[worker]
+            .load
+            .tasks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Queues a job for the first worker with nothing else to do, and wakes
+    /// one that is asleep, if any.
+    ///
+    /// No wake-up is lost: see [`JobCount`] (modelled with loom in
+    /// `notify`).
+    fn push_job(&self, job: Box<dyn FnOnce() + Send>) {
+        lock(&self.jobs).push_back(job);
+        self.jobs_len.added();
+        let n = self.workers.len();
+        let start = self.next_pick.fetch_add(1, Ordering::Relaxed);
+        for k in 0..n {
+            let w = &self.workers[(start + k) % n];
+            if w.bell.looks_asleep() {
+                w.inject(Inject::Poke);
+                return;
+            }
+        }
+    }
+
+    /// Takes the oldest queued balanced job, if any.
+    fn take_job(&self) -> Option<Box<dyn FnOnce() + Send>> {
+        if !self.jobs_len.any() {
+            return None;
+        }
+        let job = lock(&self.jobs).pop_front();
+        if job.is_some() {
+            self.jobs_len.taken();
+        }
+        job
     }
 
     fn shutdown(&self) {
@@ -301,9 +459,19 @@ impl Worker {
     /// `idle` is checked after every batch of tasks and also ends the loop.
     fn drive(&self, poll_main: &mut dyn FnMut() -> bool, idle: &dyn Fn() -> bool) {
         let mut done = false;
+        let mut tick: u32 = 0;
         loop {
             self.drain_injected();
+            tick = tick.wrapping_add(1);
+            // A balanced job goes to a worker with nothing else to run, and
+            // now and then to a busy one, so that jobs are not left waiting
+            // while every worker stays busy.
+            if self.queue.borrow().is_empty() || tick % 61 == 0 {
+                self.take_balanced_job();
+            }
+            self.publish_load();
             self.run_tasks(&mut || done = poll_main());
+            self.publish_load();
             if done || idle() {
                 break;
             }
@@ -339,8 +507,9 @@ impl Worker {
                 }
             };
             // Announce that we are going to sleep, then re-check for injected
-            // work (see `WorkerShared::inject`).
-            let mode = if self.shared.bell.prepare_park() {
+            // work (see `WorkerShared::inject`) and balanced jobs (see
+            // `RuntimeShared::push_job`): `prepare_park` ends with the fence.
+            let mode = if self.shared.bell.prepare_park() || self.rt.jobs_len.any() {
                 Park::Poll
             } else {
                 wait
@@ -352,6 +521,16 @@ impl Worker {
 
             self.fire_timers();
         }
+    }
+
+    /// Publishes how busy this worker is (see [`Load`]): two relaxed stores
+    /// to a cache line only this thread writes.
+    fn publish_load(&self) {
+        let load = &self.shared.load;
+        load.queued
+            .store(self.queue.borrow().len(), Ordering::Relaxed);
+        load.tasks
+            .store(self.tasks.borrow().len(), Ordering::Relaxed);
     }
 
     /// Busy-polls for up to `spin`. Returns `true` as soon as there is
@@ -366,7 +545,10 @@ impl Worker {
             // Reading the clock costs about as much as the checks, so look at
             // the ring many times per clock read.
             for _ in 0..64 {
-                if self.shared.bell.peek() || self.driver.borrow_mut().has_completions() {
+                if self.shared.bell.peek()
+                    || self.rt.jobs_len.any()
+                    || self.driver.borrow_mut().has_completions()
+                {
                     return true;
                 }
                 std::hint::spin_loop();
@@ -382,6 +564,15 @@ impl Worker {
         }
     }
 
+    /// Starts one queued balanced job on this worker, if there is one.
+    fn take_balanced_job(&self) {
+        if let Some(job) = self.rt.take_job() {
+            // Like an injected job: a panic building the future must not
+            // take the worker down.
+            drop(panic::catch_unwind(panic::AssertUnwindSafe(job)));
+        }
+    }
+
     fn drain_injected(&self) {
         if !self.shared.bell.take() {
             return;
@@ -392,8 +583,12 @@ impl Worker {
                 Inject::Wake(id) => self.queue.borrow_mut().push_back(id),
                 // A panic while building the future is treated like a panic in
                 // a task: it must not take the worker down.
-                Inject::Run(f) => drop(panic::catch_unwind(panic::AssertUnwindSafe(f))),
+                Inject::Run(f) => {
+                    self.rt.received(self.index);
+                    drop(panic::catch_unwind(panic::AssertUnwindSafe(f)));
+                }
                 Inject::Shutdown => self.wake_shutdown_waiters(),
+                Inject::Poke => {}
             }
         }
     }
@@ -972,9 +1167,81 @@ impl Handle {
             );
         };
         let (handle, job) = RemoteJoinHandle::new(f);
+        self.rt.sending(worker);
         // A stopped worker drops the job, which cancels the handle.
         shared.inject(Inject::Run(job));
         handle
+    }
+
+    /// Starts a task on the first worker that has nothing else to run, and
+    /// returns a handle to its result.
+    ///
+    /// Use it for work that may run anywhere, such as CPU-heavy jobs a
+    /// request needs done: they go to idle workers rather than queueing
+    /// behind the caller's other tasks. `f` waits in a queue shared by the
+    /// runtime's workers; a worker whose own run queue is empty takes the
+    /// next one, calls it, and runs the future it returns. An idle worker
+    /// is woken for it. Busy workers also take one now and then, so a job
+    /// is never stuck while every worker stays busy. Jobs start in the order
+    /// they were queued.
+    ///
+    /// Only the start is balanced: the future stays on the worker that took
+    /// `f` (giong never moves a running task, so tasks need not be `Send`).
+    /// Otherwise it behaves like [`spawn_on`](Self::spawn_on): only `f` and
+    /// the output cross threads, and the handle reports a panic or a
+    /// cancellation the same way. Jobs still queued when the runtime stops
+    /// are dropped, which cancels their handles.
+    ///
+    /// ```no_run
+    /// let rt = giong::Builder::new().workers(4).build()?;
+    /// let handle = rt.handle();
+    /// rt.run(move |worker| {
+    ///     let handle = handle.clone();
+    ///     async move {
+    ///         if worker == 0 {
+    ///             let jobs: Vec<_> = (0..8u64)
+    ///                 .map(|n| handle.spawn_balanced(move || async move { (0..n * 1_000_000).sum::<u64>() }))
+    ///                 .collect();
+    ///             for job in jobs {
+    ///                 job.await.unwrap();
+    ///             }
+    ///             handle.shutdown();
+    ///         }
+    ///         giong::shutdown_signal().await;
+    ///     }
+    /// })?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn spawn_balanced<F, Fut>(&self, f: F) -> RemoteJoinHandle<Fut::Output>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let (handle, job) = RemoteJoinHandle::new(f);
+        self.rt.push_job(job);
+        handle
+    }
+
+    /// The index of the worker that looks least busy, for code that places
+    /// work itself, for example handing a new connection to another worker
+    /// with [`spawn_on`](Self::spawn_on).
+    ///
+    /// The score is the worker's live tasks plus its runnable ones and the
+    /// work sent to it that it has not started yet, plus one if it is awake
+    /// (it is running something); the lowest wins, and ties
+    /// favour the caller's own worker, then rotate. Each worker publishes
+    /// these numbers between batches of tasks, so they can be slightly out
+    /// of date. Calling this changes nothing; sending the work with
+    /// [`spawn_on`](Self::spawn_on) counts it on the chosen worker at once,
+    /// so that the next choice takes it into account.
+    pub fn least_loaded_worker(&self) -> usize {
+        self.rt.least_loaded(self.local_index())
+    }
+
+    /// The caller's worker index, if it runs on a worker of this runtime.
+    fn local_index(&self) -> Option<usize> {
+        try_with_worker(|w| Arc::ptr_eq(&w.rt, &self.rt).then_some(w.index)).flatten()
     }
 }
 

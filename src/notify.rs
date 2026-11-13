@@ -7,15 +7,18 @@
 //!   is still seen by the poll that follows.
 //! * [`Doorbell`]: whether the worker has injected work to collect, and
 //!   whether it is asleep in the kernel and must be woken through its eventfd.
+//! * [`JobCount`]: how many balanced jobs wait in the runtime's shared queue,
+//!   checked by a worker before it sleeps, with the doorbell's sleeping flag
+//!   telling the thread that queued a job which worker to wake.
 //!
 //! The models at the bottom drive these types with real threads under every
 //! interleaving and every memory ordering outcome that loom explores, and fail
 //! if a wake-up can be lost.
 
 #[cfg(all(loom, test))]
-use loom::sync::atomic::{fence, AtomicBool, Ordering};
+use loom::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 #[cfg(not(all(loom, test)))]
-use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 /// Run-queue membership of one task.
 pub(crate) struct RunFlag(AtomicBool);
@@ -115,6 +118,46 @@ impl Doorbell {
     /// Called by the worker once it is back from the kernel.
     pub(crate) fn unpark(&self) {
         self.sleeping.swap(false, Ordering::Relaxed);
+    }
+
+    /// Whether the worker looks asleep in the kernel: a hint for choosing
+    /// where to send work, never part of a handshake.
+    pub(crate) fn looks_asleep(&self) -> bool {
+        self.sleeping.load(Ordering::Relaxed)
+    }
+}
+
+/// The number of balanced jobs waiting in the runtime's shared queue.
+///
+/// The same handshake as [`Doorbell`], with the count as the "pending" side
+/// shared by every worker: the thread that queues a job raises the count,
+/// fences, then looks for a worker that is asleep and rings its doorbell; a
+/// worker about to sleep marks itself sleeping and fences
+/// ([`Doorbell::prepare_park`]), then reads the count. Either the worker sees
+/// the job and does not sleep, or the thread sees the worker asleep.
+pub(crate) struct JobCount(AtomicUsize);
+
+impl JobCount {
+    pub(crate) fn new() -> Self {
+        Self(AtomicUsize::new(0))
+    }
+
+    /// Called after a job was put in the queue, before looking for a worker
+    /// to wake.
+    pub(crate) fn added(&self) {
+        self.0.fetch_add(1, Ordering::Release);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Called after a job was taken out of the queue.
+    pub(crate) fn taken(&self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+
+    /// Whether any job waits. After [`Doorbell::prepare_park`], this is the
+    /// check that makes sleeping safe.
+    pub(crate) fn any(&self) -> bool {
+        self.0.load(Ordering::Acquire) > 0
     }
 }
 
@@ -288,5 +331,92 @@ mod models {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(3);
         builder.check(|| run_flag_model(2));
+    }
+
+    /// `RuntimeShared::push_job` and the worker's side of `Worker::drive`,
+    /// reduced to the doorbell and the job count: the worker takes jobs
+    /// until `want` have been taken, sleeping whenever there is nothing.
+    fn job_worker(
+        bell: &Doorbell,
+        count: &JobCount,
+        jobs: &Mutex<usize>,
+        eventfd: &EventFd,
+        want: usize,
+    ) {
+        let mut got = 0;
+        loop {
+            // A poke carries nothing; collecting it just clears the flag.
+            bell.take();
+            if count.any() {
+                let mut queued = jobs.lock().unwrap();
+                if *queued > 0 {
+                    *queued -= 1;
+                    count.taken();
+                    got += 1;
+                }
+            }
+            if got == want {
+                return;
+            }
+            if !bell.prepare_park() && !count.any() {
+                eventfd.read();
+            }
+            bell.unpark();
+        }
+    }
+
+    fn push_job(bell: &Doorbell, count: &JobCount, jobs: &Mutex<usize>, eventfd: &EventFd) {
+        *jobs.lock().unwrap() += 1;
+        count.added();
+        if bell.looks_asleep() && bell.ring() {
+            eventfd.write();
+        }
+    }
+
+    #[test]
+    fn jobs_one_pusher() {
+        // The worker's loop spins while a ring is pending; without a bound
+        // loom explores every interleaving of those spins and never ends.
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let bell = Arc::new(Doorbell::new());
+            let count = Arc::new(JobCount::new());
+            let jobs = Arc::new(Mutex::new(0));
+            let eventfd = Arc::new(EventFd::new());
+            let t = {
+                let (bell, count, jobs, eventfd) =
+                    (bell.clone(), count.clone(), jobs.clone(), eventfd.clone());
+                thread::spawn(move || {
+                    push_job(&bell, &count, &jobs, &eventfd);
+                    push_job(&bell, &count, &jobs, &eventfd);
+                })
+            };
+            job_worker(&bell, &count, &jobs, &eventfd, 2);
+            t.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn jobs_two_pushers() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let bell = Arc::new(Doorbell::new());
+            let count = Arc::new(JobCount::new());
+            let jobs = Arc::new(Mutex::new(0));
+            let eventfd = Arc::new(EventFd::new());
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    let (bell, count, jobs, eventfd) =
+                        (bell.clone(), count.clone(), jobs.clone(), eventfd.clone());
+                    thread::spawn(move || push_job(&bell, &count, &jobs, &eventfd))
+                })
+                .collect();
+            job_worker(&bell, &count, &jobs, &eventfd, 2);
+            for t in threads {
+                t.join().unwrap();
+            }
+        });
     }
 }

@@ -36,6 +36,7 @@ fn main() -> std::io::Result<()> {
 - A `Request` shares the connection's receive buffer instead of copying it, so building a request allocates nothing. A handler may keep the request for as long as it likes.
 - Limits on the size of the head (64 KiB) and the body (1 MiB); timeouts for idle connections (60 s), slow requests (30 s, against slowloris) and clients that read slowly (30 s). All of them can be changed on `Server`.
 - An optional cap on open connections (`Server::max_connections`): at the cap the server stops accepting, and new clients wait in the kernel's listen queue until a connection closes.
+- Handlers that keep a worker busy (heavy computation, long responses) leave the kernel's even spread of connections uneven. Bind each worker's listener with `giong::net::TcpListener::bind_balanced` instead of `bind` and a busy worker hands new connections to a quieter one; `Server::serve` takes either.
 - `Request::peer_addr` gives the client's address (`None` over a Unix socket).
 - Graceful shutdown: a request in progress is answered with `Connection: close`, an idle connection is closed at once.
 - HTTPS through the `tls` feature (see below).

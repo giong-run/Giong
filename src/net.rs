@@ -10,6 +10,7 @@
 //! * Descriptors are closed through the ring, batched with everything else.
 
 mod addr;
+mod balance;
 mod dns;
 mod udp;
 mod unix;
@@ -139,10 +140,11 @@ impl ListenSocket {
     }
 
     pub(crate) async fn accept(&self) -> io::Result<StreamSocket> {
-        poll_fn(|cx| self.poll_accept(cx)).await
+        poll_fn(|cx| self.poll_accept(cx).map_ok(StreamSocket::new)).await
     }
 
-    fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<StreamSocket>> {
+    /// The next accepted socket, not yet tied to this worker.
+    pub(crate) fn poll_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<Socket>> {
         runtime::with_worker(|w| {
             let key = self.accept.key(w);
             let mut driver = w.driver.borrow_mut();
@@ -150,8 +152,7 @@ impl ListenSocket {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res, _) if res >= 0 => {
                         // SAFETY: a fresh descriptor returned by accept.
-                        let sock = unsafe { Socket::from_raw_fd(res) };
-                        return Poll::Ready(Ok(StreamSocket::new(sock)));
+                        return Poll::Ready(Ok(unsafe { Socket::from_raw_fd(res) }));
                     }
                     MultiPoll::Item(res, _) => return Poll::Ready(Err(os_err(res))),
                     MultiPoll::Heap(_) => unreachable!("accept never queues heap data"),
@@ -414,6 +415,8 @@ pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>) -> bool {
 /// A TCP socket listening for connections.
 pub struct TcpListener {
     inner: ListenSocket,
+    /// Set by [`bind_balanced`](Self::bind_balanced).
+    balance: Option<balance::Member>,
 }
 
 impl TcpListener {
@@ -439,7 +442,53 @@ impl TcpListener {
         sock.listen(4096)?;
         Ok(Self {
             inner: ListenSocket::new(sock),
+            balance: None,
         })
+    }
+
+    /// Like [`bind`](Self::bind), and the listener shares new connections
+    /// with the listeners that other workers of this runtime bound to the
+    /// same address with `bind_balanced`.
+    ///
+    /// With `SO_REUSEPORT` the kernel picks a listener for each connection
+    /// from a hash of its addresses, without regard to how busy each worker
+    /// is: with few connections, or a few heavy ones, one worker can end up
+    /// with several while another has none. A balanced listener checks, for
+    /// each connection it accepts, whether another worker in its group looks
+    /// clearly less busy (by the hints described at
+    /// [`Handle::least_loaded_worker`](crate::Handle::least_loaded_worker)),
+    /// and if so hands the connection over; that worker's `accept` returns
+    /// it. Connections that are already being served never move.
+    ///
+    /// Call it on every worker, inside [`Runtime::run`](crate::Runtime::run).
+    /// A handed-over connection waits for the next `accept` on its new
+    /// worker, so keep accepting on every worker; when a balanced listener
+    /// is dropped, connections still waiting for it go to another member of
+    /// the group, or are closed if it was the last one.
+    ///
+    /// What it cannot fix: a connection the kernel queued for a worker that
+    /// is stuck in a long task waits until that worker accepts again.
+    ///
+    /// ```no_run
+    /// giong::Builder::new().workers(4).build()?.run(|_| async {
+    ///     let listener = giong::net::TcpListener::bind_balanced("0.0.0.0:8080").unwrap();
+    ///     while let Ok(stream) = listener.accept().await {
+    ///         giong::spawn(async move {
+    ///             // serve `stream`
+    ///             drop(stream);
+    ///         });
+    ///     }
+    /// })?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside of a giong runtime.
+    pub fn bind_balanced<A: StdToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let mut listener = Self::bind(addr)?;
+        listener.balance = Some(balance::Member::join(listener.local_addr()?));
+        Ok(listener)
     }
 
     /// Wraps a listener created by the standard library.
@@ -448,6 +497,7 @@ impl TcpListener {
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };
         Self {
             inner: ListenSocket::new(sock),
+            balance: None,
         }
     }
 
@@ -465,7 +515,17 @@ impl TcpListener {
     /// persistent error such as `EMFILE` this returns the error on every call,
     /// so back off (e.g. [`sleep`](crate::time::sleep)) before retrying.
     pub async fn accept(&self) -> io::Result<TcpStream> {
-        let inner = self.inner.accept().await?;
+        let inner = match &self.balance {
+            None => self.inner.accept().await?,
+            Some(member) => {
+                poll_fn(|cx| {
+                    member
+                        .poll_accept(cx, &self.inner)
+                        .map_ok(StreamSocket::new)
+                })
+                .await?
+            }
+        };
         Ok(TcpStream { inner })
     }
 }

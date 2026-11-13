@@ -10,6 +10,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **Load balancing across workers**, without moving a task once it has started (so tasks
+  still need not be `Send`):
+  - `Handle::spawn_balanced(f)`: `f` waits in a queue shared by the workers, and the
+    first worker with nothing else to run takes it; busy workers also take one now and
+    then, so no job waits for ever. 64 jobs of uneven CPU cost started from one worker
+    finish in 5.7 ms on 4 workers (median of 15 rounds), against 6.9 ms placed
+    round-robin and 16.8 ms on the worker that started them; the slowest round took 6.5,
+    10.4 and 19.7 ms (`bench/spawn-balanced`).
+  - `TcpListener::bind_balanced(addr)`: listeners of the same runtime on the same address
+    form a group, and a worker that looks clearly busier than another member hands each
+    new connection it accepts to that member. `SO_REUSEPORT` alone spreads connections by
+    a hash of their addresses, so with 6 connections on 3 workers running a CPU-heavy
+    route the result depends on where the hash puts them: over 10 runs plain listeners
+    gave 37,000 to 54,000 requests per second (median 51,600, p99 448 µs), balanced ones
+    47,000 to 59,000 (median 53,000, p99 408 µs) (`bench/balance.sh`).
+  - `Handle::least_loaded_worker()`, from hints each worker publishes between batches of
+    tasks (live tasks, runnable tasks, asleep or not), plus work sent to a worker that it
+    has not taken in yet. Publishing them costs about 0.1% of the instructions per request
+    of a small HTTP response.
+
 - **`giong-http`**: what the client lacked for production traffic.
   - HTTP proxies: `ClientBuilder::proxy` with `Proxy::all`, `Proxy::http` or
     `Proxy::https`, or `Proxy::from_env` for `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and

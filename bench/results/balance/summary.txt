@@ -1,0 +1,4 @@
+6 connections, /compute?n=22, 10 rounds of 4 s
+mode       req/s median       min       max  p99 us median
+plain             51560     37277     53682            448
+balanced          53024     47314     58570            408
