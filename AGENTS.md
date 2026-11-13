@@ -102,7 +102,8 @@ the soak test every night.
 run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
 optional io_uring features that newer kernels have (`giong::IoUringFeature`), and
 `GIONG_DRIVER=epoll` picks the epoll driver; `scripts/check.sh fallback` does all three for
-you.
+you. `GIONG_ZERO_COPY_MIN=<bytes>` moves the size from which TCP sends go out without a copy
+(16 KiB), for benchmarks.
 
 The kernel TLS tests in `giong-tls` skip themselves when the kernel has no `tls` module
 (`sudo modprobe tls` loads it; containers need it loaded on the host).

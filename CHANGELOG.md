@@ -136,6 +136,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong**: on Linux 6.2 and newer, TCP sends of 16 KiB and more go out without a copy
+  into the kernel (`IORING_OP_SEND_ZC`, `zero-copy-send`) when the peer is less than a
+  millisecond away: the network card reads the caller's buffer, and the write completes
+  once the kernel has let go of it. A socket goes back to plain sends for good when the
+  kernel reports that it copied the data anyway (loopback, a card without scatter-gather)
+  or cannot send this way (kTLS); Unix sockets never use it. `bench/uring-features.sh`
+  measures each optional io_uring feature against the rest, on one machine or two.
 
 ### Changed
 

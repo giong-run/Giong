@@ -26,6 +26,16 @@ fn query_ms(q: &str) -> u64 {
     q.split('&').find_map(|kv| kv.strip_prefix("ms=")).and_then(|v| v.parse().ok()).unwrap_or(0)
 }
 
+/// The bodies of `/static?size=N` and `/stream`: up to 16 MiB, made once and never freed,
+/// so a response costs no allocation or copy of its own and the send path is
+/// what gets measured (bench/uring-features.sh).
+fn bytes(q: &str) -> &'static [u8] {
+    static BYTES: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    let all = BYTES.get_or_init(|| Vec::leak((0..16 << 20).map(|i| b'a' + (i % 26) as u8).collect()));
+    let size = q.split('&').find_map(|kv| kv.strip_prefix("size=")).and_then(|v| v.parse().ok()).unwrap_or(65536);
+    &all[..all.len().min(size)]
+}
+
 async fn handler(req: Request) -> Response {
     match req.path() {
         "/json" => Response::json(r#"{"message":"Hello, World!"}"#),
@@ -81,6 +91,34 @@ async fn handler(req: Request) -> Response {
                 .header("content-type", "application/octet-stream")
                 .body(giong_http::Body::file_range(file, 0, n))
         }
+        // `/stream?size=N&chunk=C`: N bytes as a streamed body of C-byte
+        // pieces, each sent once the one before it is written.
+        "/stream" => {
+            let q = req.query().unwrap_or("");
+            let num = |key: &str, default: usize| {
+                q.split('&').find_map(|kv| kv.strip_prefix(key)).and_then(|v| v.parse().ok()).unwrap_or(default)
+            };
+            let (size, chunk) = (num("size=", 1 << 20), num("chunk=", 65536).max(1));
+            let (tx, body) = giong_http::Body::channel();
+            drop(giong::spawn(async move {
+                let all = bytes("size=16777216");
+                let mut sent = 0;
+                while sent < size {
+                    let n = chunk.min(size - sent).min(all.len());
+                    let at = if sent + n <= all.len() { sent } else { 0 };
+                    if tx.send(&all[at..at + n]).await.is_err() {
+                        break;
+                    }
+                    sent += n;
+                }
+            }));
+            Response::new(200).header("content-type", "application/octet-stream").body(body)
+        }
+        // `/static?size=N`: N bytes from memory that is never freed, sent
+        // without a copy of their own (bench/uring-features.sh).
+        "/static" => Response::new(200)
+            .header("content-type", "application/octet-stream")
+            .body(giong_http::Body::Static(bytes(req.query().unwrap_or("")))),
         _ => Response::new(404),
     }
 }
@@ -149,6 +187,11 @@ fn main() -> std::io::Result<()> {
         .run(move |_| {
             let tls = tls.clone();
             async move {
+                // GIONG_LOG_DRIVER=1: say which driver and io_uring features
+                // each worker uses (bench/uring-features.sh records it).
+                if std::env::var_os("GIONG_LOG_DRIVER").is_some() {
+                    eprintln!("{}", giong::driver_choice());
+                }
                 // BALANCED=1: listeners hand new connections to less busy
                 // workers (bench/balance.sh).
                 let bind = if std::env::var_os("BALANCED").is_some() {
