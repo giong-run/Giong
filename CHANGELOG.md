@@ -8,6 +8,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-13
+
+"Prove it": the runtime is checked in ways it was not before, and a service gets the
+clients it needs. The cross-thread wake-up is model-checked with loom (which found a lost
+wake-up, now fixed), the suite runs on real Linux 6.0 and 6.1 kernels (which found a start
+failure on 6.0, now fixed), the HTTP parser is fuzzed every night, a two-hour soak test
+looks for leaks, and `giong-tls` had a security review. The first multi-core benchmark
+runs from 1 to 10 workers. Three new crates join the workspace, `giong-postgres`,
+`giong-mysql` and `giong-redis`, and `giong-http` gains a client. The runtime adds
+asynchronous DNS, the client side of TLS, more channels, and error codes that say how to
+fix what went wrong.
+
 ### Added
 
 - **Error codes.** Every error that giong, giong-http's client, giong-tls, giong-postgres,
@@ -233,6 +245,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     slip bytes into the encrypted session (the flaw of CVE-2021-23222 in PostgreSQL
     clients). Any byte left over before the handshake now ends the connection.
 
+### Known limitations
+
+- Not run in production yet.
+- The multi-core benchmark ran under WSL2 over loopback; scaling on bare metal and a
+  physical network are not measured.
+- The `giong-tls` review was done by the project's AI agent; an independent review is
+  still wanted.
+- No HTTP/2, no streaming HTTP bodies, and tasks do not move between workers.
+
 ## [0.2.1] - 2026-11-12
 
 A patch release: a file descriptor leak at shutdown, and the logo on crates.io.
@@ -390,7 +411,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/giong-run/Giong/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/giong-run/Giong/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/giong-run/Giong/releases/tag/v0.1.0

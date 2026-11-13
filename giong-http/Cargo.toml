@@ -1,6 +1,6 @@
 [package]
 name = "giong-http"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "A small, strict HTTP/1.1 server and client for the giong thread-per-core runtime"
@@ -19,8 +19,8 @@ tls = ["dep:giong-tls"]
 client = ["dep:giong-tls", "dep:libc"]
 
 [dependencies]
-giong = { path = "..", version = "0.2.1" }
-giong-tls = { path = "../giong-tls", version = "0.2.1", optional = true }
+giong = { path = "..", version = "0.3.0" }
+giong-tls = { path = "../giong-tls", version = "0.3.0", optional = true }
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]

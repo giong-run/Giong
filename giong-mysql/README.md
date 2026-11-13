@@ -4,8 +4,8 @@ A MySQL client and connection pool for the [giong](../README.md) runtime. It spe
 
 ```toml
 [dependencies]
-giong = "0.2"
-giong-mysql = "0.2"
+giong = "0.3"
+giong-mysql = "0.3"
 ```
 
 ```rust

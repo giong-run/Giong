@@ -1,6 +1,6 @@
 [package]
 name = "giong"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Gióng — a thread-per-core async runtime for Linux built directly on io_uring"

@@ -2,7 +2,7 @@
 
 > A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
 > worker owns its ring, tasks and buffers; tasks never move between threads, so futures
-> need not be `Send`. Version 0.2.1.
+> need not be `Send`. Version 0.3.0.
 
 Facts that are easy to get wrong:
 

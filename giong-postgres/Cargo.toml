@@ -1,6 +1,6 @@
 [package]
 name = "giong-postgres"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
 description = "A PostgreSQL client and connection pool for the giong thread-per-core runtime"
@@ -12,8 +12,8 @@ keywords = ["postgres", "postgresql", "database", "io-uring", "async"]
 categories = ["database", "network-programming", "asynchronous"]
 
 [dependencies]
-giong = { path = "..", version = "0.2.1" }
-giong-tls = { path = "../giong-tls", version = "0.2.1" }
+giong = { path = "..", version = "0.3.0" }
+giong-tls = { path = "../giong-tls", version = "0.3.0" }
 # SCRAM-SHA-256 (PBKDF2, HMAC, SHA-256) and its nonce. Already compiled in
 # through rustls, so it adds nothing to the build.
 ring = "0.17"

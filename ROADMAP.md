@@ -83,7 +83,7 @@ together with the verification that needed no extra hardware.
 - [x] Fuzz-style tests for the HTTP parser: 500,000 random inputs for the request parser
       and the chunked decoder in `giong-http`.
 
-## 0.3 — Prove it
+## 0.3 — Prove it (done)
 
 The numbers so far come from a 4-vCPU virtual machine over loopback. Before adding more
 features, find out what is actually true.
@@ -141,12 +141,12 @@ operation.
 
 A new crate: the Postgres v3 protocol on giong.
 
-- [ ] Connecting, SCRAM-SHA-256 (with `ring`, already a dependency through rustls), TLS.
-- [ ] Parameterised queries, prepared statements with a cache, transactions, the common
+- [x] Connecting, SCRAM-SHA-256 (with `ring`, already a dependency through rustls), TLS.
+- [x] Parameterised queries, prepared statements with a cache, transactions, the common
       data types.
-- [ ] Pipelining by default: queries from many requests on one core share one write.
-- [ ] A connection pool per core, with no `Arc` or `Mutex` between threads.
-- [ ] Per-worker and per-pool statistics as a public API, in `giong` and here.
+- [x] Pipelining by default: queries from many requests on one core share one write.
+- [x] A connection pool per core, with no `Arc` or `Mutex` between threads.
+- [x] Per-worker and per-pool statistics as a public API, in `giong` and here.
 
 **Exit criteria:** the test suite passes against real Postgres 14 to 17 in CI, the protocol
 parser is fuzzed, and a benchmark compares it with tokio-postgres and deadpool.
