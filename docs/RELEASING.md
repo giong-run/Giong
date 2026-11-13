@@ -27,7 +27,8 @@ request; everything else is automated and safe to re-run.
    - updates install snippets such as `giong-http = "0.2"` in the crate READMEs, and
      lists any prose that still names the old minor version (for example
      "Status: 0.2.") for you to rewrite;
-   - rebuilds `site/public`, which takes the version from `Cargo.toml`.
+   - checks that the site still builds; it takes the version from `Cargo.toml` and the
+     release notes from `CHANGELOG.md` when it deploys.
 
    From a checkout instead: `python3 scripts/release.py prepare auto --pr` (needs `gh`).
 
@@ -103,7 +104,8 @@ What a new crate needs:
 3. **Add its trusted publisher** at `https://crates.io/crates/<new-crate>/settings`:
    *Trusted Publishing → Add → GitHub*, owner `giong-run`, repository `Giong`, workflow
    `release.yml`, environment `release`.
-4. Describe it on the site (cards, examples) in `site/build.py` if it deserves a mention.
+4. It appears on the site by itself with its `Cargo.toml` description; give it an entry in
+   `site/content.py` (`CRATES`) for its place in the stack, bullets and a headline fact.
 
 From the next release on it is published with the others.
 
@@ -120,8 +122,8 @@ Done once per repository; listed so it can be checked or rebuilt.
 | `SITE_DEPLOY_KEY`: a deploy key with write access on giong-run.github.io, its private half as a secret here | giong-run.github.io → Settings → Deploy keys; Giong → Settings → Secrets → Actions | needed for automatic site deploys |
 
 Without the last two the process still works with a little more by hand: run
-`scripts/release.py prepare --pr` locally instead of the workflow, and copy
-`site/public/` to giong-run.github.io after a release.
+`scripts/release.py prepare --pr` locally instead of the workflow, and after a release run
+`python3 site/build.py` and copy `site/public/` to giong-run.github.io.
 
 ## Version numbers
 
@@ -141,6 +143,7 @@ Lessons from 0.2.0 and 0.2.1, now enforced by the tooling:
   that point at files that do not exist.
 - **Every release goes to both crates.io and GitHub,** with notes that read well and
   credit contributors, so neither is done by hand or forgotten.
-- **giong.run follows releases by itself.** The page reads the version from `Cargo.toml`,
-  CI fails if `site/public` is stale, and the release deploys it.
+- **giong.run follows releases by itself.** Its pages are built when it deploys, from
+  `Cargo.toml`, `CHANGELOG.md` and `ROADMAP.md`; CI fails if the site does not build or
+  has a broken link, and the release deploys it.
 - **Nothing names the crates by hand,** so a new crate cannot be left out of a release.
