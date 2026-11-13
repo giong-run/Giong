@@ -17,13 +17,17 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Instant;
 
 use crate::notify::RunFlag;
+use crate::observe::Location;
 use crate::runtime::{self, lock, Inject, Worker, WorkerShared};
 
 pub(crate) struct TaskSlot {
     /// `None` while the task is being polled.
     task: Option<Task>,
+    /// Where the task was spawned (see [`crate::observe`]).
+    location: Location,
     /// Unique per spawned task; guards [`JoinHandle::abort`] against slot reuse.
     uid: u64,
     /// Abort requested while the task was being polled.
@@ -314,7 +318,7 @@ pub struct RemoteJoinHandle<T> {
 
 impl<T: Send + 'static> RemoteJoinHandle<T> {
     /// The handle, and the job that the target worker runs to start the task.
-    pub(crate) fn new<F, Fut>(f: F) -> (Self, Box<dyn FnOnce() + Send>)
+    pub(crate) fn new<F, Fut>(f: F, location: Location) -> (Self, Box<dyn FnOnce() + Send>)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
@@ -335,7 +339,9 @@ impl<T: Send + 'static> RemoteJoinHandle<T> {
                 return;
             }
             match panic::catch_unwind(AssertUnwindSafe(f)) {
-                Ok(fut) => drop(spawn(run_remote(fut, guard))),
+                Ok(fut) => drop(runtime::with_worker(|w| {
+                    w.spawn_local(run_remote(fut, guard), location)
+                })),
                 Err(payload) => guard.0.complete(Err(JoinError::Panic(payload))),
             }
         });
@@ -428,7 +434,7 @@ fn drop_quietly<T>(value: T) {
 }
 
 impl Worker {
-    pub(crate) fn spawn_local<F>(&self, fut: F) -> JoinHandle<F::Output>
+    pub(crate) fn spawn_local<F>(&self, fut: F, location: Location) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
     {
@@ -458,6 +464,7 @@ impl Worker {
         let mut tasks = self.tasks.borrow_mut();
         let slot = tasks.insert(TaskSlot {
             task: None,
+            location,
             uid,
             abort: false,
         });
@@ -475,6 +482,7 @@ impl Worker {
         tasks.get_mut(slot).expect("slot just inserted").task = Some(task);
         drop(tasks);
         self.queue.borrow_mut().push_back(slot);
+        self.shared.counters.spawned();
 
         JoinHandle {
             state,
@@ -487,23 +495,47 @@ impl Worker {
     /// Polls every task that was runnable when the call started. Tasks woken in
     /// the meantime wait for the next tick, so I/O is polled in between.
     pub(crate) fn run_tasks(&self, poll_main: &mut dyn FnMut()) {
+        // Read once per batch, and two copies of the loop, so that profiling
+        // turned off costs no clock reads and no branches per poll.
+        if self.rt.profiling() {
+            self.run_batch::<true>(poll_main);
+        } else {
+            self.run_batch::<false>(poll_main);
+        }
+        self.shared.counters.between_polls();
+    }
+
+    fn run_batch<const PROFILE: bool>(&self, poll_main: &mut dyn FnMut()) {
         let budget = self.queue.borrow().len();
+        let counters = &self.shared.counters;
         for _ in 0..budget {
             let Some(id) = self.queue.borrow_mut().pop_front() else {
                 break;
             };
+            crate::driver::refill_budget();
             if id == MAIN_TASK {
+                let location = self.main_location();
+                counters.polling(location);
+                let start = PROFILE.then(Instant::now);
                 poll_main();
+                if let Some(start) = start {
+                    self.observe.record(location, start.elapsed());
+                }
                 continue;
             }
-            let task = {
+            let (task, location) = {
                 let mut tasks = self.tasks.borrow_mut();
-                tasks.get_mut(id).and_then(|slot| slot.task.take())
+                let Some(slot) = tasks.get_mut(id) else {
+                    continue;
+                };
+                (slot.task.take(), slot.location)
             };
             // A stale wake-up for a slot that is empty (or being polled).
             let Some(mut task) = task else { continue };
 
             task.state.clear_queued();
+            counters.polling(location);
+            let start = PROFILE.then(Instant::now);
             let finished = {
                 let mut cx = Context::from_waker(&task.waker);
                 // The task wrapper already catches panics from the user's future;
@@ -513,6 +545,9 @@ impl Worker {
                     Ok(Poll::Ready(())) | Err(_) => true,
                 }
             };
+            if let Some(start) = start {
+                self.observe.record(location, start.elapsed());
+            }
 
             let mut tasks = self.tasks.borrow_mut();
             let abort = tasks.get(id).map(|slot| slot.abort).unwrap_or(true);
@@ -524,6 +559,15 @@ impl Worker {
                 slot.task = Some(task);
             }
         }
+    }
+
+    /// Where each live task was spawned, for [`crate::observe::snapshot`].
+    pub(crate) fn task_locations(&self) -> Vec<Location> {
+        self.tasks
+            .borrow()
+            .iter()
+            .map(|slot| slot.location)
+            .collect()
     }
 
     /// Drops every task. Destructors may spawn new tasks; those are dropped too.
@@ -548,11 +592,13 @@ impl Worker {
 /// # Panics
 ///
 /// Panics when called outside of a giong runtime.
+#[track_caller]
 pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
 {
-    runtime::with_worker(|w| w.spawn_local(fut))
+    let location = std::panic::Location::caller();
+    runtime::with_worker(|w| w.spawn_local(fut, location))
 }
 
 /// Yields to the executor, letting other tasks and pending I/O make progress.

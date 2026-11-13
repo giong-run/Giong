@@ -1078,9 +1078,11 @@ fn streamed_bodies_arrive_piece_by_piece_with_no_limit_on_their_size() {
         assert_eq!(e.kind(), ErrorKind::TooLarge, "{e}");
         assert!(e.to_string().contains("send_streaming"), "{e}");
 
+        // A generous timeout where the server answers (ThreadSanitizer builds
+        // are slow), and a short one for the body that stops.
         let client = Client::builder()
             .max_response_size(1 << 20)
-            .timeout(Duration::from_millis(300))
+            .timeout(Duration::from_secs(10))
             .build();
         for _ in 0..2 {
             let mut r = client.get(&big).send_streaming().await.unwrap();
@@ -1116,15 +1118,11 @@ fn streamed_bodies_arrive_piece_by_piece_with_no_limit_on_their_size() {
         }
         assert_eq!(body, text_of(5 << 20));
 
-        // Dropped halfway: its connection is closed, not reused.
-        let mut r = client.get(&big).send_streaming().await.unwrap();
-        r.chunk().await.unwrap().unwrap();
-        drop(r);
-        assert_eq!(client.connections(&big), (0, 0));
-
-        // A body that stops: the timeout is per piece.
+        // A body that stops: the timeout is per piece. (Before the next step,
+        // whose server task keeps writing to a closed connection.)
         let mut r = client
             .get(&format!("{base}/stall"))
+            .timeout(Duration::from_millis(300))
             .send_streaming()
             .await
             .unwrap();
@@ -1135,6 +1133,12 @@ fn streamed_bodies_arrive_piece_by_piece_with_no_limit_on_their_size() {
         assert!(e.to_string().contains("no part of the body arrived"), "{e}");
         assert!(started.elapsed() >= Duration::from_millis(280));
         assert_eq!(r.chunk().await.unwrap(), None);
+
+        // Dropped halfway: its connection is closed, not reused.
+        let mut r = client.get(&big).send_streaming().await.unwrap();
+        r.chunk().await.unwrap().unwrap();
+        drop(r);
+        assert_eq!(client.connections(&big), (0, 0));
 
         // Statuses, as with send().
         let r = client

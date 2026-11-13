@@ -263,10 +263,13 @@ fn dropping_a_stream_closes_the_connection() {
         sleep(Duration::from_millis(20)).await;
         let stats = giong::stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
-        assert_eq!(
-            stats.inflight, 1,
-            "only the wake-up read may remain: {stats:?}"
-        );
+        // On io_uring only the wake-up read may remain; epoll has nothing
+        // in flight.
+        let expected = match giong::driver_kind() {
+            giong::DriverKind::IoUring => 1,
+            _ => 0,
+        };
+        assert_eq!(stats.inflight, expected, "{stats:?}");
         assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
     });
 }

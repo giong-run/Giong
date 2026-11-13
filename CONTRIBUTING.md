@@ -36,7 +36,9 @@ name the part of the code involved (`driver`, `fs`, `net`, `http`, `tls`).
 
 You need **Linux with kernel 6.0 or newer** and a stable Rust toolchain. giong does not
 build on Windows or macOS; use WSL2 with a 6.x kernel, a virtual machine, or a container
-started with `--security-opt seccomp=unconfined` (Docker's default profile blocks io_uring).
+with the seccomp profile from [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In a container with
+Docker's default profile, which blocks io_uring, or on an older kernel, giong runs on its
+epoll driver, so the tests pass but the io_uring driver goes untested.
 
 ```bash
 cargo build --workspace --all-features
@@ -44,8 +46,10 @@ cargo test --workspace --all-features
 cargo run --release --example http
 ```
 
-The repository is a Cargo workspace of three crates: `giong` (the runtime, at the root),
-`giong-http` and `giong-tls`. The servers under `bench/` are separate workspaces.
+The repository is a Cargo workspace of eight crates: `giong` (the runtime, at the root),
+`giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web` and
+`giong-mcp`.
+The servers under `bench/` are separate workspaces.
 
 ## Checks every change must pass
 
@@ -56,7 +60,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 scripts/check.sh test        # the whole suite in release mode, five times over
-scripts/check.sh fallback    # the same on the io_uring setups of kernels older than 6.1
+scripts/check.sh fallback    # the same on the io_uring setups of kernels older than 6.1,
+                             # then on the epoll driver
 ```
 
 If you touched `unsafe` code, buffer handling, the driver or anything that crosses
@@ -66,7 +71,8 @@ threads, also run:
 scripts/check.sh tsan        # ThreadSanitizer; needs nightly with the rust-src component
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh soak        # 5 minutes of churn, then checks for leaks (SOAK_SECS=…)
-scripts/kernels.sh           # the suite on real 6.0 and 6.1 kernels in QEMU; needs
+scripts/check.sh seccomp     # io_uring blocked as Docker blocks it: giong must pick epoll
+scripts/kernels.sh           # the suite on real 5.15, 6.0 and 6.1 kernels in QEMU; needs
                              # qemu-system-x86, busybox-static, cpio (slow without KVM)
 scripts/valgrind.sh          # needs valgrind; takes a few minutes
 ```
@@ -119,7 +125,8 @@ giong talks to the kernel, so some `unsafe` is unavoidable. Keep it small and ju
 ### Cancellation safety
 
 This is the rule that is easiest to break. io_uring keeps using the memory an operation
-points at until the kernel reports completion, whatever happens to the Rust future.
+points at until the kernel reports completion, whatever happens to the Rust future. On the
+epoll driver, a file operation running on a blocking thread does the same.
 
 - Any new operation must keep its buffers alive until its final completion arrives, even
   if its future is dropped first. Use `Op`, which already does this, rather than

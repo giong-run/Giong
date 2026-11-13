@@ -7,7 +7,8 @@ an item so the work is not duplicated.
 ## Goal
 
 A runtime for **network services on Linux** that makes the fewest possible system calls and
-keeps tail latency low, by committing fully to io_uring and to one thread per core.
+keeps tail latency low, by committing fully to io_uring and to one thread per core, and
+that still runs, on epoll, where io_uring is blocked.
 
 By 1.0, a team can write and deploy a real REST API (Postgres or MySQL, Redis, calls to
 other HTTPS services, HTTPS itself) with giong's crates alone, in an ordinary Docker or
@@ -48,9 +49,9 @@ tighter the checks around it have to be.
 These are deliberate. Proposals that need them will be declined.
 
 - **Production on other operating systems.** Linux is the only platform giong is tuned and
-  measured on, and io_uring stays the main path. A Linux epoll driver is planned (0.5) for
+  measured on, and io_uring stays the main path; the epoll driver (0.4) covers the Linux
   machines where io_uring is blocked, such as Docker's default seccomp profile. Running on
-  macOS for development (kqueue) may follow it; Windows (IOCP) not before 1.0, and only if
+  macOS for development (kqueue) may follow; Windows (IOCP) not before 1.0, and only if
   users need it.
 - **Work stealing.** A task that has started stays on its worker, so tasks need not be
   `Send`. Balancing happens where new work starts: `Handle::spawn_balanced` and
@@ -131,7 +132,13 @@ built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait
 - [x] `giong-http`: the client's address in `Request`, and a limit on open connections.
 - [x] Vectored writes (`writev`) so a response head and body need no copy.
 - [x] A clear error when io_uring is blocked, and a guide to allowing it in Docker and
-      Kubernetes until the epoll driver exists.
+      Kubernetes ([docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
+- [x] An epoll driver (moved up from 0.5), chosen by itself when io_uring cannot be set up
+      (a seccomp profile, a sandbox, a kernel older than 6.0), or by `Builder::driver` and
+      `GIONG_DRIVER`. The worker still blocks in one place that a wake-up from another
+      thread can interrupt. The whole test suite passes on both drivers, in CI inside a
+      Docker container with the default seccomp profile, and on a real 5.15 kernel; the
+      difference in speed is measured in the README.
 - [x] Remaining file operations: reading directories, `fallocate`.
 - [x] Agent-first groundwork: error codes with their documentation pages and
       `giong::error::code`, `AGENTS.md`, `llms.txt`.
@@ -203,24 +210,17 @@ a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
 - [x] A complete example REST API (`examples/rest-api`: CRUD on PostgreSQL, a Redis
       cache, HTTPS), and the same API on axum to measure it against
       (`bench/rest-api.sh`).
-- [ ] `giong-mcp`, a new crate: the MCP server described under
-      [Agent-first](#agent-first).
+- [x] `giong-mcp`, a new crate: the MCP server described under
+      [Agent-first](#agent-first). Read-only, on loopback or a Unix socket, started by
+      `GIONG_MCP`; tools `overview`, `workers`, `tasks`, `sources` and `profile`, served
+      from `giong::observe` (per-worker counters, tasks named by the line that spawned
+      them, poll profiles, pools as sources). It names the task a blocked worker is stuck
+      in.
 
 **Exit criteria:** a complete example REST API (CRUD on Postgres, a Redis cache, HTTPS) in
 the repository, and a benchmark of it against the same API on axum.
 
-## 0.5 — Runs where io_uring is blocked
-
-Starts once 0.3 is done, because both change the driver and the wake-up path.
-
-- [ ] An epoll driver, chosen automatically when io_uring cannot be set up, or by an
-      environment variable. The worker still blocks in one place that a wake-up from another
-      thread can interrupt.
-
-**Exit criteria:** the whole test suite passes on both drivers, giong runs in Docker with
-the default seccomp profile, and the difference in performance is measured and published.
-
-## 0.6 — HTTP/2 and adapters
+## 0.5 — HTTP/2 and adapters
 
 - [ ] HTTP/2 in `giong-http`, over TLS with ALPN.
 - [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
@@ -229,7 +229,7 @@ the default seccomp profile, and the difference in performance is measured and p
 
 **Exit criteria:** an HTTPS server serving real browsers over HTTP/2, and `h2spec` passing.
 
-## 0.7 — Speed
+## 0.6 — Speed
 
 Each item lands only with a benchmark showing what it buys.
 

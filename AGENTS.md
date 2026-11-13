@@ -7,18 +7,20 @@ disagree, CONTRIBUTING.md wins: report the difference.
 
 ## What this is
 
-giong is a thread-per-core async runtime for Linux, built on io_uring. One Cargo
-workspace, seven crates and an example service:
+giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
+driver where io_uring is blocked or the kernel is too old. One Cargo
+workspace, eight crates and an example service:
 
 | Path | Crate | What it is |
 |---|---|---|
-| `.` | `giong` | the runtime: executor, io_uring driver, TCP/UDP/Unix sockets, files, timers, channels |
+| `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
 | `giong-http/` | `giong-http` | a strict HTTP/1.1 server library (bodies whole or streamed both ways), HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
 | `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
+| `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
@@ -30,19 +32,26 @@ Where the code is:
 |---|---|
 | `src/runtime.rs` | `Builder`, workers, `block_on`, `run`, shutdown, `stats()`, load hints and `spawn_balanced` |
 | `src/executor.rs` | tasks, `spawn`, `JoinHandle`, `RemoteJoinHandle` (for `Handle::spawn_on`) |
-| `src/driver.rs` | io_uring setup, submission and completion, the ring tiers |
+| `src/driver/mod.rs` | the driver facade: `Io` (one operation, driver-neutral), `DriverKind`, choosing a driver and falling back |
+| `src/driver/uring.rs` | io_uring setup, submission and completion, the ring tiers |
+| `src/driver/epoll.rs` | the epoll driver: readiness, edge-triggered registration, the per-task budget |
+| `src/driver/blocking.rs` | the thread pool the epoll driver runs file operations on |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
+| `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
 ## The machine you need
 
-- **Linux 6.0 or newer with io_uring allowed.** giong does not build on macOS or Windows.
-- **Docker blocks io_uring with its default seccomp profile.** Inside a container, every
-  test fails at runtime setup with `EPERM`. Use a VM, WSL2 with a 6.x kernel, or
-  `docker run --security-opt seccomp=unconfined` for development.
+- **Linux 6.0 or newer with io_uring allowed**, to test both drivers. giong does not
+  build on macOS or Windows.
+- **Docker blocks io_uring with its default seccomp profile.** Inside such a container,
+  or on an older kernel, the tests still pass, but on the epoll driver only: the io_uring
+  half of the suite goes untested. `tests/driver.rs` and `tests/blocked.rs` check which
+  driver a worker got. Use a VM, WSL2 with a 6.x kernel, or a container with the profile
+  from `docs/DEPLOYMENT.md` to test io_uring.
 - Stable Rust. The libraries must build on **Rust 1.80**; the tests need a newer compiler
   (rcgen's dependencies). Nightly with the `rust-src` component is needed for
   ThreadSanitizer only.
@@ -68,32 +77,38 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo +1.80.0 check --workspace --all-features   # the minimum Rust version, libraries only
 
 scripts/check.sh test        # release build, every test 5 times; ROUNDS=1 for one pass
-scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1
+scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1, then on epoll
+scripts/check.sh epoll       # the tests on the epoll driver only
+scripts/check.sh seccomp     # io_uring blocked as in Docker (scripts/no-io-uring.py): giong picks epoll
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh soak        # minutes of connection churn, then checks for leaks
-scripts/kernels.sh           # the suite on real 6.0 and 6.1 kernels in QEMU (slow)
+scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 ```
 
 Continuous integration requires five checks on every pull request: `lint` (fmt, clippy,
 doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
-CI also runs `loom`, the `kernels` jobs and the database crates against other server
+CI also runs `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+profile (`docker`) and the database crates against other server
 versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
 `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, each in its `fuzz/`) and runs
 the soak test every night.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
-run; `scripts/check.sh fallback` does this for you.
+run, and `GIONG_DRIVER=epoll` the epoll driver; `scripts/check.sh fallback` does both for
+you.
 
 ## Rules that are checked in review
 
 1. **Cancellation safety.** io_uring keeps using an operation's memory until the kernel
-   reports completion, whatever happens to the Rust future. New operations go through
-   `Op`, never raw submissions. Every new `async fn` says in its documentation whether it
-   is cancel safe. Every new operation has a test that drops it mid-flight and then checks
+   reports completion, whatever happens to the Rust future, and so does a blocking thread
+   of the epoll driver. New operations are an `Io` variant run through `Op`, never raw
+   submissions, and work on both drivers. Every new `async fn` says in its documentation
+   whether it is cancel safe. Every new operation has a test that drops it mid-flight and then checks
    `giong::stats()` for leaked operations and buffers (examples in `tests/cancel.rs`).
+   Run it on both drivers (`GIONG_DRIVER=epoll`).
 2. **Tests for the normal path and the interrupted one.** A bug fix comes with a test that
    fails without it. No tight timing in tests: use generous upper bounds.
 3. **`unsafe`** only with a `// SAFETY:` comment saying why it is sound, a test that would

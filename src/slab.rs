@@ -70,6 +70,13 @@ impl<T> Slab<T> {
         self.len
     }
 
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().filter_map(|e| match e {
+            Entry::Occupied(val) => Some(val),
+            Entry::Vacant(_) => None,
+        })
+    }
+
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.entries.iter_mut().filter_map(|e| match e {
             Entry::Occupied(val) => Some(val),

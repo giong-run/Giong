@@ -4,7 +4,8 @@
     python3 scripts/release.py check
         Repository invariants that CI enforces on every pull request: the three
         crates share one version, README images use absolute URLs that exist,
-        CHANGELOG.md is well formed, and site/public matches site/build.py.
+        CHANGELOG.md is well formed, and site/build.py builds the site with no
+        broken link.
 
     python3 scripts/release.py prepare [auto|patch|minor|major|X.Y.Z] [--pr] [--dispatch-ci]
         Turn the working tree into the release commit for the next version:
@@ -244,17 +245,17 @@ def check_changelog():
 
 
 def check_site():
+    """The site builds from the repository as it is, with no broken link. Its pages are
+    generated when it deploys (site.yml), so there is nothing committed to compare."""
     build = ROOT / "site" / "build.py"
     if not build.exists():
         return []
-    problems = []
     with tempfile.TemporaryDirectory() as tmp:
-        subprocess.run([sys.executable, str(build), tmp], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
-        for f in sorted(Path(tmp).iterdir()):
-            committed = ROOT / "site" / "public" / f.name
-            if not committed.exists() or committed.read_bytes().replace(b"\r\n", b"\n") != f.read_bytes():
-                problems.append(f"site/public/{f.name} is out of date: run `python3 site/build.py` and commit the result")
-    return problems
+        done = subprocess.run([sys.executable, str(build), tmp], cwd=ROOT,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if done.returncode != 0:
+        return ["site/build.py failed: " + (done.stderr.strip() or f"exit status {done.returncode}")]
+    return []
 
 
 def cmd_check(_args):
@@ -263,7 +264,7 @@ def cmd_check(_args):
         print(("::error::" if _in_actions() else "") + p)
     if problems:
         sys.exit(1)
-    print(f"ok: giong {workspace_version()}, READMEs, CHANGELOG.md and site/public are consistent")
+    print(f"ok: giong {workspace_version()}, READMEs, CHANGELOG.md and the site are consistent")
 
 
 def _in_actions():
@@ -374,10 +375,10 @@ def bump_files(old, new, date, commits):
             write(rel, text)
             changed.append(rel)
 
-    # The site reads the version from Cargo.toml; regenerate it.
-    if (ROOT / "site" / "build.py").exists():
-        subprocess.run([sys.executable, str(ROOT / "site" / "build.py")], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
-        changed.append("site/public")
+    # The site reads the version from Cargo.toml and the notes from CHANGELOG.md when it
+    # deploys; make sure it still builds.
+    if problems := check_site():
+        fail("\n".join(problems))
     return changed, drafted, short_old if short_old != short_new else None
 
 
@@ -404,7 +405,7 @@ def cmd_prepare(args):
     hints = []
     if old_minor:
         # Prose such as "Status: 0.2." is for a person to rewrite.
-        for rel in [p.relative_to(ROOT).as_posix() for p in readmes()] + ["site/build.py", "src/lib.rs"]:
+        for rel in [p.relative_to(ROOT).as_posix() for p in readmes()] + ["site/content.py", "src/lib.rs"]:
             if (ROOT / rel).exists():
                 for n, line in enumerate(read(rel).splitlines(), 1):
                     if re.search(r"(?<![\d.])" + re.escape(old_minor) + r"(?![\d.])", line):

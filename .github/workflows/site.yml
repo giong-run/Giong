@@ -1,7 +1,10 @@
 name: Site
 
-# Deploys site/public to giong-run/giong-run.github.io, which GitHub Pages serves
-# as giong.run. Runs when site/ changes on main, and at the end of release.yml.
+# Builds giong.run and deploys it to giong-run/giong-run.github.io, which GitHub Pages
+# serves. The pages are generated here, not committed: site/build.py reads the version
+# and crates (Cargo.toml), the roadmap (ROADMAP.md), the release notes (CHANGELOG.md),
+# the error codes (docs/errors) and line counts from the commit being deployed. Runs on
+# every push to main, since any of those can change, and at the end of release.yml.
 #
 # It deploys only when the workspace version has a published GitHub Release, so
 # merging a release pull request does not announce a version before crates.io
@@ -14,7 +17,6 @@ name: Site
 on:
   push:
     branches: [main]
-    paths: ["site/**"]
   workflow_dispatch:
 
 permissions:
@@ -29,11 +31,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: The committed page matches site/build.py
-        run: |
-          python3 site/build.py > /dev/null
-          git diff --exit-code --stat -- site/public \
-            || { echo "::error::site/public is out of date: run python3 site/build.py and commit it"; exit 1; }
+      - name: Build the site
+        run: python3 site/build.py
       - id: gate
         name: The version on the page is released
         env:

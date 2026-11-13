@@ -93,6 +93,13 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | [GIONG-E1212](E1212.md) | `WebCorsRejected` | cross-origin request refused |
 | [GIONG-E1213](E1213.md) | `WebConfig` | invalid giong-web setting |
 
+## giong-mcp
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E1301](E1301.md) | `McpNotLocal` | the MCP server listens on this machine only |
+| [GIONG-E1302](E1302.md) | `McpBadAddress` | invalid address for the MCP server |
+
 ## giong-tls
 
 | Code | `Code::` | Meaning |

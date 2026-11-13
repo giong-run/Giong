@@ -10,6 +10,45 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **An epoll driver**, so that giong runs where io_uring is blocked or missing: in a
+  Docker container with the default seccomp profile, in Kubernetes with `RuntimeDefault`,
+  under gVisor, with the `kernel.io_uring_disabled` sysctl, and on kernels older than 6.0
+  (tested on 5.15). A worker falls back to it by itself when io_uring cannot be set up;
+  `Builder::driver(DriverKind::IoUring | DriverKind::Epoll)` or `GIONG_DRIVER=io_uring|epoll`
+  choose explicitly (asking for io_uring where it is blocked fails with `GIONG-E0001`, as
+  before), and `giong::driver_kind()` tells which driver a worker got. Every API behaves
+  the same on both; on epoll, file operations run on a pool of blocking threads, except on
+  pipes and sockets, and a file is closed only once the threads are done with it. On one
+  core, epoll does what raw Tokio and a hand-written epoll server do (158k requests per
+  second on a small response at 50 connections, 2.02 system calls per request), while
+  io_uring keeps its lead where batching counts: 55.7k against 32.7k requests per second
+  on an 8 KB response. The README has the full comparison.
+- **Verification**: `scripts/check.sh fallback` also runs the suite on epoll;
+  `scripts/check.sh seccomp` runs it with io_uring blocked the way Docker blocks it
+  (`scripts/no-io-uring.py`), and CI runs it inside a Docker container with the default
+  profile and on a real 5.15 kernel. ThreadSanitizer runs on both drivers.
+
+- **`giong-mcp`**, a new crate: an MCP server that lets an AI agent look inside a running
+  service. Started with `GIONG_MCP=127.0.0.1:7777` (or `Config::tcp`/`Config::unix` in
+  code), it listens only on loopback or a Unix socket (`GIONG-E1301` otherwise), refuses
+  requests whose `Host` or `Origin` is not local, and takes an optional bearer token. Five
+  read-only tools: `overview` (process, workers, warnings), `workers`, `tasks` (live tasks
+  by the line that spawned them), `sources` (connection pools) and `profile` (where the
+  workers spend their time over a window). It runs on a thread of its own, so it answers
+  when every worker is stuck, and names the task a blocked worker is in.
+- **giong**: `giong::observe`, what giong-mcp reads. `Handle::pulse(worker)` returns a
+  worker's counters (event-loop turns, polls, sleeps, idle time, spawned tasks) and the
+  task it is polling, from any thread, without disturbing it. `spawn`,
+  `Handle::spawn_on` and `Handle::spawn_balanced` record the line that called them, and
+  `observe::snapshot()` groups a worker's live tasks by it, with its timers, I/O in
+  flight, receive buffers and registered `Source`s. `Handle::set_profiling` and
+  `observe::take_profile()` time task polls by spawn location. The counters cost about
+  nine instructions per task poll (callgrind, tasks that only yield); profiling, while
+  off, one load per batch of tasks.
+- **giong-postgres**, **giong-mysql**, **giong-redis**: pools register themselves as
+  `giong::observe` sources (server and database, never credentials), so giong-mcp shows
+  their connections, waiters and errors.
+
 - **Streaming bodies in `giong-http`'s server**, both ways, with backpressure.
   - Request bodies read as they arrive: a handler whose `Handler::stream_body(&req)`
     returns `Some(limit)` is called once the head is in, and reads the body with
@@ -42,7 +81,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     (`http.request.method`, `url.path`, `http.route`, `http.response.status_code`,
     `client.address`) plus `request_id` and `worker`, so events the handler records carry
     them; the span ends with one event, at `ERROR` with the code and cause for a `5xx`.
-  - 4 new error codes, `GIONG-E1111` to `E1114`; 85 in all.
+  - 4 new error codes, `GIONG-E1111` to `E1114`; 87 in all.
 - **`examples/rest-api`**, a complete REST API on giong's own crates: users in
   PostgreSQL (`giong-postgres`), read through a Redis cache (`giong-redis`), served over
   HTTPS (`giong-tls`) by `giong-web`, with create, read, update, delete, keyset pages and
@@ -170,6 +209,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong**: a runtime that cannot use io_uring now starts on epoll instead of failing with
+  `GIONG-E0001` or `GIONG-E0002`; those errors are raised only when io_uring was asked
+  for. An unknown `GIONG_DRIVER` value fails with `GIONG-E0004`. `docs/DEPLOYMENT.md`
+  explains when each driver is used.
 - **`giong-http`**: `Body` is `#[non_exhaustive]` and has a new variant,
   `Body::Stream`; a `match` on it needs a `_` arm. `Body::as_bytes` and `len` are empty
   for a stream, and `is_empty` is `false` (`Body::is_stream`, `Response::is_streaming`

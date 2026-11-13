@@ -23,3 +23,10 @@ setup-git.cmd
 
 # Python bytecode (site/build.py imports scripts/release.py).
 __pycache__/
+
+# The site's pages, generated when it deploys (python3 site/build.py).
+site/public/*.html
+site/public/*/index.html
+site/public/llms.txt
+site/public/robots.txt
+site/public/sitemap.xml

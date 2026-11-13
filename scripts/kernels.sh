@@ -22,9 +22,11 @@ cd "$(dirname "$0")/.."
 
 VERSIONS=("$@")
 if [ ${#VERSIONS[@]} -eq 0 ]; then
-    # 6.0: the oldest kernel giong supports (COOP_TASKRUN, no DEFER_TASKRUN).
+    # 5.15: io_uring without buffer rings, so giong runs on its epoll driver.
+    # 6.0: the oldest kernel giong's io_uring driver supports (COOP_TASKRUN,
+    #      no DEFER_TASKRUN).
     # 6.1: the first with DEFER_TASKRUN, as the long-term-support series ships it.
-    VERSIONS=(6.0.19 6.1.155)
+    VERSIONS=(5.15.225 6.0.19 6.1.155)
 fi
 WORK="${CARGO_TARGET_DIR:-target}/kernels"
 MEMORY="${MEMORY:-2G}"

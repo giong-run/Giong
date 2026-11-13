@@ -1,4 +1,4 @@
-//! TCP, UDP and Unix sockets on io_uring.
+//! TCP, UDP and Unix sockets.
 //!
 //! * [`TcpListener::accept`] and [`UnixListener::accept`] use a **multishot
 //!   accept**: one submission keeps producing connections.
@@ -8,6 +8,10 @@
 //!   when data actually arrives — idle sockets pin no memory.
 //! * Writes take ownership of the buffer and return it with the result.
 //! * Descriptors are closed through the ring, batched with everything else.
+//!
+//! That is how it works on io_uring. On the epoll driver the same calls
+//! behave the same way, with a non-blocking system call made when the socket
+//! is ready (see [`DriverKind`](crate::DriverKind)).
 
 mod addr;
 mod balance;
@@ -29,11 +33,10 @@ use std::net::{Shutdown, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::task::{Context, Poll};
 
-use io_uring::{cqueue, opcode, types};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
-use crate::driver::{Driver, MultiKind, MultiPoll, BGID};
+use crate::driver::{buffer_id, Driver, Io, MultiIo, MultiKind, MultiPoll};
 use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime::{self, Worker};
@@ -103,14 +106,11 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
         // socket, which would otherwise stay open after the close.
         slot.release(w);
         match w.driver.try_borrow_mut() {
-            Ok(mut driver) => {
-                driver.close_fd(fd);
-                true
-            }
-            Err(_) => false,
+            Ok(mut driver) => driver.close_fd(fd),
+            Err(_) => w.defer_close(fd),
         }
     })
-    .unwrap_or(false);
+    .is_some();
     if !closed {
         // SAFETY: `sock` is dropped exactly once, here.
         unsafe { ManuallyDrop::drop(sock) };
@@ -157,10 +157,8 @@ impl ListenSocket {
                     MultiPoll::Item(res, _) => return Poll::Ready(Err(os_err(res))),
                     MultiPoll::Heap(_) => unreachable!("accept never queues heap data"),
                     MultiPoll::NeedArm => {
-                        let sqe = opcode::AcceptMulti::new(types::Fd(self.sock.as_raw_fd()))
-                            .flags(libc::SOCK_CLOEXEC)
-                            .build();
-                        driver.arm_multi(key, sqe);
+                        let fd = self.sock.as_raw_fd();
+                        driver.arm_multi(key, MultiIo::Accept { fd });
                     }
                     MultiPoll::Pending => return Poll::Pending,
                 }
@@ -191,17 +189,17 @@ impl StreamSocket {
         }
     }
 
-    /// Connects `sock` to `addr` through the ring.
+    /// Connects `sock` to `addr` through the driver.
     pub(crate) async fn connect(sock: Socket, addr: SockAddr) -> io::Result<Self> {
-        // Boxed so the address the SQE points at does not move with the future.
+        // Boxed so the address the operation points at does not move with
+        // the future.
         let addr: Box<SockAddr> = Box::new(addr);
-        let sqe = opcode::Connect::new(
-            types::Fd(sock.as_raw_fd()),
-            addr.as_ptr() as *const libc::sockaddr,
-            addr.len(),
-        )
-        .build();
-        let (res, _, _addr) = Op::new(sqe, addr).await;
+        let io = Io::Connect {
+            fd: sock.as_raw_fd(),
+            addr: addr.as_ptr() as *const libc::sockaddr,
+            len: addr.len(),
+        };
+        let (res, _, _addr) = Op::new(io, addr).await;
         if res < 0 {
             return Err(os_err(res));
         }
@@ -223,7 +221,7 @@ impl StreamSocket {
             loop {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res, flags) => {
-                        let bid = cqueue::buffer_select(flags);
+                        let bid = buffer_id(flags);
                         return Poll::Ready(match (res, bid) {
                             (n, Some(bid)) if n > 0 => {
                                 Ok(RecvBuf::pooled(driver.pool().clone(), bid, n as usize))
@@ -246,9 +244,8 @@ impl StreamSocket {
                         if !wait_for_pool(&mut driver, cx) {
                             return Poll::Pending;
                         }
-                        let sqe =
-                            opcode::RecvMulti::new(types::Fd(self.sock.as_raw_fd()), BGID).build();
-                        driver.arm_multi(key, sqe);
+                        let fd = self.sock.as_raw_fd();
+                        driver.arm_multi(key, MultiIo::Recv { fd });
                     }
                     MultiPoll::Pending => return Poll::Pending,
                 }
@@ -267,9 +264,12 @@ impl StreamSocket {
             return (Err(err), buf);
         }
         let len = buf.capacity().min(u32::MAX as usize) as u32;
-        let sqe =
-            opcode::Recv::new(types::Fd(self.sock.as_raw_fd()), buf.as_mut_ptr(), len).build();
-        let (res, _, mut buf) = Op::new(sqe, buf).await;
+        let io = Io::Recv {
+            fd: self.sock.as_raw_fd(),
+            buf: buf.as_mut_ptr(),
+            len,
+        };
+        let (res, _, mut buf) = Op::new(io, buf).await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
@@ -355,13 +355,15 @@ impl StreamSocket {
         let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
         msg.msg_iov = iov.as_mut_ptr();
         msg.msg_iovlen = iov.len() as _;
-        let sqe = opcode::SendMsg::new(types::Fd(self.sock.as_raw_fd()), &*msg)
-            .flags(libc::MSG_NOSIGNAL as u32)
-            .build();
+        let io = Io::SendMsg {
+            fd: self.sock.as_raw_fd(),
+            msg: &*msg,
+            flags: libc::MSG_NOSIGNAL as u32,
+        };
         // The header, the iovec array (on the heap) and the buffers all stay
         // where they are while the kernel reads them, even if this future is
         // dropped: `Op` keeps them until the operation completes.
-        let (res, _, (bufs, _iov, _msg)) = Op::new(sqe, (bufs, iov, msg)).await;
+        let (res, _, (bufs, _iov, _msg)) = Op::new(io, (bufs, iov, msg)).await;
         if res < 0 {
             (Err(os_err(res)), bufs)
         } else {
@@ -374,10 +376,13 @@ impl StreamSocket {
         let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
         // SAFETY: `offset <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(offset) };
-        let sqe = opcode::Send::new(types::Fd(self.sock.as_raw_fd()), ptr, len)
-            .flags(libc::MSG_NOSIGNAL)
-            .build();
-        let (res, _, buf) = Op::new(sqe, buf).await;
+        let io = Io::Send {
+            fd: self.sock.as_raw_fd(),
+            buf: ptr,
+            len,
+            flags: libc::MSG_NOSIGNAL,
+        };
+        let (res, _, buf) = Op::new(io, buf).await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {

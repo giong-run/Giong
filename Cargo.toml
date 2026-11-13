@@ -3,17 +3,17 @@ name = "giong"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Gióng — a thread-per-core async runtime for Linux built directly on io_uring"
+description = "Gióng — a thread-per-core async runtime for Linux, built on io_uring, with an epoll fallback"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", ".github/", "scripts/", "assets/", "site/", "docs/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", ".github/", "scripts/", "assets/", "site/", "docs/"]
 
 [workspace]
-members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "examples/rest-api"]
+members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "examples/rest-api"]
 exclude = ["bench"]
 
 [dependencies]
