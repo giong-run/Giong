@@ -56,6 +56,14 @@ impl Decoder {
 
     /// `data` is everything received after the head so far. Returns the status
     /// code to answer with on failure.
+    /// How many bytes of the input given to `feed` have been read, which
+    /// the caller may now drop: the next `feed` starts at the input's start.
+    /// For a body passed on as it arrives, with `body` taken out each time.
+    #[cfg(feature = "client")]
+    pub(crate) fn consume(&mut self) -> usize {
+        std::mem::take(&mut self.pos)
+    }
+
     pub(crate) fn feed(&mut self, data: &[u8]) -> Result<Progress, u16> {
         loop {
             let rest = &data[self.pos..];

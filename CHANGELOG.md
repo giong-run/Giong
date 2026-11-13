@@ -8,6 +8,62 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **`giong-http`**: what the client lacked for production traffic.
+  - HTTP proxies: `ClientBuilder::proxy` with `Proxy::all`, `Proxy::http` or
+    `Proxy::https`, or `Proxy::from_env` for `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and
+    `NO_PROXY`, read the way curl reads them and only when asked. `NO_PROXY` takes host
+    names (and every name under them), addresses and ranges (`10.0.0.0/8`, `fd00::/8`),
+    ports and `*`. `http` URLs go to the proxy in absolute form; `https` goes through a
+    `CONNECT` tunnel, so the proxy sees only the host name. Credentials in the proxy's
+    URL go to the proxy only, never through the tunnel, and never appear in `Debug`
+    output or errors. Connections are pooled per route, so direct and proxied ones never
+    mix. Plain `http://` proxies only: no SOCKS and no TLS to the proxy itself yet.
+  - gzip and deflate bodies: responses are asked for with `Accept-Encoding: gzip,
+    deflate` and decompressed as they arrive. The size limit applies to what comes out,
+    so a small "zip bomb" fails at the limit instead of filling memory. The gzip checksum
+    and length are checked, multi-member gzip and deflate with or without its zlib
+    wrapper are read, and a body cut short is an error, never a shorter body.
+    `ClientBuilder::decompress(false)` turns it off, a request that sets its own
+    `Accept-Encoding` gets the bytes as sent, and `br` and `zstd` bodies arrive
+    untouched. New dependency: `miniz_oxide` (pure Rust, the inflater flate2 uses), in
+    the `client` feature only.
+  - Streamed bodies: `RequestBuilder::send_streaming` returns a `StreamingResponse` once
+    the head has arrived, and its `chunk()` gives the body piece by piece (64 KiB at
+    most, decompressed), whatever its size. The request timeout covers everything up to
+    the head, then each piece. A body read to its end gives its connection back to the
+    pool; one dropped part way closes it. As with `send`, an HTTPS body that ends with
+    the connection needs the TLS `close_notify`.
+  - `ErrorKind::Proxy` (`GIONG-E1110`) for a proxy that refuses a request or a tunnel: a
+    407 says how to give credentials, a 403 suggests `no_proxy`, and 502 and 504 are
+    transient. A proxy that cannot be reached is `Connect` (`GIONG-E1102`), and its
+    message names the proxy. 68 error codes in all.
+- **Verification**: coverage-guided fuzzing of every parser that reads bytes from the
+  network, with 12 new cargo-fuzz targets (15 in all): the client's response heads, URLs
+  and gzip/deflate decoder in `giong-http`; the PostgreSQL messages, SCRAM exchange and
+  URLs (`giong-postgres/fuzz/`); the MySQL packets, framing, rows and URLs
+  (`giong-mysql/fuzz/`); RESP3 replies and URLs (`giong-redis/fuzz/`). CI fuzzes each
+  target for 10 minutes every night, keeping the corpus, and for 60 s on pull requests
+  that touch these crates. The randomised tests run the same checks under `cargo test`.
+- **Verification**: a `servers` CI job runs the database crates against PostgreSQL 14, 15
+  and 17, MySQL 8.4 and 9.1, Redis 6.2 and 7.4 and Valkey 8.0, besides the PostgreSQL 16,
+  MySQL 8.0 and Redis 7.0 of the other jobs.
+
+### Changed
+
+- **`giong-http`**: the client asks for compressed responses and decodes them by default
+  (see Added); a decoded response no longer has `Content-Encoding` and `Content-Length`
+  among its headers. A request that sets `Proxy-Authorization` itself is refused
+  (`GIONG-E1101`): the client sets it, for the proxy only.
+- **`giong-http`**: the client runs 41% fewer instructions per request (18,795 to 11,115
+  under callgrind, `json`). Each request's future held, unused, the future that opens a
+  connection, TLS handshake included, and copied its 8 KB or so at every await; that
+  future is now boxed and lives on the heap only while a connection opens. The response
+  head is no longer copied out of the buffer it was read into either. On one core,
+  requests per second rose by 3 to 16%, and with 64 connections the client sends 1.6 to
+  2.0 times as many as reqwest (`bench/http-client.sh`, median of 5 rounds).
+
 ### Fixed
 
 - `giong-http` server: more than two blank lines before a request line start the request

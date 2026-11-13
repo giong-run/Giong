@@ -10,7 +10,8 @@ use crate::{key, run};
 fn strings_numbers_and_missing_keys() {
     run(|server| async move {
         let c = Client::connect(&server.tcp()).await.unwrap();
-        assert_eq!(c.server_name(), "redis");
+        assert_eq!(c.server_name(), server.name);
+        assert!(["redis", "valkey"].contains(&c.server_name()));
         assert_eq!(c.server_version(), server.version);
         assert!(c.connection_id() > 0);
         c.ping().await.unwrap();

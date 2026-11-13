@@ -169,6 +169,12 @@ packet parsers are fuzzed, and a benchmark compares it with mysql_async and SQLx
 
 - [x] An HTTP/1.1 client in `giong-http` (feature `client`): keep-alive, a pool per host,
       HTTPS, timeouts, redirects. Benchmarked against reqwest (`bench/http-client.sh`).
+- [x] What production traffic needs from it: HTTP proxies (`HTTPS_PROXY`, `NO_PROXY`,
+      `CONNECT` tunnels), gzip and deflate bodies with the limit on what they expand to,
+      and bodies streamed piece by piece.
+- [x] The database and client parsers fuzzed (`*/fuzz/`), and the database crates tested
+      against PostgreSQL 14 to 17, MySQL 8.0, 8.4 and 9.1, Redis 6.2 to 7.4 and Valkey 8 in
+      CI.
 - [x] `giong-redis`, a new crate: RESP3, automatic pipelining, a pool per core, pub/sub.
       Benchmarked against redis-rs and fred (`bench/redis.sh`). RESP2-only servers (Redis 5
       and older) are not supported: RESP3 has been in every Redis since 6.0 (2020).

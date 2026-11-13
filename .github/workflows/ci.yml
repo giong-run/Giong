@@ -68,6 +68,89 @@ jobs:
           sudo systemctl stop redis-server
       - run: scripts/check.sh test
 
+  # The database crates against the other server versions they support; the
+  # jobs above use the runner's PostgreSQL 16, MySQL 8.0 and Ubuntu's Redis
+  # 7.0. Each entry installs one server and runs one crate's tests on it.
+  servers:
+    name: servers (${{ matrix.server }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { server: postgres 14, crate: giong-postgres, postgres: "14" }
+          - { server: postgres 15, crate: giong-postgres, postgres: "15" }
+          - { server: postgres 17, crate: giong-postgres, postgres: "17" }
+          - { server: mysql 8.4, crate: giong-mysql, mysql: "8.4.3" }
+          - { server: mysql 9.1, crate: giong-mysql, mysql: "9.1.0" }
+          - { server: redis 6.2, crate: giong-redis, redis: "6.2.16" }
+          - { server: redis 7.4, crate: giong-redis, redis: "7.4.1" }
+          - { server: valkey 8.0, crate: giong-redis, valkey: "8.0.1" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install PostgreSQL ${{ matrix.postgres }}
+        if: matrix.postgres
+        # From the PostgreSQL project's apt repository; the cluster apt
+        # creates is stopped, the tests start their own.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y -q postgresql-${{ matrix.postgres }}
+          sudo systemctl stop postgresql
+          echo "GIONG_PG_BIN=/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_ENV"
+      - name: Install MySQL ${{ matrix.mysql }}
+        if: matrix.mysql
+        # Oracle's generic Linux build, the minimal one (no debug binaries or
+        # test suite, about 60 MB), which Oracle makes for glibc 2.17 only.
+        # mysqld links libaio.so.1, which Ubuntu 24.04 renamed libaio.so.1t64.
+        # The mysql client, which the tests use to set the server up, links
+        # ncurses 5, which Ubuntu dropped in 24.04: it comes from Ubuntu
+        # 22.04, checked against the hashes in that release's package index.
+        run: |
+          v=${{ matrix.mysql }}
+          name=mysql-$v-linux-glibc2.17-x86_64-minimal
+          curl -fsSL --retry 3 "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"
+          pool=http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses
+          curl -fsSL --retry 3 -O "$pool/libtinfo5_6.3-2_amd64.deb" -O "$pool/libncurses5_6.3-2_amd64.deb"
+          printf '%s\n' \
+            "d2597b5aec92a930cf549e1b429ad892595813e72ec7814685ea146a9fb715e5  libtinfo5_6.3-2_amd64.deb" \
+            "d9b8efb37a056e01c46d93c7ef6977aa04ad2586978137d9a3954c15ad5d14c3  libncurses5_6.3-2_amd64.deb" \
+            | sha256sum -c -
+          sudo apt-get update -q
+          sudo apt-get install -y -q libaio1t64 libnuma1 ./libtinfo5_6.3-2_amd64.deb ./libncurses5_6.3-2_amd64.deb
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
+          "$RUNNER_TEMP/$name/bin/mysqld" --version
+          "$RUNNER_TEMP/$name/bin/mysql" --version
+          echo "GIONG_MYSQL_BIN=$RUNNER_TEMP/$name/bin" >> "$GITHUB_ENV"
+      - name: Build Redis ${{ matrix.redis }}
+        if: matrix.redis
+        # From source, with TLS, which the tests use.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libssl-dev
+          curl -fsSL --retry 3 "https://download.redis.io/releases/redis-${{ matrix.redis }}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          make -C "$RUNNER_TEMP/redis-${{ matrix.redis }}" -j4 BUILD_TLS=yes > /dev/null
+          echo "GIONG_REDIS_BIN=$RUNNER_TEMP/redis-${{ matrix.redis }}/src" >> "$GITHUB_ENV"
+      - name: Build Valkey ${{ matrix.valkey }}
+        if: matrix.valkey
+        # Valkey answers to redis-server's name only once installed; the
+        # tests look for that name.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libssl-dev
+          curl -fsSL --retry 3 "https://github.com/valkey-io/valkey/archive/refs/tags/${{ matrix.valkey }}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP"
+          src="$RUNNER_TEMP/valkey-${{ matrix.valkey }}/src"
+          make -C "$src/.." -j4 BUILD_TLS=yes > /dev/null
+          ln -sf valkey-server "$src/redis-server"
+          echo "GIONG_REDIS_BIN=$src" >> "$GITHUB_ENV"
+      - run: cargo test -p ${{ matrix.crate }} --all-features
+
   # The io_uring setup tiers used by kernels older than 6.1, forced on the
   # runner's newer kernel with GIONG_RING_TIER.
   fallback:

@@ -19,6 +19,9 @@ pub struct Server {
     pub tls_port: u16,
     pub socket: PathBuf,
     pub ca_pem: Vec<u8>,
+    /// `redis` or `valkey`, as the server's answer to `HELLO` says.
+    pub name: String,
+    /// The version the server's answer to `HELLO` gives.
     pub version: String,
     dir: PathBuf,
 }
@@ -161,7 +164,6 @@ fn start(bin: PathBuf) -> Server {
         .args(["--save", ""])
         .args(["--appendonly", "no"])
         .args(["--databases", "16"])
-        .args(["--enable-debug-command", "yes"])
         // Each word of a setting is an argument of its own.
         .args(["--user", "default", "on", "nopass", "~*", "&*", "+@all"])
         .args([
@@ -175,6 +177,11 @@ fn start(bin: PathBuf) -> Server {
         ])
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
+    // DEBUG (for DEBUG SLEEP) is off by default since Redis 7.0, which added
+    // this setting; Redis 6.2 does not know it, and allows DEBUG anyway.
+    if major_version(&bin) >= 7 {
+        cmd.args(["--enable-debug-command", "yes"]);
+    }
     // The server dies with the thread that started it, even when the test
     // binary is killed; the thread waits for it, so lives as long as it.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -194,7 +201,10 @@ fn start(bin: PathBuf) -> Server {
     PID.store(rx.recv().unwrap() as i32, Ordering::SeqCst);
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    let version = loop {
+    // Valkey keeps `redis_version` at the Redis release it is compatible with
+    // (7.2.4 for Valkey 8.0) and adds `server_name` and `valkey_version`,
+    // which are what its `HELLO` reports. Redis has neither.
+    let (name, version) = loop {
         if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             use std::io::{Read, Write};
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -202,8 +212,16 @@ fn start(bin: PathBuf) -> Server {
                 let mut buf = vec![0u8; 8192];
                 if let Ok(n) = s.read(&mut buf) {
                     let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if let Some(v) = text.lines().find_map(|l| l.strip_prefix("redis_version:")) {
-                        break v.trim().to_owned();
+                    let field = |prefix: &str| {
+                        text.lines()
+                            .find_map(|l| l.strip_prefix(prefix))
+                            .map(|v| v.trim().to_owned())
+                    };
+                    if let Some(redis_version) = field("redis_version:") {
+                        break (
+                            field("server_name:").unwrap_or_else(|| "redis".to_owned()),
+                            field("valkey_version:").unwrap_or(redis_version),
+                        );
                     }
                 }
             }
@@ -227,7 +245,22 @@ fn start(bin: PathBuf) -> Server {
         tls_port,
         socket,
         ca_pem: ca.pem().into_bytes(),
+        name,
         version,
         dir,
     }
+}
+
+/// The major version `redis-server --version` reports (`v=7.0.15`; Valkey
+/// says `v=8.0.1` too), or 0 if it cannot be read.
+fn major_version(bin: &std::path::Path) -> u32 {
+    let Ok(out) = Command::new(bin).arg("--version").output() else {
+        return 0;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .find_map(|w| w.strip_prefix("v="))
+        .and_then(|v| v.split('.').next())
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0)
 }

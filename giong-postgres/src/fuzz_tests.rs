@@ -1,12 +1,8 @@
 //! Randomised robustness tests: whatever a server (or a URL) sends, the
 //! parsers return a verdict without panicking.
 
-use crate::auth::Scram;
 use crate::config::Config;
-use crate::connect::ReadBuf;
-use crate::error::DbError;
-use crate::protocol::{data_row, parse_backend};
-use crate::row::RowsBuilder;
+use crate::fuzzing::{messages, scram};
 
 /// xorshift64*: deterministic, so a failure can be reproduced from its seed.
 struct Rng(u64);
@@ -99,40 +95,7 @@ fn the_message_parser_never_panics() {
         mutate(&mut rng, &mut input);
         // Split the input at a random point, as the network might.
         let cut = rng.below(input.len() + 1);
-        let mut buf = ReadBuf::new();
-        buf.extend(&input[..cut]);
-        let mut fed_rest = false;
-        loop {
-            let Ok(Some((tag, len))) = buf.peek() else {
-                if fed_rest {
-                    break;
-                }
-                buf.extend(&input[cut..]);
-                fed_rest = true;
-                continue;
-            };
-            if len > 1 << 20 {
-                buf.skip(len);
-                continue;
-            }
-            let Some(body) = buf.body(len) else {
-                if fed_rest {
-                    break;
-                }
-                buf.extend(&input[cut..]);
-                fed_rest = true;
-                continue;
-            };
-            let bytes = buf.bytes(body).to_vec();
-            buf.consume(len);
-            if let Ok(msg) = parse_backend(tag, &bytes) {
-                let _ = format!("{msg:?}");
-            }
-            let _ = DbError::parse(&bytes);
-            let mut rows = RowsBuilder::default();
-            let _ = rows.push(&bytes, 2, 1 << 16);
-            let _ = data_row(&bytes, 1, |_| {});
-        }
+        messages(&input, cut);
     }
 }
 
@@ -161,17 +124,8 @@ fn scram_never_panics_on_server_messages() {
     for _ in 0..2_000 {
         let mut input = seed.clone();
         mutate(&mut rng, &mut input);
-        // Keep the key derivation cheap: the iteration limit itself is
-        // tested in the auth module.
-        let text = String::from_utf8_lossy(&input);
-        let iterations = text.rsplit("i=").next().and_then(|i| i.parse::<u64>().ok());
-        if iterations.is_some_and(|i| i > 4096) {
-            continue;
-        }
-        let mut scram = Scram::with_nonce("pw", "", "abcdef");
-        let _ = scram.client_final(&input);
         let mut fin = b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=".to_vec();
         mutate(&mut rng, &mut fin);
-        let _ = scram.finish(&fin);
+        scram(&input, &fin);
     }
 }

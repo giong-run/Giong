@@ -323,11 +323,22 @@ fn start(bins: Bins) -> Server {
     };
     let started = Instant::now();
     while !server.socket.exists() || !server.try_sql("SELECT 1") {
-        assert!(
-            started.elapsed() < Duration::from_secs(60),
-            "MySQL did not start within 60 s:\n{}",
-            server.log()
-        );
+        if started.elapsed() > Duration::from_secs(60) {
+            // Say which side failed: the server, or the client that sets it
+            // up (which cannot run when a shared library is missing, say).
+            let client = Command::new(&server.bins.mysql)
+                .args(["--no-defaults", "-uroot", "-N", "-B", "-S"])
+                .arg(&server.socket)
+                .args(["-e", "SELECT 1"])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+                .unwrap_or_else(|e| e.to_string());
+            panic!(
+                "MySQL did not answer {} within 60 s.\nThe client says: {client}\nThe server's log:\n{}",
+                server.bins.mysql.display(),
+                server.log()
+            );
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     server.version = server.sql("SELECT VERSION()").trim().to_owned();

@@ -45,13 +45,19 @@
 //! * Strict: a malformed or ambiguous response (two lengths, bare line
 //!   feeds, folded headers) is an error, and the connection is not used
 //!   again.
+//! * HTTP proxies, when given one ([`ClientBuilder::proxy`], or
+//!   [`Proxy::from_env`] for `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`):
+//!   `https` requests go through a `CONNECT` tunnel, so they stay encrypted
+//!   end to end. The environment is not read unless asked.
 //!
-//! Not there yet: streaming bodies, compression, proxies, cookies, HTTP/2.
+//! Not there yet: streaming bodies, compression, cookies, HTTP/2.
 
 mod conn;
+mod decode;
 mod error;
 mod head;
 mod pool;
+mod proxy;
 mod url;
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -63,21 +69,29 @@ use std::time::{Duration, Instant};
 
 use giong_tls::TlsConnector;
 
-use self::conn::{Conn, Failure, Limits};
-use self::url::{Origin, Url};
+use self::conn::{Answer, Conn, Failure};
+use self::decode::{DecodeError, Encoding, Inflate};
+use self::head::Head;
+use self::proxy::Route;
+use self::url::Url;
 use crate::parse::{is_field_value, is_token_str};
 
 pub use self::error::{Error, ErrorKind};
+pub use self::proxy::Proxy;
 
-/// Checks for the randomised tests: they return whether the input was
-/// accepted, and panic if a property does not hold.
-#[cfg(test)]
-pub(crate) mod fuzzing {
+/// Checks for the randomised tests and the fuzz targets: they return
+/// whether the input was accepted, and panic if a property does not hold.
+#[cfg(any(test, fuzzing))]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::decode::{Encoding, Inflate};
     use super::head::{parse_head, Framing};
     use super::url::Url;
     use crate::parse::{find_head_end, is_token_str};
 
-    pub(crate) fn check_response_head(input: &[u8]) -> bool {
+    /// A response head: parsed whole or refused, and what is accepted is
+    /// consistent.
+    pub fn check_response_head(input: &[u8]) -> bool {
         let Some(end) = find_head_end(input, 0) else {
             return false;
         };
@@ -101,7 +115,8 @@ pub(crate) mod fuzzing {
         true
     }
 
-    pub(crate) fn check_url(input: &str, location: &str) -> bool {
+    /// A URL, and a redirect's `Location` resolved against it.
+    pub fn check_url(input: &str, location: &str) -> bool {
         let Ok(url) = Url::parse(input) else {
             return false;
         };
@@ -114,6 +129,45 @@ pub(crate) mod fuzzing {
             assert!(!next.target.contains('#'));
         }
         true
+    }
+
+    /// A compressed body: a byte choosing gzip or deflate and how the
+    /// input is cut, two bytes of output limit, then the body. Decoding
+    /// never panics, never gives more than the limit at once, and either
+    /// ends cleanly or says why not.
+    pub fn check_inflate(data: &[u8]) -> bool {
+        let [how, a, b, input @ ..] = data else {
+            return false;
+        };
+        let encoding = if how & 1 == 0 {
+            Encoding::Gzip
+        } else {
+            Encoding::Deflate
+        };
+        let step = 1 + usize::from(how >> 1) * 37;
+        let limit = 1 + usize::from(u16::from_le_bytes([*a, *b]));
+        let mut d = Inflate::new(encoding);
+        let mut total = 0usize;
+        for piece in input.chunks(step) {
+            d.push(piece);
+            loop {
+                let mut out = Vec::new();
+                if d.pull(&mut out, limit).is_err() {
+                    return false;
+                }
+                assert!(out.len() <= limit);
+                total += out.len();
+                // A body that expands without end is stopped by the
+                // caller's limit; so is this check.
+                if out.is_empty() || total > 16 << 20 {
+                    break;
+                }
+            }
+            if total > 16 << 20 {
+                return false;
+            }
+        }
+        d.finish().is_ok()
     }
 }
 
@@ -128,6 +182,7 @@ const MANAGED_HEADERS: &[&str] = &[
     "te",
     "trailer",
     "proxy-connection",
+    "proxy-authorization",
 ];
 
 /// Headers that carry credentials, which are not sent to another origin
@@ -150,6 +205,8 @@ pub struct ClientBuilder {
     redirects: usize,
     user_agent: String,
     tls: Option<TlsConnector>,
+    proxy: Option<Proxy>,
+    decompress: bool,
 }
 
 impl Default for ClientBuilder {
@@ -164,6 +221,8 @@ impl Default for ClientBuilder {
             redirects: 10,
             user_agent: concat!("giong-http/", env!("CARGO_PKG_VERSION")).to_owned(),
             tls: None,
+            proxy: None,
+            decompress: true,
         }
     }
 }
@@ -234,6 +293,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Whether to ask for compressed responses (`Accept-Encoding: gzip,
+    /// deflate`) and decode them (default `true`). The limits apply to the
+    /// decoded body, so a small response that would expand past
+    /// [`max_response_size`](Self::max_response_size) fails rather than
+    /// filling memory. A request that sets its own `Accept-Encoding` gets
+    /// its body as the server sent it, and so does a response in an
+    /// encoding the client does not decode (`br`, `zstd`).
+    pub fn decompress(mut self, on: bool) -> Self {
+        self.decompress = on;
+        self
+    }
+
+    /// Sends requests through an HTTP proxy (none by default; the
+    /// environment is read only through [`Proxy::from_env`]). Called again,
+    /// it adds to what was given: [`Proxy::http`] then [`Proxy::https`] sets
+    /// one proxy for each scheme.
+    pub fn proxy(mut self, proxy: Proxy) -> Self {
+        match &mut self.proxy {
+            Some(p) => p.merge(proxy),
+            None => self.proxy = Some(proxy),
+        }
+        self
+    }
+
     /// The client.
     pub fn build(self) -> Client {
         Client {
@@ -258,8 +341,8 @@ pub struct Client {
 struct Shared {
     config: ClientBuilder,
     tls: OnceCell<Result<TlsConnector, Error>>,
-    hosts: RefCell<HashMap<Origin, pool::Shared>>,
-    /// When the idle connections of every origin were last looked at.
+    hosts: RefCell<HashMap<Route, pool::Shared>>,
+    /// When the idle connections of every route were last looked at.
     swept: Cell<Instant>,
 }
 
@@ -281,7 +364,8 @@ impl Lease {
 
     /// Puts the connection back for the next request.
     fn give_back(mut self, idle_timeout: Duration) {
-        if let Some(conn) = self.conn.take() {
+        if let Some(mut conn) = self.conn.take() {
+            conn.idle_since = std::time::Instant::now();
             pool::put_back(&self.pool, conn, idle_timeout);
         }
     }
@@ -385,7 +469,7 @@ impl Client {
         let Ok(url) = Url::parse(url) else {
             return (0, 0);
         };
-        match self.shared.hosts.borrow().get(&url.origin()) {
+        match self.shared.hosts.borrow().get(&self.route(&url)) {
             Some(pool) => pool.borrow().counts(),
             None => (0, 0),
         }
@@ -411,21 +495,33 @@ impl Client {
             .clone()
     }
 
-    fn host(&self, origin: &Origin) -> pool::Shared {
-        self.sweep();
-        self.shared
-            .hosts
-            .borrow_mut()
-            .entry(origin.clone())
-            .or_default()
-            .clone()
+    /// Where connections for `url` go: through the proxy, or not.
+    fn route(&self, url: &Url) -> Route {
+        match &self.shared.config.proxy {
+            Some(proxy) => proxy.route(url),
+            None => Route {
+                origin: url.origin(),
+                proxy: None,
+            },
+        }
     }
 
-    /// Closes the connections of every origin that have been idle for the
-    /// idle timeout, and forgets the origins left with none. An origin's
-    /// own requests close its expired connections as they go; this catches
-    /// those of origins that are not asked for again, which would otherwise
-    /// stay open, along with their entries, for as long as the client lives.
+    fn host(&self, route: &Route) -> pool::Shared {
+        self.sweep();
+        let mut hosts = self.shared.hosts.borrow_mut();
+        // Looked up first so that the route is only copied the first time.
+        if let Some(pool) = hosts.get(route) {
+            return pool.clone();
+        }
+        hosts.entry(route.clone()).or_default().clone()
+    }
+
+    /// Closes the connections of every route (an origin, directly or
+    /// through a proxy) that have been idle for the idle timeout, and
+    /// forgets the routes left with none. A route's own requests close its
+    /// expired connections as they go; this catches those of routes that are
+    /// not asked for again, which would otherwise stay open, along with their
+    /// entries, for as long as the client lives.
     fn sweep(&self) {
         let shared = &self.shared;
         let idle_timeout = shared.config.idle_timeout;
@@ -433,19 +529,19 @@ impl Client {
             return;
         }
         shared.swept.set(Instant::now());
-        // An origin some request still holds is kept, even when empty.
+        // A route some request still holds is kept, even when empty.
         shared
             .hosts
             .borrow_mut()
             .retain(|_, pool| !pool::sweep(pool, idle_timeout) || Rc::strong_count(pool) > 1);
     }
 
-    /// A connection to `origin`: an idle one unless `fresh`, otherwise a
+    /// A connection on `route`: an idle one unless `fresh`, otherwise a
     /// new one, waiting in line while the origin has as many open as
     /// allowed.
-    async fn checkout(&self, origin: &Origin, fresh: bool) -> Result<Lease, Error> {
+    async fn checkout(&self, route: &Route, fresh: bool) -> Result<Lease, Error> {
         let config = &self.shared.config;
-        let pool = self.host(origin);
+        let pool = self.host(route);
         let taken = pool::acquire(
             &pool,
             config.max_connections_per_host,
@@ -461,12 +557,15 @@ impl Client {
             });
         }
         let mut opening = Opening { pool: Some(&pool) };
-        let tls = if origin.https {
+        let tls = if route.origin.https {
             Some(self.tls()?)
         } else {
             None
         };
-        let conn = Conn::open(origin, tls.as_ref(), config.connect_timeout).await?;
+        // Boxed: opening is rare next to reusing a connection, and its
+        // future (DNS, TCP, a proxy tunnel, the TLS handshake) is large, so
+        // it would otherwise make every request's future larger to move.
+        let conn = Box::pin(Conn::open(route, tls.as_ref(), config)).await?;
         opening.pool = None;
         drop(opening);
         Ok(Lease {
@@ -476,39 +575,48 @@ impl Client {
         })
     }
 
-    /// Sends one request, without following redirects. An idempotent
-    /// request that finds its kept-alive connection closed under it is sent
-    /// again on a new connection.
+    /// Sends one request and reads the head of its response, without
+    /// following redirects. An idempotent request that finds its
+    /// kept-alive connection closed under it is sent again on a new
+    /// connection.
     async fn execute(
         &self,
         method: &str,
         url: &Url,
         headers: &[(String, String)],
         body: Option<&[u8]>,
-    ) -> Result<Response, Error> {
+    ) -> Result<Pending, Error> {
         let config = &self.shared.config;
-        let origin = url.origin();
+        let route = self.route(url);
         let what = format!("{method} {url}");
-        let request = encode_request(method, url, headers, body, &config.user_agent);
-        let limits = Limits {
-            max_head_size: config.max_head_size,
-            max_response_size: config.max_response_size,
-        };
+        let decompress = config.decompress
+            && !headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("accept-encoding"));
+        let request = encode_request(
+            method,
+            url,
+            headers,
+            body,
+            &config.user_agent,
+            route.absolute_form(),
+            decompress,
+        );
         let mut fresh = false;
         loop {
-            let mut lease = self.checkout(&origin, fresh).await?;
+            let mut lease = self.checkout(&route, fresh).await?;
             let reused = lease.reused;
             match lease
                 .conn()
-                .exchange(request.clone(), method == "HEAD", &limits, &what)
+                .send(
+                    request.clone(),
+                    method == "HEAD",
+                    config.max_head_size,
+                    &what,
+                )
                 .await
             {
-                Ok(exchange) => {
-                    if exchange.reusable {
-                        lease.give_back(config.idle_timeout);
-                    }
-                    return Ok(Response::new(exchange, url.to_string()));
-                }
+                Ok(answer) => return Ok(Pending::new(lease, answer, url, what, decompress)),
                 Err(Failure::NothingReceived(_)) if reused && is_idempotent(method) => {
                     drop(lease);
                     fresh = true;
@@ -529,26 +637,28 @@ impl Client {
         }
     }
 
-    /// Sends a request and follows its redirects.
+    /// Sends a request and follows its redirects, up to the head of the
+    /// last response.
     async fn run(
         &self,
         mut method: String,
         mut url: Url,
         mut headers: Vec<(String, String)>,
         mut body: Option<Vec<u8>>,
-    ) -> Result<Response, Error> {
-        let max = self.shared.config.redirects;
+    ) -> Result<Pending, Error> {
+        let config = &self.shared.config;
+        let max = config.redirects;
         let mut hops = 0;
         loop {
-            let response = self
+            let pending = self
                 .execute(&method, &url, &headers, body.as_deref())
                 .await?;
-            let status = response.status();
+            let status = pending.head.status;
             if max == 0 || !matches!(status, 301 | 302 | 303 | 307 | 308) {
-                return Ok(response);
+                return Ok(pending);
             }
-            let Some(location) = response.header("location") else {
-                return Ok(response);
+            let Some(location) = pending.header("location").map(str::to_owned) else {
+                return Ok(pending);
             };
             if hops == max {
                 return Err(Error::new(
@@ -559,7 +669,7 @@ impl Client {
                     ),
                 ));
             }
-            let next = url.join(location).map_err(|m| {
+            let next = url.join(&location).map_err(|m| {
                 Error::new(
                     ErrorKind::Redirect,
                     format!("{method} {url} redirected to {location:?}, which is not valid: {m}"),
@@ -591,11 +701,157 @@ impl Client {
                         && !CREDENTIAL_HEADERS.iter().any(|c| n.eq_ignore_ascii_case(c))
                 });
             }
-            drop(response);
+            // The redirect's own body is read and dropped, so that its
+            // connection can serve the next request.
+            pending.read_whole(config).await?;
             url = next;
             hops += 1;
         }
     }
+}
+
+/// A response whose head has arrived, with the connection its body comes
+/// on.
+struct Pending {
+    lease: Lease,
+    head: Head,
+    /// Holds the head's bytes too.
+    body: conn::Body,
+    /// Set when the body is compressed and the client asked for that.
+    inflate: Option<Box<Inflate>>,
+    url: String,
+    /// `METHOD url`, for messages.
+    what: String,
+}
+
+impl Pending {
+    fn new(lease: Lease, answer: Answer, url: &Url, what: String, decompress: bool) -> Self {
+        let Answer { mut head, body } = answer;
+        let head_bytes = body.head_bytes();
+        let mut inflate = None;
+        if decompress && head.status != 206 && body.length() != Some(0) {
+            let encoding = header_in(&head, head_bytes, "content-encoding").map(Encoding::parse);
+            if let Some(Ok(Some(encoding))) = encoding {
+                inflate = Some(Box::new(Inflate::new(encoding)));
+                // The body given out is the decoded one: these describe
+                // the encoded one.
+                head.fields.retain(|(n, _)| {
+                    let name = &head_bytes[n.clone()];
+                    !name.eq_ignore_ascii_case(b"content-encoding")
+                        && !name.eq_ignore_ascii_case(b"content-length")
+                });
+            }
+        }
+        Self {
+            lease,
+            head,
+            body,
+            inflate,
+            url: url.to_string(),
+            what,
+        }
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        header_in(&self.head, self.body.head_bytes(), name)
+            .and_then(|v| std::str::from_utf8(v).ok())
+    }
+
+    /// Reads the rest of the body, decoded, up to the client's limit.
+    async fn read_whole(mut self, config: &ClientBuilder) -> Result<Response, Error> {
+        let max = config.max_response_size;
+        let what = &self.what;
+        let too_large = |decoded: bool| {
+            Error::new(
+                ErrorKind::TooLarge,
+                format!(
+                    "{what}: the response body is larger than {max} bytes{} \
+                     (ClientBuilder::max_response_size; RequestBuilder::send_streaming reads a \
+                     body of any size piece by piece)",
+                    if decoded { " once decompressed" } else { "" }
+                ),
+            )
+        };
+        if self.body.length().is_some_and(|n| n > max as u64) {
+            return Err(too_large(false));
+        }
+        let start = self.body.head_bytes().len();
+        let mut data = match self.inflate {
+            None => self.body.take_with_head(),
+            Some(_) => None,
+        }
+        .unwrap_or_else(|| self.body.head_bytes().to_vec());
+        if let Some(n) = self.body.length() {
+            data.reserve(n as usize);
+        }
+        let conn = self
+            .lease
+            .conn
+            .as_ref()
+            .expect("a lease holds its connection");
+        match &mut self.inflate {
+            None => {
+                while self.body.read(conn, &mut data, what).await? {
+                    if data.len() - start > max {
+                        return Err(too_large(false));
+                    }
+                }
+            }
+            Some(inflate) => {
+                let mut raw = Vec::new();
+                let mut received = 0;
+                loop {
+                    raw.clear();
+                    let more = self.body.read(conn, &mut raw, what).await?;
+                    received += raw.len();
+                    if received > max {
+                        return Err(too_large(false));
+                    }
+                    inflate.push(&raw);
+                    inflate
+                        .pull(&mut data, start + max + 1)
+                        .map_err(|e| decode_error(what, e))?;
+                    if data.len() - start > max {
+                        return Err(too_large(true));
+                    }
+                    if !more {
+                        inflate.finish().map_err(|e| decode_error(what, e))?;
+                        break;
+                    }
+                }
+            }
+        }
+        if self.body.reusable() {
+            self.lease.give_back(config.idle_timeout);
+        }
+        Ok(Response {
+            status: self.head.status,
+            fields: self.head.fields,
+            body_start: start,
+            data,
+            url: self.url,
+        })
+    }
+}
+
+/// The value of the first header named `name` in a head.
+fn header_in<'a>(head: &Head, bytes: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    head.fields
+        .iter()
+        .find(|(n, _)| bytes[n.clone()].eq_ignore_ascii_case(name.as_bytes()))
+        .map(|(_, v)| &bytes[v.clone()])
+}
+
+fn decode_error(what: &str, e: DecodeError) -> Error {
+    let DecodeError::Damaged(m) = e;
+    Error::new(
+        ErrorKind::Decode,
+        format!(
+            "{what}: the body cannot be decompressed: {m}. To read it as it came, send the \
+             request with its own Accept-Encoding header, or turn decompression off with \
+             ClientBuilder::decompress(false)"
+        ),
+    )
 }
 
 impl fmt::Debug for Client {
@@ -620,14 +876,26 @@ fn encode_request(
     headers: &[(String, String)],
     body: Option<&[u8]>,
     user_agent: &str,
+    proxy: Option<&proxy::Server>,
+    accept_encoding: bool,
 ) -> Vec<u8> {
     let body_len = body.map_or(0, <[u8]>::len);
     let mut out = Vec::with_capacity(256 + url.target.len() + body_len);
     let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     out.extend_from_slice(method.as_bytes());
     out.push(b' ');
+    if proxy.is_some() {
+        // Absolute form, for a proxy (RFC 9112 section 3.2.2).
+        out.extend_from_slice(b"http://");
+        out.extend_from_slice(url.host_header().as_bytes());
+    }
     out.extend_from_slice(url.target.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\n");
+    if let Some(auth) = proxy.and_then(|p| p.authorization.as_deref()) {
+        out.extend_from_slice(b"Proxy-Authorization: ");
+        out.extend_from_slice(auth.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
     if !has("host") {
         out.extend_from_slice(b"Host: ");
         out.extend_from_slice(url.host_header().as_bytes());
@@ -636,6 +904,11 @@ fn encode_request(
     if !has("user-agent") && !user_agent.is_empty() {
         out.extend_from_slice(b"User-Agent: ");
         out.extend_from_slice(user_agent.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if accept_encoding {
+        out.extend_from_slice(b"Accept-Encoding: ");
+        out.extend_from_slice(decode::ACCEPT_ENCODING.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
     for (name, value) in headers {
@@ -725,7 +998,8 @@ impl RequestBuilder {
     }
 
     /// Sends the request and reads the whole response, following
-    /// redirects.
+    /// redirects. A compressed body is decompressed (see
+    /// [`ClientBuilder::decompress`]).
     ///
     /// Any status is a response, 404 and 500 included: see
     /// [`Response::error_for_status`]. Dropping the future closes the
@@ -735,21 +1009,60 @@ impl RequestBuilder {
             return Err(e);
         }
         let url = self.url?;
-        let timeout = self.timeout.unwrap_or(self.client.shared.config.timeout);
+        let client = self.client;
+        let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
         let what = format!("{} {url}", self.method);
-        let run = self.client.run(self.method, url, self.headers, self.body);
+        let run = async {
+            let pending = client
+                .run(self.method, url, self.headers, self.body)
+                .await?;
+            pending.read_whole(&client.shared.config).await
+        };
         match giong::time::timeout(timeout, run).await {
             Ok(result) => result,
-            Err(_) => Err(Error::new(
-                ErrorKind::Timeout,
-                format!(
-                    "{what} did not finish within {timeout:?}; if the server is known to be this \
-                     slow, raise the timeout (ClientBuilder::timeout, or RequestBuilder::timeout \
-                     for one request)"
-                ),
-            )),
+            Err(_) => Err(timed_out(&what, timeout)),
         }
     }
+
+    /// Sends the request and returns once the head of the response has
+    /// arrived, following redirects; the body is then read piece by piece
+    /// with [`StreamingResponse::chunk`], with no limit on its size. For
+    /// downloads and long responses that should not be held whole.
+    ///
+    /// The request's timeout covers everything up to the head. After that,
+    /// it is the longest wait for each piece of the body, so a body that
+    /// keeps arriving can take as long as it needs, and one that stops is
+    /// noticed.
+    pub async fn send_streaming(self) -> Result<StreamingResponse, Error> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
+        let url = self.url?;
+        let client = self.client;
+        let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
+        let what = format!("{} {url}", self.method);
+        let run = client.run(self.method, url, self.headers, self.body);
+        match giong::time::timeout(timeout, run).await {
+            Ok(Ok(pending)) => Ok(StreamingResponse {
+                pending,
+                timeout,
+                idle_timeout: client.shared.config.idle_timeout,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(timed_out(&what, timeout)),
+        }
+    }
+}
+
+fn timed_out(what: &str, timeout: Duration) -> Error {
+    Error::new(
+        ErrorKind::Timeout,
+        format!(
+            "{what} did not finish within {timeout:?}; if the server is known to be this \
+             slow, raise the timeout (ClientBuilder::timeout, or RequestBuilder::timeout \
+             for one request)"
+        ),
+    )
 }
 
 impl fmt::Debug for RequestBuilder {
@@ -774,16 +1087,6 @@ pub struct Response {
 }
 
 impl Response {
-    fn new(exchange: conn::Exchange, url: String) -> Self {
-        Self {
-            status: exchange.head.status,
-            fields: exchange.head.fields,
-            body_start: exchange.head.len,
-            data: exchange.data,
-            url,
-        }
-    }
-
     /// The status code, such as 200 or 404.
     pub fn status(&self) -> u16 {
         self.status
@@ -873,6 +1176,196 @@ impl fmt::Debug for Response {
     }
 }
 
+/// A response whose body is read piece by piece, from
+/// [`RequestBuilder::send_streaming`].
+///
+/// ```no_run
+/// use giong_http::client::Client;
+///
+/// # fn main() -> Result<(), giong_http::client::Error> {
+/// # giong::block_on(async {
+/// let client = Client::new();
+/// let mut response = client
+///     .get("https://example.com/big.csv")
+///     .send_streaming()
+///     .await?
+///     .error_for_status()?;
+/// let mut total = 0;
+/// while let Some(piece) = response.chunk().await? {
+///     total += piece.len(); // write it to a file, parse it...
+/// }
+/// println!("{total} bytes");
+/// # Ok(())
+/// # })
+/// # }
+/// ```
+///
+/// The connection goes back to the pool once the body has been read to
+/// its end. Dropped before that, the response closes its connection.
+pub struct StreamingResponse {
+    /// Its lease holds no connection once the body has ended or failed.
+    pending: Pending,
+    timeout: Duration,
+    idle_timeout: Duration,
+}
+
+/// The most decoded bytes one [`StreamingResponse::chunk`] gives.
+const MAX_CHUNK: usize = 64 * 1024;
+
+impl StreamingResponse {
+    fn pending(&self) -> &Pending {
+        &self.pending
+    }
+
+    /// The status code, such as 200 or 404.
+    pub fn status(&self) -> u16 {
+        self.pending().head.status
+    }
+
+    /// Whether the status is 2xx.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status())
+    }
+
+    /// The response, or an error of kind [`ErrorKind::Status`] for a 4xx or
+    /// 5xx status. The body is not read for the message (it may be large);
+    /// the connection is closed.
+    pub fn error_for_status(self) -> Result<Self, Error> {
+        let status = self.status();
+        if status < 400 {
+            return Ok(self);
+        }
+        Err(Error::from_status(
+            status,
+            format!(
+                "{} answered {status} {}",
+                self.pending().url,
+                crate::response::reason(status)
+            ),
+        ))
+    }
+
+    /// The first header with this name (in any case), if its value is
+    /// valid UTF-8. When the body is decompressed, its `Content-Encoding`
+    /// and `Content-Length` are left out: they describe the compressed
+    /// body.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.pending().header(name)
+    }
+
+    /// Every header, in the order the server sent them.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        let p = self.pending();
+        let bytes = p.body.head_bytes();
+        p.head.fields.iter().map(move |(n, v)| {
+            let name = std::str::from_utf8(&bytes[n.clone()]).unwrap_or("");
+            (name, &bytes[v.clone()])
+        })
+    }
+
+    /// The URL that answered, after any redirects.
+    pub fn url(&self) -> &str {
+        &self.pending().url
+    }
+
+    /// The next piece of the body (decompressed if it was compressed, at
+    /// most 64 KiB), or `None` at its end. Waits at most the request's
+    /// timeout for it. After an error, the connection is closed and every
+    /// further call returns `None`.
+    pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        let pending = &mut self.pending;
+        if pending.lease.conn.is_none() {
+            return Ok(None);
+        }
+        let timeout = self.timeout;
+        let result = match giong::time::timeout(timeout, next_piece(pending)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::new(
+                ErrorKind::Timeout,
+                format!(
+                    "{}: no part of the body arrived within {timeout:?}; if the server is known \
+                     to pause this long, raise the timeout (RequestBuilder::timeout)",
+                    pending.what
+                ),
+            )),
+        };
+        match &result {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                // The end: the connection can serve another request.
+                if pending.body.reusable() {
+                    if let Some(conn) = pending.lease.conn.take() {
+                        let lease = Lease {
+                            conn: Some(conn),
+                            pool: pending.lease.pool.clone(),
+                            reused: true,
+                        };
+                        lease.give_back(self.idle_timeout);
+                    }
+                } else {
+                    close(&mut pending.lease);
+                }
+            }
+            Err(_) => close(&mut pending.lease),
+        }
+        result
+    }
+}
+
+/// Closes a lease's connection now, giving its place in the pool to the
+/// next request.
+fn close(lease: &mut Lease) {
+    if let Some(conn) = lease.conn.take() {
+        drop(conn);
+        pool::free(&lease.pool);
+    }
+}
+
+async fn next_piece(p: &mut Pending) -> Result<Option<Vec<u8>>, Error> {
+    let conn = p.lease.conn.as_ref().expect("checked by the caller");
+    let what = &p.what;
+    match &mut p.inflate {
+        None => {
+            let mut out = Vec::new();
+            if p.body.read(conn, &mut out, what).await? {
+                Ok(Some(out))
+            } else {
+                Ok(None)
+            }
+        }
+        Some(inflate) => {
+            let mut raw = Vec::new();
+            loop {
+                let mut out = Vec::new();
+                inflate
+                    .pull(&mut out, MAX_CHUNK)
+                    .map_err(|e| decode_error(what, e))?;
+                if !out.is_empty() {
+                    return Ok(Some(out));
+                }
+                if p.body.is_done() {
+                    inflate.finish().map_err(|e| decode_error(what, e))?;
+                    return Ok(None);
+                }
+                raw.clear();
+                p.body.read(conn, &mut raw, what).await?;
+                inflate.push(&raw);
+            }
+        }
+    }
+}
+
+impl fmt::Debug for StreamingResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let p = self.pending();
+        f.debug_struct("StreamingResponse")
+            .field("status", &p.head.status)
+            .field("url", &p.url)
+            .field("decompressing", &p.inflate.is_some())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,23 +1379,41 @@ mod tests {
             &[("X-Id".into(), "7".into())],
             Some(b"hi"),
             "ua/1",
+            None,
+            true,
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "POST /a?b=1 HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: ua/1\r\nX-Id: 7\r\n\
+            "POST /a?b=1 HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: ua/1\r\n\
+             Accept-Encoding: gzip, deflate\r\nX-Id: 7\r\n\
              Content-Length: 2\r\n\r\nhi"
         );
         let url = Url::parse("https://example.com/").unwrap();
         let headers = [("host".to_owned(), "other".to_owned())];
-        let out = encode_request("GET", &url, &headers, None, "");
+        let out = encode_request("GET", &url, &headers, None, "", None, false);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "GET / HTTP/1.1\r\nhost: other\r\n\r\n"
         );
-        let out = encode_request("PUT", &url, &[], None, "");
+        let out = encode_request("PUT", &url, &[], None, "", None, false);
         assert!(String::from_utf8(out)
             .unwrap()
             .ends_with("Content-Length: 0\r\n\r\n"));
+
+        // Through a proxy: the whole URL, and the proxy's credentials.
+        let proxy = Proxy::all("http://u:p@proxy:3128").unwrap();
+        let url = Url::parse("http://example.com:8080/a?b=1").unwrap();
+        let route = proxy.route(&url);
+        let out = encode_request("GET", &url, &[], None, "", route.absolute_form(), false);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "GET http://example.com:8080/a?b=1 HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n\
+             Host: example.com:8080\r\n\r\n"
+        );
+        // Through a tunnel, the request is the one the server would get.
+        let url = Url::parse("https://example.com/").unwrap();
+        assert!(proxy.route(&url).proxy.is_some());
+        assert!(proxy.route(&url).absolute_form().is_none());
     }
 
     #[test]
@@ -917,6 +1428,9 @@ mod tests {
                 .get("http://x/")
                 .header("transfer-encoding", "chunked"),
             client.get("http://x/").header("Bad Name", "1"),
+            client
+                .get("http://x/")
+                .header("Proxy-Authorization", "Basic eDp5"),
             client.get("http://x/").header("X", "a\r\nInjected: yes"),
         ] {
             let e = giong::block_on(builder.send()).unwrap_err();

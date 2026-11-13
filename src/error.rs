@@ -164,6 +164,9 @@ codes! {
     HttpClientStatus = 1108, Other, "HTTP error status";
     /// The response body could not be read as asked.
     HttpClientDecode = 1109, InvalidData, "cannot decode the response body";
+    /// The proxy refused the request or the tunnel, or did not answer as a
+    /// proxy does.
+    HttpClientProxy = 1110, Other, "the HTTP proxy refused the request";
 
     // --------------------------------------------------------- giong-tls
     /// No trusted certificate authority: none installed on the machine, or

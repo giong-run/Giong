@@ -1,0 +1,1 @@
+redis://app:secret@cache.internal:6380/2?client-name=api&connect-timeout=5

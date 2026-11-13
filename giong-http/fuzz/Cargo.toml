@@ -10,7 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 giong = { path = "../.." }
-giong-http = { path = ".." }
+giong-http = { path = "..", features = ["client"] }
 
 # Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
 [workspace]
@@ -32,6 +32,27 @@ bench = false
 [[bin]]
 name = "connection"
 path = "fuzz_targets/connection.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response_head"
+path = "fuzz_targets/response_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url"
+path = "fuzz_targets/url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
 test = false
 doc = false
 bench = false

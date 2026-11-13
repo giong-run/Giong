@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use giong::net::{TcpListener, TcpStream};
 use giong::time::sleep;
-use giong_http::client::{Client, ErrorKind};
+use giong_http::client::{Client, ErrorKind, Proxy};
 use giong_http::{Request, Response, Server};
 use giong_tls::{TlsAcceptor, TlsConnector};
 
@@ -897,14 +897,533 @@ fn an_https_body_that_ends_with_the_connection_needs_close_notify() {
     });
 }
 
+// ------------------------------------------------- compression and streaming
+
+/// `data` as a gzip member (RFC 1952).
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+    out.extend(miniz_oxide::deflate::compress_to_vec(data, 6));
+    // CRC-32, bit by bit: slow, but only for tests.
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xedb8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    out.extend((!crc).to_le_bytes());
+    out.extend((data.len() as u32).to_le_bytes());
+    out
+}
+
+fn text_of(size: usize) -> Vec<u8> {
+    (0..)
+        .flat_map(|i: u32| format!("{{\"id\":{i},\"name\":\"user {}\"}},", i % 1000).into_bytes())
+        .take(size)
+        .collect()
+}
+
+#[test]
+fn compressed_responses_are_decoded_and_the_limits_apply_to_what_comes_out() {
+    giong::block_on(async {
+        let page = Rc::new(text_of(300_000));
+        let gz = Rc::new(gzip(&page));
+        let deflated = Rc::new(miniz_oxide::deflate::compress_to_vec_zlib(&page, 6));
+        let bomb = Rc::new(gzip(&vec![b'0'; 32 << 20]));
+        let base = serve(move |req: Request| {
+            let (page, gz, deflated, bomb) =
+                (page.clone(), gz.clone(), deflated.clone(), bomb.clone());
+            async move {
+                let accepts = req.header_str("accept-encoding").unwrap_or("").to_owned();
+                let encoded = |enc: &str, body: Vec<u8>| {
+                    Response::new(200)
+                        .header("Content-Encoding", enc)
+                        .body(body)
+                };
+                match req.path() {
+                    "/page" if accepts.contains("gzip") => encoded("gzip", gz.to_vec()),
+                    "/page" => Response::new(200).body(page.to_vec()),
+                    "/accepts" => Response::text(accepts),
+                    "/deflate" => encoded("deflate", deflated.to_vec()),
+                    "/bomb" => encoded("gzip", bomb.to_vec()),
+                    "/br" => encoded("br", b"not really brotli".to_vec()),
+                    "/cut" => encoded("gzip", gz[..gz.len() / 2].to_vec()),
+                    "/damaged" => {
+                        let mut d = gz.to_vec();
+                        d[gz.len() / 2] ^= 0x55;
+                        encoded("gzip", d)
+                    }
+                    _ => Response::new(404),
+                }
+            }
+        });
+        let page = text_of(300_000);
+        let client = Client::new();
+        let url = format!("{base}/page");
+        for _ in 0..3 {
+            let r = client.get(&url).send().await.unwrap();
+            assert_eq!(r.body(), page);
+            // They described the compressed body.
+            assert_eq!(r.header("content-encoding"), None);
+            assert_eq!(r.header("content-length"), None);
+        }
+        assert_eq!(client.connections(&url), (1, 1));
+        let accepts = client.get(&format!("{base}/accepts")).send().await.unwrap();
+        assert_eq!(accepts.text().unwrap(), "gzip, deflate");
+        let r = client.get(&format!("{base}/deflate")).send().await.unwrap();
+        assert_eq!(r.body(), page);
+
+        // An encoding the client does not decode comes as it is.
+        let r = client.get(&format!("{base}/br")).send().await.unwrap();
+        assert_eq!(r.header("content-encoding"), Some("br"));
+        assert_eq!(r.body(), b"not really brotli");
+
+        // A request with its own Accept-Encoding gets the bytes as sent.
+        let r = client
+            .get(&url)
+            .header("Accept-Encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.header("content-encoding"), Some("gzip"));
+        assert_eq!(r.body(), gzip(&page));
+
+        // Turned off: not asked for, so not sent.
+        let plain = Client::builder().decompress(false).build();
+        let r = plain.get(&format!("{base}/accepts")).send().await.unwrap();
+        assert_eq!(r.text().unwrap(), "");
+        assert_eq!(plain.get(&url).send().await.unwrap().body(), page);
+
+        // 32 MiB of zeros in 32 KiB: stopped at the limit, never held.
+        let small = Client::builder().max_response_size(1 << 20).build();
+        let e = small.get(&format!("{base}/bomb")).send().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::TooLarge, "{e}");
+        assert!(e.to_string().contains("once decompressed"), "{e}");
+
+        for path in ["/cut", "/damaged"] {
+            let e = client
+                .get(&format!("{base}{path}"))
+                .send()
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Decode, "{path}: {e}");
+            assert!(e.to_string().contains("cannot be decompressed"), "{e}");
+        }
+    });
+}
+
+#[test]
+fn streamed_bodies_arrive_piece_by_piece_with_no_limit_on_their_size() {
+    giong::block_on(async {
+        // 40 MiB, chunked, in pieces of 1 MiB.
+        let gz_body = Rc::new(gzip(&text_of(5 << 20)));
+        let base = scripted(move |_, stream| {
+            let gz_body = gz_body.clone();
+            async move {
+                let mut buf = Vec::new();
+                while let Some(request) = read_request(&stream, &mut buf).await {
+                    let target = request.split(' ').nth(1).unwrap().to_owned();
+                    match target.as_str() {
+                        "/big" => {
+                            write(
+                                &stream,
+                                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+                            )
+                            .await;
+                            let piece = vec![b'x'; 1 << 20];
+                            for _ in 0..40 {
+                                let mut chunk = format!("{:x}\r\n", piece.len()).into_bytes();
+                                chunk.extend_from_slice(&piece);
+                                chunk.extend_from_slice(b"\r\n");
+                                write(&stream, &chunk).await;
+                            }
+                            write(&stream, b"0\r\n\r\n").await;
+                        }
+                        "/gz" => {
+                            let body = gz_body.to_vec();
+                            let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                            body.len()
+                        );
+                            write(&stream, head.as_bytes()).await;
+                            write(&stream, &body).await;
+                        }
+                        "/stall" => {
+                            write(
+                                &stream,
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nfirst",
+                            )
+                            .await;
+                            sleep(Duration::from_secs(5)).await;
+                            return;
+                        }
+                        _ => {
+                            write(
+                                &stream,
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                            )
+                            .await
+                        }
+                    }
+                }
+            }
+        });
+        let client = Client::builder().max_response_size(1 << 20).build();
+        let big = format!("{base}/big");
+        let e = client.get(&big).send().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::TooLarge, "{e}");
+        assert!(e.to_string().contains("send_streaming"), "{e}");
+
+        let client = Client::builder()
+            .max_response_size(1 << 20)
+            .timeout(Duration::from_millis(300))
+            .build();
+        for _ in 0..2 {
+            let mut r = client.get(&big).send_streaming().await.unwrap();
+            assert_eq!(r.status(), 200);
+            let (mut total, mut pieces) = (0, 0);
+            while let Some(piece) = r.chunk().await.unwrap() {
+                assert!(piece.iter().all(|&b| b == b'x'));
+                total += piece.len();
+                pieces += 1;
+            }
+            assert_eq!(total, 40 << 20);
+            assert!(pieces > 40, "{pieces}");
+            assert_eq!(r.chunk().await.unwrap(), None);
+            // Read to its end, the connection went back to the pool.
+            assert_eq!(client.connections(&big), (1, 1));
+        }
+
+        // Compressed: each piece is at most 64 KiB once decoded.
+        let mut r = client
+            .get(&format!("{base}/gz"))
+            .send_streaming()
+            .await
+            .unwrap();
+        assert_eq!(r.header("content-encoding"), None);
+        let mut body = Vec::new();
+        while let Some(piece) = r.chunk().await.unwrap() {
+            assert!(
+                !piece.is_empty() && piece.len() <= 64 * 1024,
+                "{}",
+                piece.len()
+            );
+            body.extend(piece);
+        }
+        assert_eq!(body, text_of(5 << 20));
+
+        // Dropped halfway: its connection is closed, not reused.
+        let mut r = client.get(&big).send_streaming().await.unwrap();
+        r.chunk().await.unwrap().unwrap();
+        drop(r);
+        assert_eq!(client.connections(&big), (0, 0));
+
+        // A body that stops: the timeout is per piece.
+        let mut r = client
+            .get(&format!("{base}/stall"))
+            .send_streaming()
+            .await
+            .unwrap();
+        assert_eq!(r.chunk().await.unwrap().as_deref(), Some(&b"first"[..]));
+        let started = Instant::now();
+        let e = r.chunk().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        assert!(e.to_string().contains("no part of the body arrived"), "{e}");
+        assert!(started.elapsed() >= Duration::from_millis(280));
+        assert_eq!(r.chunk().await.unwrap(), None);
+
+        // Statuses, as with send().
+        let r = client
+            .get(&format!("{base}/nope"))
+            .send_streaming()
+            .await
+            .unwrap();
+        let e = r.error_for_status().unwrap_err();
+        assert_eq!((e.kind(), e.status()), (ErrorKind::Status, Some(404)));
+    });
+}
+
+// ------------------------------------------------------------------ proxies
+
+/// The value of a header in a request read by `read_request`.
+fn header_of(request: &str, name: &str) -> Option<String> {
+    request.lines().find_map(|l| {
+        let (n, v) = l.split_once(':')?;
+        n.eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+    })
+}
+
+/// Copies what `from` receives to `to` until `from` closes.
+async fn copy(from: Rc<TcpStream>, to: Rc<TcpStream>) {
+    while let Ok(chunk) = from.recv().await {
+        if chunk.is_empty() || to.write_all(chunk.to_vec()).await.0.is_err() {
+            return;
+        }
+    }
+}
+
+/// A forward proxy for the tests, which logs every request it gets. It
+/// answers `http` requests itself, saying what it got, and opens a tunnel
+/// to 127.0.0.1 for `CONNECT`. With `auth`, it wants that
+/// `Proxy-Authorization` and answers 407 without it.
+fn forward_proxy(auth: Option<&'static str>, log: Rc<RefCell<Vec<String>>>) -> String {
+    scripted(move |_, stream| {
+        let log = log.clone();
+        async move {
+            let stream = Rc::new(stream);
+            let mut buf = Vec::new();
+            while let Some(request) = read_request(&stream, &mut buf).await {
+                log.borrow_mut().push(request.clone());
+                if auth.is_some() && header_of(&request, "proxy-authorization").as_deref() != auth {
+                    write(
+                        &stream,
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                          Proxy-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                    continue;
+                }
+                let line = request.lines().next().unwrap().to_owned();
+                if let Some(rest) = line.strip_prefix("CONNECT ") {
+                    let authority = rest.split(' ').next().unwrap();
+                    let port: u16 = authority.rsplit(':').next().unwrap().parse().unwrap();
+                    let upstream = Rc::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+                    write(&stream, b"HTTP/1.1 200 Connection established\r\n\r\n").await;
+                    giong::spawn(copy(upstream.clone(), stream.clone()));
+                    copy(stream, upstream).await;
+                    return;
+                }
+                let body = format!("proxied {line}");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                write(&stream, response.as_bytes()).await;
+            }
+        }
+    })
+}
+
+#[test]
+fn http_requests_go_to_the_proxy_with_the_whole_url_and_its_credentials() {
+    giong::block_on(async {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        // "u@x:p w" as user "u@x" and password "p w", %-encoded in the URL.
+        let auth = "Basic dUB4OnAgdw==";
+        let proxy = forward_proxy(Some(auth), log.clone());
+        let addr = proxy.strip_prefix("http://").unwrap();
+        let client = Client::builder()
+            .proxy(Proxy::all(&format!("http://u%40x:p%20w@{addr}")).unwrap())
+            .build();
+
+        // The host does not exist: only the proxy can answer for it.
+        let url = "http://api.example.invalid:8080/a?b=1";
+        for _ in 0..3 {
+            let r = client.get(url).header("X-Id", "7").send().await.unwrap();
+            assert_eq!(
+                r.text().unwrap(),
+                "proxied GET http://api.example.invalid:8080/a?b=1 HTTP/1.1"
+            );
+        }
+        assert_eq!(client.connections(url), (1, 1));
+        let first = log.borrow()[0].clone();
+        assert_eq!(
+            header_of(&first, "host").as_deref(),
+            Some("api.example.invalid:8080")
+        );
+        assert_eq!(header_of(&first, "x-id").as_deref(), Some("7"));
+        assert_eq!(log.borrow().len(), 3);
+
+        // Wrong credentials: for http, the proxy's 407 is the response.
+        let client = Client::builder()
+            .proxy(Proxy::http(&format!("http://u:wrong@{addr}")).unwrap())
+            .build();
+        assert_eq!(client.get(url).send().await.unwrap().status(), 407);
+
+        // A proxy for http only leaves https alone, and the other way round.
+        let client = Client::builder()
+            .proxy(Proxy::https(&format!("http://{addr}")).unwrap())
+            .build();
+        let e = client.get(url).send().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+        assert!(!e.to_string().contains("proxy"), "{e}");
+    });
+}
+
+#[test]
+fn https_goes_through_a_tunnel_and_stays_encrypted() {
+    giong::block_on(async {
+        let (port, cert) = serve_tls(|req: Request| async move {
+            Response::text(format!(
+                "secret for {}",
+                req.header_str("x-id").unwrap_or("-")
+            ))
+        });
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let auth = "Basic dTpwdw=="; // u:pw
+        let proxy = forward_proxy(Some(auth), log.clone());
+        let addr = proxy.strip_prefix("http://").unwrap().to_owned();
+        let tls = TlsConnector::with_root_pem(cert.as_bytes()).unwrap();
+        let client = Client::builder()
+            .tls(tls.clone())
+            .proxy(Proxy::all(&format!("http://u:pw@{addr}")).unwrap())
+            .build();
+        let url = format!("https://localhost:{port}/");
+        for i in 0..3 {
+            let r = client
+                .get(&url)
+                .header("X-Id", &i.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.text().unwrap(), format!("secret for {i}"));
+        }
+        // One tunnel, kept alive; the proxy saw only the CONNECT.
+        assert_eq!(client.connections(&url), (1, 1));
+        let log = log.borrow().clone();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(
+            log[0].starts_with(&format!(
+                "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n"
+            )),
+            "{log:?}"
+        );
+        assert_eq!(
+            header_of(&log[0], "proxy-authorization").as_deref(),
+            Some(auth)
+        );
+
+        // Wrong or missing credentials: the tunnel is refused, with a hint.
+        for (userinfo, says) in [("u:no@", "were refused"), ("", "put them in the proxy URL")] {
+            let client = Client::builder()
+                .tls(tls.clone())
+                .proxy(Proxy::all(&format!("http://{userinfo}{addr}")).unwrap())
+                .build();
+            let e = client.get(&url).send().await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Proxy, "{e}");
+            assert_eq!(e.status(), Some(407));
+            assert!(e.to_string().contains(says), "{e}");
+            assert!(e.to_string().starts_with("GIONG-E1110"), "{e}");
+            assert!(!e.is_transient());
+        }
+    });
+}
+
+#[test]
+fn proxies_that_fail_or_refuse_say_so_and_no_proxy_goes_around_them() {
+    giong::block_on(async {
+        let direct = serve(|_req: Request| async move { Response::text("direct") });
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let client = Client::builder()
+            .proxy(Proxy::all(&format!("http://{closed}")).unwrap())
+            .build();
+        let e = client.get(&direct).send().await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+        assert!(
+            e.to_string()
+                .contains(&format!("the proxy http://{closed}")),
+            "{e}"
+        );
+        assert!(e.is_transient());
+
+        // Listed in no_proxy: reached directly, the proxy is not tried.
+        let client = Client::builder()
+            .proxy(
+                Proxy::all(&format!("http://{closed}"))
+                    .unwrap()
+                    .no_proxy("localhost,127.0.0.1")
+                    .unwrap(),
+            )
+            .build();
+        let r = client.get(&direct).send().await.unwrap();
+        assert_eq!(r.text().unwrap(), "direct");
+
+        // Proxies that refuse the tunnel, or answer badly.
+        let cases: [(&'static [u8], Option<u16>, &str, bool); 4] = [
+            (
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+                Some(403),
+                "do not allow",
+                false,
+            ),
+            (
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+                Some(502),
+                "could not reach",
+                true,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\n\r\nsurprise",
+                Some(200),
+                "bytes after",
+                false,
+            ),
+            (b"SSH-2.0-OpenSSH\r\n\r\n", None, "not HTTP", false),
+        ];
+        for (answer, status, says, transient) in cases {
+            let proxy = scripted(move |_, stream| async move {
+                let mut buf = Vec::new();
+                if read_request(&stream, &mut buf).await.is_some() {
+                    write(&stream, answer).await;
+                    sleep(Duration::from_millis(500)).await;
+                }
+            });
+            let client = Client::builder()
+                .tls(TlsConnector::with_root_pem(certificate().0.as_bytes()).unwrap())
+                .proxy(Proxy::all(&proxy).unwrap())
+                .build();
+            let e = client
+                .get("https://api.example.invalid/")
+                .send()
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Proxy, "{e}");
+            assert_eq!(e.status(), status, "{e}");
+            assert!(e.to_string().contains(says), "{e}");
+            assert_eq!(e.is_transient(), transient, "{e}");
+        }
+
+        // A proxy that never answers the CONNECT: the connect timeout.
+        let silent = scripted(|_, stream| async move {
+            sleep(Duration::from_secs(10)).await;
+            drop(stream);
+        });
+        let client = Client::builder()
+            .connect_timeout(Duration::from_millis(200))
+            .tls(TlsConnector::with_root_pem(certificate().0.as_bytes()).unwrap())
+            .proxy(Proxy::all(&silent).unwrap())
+            .build();
+        let e = client
+            .get("https://api.example.invalid/")
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+        assert!(e.to_string().contains("through the proxy"), "{e}");
+    });
+}
+
 /// The real thing: a public HTTPS API, through the machine's certificate
-/// authorities. Needs the internet, so it runs only when asked:
+/// authorities, and through the proxy the environment names if it names one
+/// (`HTTPS_PROXY`). Needs the internet, so it runs only when asked:
 /// `cargo test -p giong-http --all-features --test client -- --ignored`.
 #[test]
 #[ignore = "needs the internet"]
 fn fetches_from_a_public_https_api() {
     giong::block_on(async {
-        let r = Client::new()
+        let mut builder = Client::builder();
+        if let Some(proxy) = Proxy::from_env().unwrap() {
+            builder = builder.proxy(proxy);
+        }
+        let r = builder
+            .build()
             .get("https://crates.io/api/v1/crates/giong")
             .header("accept", "application/json")
             .send()

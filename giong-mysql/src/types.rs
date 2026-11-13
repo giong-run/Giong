@@ -825,4 +825,14 @@ mod tests {
         assert_eq!(None::<i32>.to_sql(&mut out).unwrap(), Encoded::NULL);
         assert_eq!(out, [0xFE, 0xFF, 7, 0, 0, 0, 2, b'a', b'b']);
     }
+
+    #[test]
+    fn a_time_with_any_day_count_is_shown_not_overflowed() {
+        let time = col(ColumnType::TIME, 0, 63);
+        // 0xffff_ffff days: more than u32 hours can hold (found by fuzzing).
+        let raw = [0, 0xff, 0xff, 0xff, 0xff, 23, 59, 58];
+        assert_eq!(String::from_sql(&time, &raw).unwrap(), "103079215103:59:58");
+        let raw = [1, 34, 0, 0, 0, 22, 59, 59];
+        assert_eq!(String::from_sql(&time, &raw).unwrap(), "-838:59:59");
+    }
 }

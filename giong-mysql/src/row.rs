@@ -28,7 +28,7 @@ impl Column {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn for_tests(name: &str, ty: ColumnType, flags: u16, collation: u16) -> Self {
         Self {
             name: name.into(),

@@ -82,5 +82,7 @@ pub use server::{Server, Transport};
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing {
+    #[cfg(feature = "client")]
+    pub use crate::client::fuzzing::{check_inflate, check_response_head, check_url};
     pub use crate::invariants::{check_chunked, check_head};
 }
