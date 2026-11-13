@@ -64,11 +64,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   port as HTTP/1.1. Each stream is a `Request` like any other, so handlers and `giong-web`
   apps serve HTTP/2 unchanged; `Request::version()` returns the new `Version` (`Http10`,
   `Http11`, `Http2`). Flow control both ways, HPACK with its dynamic table, streamed
-  bodies both ways, `Expect: 100-continue`, trailers, and graceful shutdown with a GOAWAY
-  after which the streams in progress finish. A stream the client resets drops its
-  handler at once. `Server::http2(false)` serves HTTP/1.1 only, and
-  `Server::max_concurrent_streams` (default 100) caps the streams of one connection.
-  `h2spec` passes all 147 cases over TLS in strict mode, and runs in CI.
+  bodies both ways, file bodies (`Body::File`, read in 64 KiB pieces into DATA frames; a
+  file shorter than announced resets its stream), `Expect: 100-continue`, trailers, and
+  graceful shutdown with a GOAWAY after which the streams in progress finish. A stream
+  the client resets drops its handler at once. `Server::http2(false)` serves HTTP/1.1
+  only, and `Server::max_concurrent_streams` (default 100) caps the streams of one
+  connection. `h2spec` passes all 147 cases over TLS in strict mode, and runs in CI.
 - **`giong-http`**: every resource an HTTP/2 client can make the server hold is bounded,
   and a client that overdraws a limit gets a GOAWAY whose debug data carries a code with
   a page in `docs/errors`: `GIONG-E1115` (protocol error), `GIONG-E1116` (rapid reset:

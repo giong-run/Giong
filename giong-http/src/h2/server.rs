@@ -52,7 +52,7 @@ use super::wake::Wakers;
 use crate::body::{Failure, Next, Pipe, StreamBody};
 use crate::heap::HeapFuture;
 use crate::request::{BodyBytes, Request};
-use crate::response::{Body, Response};
+use crate::response::{Body, FileBody, Response};
 use crate::server::{give_buffer, take_buffer, Config, Handler, Transport};
 
 /// The window each stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`):
@@ -72,6 +72,8 @@ const OUT_HIGH: usize = 64 * 1024;
 /// With this much output waiting, input is not read: a client that sends
 /// PINGs and SETTINGS without reading the answers stops being read.
 const OUT_PAUSE: usize = 256 * 1024;
+/// How much of a file body is read at a time.
+const FILE_PIECE: u64 = 64 * 1024;
 /// Streams recently closed, remembered to answer late frames correctly.
 const CLOSED_MEMORY: usize = 64;
 /// Frames that do no work: a burst, and the rate at which it refills.
@@ -186,11 +188,25 @@ enum Send {
         piece: Vec<u8>,
         at: usize,
     },
+    /// A file's range, read a piece at a time: the piece read last, sent
+    /// from `at`, and the read in progress.
+    File {
+        file: FileBody,
+        /// Where the next read starts, and how much of the range is left.
+        next: u64,
+        left: u64,
+        piece: Vec<u8>,
+        at: usize,
+        reading: Option<FileRead>,
+    },
     /// Only END_STREAM: an empty DATA frame.
     End,
     /// END_STREAM sent.
     Done,
 }
+
+/// A read of a file body's next piece.
+type FileRead = Pin<Box<dyn Future<Output = (std::io::Result<usize>, Vec<u8>)>>>;
 
 struct Stream {
     id: u32,
@@ -224,7 +240,9 @@ impl Stream {
     fn sendable(&self) -> bool {
         match &self.send {
             Send::Bytes { body, at } => *at < body.len() && self.send_window > 0,
-            Send::Stream { piece, at, .. } => *at < piece.len() && self.send_window > 0,
+            Send::Stream { piece, at, .. } | Send::File { piece, at, .. } => {
+                *at < piece.len() && self.send_window > 0
+            }
             Send::End => true,
             Send::Waiting | Send::Done => false,
         }
@@ -233,7 +251,7 @@ impl Stream {
     fn has_data(&self) -> bool {
         match &self.send {
             Send::Bytes { body, at } => *at < body.len(),
-            Send::Stream { piece, at, .. } => *at < piece.len(),
+            Send::Stream { piece, at, .. } | Send::File { piece, at, .. } => *at < piece.len(),
             _ => false,
         }
     }
@@ -1351,6 +1369,14 @@ impl Session {
                 piece: Vec::new(),
                 at: 0,
             },
+            Body::File(file) => Send::File {
+                next: file.offset(),
+                left: file.len(),
+                file,
+                piece: Vec::new(),
+                at: 0,
+                reading: None,
+            },
             body => Send::Bytes { body, at: 0 },
         };
         self.service(slot);
@@ -1414,6 +1440,24 @@ impl Session {
                     }
                     Poll::Ready(Next::End) => ended = true,
                     Poll::Ready(Next::Aborted) => aborted = true,
+                    Poll::Pending => {}
+                }
+            }
+        }
+        if let Send::File {
+            file,
+            next,
+            left,
+            piece,
+            at,
+            reading,
+        } = &mut st.send
+        {
+            if *at >= piece.len() {
+                match poll_file(file, next, left, piece, reading, &waker) {
+                    Poll::Ready(Ok(true)) => *at = 0,
+                    Poll::Ready(Ok(false)) => ended = true,
+                    Poll::Ready(Err(_)) => aborted = true,
                     Poll::Pending => {}
                 }
             }
@@ -1546,7 +1590,7 @@ impl Session {
                         sent = n;
                     }
                 }
-                Send::Stream { piece, at, .. } => {
+                Send::Stream { piece, at, .. } | Send::File { piece, at, .. } => {
                     let n = (piece.len() - *at).min(limit);
                     if n > 0 {
                         frame::write_head(&mut self.out, n, frame::DATA, 0, id);
@@ -1578,8 +1622,9 @@ impl Session {
                 } else {
                     st.blocked_since.get_or_insert(now);
                 }
-            } else if matches!(st.send, Send::Stream { .. }) {
-                // The piece is out: ask the producer for the next one.
+            } else if matches!(st.send, Send::Stream { .. } | Send::File { .. }) {
+                // The piece is out: ask the producer, or the file, for the
+                // next one.
                 self.service(slot);
             }
         }
@@ -1685,6 +1730,62 @@ impl Session {
             self.name = Vec::new();
             self.wakers.release();
         }
+    }
+}
+
+/// Reads the next piece of a file body into `piece`, starting the read if
+/// none is in progress. `Ok(true)` when a piece was read, `Ok(false)` at the
+/// end of the range; an error if the file cannot be read or ends before the
+/// range does (`GIONG-E0201`), on which the stream is reset.
+fn poll_file(
+    file: &FileBody,
+    next: &mut u64,
+    left: &mut u64,
+    piece: &mut Vec<u8>,
+    reading: &mut Option<FileRead>,
+    waker: &std::task::Waker,
+) -> Poll<std::io::Result<bool>> {
+    loop {
+        if *left == 0 {
+            return Poll::Ready(Ok(false));
+        }
+        let read = reading.get_or_insert_with(|| {
+            let mut buf = mem::take(piece);
+            buf.clear();
+            buf.reserve(FILE_PIECE.min(*left) as usize);
+            let (handle, at) = (file.file.clone(), *next);
+            Box::pin(async move { handle.read_at(buf, at).await })
+        });
+        let (res, mut buf) = match read.as_mut().poll(&mut Context::from_waker(waker)) {
+            Poll::Ready(done) => done,
+            Poll::Pending => return Poll::Pending,
+        };
+        *reading = None;
+        let n = match res {
+            Ok(0) => {
+                let error = giong::error::Error::new(
+                    Code::FileTooShort,
+                    format!(
+                        "the file ended at byte {next}, {left} bytes short of the length the \
+                         response announced"
+                    ),
+                    "take the length from the open file (Body::file does), and replace a file \
+                     that is being served by renaming a new one over it, not by rewriting it.",
+                );
+                return Poll::Ready(Err(error.into()));
+            }
+            Ok(n) => (n as u64).min(*left),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                *piece = buf;
+                continue;
+            }
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        buf.truncate(n as usize);
+        *piece = buf;
+        *next += n;
+        *left -= n;
+        return Poll::Ready(Ok(true));
     }
 }
 

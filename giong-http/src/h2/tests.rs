@@ -76,6 +76,12 @@ fn pattern(n: usize) -> Vec<u8> {
     (0..n).map(|i| (i % 251) as u8).collect()
 }
 
+/// The file the `/file` paths serve, written by the test that asks for
+/// them.
+fn file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("giong-http-h2-{}", std::process::id()))
+}
+
 impl Handler for App {
     fn stream_body(&self, req: &Request) -> Option<u64> {
         req.path().starts_with("/pipe").then_some(4 << 20)
@@ -101,6 +107,17 @@ impl Handler for App {
                 ))
             }
             "/bytes" => Response::new(200).body(pattern(query_number(&req, "n"))),
+            "/file" | "/file-range" | "/file-short" => {
+                let file = giong::fs::File::open(file_path()).await.unwrap();
+                let len = file.len().unwrap();
+                let body = match req.path() {
+                    "/file" => Body::file(file).unwrap(),
+                    "/file-range" => Body::file_range(file, 100, 1000),
+                    // 100 bytes more than the file has.
+                    _ => Body::file_range(file, 0, len + 100),
+                };
+                Response::new(200).body(body)
+            }
             "/wait" => {
                 let _guard = Guard(state.clone(), req.query().unwrap_or("").to_string());
                 while !state.released.load(Ordering::SeqCst) {
@@ -1030,4 +1047,32 @@ fn http1_and_http2_share_a_port() {
     let mut answer = String::new();
     c.stream.read_to_string(&mut answer).unwrap();
     assert!(answer.starts_with("HTTP/1.1 "), "{answer}");
+}
+
+#[test]
+fn file_bodies_are_read_in_pieces_and_a_short_file_resets_its_stream() {
+    let data = pattern(1_000_003);
+    std::fs::write(file_path(), &data).unwrap();
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let reply = c.request("GET", "/file", &[], b"");
+    assert_eq!(reply.header("content-length"), Some("1000003"));
+    assert!(reply.body == data);
+    let reply = c.request("GET", "/file-range", &[], b"");
+    assert_eq!(reply.header("content-length"), Some("1000"));
+    assert!(reply.body == data[100..1100]);
+    let reply = c.request("HEAD", "/file", &[], b"");
+    assert_eq!(reply.header("content-length"), Some("1000003"));
+    assert!(reply.body.is_empty());
+
+    // The file ends before the length its head announced: what it had,
+    // then a reset; the connection carries on.
+    let id = c.get("/file-short");
+    assert_eq!(
+        c.reply(id).unwrap_err(),
+        Ended::Reset(Reason::Internal as u32)
+    );
+    assert!(c.replies.get(&id).is_some_and(|r| r.body == data));
+    assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
+    let _ = std::fs::remove_file(file_path());
 }
