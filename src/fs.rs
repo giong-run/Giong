@@ -434,6 +434,9 @@ async fn close(fd: RawFd) -> io::Result<()> {
     // close is a close(2) it sees.
     #[cfg(giong_tsan)]
     if runtime::driver_kind() == crate::DriverKind::IoUring {
+        // Queued operations on `fd` go to the kernel first, or they could
+        // act on whatever gets this number next.
+        runtime::with_worker(|w| w.driver.borrow_mut().submit_queued());
         // SAFETY: the descriptor is ours and is closed exactly once.
         return if unsafe { libc::close(fd) } < 0 {
             Err(io::Error::last_os_error())

@@ -710,7 +710,7 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-749 tests across the nine crates and the example API (`cargo test --workspace
+752 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
 database clients, giong-web, giong-mcp, giong-compat and the example API describe theirs
@@ -722,7 +722,7 @@ in their READMEs.
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
 | `tests/net.rs` (15) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
-| `tests/udp.rs` (16) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, sockets closed on drop |
+| `tests/udp.rs` (18) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop |
 | `tests/fs.rs` (20) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll) |
 | `tests/cancel.rs` (11) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; teardown with everything in flight |
 | `tests/multi.rs` (14) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
@@ -738,8 +738,9 @@ Also:
 
 - **ThreadSanitizer** (`scripts/check.sh tsan`, Rust nightly) over the workspace's tests,
   on both drivers: no data race. Two things are handled specially, both because of the tool:
-  sanitizer builds close descriptors with `close(2)` (it cannot see a close that goes
-  through the ring and then reports races on reused descriptor numbers), and the SIGTERM
+  sanitizer builds close descriptors with `close(2)`, after handing queued operations to
+  the kernel (it cannot see a close that goes through the ring and then reports races on
+  reused descriptor numbers), and the SIGTERM
   test is skipped (the sanitizer delivers signals only inside libc calls it intercepts,
   and giong's threads wait in raw system calls).
 - **The fallback io_uring setups and the epoll driver** (`scripts/check.sh fallback`): the

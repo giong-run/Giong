@@ -158,6 +158,9 @@ impl UdpSocket {
     /// worker can bind its own socket to the same port and let the kernel
     /// spread incoming datagrams across cores (all datagrams of one sender
     /// address go to the same worker).
+    ///
+    /// Port 0 asks the kernel for a port of the socket's own: it is bound
+    /// without those options, so no other socket can share the port.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut last_err = None;
         for addr in addr.to_socket_addrs()? {
@@ -171,8 +174,14 @@ impl UdpSocket {
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
         let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        sock.set_reuse_address(true)?;
-        sock.set_reuse_port(true)?;
+        // Not for port 0: with either option set, Linux may pick a port that
+        // another UDP socket of the same user already holds with the same
+        // options, and join the two. Datagrams for either socket would then
+        // be split between them by a hash of the sender's address.
+        if addr.port() != 0 {
+            sock.set_reuse_address(true)?;
+            sock.set_reuse_port(true)?;
+        }
         sock.bind(&addr.into())?;
         Ok(Self::from_socket(sock))
     }

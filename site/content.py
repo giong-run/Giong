@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=223,
+        layer="runtime", tests=226,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
