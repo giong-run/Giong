@@ -194,14 +194,14 @@ let runtime = giong::Builder::new()
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
 | Configuration | `.workers(n)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
-| TCP | `TcpListener::bind` / `accept`; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
+| TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
 | Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
 | UDP | `UdpSocket::bind` / `connect`; `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast` |
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
-| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
+| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
 | Errors | Every error giong raises starts with a code (`GIONG-E0102: no address found for …`) and links to its page in [docs/errors](docs/errors/README.md); `error::code(&err)` returns it as a `Code` to match on |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response`; with the `client` feature, `client::Client` (`get`, `post`, ... `send`), `client::Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
@@ -682,8 +682,10 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for MySQL,
   [`giong-mysql`](giong-mysql/README.md); for Redis, [`giong-redis`](giong-redis/README.md);
   for HTTP requests, `giong-http`'s client.
-- **Tasks do not migrate.** An overloaded core is not helped by an idle one; spread work
-  yourself with `spawn_on` or a channel.
+- **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
+  `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
+  `TcpListener::bind_balanced` hand new connections to less busy workers. A connection
+  already being served stays on its worker, however busy that worker gets.
 - **Graceful draining is opt-in.** By default, when a worker's main future returns, the
   remaining connections are dropped. Set `.shutdown_grace(..)` and use `until_shutdown` in
   the connection loop (`giong-http` does). Connections still in the kernel's accept queue
