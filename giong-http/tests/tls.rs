@@ -316,6 +316,33 @@ fn large_bodies_survive_in_both_directions_over_tls() {
 }
 
 #[test]
+fn file_bodies_are_encrypted_and_sent_over_tls() {
+    let data: Vec<u8> = (0..1_500_007u32).map(|i| (i * 13 % 251) as u8).collect();
+    let path = std::env::temp_dir().join(format!("giong-http-tls-{}-file", std::process::id()));
+    std::fs::write(&path, &data).unwrap();
+    let served = path.clone();
+    let handler = move |req: Request| {
+        let path = served.clone();
+        async move {
+            let file = giong::fs::File::open(&path).await.unwrap();
+            let body = match req.path() {
+                "/range" => giong_http::Body::file_range(file, 1_000, 70_000),
+                _ => giong_http::Body::file(file).unwrap(),
+            };
+            Response::new(200).body(body)
+        }
+    };
+    let server = TestServer::start(Server::new(), handler);
+    let mut c = server.client();
+    c.send("GET /file HTTP/1.1\r\nHost: localhost\r\n\r\nGET /range HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let r = c.reply();
+    assert_eq!(r.header("content-length"), Some("1500007"));
+    assert!(r.body == data);
+    assert!(c.reply().body == data[1_000..71_000]);
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn errors_are_answered_and_the_session_is_closed() {
     let server = TestServer::start(Server::new().max_body_size(10), echo);
     let mut c = server.client();

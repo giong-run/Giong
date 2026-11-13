@@ -239,6 +239,7 @@ fn sqe_for(io: &Io) -> squeue::Entry {
         } => opcode::Send::new(types::Fd(fd), buf, len)
             .flags(flags)
             .build(),
+        Io::Writable { fd } => opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as u32).build(),
         Io::SendMsg { fd, msg, flags } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),

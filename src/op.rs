@@ -55,38 +55,42 @@ impl<T: 'static> Future for Op<T> {
         let this = &mut *self;
         runtime::with_worker(|w| {
             let mut driver = w.driver.borrow_mut();
-            match this.key {
-                None => {
-                    let io = this
-                        .io
-                        .take()
-                        .expect("giong: operation polled after completion");
-                    match driver.start(&io, cx.waker()) {
-                        Start::Done(res, flags) => {
-                            let data = this.data.take().expect("operation resources");
-                            Poll::Ready((res, flags, data))
-                        }
-                        Start::Submitted(key) => {
-                            this.key = Some(key);
-                            this.worker_uid = w.shared.uid;
-                            Poll::Pending
+            loop {
+                let (res, flags) = match this.key {
+                    None => {
+                        let io = this.io.expect("giong: operation polled after completion");
+                        match driver.start(&io, cx.waker()) {
+                            Start::Done(res, flags) => (res, flags),
+                            Start::Submitted(key) => {
+                                this.key = Some(key);
+                                this.worker_uid = w.shared.uid;
+                                return Poll::Pending;
+                            }
                         }
                     }
-                }
-                Some(key) => {
-                    assert_eq!(
-                        this.worker_uid, w.shared.uid,
-                        "giong: operation polled on a different runtime"
-                    );
-                    match driver.poll_op(key, cx.waker()) {
-                        Poll::Ready((res, flags)) => {
-                            this.key = None;
-                            let data = this.data.take().expect("operation resources");
-                            Poll::Ready((res, flags, data))
+                    Some(key) => {
+                        assert_eq!(
+                            this.worker_uid, w.shared.uid,
+                            "giong: operation polled on a different runtime"
+                        );
+                        match driver.poll_op(key, cx.waker()) {
+                            Poll::Ready(done) => {
+                                this.key = None;
+                                done
+                            }
+                            Poll::Pending => return Poll::Pending,
                         }
-                        Poll::Pending => Poll::Pending,
                     }
+                };
+                if res == -libc::EAGAIN && this.io.is_some_and(|io| io.waits_when_not_ready()) {
+                    // io_uring on a non-blocking socket: it gave up waiting
+                    // (Linux 6.0 and 6.1 do after a second `EAGAIN`). Nothing
+                    // was transferred; submitting again waits afresh.
+                    continue;
                 }
+                this.io = None;
+                let data = this.data.take().expect("operation resources");
+                return Poll::Ready((res, flags, data));
             }
         })
     }
