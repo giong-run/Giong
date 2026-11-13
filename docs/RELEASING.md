@@ -80,8 +80,9 @@ if needed and use *Re-run failed jobs* on the Release run.
 Re-run the latest Release run (*Re-run all jobs*), or run the Release workflow by hand
 with *Use workflow from: Tags → vX.Y.Z* (for tags made after this process was set up). It
 exchanges the token for real, skips every crate as already published and keeps the
-Release, so it publishes nothing. A green `publish` job means every crate's trusted
-publisher is in place.
+Release, so it publishes nothing. A green `publish` job proves that the token exchange
+works, which needs at least one crate whose trusted publisher matches; check each crate's
+settings page to be sure every one is in place.
 
 ## Adding a crate
 
@@ -101,6 +102,14 @@ What a new crate needs:
    cargo publish -p <new-crate>
    ```
    Until then, `release.yml` refuses to start publishing and names the crate.
+   If the new crate depends on other workspace crates at a version that is not on
+   crates.io yet (it is released together with them), publish those first, by hand too,
+   from the release tag. After the release pull request is merged, `release.yml` stops
+   at this check with nothing published; check out `vX.Y.Z` and publish the new crate
+   with every workspace crate it depends on in one command, for example
+   `cargo publish -p giong -p giong-tls -p giong-http -p giong-web` (Cargo 1.90 or newer
+   puts them in dependency order). Then add the trusted publisher and re-run the
+   workflow: it skips what is already published.
 3. **Add its trusted publisher** at `https://crates.io/crates/<new-crate>/settings`:
    *Trusted Publishing → Add → GitHub*, owner `giong-run`, repository `Giong`, workflow
    `release.yml`, environment `release`.
@@ -115,7 +124,7 @@ Done once per repository; listed so it can be checked or rebuilt.
 
 | What | Where | State |
 |---|---|---|
-| Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http: done (2026-11-12) |
+| Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http, giong-postgres, giong-mysql, giong-redis: done (2026-11-13); giong-web, giong-mcp: first version published by hand, then added (see [Adding a crate](#adding-a-crate)) |
 | Environment `release`, deployments from `v*` tags only | repo Settings → Environments | done |
 | Branch protection on `main` with the CI checks `lint`, `msrv`, `test`, `fallback`, `tsan` | repo Settings → Branches | done |
 | *Allow GitHub Actions to create and approve pull requests* | org Settings → Actions → General, then repo Settings → Actions → General | needed for Prepare release |
