@@ -16,10 +16,8 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use io_uring::{opcode, types};
-
 use crate::buf::BufPool;
-use crate::driver::{Driver, Park};
+use crate::driver::{Driver, DriverKind, Io, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
@@ -299,6 +297,8 @@ impl RuntimeShared {
 
 #[derive(Clone)]
 struct Config {
+    /// `None`: io_uring where the kernel allows it, epoll elsewhere.
+    driver: Option<DriverKind>,
     spin: Option<Duration>,
     ring_entries: u32,
     buf_count: u16,
@@ -312,6 +312,11 @@ pub(crate) struct Worker {
     pub(crate) shared: Arc<WorkerShared>,
     pub(crate) rt: Arc<RuntimeShared>,
     pub(crate) driver: RefCell<Driver>,
+    /// Which driver `driver` is, readable without borrowing it.
+    driver_kind: DriverKind,
+    /// Descriptors given up while the driver was borrowed; closed through it
+    /// at the next turn of the event loop.
+    deferred_closes: RefCell<Vec<RawFd>>,
     pub(crate) tasks: RefCell<Slab<TaskSlot>>,
     pub(crate) queue: RefCell<VecDeque<usize>>,
     pub(crate) timers: RefCell<Timers>,
@@ -354,12 +359,19 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let driver = Driver::new(cfg.ring_entries, pool.clone(), shared.eventfd.as_raw_fd())?;
+        let driver = Driver::new(
+            cfg.driver,
+            cfg.ring_entries,
+            pool.clone(),
+            shared.eventfd.as_raw_fd(),
+        )?;
         Ok(Rc::new(Self {
             index,
             shared,
             rt,
+            driver_kind: driver.kind(),
             driver: RefCell::new(driver),
+            deferred_closes: RefCell::new(Vec::new()),
             tasks: RefCell::new(Slab::new()),
             queue: RefCell::new(VecDeque::with_capacity(256)),
             timers: RefCell::new(Timers::new()),
@@ -461,6 +473,7 @@ impl Worker {
         let mut done = false;
         let mut tick: u32 = 0;
         loop {
+            self.close_deferred();
             self.drain_injected();
             tick = tick.wrapping_add(1);
             // A balanced job goes to a worker with nothing else to run, and
@@ -520,6 +533,25 @@ impl Worker {
             drop(graveyard);
 
             self.fire_timers();
+        }
+    }
+
+    /// Hands a descriptor that was given up while the driver was borrowed to
+    /// the driver at the next turn of the event loop. The epoll driver must
+    /// forget a descriptor before its number can be reused, so it is never
+    /// closed behind the driver's back.
+    pub(crate) fn defer_close(&self, fd: RawFd) {
+        self.deferred_closes.borrow_mut().push(fd);
+    }
+
+    fn close_deferred(&self) {
+        if self.deferred_closes.borrow().is_empty() {
+            return;
+        }
+        let fds = mem::take(&mut *self.deferred_closes.borrow_mut());
+        let mut driver = self.driver.borrow_mut();
+        for fd in fds {
+            driver.close_fd(fd);
         }
     }
 
@@ -613,6 +645,7 @@ impl Worker {
         drop(timers);
         let waiters = self.shutdown_waiters.borrow_mut().take_all();
         drop(waiters);
+        self.close_deferred();
         // 3. Cancel all I/O and wait until the kernel has let go of our memory.
         let (quiesced, graveyard) = {
             let mut driver = self.driver.borrow_mut();
@@ -651,6 +684,7 @@ impl Worker {
 #[derive(Clone, Debug)]
 pub struct Builder {
     workers: Option<usize>,
+    driver: Option<DriverKind>,
     pin_cores: bool,
     ring_entries: u32,
     buf_count: u16,
@@ -672,6 +706,7 @@ impl Builder {
     pub fn new() -> Self {
         Self {
             workers: None,
+            driver: None,
             pin_cores: true,
             ring_entries: 1024,
             buf_count: 512,
@@ -685,6 +720,31 @@ impl Builder {
     /// Number of worker threads. Defaults to the CPUs this process may run on.
     pub fn workers(mut self, n: usize) -> Self {
         self.workers = Some(n.max(1));
+        self
+    }
+
+    /// The I/O driver every worker uses. By default giong uses io_uring where
+    /// the kernel allows it and falls back to epoll where it does not: in a
+    /// Docker container with the default seccomp profile, under gVisor, with
+    /// the `kernel.io_uring_disabled` sysctl set, or on a kernel older than
+    /// 6.0. [`driver_kind`](crate::driver_kind) tells which one a worker got.
+    ///
+    /// Name a driver to take that choice away: with
+    /// [`DriverKind::IoUring`] the runtime fails to start where io_uring is
+    /// not available (`GIONG-E0001`) instead of running on epoll; with
+    /// [`DriverKind::Epoll`] it never uses io_uring.
+    ///
+    /// When no driver is named here, the `GIONG_DRIVER` environment variable
+    /// can name one (`io_uring` or `epoll`), so that a deployment can choose
+    /// without a rebuild. Any other value makes [`build`](Self::build) fail
+    /// with `GIONG-E0004`.
+    ///
+    /// ```no_run
+    /// let rt = giong::Builder::new().driver(giong::DriverKind::Epoll).build()?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn driver(mut self, kind: DriverKind) -> Self {
+        self.driver = Some(kind);
         self
     }
 
@@ -772,22 +832,31 @@ impl Builder {
         self
     }
 
-    fn config(&self) -> Config {
-        Config {
+    /// The settings each worker starts from. Reads `GIONG_DRIVER` when no
+    /// driver was named.
+    fn config(&self) -> io::Result<Config> {
+        let driver = match self.driver {
+            Some(kind) => Some(kind),
+            None => crate::driver::kind_from_env()?,
+        };
+        Ok(Config {
+            driver,
             spin: self.spin,
             ring_entries: self.ring_entries,
             buf_count: self.buf_count,
             buf_size: self.buf_size,
             shutdown_grace: self.shutdown_grace,
-        }
+        })
     }
 
     /// Creates the runtime. Nothing runs until [`Runtime::run`] is called.
     pub fn build(self) -> io::Result<Runtime> {
+        let cfg = self.config()?;
         let workers = self.workers.unwrap_or_else(|| allowed_cpus().len().max(1));
         let shared = RuntimeShared::new(workers)?;
         Ok(Runtime {
             builder: self,
+            cfg,
             shared,
         })
     }
@@ -795,8 +864,9 @@ impl Builder {
     /// Runs a single future on the current thread, using this configuration
     /// with one worker. The thread is not pinned.
     pub fn block_on<F: Future>(self, fut: F) -> io::Result<F::Output> {
+        let cfg = self.config()?;
         let rt = RuntimeShared::new(1)?;
-        let worker = Worker::new(0, rt, &self.config())?;
+        let worker = Worker::new(0, rt, &cfg)?;
         Ok(worker.run(fut))
     }
 }
@@ -817,6 +887,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
 /// A configured, not yet running, thread-per-core runtime.
 pub struct Runtime {
     builder: Builder,
+    cfg: Config,
     shared: Arc<RuntimeShared>,
 }
 
@@ -867,7 +938,7 @@ impl Runtime {
         Fut: Future<Output = ()> + 'static,
     {
         let n = self.shared.workers.len();
-        let cfg = self.builder.config();
+        let cfg = self.cfg.clone();
         let cpus = allowed_cpus();
         let f = Arc::new(f);
         let gate = Arc::new(Gate {
@@ -1072,8 +1143,12 @@ async fn watch_signals(fd: RawFd) {
     until_shutdown(async {
         let mut buf: Vec<u8> = Vec::with_capacity(8);
         loop {
-            let sqe = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), 8).build();
-            let (res, _, b) = Op::new(sqe, buf).await;
+            let io = Io::ReadReady {
+                fd,
+                buf: buf.as_mut_ptr(),
+                len: 8,
+            };
+            let (res, _, b) = Op::new(io, buf).await;
             buf = b;
             if res > 0 {
                 handle().shutdown();
@@ -1269,6 +1344,16 @@ pub fn handle() -> Handle {
 /// Panics when called outside of a giong runtime.
 pub fn worker_id() -> usize {
     with_worker(|w| w.index)
+}
+
+/// The I/O driver of the worker the current task is running on: io_uring,
+/// or epoll where io_uring is not available (see [`Builder::driver`]).
+///
+/// # Panics
+///
+/// Panics when called outside of a giong runtime.
+pub fn driver_kind() -> DriverKind {
+    with_worker(|w| w.driver_kind)
 }
 
 /// Index of the worker the current thread runs, or `None` outside of a giong

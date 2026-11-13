@@ -152,7 +152,8 @@ jobs:
       - run: cargo test -p ${{ matrix.crate }} --all-features
 
   # The io_uring setup tiers used by kernels older than 6.1, forced on the
-  # runner's newer kernel with GIONG_RING_TIER.
+  # runner's newer kernel with GIONG_RING_TIER, then the epoll driver
+  # (GIONG_DRIVER=epoll).
   fallback:
     runs-on: ubuntu-24.04
     steps:
@@ -166,6 +167,36 @@ jobs:
           sudo apt-get install -y -q redis-server
           sudo systemctl stop redis-server
       - run: scripts/check.sh fallback
+
+  # The epoll driver where it is needed: a container with Docker's default
+  # seccomp profile, which blocks io_uring. Nothing names a driver, so the
+  # tests also show that giong falls back to epoll by itself. The database
+  # crates' tests skip here (no servers in the image).
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the test binaries
+        run: |
+          cargo test --release --workspace --all-features --no-run --message-format=json |
+            python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              msg = json.loads(line)
+              if msg.get("reason") == "compiler-artifact" and msg.get("executable") and msg["profile"]["test"]:
+                  print(msg["executable"])
+          ' > target/test-binaries.txt
+          wc -l target/test-binaries.txt
+      - name: Run them in a container with the default seccomp profile
+        run: |
+          docker info --format '{{.SecurityOptions}}' | grep -q seccomp
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" -v /etc/ssl/certs:/etc/ssl/certs:ro \
+            -e GIONG_TEST_EXPECT_DRIVER=epoll ubuntu:24.04 sh -ec '
+              for t in $(cat target/test-binaries.txt); do
+                echo "== $t"
+                "$t" -q
+              done'
 
   tsan:
     runs-on: ubuntu-24.04
@@ -195,13 +226,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/check.sh loom
 
-  # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM).
+  # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM),
+  # and on 5.15, whose io_uring lacks buffer rings: giong runs on epoll there.
   kernels:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        kernel: ["6.0.19", "6.1.155"]
+        kernel: ["5.15.225", "6.0.19", "6.1.155"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

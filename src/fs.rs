@@ -6,6 +6,10 @@
 //! writes and syncs are submitted and completed in the same batches as
 //! network I/O, and the worker thread never blocks on the disk.
 //!
+//! On the epoll driver (see [`DriverKind`](crate::DriverKind)) these
+//! operations run on a pool of blocking threads instead, with the same API
+//! and the same cancellation rules.
+//!
 //! ```no_run
 //! use giong::fs::{self, File};
 //!
@@ -44,9 +48,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use io_uring::{opcode, types};
-
 use crate::buf::{IoBuf, IoBufMut};
+use crate::driver::Io;
 use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime;
@@ -65,13 +68,9 @@ fn c_path(path: &Path) -> io::Result<CString> {
     })
 }
 
-fn cwd() -> types::Fd {
-    types::Fd(libc::AT_FDCWD)
-}
-
 /// Runs an operation whose only resource is one path.
-async fn path_op(path: CString, sqe: io_uring::squeue::Entry) -> io::Result<i32> {
-    let (res, _, _path) = Op::new(sqe, path).await;
+async fn path_op(path: CString, io: Io) -> io::Result<i32> {
+    let (res, _, _path) = Op::new(io, path).await;
     if res < 0 {
         Err(os_err(res))
     } else {
@@ -188,11 +187,12 @@ impl OpenOptions {
     pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         let flags = self.flags()?;
         let path = c_path(path.as_ref())?;
-        let sqe = opcode::OpenAt::new(cwd(), path.as_ptr())
-            .flags(flags)
-            .mode(self.mode)
-            .build();
-        let fd = path_op(path, sqe).await?;
+        let io = Io::OpenAt {
+            path: path.as_ptr(),
+            flags,
+            mode: self.mode,
+        };
+        let fd = path_op(path, io).await?;
         Ok(File::from_fd(fd))
     }
 }
@@ -258,10 +258,13 @@ impl File {
     /// cancellation, and that data is lost.
     pub async fn read_at<B: IoBufMut>(&self, mut buf: B, offset: u64) -> (io::Result<usize>, B) {
         let len = buf.capacity().min(u32::MAX as usize) as u32;
-        let sqe = opcode::Read::new(types::Fd(self.fd), buf.as_mut_ptr(), len)
-            .offset(offset)
-            .build();
-        let (res, _, mut buf) = Op::new(sqe, buf).await;
+        let io = Io::Read {
+            fd: self.fd,
+            buf: buf.as_mut_ptr(),
+            len,
+            offset,
+        };
+        let (res, _, mut buf) = Op::new(io, buf).await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
@@ -303,10 +306,13 @@ impl File {
         let len = (buf.len() - skip).min(u32::MAX as usize) as u32;
         // SAFETY: `skip <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(skip) };
-        let sqe = opcode::Write::new(types::Fd(self.fd), ptr, len)
-            .offset(offset)
-            .build();
-        let (res, _, buf) = Op::new(sqe, buf).await;
+        let io = Io::Write {
+            fd: self.fd,
+            buf: ptr,
+            len,
+            offset,
+        };
+        let (res, _, buf) = Op::new(io, buf).await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -316,13 +322,13 @@ impl File {
 
     /// Flushes data and metadata to the storage device (`fsync`).
     pub async fn sync_all(&self) -> io::Result<()> {
-        self.fsync(types::FsyncFlags::empty()).await
+        self.fsync(false).await
     }
 
     /// Flushes data, and only the metadata needed to read it back
     /// (`fdatasync`).
     pub async fn sync_data(&self) -> io::Result<()> {
-        self.fsync(types::FsyncFlags::DATASYNC).await
+        self.fsync(true).await
     }
 
     /// Reserves disk space for the bytes `offset..offset + len`
@@ -333,10 +339,12 @@ impl File {
     /// Fails with `Unsupported` on a filesystem without `fallocate` (some
     /// network filesystems).
     pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
-        let sqe = opcode::Fallocate::new(types::Fd(self.fd), len)
-            .offset(offset)
-            .build();
-        let (res, _, ()) = Op::new(sqe, ()).await;
+        let io = Io::Fallocate {
+            fd: self.fd,
+            offset,
+            len,
+        };
+        let (res, _, ()) = Op::new(io, ()).await;
         match res {
             0.. => Ok(()),
             // The kind is set here, as older standard libraries leave
@@ -348,9 +356,12 @@ impl File {
         }
     }
 
-    async fn fsync(&self, flags: types::FsyncFlags) -> io::Result<()> {
-        let sqe = opcode::Fsync::new(types::Fd(self.fd)).flags(flags).build();
-        let (res, _, ()) = Op::new(sqe, ()).await;
+    async fn fsync(&self, datasync: bool) -> io::Result<()> {
+        let io = Io::Fsync {
+            fd: self.fd,
+            datasync,
+        };
+        let (res, _, ()) = Op::new(io, ()).await;
         if res < 0 {
             Err(os_err(res))
         } else {
@@ -361,7 +372,7 @@ impl File {
     /// Size, type and modification time of the file.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         // An empty path with AT_EMPTY_PATH means "the descriptor itself".
-        statx(types::Fd(self.fd), CString::default(), libc::AT_EMPTY_PATH).await
+        statx(self.fd, CString::default(), libc::AT_EMPTY_PATH).await
     }
 
     /// The size of the file in bytes, read with a plain `fstat` (a system
@@ -400,13 +411,10 @@ impl Drop for File {
         let fd = self.fd;
         // Through the current worker's ring, or directly if there is none.
         let closed = runtime::try_with_worker(|w| match w.driver.try_borrow_mut() {
-            Ok(mut driver) => {
-                driver.close_fd(fd);
-                true
-            }
-            Err(_) => false,
+            Ok(mut driver) => driver.close_fd(fd),
+            Err(_) => w.defer_close(fd),
         })
-        .unwrap_or(false);
+        .is_some();
         if !closed {
             // SAFETY: the descriptor is ours and is closed exactly once.
             unsafe { libc::close(fd) };
@@ -422,8 +430,7 @@ impl std::fmt::Debug for File {
 
 #[cfg(not(giong_tsan))]
 async fn close(fd: RawFd) -> io::Result<()> {
-    let sqe = opcode::Close::new(types::Fd(fd)).build();
-    let (res, _, ()) = Op::new(sqe, ()).await;
+    let (res, _, ()) = Op::new(Io::Close { fd }, ()).await;
     if res < 0 {
         Err(os_err(res))
     } else {
@@ -493,20 +500,19 @@ impl Metadata {
     }
 }
 
-async fn statx(dir: types::Fd, path: CString, flags: i32) -> io::Result<Metadata> {
+async fn statx(dir: RawFd, path: CString, flags: i32) -> io::Result<Metadata> {
     // SAFETY: all-zero is a valid `statx` (plain integers).
     let out: Box<libc::statx> = Box::new(unsafe { mem::zeroed() });
     let mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_SIZE | libc::STATX_MTIME;
     let mut resources = (path, out);
-    let sqe = opcode::Statx::new(
+    let io = Io::Statx {
         dir,
-        resources.0.as_ptr(),
-        (&mut *resources.1 as *mut libc::statx).cast(),
-    )
-    .flags(flags)
-    .mask(mask)
-    .build();
-    let (res, _, (_path, out)) = Op::new(sqe, resources).await;
+        path: resources.0.as_ptr(),
+        flags,
+        mask,
+        out: &mut *resources.1,
+    };
+    let (res, _, (_path, out)) = Op::new(io, resources).await;
     if res < 0 {
         return Err(os_err(res));
     }
@@ -527,13 +533,13 @@ async fn statx(dir: types::Fd, path: CString, flags: i32) -> io::Result<Metadata
 /// Size, type and modification time of the file at `path`, following
 /// symbolic links.
 pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    statx(cwd(), c_path(path.as_ref())?, 0).await
+    statx(libc::AT_FDCWD, c_path(path.as_ref())?, 0).await
 }
 
 /// Like [`metadata`], but describes a symbolic link itself instead of what it
 /// points at.
 pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    statx(cwd(), c_path(path.as_ref())?, libc::AT_SYMLINK_NOFOLLOW).await
+    statx(libc::AT_FDCWD, c_path(path.as_ref())?, libc::AT_SYMLINK_NOFOLLOW).await
 }
 
 /// Reads a whole file.
@@ -582,33 +588,41 @@ pub async fn write<P: AsRef<Path>, B: IoBuf>(path: P, data: B) -> io::Result<()>
 /// Removes a file.
 pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
-    let sqe = opcode::UnlinkAt::new(cwd(), path.as_ptr()).build();
-    path_op(path, sqe).await.map(drop)
+    let io = Io::UnlinkAt {
+        path: path.as_ptr(),
+        flags: 0,
+    };
+    path_op(path, io).await.map(drop)
 }
 
 /// Removes an empty directory.
 pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
-    let sqe = opcode::UnlinkAt::new(cwd(), path.as_ptr())
-        .flags(libc::AT_REMOVEDIR)
-        .build();
-    path_op(path, sqe).await.map(drop)
+    let io = Io::UnlinkAt {
+        path: path.as_ptr(),
+        flags: libc::AT_REMOVEDIR,
+    };
+    path_op(path, io).await.map(drop)
 }
 
 /// Creates a directory (permissions `0o777` before the umask).
 pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
-    let sqe = opcode::MkDirAt::new(cwd(), path.as_ptr())
-        .mode(0o777)
-        .build();
-    path_op(path, sqe).await.map(drop)
+    let io = Io::MkDirAt {
+        path: path.as_ptr(),
+        mode: 0o777,
+    };
+    path_op(path, io).await.map(drop)
 }
 
 /// Renames a file or directory, replacing `to` if it exists.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     let paths = (c_path(from.as_ref())?, c_path(to.as_ref())?);
-    let sqe = opcode::RenameAt::new(cwd(), paths.0.as_ptr(), cwd(), paths.1.as_ptr()).build();
-    let (res, _, _paths) = Op::new(sqe, paths).await;
+    let io = Io::RenameAt {
+        from: paths.0.as_ptr(),
+        to: paths.1.as_ptr(),
+    };
+    let (res, _, _paths) = Op::new(io, paths).await;
     if res < 0 {
         Err(os_err(res))
     } else {

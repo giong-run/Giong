@@ -204,6 +204,9 @@ pub(crate) struct BufPool {
     buf_len: usize,
     /// Our private copy of the ring tail (the published copy lives in `ring`).
     tail: Cell<u16>,
+    /// Where the next buffer is taken from the ring when user space plays
+    /// the kernel's part (the epoll driver); unused with io_uring.
+    head: Cell<u16>,
     /// Buffers currently available to the kernel.
     free: Cell<usize>,
     /// Tasks waiting for a buffer to come back.
@@ -251,6 +254,7 @@ impl BufPool {
             count,
             buf_len,
             tail: Cell::new(0),
+            head: Cell::new(0),
             free: Cell::new(0),
             waiters: RefCell::new(Vec::new()),
         };
@@ -282,6 +286,31 @@ impl BufPool {
     /// Records that the kernel handed buffer ownership to user space.
     pub(crate) fn taken(&self) {
         self.free.set(self.free.get().saturating_sub(1));
+    }
+
+    /// The epoll driver: the buffer the kernel would fill next, as its id
+    /// and its memory, or `None` if every buffer is in use. It stays free
+    /// until [`take_next`](Self::take_next).
+    pub(crate) fn next_free(&self) -> Option<(u16, *mut u8, usize)> {
+        if self.free.get() == 0 {
+            return None;
+        }
+        let idx = (self.head.get() & (self.count - 1)) as usize;
+        // SAFETY: `idx < count`, and the entries from the head up to the
+        // published tail were written by `push`.
+        let bid = unsafe { (*self.ring_ptr().add(idx)).bid() };
+        debug_assert!(bid < self.count);
+        // SAFETY: `bid < count`, so the buffer lies inside `mem`.
+        let ptr = unsafe { self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) };
+        Some((bid, ptr, self.buf_len))
+    }
+
+    /// The epoll driver: the buffer [`next_free`](Self::next_free) returned
+    /// now holds data and belongs to user space until it is recycled.
+    pub(crate) fn take_next(&self) {
+        debug_assert!(self.free.get() > 0);
+        self.head.set(self.head.get().wrapping_add(1));
+        self.free.set(self.free.get() - 1);
     }
 
     /// Gives a buffer back to the kernel and wakes tasks starved for buffers.
