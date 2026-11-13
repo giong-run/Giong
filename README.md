@@ -728,7 +728,7 @@ READMEs.
 | `tests/driver.rs` (8), `tests/blocked.rs` (3) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (8) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time; poll profiles by spawn location; sources reported until dropped |
 | `giong-http` (131) | 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 51 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 21 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 end-to-end tests of request and response bodies streamed both ways; 11 end-to-end HTTPS tests with a rustls client; 12 documentation examples |
-| `giong-tls` (34) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
+| `giong-tls` (62) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes; 26 kernel TLS tests (every cipher suite through the kernel in both roles, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, cancellation), run on Linux 6.1 and 6.18 with the `tls` module |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
@@ -823,8 +823,9 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   sockets, multicast, `set_len`, file locks, `O_DIRECT` with registered buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
-- **`giong-tls` has no kTLS yet,** and no independent audit (see the
-  [self-review](docs/reviews/2026-11-giong-tls.md)).
+- **`giong-tls` has had no independent audit** (see the
+  [self-review](docs/reviews/2026-11-giong-tls.md)), and kernel TLS does not yet send
+  files straight from the page cache (`sendfile`).
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
   sqlx, reqwest) do not run on giong. Crates that only use `std::future` do. For
   PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for MySQL,

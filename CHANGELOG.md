@@ -27,6 +27,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   error codes `GIONG-E2009` to `GIONG-E2012` explain each failure.
 - **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
   data, on both drivers (giong-tls sends TLS alerts and key updates through it).
+- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
+  and a body for example, without copying them into one first. `giong-http` uses it for
+  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
 - **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
   module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
   tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 6.1, Ubuntu's 6.8 and 6.18,

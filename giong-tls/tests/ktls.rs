@@ -174,7 +174,8 @@ async fn recv_exactly(tls: &TlsStream, n: usize) -> Vec<u8> {
 }
 
 /// Messages of awkward sizes around the 16 KiB record size, then a few
-/// megabytes, from `a` to `b` and back.
+/// megabytes, from `a` to `b` and back; then a header, a body and a trailer
+/// in one vectored write each way.
 async fn exchange(a: &TlsStream, b: &TlsStream) {
     let sizes = [1, 2, 100, 16383, 16384, 16385, 32768, 65537, 1_000_000];
     for (i, &n) in sizes.iter().enumerate() {
@@ -185,6 +186,18 @@ async fn exchange(a: &TlsStream, b: &TlsStream) {
         let (res, data) = b.write_all(data).await;
         res.unwrap();
         assert!(recv_exactly(a, n).await == data, "{n} bytes b to a");
+    }
+    let body: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
+    let pieces = vec![b"head ".to_vec(), body, Vec::new(), b" tail".to_vec()];
+    let whole = pieces.concat();
+    for (from, to) in [(a, b), (b, a)] {
+        let (res, back) = from.write_all_vectored(pieces.clone()).await;
+        res.unwrap();
+        assert!(back == pieces, "the pieces are handed back");
+        assert!(
+            recv_exactly(to, whole.len()).await == whole,
+            "vectored write"
+        );
     }
 }
 
@@ -773,14 +786,22 @@ fn a_tampered_record_is_an_error_not_data() {
         let serve = move |tls: TlsStream| {
             let tx = tx.clone();
             async move {
-                let _ = tx.send(tls.recv().await.map(|d| d.len()));
+                // The server's handshake ends when the client's Finished
+                // arrives. Say so before the client sends the tampered
+                // record: arriving with the Finished, it would be rustls,
+                // still finishing the handshake, that rejects it.
+                if tls.write_all(b"ready".to_vec()).await.0.is_ok() {
+                    let _ = tx.send(tls.recv().await.map(|d| d.len()));
+                }
             }
         };
         let acceptor = pki.acceptor(Some(suite), Ktls::Required);
         let client = Arc::new(pki.client(Some(suite)));
         with_server(acceptor, serve, move |addr| {
             let mut c = blocking_client(addr, &client);
-            retry(|| c.conn.complete_io(&mut c.sock)).unwrap();
+            let mut ready = [0; 5];
+            c.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"ready");
             // Encrypt, then flip a bit of the authentication tag.
             c.conn.writer().write_all(b"pay 100 to alice").unwrap();
             let mut record = Vec::new();
@@ -1009,35 +1030,42 @@ fn a_cancelled_kernel_write_ends_sending_instead_of_cutting_a_message() {
         return;
     }
     let pki = pki();
-    let acceptor = pki.acceptor(Some(suites::TLS13_AES_128_GCM_SHA256), Ktls::Required);
-    let connector = pki.connector(Some(suites::TLS13_AES_128_GCM_SHA256), Ktls::Required);
-    run(async move {
-        let (server, client) = tls_pair(acceptor, connector).await;
-        // Nobody reads on the client, so a big write fills the buffers and
-        // is cancelled half way.
-        let big = vec![7u8; 64 << 20];
-        let cancelled = timeout(Duration::from_millis(200), server.write_all(big))
-            .await
-            .is_err();
-        assert!(cancelled, "the write finished; make it bigger");
-        let (res, _) = server.write_all(b"more".to_vec()).await;
-        let err = res.unwrap_err();
-        assert_eq!(code(&err), Some(Code::TlsBroken), "{err}");
-        // What did arrive is intact: sevens, then the end.
-        let mut total = 0;
-        while let Ok(Ok(data)) = timeout(Duration::from_millis(500), client.recv()).await {
-            if data.is_empty() {
-                break;
+    for vectored in [false, true] {
+        let acceptor = pki.acceptor(Some(suites::TLS13_AES_128_GCM_SHA256), Ktls::Required);
+        let connector = pki.connector(Some(suites::TLS13_AES_128_GCM_SHA256), Ktls::Required);
+        run(async move {
+            let (server, client) = tls_pair(acceptor, connector).await;
+            // Nobody reads on the client, so a big write fills the buffers and
+            // is cancelled half way.
+            let big = vec![7u8; 64 << 20];
+            let cancelled = if vectored {
+                let write = server.write_all_vectored(vec![vec![7u8; 100], big]);
+                timeout(Duration::from_millis(200), write).await.is_err()
+            } else {
+                timeout(Duration::from_millis(200), server.write_all(big))
+                    .await
+                    .is_err()
+            };
+            assert!(cancelled, "the write finished; make it bigger");
+            let (res, _) = server.write_all(b"more".to_vec()).await;
+            let err = res.unwrap_err();
+            assert_eq!(code(&err), Some(Code::TlsBroken), "{err}");
+            // What did arrive is intact: sevens, then the end.
+            let mut total = 0;
+            while let Ok(Ok(data)) = timeout(Duration::from_millis(500), client.recv()).await {
+                if data.is_empty() {
+                    break;
+                }
+                assert!(data.iter().all(|&b| b == 7));
+                total += data.len();
             }
-            assert!(data.iter().all(|&b| b == 7));
-            total += data.len();
-        }
-        assert!(total > 0);
-        drop((server, client));
-        sleep(Duration::from_millis(50)).await;
-        let stats = giong::stats();
-        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
-    });
+            assert!(total > 0);
+            drop((server, client));
+            sleep(Duration::from_millis(50)).await;
+            let stats = giong::stats();
+            assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+        });
+    }
 }
 
 #[test]

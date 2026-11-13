@@ -142,6 +142,36 @@ fn echoes_over_tls_1_2() {
 }
 
 #[test]
+fn pieces_written_together_arrive_in_order() {
+    // A header, a body larger than rustls' send buffer, an empty piece and
+    // a trailer in one vectored write.
+    fn pieces() -> Vec<Vec<u8>> {
+        let body: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        vec![b"head:".to_vec(), body, Vec::new(), b":tail".to_vec()]
+    }
+    let c = certs(&[&rustls::version::TLS13]);
+    let client_config = c.client.clone();
+    let serve = |tls: TlsStream| async move {
+        if tls.recv().await.is_err() {
+            return;
+        }
+        let (res, back) = tls.write_all_vectored(pieces()).await;
+        if res.is_ok() && back == pieces() {
+            let _ = tls.shutdown().await;
+        }
+    };
+    with_server(c.acceptor, serve, move |addr| {
+        let mut client = connect(addr, &client_config);
+        client.write_all(b"go").unwrap();
+        let mut got = Vec::new();
+        // Fails without the server's close_notify, which it sends only if
+        // the write succeeded and handed the pieces back.
+        client.read_to_end(&mut got).unwrap();
+        assert!(got == pieces().concat());
+    });
+}
+
+#[test]
 fn alpn_is_negotiated() {
     let c = certs(rustls::ALL_VERSIONS);
     let mut config = (*c.client).clone();

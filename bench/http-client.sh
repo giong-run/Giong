@@ -9,19 +9,24 @@
 #     core) on SERVER_CPUS, over plain HTTP on port 3009 and HTTPS on port
 #     3010 (a certificate from an authority made for the run). The client runs on
 #     CLIENT_CPU, so the numbers show how much one core of client gets done.
-#   * Workloads: `json` is a 27-byte JSON answer, `users` an 8.5 KiB one;
-#     each client reads the whole body of every response.
+#   * Workloads: `json` is a 27-byte JSON answer, `users` an 8.5 KiB one,
+#     `bytes64k` and `bytes1m` 64 KiB and 1 MiB of bytes (giong-http's
+#     /bytes); each client reads the whole body of every response.
 #   * Clients: `giong` is one giong_http::client::Client shared by every
 #     task, with its default of at most 16 connections to a host;
 #     `giong-64` allows 64 (one per task). `reqwest` is one reqwest::Client
 #     (0.12, rustls) on a current-thread Tokio runtime, with its default
-#     pool, which has no limit: one connection per task.
+#     pool, which has no limit: one connection per task. `giong-ktls` is
+#     `giong` with kernel TLS (`Ktls::Required`, https only; it needs the
+#     kernel's `tls` module): the kernel decrypts what the client receives.
 #   * TASKS concurrent tasks send requests back to back. 2 s of warm-up,
 #     then SECS measured. `cpu%` is the client's core; `srv%` the server's
-#     cores together (100 per core), from /proc/stat.
+#     cores together (100 per core), from /proc/stat; `us/req` the client's
+#     CPU time per request.
 #
 # WORKLOADS, SCHEMES and CLIENTS pick a subset, for example
 #   WORKLOADS=json SCHEMES=https CLIENTS=reqwest OUT=results/x bench/http-client.sh 3
+#   WORKLOADS="users bytes64k bytes1m" SCHEMES=https CLIENTS="giong giong-ktls" bench/http-client.sh
 #
 # Requires: cargo, openssl, python3. Results: bench/results/http-client/.
 set -euo pipefail
@@ -72,7 +77,7 @@ server_ticks() {
     busy += $2 + $3 + $4 + $7 + $8 } END { print busy }' /proc/stat
 }
 
-echo "client,scheme,workload,round,ops,p50,p99,cpu,srv" > "$CSV"
+echo "client,scheme,workload,round,ops,p50,p99,cpu,srv,ktls" > "$CSV"
 for round in $(seq 1 "$ROUNDS"); do
   for scheme in $SCHEMES; do
     case $scheme in
@@ -84,10 +89,18 @@ for round in $(seq 1 "$ROUNDS"); do
         case $client in
           giong) cmd=(env POOL_SIZE=16 http-client-giong/target/release/bench-http-client-giong) ;;
           giong-64) cmd=(env POOL_SIZE=64 http-client-giong/target/release/bench-http-client-giong) ;;
+          giong-ktls)
+            [ "$scheme" = https ] || continue
+            cmd=(env POOL_SIZE=16 GIONG_KTLS=required http-client-giong/target/release/bench-http-client-giong) ;;
           reqwest) cmd=(http-client-tokio/target/release/bench-http-client-tokio) ;;
         esac
         out_file="$TMP/out"
-        CA="$TMP/ca.pem" taskset -c "$CLIENT_CPU" "${cmd[@]}" "$url_base/$workload" "$TASKS" "$SECS" >"$out_file" &
+        case $workload in
+          bytes64k) path="bytes?n=65536" ;;
+          bytes1m) path="bytes?n=1048576" ;;
+          *) path=$workload ;;
+        esac
+        CA="$TMP/ca.pem" taskset -c "$CLIENT_CPU" "${cmd[@]}" "$url_base/$path" "$TASKS" "$SECS" >"$out_file" &
         cpid=$!
         sleep 2.2
         before=$(server_ticks)
@@ -97,7 +110,7 @@ for round in $(seq 1 "$ROUNDS"); do
         out=$(cat "$out_file")
         srv=$(( (after - before) * 100 / (CLK_TCK * SECS) ))
         get() { sed -n "s/.*$1=\([0-9.]*\).*/\1/p" <<<"$out"; }
-        echo "$client,$scheme,$workload,$round,$(get ops),$(get p50_us),$(get p99_us),$(get cpu),$srv" >> "$CSV"
+        echo "$client,$scheme,$workload,$round,$(get ops),$(get p50_us),$(get p99_us),$(get cpu),$srv,$(get ktls)" >> "$CSV"
       done
     done
   done
@@ -109,15 +122,22 @@ import csv, statistics, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 med = statistics.median
 print(f"{sys.argv[2]} tasks, {sys.argv[3]} rounds of {sys.argv[4]} s; median, min and max of the rounds")
-print(f"{'scheme':<7}{'workload':<9}{'client':<10}{'req/s median':>13}{'min':>9}{'max':>9}{'p50 us':>8}{'p99 us':>8}{'cpu%':>6}{'srv%':>6}")
-for s in ("http", "https"):
-    for w in ("json", "users"):
-        for c in ("giong", "giong-64", "reqwest"):
+print(f"{'scheme':<7}{'workload':<9}{'client':<11}{'req/s median':>13}{'min':>9}{'max':>9}{'p50 us':>8}{'p99 us':>8}{'cpu%':>6}{'srv%':>6}{'us/req':>8}")
+def seen(key):
+    out = []
+    for r in rows:
+        if r[key] not in out: out.append(r[key])
+    return out
+for s in seen("scheme"):
+    for w in seen("workload"):
+        for c in seen("client"):
             sel = [r for r in rows if (r["scheme"], r["workload"], r["client"]) == (s, w, c)]
             if not sel: continue
             ops = [float(r["ops"]) for r in sel]
-            print(f"{s:<7}{w:<9}{c:<10}{med(ops):13.0f}{min(ops):9.0f}{max(ops):9.0f}"
+            # The client's CPU time per request, in microseconds.
+            us = med(float(r["cpu"]) * 1e4 / float(r["ops"]) for r in sel)
+            print(f"{s:<7}{w:<9}{c:<11}{med(ops):13.0f}{min(ops):9.0f}{max(ops):9.0f}"
                   f"{med(float(r['p50']) for r in sel):8.0f}{med(float(r['p99']) for r in sel):8.0f}"
-                  f"{med(float(r['cpu']) for r in sel):6.0f}{med(float(r['srv']) for r in sel):6.0f}")
+                  f"{med(float(r['cpu']) for r in sel):6.0f}{med(float(r['srv']) for r in sel):6.0f}{us:8.2f}")
         print()
 PY

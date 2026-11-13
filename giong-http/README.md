@@ -31,7 +31,7 @@ fn main() -> std::io::Result<()> {
 ## What it does
 
 - HTTP/1.1 and HTTP/1.0, keep-alive, pipelining. Responses to pipelined requests leave in a single write; if a handler has to wait, the responses before it are sent first.
-- A body of 32 KiB or more is not copied: it leaves from where it is, right after its head, in one vectored write. This is over TCP and Unix sockets; over TLS the body is still copied after its head.
+- A body of 32 KiB or more is not copied: it leaves from where it is, right after its head, in one vectored write over TCP and Unix sockets. Over TLS it is not copied after its head either: rustls takes the head and then the body, and with kernel TLS both go to the kernel in one vectored write.
 - Bodies by `Content-Length` or chunked, received in full before the handler is called. `Expect: 100-continue` is supported.
 - Or streamed, both ways. A handler whose `Handler::stream_body` returns a limit is called as soon as the head is in and reads the body piece by piece with `Request::body_stream`; nothing is read until it asks, so it can refuse an upload before the client sends it. `Body::channel()` gives a response body that is written as it is produced (chunked), for downloads, exports and server-sent events. One piece is in flight at a time in each direction, so a slow peer slows the other side down instead of filling memory. See "Streaming" below.
 - A `Request` shares the connection's receive buffer instead of copying it, so building a request allocates nothing. A handler may keep the request for as long as it likes.

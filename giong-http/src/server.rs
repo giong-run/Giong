@@ -106,7 +106,8 @@ pub trait Transport: 'static {
     ///
     /// The default copies the body after the head and calls
     /// [`write_all`](Self::write_all). [`TcpStream`] and [`UnixStream`] send
-    /// both with one vectored write instead, without the copy.
+    /// both with one vectored write instead, without the copy, and
+    /// `giong_tls::TlsStream` hands both to TLS without the copy.
     fn write_all_with_body(
         &self,
         head: Vec<u8>,
@@ -191,6 +192,12 @@ impl Transport for giong_tls::TlsStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         giong_tls::TlsStream::write_all(self, buf)
+    }
+
+    async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
+        let bufs = vec![Cow::Owned(head), body.into_cow()];
+        let (res, bufs) = giong_tls::TlsStream::write_all_vectored(self, bufs).await;
+        (res, into_head(bufs))
     }
 
     async fn close_write(&self) {

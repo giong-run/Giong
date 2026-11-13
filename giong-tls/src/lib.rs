@@ -1000,6 +1000,47 @@ impl TlsStream {
         (Ok(()), buf)
     }
 
+    /// Encrypts and sends all of `bufs`, one after the other, without
+    /// copying them into one buffer first, then hands them back.
+    ///
+    /// Use it to send a header and a large body that live in different
+    /// buffers. In the process, rustls takes the pieces one by one, so a
+    /// small header goes out in the same write as the start of the body;
+    /// with kernel TLS they go to the kernel in vectored writes, as with
+    /// [`TcpStream::write_all_vectored`].
+    ///
+    /// Not cancel safe, as [`write_all`](Self::write_all).
+    pub async fn write_all_vectored<B>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>)
+    where
+        B: giong::IoBuf + AsRef<[u8]>,
+    {
+        if self.is_ktls() {
+            return self.kernel_write_all_vectored(bufs).await;
+        }
+        for buf in &bufs {
+            let buf = buf.as_ref();
+            let mut sent = 0;
+            while sent < buf.len() {
+                let accepted = self.conn().writer().write(&buf[sent..]);
+                match accepted {
+                    Ok(n) => sent += n,
+                    Err(e) => return (Err(e), bufs),
+                }
+                // rustls takes a bounded amount: send what it holds once it
+                // is full, and the rest at the end.
+                if sent < buf.len() {
+                    if let Err(e) = self.flush_tls().await {
+                        return (Err(e), bufs);
+                    }
+                }
+            }
+        }
+        match self.flush_tls().await {
+            Ok(()) => (Ok(()), bufs),
+            Err(e) => (Err(e), bufs),
+        }
+    }
+
     /// Sends the TLS `close_notify` alert and closes the sending direction.
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_ktls() {

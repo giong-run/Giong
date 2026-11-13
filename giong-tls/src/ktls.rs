@@ -89,6 +89,9 @@ const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
 const TLS_SET_RECORD_TYPE: libc::c_int = 1;
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
+/// Linux 6.0+: the peer does not pad TLS 1.3 records, so the kernel may
+/// decrypt straight into the receiver's buffer (`TLS_RX_EXPECT_NO_PAD`).
+const TLS_RX_EXPECT_NO_PAD: libc::c_int = 4;
 
 const TLS_1_2_VERSION: u16 = 0x0303;
 const TLS_1_3_VERSION: u16 = 0x0304;
@@ -1299,6 +1302,13 @@ impl<'a> Handshake<'a> {
             .install(fd, false)
             .map_err(|e| ktls_setup(format!("TLS_RX: {e}")))?;
         drop(secrets);
+        if version == Version::Tls13 {
+            // A hint, not a promise: rustls and the common TLS libraries do
+            // not pad records, and when a record is padded, or is not data,
+            // the kernel decrypts it again the slow way. Older kernels do
+            // not know the option, which changes nothing.
+            let _ = setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &1u32.to_ne_bytes());
+        }
         Ok(Done {
             kernel: Kernel {
                 side,
@@ -1801,6 +1811,27 @@ impl TlsStream {
             }
             // Part of `buf` may be gone: the stream is cut, as in process.
             Err(e) => (Err(kernel_error(e)), buf),
+        }
+    }
+
+    /// `write_all_vectored` once the kernel encrypts.
+    pub(crate) async fn kernel_write_all_vectored<B: giong::IoBuf>(
+        &self,
+        bufs: Vec<B>,
+    ) -> (io::Result<()>, Vec<B>) {
+        let len = bufs.iter().map(giong::IoBuf::len).sum();
+        let sending = self.lock_send().await;
+        if let Err(e) = self.before_kernel_send(len).await {
+            sending.done();
+            return (Err(e), bufs);
+        }
+        let (res, bufs) = self.tcp.write_all_vectored(bufs).await;
+        match res {
+            Ok(()) => {
+                sending.done();
+                (Ok(()), bufs)
+            }
+            Err(e) => (Err(kernel_error(e)), bufs),
         }
     }
 
