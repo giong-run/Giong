@@ -93,12 +93,12 @@ features, find out what is actually true.
 
 - [x] Benchmark on a multi-core machine: 1 to 10 workers on a 14-core i5-13500 under WSL2,
       over loopback (see the README). The load generator on a separate host and a
-      physical network card move to 0.4.
+      physical network card move to 0.5.
 - [x] Measure throughput from 1 to N workers with `bench/workers.sh`. Under WSL2 the
       one-worker baseline is unreliable, so scaling efficiency still needs bare metal
-      (0.4).
+      (0.5).
 - [x] Repeat the Monoio and Glommio comparison on several cores (same run). On a
-      physical network: 0.4.
+      physical network: 0.5.
 - [x] Run the test suite on real 6.0 and 6.1 kernels (in QEMU, in CI; it found that
       6.0 could fail to start a runtime, now fixed).
 - [x] Model-check the cross-thread wake-up handshake with `loom` (it found a lost
@@ -115,14 +115,11 @@ features, find out what is actually true.
 **Exit criteria:** published multi-core results with their method, and no open memory- or
 thread-safety finding.
 
-## 0.4 — Foundations for services
+## 0.4 — Foundations for services (done)
 
 What every client library and service needs before the database and web crates can be
 built on it. Worked on alongside 0.3; changes to the runtime's wake-up path wait for 0.3's.
 
-- [ ] Carried over from 0.3: run `bench/workers.sh` on bare-metal Linux with the load
-      generator on a second machine over a physical network card, for scaling efficiency
-      and the Monoio and Glommio comparison on a real network.
 - [x] Asynchronous DNS resolution (`/etc/hosts`, `resolv.conf`, UDP then TCP, a cache per
       worker), and `TcpStream::connect` by name, trying addresses the RFC 8305 way.
 - [x] The client side of `giong-tls`: the machine's CA certificates or compiled-in ones,
@@ -195,7 +192,7 @@ packet parsers are fuzzed, and a benchmark compares it with mysql_async and SQLx
 **Exit criteria:** the client fetches from a public HTTPS API, `giong-redis` passes against
 a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
 
-## giong-web 0.1 and giong-mcp 0.1
+## giong-web 0.1 and giong-mcp 0.1 (done)
 
 - [x] Streaming request and response bodies in `giong-http`: `Handler::stream_body` and
       `BodyStream` for requests, `Body::channel` for responses, backpressure both ways;
@@ -222,6 +219,10 @@ the repository, and a benchmark of it against the same API on axum.
 
 ## 0.5 — HTTP/2 and adapters
 
+- [ ] Carried over from 0.3 and 0.4: run `bench/workers.sh` on bare-metal Linux with the
+      load generator on a second machine over a physical network card, for scaling
+      efficiency and the Monoio and Glommio comparison on a real network (two machines
+      rented by the hour are enough).
 - [ ] HTTP/2 in `giong-http`, over TLS with ALPN.
 - [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
       over the transport can run on giong.

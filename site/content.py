@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=194,
+        layer="runtime", tests=223,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
@@ -34,7 +34,7 @@ CRATES = {
                "`spawn_on`, `spawn_balanced` and `bind_balanced` to spread new work"],
         fact="3 dependencies: `io-uring`, `libc`, `socket2`"),
     "giong-http": dict(
-        layer="protocols", tests=109,
+        layer="protocols", tests=131,
         short="A strict HTTP/1.1 server, HTTPS behind a feature, and a pooled client.",
         lede="A small, strict HTTP/1.1 server with one async handler, and a client.",
         items=["Keep-alive, pipelining, bodies by `Content-Length` or chunked",
@@ -80,7 +80,7 @@ CRATES = {
                "TLS; Redis 6 or newer (RESP3)"],
         fact="1.4× redis-rs's `GET`s per core"),
     "giong-web": dict(
-        layer="framework", tests=68,
+        layer="framework", tests=77,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
         lede="A router, middleware and JSON on giong-http. Handlers are plain `async fn`s; every "
              "error is a coded problem+json answer.",
@@ -90,13 +90,21 @@ CRATES = {
                "404, 405 with `Allow`, `OPTIONS` and `HEAD` answered for you; `App::handle` tests "
                "without a socket"],
         fact="1.3× axum's `/json` on one core"),
+    "giong-mcp": dict(
+        layer="tooling", tests=16,
+        short="A read-only MCP server: an agent sees what each worker, task and pool is doing.",
+        lede="A read-only MCP server that lets an AI agent look inside a running service: which "
+             "task blocks a worker, which line spawned the tasks that leak, how full the pools are.",
+        items=["`giong_mcp::start_from_env(&handle)`, on when `GIONG_MCP` is set",
+               "Tools: `overview`, `workers`, `tasks`, `sources`, `profile`",
+               "A worker stuck in one poll is reported with the line that spawned the task",
+               "Loopback or a Unix socket only; `Host` and `Origin` checked; optional token"],
+        fact="about 9 instructions per task poll"),
 }
 
 # Crates on the roadmap that do not exist yet. Each disappears from this list on its
 # own once a crate of that name is in the workspace.
 COMING = {
-    "giong-mcp": dict(layer="tooling",
-                      short="A read-only MCP server: an agent reads workers, connections and pools."),
 }
 
 LAYERS = [  # top to bottom, as drawn
@@ -110,8 +118,8 @@ LAYERS = [  # top to bottom, as drawn
 # ---------------------------------------------------------------- home
 HERO = dict(
     h1="One syscall per tick, <em>not per operation.</em>",
-    lede=("giong is an async runtime for Rust services on Linux, built directly on io_uring with "
-          "one thread per core. It brings its own HTTP server and client, TLS, PostgreSQL, MySQL "
+    lede=("giong is an async runtime for Rust services on Linux, built on io_uring with one "
+          "thread per core, and an epoll driver wherever io_uring is blocked. It brings its own HTTP server and client, TLS, PostgreSQL, MySQL "
           "and Redis clients and a web framework, so a whole service runs on it with no Tokio "
           "underneath."),
 )
@@ -154,8 +162,8 @@ AGENTS = dict(
          "Tests, ThreadSanitizer, loom, fuzzing and soak tests run in CI and block merging. "
          "Machines check the work, not only reviewers."),
         ("Docs a machine can read",
-         "`AGENTS.md` in the repository and `llms.txt` on this site. `giong-mcp`, on the roadmap, "
-         "lets an agent look inside a running service."),
+         "`AGENTS.md` in the repository and `llms.txt` on this site. `giong-mcp` lets an "
+         "agent look inside a running service."),
     ],
     error=("GIONG-E0102: no address found for db.internal. Fix: check the spelling of the name, "
            "/etc/hosts, and the DNS servers in /etc/resolv.conf (in a container, the network it is "
@@ -163,8 +171,8 @@ AGENTS = dict(
 )
 
 CHECKED = [
-    "Tests repeated in release mode on all three io_uring setups",
-    "Real Linux 6.0 and 6.1 kernels in QEMU on every change",
+    "Tests repeated in release mode on all three io_uring setups and on epoll",
+    "Real Linux 5.15, 6.0, 6.1 and Ubuntu 24.04 kernels in QEMU, and Docker's default profile, on every change",
     "ThreadSanitizer: no data race",
     "`loom` model check of the cross-thread wake-up",
     "Parsers fuzzed every night; a two-hour soak test",
@@ -417,7 +425,7 @@ CAVEATS = [
 # From "Compared with Monoio and Glommio" in the README. Versions as measured there.
 COMPARE_HEAD = ["", "giong", "Monoio 0.2.4", "Glommio 0.9.0"]
 COMPARE = [
-    ("Platforms", "Linux ≥ 6.0", "Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS)",
+    ("Platforms", "Linux: io_uring on ≥ 6.0, an epoll driver elsewhere (tested on 5.15)", "Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS)",
      "Linux ≥ 5.8, needs a raised memlock limit"),
     ("Receiving", "multishot, kernel-provided buffers", "one submission per read, caller's buffer",
      "direct `recv`, io_uring to wait"),
@@ -439,13 +447,14 @@ COMPARE = [
 
 # ---------------------------------------------------------------- docs
 REQS = [
-    ("kernel", "**Linux 6.0 or newer**, 6.1+ recommended. Developed and tested on 6.18."),
+    ("kernel", "**Linux.** For io_uring, 6.0 or newer, 6.1+ recommended; developed and tested on "
+               "6.18. Elsewhere giong runs on its epoll driver, tested down to 5.15."),
     ("rust", "1.80 or newer for the libraries."),
     ("elsewhere", "giong does not build on Windows or macOS. Use WSL2 with a 6.x kernel or a Linux "
                   "virtual machine."),
-    ("docker", "Docker's default seccomp profile blocks io_uring. "
-               "[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow it in Docker, Compose "
-               "and Kubernetes without turning seccomp off."),
+    ("docker", "Docker's default seccomp profile blocks io_uring, so giong runs on epoll there. "
+               "[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow io_uring in Docker, "
+               "Compose and Kubernetes without turning seccomp off."),
     ("license", "MIT OR Apache-2.0, at your option."),
 ]
 
@@ -469,8 +478,8 @@ EXAMPLES = [
 ]
 
 LIMITS = [
-    ("Linux only", "Kernel 6.0 or newer. An epoll driver for machines where io_uring is blocked is "
-                   "on the roadmap; there will be no kqueue or IOCP in production."),
+    ("Linux only", "io_uring on 6.0 or newer, epoll elsewhere. On epoll giong is as fast as other "
+                   "epoll runtimes, not faster. There will be no kqueue or IOCP in production."),
     ("Not Tokio's ecosystem", "Crates that need the Tokio runtime (hyper, sqlx, reqwest) do not run "
                               "on giong. Crates that only use `std::future` do."),
     ("No HTTP/2", "`giong-http` speaks HTTP/1.1. A request body over the limit is refused."),
@@ -494,11 +503,13 @@ FAQ = [
      "in production. 1.0 waits for, among other things, at least one production user reporting back."),
     ("Does it run on macOS or Windows?",
      "No. io_uring is a Linux interface. On Windows use WSL2 with a 6.x kernel (`uname -r`; "
-     "`wsl --update` if it is older); on macOS a Linux virtual machine. In Docker, allow io_uring "
-     "as [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows."),
+     "`wsl --update` if it is older); on macOS a Linux virtual machine or Docker. In Docker giong "
+     "runs on epoll; allow io_uring as [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows to get its "
+     "full speed."),
     ("Which Linux kernel do I need?",
-     "6.0 or newer, 6.1 or newer recommended. giong tries three ring setups in order: "
-     "`DEFER_TASKRUN` (6.1+), `COOP_TASKRUN` (6.0), then no flags."),
+     "For io_uring, 6.0 or newer, 6.1 or newer recommended. giong tries three ring setups in order: "
+     "`DEFER_TASKRUN` (6.1+), `COOP_TASKRUN` (6.0), then no flags. On an older kernel, or where "
+     "io_uring is blocked, it runs on its epoll driver (tested on 5.15)."),
     ("Can I use hyper, reqwest, sqlx or other Tokio crates?",
      "Not crates that need the Tokio runtime; giong has its own HTTP, TLS, PostgreSQL, MySQL and "
      "Redis crates instead. Crates that only use `std::future` work. Adapters for the `futures-io` "

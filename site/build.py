@@ -581,7 +581,7 @@ def home():
     stats = [
         (sys_rows["giong"][2], f"system calls per request on `/json`; raw Tokio makes {sys_rows['tokio'][2]}"),
         (str(len(CRATES)), "crates on one version: the runtime and what a service needs on top"),
-        (f"{TOTAL_TESTS:,}", "tests, run on three io_uring setups and on real 6.0 and 6.1 kernels"),
+        (f"{TOTAL_TESTS:,}", "tests, run on three io_uring setups, on epoll and on real 5.15, 6.0 and 6.1 kernels"),
         (str(len(DEPS)), "dependencies in the runtime: " + ", ".join(f"`{d}`" for d in DEPS)),
     ]
     stats_html = "".join(f'<div class="stat"><b>{v}</b><span>{ilm(d)}</span></div>' for v, d in stats)

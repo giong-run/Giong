@@ -8,6 +8,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-13
+
+Foundations for services, and a look inside them. giong now runs where io_uring is
+blocked or missing (Docker and Kubernetes with their default seccomp profiles, gVisor,
+kernels before 6.0) on an epoll driver it falls back to by itself, about as fast as Tokio
+there, and it says when and why it does. On Ubuntu 24.04's own 6.8 kernels, whose
+backported bug rejects every io_uring buffer ring, it now runs on io_uring at full speed.
+`giong-http` streams bodies both ways, `giong-web` gains `tracing`, and an example
+REST API built only on giong's crates (PostgreSQL, Redis, HTTPS) serves 1.5 to 2.1 times
+as many requests per second as the same API on axum. The new `giong-mcp` lets an AI agent
+look inside a running service and names the task that blocks a worker. An idle
+connection now costs 1.9 KiB instead of 10.9 (axum 20.4, Go 18.9), and new work is
+balanced across workers when it is placed. Two changes in `giong-http` break code that
+used it: `Body` is `#[non_exhaustive]`, and a closure passed to `Server::serve` needs its
+argument's type written.
+
 ### Added
 
 - **giong**: `giong::driver_choice()` (on a worker) and `Handle::driver_choice(worker)`
@@ -22,7 +38,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   testing epoll only, and the whole suite also runs on Ubuntu 24.04's own kernel
   (6.8.0-147) in QEMU: `scripts/kernels.sh ubuntu-6.8.0-147` boots any kernel Ubuntu ships.
   Every QEMU run checks the driver giong chose and the kernel bugs it worked around.
-
 - **An epoll driver**, so that giong runs where io_uring is blocked or missing: in a
   Docker container with the default seccomp profile, in Kubernetes with `RuntimeDefault`,
   under gVisor, with the `kernel.io_uring_disabled` sysctl, and on kernels older than 6.0
@@ -264,11 +279,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `GIONG-E0001` or `GIONG-E0002`; those errors are raised only when io_uring was asked
   for. An unknown `GIONG_DRIVER` value fails with `GIONG-E0004`. `docs/DEPLOYMENT.md`
   explains when each driver is used.
-- **`giong-http`**: `Body` is `#[non_exhaustive]` and has a new variant,
+- **Breaking:** **`giong-http`**: `Body` is `#[non_exhaustive]` and has a new variant,
   `Body::Stream`; a `match` on it needs a `_` arm. `Body::as_bytes` and `len` are empty
   for a stream, and `is_empty` is `false` (`Body::is_stream`, `Response::is_streaming`
   tell). `Server::max_body_size` does not apply to bodies read as a stream.
-- **`giong-http`**: `Server::serve`, `serve_unix` and `serve_tls` take any `Handler`. A
+- **Breaking:** **`giong-http`**: `Server::serve`, `serve_unix` and `serve_tls` take any `Handler`. A
   closure passed to them needs its argument's type written (`|req: Request| async
   move { .. }`): Rust no longer infers it.
 - **`giong-http`**: the client asks for compressed responses and decodes them by default
@@ -301,7 +316,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - Tests: `accept_many_connections` and `accept_backlog_is_bounded_and_no_connection_is_lost`
   failed with "too many open files" under the 1024 soft limit that shells start with;
   they raise the soft limit up to the hard one.
-
 - `giong-http` server: more than two blank lines before a request line start the request
   timeout. A client sending `\r\n` once a minute kept a connection open for ever.
 - `giong-http` client: a kept-alive connection that received anything while idle (a `408
@@ -767,7 +781,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/giong-run/Giong/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/giong-run/Giong/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/giong-run/Giong/compare/v0.1.0...v0.2.0

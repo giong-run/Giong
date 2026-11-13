@@ -343,11 +343,22 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
                         });
                     }
                 });
-                // A port nobody listens on: bound, then closed.
-                let refused = std::net::TcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
+                // A port nobody listens on, kept bound (without listening) for
+                // the whole test. A port that was bound and closed again could
+                // be taken by another test meanwhile, or become the source port
+                // of the connect itself, and the connect would then succeed.
+                let reserved =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                reserved
+                    .bind(
+                        &"127.0.0.1:0"
+                            .parse::<std::net::SocketAddr>()
+                            .unwrap()
+                            .into(),
+                    )
                     .unwrap();
+                let refused = reserved.local_addr().unwrap().as_socket().unwrap();
                 let missing = dir.join("missing.sock");
                 // Generous: a working echo takes microseconds.
                 let limit = Duration::from_secs(2);

@@ -104,8 +104,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "0.3", features = ["tls"] }
-giong-tls = "0.3"
+giong-http = { version = "0.4", features = ["tls"] }
+giong-tls = "0.4"
 ```
 
 ```rust
@@ -127,7 +127,7 @@ To serve over another kind of connection (a different TLS layer, a fake connecti
 The `client` feature adds an HTTP/1.1 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "0.3", features = ["client"] }
+giong-http = { version = "0.4", features = ["client"] }
 ```
 
 ```rust
@@ -161,7 +161,7 @@ let created = client
 - **Streaming.** `RequestBuilder::send_streaming()` returns once the head has arrived; `StreamingResponse::chunk()` gives the body piece by piece (64 KiB at most, decompressed), with no limit on its size and the timeout applying to each piece. Read to its end, the connection goes back to the pool; dropped before, it is closed.
 - **Errors that say what to do.** `Error::kind` is one of `Request`, `Connect`, `Timeout`, `TooLarge`, `Redirect`, `Closed`, `Protocol`, `Status`, `Decode` and `Proxy`, each with a giong code (GIONG-E1101 to E1110) and a page in [docs/errors](../docs/errors/README.md); `Error::is_transient` says whether retrying can help. Any status is a `Response`; `error_for_status` turns 4xx and 5xx into an error with the start of the body.
 
-Proxies, compression, streamed bodies and the `Proxy` error kind were added after giong-http 0.3.0: the 0.3.0 release does not have them.
+Proxies, compression, streamed bodies and the `Proxy` error kind are new in 0.4.0; giong-http 0.3 does not have them.
 
 The client is not `Send`, like everything in giong: make one per worker (in `Builder::run`'s closure) and clone it into that worker's tasks.
 
