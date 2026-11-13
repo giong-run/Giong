@@ -18,6 +18,10 @@
 //! * Cancelling an operation that waits for readiness frees its resources at
 //!   once: no system call is in progress. One on a blocking thread keeps them
 //!   until the thread is done, exactly like an io_uring operation in flight.
+//! * A descriptor that blocking threads are using is closed only once the
+//!   last of them has reported. io_uring operations hold a reference to the
+//!   file; a thread holds only the number, which the kernel would otherwise
+//!   hand to the next `open` while the thread is about to use it.
 //!
 //! An operation that finishes at once does not yield, so a task whose every
 //! read and write succeeds immediately could keep the worker to itself. A
@@ -27,6 +31,7 @@
 
 use std::any::Any;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -107,10 +112,11 @@ enum Lifecycle {
 enum EOp {
     /// Waits for its descriptor; tried again when its future is polled.
     Ready { io: Io, connecting: bool },
-    /// Runs on a blocking thread.
+    /// Runs on a blocking thread, on descriptor `fd` (-1 for none).
     Blocking {
         state: Lifecycle,
         cancel: Arc<Cancel>,
+        fd: RawFd,
     },
     /// A multishot operation, armed once `io` is set.
     Multi { io: Option<MultiIo> },
@@ -255,6 +261,9 @@ pub(crate) struct Epoll {
     done: Vec<(usize, i32)>,
     /// Blocking jobs whose result has not been collected yet.
     blocking: usize,
+    /// Descriptors that blocking jobs use: how many jobs, and whether the
+    /// descriptor is to be closed when the last one reports.
+    busy: HashMap<RawFd, (u32, bool)>,
     graveyard: Vec<Box<dyn Any>>,
     /// `epoll_pwait2` (Linux 5.11) works here; else `epoll_wait`, whose
     /// timeout is in whole milliseconds.
@@ -283,6 +292,7 @@ impl Epoll {
             ready: 0,
             done: Vec::new(),
             blocking: 0,
+            busy: HashMap::new(),
             graveyard: Vec::new(),
             pwait2: true,
         };
@@ -409,12 +419,36 @@ impl Epoll {
         }
     }
 
-    /// Closes a descriptor the caller gives up.
+    /// Closes a descriptor the caller gives up: now, or when the last
+    /// blocking job using it reports.
     pub(crate) fn close_fd(&mut self, fd: RawFd) {
         self.forget(fd);
+        if let Some((_, close)) = self.busy.get_mut(&fd) {
+            *close = true;
+            return;
+        }
         // SAFETY: the caller owns `fd` and gives it up here. Closing also
         // removes it from the epoll set (no other descriptor shares it).
         unsafe { libc::close(fd) };
+    }
+
+    /// A blocking job on `fd` has reported; closes `fd` if it was given up
+    /// and no other job uses it.
+    fn release(&mut self, fd: RawFd) {
+        let Some((jobs, close)) = self.busy.get_mut(&fd) else {
+            return;
+        };
+        *jobs -= 1;
+        if *jobs > 0 {
+            return;
+        }
+        let close = *close;
+        self.busy.remove(&fd);
+        if close {
+            // SAFETY: the owner gave `fd` up in `close_fd`, and the last job
+            // that used it is done.
+            unsafe { libc::close(fd) };
+        }
     }
 
     // ---------------------------------------------------------------- attempts
@@ -499,6 +533,13 @@ impl Epoll {
     // ------------------------------------------------------------- single-shot
 
     pub(crate) fn start(&mut self, io: &Io, waker: &Waker) -> Start {
+        if let Io::Close { fd } = *io {
+            if self.busy.contains_key(&fd) {
+                // A cancelled job still uses it: close it when that reports.
+                self.close_fd(fd);
+                return Start::Done(0, 0);
+            }
+        }
         if self.goes_to_thread(io) {
             return Start::Submitted(self.start_blocking(io, waker));
         }
@@ -553,9 +594,21 @@ impl Epoll {
 
     fn start_blocking(&mut self, io: &Io, waker: &Waker) -> usize {
         let cancel = Cancel::new();
+        let fd = match *io {
+            Io::Read { fd, .. }
+            | Io::Write { fd, .. }
+            | Io::Fsync { fd, .. }
+            | Io::Fallocate { fd, .. }
+            | Io::Statx { dir: fd, .. } => fd,
+            _ => -1,
+        };
+        if fd >= 0 {
+            self.busy.entry(fd).or_insert((0, false)).0 += 1;
+        }
         let key = self.ops.insert(EOp::Blocking {
             state: Lifecycle::Waiting(waker.clone()),
             cancel: cancel.clone(),
+            fd,
         });
         self.blocking += 1;
         let completions = self.completions.clone();
@@ -617,6 +670,7 @@ impl Epoll {
             Some(EOp::Blocking {
                 state: state @ Lifecycle::Waiting(_),
                 cancel,
+                ..
             }) => {
                 // The thread may be using the resources: keep them until it
                 // reports. A job that has not started yet skips its call.
@@ -922,8 +976,10 @@ impl Epoll {
         self.completions.take(&mut done);
         for (key, res) in done.drain(..) {
             self.blocking -= 1;
+            let mut used = -1;
             let remove = match self.ops.get_mut(key) {
-                Some(EOp::Blocking { state, .. }) => {
+                Some(EOp::Blocking { state, fd, .. }) => {
+                    used = *fd;
                     match mem::replace(state, Lifecycle::Done(res)) {
                         Lifecycle::Waiting(waker) => {
                             waker.wake();
@@ -943,6 +999,7 @@ impl Epoll {
             if remove {
                 self.ops.remove(key);
             }
+            self.release(used);
         }
         self.done = done;
     }

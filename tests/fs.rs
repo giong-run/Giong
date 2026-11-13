@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use giong::fs::{self, File, OpenOptions};
 use giong::time::timeout;
@@ -403,6 +403,85 @@ fn a_read_that_never_completes_can_be_cancelled() {
         let (res, buf) = pipe.read_at(Vec::with_capacity(16), 0).await;
         assert_eq!((res.unwrap(), &buf[..]), (4, &b"late"[..]));
     });
+}
+
+#[test]
+fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
+    // On epoll a read from a terminal runs on a blocking thread and waits
+    // there for input. Dropping the read and then the file must not close the
+    // descriptor under that thread: the kernel could give its number to the
+    // next open, and the thread would read from whatever that is.
+    for close in [false, true] {
+        let Some((master, slave)) = pseudo_terminal() else {
+            eprintln!("skipped: no pseudo-terminals here");
+            return;
+        };
+        closed_after_the_thread(master, slave, close);
+    }
+}
+
+fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, close: bool) {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+    let before = open_fds(&target);
+    giong::block_on(async move {
+        let file = File::from_std(master);
+        let read = file.read_at(Vec::with_capacity(16), 0);
+        assert!(timeout(Duration::from_millis(100), read).await.is_err());
+        if close {
+            file.close().await.unwrap();
+        } else {
+            drop(file);
+        }
+        let epoll = giong::driver_kind() == giong::DriverKind::Epoll;
+        if epoll {
+            // The thread still waits in read(2): the descriptor stays open.
+            giong::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(open_fds(&target), before);
+        }
+        // Once the thread has read something, the descriptor goes. (On
+        // io_uring the read was cancelled in the kernel, and the terminal
+        // may already be closed, which makes this write fail.)
+        let wrote = std::io::Write::write_all(&mut slave, b"x\n");
+        if epoll {
+            wrote.unwrap();
+        }
+        let start = Instant::now();
+        while open_fds(&target) != before - 1 {
+            assert!(start.elapsed() < Duration::from_secs(5), "never closed");
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+}
+
+/// A pseudo-terminal's two ends, or `None` where there are none.
+fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let master = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open("/dev/ptmx")
+        .ok()?;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+    let mut name = [0 as libc::c_char; 64];
+    // SAFETY: `fd` is a terminal master we own; `name` is large enough.
+    unsafe {
+        if libc::grantpt(fd) != 0
+            || libc::unlockpt(fd) != 0
+            || libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) != 0
+        {
+            return None;
+        }
+    }
+    // SAFETY: ptsname_r wrote a NUL-terminated path.
+    let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    let slave = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(path.to_str().ok()?)
+        .ok()?;
+    Some((master, slave))
 }
 
 #[test]

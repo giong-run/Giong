@@ -216,6 +216,8 @@ jobs:
           sudo apt-get install -y -q redis-server
           sudo systemctl stop redis-server
       - run: ROUNDS=2 scripts/check.sh tsan
+      # The epoll driver hands file operations to threads of its own.
+      - run: GIONG_DRIVER=epoll ROUNDS=1 scripts/check.sh tsan
 
   # Model-check the wake-up handshakes in src/notify.rs with loom, then run the
   # same race on the runner's real CPUs.

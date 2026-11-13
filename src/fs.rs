@@ -428,23 +428,22 @@ impl std::fmt::Debug for File {
     }
 }
 
-#[cfg(not(giong_tsan))]
 async fn close(fd: RawFd) -> io::Result<()> {
+    // ThreadSanitizer keeps track of descriptors, but cannot see a close that
+    // goes through the ring (see `Driver::close_fd`). The epoll driver's
+    // close is a close(2) it sees.
+    #[cfg(giong_tsan)]
+    if runtime::driver_kind() == crate::DriverKind::IoUring {
+        // SAFETY: the descriptor is ours and is closed exactly once.
+        return if unsafe { libc::close(fd) } < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+    }
     let (res, _, ()) = Op::new(Io::Close { fd }, ()).await;
     if res < 0 {
         Err(os_err(res))
-    } else {
-        Ok(())
-    }
-}
-
-/// ThreadSanitizer keeps track of descriptors, but cannot see a close that
-/// goes through the ring (see `Driver::close_fd`).
-#[cfg(giong_tsan)]
-async fn close(fd: RawFd) -> io::Result<()> {
-    // SAFETY: the descriptor is ours and is closed exactly once.
-    if unsafe { libc::close(fd) } < 0 {
-        Err(io::Error::last_os_error())
     } else {
         Ok(())
     }
