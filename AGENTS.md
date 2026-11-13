@@ -9,7 +9,7 @@ disagree, CONTRIBUTING.md wins: report the difference.
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
 driver where io_uring is blocked or the kernel is too old. One Cargo
-workspace, seven crates:
+workspace, eight crates:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -20,6 +20,7 @@ workspace, seven crates:
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
 | `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts) and JSON on giong-http |
+| `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.
@@ -38,6 +39,7 @@ Where the code is:
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
+| `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
 ## The machine you need

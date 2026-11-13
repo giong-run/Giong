@@ -102,6 +102,20 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The server and database, without user or password, for diagnostics:
+    /// `db.internal:3306/app`.
+    pub(crate) fn describe(&self) -> String {
+        let server = match &self.host {
+            Host::Tcp(host) if host.contains(':') => format!("[{host}]:{}", self.port),
+            Host::Tcp(host) => format!("{host}:{}", self.port),
+            Host::Unix(path) => path.display().to_string(),
+        };
+        match &self.database {
+            Some(db) => format!("{server}/{db}"),
+            None => server,
+        }
+    }
+
     /// Settings for `localhost:3306`, with no user yet and the default
     /// limits.
     pub fn new() -> Self {

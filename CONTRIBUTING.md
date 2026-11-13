@@ -46,8 +46,9 @@ cargo test --workspace --all-features
 cargo run --release --example http
 ```
 
-The repository is a Cargo workspace of seven crates: `giong` (the runtime, at the root),
-`giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis` and `giong-web`.
+The repository is a Cargo workspace of eight crates: `giong` (the runtime, at the root),
+`giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web` and
+`giong-mcp`.
 The servers under `bench/` are separate workspaces.
 
 ## Checks every change must pass

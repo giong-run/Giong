@@ -72,7 +72,57 @@ struct Inner {
     config: Config,
     max_size: usize,
     wait_timeout: Duration,
-    state: RefCell<State>,
+    state: Rc<RefCell<State>>,
+    /// The pool as `giong::observe` sees it; registered by a weak reference,
+    /// so it leaves snapshots when the pool is dropped.
+    _observed: Rc<Observed>,
+}
+
+/// Reports the pool's state in `giong::observe` snapshots (and so to
+/// giong-mcp).
+struct Observed {
+    name: String,
+    max_size: usize,
+    state: Rc<RefCell<State>>,
+}
+
+impl giong::observe::Source for Observed {
+    fn kind(&self) -> &'static str {
+        "redis pool"
+    }
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn stats(&self) -> Vec<(&'static str, u64)> {
+        let s = stats_of(&self.state.borrow());
+        let n = |v: usize| v as u64;
+        vec![
+            ("max_size", n(self.max_size)),
+            ("connections", n(s.connections)),
+            ("taken", n(s.taken)),
+            ("connecting", n(s.connecting)),
+            ("in_flight", n(s.in_flight)),
+            ("waiting", n(s.waiting)),
+            ("opened", s.opened),
+            ("connect_errors", s.connect_errors),
+            ("timeouts", s.timeouts),
+        ]
+    }
+}
+
+fn stats_of(st: &State) -> PoolStats {
+    PoolStats {
+        connections: st.shared.len() + st.taken,
+        taken: st.taken,
+        connecting: st.connecting,
+        in_flight: st.shared.iter().map(|c| c.in_flight()).sum(),
+        waiting: st.waiting,
+        opened: st.opened,
+        connect_errors: st.connect_errors,
+        timeouts: st.timeouts,
+    }
 }
 
 #[derive(Default)]
@@ -147,12 +197,20 @@ impl Pool {
             max_size > 0,
             "a pool needs room for at least one connection"
         );
+        let state = Rc::new(RefCell::default());
+        let observed = Rc::new(Observed {
+            name: config.describe(),
+            max_size,
+            state: Rc::clone(&state),
+        });
+        giong::observe::register_rc(&observed);
         Self {
             inner: Rc::new(Inner {
                 config,
                 max_size,
                 wait_timeout: Duration::from_secs(5),
-                state: RefCell::default(),
+                state,
+                _observed: observed,
             }),
         }
     }
@@ -245,17 +303,7 @@ impl Pool {
 
     /// The pool's current state and counters.
     pub fn stats(&self) -> PoolStats {
-        let st = self.inner.state.borrow();
-        PoolStats {
-            connections: st.shared.len() + st.taken,
-            taken: st.taken,
-            connecting: st.connecting,
-            in_flight: st.shared.iter().map(|c| c.in_flight()).sum(),
-            waiting: st.waiting,
-            opened: st.opened,
-            connect_errors: st.connect_errors,
-            timeouts: st.timeouts,
-        }
+        stats_of(&self.inner.state.borrow())
     }
 
     /// The least busy shared connection, or a new one if every open one is

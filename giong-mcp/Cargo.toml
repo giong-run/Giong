@@ -1,0 +1,22 @@
+[package]
+name = "giong-mcp"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.80"
+description = "An MCP server that lets AI agents look inside a running giong service: workers, tasks, pools, profiles"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://docs.rs/giong-mcp"
+keywords = ["mcp", "observability", "diagnostics", "agent", "thread-per-core"]
+categories = ["development-tools::debugging", "asynchronous", "network-programming"]
+
+[dependencies]
+giong = { path = "..", version = "0.3.0" }
+giong-http = { path = "../giong-http", version = "0.3.0" }
+# JSON-RPC messages. Already in the workspace through giong-web's `serde`
+# feature.
+serde_json = "1"
+
+[dev-dependencies]
+giong-http = { path = "../giong-http", version = "0.3.0", features = ["client"] }

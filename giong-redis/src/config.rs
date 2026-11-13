@@ -91,6 +91,17 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The server and database, without user or password, for diagnostics:
+    /// `cache.internal:6379/0`.
+    pub(crate) fn describe(&self) -> String {
+        let server = match &self.host {
+            Host::Tcp(host) if host.contains(':') => format!("[{host}]:{}", self.port),
+            Host::Tcp(host) => format!("{host}:{}", self.port),
+            Host::Unix(path) => path.display().to_string(),
+        };
+        format!("{server}/{}", self.database)
+    }
+
     /// Settings for `localhost:6379`, database 0, no password, and the
     /// default limits.
     pub fn new() -> Self {
