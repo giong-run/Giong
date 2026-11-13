@@ -539,7 +539,12 @@ pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// Like [`metadata`], but describes a symbolic link itself instead of what it
 /// points at.
 pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    statx(libc::AT_FDCWD, c_path(path.as_ref())?, libc::AT_SYMLINK_NOFOLLOW).await
+    statx(
+        libc::AT_FDCWD,
+        c_path(path.as_ref())?,
+        libc::AT_SYMLINK_NOFOLLOW,
+    )
+    .await
 }
 
 /// Reads a whole file.

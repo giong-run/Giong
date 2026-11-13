@@ -473,16 +473,19 @@ impl Epoll {
                     retry(|| libc::sendmsg(fd, msg, flags as i32 | libc::MSG_DONTWAIT)),
                     Dir::Write,
                 ),
-                Io::RecvMsg { fd, msg } => {
-                    (retry(|| libc::recvmsg(fd, msg, libc::MSG_DONTWAIT)), Dir::Read)
-                }
+                Io::RecvMsg { fd, msg } => (
+                    retry(|| libc::recvmsg(fd, msg, libc::MSG_DONTWAIT)),
+                    Dir::Read,
+                ),
                 // A pipe or a socket: offsets do not apply.
-                Io::ReadReady { fd, buf, len } | Io::Read { fd, buf, len, .. } => {
-                    (retry(|| libc::read(fd, buf.cast(), len as usize)), Dir::Read)
-                }
-                Io::Write { fd, buf, len, .. } => {
-                    (retry(|| libc::write(fd, buf.cast(), len as usize)), Dir::Write)
-                }
+                Io::ReadReady { fd, buf, len } | Io::Read { fd, buf, len, .. } => (
+                    retry(|| libc::read(fd, buf.cast(), len as usize)),
+                    Dir::Read,
+                ),
+                Io::Write { fd, buf, len, .. } => (
+                    retry(|| libc::write(fd, buf.cast(), len as usize)),
+                    Dir::Write,
+                ),
                 _ => unreachable!(),
             }
         };
@@ -733,12 +736,10 @@ impl Epoll {
         const OUT_HEADER: usize = 16;
         let (bid, ptr, len) = self.pool.next_free()?;
         // SAFETY: `hdr` points at a `'static` template (see `MultiIo`).
-        let (name_space, control_space) = unsafe {
-            (
-                (*hdr).msg_namelen as usize,
-                (*hdr).msg_controllen as usize,
-            )
-        };
+        // `msg_controllen` is a `usize` on glibc and a `u32` on musl.
+        #[allow(clippy::unnecessary_cast)]
+        let (name_space, control_space) =
+            unsafe { ((*hdr).msg_namelen as usize, (*hdr).msg_controllen as usize) };
         let payload_at = OUT_HEADER + name_space + control_space;
         if len < payload_at {
             return Some(Err(-libc::ENOBUFS));
@@ -849,7 +850,9 @@ impl Epoll {
                     ms.min(i32::MAX as u128) as libc::c_int
                 });
                 // SAFETY: as above.
-                unsafe { libc::epoll_wait(epfd, buf, MAX_EVENTS as libc::c_int, ms) as libc::c_long }
+                unsafe {
+                    libc::epoll_wait(epfd, buf, MAX_EVENTS as libc::c_int, ms) as libc::c_long
+                }
             };
             if res >= 0 {
                 break res as usize;
@@ -859,10 +862,7 @@ impl Epoll {
                 // A kernel older than 5.11, or a seccomp profile that does
                 // not know the call: use epoll_wait from now on.
                 Some(libc::ENOSYS | libc::EPERM) if self.pwait2 => self.pwait2 = false,
-                _ => panic!(
-                    "giong: epoll_wait failed: {}",
-                    io::Error::last_os_error()
-                ),
+                _ => panic!("giong: epoll_wait failed: {}", io::Error::last_os_error()),
             }
         };
         // SAFETY: the kernel initialised `n <= MAX_EVENTS` events.
@@ -872,11 +872,9 @@ impl Epoll {
 
     /// Wakes the tasks waiting for the descriptors in the first `n` events.
     fn dispatch(&mut self, n: usize) {
-        const READABLE: u32 = (libc::EPOLLIN
-            | libc::EPOLLPRI
-            | libc::EPOLLRDHUP
-            | libc::EPOLLHUP
-            | libc::EPOLLERR) as u32;
+        const READABLE: u32 =
+            (libc::EPOLLIN | libc::EPOLLPRI | libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR)
+                as u32;
         const WRITABLE: u32 = (libc::EPOLLOUT | libc::EPOLLHUP | libc::EPOLLERR) as u32;
         for i in 0..n {
             // Copied out: the struct is packed on x86-64.
@@ -887,11 +885,7 @@ impl Epoll {
                     // SAFETY: reads 8 bytes into a valid u64 from the
                     // non-blocking eventfd.
                     unsafe {
-                        libc::read(
-                            self.wake_fd,
-                            &mut count as *mut u64 as *mut libc::c_void,
-                            8,
-                        )
+                        libc::read(self.wake_fd, &mut count as *mut u64 as *mut libc::c_void, 8)
                     };
                 }
                 DONE => {} // collected below
@@ -929,19 +923,21 @@ impl Epoll {
         for (key, res) in done.drain(..) {
             self.blocking -= 1;
             let remove = match self.ops.get_mut(key) {
-                Some(EOp::Blocking { state, .. }) => match mem::replace(state, Lifecycle::Done(res)) {
-                    Lifecycle::Waiting(waker) => {
-                        waker.wake();
-                        false
-                    }
-                    Lifecycle::Ignored(data) => {
-                        if let Some(data) = data {
-                            self.graveyard.push(data);
+                Some(EOp::Blocking { state, .. }) => {
+                    match mem::replace(state, Lifecycle::Done(res)) {
+                        Lifecycle::Waiting(waker) => {
+                            waker.wake();
+                            false
                         }
-                        true
+                        Lifecycle::Ignored(data) => {
+                            if let Some(data) = data {
+                                self.graveyard.push(data);
+                            }
+                            true
+                        }
+                        Lifecycle::Done(_) => false,
                     }
-                    Lifecycle::Done(_) => false,
-                },
+                }
                 _ => false,
             };
             if remove {
@@ -1021,7 +1017,12 @@ unsafe fn connect_result(fd: RawFd) -> i32 {
     }
     let mut addr: libc::sockaddr_storage = mem::zeroed();
     let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    if libc::getpeername(fd, (&mut addr as *mut libc::sockaddr_storage).cast(), &mut len) < 0 {
+    if libc::getpeername(
+        fd,
+        (&mut addr as *mut libc::sockaddr_storage).cast(),
+        &mut len,
+    ) < 0
+    {
         return neg_errno();
     }
     0

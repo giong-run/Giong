@@ -204,13 +204,13 @@ pub(crate) enum MultiIo {
     /// Datagrams into pool buffers, each laid out as io_uring's
     /// `io_uring_recvmsg_out` header, then the sender's address in a field
     /// of `hdr.msg_namelen` bytes, then the payload.
-    RecvMsg {
-        fd: RawFd,
-        hdr: *const libc::msghdr,
-    },
+    RecvMsg { fd: RawFd, hdr: *const libc::msghdr },
 }
 
 /// A worker's I/O driver.
+// One per worker, created once and never moved: boxing the larger variant
+// would only add an indirection to every operation.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Driver {
     Uring(uring::Uring),
     Epoll(epoll::Epoll),
@@ -258,11 +258,15 @@ impl Driver {
         wake_fd: RawFd,
     ) -> io::Result<Self> {
         match choice {
-            Some(DriverKind::IoUring) => Ok(Driver::Uring(uring::Uring::new(entries, pool, wake_fd)?)),
+            Some(DriverKind::IoUring) => {
+                Ok(Driver::Uring(uring::Uring::new(entries, pool, wake_fd)?))
+            }
             Some(DriverKind::Epoll) => Ok(Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?)),
             None => match uring::Uring::new(entries, pool.clone(), wake_fd) {
                 Ok(ring) => Ok(Driver::Uring(ring)),
-                Err(e) if io_uring_unusable(&e) => Ok(Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?)),
+                Err(e) if io_uring_unusable(&e) => {
+                    Ok(Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?))
+                }
                 Err(e) => Err(e),
             },
         }

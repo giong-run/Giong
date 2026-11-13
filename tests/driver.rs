@@ -97,7 +97,10 @@ fn giong_driver_chooses_when_the_builder_does_not() {
 #[test]
 fn an_unknown_giong_driver_is_an_error() {
     if std::env::var_os(CHILD).is_some() {
-        let err = giong::Builder::new().build().err().expect("build must fail");
+        let err = giong::Builder::new()
+            .build()
+            .err()
+            .expect("build must fail");
         println!("build: {err}");
         println!("code: {:?}", error::code(&err));
         let err = giong::Builder::new().block_on(async {}).unwrap_err();
