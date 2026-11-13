@@ -572,29 +572,30 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-173 tests (`cargo test --workspace --all-features`), repeated in release mode on all three
-io_uring setups without a failure:
+529 tests across the six crates (`cargo test --workspace --all-features`), repeated in
+release mode on all three io_uring setups without a failure. The runtime's, HTTP's and
+TLS's main suites are below; the database clients describe theirs in their READMEs.
 
 | Suite | What it checks |
 |---|---|
 | `tests/executor.rs` (14) | spawn and join, panics, abort, teardown, runtimes run back to back |
 | `tests/time.rs` (7), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
-| `tests/net.rs` (13) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients |
-| `tests/unix.rs` (7) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
+| `tests/net.rs` (15) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients |
+| `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/udp.rs` (16) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, sockets closed on drop |
-| `tests/fs.rs` (12) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight |
-| `tests/cancel.rs` (10) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; teardown with everything in flight |
-| `tests/multi.rs` (10) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
+| `tests/fs.rs` (19) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight |
+| `tests/cancel.rs` (11) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; teardown with everything in flight |
+| `tests/multi.rs` (14) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (9) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
-| `giong-http` (50) | 15 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 19 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 11 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
-| `giong-tls` (8) | TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
-| Other (7) | slab, the io_uring setup tiers, 5 documentation examples |
+| `giong-http` (81) | 16 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies); 28 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 19 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 11 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
+| `giong-tls` (34) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
+| Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
 
-- **ThreadSanitizer** (`scripts/check.sh tsan`, Rust nightly) over 157 tests of all three
-  crates: no data race. Two things are handled specially, both because of the tool:
+- **ThreadSanitizer** (`scripts/check.sh tsan`, Rust nightly) over the workspace's tests:
+  no data race. Two things are handled specially, both because of the tool:
   sanitizer builds close descriptors with `close(2)` (it cannot see a close that goes
   through the ring and then reports races on reused descriptor numbers), and the SIGTERM
   test is skipped (the sanitizer delivers signals only inside libc calls it intercepts,
@@ -642,7 +643,7 @@ Not verified, and you should know it:
 
 ## Compared with Monoio and Glommio
 
-| | giong 0.2 | Monoio 0.2.4 | Glommio 0.9.0 |
+| | giong 0.3 | Monoio 0.2.4 | Glommio 0.9.0 |
 |---|---|---|---|
 | Platforms | Linux ≥ 6.0 | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
 | Receiving | multishot, kernel-provided buffers | one submission per read, caller's buffer | direct `recv`, io_uring to wait |
@@ -654,15 +655,14 @@ Not verified, and you should know it:
 | Multi-core | built-in builder with graceful draining and signals | `#[monoio::main(threads = N)]` | executor pools placed by CPU topology |
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
-| Ecosystem | its own HTTP/1.1 server, and TLS for servers and clients; nothing else | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
-| Size | ~5,400 lines, plus ~2,250 for HTTP and TLS | ~25,000 lines | ~40,500 lines |
+| Ecosystem | its own HTTP/1.1 server and client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
+| Size | ~8,800 lines, plus ~5,500 for HTTP and TLS and ~17,000 for the database clients | ~25,000 lines | ~40,500 lines |
 
-Monoio is the mature choice and runs in production at ByteDance; if you need an HTTP
-client, HTTP/2 or Tokio-compatible crates today, use it. Glommio is built for storage
-engines: Direct I/O and priority scheduling are its strengths, not HTTP. giong's case is
-narrower: the receive path (multishot with provided buffers, cancel safe without a second
-API), good defaults, the latency dial, a strict HTTP server on top, and code small enough
-to audit.
+Monoio is the mature choice and runs in production at ByteDance; if you need HTTP/2 or
+Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
+priority scheduling are its strengths, not HTTP. giong's case is narrower: the receive
+path (multishot with provided buffers, cancel safe without a second API), good defaults,
+the latency dial, a strict HTTP server on top, and code small enough to audit.
 
 ## Limitations
 

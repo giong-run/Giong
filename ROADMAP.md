@@ -83,7 +83,7 @@ together with the verification that needed no extra hardware.
 - [x] Fuzz-style tests for the HTTP parser: 500,000 random inputs for the request parser
       and the chunked decoder in `giong-http`.
 
-## 0.3 — Prove it
+## 0.3 — Prove it (done)
 
 The numbers so far come from a 4-vCPU virtual machine over loopback. Before adding more
 features, find out what is actually true.

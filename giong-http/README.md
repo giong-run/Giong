@@ -57,8 +57,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "0.2", features = ["tls"] }
-giong-tls = "0.2"
+giong-http = { version = "0.3", features = ["tls"] }
+giong-tls = "0.3"
 ```
 
 ```rust
@@ -80,7 +80,7 @@ To serve over another kind of connection (a different TLS layer, a fake connecti
 The `client` feature adds an HTTP/1.1 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "0.2", features = ["client"] }
+giong-http = { version = "0.3", features = ["client"] }
 ```
 
 ```rust
