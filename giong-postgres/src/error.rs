@@ -63,11 +63,15 @@ pub enum ErrorKind {
     /// The server sent something this crate cannot understand. The connection
     /// is closed.
     Protocol,
+    /// The statement cannot be sent this way, and was not: a transaction
+    /// statement on the connections a [`Pool`](crate::Pool) shares between
+    /// tasks. The message says what to use instead.
+    Statement,
 }
 
 impl ErrorKind {
     /// The giong error code for errors of this kind, `GIONG-E3001` to
-    /// `GIONG-E3010`.
+    /// `GIONG-E3011`.
     pub fn giong_code(self) -> Code {
         match self {
             ErrorKind::Config => Code::PostgresConfig,
@@ -80,6 +84,7 @@ impl ErrorKind {
             ErrorKind::Closed => Code::PostgresClosed,
             ErrorKind::PoolTimeout => Code::PostgresPoolTimeout,
             ErrorKind::Protocol => Code::PostgresProtocol,
+            ErrorKind::Statement => Code::PostgresStatement,
         }
     }
 }
@@ -240,7 +245,7 @@ impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
         let kind = match (&e.0.source, e.kind()) {
             (Some(source), _) => source.kind(),
-            (None, ErrorKind::Config) => io::ErrorKind::InvalidInput,
+            (None, ErrorKind::Config | ErrorKind::Statement) => io::ErrorKind::InvalidInput,
             (None, ErrorKind::Auth) => io::ErrorKind::PermissionDenied,
             (None, ErrorKind::Type | ErrorKind::Protocol) => io::ErrorKind::InvalidData,
             (None, ErrorKind::PoolTimeout) => io::ErrorKind::TimedOut,
@@ -436,6 +441,7 @@ mod tests {
             ErrorKind::Closed,
             ErrorKind::PoolTimeout,
             ErrorKind::Protocol,
+            ErrorKind::Statement,
         ];
         let codes: std::collections::HashSet<_> = kinds.iter().map(|k| k.giong_code()).collect();
         assert_eq!(codes.len(), kinds.len());

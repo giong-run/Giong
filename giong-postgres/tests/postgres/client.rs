@@ -250,6 +250,18 @@ fn row_counts_and_the_one_row_helpers() {
             .unwrap();
         assert_eq!(rows.len(), 100_000);
         assert_eq!(rows[99_999].get::<i32>("n").unwrap(), 100_000);
+
+        // Rows without columns are rows too.
+        let rows = client
+            .query("SELECT FROM generate_series(1, 3)", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].is_empty());
+        client
+            .query_one("SELECT FROM counts WHERE id = 1", &[])
+            .await
+            .unwrap();
     });
 }
 

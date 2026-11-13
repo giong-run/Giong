@@ -618,7 +618,8 @@ fn format_temporal(ty: ColumnType, raw: &[u8]) -> Result<String, Error> {
         let get = |i: usize| raw.get(i).copied().unwrap_or(0);
         let negative = get(0) == 1;
         let days = u32::from_le_bytes([get(1), get(2), get(3), get(4)]);
-        let hours = days * 24 + u32::from(get(5));
+        // In u64: a TIME is at most 34 days, but a server could send more.
+        let hours = u64::from(days) * 24 + u64::from(get(5));
         let _ = write!(
             s,
             "{}{:02}:{:02}:{:02}",
@@ -799,6 +800,12 @@ mod tests {
         let time = col(ColumnType::TIME, 0, 63);
         let raw = [1, 34, 0, 0, 0, 22, 59, 59];
         assert_eq!(String::from_sql(&time, &raw).unwrap(), "-838:59:59");
+        // More days than a TIME holds does not overflow.
+        let huge = [0, 0xFF, 0xFF, 0xFF, 0xFF, 23, 0, 0];
+        assert_eq!(
+            String::from_sql(&time, &huge).unwrap(),
+            "103079215103:00:00"
+        );
         let far = UNIX_EPOCH + Duration::from_secs(400_000_000_000);
         assert!(far.to_sql(&mut Vec::new()).is_err());
     }

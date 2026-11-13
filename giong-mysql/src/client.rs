@@ -93,6 +93,13 @@ enum Tx {
     Committed,
 }
 
+/// Why a shared connection was closed under its statements.
+const LEFT_OPEN: &str = "a statement sent through the pool's shared methods (Pool::batch_execute) \
+     left a transaction open, or autocommit off, on a connection other tasks share, so the \
+     connection was closed and the transaction rolled back, with every statement sent on it \
+     since, this one included. Run transactions on a connection of the task's own: \
+     pool.get().await?.transaction()";
+
 /// The state shared by a client and its two tasks.
 struct Conn {
     weak: Weak<Conn>,
@@ -105,6 +112,13 @@ struct Conn {
     connection_id: u32,
     server_version: String,
     tx: Cell<Tx>,
+    /// Several tasks send statements on this connection at once (it is among
+    /// a pool's shared connections): none of them may leave a transaction
+    /// open, or autocommit off, which would take in the statements of the
+    /// others.
+    shared: Cell<bool>,
+    /// Woken when nothing is in flight any more, or the connection fails.
+    idle_wakers: RefCell<Vec<Waker>>,
 }
 
 struct State {
@@ -131,6 +145,8 @@ enum Entry {
 /// A request in flight and what has arrived for it.
 struct Slot {
     kind: Kind,
+    /// Sent while the connection was shared.
+    shared: bool,
     inner: RefCell<SlotInner>,
 }
 
@@ -189,9 +205,10 @@ enum Response {
 }
 
 impl Slot {
-    fn new(kind: Kind, seq: u8) -> Rc<Self> {
+    fn new(kind: Kind, seq: u8, shared: bool) -> Rc<Self> {
         Rc::new(Slot {
             kind,
+            shared,
             inner: RefCell::new(SlotInner {
                 seq,
                 ..SlotInner::default()
@@ -269,6 +286,8 @@ impl Client {
             connection_id,
             server_version,
             tx: Cell::new(Tx::None),
+            shared: Cell::new(false),
+            idle_wakers: RefCell::new(Vec::new()),
             state: RefCell::new(State {
                 out: Vec::new(),
                 writer: None,
@@ -479,12 +498,36 @@ impl Client {
     }
 
     /// Rolls back whatever transaction is open, and forgets any
-    /// [`Transaction`] that ended early.
+    /// [`Transaction`] that ended early. A statement still on its way (its
+    /// future was dropped, by a timeout say) may be a `BEGIN`, which the last
+    /// answer cannot tell, so then `ROLLBACK` is sent anyway.
     pub(crate) fn reset_transaction(&self) {
-        if self.in_transaction() {
+        if self.in_flight() > 0 || self.in_transaction() {
             self.send_and_forget("ROLLBACK");
         }
         self.conn.tx.set(Tx::None);
+    }
+
+    /// Whether the last answer from the server said autocommit was on.
+    pub(crate) fn autocommit(&self) -> bool {
+        self.conn.state.borrow().status & status::AUTOCOMMIT != 0
+    }
+
+    /// Marks the connection as shared between tasks, or as one task's own.
+    /// Statements sent while it is shared must not leave a transaction open
+    /// or autocommit off: if one does, the connection is closed, which rolls
+    /// the transaction back, rather than let the statements of other tasks
+    /// run inside it.
+    pub(crate) fn set_shared(&self, shared: bool) {
+        self.conn.shared.set(shared);
+    }
+
+    /// Wakes `waker` once nothing is in flight, or the connection fails.
+    pub(crate) fn wake_when_idle(&self, waker: &Waker) {
+        let mut wakers = self.conn.idle_wakers.borrow_mut();
+        if !wakers.iter().any(|w| w.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
     }
 
     async fn run(
@@ -596,7 +639,7 @@ impl Conn {
                 return Err(e);
             }
         };
-        let slot = Slot::new(kind, seq);
+        let slot = Slot::new(kind, seq, self.shared.get());
         if st.queue.is_empty() {
             self.head_since.set(Some(giong::time::Instant::now()));
         }
@@ -697,7 +740,15 @@ impl Conn {
                 w.wake();
             }
         }
+        self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
+    }
+
+    fn wake_idle(&self) {
+        let wakers = std::mem::take(&mut *self.idle_wakers.borrow_mut());
+        for w in wakers {
+            w.wake();
+        }
     }
 
     /// Takes apart and handles every whole message in `buf`.
@@ -863,14 +914,32 @@ impl Conn {
             }
         };
         if done {
+            // A statement sent on a shared connection opened a transaction,
+            // or turned autocommit off: the statements other tasks send next
+            // would run inside it, and be lost with it.
+            let left_open = slot.shared && {
+                let status = self.state.borrow().status;
+                status & status::IN_TRANS != 0 || status & status::AUTOCOMMIT == 0
+            };
+            if left_open {
+                inner.error = Some(Error::closed(LEFT_OPEN));
+            }
             drop(inner);
-            {
+            let idle = {
                 let mut st = self.state.borrow_mut();
                 st.queue.pop_front();
                 self.head_since
                     .set((!st.queue.is_empty()).then(giong::time::Instant::now));
-            }
+                st.queue.is_empty()
+            };
             self.complete(&slot);
+            if left_open {
+                // Closing the connection makes the server roll back.
+                return Err(Error::closed(LEFT_OPEN));
+            }
+            if idle {
+                self.wake_idle();
+            }
         }
         Ok(())
     }

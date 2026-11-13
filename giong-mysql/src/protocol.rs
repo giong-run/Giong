@@ -52,6 +52,7 @@ pub(crate) const WANTED: u32 = cap::LONG_PASSWORD
 /// Server status flags, in OK and EOF packets.
 pub(crate) mod status {
     pub const IN_TRANS: u16 = 0x0001;
+    pub const AUTOCOMMIT: u16 = 0x0002;
     pub const MORE_RESULTS_EXISTS: u16 = 0x0008;
 }
 
