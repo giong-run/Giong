@@ -39,10 +39,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
       - name: Bump, update the changelog and open the pull request
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
-        run: python3 scripts/release.py prepare "$VERSION" --pr --dispatch-ci | tee prepare.log
+        run: python3 scripts/release.py prepare "$VERSION" --pr --dispatch-ci | tee "$RUNNER_TEMP/prepare.log"
       - name: Summary
         if: always()
         run: |
@@ -50,6 +51,6 @@ jobs:
             echo '### Prepare release'
             echo
             echo '```'
-            cat prepare.log 2>/dev/null || true
+            cat "$RUNNER_TEMP/prepare.log" 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
