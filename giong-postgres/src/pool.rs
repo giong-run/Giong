@@ -59,7 +59,18 @@ const STALLED: Duration = Duration::from_millis(5);
 /// [`get`](Self::get) takes a connection for one task alone, for a
 /// transaction or for session settings. While it is out, no shared statement
 /// runs on it. It comes back when the [`PooledClient`] is dropped; if a
-/// transaction was left open, it is rolled back first.
+/// transaction was left open, or a statement is still on its way, a
+/// `ROLLBACK` is queued first.
+///
+/// **Transactions never run on the shared connections**, since the
+/// statements of other tasks would run inside them. `query`, `query_one`,
+/// `query_opt` and `execute` refuse `BEGIN`, `COMMIT`, `ROLLBACK` and the
+/// other transaction statements before sending anything
+/// ([`ErrorKind::Statement`]). [`batch_execute`](Self::batch_execute) may
+/// carry a whole transaction (`BEGIN; ...; COMMIT`); if a batch leaves one
+/// open, its connection is closed, which rolls it back, and the batch and
+/// every statement sent on that connection after it fail with
+/// [`ErrorKind::Closed`].
 ///
 /// Connections the server closed, or that broke, are left behind as soon as
 /// that is noticed, which is when it happens: each connection is read
@@ -177,48 +188,50 @@ impl Pool {
     }
 
     /// Runs a statement on a shared connection and returns its rows; see
-    /// [`Client::query`].
+    /// [`Client::query`]. Transaction statements are refused
+    /// ([`ErrorKind::Statement`]): run them on a connection from
+    /// [`get`](Self::get).
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
+        refuse_transaction(sql)?;
         let client = self.shared().await?;
-        let result = client.query(sql, params).await;
-        self.release(client);
-        result
+        client.query(sql, params).await
     }
 
     /// Runs a statement that returns exactly one row; see
-    /// [`Client::query_one`].
+    /// [`Client::query_one`]. Transaction statements are refused.
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
+        refuse_transaction(sql)?;
         let client = self.shared().await?;
-        let result = client.query_one(sql, params).await;
-        self.release(client);
-        result
+        client.query_one(sql, params).await
     }
 
     /// Runs a statement that returns at most one row; see
-    /// [`Client::query_opt`].
+    /// [`Client::query_opt`]. Transaction statements are refused.
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
+        refuse_transaction(sql)?;
         let client = self.shared().await?;
-        let result = client.query_opt(sql, params).await;
-        self.release(client);
-        result
+        client.query_opt(sql, params).await
     }
 
     /// Runs a statement and returns the number of rows it changed; see
-    /// [`Client::execute`].
+    /// [`Client::execute`]. Transaction statements are refused.
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
+        refuse_transaction(sql)?;
         let client = self.shared().await?;
-        let result = client.execute(sql, params).await;
-        self.release(client);
-        result
+        client.execute(sql, params).await
     }
 
     /// Runs several statements without parameters; see
     /// [`Client::batch_execute`].
+    ///
+    /// The batch may hold a whole transaction, `BEGIN; ...; COMMIT`. If it
+    /// leaves one open, the connection is closed, which rolls the
+    /// transaction back, and the batch fails with [`ErrorKind::Closed`], as
+    /// do the statements other tasks sent on that connection after it: they
+    /// would otherwise have run inside the transaction.
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
         let client = self.shared().await?;
-        let result = client.batch_execute(sql).await;
-        self.release(client);
-        result
+        client.batch_execute(sql).await
     }
 
     /// Takes a connection for this task alone, for a transaction or session
@@ -246,7 +259,10 @@ impl Pool {
                     let c = st.shared.swap_remove(i);
                     st.taken += 1;
                     return match Rc::try_unwrap(c) {
-                        Ok(client) => Decision::Ready(client),
+                        Ok(client) => {
+                            client.set_shared(false);
+                            Decision::Ready(client)
+                        }
                         Err(_) => unreachable!("checked: nobody else holds it"),
                     };
                 }
@@ -293,7 +309,7 @@ impl Pool {
     /// [`STALLED`] is passed over while another will do: statements queue
     /// behind it in order, so a slow one would hold up everything sent after
     /// it on that connection.
-    async fn shared(&self) -> Result<Rc<Client>, Error> {
+    async fn shared(&self) -> Result<Lent<'_>, Error> {
         let client = self
             .acquire(|st, max| {
                 let now = Instant::now();
@@ -321,19 +337,19 @@ impl Pool {
                 }
             })
             .await?;
-        Ok(match client {
+        let client = match client {
             Ok(c) => c,
             Err(new) => {
+                new.set_shared(true);
                 let c = Rc::new(new);
                 self.inner.state.borrow_mut().shared.push(c.clone());
                 c
             }
+        };
+        Ok(Lent {
+            pool: self,
+            client: Some(client),
         })
-    }
-
-    fn release(&self, client: Rc<Client>) {
-        drop(client);
-        self.notify();
     }
 
     /// Wakes every task waiting for a connection, to look again.
@@ -383,11 +399,17 @@ impl Pool {
                             return Poll::Ready(());
                         }
                         registered = true;
-                        self.inner
-                            .state
-                            .borrow_mut()
-                            .waiters
-                            .push(cx.waker().clone());
+                        let mut st = self.inner.state.borrow_mut();
+                        st.waiters.push(cx.waker().clone());
+                        // A connection kept busy only by statements whose
+                        // tasks stopped waiting (a timeout dropped them) is
+                        // free once they are answered, which nothing else
+                        // would announce.
+                        for c in &st.shared {
+                            if Rc::strong_count(c) == 1 && c.in_flight() > 0 {
+                                c.wake_when_idle(cx.waker());
+                            }
+                        }
                         Poll::Pending
                     });
                     let left = deadline.saturating_duration_since(Instant::now());
@@ -411,6 +433,101 @@ impl Pool {
             }
         }
     }
+}
+
+/// A shared connection lent to one statement. Dropping it, when the
+/// statement is answered or its future is dropped, tells waiting tasks to
+/// look again: the connection may have become free.
+struct Lent<'a> {
+    pool: &'a Pool,
+    client: Option<Rc<Client>>,
+}
+
+impl Deref for Lent<'_> {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        self.client = None;
+        self.pool.notify();
+    }
+}
+
+/// Refuses a statement that controls a transaction, which must not run on a
+/// connection that other tasks share.
+fn refuse_transaction(sql: &str) -> Result<(), Error> {
+    let words = leading_words(sql);
+    let word = |i: usize| words.get(i).map_or("", String::as_str);
+    let refused = match word(0) {
+        "BEGIN" | "START" | "END" | "ABORT" | "SAVEPOINT" | "RELEASE" => true,
+        // Two-phase commit's second phase may run on any connection.
+        "COMMIT" | "ROLLBACK" => word(1) != "PREPARED",
+        "PREPARE" => word(1) == "TRANSACTION",
+        _ => false,
+    };
+    if !refused {
+        return Ok(());
+    }
+    Err(Error::new(
+        ErrorKind::Statement,
+        format!(
+            "{} controls a transaction, and the pool's own methods run statements on \
+             connections that other tasks share, whose statements would run inside it; \
+             nothing was sent. Run the transaction on a connection of this task's own: \
+             let mut conn = pool.get().await?; let tx = conn.transaction().await?; ...; \
+             tx.commit().await?",
+            word(0)
+        ),
+    ))
+}
+
+/// The first two words of `sql`, upper-cased, after blanks and comments.
+fn leading_words(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    let mut words = Vec::new();
+    while words.len() < 2 && i < b.len() {
+        match b[i] {
+            c if c.is_ascii_whitespace() => i += 1,
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                // PostgreSQL's block comments nest.
+                let mut depth = 0;
+                while i < b.len() {
+                    if b[i..].starts_with(b"/*") {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i..].starts_with(b"*/") {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                words.push(sql[start..i].to_ascii_uppercase());
+            }
+            _ => break,
+        }
+    }
+    words
 }
 
 impl std::fmt::Debug for Pool {
@@ -458,10 +575,13 @@ impl Drop for PooledClient {
             let mut st = self.pool.inner.state.borrow_mut();
             st.taken -= 1;
             if !client.is_closed() {
+                // A statement still on its way (its future was dropped, by a
+                // timeout say) may be a BEGIN: the last answer cannot tell.
                 // Queued ahead of anything a shared statement sends next.
-                if client.in_transaction() {
+                if client.in_flight() > 0 || client.in_transaction() {
                     client.send_and_forget("ROLLBACK");
                 }
+                client.set_shared(true);
                 st.shared.push(Rc::new(client));
             }
         }

@@ -49,6 +49,9 @@ pub(crate) struct ResultSet {
     /// or -1 for `NULL`.
     values: Vec<(u32, i32)>,
     data: Vec<u8>,
+    /// Counted, not worked out from `values`: rows can have no columns
+    /// (`SELECT FROM t`).
+    rows: usize,
 }
 
 /// Collects rows as they arrive, up to a size limit.
@@ -98,17 +101,14 @@ impl RowsBuilder {
             columns,
             values: self.values,
             data: self.data,
+            rows: self.rows,
         }
     }
 }
 
 impl ResultSet {
     pub(crate) fn into_rows(self) -> Vec<Row> {
-        let count = if self.columns.is_empty() {
-            0
-        } else {
-            self.values.len() / self.columns.len()
-        };
+        let count = self.rows;
         let set = Rc::new(self);
         (0..count)
             .map(|index| Row {

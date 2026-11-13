@@ -282,6 +282,50 @@ fn a_connection_the_server_closed_while_idle_is_not_used() {
 }
 
 #[test]
+fn idle_connections_of_origins_no_longer_asked_for_are_closed() {
+    giong::block_on(async {
+        let closed = Rc::new(Cell::new(0));
+        let script = |closed: Rc<Cell<usize>>| {
+            move |_, stream: TcpStream| {
+                let closed = closed.clone();
+                async move {
+                    let mut buf = Vec::new();
+                    while read_request(&stream, &mut buf).await.is_some() {
+                        write(&stream, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                    }
+                    closed.set(closed.get() + 1);
+                }
+            }
+        };
+        let first = scripted(script(closed.clone()));
+        let others: Vec<String> = (0..3)
+            .map(|_| scripted(script(Rc::new(Cell::new(0)))))
+            .collect();
+        let client = Client::builder()
+            .idle_timeout(Duration::from_millis(100))
+            .build();
+        client.get(&first).send().await.unwrap();
+        assert_eq!(client.connections(&first), (1, 1));
+
+        // Only other origins are asked for from now on.
+        for other in others.iter().cycle().take(6) {
+            sleep(Duration::from_millis(60)).await;
+            client.get(other).send().await.unwrap();
+        }
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(client.connections(&first), (0, 0));
+        assert_eq!(
+            closed.get(),
+            1,
+            "the first origin's connection is still open"
+        );
+        // The first origin is forgotten, not kept as an empty entry.
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("origins: 4"), "{debug}");
+    });
+}
+
+#[test]
 fn a_kept_alive_connection_closing_as_the_request_goes_is_retried_only_when_safe() {
     giong::block_on(async {
         // The first connection answers one request, then reads the next one
@@ -467,6 +511,36 @@ fn malformed_responses_are_errors_and_their_connection_is_dropped() {
 }
 
 #[test]
+fn bytes_that_arrive_while_a_connection_is_idle_keep_it_out_of_use() {
+    giong::block_on(async {
+        let base = scripted(|n, stream| async move {
+            let mut buf = Vec::new();
+            while read_request(&stream, &mut buf).await.is_some() {
+                write(&stream, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                if n == 0 {
+                    // What some servers send to an idle connection before
+                    // closing it, here without the close.
+                    sleep(Duration::from_millis(20)).await;
+                    write(
+                        &stream,
+                        b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                    sleep(Duration::from_secs(5)).await;
+                    return;
+                }
+            }
+        });
+        let client = Client::new();
+        for method in ["GET", "POST"] {
+            let r = client.request(method, &base).send().await.unwrap();
+            assert_eq!((r.status(), r.text().unwrap()), (200, "ok"), "{method}");
+            sleep(Duration::from_millis(100)).await;
+        }
+    });
+}
+
+#[test]
 fn bytes_after_a_response_keep_its_connection_out_of_the_pool() {
     giong::block_on(async {
         let base = scripted(|_, stream| async move {
@@ -568,11 +642,13 @@ fn redirects_are_followed_the_way_browsers_do() {
     giong::block_on(async {
         let other = serve(|req: Request| async move {
             Response::text(format!(
-                "other {} auth={}",
+                "other {} auth={} host={}",
                 req.target(),
-                req.header_str("authorization").unwrap_or("-")
+                req.header_str("authorization").unwrap_or("-"),
+                req.header_str("host").unwrap_or("-")
             ))
         });
+        let other_host = other.trim_start_matches("http://").to_owned();
         let base = serve(move |req: Request| {
             let other = other.clone();
             async move {
@@ -625,13 +701,17 @@ fn redirects_are_followed_the_way_browsers_do() {
             "POST /end auth=- type=application/json body={}"
         );
 
-        // Credentials stay with their origin.
+        // Credentials stay with their origin, and so does a Host header.
         let r = get("/away")
             .header("Authorization", "Bearer s3cret")
+            .header("Host", "intranet.example")
             .send()
             .await
             .unwrap();
-        assert_eq!(r.text().unwrap(), "other /landed auth=-");
+        assert_eq!(
+            r.text().unwrap(),
+            format!("other /landed auth=- host={other_host}")
+        );
         let r = get("/303")
             .header("Authorization", "Bearer s3cret")
             .send()

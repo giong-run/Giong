@@ -10,6 +10,40 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- `giong-http` server: more than two blank lines before a request line start the request
+  timeout. A client sending `\r\n` once a minute kept a connection open for ever.
+- `giong-http` client: a kept-alive connection that received anything while idle (a `408
+  Request Timeout` that some servers send before closing, the rest of a body longer than
+  its `Content-Length`) is no longer used. The bytes were read as the response to the next
+  request.
+- `giong-http` client: a `Host` header set by hand is not sent to another origin after a
+  redirect, like `Authorization` and `Cookie`.
+- `giong-http` client: idle connections of an origin that is not asked for again are
+  closed after the idle timeout, and the origin is forgotten. Before, they stayed open,
+  with their entry, for as long as the client lived.
+- `giong-postgres` and `giong-mysql`: transactions no longer run on the connections a
+  pool shares. `Pool::query`, `query_one`, `query_opt` and `execute` (and `insert` in
+  giong-mysql) refuse `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` and
+  the other transaction statements (MySQL also `XA`, `LOCK` and `UNLOCK`) before sending
+  anything, with the new error codes `GIONG-E3011` and `GIONG-E3111`
+  (`ErrorKind::Statement`). Before, `pool.execute("BEGIN", &[])` left a connection that
+  other tasks share inside a transaction: their statements ran in it and were never
+  committed, though they had been told they succeeded. A `Pool::batch_execute` that leaves
+  a transaction open (or, in MySQL, autocommit off) now closes its connection, which rolls
+  the transaction back, and fails with `ErrorKind::Closed`, as do the statements pipelined
+  behind it.
+- `giong-postgres` and `giong-mysql`: a `PooledClient` given back while a statement is
+  still in flight (its future dropped by a timeout) queues a `ROLLBACK` first. If that
+  statement was `BEGIN`, the connection went back to the shared pool inside a
+  transaction, because the last answer still said there was none. giong-mysql closes a
+  connection given back with autocommit off.
+- `giong-postgres` and `giong-mysql`: `Pool::get` waiting for a connection is woken when a
+  statement whose future was dropped frees it. It waited out the wait timeout and failed
+  with `PoolTimeout`.
+- `giong-postgres`: rows without columns (`SELECT FROM t`) are counted; `query` returned
+  none.
+- `giong-mysql`: a `TIME` with more days than MySQL allows no longer overflows when it is
+  read as text.
 - `giong-redis`: a `watch` cancelled while waiting for `WATCH`'s reply sends `UNWATCH`.
   Before, the watch stayed on the connection, and once a pool shared it, another task's
   atomic pipeline could be skipped by `EXEC` while reporting success.
@@ -21,6 +55,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - `giong-redis`: a task waiting in `Pool::take` is woken when a shared command whose
   future was dropped frees the connection. Before, it slept until the wait timeout and
   could fail with `PoolTimeout` while the connection was free.
+
+### Security
+
+- `giong`: `localhost` and names under `.localhost` resolve to the loopback addresses
+  without asking DNS (RFC 6761). Before, they went through the search list first, so a
+  wildcard record in a search domain, or a forged answer, could point `localhost` at
+  another machine, which `giong-postgres` and `giong-mysql` then trusted as local: no TLS,
+  the password sent in the clear, MySQL's RSA key fetched unverified. A hosts file entry
+  for such a name is used only if it is a loopback address.
+- `giong-http`: chunk extensions are limited to 16 KiB per body, on the server and in the
+  client. They counted toward no limit, so a peer could send about 4,000 bytes per byte of
+  body, all of it held in memory until the body ended (the flaw of Node.js
+  CVE-2024-22019). Such a request is answered with 400; such a response is an error.
 
 ## [0.3.0] - 2026-11-13
 
