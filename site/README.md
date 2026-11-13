@@ -8,6 +8,7 @@ site/
   build.py        generates the pages into public/ (run it, do not edit its output)
   content.py      what a person writes: the pitch, benchmark notes, code samples, FAQ
   md.py           the small Markdown renderer for ROADMAP.md and CHANGELOG.md
+  art.py          the drawings that explain the design (inline SVG, coloured by styles.css)
   public/         the folder that is deployed
     styles.css    every style; dark by default, light from the system or the toggle
     main.js       theme toggle, phone menu, copy buttons, code tabs, the ring animation
@@ -46,6 +47,16 @@ changes to the project reach the site without anyone touching `site/`:
 
 The build fails on a link between the site's own pages, or to an anchor, that does not
 exist. `python3 scripts/release.py check` runs it in CI on every pull request.
+
+## Drawings
+
+The diagrams on the home page, the docs and the benchmarks page are inline SVG written by
+`art.py`: one function per idea (thread per core, one syscall per tick, provided buffers,
+cancel safety, a request's path, the benchmark setup). They take their colours from the
+tokens in `styles.css`, so they follow the theme, and they are drawn on a 360-unit canvas so
+their text stays readable on a phone. Motion is CSS only and stops for readers who ask for
+reduced motion; the still picture says everything on its own. If the design they show
+changes, change the drawing in the same pull request.
 
 ## Changing the words or a number
 

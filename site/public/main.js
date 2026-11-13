@@ -91,7 +91,15 @@
     Object.keys(links).forEach(function (id) { var el = document.getElementById(id); if (el) spy.observe(el); });
   }
 
-  // 6. The tick. Operations queue on the ring; one io_uring_enter submits them
+  // 6. The drawings move only while they are on screen.
+  if ("IntersectionObserver" in window) {
+    var live = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { e.target.setAttribute("data-live", e.isIntersecting ? "1" : "0"); });
+    });
+    document.querySelectorAll(".ill-wrap").forEach(function (el) { live.observe(el); });
+  }
+
+  // 7. The tick. Operations queue on the ring; one io_uring_enter submits them
   //    all and reaps their completions. The second row counts what the same
   //    work costs when every operation is its own system call.
   var tick = document.getElementById("tick");

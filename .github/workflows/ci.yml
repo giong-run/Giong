@@ -179,6 +179,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the test binaries
         run: |
+          mkdir -p target
           cargo test --release --workspace --all-features --no-run --message-format=json |
             python3 -c '
           import json, sys
