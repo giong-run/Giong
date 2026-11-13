@@ -103,17 +103,28 @@ jobs:
       - name: Install MySQL ${{ matrix.mysql }}
         if: matrix.mysql
         # Oracle's generic Linux build, the minimal one (no debug binaries or
-        # test suite, about 60 MB), which Oracle makes for glibc 2.17 only. It
-        # links libaio.so.1, which Ubuntu 24.04 renamed libaio.so.1t64.
+        # test suite, about 60 MB), which Oracle makes for glibc 2.17 only.
+        # mysqld links libaio.so.1, which Ubuntu 24.04 renamed libaio.so.1t64.
+        # The mysql client, which the tests use to set the server up, links
+        # ncurses 5, which Ubuntu dropped in 24.04: it comes from Ubuntu
+        # 22.04, checked against the hashes in that release's package index.
         run: |
           v=${{ matrix.mysql }}
           name=mysql-$v-linux-glibc2.17-x86_64-minimal
           curl -fsSL --retry 3 "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz" \
             | tar -xJ -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"
+          pool=http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses
+          curl -fsSL --retry 3 -O "$pool/libtinfo5_6.3-2_amd64.deb" -O "$pool/libncurses5_6.3-2_amd64.deb"
+          printf '%s\n' \
+            "d2597b5aec92a930cf549e1b429ad892595813e72ec7814685ea146a9fb715e5  libtinfo5_6.3-2_amd64.deb" \
+            "d9b8efb37a056e01c46d93c7ef6977aa04ad2586978137d9a3954c15ad5d14c3  libncurses5_6.3-2_amd64.deb" \
+            | sha256sum -c -
           sudo apt-get update -q
-          sudo apt-get install -y -q libaio1t64 libnuma1
+          sudo apt-get install -y -q libaio1t64 libnuma1 ./libtinfo5_6.3-2_amd64.deb ./libncurses5_6.3-2_amd64.deb
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
           "$RUNNER_TEMP/$name/bin/mysqld" --version
+          "$RUNNER_TEMP/$name/bin/mysql" --version
           echo "GIONG_MYSQL_BIN=$RUNNER_TEMP/$name/bin" >> "$GITHUB_ENV"
       - name: Build Redis ${{ matrix.redis }}
         if: matrix.redis
