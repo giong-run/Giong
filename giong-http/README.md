@@ -114,6 +114,8 @@ let created = client
 - **Streaming.** `RequestBuilder::send_streaming()` returns once the head has arrived; `StreamingResponse::chunk()` gives the body piece by piece (64 KiB at most, decompressed), with no limit on its size and the timeout applying to each piece. Read to its end, the connection goes back to the pool; dropped before, it is closed.
 - **Errors that say what to do.** `Error::kind` is one of `Request`, `Connect`, `Timeout`, `TooLarge`, `Redirect`, `Closed`, `Protocol`, `Status`, `Decode` and `Proxy`, each with a giong code (GIONG-E1101 to E1110) and a page in [docs/errors](../docs/errors/README.md); `Error::is_transient` says whether retrying can help. Any status is a `Response`; `error_for_status` turns 4xx and 5xx into an error with the start of the body.
 
+Proxies, compression, streamed bodies and the `Proxy` error kind were added after giong-http 0.3.0: the 0.3.0 release does not have them.
+
 The client is not `Send`, like everything in giong: make one per worker (in `Builder::run`'s closure) and clone it into that worker's tasks.
 
 ### Client performance
