@@ -298,9 +298,18 @@ impl<S> Req<S> {
     }
 
     /// The request body, received in full before the handler runs (within
-    /// the server's `max_body_size`).
+    /// the server's `max_body_size`). Empty on a route that reads its body
+    /// as a stream: see [`body_stream`](Self::body_stream).
     pub fn body(&self) -> &[u8] {
         self.http.body()
+    }
+
+    /// The request body as it arrives, on a route of a router with
+    /// [`Router::stream_bodies`](crate::Router::stream_bodies); `None` on
+    /// other routes, whose body is in [`body`](Self::body). See
+    /// [`BodyStream`](crate::BodyStream).
+    pub fn body_stream(&self) -> Option<giong_http::BodyStream> {
+        self.http.body_stream()
     }
 
     /// The client's address; `None` over a Unix socket.

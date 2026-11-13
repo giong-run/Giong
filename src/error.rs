@@ -47,7 +47,7 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
-        /// giong-http's client, `E12xx` giong-web, `E2xxx` giong-tls, `E30xx`
+        /// giong-http, `E12xx` giong-web, `E2xxx` giong-tls, `E30xx`
         /// giong-postgres, `E31xx` giong-mysql and `E32xx` giong-redis. Each
         /// has a page under `docs/errors/` in the repository;
         /// [`url`](Code::url) links to it.
@@ -168,6 +168,21 @@ codes! {
     /// The proxy refused the request or the tunnel, or did not answer as a
     /// proxy does.
     HttpClientProxy = 1110, Other, "the HTTP proxy refused the request";
+
+    // ------------------------------------------------- giong-http server
+    /// A request body read as a stream went past the limit its handler set
+    /// with `Handler::stream_body`.
+    HttpBodyTooLarge = 1111, InvalidData, "request body too large";
+    /// A request body read as a stream ended early: the client closed the
+    /// connection or sent nothing for the request timeout, or the handler
+    /// answered before reading all of it.
+    HttpBodyIncomplete = 1112, UnexpectedEof, "request body cut short";
+    /// A request body read as a stream has broken chunked framing.
+    HttpBodyMalformed = 1113, InvalidData, "malformed request body";
+    /// A streamed response body cannot be sent any more: the client went
+    /// away, or the response is to a `HEAD` request or has a status without
+    /// a body.
+    HttpBodyNotSent = 1114, BrokenPipe, "response body not sent";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with

@@ -96,6 +96,10 @@ impl Compression {
     /// client that accepts gzip.
     fn eligible(&self, resp: &Response) -> bool {
         let len = resp.body_bytes().len();
+        if resp.is_streaming() {
+            // Its bytes are not known yet.
+            return false;
+        }
         if matches!(resp.status(), 204 | 206 | 304) || len < self.min_size || len > self.max_size {
             return false;
         }

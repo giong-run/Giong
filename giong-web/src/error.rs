@@ -19,6 +19,9 @@ use crate::req::IdBuf;
 /// an `Error` with status `500` (code `GIONG-E1210`), or `503` (code
 /// `GIONG-E1211`) when the error says a database, cache or upstream API could
 /// not be reached in time. Their message goes to the log, never to the client.
+/// The errors of a request body read as a stream are the client's doing:
+/// `413` (`GIONG-E1111`) past the route's limit, `400` (`GIONG-E1112`,
+/// `GIONG-E1113`) cut short or malformed.
 ///
 /// Errors meant for the client are made with a status, a stable code the
 /// client can match on, and a detail that says what to do:
@@ -265,6 +268,20 @@ impl Error {
     fn from_cause(cause: Box<dyn StdError + Send + Sync>) -> Self {
         match giong_code(&*cause) {
             Some(code) if is_unavailable(code) => Self::unavailable(cause),
+            // A streamed request body that went wrong: the client's doing.
+            Some(code @ Code::HttpBodyTooLarge) => Self::coded(
+                413,
+                code,
+                "the request body is larger than this route accepts",
+            )
+            .with_source(cause),
+            Some(code @ Code::HttpBodyIncomplete) => {
+                Self::coded(400, code, "the request body was cut short").with_source(cause)
+            }
+            Some(code @ Code::HttpBodyMalformed) => {
+                Self::coded(400, code, "the request body's chunked framing is broken")
+                    .with_source(cause)
+            }
             _ => Self::internal(cause),
         }
     }

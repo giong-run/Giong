@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
-use std::io;
+use std::io::{self, Write as _};
 use std::mem;
 use std::net::{Shutdown, SocketAddr};
 use std::ops::Deref;
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use giong::time::{sleep, timeout};
 
+use crate::body::{Failure, Next, Pipe, StreamBody};
 use crate::chunked::{Decoder, Progress};
 use crate::parse::{find_head_end, parse_head};
 use crate::request::{BodyBytes, Request};
@@ -197,6 +198,29 @@ pub trait Handler: 'static {
     /// Answers one request. The future may borrow from `self`; the server
     /// keeps the handler alive until every connection using it has closed.
     fn call(&self, req: Request) -> impl Future<Output = Response>;
+
+    /// Whether to read the body of `req` as it arrives, and up to how many
+    /// bytes.
+    ///
+    /// Called once the head of a request with a body has arrived, before
+    /// any of the body is read ([`Request::body`] is empty then). `None`,
+    /// the default, receives the whole body first, up to the server's
+    /// [`max_body_size`](Server::max_body_size), and then calls the
+    /// handler, as usual.
+    ///
+    /// `Some(limit)` calls the handler right away instead, with the body
+    /// readable through [`Request::body_stream`] (see
+    /// [`BodyStream`](crate::BodyStream)). A body announced as longer than
+    /// `limit` gets `413 Content Too Large` without calling the handler; a
+    /// chunked body that grows past it fails with `GIONG-E1111`. The
+    /// server's `max_body_size` does not apply.
+    ///
+    /// A handler that answers before reading the body to its end makes the
+    /// connection close after the response.
+    fn stream_body(&self, req: &Request) -> Option<u64> {
+        let _ = req;
+        None
+    }
 }
 
 impl<F, Fut> Handler for F
@@ -303,7 +327,8 @@ impl Server {
     }
 
     /// Largest accepted request body, in bytes (default: 1 MiB). Larger bodies
-    /// get `413 Content Too Large`.
+    /// get `413 Content Too Large`. A body read as a stream has the limit its
+    /// handler gives instead (see [`Handler::stream_body`]).
     pub fn max_body_size(mut self, bytes: usize) -> Self {
         self.cfg.max_body_size = bytes;
         self
@@ -521,6 +546,22 @@ enum End {
     Status(u16),
 }
 
+/// A request body read as it arrives (see `Handler::stream_body`).
+struct Streamed {
+    pipe: Rc<Pipe>,
+    chunked: bool,
+    /// The announced length, for a body that is not chunked.
+    length: u64,
+    limit: u64,
+    /// The client waits for `100 Continue` before sending the body.
+    expect_continue: bool,
+}
+
+/// Appends `n` in hexadecimal, as a chunk size.
+fn push_hex(out: &mut Vec<u8>, n: usize) {
+    let _ = write!(out, "{n:x}");
+}
+
 /// The head buffer back from a vectored write of `[head, body]`.
 fn into_head(mut bufs: Vec<Cow<'static, [u8]>>) -> Vec<u8> {
     match bufs.swap_remove(0) {
@@ -568,9 +609,11 @@ impl<T: Transport> Conn<T> {
     }
 
     async fn run<H: Handler>(mut self, handler: Rc<H>) {
+        // Set when the connection closes with part of a request body unread.
+        let mut linger = false;
         loop {
-            let req = match self.next_request().await {
-                Ok(req) => req,
+            let (req, streamed) = match self.next_request(&*handler).await {
+                Ok(next) => next,
                 Err(End::Close) => break,
                 Err(End::Status(status)) => {
                     self.reserve_out();
@@ -585,34 +628,63 @@ impl<T: Transport> Conn<T> {
             let head_only = req.method() == "HEAD";
             let wants_keep_alive = !req.head.close && (minor == 1 || req.head.keep_alive);
 
-            // Poll the handler once before deciding what to do with responses
-            // that are waiting: if it answers at once (the common case), they
-            // all go out in one write; if it has to wait, they go out first.
-            let mut fut = pin!(handler.call(req));
-            let first = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
-            let resp = match first {
-                Poll::Ready(resp) => resp,
-                Poll::Pending => {
+            let (resp, body_read) = match streamed {
+                None => {
+                    // Poll the handler once before deciding what to do with
+                    // responses that are waiting: if it answers at once (the
+                    // common case), they all go out in one write; if it has
+                    // to wait, they go out first.
+                    let mut fut = pin!(handler.call(req));
+                    let first = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+                    let resp = match first {
+                        Poll::Ready(resp) => resp,
+                        Poll::Pending => {
+                            if self.flush().await.is_err() {
+                                return;
+                            }
+                            fut.await
+                        }
+                    };
+                    (resp, true)
+                }
+                Some(body) => {
+                    // The body may take long to arrive: answers to earlier
+                    // requests go out first.
                     if self.flush().await.is_err() {
                         return;
                     }
-                    fut.await
+                    self.answer_streaming(&*handler, req, body).await
                 }
             };
 
             // Decided after the handler ran: a shutdown may have begun meanwhile.
             self.closing |= giong::is_shutting_down();
-            let keep_alive = wants_keep_alive && !self.closing;
+            let streams = resp.is_streaming() && resp.sends_body(head_only);
+            // Without chunked encoding (HTTP/1.0), a streamed body ends when
+            // the connection does.
+            let keep_alive =
+                wants_keep_alive && !self.closing && body_read && !(streams && minor == 0);
             self.reserve_out();
             let mut resp = resp;
-            if resp.sends_body(head_only) && resp.body_len() >= SEPARATE_BODY_AT {
+            if streams {
+                resp.write_head(&mut self.out, minor, keep_alive);
+                if let Body::Stream(body) = resp.take_body() {
+                    drop(resp);
+                    if self.write_stream(&body, minor == 1).await.is_err() {
+                        return;
+                    }
+                }
+            } else if resp.sends_body(head_only) && resp.body_len() >= SEPARATE_BODY_AT {
                 // Sent from where it is, right after its head.
                 resp.write_head(&mut self.out, minor, keep_alive);
                 self.body = resp.take_body();
             } else {
+                // A streamed body that is not sent (`HEAD`, 204, 304) is
+                // dropped here, which tells its sender.
                 resp.write_to(&mut self.out, minor, keep_alive, head_only);
             }
             if !keep_alive {
+                linger = !body_read;
                 break;
             }
             // Nothing may be appended after a separate body: send it now.
@@ -622,14 +694,206 @@ impl<T: Transport> Conn<T> {
             }
         }
         if self.flush().await.is_ok() {
-            self.close_write().await;
+            if linger {
+                self.lingering_close().await;
+            } else {
+                self.close_write().await;
+            }
         }
     }
 
-    /// Receives and parses the next request, body included.
-    async fn next_request(&mut self) -> Result<Request, End> {
+    /// Runs the handler of a request whose body it reads as a stream, while
+    /// the connection reads the body into the stream. Returns the response,
+    /// and whether the body was read to its end: only then can another
+    /// request follow on the connection.
+    async fn answer_streaming<H: Handler>(
+        &mut self,
+        handler: &H,
+        req: Request,
+        body: Streamed,
+    ) -> (Response, bool) {
+        let mut pumped = None;
+        let resp = {
+            let mut pump = pin!(self.pump(&body));
+            let mut fut = pin!(handler.call(req));
+            poll_fn(|cx| {
+                if pumped.is_none() {
+                    if let Poll::Ready(result) = pump.as_mut().poll(cx) {
+                        pumped = Some(result);
+                    }
+                }
+                fut.as_mut().poll(cx)
+            })
+            .await
+        };
+        // If the handler answered first, nothing reads the rest of the body;
+        // a stream it kept says so. (The first end counts.)
+        body.pipe.finish(Err(Failure::Abandoned));
+        (resp, pumped == Some(Ok(())))
+    }
+
+    /// Reads a streamed request body into its pipe, piece by piece, from
+    /// the moment the handler first asks for it.
+    async fn pump(&mut self, body: &Streamed) -> Result<(), Failure> {
+        body.pipe.asked().await;
+        let result = if body.chunked {
+            self.pump_chunked(body).await
+        } else {
+            self.pump_length(body).await
+        };
+        body.pipe.finish(result);
+        result
+    }
+
+    async fn pump_length(&mut self, body: &Streamed) -> Result<(), Failure> {
+        let mut left = body.length;
+        // What arrived with the head.
+        let have = (self.buf.len() - self.pos).min(usize::try_from(left).unwrap_or(usize::MAX));
+        if have > 0 {
+            let piece = self.buf[self.pos..self.pos + have].to_vec();
+            self.pos += have;
+            left -= have as u64;
+            body.pipe.put(piece).await;
+        }
+        if left > 0 {
+            self.continue_body(body).await?;
+        }
+        while left > 0 {
+            let chunk = self.recv_body().await?;
+            let n = usize::try_from(left).map_or(chunk.len(), |left| left.min(chunk.len()));
+            let piece = chunk[..n].to_vec();
+            if n < chunk.len() {
+                // The start of the next request.
+                self.append(&chunk[n..]);
+            }
+            drop(chunk);
+            left -= n as u64;
+            body.pipe.put(piece).await;
+        }
+        Ok(())
+    }
+
+    async fn pump_chunked(&mut self, body: &Streamed) -> Result<(), Failure> {
+        let mut decoder = Decoder::new(usize::try_from(body.limit).unwrap_or(usize::MAX));
+        // What arrived with the head, then what follows, less what the
+        // decoder has read.
+        let mut input = self.buf[self.pos..].to_vec();
+        self.pos = self.buf.len();
+        let mut waited = false;
+        loop {
+            let progress = decoder.feed(&input);
+            let piece = mem::take(&mut decoder.body);
+            if !piece.is_empty() {
+                body.pipe.put(piece).await;
+            }
+            match progress {
+                Ok(Progress::Done(used)) => {
+                    if used < input.len() {
+                        // The start of the next request.
+                        self.append(&input[used..]);
+                    }
+                    return Ok(());
+                }
+                Ok(Progress::NeedMore) => {
+                    input.drain(..decoder.consume());
+                    if !waited {
+                        waited = true;
+                        self.continue_body(body).await?;
+                    }
+                    let chunk = self.recv_body().await?;
+                    input.extend_from_slice(&chunk);
+                }
+                Err(413) => return Err(Failure::TooLarge(body.limit)),
+                Err(_) => return Err(Failure::Malformed),
+            }
+        }
+    }
+
+    /// Answers `Expect: 100-continue` before waiting for a streamed body.
+    async fn continue_body(&mut self, body: &Streamed) -> Result<(), Failure> {
+        if body.expect_continue {
+            self.reserve_out();
+            self.out.extend_from_slice(b"HTTP/1.1 100 Continue\r\n\r\n");
+            self.flush().await.map_err(|_| Failure::Cut)?;
+        }
+        Ok(())
+    }
+
+    /// The next piece of a streamed request body, within the request
+    /// timeout.
+    async fn recv_body(&self) -> Result<T::Chunk, Failure> {
+        match timeout(self.cfg.request_timeout, self.stream.recv()).await {
+            Ok(Ok(chunk)) if !chunk.is_empty() => Ok(chunk),
+            _ => Err(Failure::Cut),
+        }
+    }
+
+    /// Writes a streamed response body as its producer sends it, after the
+    /// head that is in `out`: each piece as a chunk (as it is, for HTTP/1.0),
+    /// written as soon as it arrives. `Err` if the client stopped reading
+    /// or the producer aborted: the connection then closes without ending
+    /// the body, so the client can tell it is incomplete.
+    async fn write_stream(&mut self, body: &StreamBody, chunked: bool) -> Result<(), End> {
+        // A large piece went out without the CRLF that ends its chunk.
+        let mut open = false;
+        loop {
+            let mut next = pin!(body.next());
+            let next = match poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await {
+                Poll::Ready(next) => next,
+                Poll::Pending => {
+                    // Nothing more yet: what is waiting goes out now.
+                    self.flush().await?;
+                    next.await
+                }
+            };
+            // Nothing may be appended after a separate body.
+            if !matches!(self.body, Body::Empty) {
+                self.flush().await?;
+            }
+            self.reserve_out();
+            if open {
+                self.out.extend_from_slice(b"\r\n");
+                open = false;
+            }
+            match next {
+                Next::Piece(piece) => {
+                    if chunked {
+                        push_hex(&mut self.out, piece.len());
+                        self.out.extend_from_slice(b"\r\n");
+                    }
+                    if piece.len() >= SEPARATE_BODY_AT {
+                        // Sent from where it is.
+                        self.body = Body::Owned(piece);
+                        open = chunked;
+                    } else {
+                        self.out.extend_from_slice(&piece);
+                        if chunked {
+                            self.out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Next::End => {
+                    if chunked {
+                        self.out.extend_from_slice(b"0\r\n\r\n");
+                    }
+                    return Ok(());
+                }
+                Next::Aborted => {
+                    let _ = self.flush().await;
+                    return Err(End::Close);
+                }
+            }
+        }
+    }
+
+    /// Receives and parses the next request, body included, unless the
+    /// handler reads the body as a stream: the second value then says how.
+    async fn next_request<H: Handler>(
+        &mut self,
+        handler: &H,
+    ) -> Result<(Request, Option<Streamed>), End> {
         let mut blank_lines = 0;
-        let head = loop {
+        let mut head = loop {
             // Empty lines before a request line are ignored (RFC 9112 §2.2).
             while self.buf[self.pos..].starts_with(b"\r\n") {
                 self.pos += 2;
@@ -655,6 +919,40 @@ impl<T: Transport> Conn<T> {
             let idle = data.is_empty() && blank_lines <= IDLE_BLANK_LINES;
             self.read_more(idle).await?;
         };
+
+        if head.chunked || head.content_length.is_some_and(|len| len > 0) {
+            let start = self.pos + head.len;
+            let mut req = Request {
+                buf: self.buf.clone(),
+                start: self.pos,
+                head,
+                body: BodyBytes::InBuffer(start..start),
+                peer: self.peer,
+            };
+            match handler.stream_body(&req) {
+                Some(limit) => {
+                    let length = req.head.content_length;
+                    if length.is_some_and(|len| len > limit) {
+                        return Err(End::Status(413));
+                    }
+                    let pipe = Rc::new(Pipe::new(length));
+                    let streamed = Streamed {
+                        pipe: pipe.clone(),
+                        chunked: req.head.chunked,
+                        length: length.unwrap_or(0),
+                        limit,
+                        expect_continue: req.head.expect_continue && req.head.minor == 1,
+                    };
+                    req.body = BodyBytes::Stream(pipe);
+                    // The body is the pump's to read from here.
+                    self.pos += req.head.len;
+                    self.scanned = 0;
+                    self.deadline = None;
+                    return Ok((req, Some(streamed)));
+                }
+                None => head = req.head,
+            }
+        }
 
         let mut interim_sent = false;
         let (body, total) = if head.chunked {
@@ -698,7 +996,7 @@ impl<T: Transport> Conn<T> {
         self.pos += total;
         self.scanned = 0;
         self.deadline = None;
-        Ok(req)
+        Ok((req, None))
     }
 
     /// Answers `Expect: 100-continue` once, before waiting for the body.
@@ -794,7 +1092,7 @@ impl<T: Transport> Conn<T> {
 
     /// Writes everything in `out`. One send per batch of responses.
     async fn flush(&mut self) -> Result<(), End> {
-        if self.out.is_empty() {
+        if self.out.is_empty() && matches!(self.body, Body::Empty) {
             return Ok(());
         }
         let out = mem::take(&mut self.out);

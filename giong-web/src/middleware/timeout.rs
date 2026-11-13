@@ -15,7 +15,12 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// connection whose query was abandoned instead of reusing it.
 ///
 /// The limit covers producing the response, not receiving the request
-/// (giong-http's `request_timeout`) or sending it (`write_timeout`).
+/// (giong-http's `request_timeout`) or sending it (`write_timeout`). So a
+/// request whose body is read as a stream
+/// ([`Router::stream_bodies`](crate::Router::stream_bodies)) has no limit
+/// here, since the handler runs while the body arrives; and for a response
+/// body written as it is produced, the limit ends when the handler returns
+/// the response.
 #[derive(Clone, Copy, Debug)]
 pub struct Timeout {
     limit: Duration,
@@ -41,6 +46,9 @@ impl Timeout {
 
 impl<S: 'static> Middleware<S> for Timeout {
     async fn call(&self, req: Req<S>, next: Next<'_, S>) -> Result<Response, Error> {
+        if req.body_stream().is_some() {
+            return Ok(next.run(req).await);
+        }
         match giong::time::timeout(self.limit, next.run(req)).await {
             Ok(resp) => Ok(resp),
             Err(_) => Err(Error::coded(

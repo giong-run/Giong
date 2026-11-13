@@ -190,13 +190,19 @@ a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
 
 ## giong-web 0.1 and giong-mcp 0.1
 
-- [ ] Streaming request and response bodies in `giong-http`.
+- [x] Streaming request and response bodies in `giong-http`: `Handler::stream_body` and
+      `BodyStream` for requests, `Body::channel` for responses, backpressure both ways;
+      `Router::stream_bodies` in `giong-web`.
 - [x] `giong-web`, a new crate: a router with path parameters, middleware (logging,
       timeouts, CORS, request ids, compression), JSON through `serde` behind a feature.
       Errors are problem+json bodies with giong codes (`GIONG-E1201` to `E1213`).
       Benchmarked against axum (`bench/web.sh`).
-- [ ] Structured logs as JSON lines, and an optional `tracing` feature. The JSON lines
-      are done (`giong_web::middleware::Logger`); `tracing` is not.
+- [x] Structured logs as JSON lines (`giong_web::middleware::Logger`), and an optional
+      `tracing` feature (`giong_web::middleware::Trace`, a span per request with
+      OpenTelemetry's field names).
+- [x] A complete example REST API (`examples/rest-api`: CRUD on PostgreSQL, a Redis
+      cache, HTTPS), and the same API on axum to measure it against
+      (`bench/rest-api.sh`).
 - [ ] `giong-mcp`, a new crate: the MCP server described under
       [Agent-first](#agent-first).
 

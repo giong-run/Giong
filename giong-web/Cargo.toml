@@ -17,6 +17,8 @@ categories = ["web-programming::http-server", "network-programming", "asynchrono
 serde = ["dep:serde", "dep:serde_json"]
 # HTTPS: `Server::serve_tls`, re-exported from giong-http.
 tls = ["giong-http/tls"]
+# `middleware::Trace`: a `tracing` span per request.
+tracing = ["dep:tracing"]
 
 [dependencies]
 giong = { path = "..", version = "0.3.0" }
@@ -26,6 +28,7 @@ giong-http = { path = "../giong-http", version = "0.3.0" }
 miniz_oxide = "0.9"
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+tracing = { version = "0.1.40", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 giong-http = { path = "../giong-http", version = "0.3.0", features = ["client"] }
@@ -35,6 +38,10 @@ serde = { version = "1", features = ["derive"] }
 [[test]]
 name = "serde"
 required-features = ["serde"]
+
+[[test]]
+name = "trace"
+required-features = ["tracing"]
 
 [lints.rust]
 # Set by `cargo fuzz` (see fuzz/).

@@ -1,0 +1,14 @@
+POST /sr HTTP/1.1
+Host: a
+Transfer-Encoding: chunked
+Expect: 100-continue
+
+3
+abc
+2
+de
+0
+
+GET /rx HTTP/1.1
+Host: a
+

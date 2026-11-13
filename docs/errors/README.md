@@ -56,7 +56,7 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
 
-## giong-http (its client)
+## giong-http
 
 | Code | `Code::` | Meaning |
 |---|---|---|
@@ -70,6 +70,10 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | [GIONG-E1108](E1108.md) | `HttpClientStatus` | HTTP error status |
 | [GIONG-E1109](E1109.md) | `HttpClientDecode` | cannot decode the response body |
 | [GIONG-E1110](E1110.md) | `HttpClientProxy` | the HTTP proxy refused the request |
+| [GIONG-E1111](E1111.md) | `HttpBodyTooLarge` | request body too large |
+| [GIONG-E1112](E1112.md) | `HttpBodyIncomplete` | request body cut short |
+| [GIONG-E1113](E1113.md) | `HttpBodyMalformed` | malformed request body |
+| [GIONG-E1114](E1114.md) | `HttpBodyNotSent` | response body not sent |
 
 ## giong-web
 
