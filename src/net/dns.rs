@@ -189,6 +189,33 @@ impl ResolverConfig {
     }
 }
 
+/// The addresses of a `localhost` name (RFC 6761, section 6.3): the loopback
+/// addresses the hosts file gives it, or `::1` and `127.0.0.1`.
+///
+/// Such a name is never sent to a DNS server. Database clients treat
+/// `localhost` as this machine, connecting without TLS and sending passwords
+/// they would not send over a network; a search domain with a wildcard record,
+/// or a forged answer, must not be able to point it at another machine. For
+/// the same reason a hosts file entry that is not a loopback address is
+/// ignored.
+fn localhost(mut from_hosts: Vec<IpAddr>) -> Vec<IpAddr> {
+    from_hosts.retain(is_loopback);
+    if from_hosts.is_empty() {
+        vec![Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()]
+    } else {
+        from_hosts
+    }
+}
+
+fn is_loopback(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 fn read_optional(path: &str) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -283,11 +310,14 @@ impl Resolver {
         }
         validate_name(host)?;
         let cfg = &self.inner.cfg;
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        if key == "localhost" || key.ends_with(".localhost") {
+            return Ok(localhost(cfg.hosts_lookup(host)));
+        }
         let found = cfg.hosts_lookup(host);
         if !found.is_empty() {
             return Ok(found);
         }
-        let key = host.trim_end_matches('.').to_ascii_lowercase();
         if let Some(addrs) = self.cached(&key) {
             return Ok(addrs);
         }
@@ -303,10 +333,6 @@ impl Resolver {
                 // report the problem if no candidate resolves.
                 Err(e) => last_err = Some(e),
             }
-        }
-        // RFC 6761: localhost is the loopback interface even if no file says so.
-        if key == "localhost" || key.ends_with(".localhost") {
-            return Ok(vec![Ipv6Addr::LOCALHOST.into(), Ipv4Addr::LOCALHOST.into()]);
         }
         Err(last_err.unwrap_or_else(|| {
             raise(

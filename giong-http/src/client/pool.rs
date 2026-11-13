@@ -92,7 +92,7 @@ pub(crate) async fn acquire(
                 }
             } else {
                 while let Some(conn) = p.idle.pop() {
-                    if conn.idle_since.elapsed() >= idle_timeout || conn.is_closed_by_peer() {
+                    if conn.idle_since.elapsed() >= idle_timeout || conn.is_spoiled() {
                         p.open -= 1;
                         continue;
                     }
@@ -140,6 +140,16 @@ pub(crate) fn put_back(pool: &Shared, conn: Conn, idle_timeout: Duration) {
     p.idle.retain(|c| c.idle_since.elapsed() < idle_timeout);
     p.open -= before - p.idle.len();
     p.idle.push(conn);
+}
+
+/// Closes the connections that have been idle for `idle_timeout`. Returns
+/// whether the origin is left with no connection and nobody waiting.
+pub(crate) fn sweep(pool: &Shared, idle_timeout: Duration) -> bool {
+    let mut p = pool.borrow_mut();
+    let before = p.idle.len();
+    p.idle.retain(|c| c.idle_since.elapsed() < idle_timeout);
+    p.open -= before - p.idle.len();
+    p.open == 0 && p.waiters.is_empty()
 }
 
 /// Gives up a place: a connection closed, or one could not be opened. The
