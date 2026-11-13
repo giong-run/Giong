@@ -16,7 +16,9 @@
 # older than 6.0, io_uring from 6.0 on (GIONG_TEST_EXPECT_DRIVER overrides
 # that), so a kernel that quietly puts giong on epoll fails the run. With
 # GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS set (names separated by commas, or empty
-# for none), it also checks which kernel bugs giong had to work around.
+# for none), it also checks which kernel bugs giong had to work around, and
+# with GIONG_TEST_EXPECT_IO_URING_FEATURES which optional io_uring features it
+# found.
 #
 # The test binaries are built on the host, then packed into an initramfs with
 # a static busybox and the shared libraries they need; the guest boots that
@@ -35,7 +37,8 @@ if [ ${#VERSIONS[@]} -eq 0 ]; then
     # 6.0: the oldest kernel giong's io_uring driver supports (COOP_TASKRUN,
     #      no DEFER_TASKRUN).
     # 6.1: the first with DEFER_TASKRUN, as the long-term-support series ships it.
-    VERSIONS=(5.15.225 6.0.19 6.1.155)
+    # 6.12: the first with packed buffer rings (IOU_PBUF_RING_INC).
+    VERSIONS=(5.15.225 6.0.19 6.1.155 6.12.117)
 fi
 WORK="${CARGO_TARGET_DIR:-target}/kernels"
 MEMORY="${MEMORY:-2G}"
@@ -107,11 +110,12 @@ for arg in $(cat /proc/cmdline); do
     case "$arg" in
         giong.expect_driver=*) export GIONG_TEST_EXPECT_DRIVER="${arg#*=}" ;;
         giong.expect_workarounds=*) export GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS="${arg#*=}" ;;
+        giong.expect_features=*) export GIONG_TEST_EXPECT_IO_URING_FEATURES="${arg#*=}" ;;
     esac
 done
 # A line of its own: the console's escape codes end up in front of the first one.
 echo
-echo "GIONG-EXPECT driver=${GIONG_TEST_EXPECT_DRIVER:-} workarounds=${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS-unchecked}"
+echo "GIONG-EXPECT driver=${GIONG_TEST_EXPECT_DRIVER:-} workarounds=${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS-unchecked} features=${GIONG_TEST_EXPECT_IO_URING_FEATURES-unchecked}"
 # The tests open thousands of sockets; init starts with a limit of 1024.
 ulimit -n 65536
 export TMPDIR=/tmp HOME=/tmp RUST_BACKTRACE=1
@@ -196,6 +200,9 @@ for version in "${VERSIONS[@]}"; do
     cmdline="console=ttyS0 quiet panic=-1 oops=panic giong.expect_driver=$expect"
     if [ -n "${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS+set}" ]; then
         cmdline+=" giong.expect_workarounds=$GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS"
+    fi
+    if [ -n "${GIONG_TEST_EXPECT_IO_URING_FEATURES+set}" ]; then
+        cmdline+=" giong.expect_features=$GIONG_TEST_EXPECT_IO_URING_FEATURES"
     fi
     timeout "${TIMEOUT:-3600}" qemu-system-x86_64 "${accel[@]}" -smp "$CPUS" -m "$MEMORY" \
         -kernel "$kernel" -initrd "$initrd" \

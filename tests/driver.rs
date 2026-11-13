@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use giong::error::{self, Code};
 use giong::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
-use giong::{ChosenBy, DriverKind};
+use giong::{ChosenBy, DriverKind, IoUringFeature};
 
 /// `true` if io_uring works here (it is blocked, for instance, under
 /// `scripts/no-io-uring.py` or in a container). Where CI says it must work
@@ -380,4 +380,85 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
             .unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `(major, minor)` of the running kernel.
+fn kernel_version() -> (u32, u32) {
+    // SAFETY: `utsname` is plain data; `uname` fills it.
+    let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::uname(&mut u) }, 0);
+    // SAFETY: `release` is NUL-terminated.
+    let release = unsafe { std::ffi::CStr::from_ptr(u.release.as_ptr()) }.to_string_lossy();
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    let major = parts.next().unwrap().parse().unwrap();
+    let minor = parts.next().unwrap().parse().unwrap();
+    (major, minor)
+}
+
+/// The io_uring features a worker reports are those the kernel has, less
+/// the ones `GIONG_IO_URING_OFF` turns off; `scripts/kernels.sh` says which
+/// to expect of the kernels it boots (`GIONG_TEST_EXPECT_IO_URING_FEATURES`).
+#[test]
+fn io_uring_features_are_the_ones_the_kernel_has() {
+    let features = || {
+        giong::Builder::new()
+            .driver(DriverKind::IoUring)
+            .block_on(async { giong::driver_choice() })
+            .unwrap()
+    };
+    if std::env::var_os(CHILD).is_some() {
+        println!("features: {:?}", features().io_uring_features);
+        return;
+    }
+    let epoll = giong::Builder::new()
+        .driver(DriverKind::Epoll)
+        .block_on(async { giong::driver_choice() })
+        .unwrap();
+    assert!(epoll.io_uring_features.is_empty());
+    if !io_uring_available() {
+        return;
+    }
+    let names =
+        |list: &[IoUringFeature]| -> Vec<&'static str> { list.iter().map(|f| f.name()).collect() };
+    let choice = features();
+    let got = names(&choice.io_uring_features);
+    for f in &choice.io_uring_features {
+        assert!(choice.to_string().contains(f.name()), "{choice}");
+    }
+    if std::env::var_os("GIONG_IO_URING_OFF").is_none() {
+        if let Ok(expected) = std::env::var("GIONG_TEST_EXPECT_IO_URING_FEATURES") {
+            assert_eq!(got.join(","), expected);
+        }
+        if kernel_version() >= (6, 12) {
+            assert!(got.contains(&"packed-buffers"), "{got:?}");
+        }
+    }
+
+    // Turned off, one by one and all at once.
+    for off in IoUringFeature::ALL.iter().map(|f| f.name()).chain(["all"]) {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "io_uring_features_are_the_ones_the_kernel_has",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("GIONG_IO_URING_OFF", off)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}");
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with("features: "))
+            .unwrap();
+        for f in IoUringFeature::ALL {
+            let shown = line.contains(&format!("{f:?}"));
+            if off == "all" || off == f.name() {
+                assert!(!shown, "{off}: {line}");
+            } else {
+                assert_eq!(shown, got.contains(&f.name()), "{off}: {line}");
+            }
+        }
+    }
 }

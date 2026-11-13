@@ -831,6 +831,12 @@ impl Builder {
     /// with io_uring a worker lends the kernel 16 of them at first and twice
     /// as many each time a turn of the event loop takes most of those. A
     /// worker serving a few connections touches a few buffers.
+    ///
+    /// On Linux 6.12 and newer, stream receives fill these buffers piece by
+    /// piece ([`IoUringFeature::PackedBuffers`](crate::IoUringFeature::PackedBuffers)):
+    /// a hundred connections that each send a short request share one or two
+    /// buffers instead of taking one each. A buffer is free again once every
+    /// [`RecvBuf`](crate::buf::RecvBuf) cut from it has been dropped.
     pub fn recv_buffers(mut self, count: usize, size: usize) -> Self {
         self.buf_count = count.clamp(1, 32768).next_power_of_two() as u16;
         self.buf_size = size.max(64);

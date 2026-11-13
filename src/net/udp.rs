@@ -13,7 +13,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::{close_socket, inet_addr, no_addresses, os_err, unexpected, wait_for_pool, MultiSlot};
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
-use crate::driver::{buffer_id, Io, MultiIo, MultiKind, MultiPoll};
+use crate::driver::{Io, MultiIo, MultiKind, MultiPoll};
 use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime;
@@ -242,31 +242,16 @@ impl UdpSocket {
             let mut driver = w.driver.borrow_mut();
             loop {
                 match driver.poll_multi(key, cx.waker()) {
-                    MultiPoll::Item(res, flags) => {
-                        let bid = buffer_id(flags);
-                        return Poll::Ready(match (res, bid) {
-                            (n, Some(bid)) if n > 0 => Datagram::parse(RecvBuf::pooled(
-                                driver.pool().clone(),
-                                bid,
-                                n as usize,
-                            )),
-                            (n, bid) => {
-                                if let Some(bid) = bid {
-                                    driver.pool().recycle(bid);
-                                }
-                                if n < 0 {
-                                    Err(os_err(n))
-                                } else {
-                                    Err(unexpected("io_uring returned a datagram without a buffer"))
-                                }
-                            }
+                    MultiPoll::Item(res) => {
+                        return Poll::Ready(if res < 0 {
+                            Err(os_err(res))
+                        } else {
+                            Err(unexpected("io_uring returned a datagram without a buffer"))
                         });
                     }
-                    MultiPoll::Heap(data) => {
-                        return Poll::Ready(Datagram::parse(RecvBuf::heap(data)))
-                    }
+                    MultiPoll::Data(buf) => return Poll::Ready(Datagram::parse(buf)),
                     MultiPoll::NeedArm => {
-                        if !wait_for_pool(&mut driver, cx) {
+                        if !wait_for_pool(&mut driver, cx, true) {
                             return Poll::Pending;
                         }
                         let io = MultiIo::RecvMsg {

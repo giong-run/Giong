@@ -8,8 +8,8 @@ tokio-raw                 -        -        -
 go                        -        -        -
 
 server              peak MiB     req/s   under load
-giong-http              50.3    357607
-giong-http-epoll        14.3    330696
+giong-http              23.4    423044
+giong-http-epoll        14.7    395974
 axum                   124.2    211357
 tokio-raw               63.5    302697
 go                     184.0    141709

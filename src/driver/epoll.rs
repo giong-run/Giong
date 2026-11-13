@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use super::blocking::{self, Cancel, Completions};
 use super::{Io, MultiIo, MultiKind, MultiPoll, Park, Start, BUFFER_SHIFT, F_BUFFER, F_MORE};
-use crate::buf::BufPool;
+use crate::buf::{BufPool, RecvBuf};
 use crate::slab::Slab;
 
 /// Immediate operations a task may complete in one poll before it yields.
@@ -723,7 +723,7 @@ impl Epoll {
         };
         if let Err(e) = self.register(fd) {
             self.disarm(key);
-            return MultiPoll::Item(e, 0);
+            return MultiPoll::Item(e);
         }
         let outcome = match io {
             MultiIo::Accept { fd } => self.accept(fd),
@@ -731,7 +731,13 @@ impl Epoll {
             MultiIo::RecvMsg { fd, hdr } => self.recvmsg_into_pool(fd, hdr),
         };
         match outcome {
-            Some(Ok((res, flags))) => MultiPoll::Item(res, flags),
+            Some(Ok((res, flags))) => match super::buffer_id(flags) {
+                Some(bid) if res > 0 => {
+                    let pool = self.pool.clone();
+                    MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, res as u32))
+                }
+                _ => MultiPoll::Item(res),
+            },
             Some(Err(res)) if is_would_block(res) => {
                 self.wait(fd, Dir::Read, waker);
                 MultiPoll::Pending
@@ -740,7 +746,7 @@ impl Epoll {
                 // Like a multishot that ended with an error: the next poll
                 // arms it again.
                 self.disarm(key);
-                MultiPoll::Item(res, 0)
+                MultiPoll::Item(res)
             }
             None => {
                 // No pool buffer: the caller waits for one, then arms again.

@@ -36,7 +36,7 @@ use std::task::{Context, Poll};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
-use crate::driver::{buffer_id, Driver, Io, MultiIo, MultiKind, MultiPoll};
+use crate::driver::{Driver, Io, MultiIo, MultiKind, MultiPoll};
 use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime::{self, Worker};
@@ -150,12 +150,12 @@ impl ListenSocket {
             let mut driver = w.driver.borrow_mut();
             loop {
                 match driver.poll_multi(key, cx.waker()) {
-                    MultiPoll::Item(res, _) if res >= 0 => {
+                    MultiPoll::Item(res) if res >= 0 => {
                         // SAFETY: a fresh descriptor returned by accept.
                         return Poll::Ready(Ok(unsafe { Socket::from_raw_fd(res) }));
                     }
-                    MultiPoll::Item(res, _) => return Poll::Ready(Err(os_err(res))),
-                    MultiPoll::Heap(_) => unreachable!("accept never queues heap data"),
+                    MultiPoll::Item(res) => return Poll::Ready(Err(os_err(res))),
+                    MultiPoll::Data(_) => unreachable!("accept never receives data"),
                     MultiPoll::NeedArm => {
                         let fd = self.sock.as_raw_fd();
                         driver.arm_multi(key, MultiIo::Accept { fd });
@@ -226,28 +226,16 @@ impl StreamSocket {
             let mut driver = w.driver.borrow_mut();
             loop {
                 match driver.poll_multi(key, cx.waker()) {
-                    MultiPoll::Item(res, flags) => {
-                        let bid = buffer_id(flags);
-                        return Poll::Ready(match (res, bid) {
-                            (n, Some(bid)) if n > 0 => {
-                                Ok(RecvBuf::pooled(driver.pool().clone(), bid, n as usize))
-                            }
-                            (n, bid) => {
-                                // No payload: hand the buffer (if any) straight back.
-                                if let Some(bid) = bid {
-                                    driver.pool().recycle(bid);
-                                }
-                                match n {
-                                    0 => Ok(RecvBuf::eof()),
-                                    n if n < 0 => Err(os_err(n)),
-                                    _ => Err(unexpected("io_uring returned data without a buffer")),
-                                }
-                            }
+                    MultiPoll::Item(res) => {
+                        return Poll::Ready(match res {
+                            0 => Ok(RecvBuf::eof()),
+                            n if n < 0 => Err(os_err(n)),
+                            _ => Err(unexpected("io_uring returned data without a buffer")),
                         });
                     }
-                    MultiPoll::Heap(data) => return Poll::Ready(Ok(RecvBuf::heap(data))),
+                    MultiPoll::Data(buf) => return Poll::Ready(Ok(buf)),
                     MultiPoll::NeedArm => {
-                        if !wait_for_pool(&mut driver, cx) {
+                        if !wait_for_pool(&mut driver, cx, false) {
                             return Poll::Pending;
                         }
                         let fd = self.sock.as_raw_fd();
@@ -404,15 +392,15 @@ impl Drop for StreamSocket {
 }
 
 /// Makes sure the kernel has a pool buffer to receive into before a multishot
-/// receive is armed. Returns `false` if the caller has to wait for one (its
-/// waker is registered with the pool).
-pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>) -> bool {
-    if !driver.pool().ensure_published() {
+/// receive (of datagrams, or of a stream) is armed. Returns `false` if the
+/// caller has to wait for one (its waker is registered with the pool).
+pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, datagram: bool) -> bool {
+    if !driver.ensure_recv_buffer(datagram) {
         // The pool is exhausted. Reclaim buffers that hold unread data of
         // other sockets ...
         driver.evacuate();
     }
-    if !driver.pool().ensure_published() {
+    if !driver.ensure_recv_buffer(datagram) {
         // ... and if user code holds all the rest, wait for one to come back
         // instead of spinning on ENOBUFS.
         driver.pool().wait(cx.waker());

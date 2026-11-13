@@ -265,7 +265,7 @@ run the tasks that are ready  →  io_uring_enter (submit everything, collect ev
 | **Threads** | Thread-per-core, shared-nothing. A task never changes thread. | Futures need not be `Send`; `Rc` and `RefCell` just work. No locks on the hot path. |
 | **Wakers** | A waker does not own its task; it holds a slot number and a handle to the worker. Same thread: push onto the local queue. Other thread: injector plus eventfd. | Wakers must be `Send + Sync` although tasks are not. This gets there without `unsafe`. |
 | **I/O** | Everything a tick produces enters the kernel in one `io_uring_enter`, with `DEFER_TASKRUN` and `SINGLE_ISSUER`. | The fewest system calls possible; completions are processed only when the worker asks. |
-| **Accept and receive** | Multishot accept; multishot receive with a provided buffer ring, for TCP, Unix sockets and UDP (`recvmsg`). | One submission for the life of a listener, connection or socket. The kernel picks a buffer only when data arrives, so the buffer is warm in cache and idle connections hold none. |
+| **Accept and receive** | Multishot accept; multishot receive with a provided buffer ring, for TCP, Unix sockets and UDP (`recvmsg`). On Linux 6.12+ streams fill each buffer piece by piece (`IOU_PBUF_RING_INC`). | One submission for the life of a listener, connection or socket. The kernel picks a buffer only when data arrives, so the buffer is warm in cache and idle connections hold none; connections that send a little share a buffer. |
 | **Writes and files** | Ownership passing: `write_all(buf)` returns `(result, buf)`. File operations are ordinary entries in the same ring. | The kernel keeps a pointer to the buffer until it is done; this API makes that sound in Rust. Files need no pool of blocking threads. |
 | **Cancellation** | When a future is dropped mid-flight, its buffer moves to the driver, a cancel is sent, and the memory is freed only when the kernel confirms. | Avoids use-after-free, the classic bug of completion-based runtimes. |
 | **Backpressure** | A slow reader has its multishot receive paused (TCP then slows the sender) and its backlog copied off the pool. A dry pool reclaims buffers that hold unread data. An accept backlog over 1,024 pauses the accept. | One stalled connection cannot starve the rest. |
@@ -429,11 +429,13 @@ connections held, minus before, per connection. "Idle" is a keep-alive connectio
 has had one request answered, the usual state of a connection from a browser, an app or
 a pool; "pending" has a request whose handler is waiting (`/wait`, as for a database or
 another service). "Under load" is the peak while `wrk` keeps 5,000 connections busy.
+giong's two rows were measured again after the packed receive buffers below (0.5), the
+others are from 0.4's run on the same kind of VM.
 
 | Server | Open | Idle | Pending | Under load |
 |---|---|---|---|---|
-| **giong-http** | **1.9 KiB** | **1.9 KiB** | 7.2 KiB | 19.6 MiB |
-| **giong-http** on epoll | 2.1 KiB | 2.1 KiB | **6.3 KiB** | **10.2 MiB** |
+| **giong-http** | **1.9 KiB** | **2.0 KiB** | **6.4 KiB** | 15.7 MiB |
+| **giong-http** on epoll | 2.1 KiB | 2.1 KiB | **6.4 KiB** | **10.4 MiB** |
 | Axum (Tokio + hyper) | 5.7 KiB | 20.4 KiB | 19.3 KiB | 115 MiB |
 | Raw Tokio, own parser | 12.9 KiB | 13.1 KiB | 12.9 KiB | 64 MiB |
 | Go `net/http` | 10.8 KiB | 18.9 KiB | 18.3 KiB | 155 MiB |
@@ -456,12 +458,18 @@ another service). "Under load" is the peak while `wrk` keeps 5,000 connections b
   each time a turn of the event loop takes most of them, and reuses the most recently
   freed first. With 20 workers and 100 busy connections, giong-http's memory rises by
   1 MiB (it rose by 40 MiB when every worker lent all 512 buffers at once).
-- **Under load io_uring holds more than epoll**: a response's buffer stays with the
-  kernel until its send completes, and the receive buffers a turn takes stay lent until
-  their connections run, while epoll writes at once and reads only into a buffer it
-  needs. With 20 workers and 5,000 busy connections giong-http peaked 50 MiB above idle
-  on io_uring and 14 MiB on epoll, raw Tokio 64 MiB, Axum 124 MiB and Go 184 MiB
-  (`WORKERS=20 SCENARIOS=load`, in `bench/results/memory-20w/`).
+- **Small reads share a buffer.** On Linux 6.12 and newer the kernel fills a receive
+  buffer piece by piece (`IOU_PBUF_RING_INC`), so a hundred connections that each send a
+  short request use one or two 8 KiB buffers rather than a hundred. Before, each receive
+  took a whole buffer, and under load a worker cycled through all it had lent: with 20
+  workers and 5,000 busy connections giong-http peaked 50 MiB above idle, now 23 MiB
+  (epoll 15 MiB, raw Tokio 64 MiB, Axum 124 MiB, Go 184 MiB; `WORKERS=20
+  SCENARIOS=load`, in `bench/results/memory-20w/`). Requests per second did not change
+  (eight interleaved rounds each at 4 and 20 workers, within this VM's noise).
+- **Under load io_uring still holds more than epoll**: a response's buffer stays with the
+  kernel until its send completes, and received data stays in its buffer until its
+  connection runs, while epoll writes at once and reads only into a buffer it needs.
+  Older kernels (and `GIONG_IO_URING_OFF=packed-buffers`) take whole buffers as before.
 - Throughput under load is in the other tables; here the servers and `wrk` share four
   vCPUs.
 
@@ -741,8 +749,9 @@ Also:
   test is skipped (the sanitizer delivers signals only inside libc calls it intercepts,
   and giong's threads wait in raw system calls).
 - **The fallback io_uring setups and the epoll driver** (`scripts/check.sh fallback`): the
-  whole suite again with `GIONG_RING_TIER=coop` (the flags of kernel 6.0), `basic` (no
-  flags at all) and `GIONG_DRIVER=epoll`.
+  whole suite again without the optional io_uring features of newer kernels
+  (`GIONG_IO_URING_OFF=all`, as on 6.1 to 6.11), with `GIONG_RING_TIER=coop` (the flags of
+  kernel 6.0), `basic` (no flags at all) and `GIONG_DRIVER=epoll`.
 - **io_uring blocked as in a container** (`scripts/check.sh seccomp`, and the `docker` CI
   job inside Docker's default seccomp profile): the whole suite with no driver named, so
   every runtime has to fall back to epoll by itself.
