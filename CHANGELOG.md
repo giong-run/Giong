@@ -107,7 +107,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   outside a `Watch`) is an error, "the transaction did not run", instead of a value.
 - `giong-redis`: a push message larger than `Config::max_reply_size` (a client-side
   caching invalidation) is passed over. Before, it was counted as the reply to the oldest
-  command, and every later reply went to the wrong command.
+  command, and every later reply went to the wrong command. An attribute count out of
+  range at the front of such a message (`|9223372036854775807`, or a negative one) is
+  no longer multiplied: it overflowed, a panic in a debug build. Found by the `replies`
+  fuzz target.
 - `giong-redis`: a task waiting in `Pool::take` is woken when a shared command whose
   future was dropped frees the connection. Before, it slept until the wait timeout and
   could fail with `PoolTimeout` while the connection was free.
