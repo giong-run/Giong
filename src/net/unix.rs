@@ -92,7 +92,9 @@ impl UnixStream {
     /// Connects to the socket at `path`.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let addr = SockAddr::unix(path)?;
-        let inner = StreamSocket::connect(new_socket()?, addr).await?;
+        let inner = StreamSocket::connect(new_socket()?, addr)
+            .await?
+            .without_zero_copy();
         Ok(Self { inner })
     }
 
@@ -100,7 +102,7 @@ impl UnixStream {
     pub fn pair() -> io::Result<(Self, Self)> {
         let (a, b) = Socket::pair(Domain::UNIX, Type::STREAM, None)?;
         let wrap = |sock| Self {
-            inner: StreamSocket::new(sock),
+            inner: StreamSocket::new(sock).without_zero_copy(),
         };
         Ok((wrap(a), wrap(b)))
     }
@@ -110,7 +112,7 @@ impl UnixStream {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
         Self {
-            inner: StreamSocket::new(sock),
+            inner: StreamSocket::new(sock).without_zero_copy(),
         }
     }
 

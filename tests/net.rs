@@ -173,6 +173,45 @@ fn a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies() {
 }
 
 #[test]
+fn large_writes_arrive_intact_with_or_without_zero_copy() {
+    // Sizes around the zero-copy threshold (16 KiB), written plainly and as
+    // a header and a body, twice on each fresh connection: the first large
+    // send of a socket goes out without a copy where the kernel offers it;
+    // on loopback the kernel copies it after all, so the second is a plain
+    // send.
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let sizes = [16 * 1024 - 1, 16 * 1024, 64 * 1024 + 7, 1024 * 1024 + 3];
+        for (i, &size) in sizes.iter().enumerate() {
+            for vectored in [false, true] {
+                let c = TcpStream::connect(addr).await.unwrap();
+                let s = l.accept().await.unwrap();
+                let data = payload(size, i as u64);
+                let reader = giong::spawn(async move { recv_exact(&s, 2 * size).await });
+                for _ in 0..2 {
+                    if vectored {
+                        let (head, body) = data.split_at(100);
+                        let pieces = vec![head.to_vec(), body.to_vec()];
+                        c.write_all_vectored(pieces).await.0.unwrap();
+                    } else {
+                        c.write_all(data.clone()).await.0.unwrap();
+                    }
+                }
+                let got = reader.await.unwrap();
+                assert!(
+                    got[..size] == data[..] && got[size..] == data[..],
+                    "{size} bytes, vectored: {vectored}"
+                );
+            }
+        }
+        drop(l);
+        sleep(Duration::from_millis(20)).await;
+        let stats = giong::stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
 fn recv_reports_eof_and_keeps_reporting_it() {
     giong::block_on(async {
         let (l, addr) = listener();

@@ -750,8 +750,9 @@ Also:
   and giong's threads wait in raw system calls).
 - **The fallback io_uring setups and the epoll driver** (`scripts/check.sh fallback`): the
   whole suite again without the optional io_uring features of newer kernels
-  (`GIONG_IO_URING_OFF=all`, as on 6.1 to 6.11), with `GIONG_RING_TIER=coop` (the flags of
-  kernel 6.0), `basic` (no flags at all) and `GIONG_DRIVER=epoll`.
+  (`GIONG_IO_URING_OFF=all`, as on kernels that lack them), with `GIONG_RING_TIER=coop`
+  (the flags of kernel 6.0), `basic` (no flags at all), `GIONG_DRIVER=epoll`, and with
+  the opt-in submission polling (`GIONG_SQPOLL=1`, a kernel thread per worker).
 - **io_uring blocked as in a container** (`scripts/check.sh seccomp`, and the `docker` CI
   job inside Docker's default seccomp profile): the whole suite with no driver named, so
   every runtime has to fall back to epoll by itself.

@@ -77,8 +77,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 cargo +1.80.0 check --workspace --all-features   # the minimum Rust version, libraries only
 
 scripts/check.sh test        # release build, every test 5 times; ROUNDS=1 for one pass
-scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1, then on epoll
+scripts/check.sh fallback    # the same without optional features, on the ring setups of kernels
+                             # older than 6.1, on epoll, then with submission polling (SQPOLL)
 scripts/check.sh epoll       # the tests on the epoll driver only
+scripts/check.sh sqpoll      # the tests with SQPOLL (GIONG_SQPOLL) only
 scripts/check.sh seccomp     # io_uring blocked as in Docker (scripts/no-io-uring.py): giong picks epoll
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
@@ -100,7 +102,8 @@ the soak test every night.
 run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
 optional io_uring features that newer kernels have (`giong::IoUringFeature`), and
 `GIONG_DRIVER=epoll` picks the epoll driver; `scripts/check.sh fallback` does all three for
-you.
+you. `GIONG_ZERO_COPY_MIN=<bytes>` moves the size from which TCP sends go out without a copy
+(16 KiB), for benchmarks.
 
 ## Rules that are checked in review
 

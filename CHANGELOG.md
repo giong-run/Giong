@@ -18,6 +18,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong** (measuring, not for release as is): zero-copy sends of 16 KiB and more on TCP
+  sockets whose peer is less than 1 ms away (`zero-copy-send`, Linux 6.2), entering the
+  kernel through the thread's registered ring table (`registered-ring`), and
+  `Builder::submission_polling` for io_uring's `SQPOLL` (`sq-poll`, opt-in;
+  `GIONG_SQPOLL=<ms>` and `scripts/check.sh sqpoll` for tests). `bench/uring-features.sh`
+  measures each against the rest on two machines.
 
 ### Changed
 

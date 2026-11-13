@@ -4,10 +4,15 @@
 #   scripts/check.sh test       release tests, repeated (default 5 rounds)
 #   scripts/check.sh fallback   the same tests on the io_uring of older kernels:
 #                               without the optional io_uring features
-#                               (GIONG_IO_URING_OFF=all, as on 6.1 to 6.11), then
-#                               also on the setup tiers of kernels older than 6.1
+#                               (GIONG_IO_URING_OFF=all, as on kernels that
+#                               lack them), then also on the setup tiers of
+#                               kernels older than 6.1
 #                               (COOP_TASKRUN, no flags), then on the epoll driver
-#                               (GIONG_DRIVER=epoll)
+#                               (GIONG_DRIVER=epoll), then with the opt-in
+#                               submission polling (see sqpoll)
+#   scripts/check.sh sqpoll     the tests with a kernel thread picking up each
+#                               worker's submissions (GIONG_SQPOLL, as
+#                               Builder::submission_polling)
 #   scripts/check.sh epoll      the tests on the epoll driver only
 #   scripts/check.sh seccomp    the tests with io_uring blocked as in Docker's
 #                               default seccomp profile (scripts/no-io-uring.py),
@@ -46,6 +51,13 @@ run_fallback() {
         GIONG_IO_URING_OFF=all GIONG_RING_TIER="$tier" repeat_tests "ring tier '$tier'"
     done
     run_epoll
+    run_sqpoll
+}
+
+run_sqpoll() {
+    # A 1 ms idle time, so that the polling thread falls asleep and has to be
+    # woken often.
+    GIONG_SQPOLL=1 repeat_tests "io_uring with submission polling"
 }
 
 run_epoll() {
@@ -99,11 +111,12 @@ case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback ;;
     epoll) run_epoll ;;
+    sqpoll) run_sqpoll ;;
     seccomp) run_seccomp ;;
     tsan) run_tsan ;;
     loom) run_loom ;;
     soak) run_soak ;;
     all) run_test; run_fallback; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|sqpoll|seccomp|tsan|loom|soak|all]" >&2; exit 2 ;;
 esac
 echo "ok"

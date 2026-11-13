@@ -6,7 +6,9 @@
 //!   use a **multishot receive with provided buffers**: one submission per
 //!   socket, and the kernel picks a buffer from the worker's shared pool only
 //!   when data actually arrives — idle sockets pin no memory.
-//! * Writes take ownership of the buffer and return it with the result.
+//! * Writes take ownership of the buffer and return it with the result. Large
+//!   writes on TCP go out **without a copy** where the kernel allows it
+//!   ([`IoUringFeature::ZeroCopySend`](crate::IoUringFeature::ZeroCopySend)).
 //! * Descriptors are closed through the ring, batched with everything else.
 //!
 //! That is how it works on io_uring. On the epoll driver the same calls
@@ -36,7 +38,7 @@ use std::task::{Context, Poll};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
-use crate::driver::{Driver, Io, MultiIo, MultiKind, MultiPoll};
+use crate::driver::{Driver, Io, MultiIo, MultiKind, MultiPoll, ZC_COPIED};
 use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime::{self, Worker};
@@ -173,10 +175,47 @@ impl Drop for ListenSocket {
     }
 }
 
+/// Whether a stream's large sends go out without a copy
+/// ([`IoUringFeature::ZeroCopySend`](crate::IoUringFeature::ZeroCopySend)).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ZeroCopy {
+    /// Not decided yet: decided at the first send large enough.
+    Untried,
+    On,
+    /// A Unix socket, a far peer, or the kernel copied or refused a send.
+    Off,
+}
+
+/// A zero-copy send completes once the peer has acknowledged the data, so a
+/// writer that waits for each send (a streamed body) gets one send per round
+/// trip. Only peers nearer than this (the same data centre) get zero copy.
+const ZERO_COPY_MAX_RTT_US: u32 = 1000;
+
+/// The smoothed round-trip time the kernel measured for TCP socket `fd`, in
+/// microseconds; `None` if it is not a TCP socket.
+fn tcp_rtt_us(fd: RawFd) -> Option<u32> {
+    // SAFETY: `tcp_info` is plain data, for which all zeroes is valid.
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: `info` and `len` describe a buffer of the right size.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast(),
+            &mut len,
+        )
+    };
+    (ret == 0).then_some(info.tcpi_rtt)
+}
+
 /// A connected stream socket: what [`TcpStream`] and [`UnixStream`] share.
 pub(crate) struct StreamSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
+    /// Whether large sends go out without a copy (see [`ZeroCopy`]).
+    zero_copy: Cell<ZeroCopy>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -185,8 +224,50 @@ impl StreamSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
+            zero_copy: Cell::new(ZeroCopy::Untried),
             _not_send: PhantomData,
         }
+    }
+
+    /// A socket the kernel cannot send from without a copy (a Unix socket).
+    pub(crate) fn without_zero_copy(self) -> Self {
+        self.zero_copy.set(ZeroCopy::Off);
+        self
+    }
+
+    /// `true` if a send of `len` bytes should go out without a copy.
+    fn wants_zero_copy(&self, len: usize) -> bool {
+        if self.zero_copy.get() == ZeroCopy::Off
+            || !runtime::with_worker(|w| w.driver.borrow().zero_copy_min())
+                .is_some_and(|min| len >= min)
+        {
+            return false;
+        }
+        if self.zero_copy.get() == ZeroCopy::Untried {
+            // A zero-copy send completes only once the peer has acknowledged
+            // the data, which a far peer does late: decide once, by the
+            // round trip the kernel measured.
+            let near =
+                tcp_rtt_us(self.sock.as_raw_fd()).is_some_and(|rtt| rtt < ZERO_COPY_MAX_RTT_US);
+            self.zero_copy
+                .set(if near { ZeroCopy::On } else { ZeroCopy::Off });
+        }
+        self.zero_copy.get() == ZeroCopy::On
+    }
+
+    /// Looks at how a zero-copy send went. `false` if the kernel refused it
+    /// (as on a kTLS socket), so it must be sent again with a copy; either
+    /// that or a copy the kernel made anyway turns zero copy off for this
+    /// socket.
+    fn zero_copy_done(&self, res: i32, flags: u32) -> bool {
+        if res == -libc::EOPNOTSUPP {
+            self.zero_copy.set(ZeroCopy::Off);
+            return false;
+        }
+        if flags & ZC_COPIED != 0 {
+            self.zero_copy.set(ZeroCopy::Off);
+        }
+        true
     }
 
     /// Connects `sock` to `addr` through the driver.
@@ -349,38 +430,61 @@ impl StreamSocket {
         let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
         msg.msg_iov = iov.as_mut_ptr();
         msg.msg_iovlen = iov.len() as _;
-        let io = Io::SendMsg {
-            fd: self.sock.as_raw_fd(),
-            msg: &*msg,
-            flags: libc::MSG_NOSIGNAL as u32,
-        };
-        // The header, the iovec array (on the heap) and the buffers all stay
-        // where they are while the kernel reads them, even if this future is
-        // dropped: `Op` keeps them until the operation completes.
-        let (res, _, (bufs, _iov, _msg)) = Op::new(io, (bufs, iov, msg)).await;
-        if res < 0 {
-            (Err(os_err(res)), bufs)
-        } else {
-            (Ok(res as usize), bufs)
+        let len = iov.iter().map(|v| v.iov_len).sum();
+        let mut zero_copy = self.wants_zero_copy(len);
+        let mut held = (bufs, iov, msg);
+        loop {
+            let io = Io::SendMsg {
+                fd: self.sock.as_raw_fd(),
+                msg: &*held.2,
+                flags: libc::MSG_NOSIGNAL as u32,
+                zero_copy,
+            };
+            // The header, the iovec array (on the heap) and the buffers all
+            // stay where they are while the kernel reads them, even if this
+            // future is dropped: `Op` keeps them until the operation
+            // completes.
+            let (res, flags, h) = Op::new(io, held).await;
+            held = h;
+            if zero_copy && !self.zero_copy_done(res, flags) {
+                zero_copy = false;
+                continue;
+            }
+            let bufs = held.0;
+            return if res < 0 {
+                (Err(os_err(res)), bufs)
+            } else {
+                (Ok(res as usize), bufs)
+            };
         }
     }
 
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
         let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
-        // SAFETY: `offset <= len`, so the pointer stays within the buffer.
-        let ptr = unsafe { buf.as_ptr().add(offset) };
-        let io = Io::Send {
-            fd: self.sock.as_raw_fd(),
-            buf: ptr,
-            len,
-            flags: libc::MSG_NOSIGNAL,
-        };
-        let (res, _, buf) = Op::new(io, buf).await;
-        if res < 0 {
-            (Err(os_err(res)), buf)
-        } else {
-            (Ok(res as usize), buf)
+        let mut zero_copy = self.wants_zero_copy(len as usize);
+        let mut buf = buf;
+        loop {
+            // SAFETY: `offset <= len`, so the pointer stays within the buffer.
+            let ptr = unsafe { buf.as_ptr().add(offset) };
+            let io = Io::Send {
+                fd: self.sock.as_raw_fd(),
+                buf: ptr,
+                len,
+                flags: libc::MSG_NOSIGNAL,
+                zero_copy,
+            };
+            let (res, flags, b) = Op::new(io, buf).await;
+            buf = b;
+            if zero_copy && !self.zero_copy_done(res, flags) {
+                zero_copy = false;
+                continue;
+            }
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
         }
     }
 }

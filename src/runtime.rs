@@ -318,6 +318,8 @@ struct Config {
     chosen_by: ChosenBy,
     spin: Option<Duration>,
     ring_entries: u32,
+    /// io_uring's `SQPOLL`, with how long its thread polls before it sleeps.
+    sq_poll: Option<Duration>,
     buf_count: u16,
     buf_size: usize,
     shutdown_grace: Duration,
@@ -384,6 +386,7 @@ impl Worker {
             cfg.driver,
             cfg.chosen_by,
             cfg.ring_entries,
+            cfg.sq_poll,
             pool.clone(),
             shared.eventfd.as_raw_fd(),
         )?;
@@ -746,6 +749,7 @@ pub struct Builder {
     driver: Option<DriverKind>,
     pin_cores: bool,
     ring_entries: u32,
+    sq_poll: Option<Duration>,
     buf_count: u16,
     buf_size: usize,
     signals: bool,
@@ -768,6 +772,7 @@ impl Builder {
             driver: None,
             pin_cores: true,
             ring_entries: 1024,
+            sq_poll: None,
             buf_count: 512,
             buf_size: 8 * 1024,
             signals: false,
@@ -816,6 +821,25 @@ impl Builder {
     /// Size of each worker's io_uring submission queue (default: 1024).
     pub fn ring_entries(mut self, entries: u32) -> Self {
         self.ring_entries = entries.clamp(8, 32768).next_power_of_two();
+        self
+    }
+
+    /// Lets a kernel thread per worker pick up the worker's io_uring
+    /// submissions (`IORING_SETUP_SQPOLL`), so that a busy worker submits
+    /// I/O without system calls (default: off). After the last submission the
+    /// thread keeps polling for `idle`, then sleeps until the worker wakes it.
+    ///
+    /// While it polls, the thread keeps a CPU busy: it pays only where the
+    /// machine has cores to spare beside the workers' own, and costs
+    /// throughput where it does not. Measure before turning it on.
+    ///
+    /// Where the kernel refuses it, or on epoll, workers run without it;
+    /// [`DriverChoice::io_uring_features`](crate::DriverChoice::io_uring_features)
+    /// lists [`IoUringFeature::SubmissionPolling`](crate::IoUringFeature::SubmissionPolling)
+    /// when a worker has it. `GIONG_SQPOLL=<idle in ms>` turns it on for a
+    /// whole test run or benchmark.
+    pub fn submission_polling(mut self, idle: Duration) -> Self {
+        self.sq_poll = Some(idle);
         self
     }
 
@@ -913,11 +937,19 @@ impl Builder {
                 None => (None, ChosenBy::Automatic),
             },
         };
+        // A test and benchmark hook, like GIONG_DRIVER.
+        let sq_poll = self.sq_poll.or_else(|| {
+            std::env::var("GIONG_SQPOLL")
+                .ok()
+                .and_then(|ms| ms.trim().parse().ok())
+                .map(Duration::from_millis)
+        });
         Ok(Config {
             driver,
             chosen_by,
             spin: self.spin,
             ring_entries: self.ring_entries,
+            sq_poll,
             buf_count: self.buf_count,
             buf_size: self.buf_size,
             shutdown_grace: self.shutdown_grace,

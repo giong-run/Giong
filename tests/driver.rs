@@ -432,9 +432,17 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         if kernel_version() >= (6, 12) {
             assert!(got.contains(&"packed-buffers"), "{got:?}");
         }
+        if kernel_version() >= (6, 2) {
+            assert!(got.contains(&"zero-copy-send"), "{got:?}");
+        }
     }
 
-    // Turned off, one by one and all at once.
+    // Turned off, one by one and all at once. Each child sets its own
+    // GIONG_IO_URING_OFF, so this compares against the full set only when this
+    // run has nothing turned off itself.
+    if std::env::var_os("GIONG_IO_URING_OFF").is_some() {
+        return;
+    }
     for off in IoUringFeature::ALL.iter().map(|f| f.name()).chain(["all"]) {
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -460,5 +468,55 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
                 assert_eq!(shown, got.contains(&f.name()), "{off}: {line}");
             }
         }
+    }
+}
+
+#[test]
+fn submission_polling_runs_io_and_wakes_its_thread() {
+    if !io_uring_available() {
+        return;
+    }
+    let polled = giong::Builder::new()
+        .driver(DriverKind::IoUring)
+        .submission_polling(Duration::from_millis(2))
+        .block_on(async {
+            let polled = giong::driver_choice()
+                .io_uring_features
+                .contains(&IoUringFeature::SubmissionPolling);
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let server = giong::spawn(async move {
+                let s = l.accept().await.unwrap();
+                loop {
+                    let data = s.recv().await.unwrap();
+                    if data.is_empty() {
+                        break;
+                    }
+                    s.write_all(data.to_vec()).await.0.unwrap();
+                }
+            });
+            let c = TcpStream::connect(addr).await.unwrap();
+            for round in 0..20u8 {
+                // Long enough pauses for the polling thread to go to sleep,
+                // so the worker has to wake it.
+                if round % 5 == 0 {
+                    giong::time::sleep(Duration::from_millis(10)).await;
+                }
+                let msg = vec![round; 3000 + usize::from(round) * 1000];
+                c.write_all(msg.clone()).await.0.unwrap();
+                let mut got = Vec::new();
+                while got.len() < msg.len() {
+                    got.extend_from_slice(&c.recv().await.unwrap());
+                }
+                assert_eq!(got, msg, "round {round}");
+            }
+            drop(c);
+            server.await.unwrap();
+            polled
+        })
+        .unwrap();
+    // Unprivileged SQPOLL rings since 5.11; SINGLE_ISSUER with it since 6.0.
+    if kernel_version() >= (6, 1) && std::env::var_os("GIONG_IO_URING_OFF").is_none() {
+        assert!(polled, "the kernel refused SQPOLL");
     }
 }

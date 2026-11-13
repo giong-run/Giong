@@ -32,6 +32,7 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use super::{
     Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, F_BUF_MORE,
+    ZC_COPIED,
 };
 use crate::buf::{BufPool, Received, RecvBuf, RingId};
 use crate::error::{Code, Error};
@@ -72,6 +73,9 @@ const ACCEPT_BACKLOG_LIMIT: usize = 1024;
 enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
     Waiting(Waker),
+    /// A zero-copy send has its result, but the kernel may still read the
+    /// buffer until its notification arrives.
+    Sent(Waker, i32, u32),
     /// Finished; the result has not been collected yet.
     Done(i32, u32),
     /// The future was dropped while in flight. Holds the operation's resources
@@ -135,6 +139,15 @@ pub(crate) struct Uring {
     recv_copied: u64,
     /// io_uring features this ring uses.
     features: Vec<IoUringFeature>,
+    /// The smallest send that goes out without a copy, with
+    /// [`IoUringFeature::ZeroCopySend`].
+    zero_copy_min: Option<usize>,
+    /// The ring's index in this thread's registered ring table, with
+    /// [`IoUringFeature::RegisteredRing`].
+    registered_ring: Option<u32>,
+    /// A kernel thread picks up submissions
+    /// ([`IoUringFeature::SubmissionPolling`]).
+    sq_polled: bool,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -231,8 +244,36 @@ fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
     b.build(entries)
 }
 
-/// The SQE for a single-shot operation.
-fn sqe_for(io: &Io) -> squeue::Entry {
+/// `IORING_CQE_F_MORE`: more completions of this operation follow.
+const F_MORE: u32 = 1 << 1;
+/// `IORING_CQE_F_NOTIF`: the notification of a zero-copy send, which says
+/// the kernel no longer reads its buffer.
+const F_NOTIF: u32 = 1 << 3;
+/// `IORING_SEND_ZC_REPORT_USAGE`: the notification says whether the kernel
+/// copied the data after all, in [`NOTIF_COPIED`] (Linux 6.2).
+const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
+/// `IORING_NOTIF_USAGE_ZC_COPIED`, in the result of a notification.
+const NOTIF_COPIED: u32 = 1 << 31;
+
+/// A ring with a kernel thread that picks up submissions
+/// (`IORING_SETUP_SQPOLL`), polling for `idle` before it sleeps; `None`
+/// where the kernel refuses it. The kernel refuses the task-run flags with
+/// it (`DEFER_TASKRUN`, `COOP_TASKRUN`, `TASKRUN_FLAG`): the polling thread
+/// runs the completion work itself and posts the completions.
+fn build_sqpoll_ring(entries: u32, idle: Duration) -> Option<IoUring> {
+    let idle_ms = u32::try_from(idle.as_millis()).unwrap_or(u32::MAX).max(1);
+    let mut b = IoUring::builder();
+    b.setup_sqpoll(idle_ms)
+        .setup_single_issuer()
+        .setup_submit_all()
+        .setup_cqsize(entries.saturating_mul(4))
+        .setup_clamp();
+    b.build(entries).ok()
+}
+
+/// The SQE for a single-shot operation. `zero_copy` says whether the ring
+/// uses [`IoUringFeature::ZeroCopySend`].
+fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
     let cwd = types::Fd(libc::AT_FDCWD);
     match *io {
         Io::Connect { fd, addr, len } => opcode::Connect::new(types::Fd(fd), addr, len).build(),
@@ -242,10 +283,30 @@ fn sqe_for(io: &Io) -> squeue::Entry {
             buf,
             len,
             flags,
+            zero_copy: true,
+        } if zero_copy => opcode::SendZc::new(types::Fd(fd), buf, len)
+            .flags(flags)
+            .zc_flags(SEND_ZC_REPORT_USAGE)
+            .build(),
+        Io::Send {
+            fd,
+            buf,
+            len,
+            flags,
+            ..
         } => opcode::Send::new(types::Fd(fd), buf, len)
             .flags(flags)
             .build(),
-        Io::SendMsg { fd, msg, flags } => opcode::SendMsg::new(types::Fd(fd), msg)
+        Io::SendMsg {
+            fd,
+            msg,
+            flags,
+            zero_copy: true,
+        } if zero_copy => opcode::SendMsgZc::new(types::Fd(fd), msg)
+            .flags(flags)
+            .ioprio(SEND_ZC_REPORT_USAGE)
+            .build(),
+        Io::SendMsg { fd, msg, flags, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),
         Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
@@ -422,6 +483,103 @@ unsafe fn register_packed_ring(
     register_pbuf(ring.as_raw_fd(), REGISTER_PBUF_RING, &reg).is_ok()
 }
 
+/// `true` if the kernel sends without a copy the way giong asks it to: with
+/// `IORING_OP_SEND_ZC` and `IORING_OP_SENDMSG_ZC`, whose notifications say
+/// whether the data was copied after all (`IORING_SEND_ZC_REPORT_USAGE`,
+/// Linux 6.2; a probe cannot see flags, hence the version).
+fn has_zero_copy_send(ring: &IoUring) -> bool {
+    if !kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 2)) {
+        return false;
+    }
+    let mut probe = io_uring::Probe::new();
+    if ring.submitter().register_probe(&mut probe).is_err() {
+        return false;
+    }
+    probe.is_supported(opcode::SendZc::CODE) && probe.is_supported(opcode::SendMsgZc::CODE)
+}
+
+/// `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS`.
+const REGISTER_RING_FDS: libc::c_uint = 20;
+const UNREGISTER_RING_FDS: libc::c_uint = 21;
+/// `IORING_ENTER_GETEVENTS`, `IORING_ENTER_EXT_ARG` and
+/// `IORING_ENTER_REGISTERED_RING`.
+const ENTER_GETEVENTS: u32 = 1 << 0;
+/// `IORING_ENTER_SQ_WAKEUP` and `IORING_ENTER_SQ_WAIT`, with `SQPOLL`.
+const ENTER_SQ_WAKEUP: u32 = 1 << 1;
+const ENTER_SQ_WAIT: u32 = 1 << 2;
+const ENTER_EXT_ARG: u32 = 1 << 3;
+const ENTER_REGISTERED_RING: u32 = 1 << 4;
+
+/// `struct io_uring_rsrc_update`, the argument of both.
+#[repr(C)]
+struct RsrcUpdate {
+    offset: u32,
+    resv: u32,
+    data: u64,
+}
+
+/// `struct io_uring_getevents_arg`, for a wait with a timeout.
+#[repr(C)]
+struct GeteventsArg {
+    sigmask: u64,
+    sigmask_sz: u32,
+    min_wait_usec: u32,
+    ts: u64,
+}
+
+/// `struct __kernel_timespec`.
+#[repr(C)]
+struct KernelTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Puts `ring` in this thread's registered ring table, returning its index
+/// there, or `None` where the kernel cannot (before 5.18, or the table is
+/// full: it holds 16 rings per thread).
+///
+/// The table belongs to the thread, so the ring must be entered from this
+/// thread only (which `SINGLE_ISSUER` asks anyway) and taken out of it on
+/// this thread ([`unregister_ring_fd`]).
+fn register_ring_fd(ring: &IoUring) -> Option<u32> {
+    let mut up = RsrcUpdate {
+        // Any free index.
+        offset: u32::MAX,
+        resv: 0,
+        data: ring.as_raw_fd() as u64,
+    };
+    // SAFETY: the argument is one `io_uring_rsrc_update`, as the count says.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring.as_raw_fd(),
+            REGISTER_RING_FDS,
+            &mut up as *mut RsrcUpdate,
+            1u32,
+        )
+    };
+    (ret == 1).then_some(up.offset)
+}
+
+/// Takes the ring at `index` out of this thread's registered ring table.
+fn unregister_ring_fd(ring: &IoUring, index: u32) {
+    let mut up = RsrcUpdate {
+        offset: index,
+        resv: 0,
+        data: 0,
+    };
+    // SAFETY: as in `register_ring_fd`.
+    unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring.as_raw_fd(),
+            UNREGISTER_RING_FDS,
+            &mut up as *mut RsrcUpdate,
+            1u32,
+        )
+    };
+}
+
 /// The running kernel's release (`uname -r`), or `"unknown"`.
 fn kernel_release() -> String {
     // SAFETY: `utsname` is plain data, for which all zeroes is a valid value.
@@ -473,8 +631,20 @@ fn buffer_ring_error(release: &str, e: io::Error) -> io::Error {
 }
 
 impl Uring {
-    pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
-        let ring = build_ring(entries)?;
+    pub(crate) fn new(
+        entries: u32,
+        sq_poll: Option<Duration>,
+        pool: Rc<BufPool>,
+        wake_fd: RawFd,
+    ) -> io::Result<Self> {
+        let sq_ring = sq_poll
+            .filter(|_| super::feature_enabled(IoUringFeature::SubmissionPolling))
+            .and_then(|idle| build_sqpoll_ring(entries, idle));
+        let sq_polled = sq_ring.is_some();
+        let ring = match sq_ring {
+            Some(ring) => ring,
+            None => build_ring(entries)?,
+        };
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
@@ -487,10 +657,28 @@ impl Uring {
             pool.set_registered(RingId::Packed);
             features.push(IoUringFeature::PackedBuffers);
         }
+        let zero_copy_min = (super::feature_enabled(IoUringFeature::ZeroCopySend)
+            && has_zero_copy_send(&ring))
+        .then(super::zero_copy_min);
+        if zero_copy_min.is_some() {
+            features.push(IoUringFeature::ZeroCopySend);
+        }
+        let registered_ring = super::feature_enabled(IoUringFeature::RegisteredRing)
+            .then(|| register_ring_fd(&ring))
+            .flatten();
+        if registered_ring.is_some() {
+            features.push(IoUringFeature::RegisteredRing);
+        }
+        if sq_polled {
+            features.push(IoUringFeature::SubmissionPolling);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
+            zero_copy_min,
+            registered_ring,
+            sq_polled,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -521,8 +709,14 @@ impl Uring {
             if unsafe { self.ring.submission().push(&sqe) }.is_ok() {
                 break;
             }
-            // Submission queue full: hand what we have to the kernel.
-            match self.ring.submit() {
+            // Submission queue full: hand what we have to the kernel, or
+            // wait for its polling thread to take some.
+            let res = if self.sq_polled {
+                self.enter_with(0, None, ENTER_SQ_WAIT)
+            } else {
+                self.enter(0, None)
+            };
+            match res {
                 Ok(_) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EINTR) => {}
@@ -545,7 +739,8 @@ impl Uring {
         let key = self
             .ops
             .insert(OpState::Single(Lifecycle::Waiting(waker.clone())));
-        self.push(sqe_for(io).user_data(key as u64));
+        let sqe = sqe_for(io, self.zero_copy_min.is_some());
+        self.push(sqe.user_data(key as u64));
         key
     }
 
@@ -557,7 +752,7 @@ impl Uring {
                 self.ops.remove(key);
                 Poll::Ready(out)
             }
-            Some(OpState::Single(Lifecycle::Waiting(w))) => {
+            Some(OpState::Single(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..))) => {
                 if !w.will_wake(waker) {
                     *w = waker.clone();
                 }
@@ -578,6 +773,11 @@ impl Uring {
                         .build()
                         .user_data(UD_IGNORE),
                 );
+            }
+            Some(OpState::Single(lc @ Lifecycle::Sent(..))) => {
+                // Sent: nothing to cancel, but the kernel may still read the
+                // buffer until the notification.
+                *lc = Lifecycle::Ignored(data);
             }
             Some(OpState::Single(Lifecycle::Done(..))) => {
                 self.ops.remove(key);
@@ -790,14 +990,18 @@ impl Uring {
     pub(crate) fn submit_queued(&mut self) {
         let mut attempts = 0u32;
         while !self.ring.submission().is_empty() {
-            match self.ring.submit() {
-                Ok(_) => {}
+            match self.enter(0, None) {
+                Ok(()) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
                     _ => panic!("giong: io_uring submit failed: {e}"),
                 },
+            }
+            if self.sq_polled {
+                // The polling thread takes them; give it the CPU.
+                std::thread::yield_now();
             }
             attempts += 1;
             assert!(
@@ -845,17 +1049,12 @@ impl Uring {
                     (sq.len(), sq.taskrun() || sq.cq_overflow())
                 };
                 if queued > 0 || pending {
-                    self.ring.submit_and_wait(0).map(drop)
+                    self.enter(0, None)
                 } else {
                     Ok(())
                 }
             }
-            Park::Wait(None) => self.ring.submit_and_wait(1).map(drop),
-            Park::Wait(Some(dur)) => {
-                let ts = types::Timespec::from(dur);
-                let args = types::SubmitArgs::new().timespec(&ts);
-                self.ring.submitter().submit_with_args(1, &args).map(drop)
-            }
+            Park::Wait(timeout) => self.enter(1, timeout),
         };
         if let Err(e) = res {
             match e.raw_os_error() {
@@ -866,6 +1065,84 @@ impl Uring {
         }
         self.reap();
         mem::take(&mut self.graveyard)
+    }
+
+    /// `io_uring_enter`: submits every queued SQE, then waits until `want`
+    /// completions are ready (0: does not wait), for at most `timeout`.
+    ///
+    /// The same as the `io-uring` crate's `submit_and_wait` and
+    /// `submit_with_args`, except that it enters through the registered ring
+    /// where there is one: the crate remembers a registration only in the
+    /// short-lived `Submitter` that made it.
+    fn enter(&mut self, want: u32, timeout: Option<Duration>) -> io::Result<()> {
+        self.enter_with(want, timeout, 0)
+    }
+
+    /// [`enter`](Self::enter) with extra `IORING_ENTER_*` flags.
+    fn enter_with(&mut self, want: u32, timeout: Option<Duration>, extra: u32) -> io::Result<()> {
+        let (to_submit, pending, need_wakeup) = {
+            let mut sq = self.ring.submission();
+            sq.sync();
+            let need_wakeup = self.sq_polled && sq.need_wakeup();
+            (
+                sq.len() as u32,
+                sq.taskrun() || sq.cq_overflow(),
+                need_wakeup,
+            )
+        };
+        let (fd, mut flags) = match self.registered_ring {
+            Some(index) => (index as i32, ENTER_REGISTERED_RING | extra),
+            None => (self.ring.as_raw_fd(), extra),
+        };
+        // Deferred task work and overflowed completions are only processed
+        // by an enter that asks for completions.
+        if want > 0 || pending {
+            flags |= ENTER_GETEVENTS;
+        }
+        if need_wakeup {
+            flags |= ENTER_SQ_WAKEUP;
+        } else if self.sq_polled && flags & (ENTER_GETEVENTS | ENTER_SQ_WAIT) == 0 {
+            // The polling thread is awake and takes the submissions itself.
+            return Ok(());
+        }
+        let ts;
+        let arg;
+        let (arg_ptr, arg_len) = match timeout {
+            None => (std::ptr::null::<GeteventsArg>(), 0),
+            Some(d) => {
+                ts = KernelTimespec {
+                    tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
+                    tv_nsec: i64::from(d.subsec_nanos()),
+                };
+                arg = GeteventsArg {
+                    sigmask: 0,
+                    sigmask_sz: 0,
+                    min_wait_usec: 0,
+                    ts: &ts as *const KernelTimespec as u64,
+                };
+                flags |= ENTER_EXT_ARG;
+                (&arg as *const GeteventsArg, mem::size_of::<GeteventsArg>())
+            }
+        };
+        // SAFETY: the SQEs up to the published tail are complete (`push`),
+        // and `arg_ptr` is null or points at a `GeteventsArg` (and its
+        // timespec) that outlives the call.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_enter,
+                fd,
+                to_submit,
+                want,
+                flags,
+                arg_ptr,
+                arg_len,
+            )
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     /// Dispatches every completion currently in the completion queue.
@@ -919,19 +1196,7 @@ impl Uring {
                 let remove = match self.ops.get_mut(key) {
                     None => false,
                     Some(OpState::Single(lc)) => {
-                        match mem::replace(lc, Lifecycle::Done(res, flags)) {
-                            Lifecycle::Waiting(waker) => {
-                                waker.wake();
-                                false
-                            }
-                            Lifecycle::Ignored(data) => {
-                                if let Some(data) = data {
-                                    self.graveyard.push(data);
-                                }
-                                true
-                            }
-                            Lifecycle::Done(..) => false,
-                        }
+                        Self::complete(lc, res, flags, more, &mut self.graveyard)
                     }
                     Some(OpState::Multi(m)) => {
                         if !more {
@@ -1015,6 +1280,54 @@ impl Uring {
         }
     }
 
+    /// Records a completion of single-shot operation `lc`. Returns `true` if
+    /// its slab entry can go.
+    ///
+    /// A zero-copy send completes twice: first with its result and
+    /// `IORING_CQE_F_MORE`, then with a notification once the kernel no
+    /// longer reads the buffer. Its future gets the result at the second.
+    fn complete(
+        lc: &mut Lifecycle,
+        res: i32,
+        flags: u32,
+        more: bool,
+        graveyard: &mut Vec<Box<dyn Any>>,
+    ) -> bool {
+        if more {
+            // The result of a zero-copy send; the notification follows. A
+            // dropped send stays `Ignored`: its buffer waits for it too.
+            if let Lifecycle::Waiting(waker) = lc {
+                let waker = waker.clone();
+                *lc = Lifecycle::Sent(waker, res, flags & !F_MORE);
+            }
+            return false;
+        }
+        let done = match *lc {
+            Lifecycle::Sent(_, sent, sent_flags) if flags & F_NOTIF != 0 => {
+                let copied = if res as u32 & NOTIF_COPIED != 0 {
+                    ZC_COPIED
+                } else {
+                    0
+                };
+                Lifecycle::Done(sent, sent_flags | copied)
+            }
+            _ => Lifecycle::Done(res, flags),
+        };
+        match mem::replace(lc, done) {
+            Lifecycle::Waiting(waker) | Lifecycle::Sent(waker, ..) => {
+                waker.wake();
+                false
+            }
+            Lifecycle::Ignored(data) => {
+                if let Some(data) = data {
+                    graveyard.push(data);
+                }
+                true
+            }
+            Lifecycle::Done(..) => false,
+        }
+    }
+
     // -------------------------------------------------------------- teardown
 
     /// Drains batched closes, cancels remaining I/O, and waits for its buffers.
@@ -1025,7 +1338,7 @@ impl Uring {
         self.closing = true;
         for _ in 0..100 {
             // Push out queued SQEs (cancels, closes) and collect completions.
-            match self.ring.submit_and_wait(0) {
+            match self.enter(0, None) {
                 Ok(_) => {}
                 Err(e)
                     if matches!(
@@ -1047,9 +1360,7 @@ impl Uring {
                     types::CancelBuilder::any().all(),
                 );
             }
-            let ts = types::Timespec::from(Duration::from_millis(10));
-            let args = types::SubmitArgs::new().timespec(&ts);
-            let _ = self.ring.submitter().submit_with_args(1, &args);
+            let _ = self.enter(1, Some(Duration::from_millis(10)));
         }
         self.reap();
         self.inflight == 0
@@ -1082,6 +1393,22 @@ impl Uring {
     /// io_uring features this ring uses.
     pub(crate) fn features(&self) -> &[IoUringFeature] {
         &self.features
+    }
+
+    /// The smallest send that goes out without a copy, or `None` without
+    /// [`IoUringFeature::ZeroCopySend`].
+    pub(crate) fn zero_copy_min(&self) -> Option<usize> {
+        self.zero_copy_min
+    }
+}
+
+impl Drop for Uring {
+    fn drop(&mut self) {
+        // The thread's table holds a reference to the ring, which would keep
+        // it (and its memory) alive until the thread exits.
+        if let Some(index) = self.registered_ring {
+            unregister_ring_fd(&self.ring, index);
+        }
     }
 }
 

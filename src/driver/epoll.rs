@@ -494,16 +494,18 @@ impl Epoll {
                     retry(|| libc::recv(fd, buf.cast(), len as usize, libc::MSG_DONTWAIT)),
                     Dir::Read,
                 ),
+                // Zero-copy sends are io_uring's: epoll always copies.
                 Io::Send {
                     fd,
                     buf,
                     len,
                     flags,
+                    ..
                 } => (
                     retry(|| libc::send(fd, buf.cast(), len as usize, flags | libc::MSG_DONTWAIT)),
                     Dir::Write,
                 ),
-                Io::SendMsg { fd, msg, flags } => (
+                Io::SendMsg { fd, msg, flags, .. } => (
                     retry(|| libc::sendmsg(fd, msg, flags as i32 | libc::MSG_DONTWAIT)),
                     Dir::Write,
                 ),
