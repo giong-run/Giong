@@ -286,9 +286,14 @@ fn many_tasks_send_on_one_socket() {
 
 #[test]
 fn every_worker_can_bind_the_same_port() {
+    // Every UdpSocket sets SO_REUSEPORT. A socket that a test running at the
+    // same time binds to 127.0.0.1 can get this port once the probe below has
+    // let it go, and then joins the workers' group and takes some of their
+    // datagrams. No other test binds to 127.0.0.2.
+    const ADDR: &str = "127.0.0.2";
     // Reserve a port, then let three workers share it.
     let port = {
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let probe = std::net::UdpSocket::bind((ADDR, 0)).unwrap();
         probe.local_addr().unwrap().port()
     };
     let received = Arc::new(AtomicUsize::new(0));
@@ -300,7 +305,7 @@ fn every_worker_can_bind_the_same_port() {
         rt.run(move |_| {
             let (r, b) = (r.clone(), b.clone());
             async move {
-                let socket = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+                let socket = UdpSocket::bind((ADDR, port)).unwrap();
                 b.fetch_add(1, Ordering::SeqCst);
                 while let Some(Ok((got, from))) = giong::until_shutdown(socket.recv_from()).await {
                     let reply = got.to_vec();
@@ -323,9 +328,7 @@ fn every_worker_can_bind_the_same_port() {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let message = format!("sender {i}");
-        client
-            .send_to(message.as_bytes(), ("127.0.0.1", port))
-            .unwrap();
+        client.send_to(message.as_bytes(), (ADDR, port)).unwrap();
         let mut buf = [0u8; 64];
         let (n, _) = client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], message.as_bytes());
