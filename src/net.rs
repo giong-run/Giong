@@ -199,11 +199,17 @@ impl StreamSocket {
             addr: addr.as_ptr() as *const libc::sockaddr,
             len: addr.len(),
         };
+        // Owned as a stream from here on, so that a connect that fails, or
+        // whose future is dropped, still closes the socket through the
+        // driver. The epoll driver registered the descriptor for the
+        // attempt; closed behind its back, the number would stay marked as
+        // registered, and the next socket to get it would never be woken.
+        let stream = Self::new(sock);
         let (res, _, _addr) = Op::new(io, addr).await;
         if res < 0 {
             return Err(os_err(res));
         }
-        Ok(Self::new(sock))
+        Ok(stream)
     }
 
     pub(crate) fn socket(&self) -> &Socket {

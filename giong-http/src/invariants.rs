@@ -63,10 +63,34 @@ pub fn check_chunked(input: &[u8], max: usize, mut splits: impl FnMut() -> usize
         }
     };
     assert_eq!(got, expected, "input {:?}", String::from_utf8_lossy(input));
+
+    // The same bytes passed on as they arrive, as a streamed request body
+    // is: the input dropped and the body taken out after every piece.
+    let mut streamed = Decoder::new(max);
+    let mut body = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    let got = loop {
+        end = (end + 1 + splits() % 6).min(input.len());
+        let progress = streamed.feed(&input[start..end]);
+        body.append(&mut streamed.body);
+        match progress {
+            Ok(Progress::NeedMore) if end < input.len() => start += streamed.consume(),
+            Ok(Progress::Done(used)) => break Ok(Progress::Done(start + used)),
+            other => break other,
+        }
+    };
+    assert_eq!(
+        got,
+        expected,
+        "streamed {:?}",
+        String::from_utf8_lossy(input)
+    );
+
     if let Ok(Progress::Done(used)) = expected {
         assert!(used <= input.len());
         assert!(whole.body.len() <= max);
         assert_eq!(whole.body, pieces.body);
+        assert_eq!(whole.body, body);
         true
     } else {
         false

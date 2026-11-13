@@ -35,6 +35,10 @@
 //!   requests are sent in one write).
 //! * Request bodies with `Content-Length` or chunked encoding, fully received
 //!   before the handler runs; `Expect: 100-continue`.
+//! * Bodies that do not fit in memory: a handler can read the request body
+//!   as it arrives ([`Handler::stream_body`], [`BodyStream`]) and write the
+//!   response body as it is produced ([`Body::channel`], [`BodySender`]),
+//!   with backpressure both ways.
 //! * Limits on head and body size, timeouts for idle connections, slow
 //!   requests and slow readers, and an optional cap on open connections.
 //! * The client's address on every request ([`Request::peer_addr`]).
@@ -46,7 +50,7 @@
 //!
 //! ## What it does not do (yet)
 //!
-//! HTTP/2, streaming bodies, compression, routing.
+//! HTTP/2, compression, routing (see the `giong-web` crate for the last two).
 //!
 //! ## HTTPS
 //!
@@ -60,6 +64,7 @@
 
 #![warn(missing_docs)]
 
+mod body;
 mod chunked;
 #[cfg(feature = "client")]
 pub mod client;
@@ -74,6 +79,7 @@ mod request;
 mod response;
 mod server;
 
+pub use body::{BodySender, BodyStream, StreamBody};
 pub use request::Request;
 pub use response::{reason_phrase, Body, Response};
 pub use server::{Handler, Server, Transport};

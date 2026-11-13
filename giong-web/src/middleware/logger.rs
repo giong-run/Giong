@@ -87,7 +87,12 @@ impl<S: 'static> Middleware<S> for Logger {
         }
         line.u64("status", u64::from(status));
         line.u64("duration_us", elapsed.as_micros() as u64);
-        line.u64("bytes", resp.body_bytes().len() as u64);
+        if resp.is_streaming() {
+            // Written after this line, piece by piece.
+            line.null("bytes");
+        } else {
+            line.u64("bytes", resp.body_bytes().len() as u64);
+        }
         let rendered = resp.extension::<Rendered>();
         let id = id.or_else(|| {
             rendered

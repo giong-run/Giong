@@ -2,8 +2,9 @@
 //!
 //! Add them with [`Router::layer`](crate::Router::layer), in this order when
 //! you use several: [`RequestId`] first, so that everything after it knows
-//! the id; [`Logger`] next, so that it sees every response, including those
-//! the others make; then [`Cors`], [`Compression`] and [`Timeout`].
+//! the id; [`Logger`] next (or `Trace`, with the `tracing` feature), so that
+//! it sees every response, including those the others make; then [`Cors`],
+//! [`Compression`] and [`Timeout`].
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -26,6 +27,8 @@ mod cors;
 mod logger;
 mod request_id;
 mod timeout;
+#[cfg(feature = "tracing")]
+mod trace;
 
 #[cfg(any(test, fuzzing))]
 pub(crate) use compression::gunzip;
@@ -34,6 +37,8 @@ pub use cors::Cors;
 pub use logger::Logger;
 pub use request_id::RequestId;
 pub use timeout::Timeout;
+#[cfg(feature = "tracing")]
+pub use trace::Trace;
 
 /// Panics with `GIONG-E1213` for a middleware setting that cannot work.
 #[track_caller]

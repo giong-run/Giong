@@ -48,6 +48,51 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-postgres**, **giong-mysql**, **giong-redis**: pools register themselves as
   `giong::observe` sources (server and database, never credentials), so giong-mcp shows
   their connections, waiters and errors.
+
+- **Streaming bodies in `giong-http`'s server**, both ways, with backpressure.
+  - Request bodies read as they arrive: a handler whose `Handler::stream_body(&req)`
+    returns `Some(limit)` is called once the head is in, and reads the body with
+    `req.body_stream()` (`BodyStream::chunk`, `read_to_end`), one piece in flight at a
+    time. Nothing is read until the handler asks, so it can refuse an upload before the
+    client sends it (`100 Continue` only then). `Content-Length` and chunked bodies are
+    both streamed; a body announced past the limit gets `413` without calling the
+    handler, one that grows past it fails with `GIONG-E1111`; a client that closes or
+    stalls (each piece gets `request_timeout`, the whole body no deadline) gives
+    `GIONG-E1112`, broken chunked framing `GIONG-E1113`. A handler that answers before
+    the end of the body gets its response sent, then the connection closes.
+  - Response bodies written as they are produced: `Body::channel()` gives a
+    `BodySender` and a `Body` for the response. The head goes out when the handler
+    returns, each piece as soon as it is sent, with `Transfer-Encoding: chunked` (to an
+    HTTP/1.0 client without a length, then the connection closes). `send` waits until
+    the previous piece is written; it fails with `GIONG-E1114` once the client is gone
+    or the response has no body (`HEAD`, 204, 304). `BodySender::abort` ends the body
+    without its last chunk, so the client sees it is incomplete. Large pieces are written
+    without a copy, as large bodies are.
+  - The connection fuzz target streams request and response bodies too.
+- **`giong-web`**: streaming and `tracing`.
+  - `Router::stream_bodies(max)`: the routes of that router (wherever it is nested) read
+    their body as it arrives, with `Req::body_stream()`, up to `max` bytes. `?` on a
+    body error answers `413` (`GIONG-E1111`) or `400` (`GIONG-E1112`, `E1113`);
+    `Req::json` on such a route is a `500` whose logged cause says to use the stream.
+    `Timeout` leaves these requests alone, `Compression` leaves streamed responses
+    alone, and `Logger` writes `"bytes":null` for them.
+  - `middleware::Trace`, behind the new `tracing` feature: each request runs in a
+    `request` span (target `giong_web`) with OpenTelemetry's field names
+    (`http.request.method`, `url.path`, `http.route`, `http.response.status_code`,
+    `client.address`) plus `request_id` and `worker`, so events the handler records carry
+    them; the span ends with one event, at `ERROR` with the code and cause for a `5xx`.
+  - 4 new error codes, `GIONG-E1111` to `E1114`; 87 in all.
+- **`examples/rest-api`**, a complete REST API on giong's own crates: users in
+  PostgreSQL (`giong-postgres`), read through a Redis cache (`giong-redis`), served over
+  HTTPS (`giong-tls`) by `giong-web`, with create, read, update, delete, keyset pages and
+  an NDJSON export streamed with `Body::channel`. Each worker has its own pools and
+  listener. Its test starts a throwaway PostgreSQL and Redis and goes through every route,
+  including reads with the cache down. `bench/rest-api.sh` measures it against the same
+  API on axum 0.8 (`bench/rest-api-axum`), one worker each over HTTPS: 69.9k against
+  47.2k requests per second on cached reads, 35.9k against 19.5k on pages from
+  PostgreSQL, 54.1k against 25.8k on inserts (medians of 5 rounds; method and ranges in
+  the example's README).
+
 - **Load balancing across workers**, without moving a task once it has started (so tasks
   still need not be `Send`):
   - `Handle::spawn_balanced(f)`: `f` waits in a queue shared by the workers, and the
@@ -206,6 +251,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `GIONG-E0001` or `GIONG-E0002`; those errors are raised only when io_uring was asked
   for. An unknown `GIONG_DRIVER` value fails with `GIONG-E0004`. `docs/DEPLOYMENT.md`
   explains when each driver is used.
+- **`giong-http`**: `Body` is `#[non_exhaustive]` and has a new variant,
+  `Body::Stream`; a `match` on it needs a `_` arm. `Body::as_bytes` and `len` are empty
+  for a stream, and `is_empty` is `false` (`Body::is_stream`, `Response::is_streaming`
+  tell). `Server::max_body_size` does not apply to bodies read as a stream.
 - **`giong-http`**: `Server::serve`, `serve_unix` and `serve_tls` take any `Handler`. A
   closure passed to them needs its argument's type written (`|req: Request| async
   move { .. }`): Rust no longer infers it.

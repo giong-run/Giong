@@ -5,10 +5,12 @@ use std::borrow::Cow;
 use std::fmt;
 use std::mem;
 
+use crate::body::{BodySender, StreamBody};
 use crate::parse::{is_field_value, is_token_str};
 
 /// A response body.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub enum Body {
     /// No body.
     #[default]
@@ -18,32 +20,82 @@ pub enum Body {
     Static(&'static [u8]),
     /// Owned bytes.
     Owned(Vec<u8>),
+    /// A body written piece by piece as it is produced: see
+    /// [`channel`](Self::channel).
+    Stream(StreamBody),
 }
 
 impl Body {
-    /// The bytes of the body.
+    /// A body that is written as it is produced, and the sender that
+    /// produces it: for a body too large to hold (a file, an export) or not
+    /// known in full when the response starts (server-sent events).
+    ///
+    /// ```no_run
+    /// use giong_http::{Body, Request, Response};
+    ///
+    /// async fn events(_req: Request) -> Response {
+    ///     let (tx, body) = Body::channel();
+    ///     drop(giong::spawn(async move {
+    ///         for n in 0.. {
+    ///             let event = format!("data: tick {n}\n\n");
+    ///             if tx.send(event).await.is_err() {
+    ///                 break; // The client went away.
+    ///             }
+    ///             giong::time::sleep(std::time::Duration::from_secs(1)).await;
+    ///         }
+    ///     }));
+    ///     Response::new(200)
+    ///         .header("Content-Type", "text/event-stream")
+    ///         .header("Cache-Control", "no-store")
+    ///         .body(body)
+    /// }
+    /// ```
+    ///
+    /// The response goes out with `Transfer-Encoding: chunked`, its head as
+    /// soon as the handler returns and each piece as soon as it is sent.
+    /// Dropping the [`BodySender`] ends the body. An HTTP/1.0 client gets
+    /// the body without a length, and the connection closes after it.
+    ///
+    /// The server waits for the producer without a time limit (an event
+    /// stream may be quiet for a long time); each piece must be written
+    /// within [`Server::write_timeout`](crate::Server::write_timeout). A
+    /// client that goes away is noticed at the next write, and the sender's
+    /// [`send`](BodySender::send) fails from then on.
+    pub fn channel() -> (BodySender, Body) {
+        let (tx, body) = crate::body::channel();
+        (tx, Body::Stream(body))
+    }
+
+    /// The bytes of the body. Empty for a [`Stream`](Self::Stream).
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            Body::Empty => &[],
+            Body::Empty | Body::Stream(_) => &[],
             Body::Static(bytes) => bytes,
             Body::Owned(bytes) => bytes,
         }
     }
 
-    /// The length of the body in bytes.
+    /// The length of the body in bytes; 0 for a [`Stream`](Self::Stream).
     pub fn len(&self) -> usize {
         self.as_bytes().len()
     }
 
-    /// `true` if the body has no bytes.
+    /// `true` if the body has no bytes. A [`Stream`](Self::Stream) is not
+    /// empty: its bytes are not known yet.
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        !self.is_stream() && self.len() == 0
+    }
+
+    /// `true` for a body written as it is produced.
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Body::Stream(_))
     }
 
     /// The bytes as a buffer the kernel can send from, without a copy.
+    /// Empty for a stream, which the server writes piece by piece instead.
     pub(crate) fn into_cow(self) -> Cow<'static, [u8]> {
         match self {
-            Body::Empty => Cow::Borrowed(&[]),
+            Body::Empty | Body::Stream(_) => Cow::Borrowed(&[]),
             Body::Static(bytes) => Cow::Borrowed(bytes),
             Body::Owned(bytes) => Cow::Owned(bytes),
         }
@@ -214,9 +266,17 @@ impl Response {
         self
     }
 
-    /// The body's bytes.
+    /// The body's bytes. Empty for a body written as it is produced (see
+    /// [`is_streaming`](Self::is_streaming)).
     pub fn body_bytes(&self) -> &[u8] {
         self.body.as_bytes()
+    }
+
+    /// `true` if the body is written as it is produced
+    /// ([`Body::channel`]): its bytes are not known yet, so code around the
+    /// handler (compression, an access log) should leave it alone.
+    pub fn is_streaming(&self) -> bool {
+        self.body.is_stream()
     }
 
     /// Takes the body out, leaving the response without one.
@@ -269,7 +329,9 @@ impl Response {
     }
 
     /// Appends the status line and the header fields, up to and including the
-    /// blank line, to `out`.
+    /// blank line, to `out`. A streamed body gets `Transfer-Encoding:
+    /// chunked` over HTTP/1.1, and no length over HTTP/1.0 (the caller then
+    /// closes the connection after it).
     pub(crate) fn write_head(&self, out: &mut Vec<u8>, minor: u8, keep_alive: bool) {
         out.reserve(128 + self.headers.len());
         out.extend_from_slice(if minor == 0 {
@@ -283,10 +345,17 @@ impl Response {
         out.extend_from_slice(b"\r\nDate: ");
         out.extend_from_slice(&crate::date::now());
         out.extend_from_slice(b"\r\n");
-        if !self.bodiless() {
-            out.extend_from_slice(b"Content-Length: ");
-            push_number(out, self.body_len());
-            out.extend_from_slice(b"\r\n");
+        match (self.bodiless(), self.body.is_stream()) {
+            (true, _) => {}
+            (false, false) => {
+                out.extend_from_slice(b"Content-Length: ");
+                push_number(out, self.body_len());
+                out.extend_from_slice(b"\r\n");
+            }
+            (false, true) if minor == 1 => {
+                out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            }
+            (false, true) => {}
         }
         out.extend_from_slice(&self.headers);
         if !keep_alive {
@@ -470,6 +539,30 @@ mod tests {
             (&b"hello"[..], 5, false)
         );
         assert!(resp.body_bytes().is_empty());
+    }
+
+    #[test]
+    fn a_streamed_body_is_chunked_over_http_1_1_and_unframed_over_1_0() {
+        let (tx, body) = Body::channel();
+        assert!(body.is_stream() && !body.is_empty() && body.as_bytes().is_empty());
+        let resp = Response::new(200)
+            .header("Content-Type", "text/plain")
+            .body(body);
+        assert!(resp.is_streaming() && resp.body_bytes().is_empty());
+        assert_eq!(
+            wire(&resp, 1, true, false),
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n"
+        );
+        assert_eq!(
+            wire(&resp, 0, false, false),
+            "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n"
+        );
+        let resp = Response::new(304).body(Body::channel().1);
+        assert_eq!(
+            wire(&resp, 1, true, false),
+            "HTTP/1.1 304 Not Modified\r\n\r\n"
+        );
+        assert!(!tx.is_closed());
     }
 
     #[test]

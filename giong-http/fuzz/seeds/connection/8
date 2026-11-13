@@ -1,0 +1,5 @@
+GET /rn HTTP/1.1
+Host: a
+
+GET /r HTTP/1.0
+

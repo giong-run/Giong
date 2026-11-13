@@ -13,7 +13,7 @@ categories = ["asynchronous", "network-programming"]
 exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", ".github/", "scripts/", "assets/", "site/", "docs/"]
 
 [workspace]
-members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp"]
+members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "examples/rest-api"]
 exclude = ["bench"]
 
 [dependencies]
