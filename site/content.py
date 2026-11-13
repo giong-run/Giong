@@ -157,8 +157,8 @@ AGENTS = dict(
          "`AGENTS.md` in the repository and `llms.txt` on this site. `giong-mcp`, on the roadmap, "
          "lets an agent look inside a running service."),
     ],
-    error=("GIONG-E0102: no address found for db.internal. Fix: check the spelling of the name,\n"
-           "/etc/hosts, and the DNS servers in /etc/resolv.conf (in a container, the network it is\n"
+    error=("GIONG-E0102: no address found for db.internal. Fix: check the spelling of the name, "
+           "/etc/hosts, and the DNS servers in /etc/resolv.conf (in a container, the network it is "
            "attached to). See https://github.com/giong-run/Giong/blob/main/docs/errors/E0102.md"),
 )
 
