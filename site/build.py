@@ -30,6 +30,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "scripts"))
+import art  # noqa: E402
 import content as C  # noqa: E402
 import md  # noqa: E402
 import release  # noqa: E402
@@ -228,6 +229,16 @@ def doc_md(src, src_dir="", **kw):
     return md.render(src, link=lambda u: repo_link(u, src_dir), **kw)
 
 
+def split_intro(src):
+    """The opening paragraphs of a Markdown body, and the rest from its first list or heading."""
+    m = re.search(r"^(?:#{2,6} |[-*] |\d+\. |\|)", src, re.M)
+    return (src, "") if not m else (src[:m.start()].strip(), src[m.start():].strip())
+
+
+def more(label, inner, cls="more-box"):
+    return f'<details class="{cls}"><summary>{label}</summary>{inner}</details>'
+
+
 def ilm(s, src_dir=""):
     """Inline Markdown in a content string, links resolved against the repository."""
     return md.inline(s, link=lambda u: repo_link(u, src_dir))
@@ -377,8 +388,8 @@ def stack(detail=False):
         rows.append(f'<div class="layer is-{key}"><p class="layer-name">{label}</p>'
                     f'<div class="layer-tiles">{"".join(tiles)}</div></div>')
     base = ('<div class="layer is-kernel"><p class="layer-name">Linux</p><div class="layer-tiles">'
-            '<div class="kernel">io_uring <span>·</span> one thread and one ring per core '
-            '<span>·</span> kernel 6.0+</div></div></div>')
+            '<div class="kernel"><span>io_uring</span><span>one thread and one ring per core</span>'
+            '<span>kernel 6.0+</span></div></div></div>')
     return f'<div class="stack">{"".join(rows)}{base}</div>'
 
 
@@ -574,9 +585,15 @@ def home():
         (str(len(DEPS)), "dependencies in the runtime: " + ", ".join(f"`{d}`" for d in DEPS)),
     ]
     stats_html = "".join(f'<div class="stat"><b>{v}</b><span>{ilm(d)}</span></div>' for v, d in stats)
+    drawn = {"One syscall per tick": art.syscalls, "Idle connections hold no buffer": art.buffers,
+             "Cancel safe by construction": art.cancel, "Shared nothing": art.cores}
+    how = "".join(
+        f'<article class="how-card"><div class="ill-wrap">{drawn[h]()}</div>'
+        f'<div class="how-text"><p class="tag">{tag}</p><h3>{h}</h3><p>{ilm(p)}</p></div></article>'
+        for tag, h, p in C.PILLARS if h in drawn)
     pillars = "".join(
         f'<article class="pillar"><p class="tag">{tag}</p><h3>{h}</h3><p>{ilm(p)}</p></article>'
-        for tag, h, p in C.PILLARS)
+        for tag, h, p in C.PILLARS if h not in drawn)
     charts = "".join(chart(c, home=True) for c in C.CHARTS if c.get("home"))
     a = C.AGENTS
     points = "".join(f'<li><h3>{h}</h3><p>{ilm(p)}</p></li>' for h, p in a["points"])
@@ -621,7 +638,8 @@ def home():
   <div class="wrap">
     {head_block("why giong", "Built around the kernel's own queue",
                 "giong commits to io_uring and to one thread per core, and to nothing else. These are the six things that buys.")}
-    <div class="pillars">{pillars}</div>
+    <div class="how">{how}</div>
+    <div class="pillars pillars-2">{pillars}</div>
   </div>
 </section>
 
@@ -723,7 +741,7 @@ def docs():
         for c in CRATES)
     errs = "".join(
         f'<details class="errs"{" open" if n == 0 else ""}><summary><b>{html.escape(g["name"])}</b>'
-        f'<span>{len(g["rows"])} codes</span></summary><table><tbody>'
+        f'<span>{len(g["rows"])} code{"" if len(g["rows"]) == 1 else "s"}</span></summary><table><tbody>'
         + "".join(f'<tr><td><a href="{repo_link(r["file"], "docs/errors")}">{r["code"]}</a></td>'
                   f'<td><code>{html.escape(r["variant"])}</code></td><td>{ilm(r["meaning"])}</td></tr>'
                   for r in g["rows"])
@@ -732,13 +750,13 @@ def docs():
     elsewhere = "".join(f"<p>{ilm(p)}</p>" for p in C.ELSEWHERE)
     faq = "".join(f'<details class="qa"><summary>{q}</summary><p>{ilm(a)}</p></details>' for q, a in C.FAQ)
     toc = [("requirements", "Requirements"), ("install", "Install"), ("first", "A first server"),
-           ("examples", "Examples"), ("api", "API reference"), ("errors", "Error codes"),
+           ("how", "A request's path"), ("examples", "Examples"), ("api", "API reference"), ("errors", "Error codes"),
            ("limits", "Limits"), ("faq", "Questions"), ("contribute", "Work on giong")]
     toc_html = "".join(f'<a href="#{a}">{label}</a>' for a, label in toc)
     body = f'''{page_head("docs", "Get started with giong",
                           "Requirements, a first server, and where everything else is documented. The API reference for each crate is on docs.rs.")}
 <div class="wrap doc-grid">
-  <nav class="toc" aria-label="On this page"><p>On this page</p>{toc_html}</nav>
+  <nav class="toc" aria-label="On this page"><p>On this page</p><div class="toc-links">{toc_html}</div></nav>
   <div class="doc">
     <section id="requirements"><h2>Requirements</h2><dl class="reqs">{reqs}</dl></section>
     <section id="install"><h2>Install</h2>
@@ -754,6 +772,15 @@ cargo add giong-http          # or giong-web for routing, middleware and JSON</c
       <pre class="code" tabindex="0"><code>{rust(http["src"])}</code></pre>
       <p>Then run it:</p>
       <pre class="code" tabindex="0"><code>{shell(C.RUN_SH)}</code></pre>
+    </section>
+    <section id="how"><h2>What happens to a request</h2>
+      <p>One connection, from the kernel to your handler and back. Everything stays on the worker
+      that accepted it, and every trip into the kernel that a turn of its loop needs, for all of
+      its connections, goes in the same <code>io_uring_enter</code>.</p>
+      <figure class="fig ill-wrap">{art.request()}
+        <figcaption>The worker on core 2 owns this connection for its whole life. Its query to
+        PostgreSQL is one more entry in the same ring, pipelined with the other tasks' queries.</figcaption>
+      </figure>
     </section>
     <section id="examples"><h2>Examples</h2>
       <p>Each one runs from a clone of the repository; the crates' READMEs have more.
@@ -835,6 +862,18 @@ def benchmarks():
     body = f'''{page_head("benchmarks", "Benchmarks", C.BENCH_METHOD,
                           f'Full tables and raw output: <a href="{REPO}#benchmarks">README</a> · <a href="{TREE}bench/results">bench/results/</a>')}
 <section class="band band-tight"><div class="wrap">
+  <div class="bench-intro">
+    <div class="head-text">
+      <p class="eyebrow">method</p>
+      <h2>How each number is measured</h2>
+      <p class="head-lede">The server gets one core and the load generator another, so they never
+      compete. Servers take turns in interleaved rounds, so a change in the machine's speed hits all
+      of them alike. A bar is the median of five rounds; the thin line under it runs from the lowest
+      round to the highest.</p>
+      <a class="more" href="{BLOB}bench/run.sh">bench/run.sh <span aria-hidden="true">→</span></a>
+    </div>
+    <figure class="fig ill-wrap">{art.bench_setup()}</figure>
+  </div>
   <div class="charts">{charts}</div>
 </div></section>
 <section class="band band-alt" id="caveats"><div class="wrap caveats">
@@ -858,9 +897,16 @@ def benchmarks():
 
 
 def roadmap():
-    def body_html(m):
-        h = doc_md(m["body"], heading_shift=1, heading_ids=False)
+    def md_html(src):
+        h = doc_md(src, heading_shift=1, heading_ids=False)
         return h.replace("<p><strong>Exit criteria:</strong>", '<p class="exit"><strong>Done when:</strong>')
+
+    def body_html(m):
+        intro, rest = split_intro(m["body"])
+        if m["state"] != "done" or not rest or not intro:
+            return md_html(m["body"])
+        label = f'Show the {m["total"]} items' if m["total"] else "Show the details"
+        return md_html(intro) + more(label, f'<div class="prose">{md_html(rest)}</div>')
     rows = []
     for m in MILESTONES:
         progress = f'<span class="ms-progress">{m["done"]} of {m["total"]}</span>' if m["total"] else ""
@@ -907,11 +953,15 @@ def releases():
             meta.append(f'<a href="{r["compare"]}">every commit</a>')
         latest = r is LATEST
         badge = '<span class="badge">latest</span>' if latest else ""
-        notes = f'<div class="prose">{doc_md(r["body"], heading_shift=0, heading_ids=False)}</div>'
+        count = len(re.findall(r"^- ", r["body"], re.M))
+        intro, rest = split_intro(r["body"])
         if unreleased:
-            count = len(re.findall(r"^- ", r["body"], re.M))
-            notes = (f'<details class="next"><summary>Show the {count} entries waiting for the next release</summary>'
-                     f'{notes}</details>')
+            intro, rest = "", r["body"]
+        notes = f'<div class="prose">{doc_md(intro, heading_ids=False)}</div>' if intro else ""
+        if rest:
+            label = (f"Show the {count} entries waiting for the next release" if unreleased
+                     else f'Show {"the " + str(count) + " changes" if count > 1 else "the change"} in {r["version"]}')
+            notes += more(label, f'<div class="prose">{doc_md(rest, heading_ids=False)}</div>', "more-box next")
         items.append(
             f'<article class="rel{" is-next" if unreleased else ""}" id="{r["id"]}">'
             f'<header class="rel-head"><h2>{title}{badge}</h2>'
@@ -922,7 +972,7 @@ def releases():
                           "What changed in each version, newest first. Every crate shares the version number. While it starts with 0, a minor release may break the API.",
                           source_note(["CHANGELOG.md"]) + f' · <a href="{REPO}/releases.atom">feed</a>')}
 <div class="wrap doc-grid">
-  <nav class="toc" aria-label="Versions"><p>Versions</p>{"".join(side)}</nav>
+  <nav class="toc" aria-label="Versions"><p>Versions</p><div class="toc-links">{"".join(side)}</div></nav>
   <div class="releases">{"".join(items)}</div>
 </div>'''
     return frame("releases", "Releases", "Release notes for every version of giong, from CHANGELOG.md.",
