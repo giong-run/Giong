@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use giong::error::{self, Code};
-use giong::net::UdpSocket;
+use giong::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
 use giong::DriverKind;
 
 /// `true` if io_uring works here (it is blocked, for instance, under
@@ -175,4 +175,107 @@ fn the_default_driver_is_the_expected_one() {
         .block_on(async { giong::driver_kind() })
         .unwrap();
     assert_eq!(got.name(), expected);
+}
+
+/// Sends `ping` over `stream` and reads the echo; `true` if that took less
+/// than `limit`. A lost wake-up does not show as a hang here: the timeout's
+/// own timer wakes the task, which then finds the echo waiting. Hence the
+/// clock.
+async fn echo_within<S: Echo>(stream: S, limit: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let echoed = giong::time::timeout(2 * limit, stream.ping())
+        .await
+        .is_ok_and(|r| r.is_ok_and(|b| b == b"ping"));
+    echoed && start.elapsed() < limit
+}
+
+trait Echo {
+    async fn ping(self) -> std::io::Result<Vec<u8>>;
+}
+
+impl Echo for TcpStream {
+    async fn ping(self) -> std::io::Result<Vec<u8>> {
+        let (r, _) = self.write_all(b"ping".to_vec()).await;
+        r?;
+        let (r, buf) = self.read(vec![0u8; 16]).await;
+        Ok(buf[..r?].to_vec())
+    }
+}
+
+impl Echo for UnixStream {
+    async fn ping(self) -> std::io::Result<Vec<u8>> {
+        let (r, _) = self.write_all(b"ping".to_vec()).await;
+        r?;
+        let (r, buf) = self.read(vec![0u8; 16]).await;
+        Ok(buf[..r?].to_vec())
+    }
+}
+
+#[test]
+fn a_failed_connect_does_not_stall_the_next_socket() {
+    // A connect that fails gives its descriptor number back, and the next
+    // socket usually gets the same number. The epoll driver once kept the
+    // old registration on record, so the new socket was never woken.
+    let mut kinds = vec![DriverKind::Epoll];
+    if io_uring_available() {
+        kinds.push(DriverKind::IoUring);
+    }
+    let dir = std::env::temp_dir().join(format!("giong-failed-connect-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for kind in kinds {
+        let dir = dir.clone();
+        giong::Builder::new()
+            .driver(kind)
+            .block_on(async move {
+                let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+                let tcp_addr = tcp.local_addr().unwrap();
+                let path = dir.join(format!("{kind}.sock"));
+                let unix = UnixListener::bind(&path).unwrap();
+                giong::spawn(async move {
+                    loop {
+                        let s = tcp.accept().await.unwrap();
+                        giong::spawn(async move {
+                            let (r, buf) = s.read(vec![0u8; 16]).await;
+                            let n = r.unwrap();
+                            let _ = s.write_all(buf[..n].to_vec()).await;
+                        });
+                    }
+                });
+                giong::spawn(async move {
+                    loop {
+                        let s = unix.accept().await.unwrap();
+                        giong::spawn(async move {
+                            let (r, buf) = s.read(vec![0u8; 16]).await;
+                            let n = r.unwrap();
+                            let _ = s.write_all(buf[..n].to_vec()).await;
+                        });
+                    }
+                });
+                // A port nobody listens on: bound, then closed.
+                let refused = std::net::TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap();
+                let missing = dir.join("missing.sock");
+                // Generous: a working echo takes microseconds.
+                let limit = Duration::from_secs(2);
+                for _ in 0..3 {
+                    assert!(TcpStream::connect(refused).await.is_err());
+                    let s = TcpStream::connect(tcp_addr).await.unwrap();
+                    assert!(
+                        echo_within(s, limit).await,
+                        "{kind}: TCP after a refused connect"
+                    );
+                    assert!(UnixStream::connect(&missing).await.is_err());
+                    let s = UnixStream::connect(&path).await.unwrap();
+                    assert!(
+                        echo_within(s, limit).await,
+                        "{kind}: Unix after a failed connect"
+                    );
+                }
+            })
+            .unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
