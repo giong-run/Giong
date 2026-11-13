@@ -18,14 +18,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   choose explicitly (asking for io_uring where it is blocked fails with `GIONG-E0001`, as
   before), and `giong::driver_kind()` tells which driver a worker got. Every API behaves
   the same on both; on epoll, file operations run on a pool of blocking threads, except on
-  pipes and sockets. On one core, epoll does what raw Tokio and a hand-written epoll server
-  do (158k requests per second on a small response at 50 connections, 2.02 system calls
-  per request), while io_uring keeps its lead where batching counts: 55.7k against 32.7k
-  requests per second on an 8 KB response. The README has the full comparison.
+  pipes and sockets, and a file is closed only once the threads are done with it. On one
+  core, epoll does what raw Tokio and a hand-written epoll server do (158k requests per
+  second on a small response at 50 connections, 2.02 system calls per request), while
+  io_uring keeps its lead where batching counts: 55.7k against 32.7k requests per second
+  on an 8 KB response. The README has the full comparison.
 - **Verification**: `scripts/check.sh fallback` also runs the suite on epoll;
   `scripts/check.sh seccomp` runs it with io_uring blocked the way Docker blocks it
   (`scripts/no-io-uring.py`), and CI runs it inside a Docker container with the default
-  profile and on a real 5.15 kernel.
+  profile and on a real 5.15 kernel. ThreadSanitizer runs on both drivers.
 
 - **Load balancing across workers**, without moving a task once it has started (so tasks
   still need not be `Send`):
