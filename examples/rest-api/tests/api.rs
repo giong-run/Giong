@@ -317,7 +317,10 @@ fn crud_through_the_cache_over_https() {
 
         let resp = client.get(&url("/users/export")).send().await.unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.header("transfer-encoding"), Some("chunked"));
+        // Streamed: the client and the server agree on HTTP/2 through ALPN,
+        // where a body sent as it is made has no length.
+        assert_eq!(resp.version(), giong_http::Version::Http2);
+        assert_eq!(resp.header("content-length"), None);
         let text = resp.text().unwrap();
         let lines: Vec<serde_json::Value> = text
             .lines()
