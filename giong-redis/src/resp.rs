@@ -7,7 +7,8 @@
 //! or [`ReadBuf::skip`] passes over a reply nobody waits for.
 //!
 //! A reply larger than the limit is thrown away as it arrives, without
-//! being kept, and reported as [`Next::TooLarge`]: the connection stays in
+//! being kept, and reported as [`Next::TooLarge`], which says whether it
+//! was a push message (one no command waits for): the connection stays in
 //! step with the server.
 
 use crate::error::{Error, ServerError};
@@ -35,8 +36,9 @@ pub(crate) enum Next {
     Pending,
     /// The next reply is here, this many bytes long: take or skip it.
     Ready(usize),
-    /// A reply larger than the limit arrived and was thrown away.
-    TooLarge,
+    /// A reply larger than the limit arrived and was thrown away. `push`:
+    /// it was a push message, which answers no command.
+    TooLarge { push: bool },
 }
 
 /// Bytes received and not yet taken apart into replies.
@@ -55,6 +57,8 @@ struct Scan {
     stack: Vec<u64>,
     /// The reply in progress is over the limit and being thrown away.
     discarding: bool,
+    /// The reply being thrown away is a push message.
+    push: bool,
     /// Bytes of a string being thrown away that have not arrived yet.
     skip: usize,
     /// A string being thrown away has ended: one element is complete.
@@ -165,11 +169,11 @@ impl ReadBuf {
                 return Ok(Next::Pending);
             }
             if std::mem::take(&mut scan.skipped_one) && scan.complete_one() {
-                return Ok(scan.finish(&mut self.start, limit));
+                return Ok(scan.finish(&self.data, &mut self.start, limit));
             }
             let buf = &self.data[self.start..];
             if !scan.discarding && scan.pos > limit {
-                scan.discard(&mut self.start);
+                scan.discard(&self.data, &mut self.start);
                 continue;
             }
             let pos = scan.pos;
@@ -193,7 +197,7 @@ impl ReadBuf {
                 b'+' | b'-' | b':' | b',' | b'#' | b'_' | b'(' => {
                     scan.pos = after;
                     if scan.complete_one() {
-                        return Ok(scan.finish(&mut self.start, limit));
+                        return Ok(scan.finish(&self.data, &mut self.start, limit));
                     }
                 }
                 b'$' | b'!' | b'=' => {
@@ -201,7 +205,7 @@ impl ReadBuf {
                         Some(-1) if kind == b'$' => {
                             scan.pos = after;
                             if scan.complete_one() {
-                                return Ok(scan.finish(&mut self.start, limit));
+                                return Ok(scan.finish(&self.data, &mut self.start, limit));
                             }
                             continue;
                         }
@@ -218,12 +222,13 @@ impl ReadBuf {
                         }
                         scan.pos = after + total;
                         if scan.complete_one() {
-                            return Ok(scan.finish(&mut self.start, limit));
+                            return Ok(scan.finish(&self.data, &mut self.start, limit));
                         }
                     } else if scan.discarding || after + total > limit {
                         // Throw away what is here, and the rest as it comes.
                         if !scan.discarding {
                             scan.discarding = true;
+                            scan.push = starts_push(buf);
                         }
                         self.start += buf.len();
                         scan.pos = 0;
@@ -239,7 +244,7 @@ impl ReadBuf {
                         Some(-1) if kind == b'*' => {
                             scan.pos = after;
                             if scan.complete_one() {
-                                return Ok(scan.finish(&mut self.start, limit));
+                                return Ok(scan.finish(&self.data, &mut self.start, limit));
                             }
                             continue;
                         }
@@ -255,7 +260,7 @@ impl ReadBuf {
                     scan.pos = after;
                     if elements == 0 {
                         if scan.complete_one() {
-                            return Ok(scan.finish(&mut self.start, limit));
+                            return Ok(scan.finish(&self.data, &mut self.start, limit));
                         }
                     } else {
                         if scan.stack.len() >= MAX_DEPTH {
@@ -278,20 +283,7 @@ impl ReadBuf {
 
     /// Whether the reply found by [`next`](Self::next) is a push message.
     pub(crate) fn is_push(&self) -> bool {
-        let mut pos = self.start;
-        // Attributes come before what they describe.
-        while self.data.get(pos) == Some(&b'|') {
-            pos += 1;
-            let Some(pairs) = line(&self.data, &mut pos).ok().and_then(number) else {
-                return false;
-            };
-            for _ in 0..2 * pairs {
-                if parse(&self.data, &mut pos, 0).is_err() {
-                    return false;
-                }
-            }
-        }
-        self.data.get(pos) == Some(&b'>')
+        starts_push(&self.data[self.start..])
     }
 
     /// Builds the reply of `len` bytes found by [`next`](Self::next) and
@@ -331,22 +323,50 @@ impl Scan {
     }
 
     /// Ends the reply: what to report, and resets for the next one.
-    fn finish(&mut self, start: &mut usize, limit: usize) -> Next {
+    /// `data[*start..]` holds what is left of the reply.
+    fn finish(&mut self, data: &[u8], start: &mut usize, limit: usize) -> Next {
         let pos = std::mem::take(&mut self.pos);
-        if std::mem::take(&mut self.discarding) || pos > limit {
+        let push = std::mem::take(&mut self.push);
+        if std::mem::take(&mut self.discarding) {
             *start += pos;
-            Next::TooLarge
+            Next::TooLarge { push }
+        } else if pos > limit {
+            // Whole, but over the limit: all of it is still here.
+            let push = starts_push(&data[*start..]);
+            *start += pos;
+            Next::TooLarge { push }
         } else {
             Next::Ready(pos)
         }
     }
 
-    /// Starts throwing away the reply in progress.
-    fn discard(&mut self, start: &mut usize) {
+    /// Starts throwing away the reply in progress, which begins at
+    /// `data[*start..]`.
+    fn discard(&mut self, data: &[u8], start: &mut usize) {
         self.discarding = true;
+        self.push = starts_push(&data[*start..]);
         *start += self.pos;
         self.pos = 0;
     }
+}
+
+/// Whether the reply at the start of `data` is a push message. Attributes
+/// before it are looked through when they have arrived whole.
+fn starts_push(data: &[u8]) -> bool {
+    let mut pos = 0;
+    // Attributes come before what they describe.
+    while data.get(pos) == Some(&b'|') {
+        pos += 1;
+        let Some(pairs) = line(data, &mut pos).ok().and_then(number) else {
+            return false;
+        };
+        for _ in 0..2 * pairs {
+            if parse(data, &mut pos, 0).is_err() {
+                return false;
+            }
+        }
+    }
+    data.get(pos) == Some(&b'>')
 }
 
 fn lossy(b: &[u8]) -> String {
@@ -518,7 +538,13 @@ pub(crate) fn encode(v: &Value, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    fn read_all(input: &[u8], limit: usize, piece: usize) -> Result<Vec<Result<Value, ()>>, Error> {
+    /// The replies in `input`, fed `piece` bytes at a time; one over the
+    /// limit is `Err(push)`.
+    fn read_all(
+        input: &[u8],
+        limit: usize,
+        piece: usize,
+    ) -> Result<Vec<Result<Value, bool>>, Error> {
         let mut buf = ReadBuf::new();
         let mut out = Vec::new();
         for chunk in input.chunks(piece.max(1)) {
@@ -527,7 +553,7 @@ mod tests {
                 match buf.next(limit)? {
                     Next::Pending => break,
                     Next::Ready(n) => out.push(Ok(buf.take(n)?)),
-                    Next::TooLarge => out.push(Err(())),
+                    Next::TooLarge { push } => out.push(Err(push)),
                 }
             }
         }
@@ -715,12 +741,31 @@ mod tests {
             &Value::Array(vec![Value::Bulk(vec![b'z'; 600]); 20]),
             &mut input,
         );
+        // Push messages over the limit are told apart, so that a client
+        // does not take them for the answer to a command.
+        encode(
+            &Value::Push(vec![
+                Value::Bulk(b"invalidate".to_vec()),
+                Value::Array(vec![Value::Bulk(vec![b'k'; 2000])]),
+            ]),
+            &mut input,
+        );
+        encode(
+            &Value::Push(vec![Value::Bulk(vec![b'p'; 300]); 10]),
+            &mut input,
+        );
         encode(&Value::Int(5), &mut input);
         for piece in [1, 5, 100, 4096, input.len()] {
             let got = read_all(&input, 1000, piece).unwrap();
             assert_eq!(
                 got,
-                [Err(()), Err(()), Ok(Value::Int(5))],
+                [
+                    Err(false),
+                    Err(false),
+                    Err(true),
+                    Err(true),
+                    Ok(Value::Int(5))
+                ],
                 "in pieces of {piece}"
             );
         }
@@ -733,7 +778,7 @@ mod tests {
         assert!(buf.data.len() - buf.start < 1000);
         buf.extend(&vec![b'q'; 500_000]);
         buf.extend(b"\r\n:1\r\n");
-        assert_eq!(buf.next(1000).unwrap(), Next::TooLarge);
+        assert_eq!(buf.next(1000).unwrap(), Next::TooLarge { push: false });
         assert_eq!(buf.next(1000).unwrap(), Next::Ready(4));
         assert_eq!(buf.take(4).unwrap(), Value::Int(1));
         assert!(buf.is_empty());

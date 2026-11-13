@@ -322,6 +322,16 @@ impl Client {
             .conn
             .send("the pipeline", shape, true, |out| pipe.encode(out, atomic))
             .await?;
+        if atomic && matches!(value, Value::Nil) {
+            // EXEC answers nil only when a watched key changed. Not
+            // watched through a `Watch`, the commands did not run, and
+            // saying so is the only safe answer.
+            return Err(Error::new(
+                ErrorKind::Server,
+                "the transaction did not run: EXEC answered nil, as it does when a key WATCHed \
+                 on this connection changed; use Client::watch for optimistic transactions",
+            ));
+        }
         T::from_value(value)
     }
 
@@ -355,13 +365,20 @@ impl Client {
             return Err(Error::command("WATCH needs at least one key"));
         }
         let watch = cmd("WATCH").args(keys);
-        self.conn
-            .send("WATCH", Shape::One, true, |out| watch.encode(out))
-            .await?;
-        Ok(Watch {
+        // Made first, so that if this future is dropped once WATCH is
+        // queued, or WATCH fails, the guard queues UNWATCH: a watch left
+        // behind would make a later transaction on the connection, perhaps
+        // another task's once a pool shares it, quietly not run.
+        let guard = Watch {
             client: self,
             done: false,
-        })
+        };
+        guard
+            .client
+            .conn
+            .send("WATCH", Shape::One, true, |out| watch.encode(out))
+            .await?;
+        Ok(guard)
     }
 
     /// The server's version, from its answer to `HELLO`.
@@ -593,16 +610,18 @@ impl Conn {
         let mut now = None;
         loop {
             let next = buf.next(self.config.max_reply_size)?;
-            if let Next::Pending = next {
-                return Ok(());
-            }
-            if let Next::Ready(n) = next {
-                if buf.is_push() {
-                    // Pub/Sub messages and tracking invalidations are for
-                    // PubSub; a client has no use for them.
+            match next {
+                Next::Pending => return Ok(()),
+                // Pub/Sub messages and tracking invalidations answer no
+                // command, and a client has no use for them. One over the
+                // limit is thrown away just the same: counted as a reply, it
+                // would put every later reply against the wrong command.
+                Next::Ready(n) if buf.is_push() => {
                     buf.skip(n);
                     continue;
                 }
+                Next::TooLarge { push: true } => continue,
+                _ => {}
             }
             let slot = self
                 .state
@@ -627,7 +646,7 @@ impl Conn {
                             }
                         }
                     }
-                    Next::TooLarge => {
+                    Next::TooLarge { .. } => {
                         if inner.failed.is_none() && !inner.abandoned {
                             inner.failed = Some(Error::new(
                                 ErrorKind::TooLarge,

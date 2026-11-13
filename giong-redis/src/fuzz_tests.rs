@@ -56,9 +56,13 @@ fn value(rng: &mut Rng, depth: usize) -> Value {
     }
 }
 
-/// Reads `input` delivered in random pieces; returns the replies (`None`
-/// for one over the limit) or the first error.
-fn read(rng: &mut Rng, input: &[u8], limit: usize) -> Result<Vec<Option<Value>>, crate::Error> {
+/// Reads `input` delivered in random pieces; returns the replies
+/// (`Err(push)` for one over the limit) or the first error.
+fn read(
+    rng: &mut Rng,
+    input: &[u8],
+    limit: usize,
+) -> Result<Vec<Result<Value, bool>>, crate::Error> {
     let mut buf = ReadBuf::new();
     let mut out = Vec::new();
     let mut pos = 0;
@@ -74,9 +78,9 @@ fn read(rng: &mut Rng, input: &[u8], limit: usize) -> Result<Vec<Option<Value>>,
                     let pushed = buf.is_push();
                     let v = buf.take(len)?;
                     assert_eq!(pushed, matches!(v, Value::Push(_)));
-                    out.push(Some(v));
+                    out.push(Ok(v));
                 }
-                Next::TooLarge => out.push(None),
+                Next::TooLarge { push } => out.push(Err(push)),
             }
         }
     }
@@ -122,12 +126,16 @@ fn replies_read_back_whole_however_they_are_cut_and_whatever_the_limit() {
         assert_eq!(got.len(), values.len());
         for ((g, v), size) in got.iter().zip(&values).zip(&sizes) {
             match g {
-                Some(g) => {
+                Ok(g) => {
                     assert!(same(g, v), "{g:?} != {v:?}");
                     assert!(*size <= limit, "{size} > {limit} was kept");
                 }
-                // Thrown away only when it is over the limit.
-                None => assert!(*size > limit, "{size} <= {limit}"),
+                // Thrown away only when it is over the limit, and said to
+                // be a push message only when it is one.
+                Err(push) => {
+                    assert!(*size > limit, "{size} <= {limit}");
+                    assert_eq!(*push, matches!(v, Value::Push(_)), "{v:?}");
+                }
             }
         }
     }

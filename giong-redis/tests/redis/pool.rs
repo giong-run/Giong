@@ -1,4 +1,7 @@
+use std::future::{poll_fn, Future};
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 
 use giong_redis::{cmd, Client, ErrorKind, Pipeline, Pool, Value};
@@ -99,6 +102,62 @@ fn a_connection_left_in_a_cancelled_blocking_command_is_closed_not_shared() {
         pool.ping().await.unwrap();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(pool.stats().opened, 2);
+    });
+}
+
+#[test]
+fn a_watch_cancelled_before_its_reply_does_not_outlive_it() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 1);
+        let other = Client::connect(&server.tcp()).await.unwrap();
+        let k = key("cancelled-watch");
+        other.set(&k, 1).await.unwrap();
+        {
+            let mut conn = pool.take().await.unwrap();
+            let keys = [&k];
+            let mut watch = pin!(conn.watch(&keys));
+            // WATCH is queued, then the future is dropped before its reply.
+            let pending = poll_fn(|cx| Poll::Ready(watch.as_mut().poll(cx).is_pending())).await;
+            assert!(pending);
+        }
+        // Answered after WATCH, on the same connection, now shared.
+        pool.ping().await.unwrap();
+        other.set(&k, 10).await.unwrap();
+        // Another task's transaction on that connection runs.
+        let (v,): (i64,) = pool
+            .pipeline(&Pipeline::new().add(cmd("INCR").arg(&k)).atomic())
+            .await
+            .unwrap();
+        assert_eq!(v, 11);
+        assert_eq!(pool.stats().opened, 1);
+    });
+}
+
+#[test]
+fn a_task_waiting_to_take_hears_when_a_dropped_command_frees_the_connection() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 1).wait_timeout(Duration::from_secs(3));
+        pool.ping().await.unwrap();
+        let waiter = {
+            let mut ping = pin!(pool.ping());
+            // Sent on the only connection, which is now in use.
+            let pending = poll_fn(|cx| Poll::Ready(ping.as_mut().poll(cx).is_pending())).await;
+            assert!(pending);
+            let waiter = giong::spawn({
+                let pool = pool.clone();
+                async move {
+                    let start = std::time::Instant::now();
+                    pool.take().await.map(|_| start.elapsed())
+                }
+            });
+            giong::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(pool.stats().waiting, 1);
+            waiter
+            // The PING is dropped here, as by a timeout around it: the
+            // waiting task looks again.
+        };
+        let waited = waiter.await.unwrap().unwrap();
+        assert!(waited < Duration::from_secs(1), "{waited:?}");
     });
 }
 

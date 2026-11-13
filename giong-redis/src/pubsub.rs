@@ -229,7 +229,7 @@ impl PubSub {
                     return Err(e);
                 }
                 Ok(Next::Pending) => return Ok(None),
-                Ok(Next::TooLarge) => {
+                Ok(Next::TooLarge { .. }) => {
                     return Err(Error::new(
                         ErrorKind::TooLarge,
                         format!(
