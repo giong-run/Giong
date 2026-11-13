@@ -9,6 +9,8 @@ use std::time::Duration;
 use giong::net::{TcpListener, TcpStream};
 use giong::time::{sleep, timeout};
 
+mod common;
+
 /// Lets this process open at least `needed` descriptors, by raising the soft
 /// limit up to the hard one. Shells start with a soft limit of 1024 (Ubuntu's
 /// included), which the tests below need more than; the tests running
@@ -185,11 +187,7 @@ fn read_and_recv_cannot_be_mixed() {
 #[test]
 fn connect_refused() {
     giong::block_on(async {
-        // Bind then drop to get a port nobody listens on.
-        let addr = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let (_refusing, addr) = common::refusing_addr();
         let err = TcpStream::connect(addr).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
         assert_eq!(giong::stats().tracked_ops, 0);

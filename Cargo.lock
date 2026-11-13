@@ -102,6 +102,7 @@ dependencies = [
  "miniz_oxide",
  "rcgen",
  "rustls",
+ "socket2",
 ]
 
 [[package]]

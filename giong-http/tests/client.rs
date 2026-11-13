@@ -619,13 +619,15 @@ fn a_server_that_does_not_answer_hits_the_timeout() {
         assert!(e.to_string().contains("within 100ms"), "{e}");
         assert_eq!(client.connections(&base), (0, 0));
 
-        // Nothing listening is a connect error, at once.
-        // (A standard library listener closes as it is dropped.)
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Nothing listening is a connect error, at once. The socket is bound
+        // but does not listen, so the connect is refused for certain (a port
+        // from a closed listener could be taken in the meantime).
+        let refusing =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        refusing
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let port = refusing.local_addr().unwrap().as_socket().unwrap().port();
         let e = client
             .get(&format!("http://127.0.0.1:{port}/"))
             .send()

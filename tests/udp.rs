@@ -16,6 +16,34 @@ fn socket() -> (UdpSocket, SocketAddr) {
     (socket, addr)
 }
 
+/// Lets this process open at least `needed` descriptors, by raising the soft
+/// limit (often 1024) towards the hard one.
+fn allow_open_files(needed: u64) {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: plain system calls with a valid `rlimit`.
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim), 0);
+        if lim.rlim_cur >= needed {
+            return;
+        }
+        assert!(
+            lim.rlim_max >= needed,
+            "this test needs {needed} open files, and the hard limit is {} (ulimit -Hn)",
+            lim.rlim_max
+        );
+        lim.rlim_cur = needed;
+        assert_eq!(
+            libc::setrlimit(libc::RLIMIT_NOFILE, &lim),
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Deterministic pseudo-random payload.
 fn payload(len: usize, seed: u64) -> Vec<u8> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -286,10 +314,9 @@ fn many_tasks_send_on_one_socket() {
 
 #[test]
 fn every_worker_can_bind_the_same_port() {
-    // Every UdpSocket sets SO_REUSEPORT. A socket that a test running at the
-    // same time binds to 127.0.0.1 can get this port once the probe below has
-    // let it go, and then joins the workers' group and takes some of their
-    // datagrams. No other test binds to 127.0.0.2.
+    // A socket that a test running at the same time binds to 127.0.0.1 could
+    // get this port once the probe below has let it go, and the workers could
+    // not bind it. No other test binds to 127.0.0.2.
     const ADDR: &str = "127.0.0.2";
     // Reserve a port, then let three workers share it.
     let port = {
@@ -336,6 +363,28 @@ fn every_worker_can_bind_the_same_port() {
     handle.shutdown();
     server.join().unwrap();
     assert_eq!(received.load(Ordering::SeqCst), SENDERS);
+}
+
+#[test]
+fn port_zero_gives_every_socket_a_port_of_its_own() {
+    // With SO_REUSEPORT set before binding to port 0, Linux picks ports
+    // without regard to other sockets of this user that hold them with the
+    // same option, and puts the new socket in their group: of 1,000 sockets,
+    // some 15 pairs shared a port, and each pair split its datagrams.
+    const N: usize = 1_000;
+    allow_open_files(N as u64 + 1024);
+    giong::block_on(async {
+        let sockets: Vec<_> = (0..N).map(|_| socket()).collect();
+        let mut ports: Vec<u16> = sockets.iter().map(|(_, addr)| addr.port()).collect();
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), N, "two sockets bound to port 0 share a port");
+
+        // Nor can a socket join such a port later.
+        let (_, addr) = &sockets[0];
+        let err = UdpSocket::bind(addr).expect_err("joined a port-0 socket");
+        assert_eq!(err.kind(), ErrorKind::AddrInUse);
+    });
 }
 
 #[test]
@@ -473,6 +522,44 @@ fn a_cancelled_read_from_leaves_the_socket_usable() {
         let (res, buf) = timeout(Duration::from_secs(30), read).await.unwrap();
         assert_eq!(res.unwrap().0, 10);
         assert_eq!(buf, b"still here");
+    });
+}
+
+#[test]
+fn a_new_socket_with_a_closed_sockets_number_is_left_alone() {
+    // A receive that the runtime has queued but not yet handed to the kernel
+    // names its socket by number. Once the socket is closed, a new socket can
+    // get that number at once; the queued receive must not take its data.
+    use std::future::Future;
+    use std::os::fd::AsRawFd;
+    use std::task::Poll;
+    giong::block_on(async {
+        let (old, _) = socket();
+        let mut recv = Box::pin(old.recv());
+        std::future::poll_fn(|cx| {
+            assert!(recv.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(recv);
+        let number = old.as_raw_fd();
+        drop(old);
+
+        // Opened before the runtime turns again, so it gets the lowest free
+        // number: usually the old socket's, unless a test running alongside
+        // took it first.
+        let new = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"mine", new.local_addr().unwrap()).unwrap();
+        sleep(Duration::from_millis(20)).await;
+
+        new.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 16];
+        let n = new.recv(&mut buf).unwrap_or_else(|e| {
+            let reused = new.as_raw_fd() == number;
+            panic!("the datagram is gone ({e}); descriptor number reused: {reused}")
+        });
+        assert_eq!(&buf[..n], b"mine");
     });
 }
 

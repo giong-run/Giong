@@ -30,6 +30,8 @@ use std::time::{Duration, Instant};
 use giong::net::{TcpListener, TcpStream, UdpSocket};
 use giong::time::{sleep, timeout};
 
+mod common;
+
 /// Client tasks per worker.
 const CLIENTS: usize = 32;
 const RECV_BUFFERS: usize = 512;
@@ -330,11 +332,7 @@ fn soak() {
 
     // A free port for every worker's listener (SO_REUSEPORT), and one UDP
     // socket per worker, bound up front so that every worker knows the others.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (port_holder, port) = common::shared_port();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let udp_sockets: Vec<_> = (0..workers)
         .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
@@ -489,6 +487,7 @@ fn soak() {
 
     // 3. Descriptors: nothing left once the runtime is gone, and no growth
     //    during the run beyond the connections that happen to be open.
+    drop(port_holder);
     assert_eq!(open_fds(), fds_before, "descriptors leaked");
     let samples = samples.lock().unwrap();
     if samples.len() >= 8 {

@@ -8,6 +8,29 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- **giong**: a `UdpSocket` bound to port 0 could get a port that another UDP socket of the
+  same user already held, in this process or another, and the two sockets then split
+  each other's datagrams by a hash of the sender's address: answers went to the wrong
+  socket and the one waiting for them never saw them. With `SO_REUSEADDR` or
+  `SO_REUSEPORT` set, Linux picks a port for port 0 without avoiding the sockets that hold
+  one with the same options; of 1,000 sockets bound to `127.0.0.1:0` at once, about 15
+  pairs shared a port. `UdpSocket::bind` now sets neither option for port 0, so such a
+  socket has its port to itself (binding that port again fails with `AddrInUse`);
+  sockets bound to a port given explicitly share it between workers as before. This was
+  the rare UDP failure in 0.4.0's CI. TCP listeners were not affected.
+- **giong**, ThreadSanitizer builds only (`--cfg giong_tsan`): a socket or file closed
+  with `close(2)` could still have operations queued in the ring, and a socket that got
+  the same descriptor number next could have its data taken by them. Queued operations
+  now go to the kernel before the close.
+- **Tests**: tests that took a port from a socket closed at once, to connect where nothing
+  listens or to share it between workers, now hold it with a socket that is bound but
+  does not listen, so a test running alongside cannot take it in between. The
+  load-balancing test judges the hand-over rule with exact load figures instead of timing
+  (no worker more than two connections ahead, every run); the burst of connections is
+  still run, and its spread printed, not judged.
+
 ## [0.4.0] - 2026-11-13
 
 Foundations for services, and a look inside them. giong now runs where io_uring is

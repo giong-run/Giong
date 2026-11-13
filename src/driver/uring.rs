@@ -698,9 +698,39 @@ impl Uring {
     /// belongs to the old socket and reports a race that does not exist.
     #[cfg(giong_tsan)]
     pub(crate) fn close_fd(&mut self, fd: RawFd) {
+        self.submit_queued();
         // SAFETY: the caller owns `fd` and gives it up here, exactly as with
         // the ring-based close.
         unsafe { libc::close(fd) };
+    }
+
+    /// Hands every queued SQE to the kernel now. TSan builds call it before
+    /// each close(2).
+    ///
+    /// Queued SQEs name descriptors by number, and the kernel looks the
+    /// number up only when it takes the SQE. Once close(2) returns, another
+    /// thread can get the same number for a new socket, and a receive still
+    /// in the queue would take that socket's data. (A close through the ring
+    /// comes after those SQEs in the same queue, so it needs no such step.)
+    #[cfg(giong_tsan)]
+    pub(crate) fn submit_queued(&mut self) {
+        let mut attempts = 0u32;
+        while !self.ring.submission().is_empty() {
+            match self.ring.submit() {
+                Ok(_) => {}
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    // Completion queue backed up: make room, then retry.
+                    Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
+                    _ => panic!("giong: io_uring submit failed: {e}"),
+                },
+            }
+            attempts += 1;
+            assert!(
+                attempts < 100_000,
+                "giong: unable to make progress submitting to io_uring"
+            );
+        }
     }
 
     pub(crate) fn pool(&self) -> &Rc<BufPool> {
