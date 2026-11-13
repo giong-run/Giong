@@ -53,6 +53,15 @@ impl<S> Req<S> {
                 format!("expected a JSON body with Content-Type: application/json; {got}"),
             ));
         }
+        if self.body_stream().is_some() {
+            return Err(Error::internal(giong::error::Error::new(
+                Code::WebConfig,
+                "Req::json on a route that reads its body as a stream \
+                 (Router::stream_bodies): the body has not been received",
+                "read the body with Req::body_stream (BodyStream::read_to_end, then \
+                 serde_json::from_slice), or move the route out of the streaming router.",
+            )));
+        }
         serde_json::from_slice(self.body()).map_err(|e| {
             let status = match e.classify() {
                 serde_json::error::Category::Data => 422,

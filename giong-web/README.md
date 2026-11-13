@@ -78,7 +78,8 @@ fn main() -> std::io::Result<()> {
 - **Routing that answers what it can for you.** Patterns with parameters (`/users/{id}`) and a catch-all (`/files/{*path}`). A literal segment wins over a parameter and a parameter over a catch-all, with backtracking, so `/users/me` and `/users/{id}` live side by side. `HEAD` is answered by the `GET` route, `OPTIONS` and `405` with `Allow` for every path, and a `404` for `/users/` asks "did you mean /users?" when that route exists.
 - **Errors that explain themselves.** Every error answer is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem+json body with a code an agent or a client can match on, and the request id when there is one. The codes giong-web uses itself (`GIONG-E1201` to `GIONG-E1213`) each have a page with the cause and the fix in [docs/errors](../docs/errors/README.md).
 - **Mistakes in the program fail at startup, not on the first request.** Two routes that would answer the same requests, a pattern that is not valid, or middleware settings that cannot work (any origin with credentials) panic with a code and the line that added them.
-- **Middleware is one `async fn`.** They run in the order added, and those of a nested router only for its routes. Included: request ids, JSON-line logs, CORS, gzip and timeouts.
+- **Middleware is one `async fn`.** They run in the order added, and those of a nested router only for its routes. Included: request ids, JSON-line logs, CORS, gzip and timeouts, and with the `tracing` feature a `tracing` span per request.
+- **Bodies of any size.** The routes of a router with `stream_bodies(max)` read their request body as it arrives; any handler can write its response body as it is produced. See "Streaming".
 - **Tested without a socket.** `App::handle(request)` answers a `Request` built with `Request::from_bytes`, so routes and middleware are tested with plain unit tests.
 - **Per-worker and lock-free.** The app, its state and its middleware live on one worker. A worker that compresses a large body yields to the others' requests every 64 KiB.
 
@@ -150,7 +151,8 @@ impl<S: 'static> Middleware<S> for RequireAuth {
 | `Logger::new(Sink::Stdout)` | one JSON line per request: time, method, path, route, status, duration, bytes, request id, peer, worker, and for errors the code, detail and cause | query strings left out (`.include_query(true)`); written by a background thread, never on the worker |
 | `Cors::new()` | answers preflights and adds `Access-Control-Allow-*` for the origins named | no origin allowed until named with `.allow_origin(..)`; methods `GET`, `HEAD`, `POST`; no extra headers |
 | `Compression::new()` | gzip for clients that accept it | level 1, bodies from 1 KiB to 16 MiB; text, JSON, JavaScript, XML (SVG too) and WebAssembly |
-| `Timeout::new(d)` | answers `503` (`GIONG-E1209`) when the handler takes longer than `d` | |
+| `Timeout::new(d)` | answers `503` (`GIONG-E1209`) when the handler takes longer than `d` | not for routes that stream their request body |
+| `Trace::new()` (feature `tracing`) | runs each request in a `tracing` span with OpenTelemetry's field names (`http.request.method`, `url.path`, `http.route`, `http.response.status_code`, `client.address`) plus `request_id` and `worker`, ended by one event; a `5xx` at `ERROR` with its code and cause | instead of `Logger`, or beside it |
 
 A log line:
 
@@ -159,6 +161,43 @@ A log line:
 ```
 
 The log thread batches lines every 10 ms. When it falls behind by more than 1 MiB per worker, lines are dropped and counted in a `log_dropped` line, instead of the workers waiting or memory growing. `giong_web::flush_logs()` waits for what is queued (up to 2 s); dropping an `App` calls it.
+
+## Streaming
+
+```rust
+use giong_web::{Body, Error, Req, Response, Router};
+
+async fn upload(req: Req) -> Result<Response, Error> {
+    let body = req.body_stream().expect("a streaming route");
+    let mut total = 0;
+    while let Some(piece) = body.chunk().await? {
+        total += piece.len(); // write it to a file, hash it, ...
+    }
+    Ok(Response::text(format!("{total} bytes")))
+}
+
+async fn events(_req: Req) -> Result<Response, Error> {
+    let (tx, body) = Body::channel();
+    drop(giong::spawn(async move {
+        for n in 0.. {
+            if tx.send(format!("data: {n}\n\n")).await.is_err() {
+                break; // the client went away
+            }
+            giong::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    }));
+    Ok(Response::new(200).header("Content-Type", "text/event-stream").body(body))
+}
+
+let uploads = Router::new().put("/files/{*path}", upload).stream_bodies(10 << 30);
+let app = Router::new().get("/events", events).nest("/api", uploads).build(());
+```
+
+- `stream_bodies(max)` applies to every route of its router, wherever the router is nested. Other routes still get their body in full, within the server's `max_body_size`.
+- Nothing of the body is read until the handler asks, so a handler can refuse an upload (no credentials, no space) before the client sends it. One piece is in flight at a time: a slow handler slows the client down instead of filling memory.
+- `?` on a body error answers `413` (`GIONG-E1111`, past `max`) or `400` (`GIONG-E1112` cut short, `GIONG-E1113` malformed). A body announced past `max` gets `413` before the handler runs. `req.json()` on a streaming route is a `500` whose logged cause says to read the stream.
+- `Timeout` does not limit a streaming route, whose handler runs while the body arrives; each piece still has the server's `request_timeout`. `Compression` leaves streamed responses alone, and `Logger` writes `"bytes":null` for them.
+- A streamed response goes out chunked, each piece as soon as it is sent. `send` fails once the client has gone (noticed at the next write), so the producer stops.
 
 ## Testing
 
@@ -194,7 +233,7 @@ With middleware:
 - **Pipelined requests** (16 per write): axum stays at 18k, as in the [main benchmark](../README.md#throughput-at-50-connections); we have not looked into why. giong-http reads a pipeline and answers it as a batch.
 - Resident memory after the run: 6.6 MB for giong-web, 5.2 MB for axum.
 
-Not measured yet: several cores, HTTPS, a database behind the handlers, and middleware one at a time. Results are in `bench/results/web/`.
+HTTPS and a database behind the handlers are measured with the [example REST API](../examples/rest-api/README.md#performance). Not measured yet: several cores, and middleware one at a time. Results are in `bench/results/web/`.
 
 ## Features
 
@@ -202,13 +241,14 @@ Not measured yet: several cores, HTTPS, a database behind the handlers, and midd
 |---|---|
 | `serde` | `req.json::<T>()`, `req.query::<T>()` and `json(status, &value)`, through serde and serde_json |
 | `tls` | `Server::serve_tls`, through giong-http |
+| `tracing` | `middleware::Trace`, through `tracing` 0.1 |
 
 ## Not there yet
 
-Streamed request and response bodies (a body is read in full, up to giong-http's limit, before the handler runs), HTTP/2, a `tracing` integration, cookies and sessions, forms and multipart bodies, WebSockets, serving static files, and compressions other than gzip. The crate has had no independent security audit.
+HTTP/2, cookies and sessions, forms and multipart bodies, WebSockets, serving static files, and compressions other than gzip. The crate has had no independent security audit.
 
 ## Tests
 
-`cargo test -p giong-web --all-features`: 23 tests without a socket, most through `App::handle`: text beating parameters beating catch-alls, `HEAD`, `404` with its hint, `405` and `OPTIONS` with `Allow`, parameters that do not parse and a parameter the route lacks, query strings, errors from `?`, state and nested routers, the order middleware run in and which routes they see, a middleware answering by itself and passing values to the handler, closures, the startup panics for bad and duplicate routes; request ids (made, trusted only when asked, sent back), log lines and their fields, timeouts, CORS preflights allowed and refused and simple requests, every middleware setting that cannot work, gzip and when not to use it; JSON bodies in and out, `415`, `400` and `422`, typed queries. One test over real TCP with giong-http's client: gzip on the wire, CORS, `405`, 50 requests on one kept-alive connection. 32 unit tests, among them 30,000 random route sets matched against a slow reference matcher, 4,000 random requests through every middleware with the checks below, and bodies around the 64 KiB compression slice. 12 documentation examples.
+`cargo test -p giong-web --all-features`: 23 tests without a socket, most through `App::handle`: text beating parameters beating catch-alls, `HEAD`, `404` with its hint, `405` and `OPTIONS` with `Allow`, parameters that do not parse and a parameter the route lacks, query strings, errors from `?`, state and nested routers, the order middleware run in and which routes they see, a middleware answering by itself and passing values to the handler, closures, the startup panics for bad and duplicate routes; request ids (made, trusted only when asked, sent back), log lines and their fields, timeouts, CORS preflights allowed and refused and simple requests, every middleware setting that cannot work, gzip and when not to use it; JSON bodies in and out, `415`, `400` and `422`, typed queries. One test over real TCP with giong-http's client: gzip on the wire, CORS, `405`, 50 requests on one kept-alive connection. 5 tests of streamed bodies over real TCP: uploads past the server's body limit on a streaming route, `413` with its code for one past the route's limit, a slow upload that the timeout leaves alone, `req.json()` on a streaming route, a streamed response that passes through every middleware untouched. 2 tests of `Trace` with a recording subscriber: the span's fields, and the code and cause of errors. 32 unit tests, among them 30,000 random route sets matched against a slow reference matcher, 4,000 random requests through every middleware with the checks below, and bodies around the 64 KiB compression slice. 14 documentation examples.
 
 Two fuzz targets in `fuzz/` (`cargo +nightly fuzz run request`, or `routes`): `routes` checks that the route table finds the route a slow reference finds, with the same parameters, or the same `404`, `405` or `OPTIONS` answer; `request` sends any bytes as a request to an app with every middleware and checks that the answer is well formed: a valid status and headers, a problem+json body with a code for every error, gzip only when asked and decoding to what the handler wrote, one log line that is JSON and agrees with the response, and the request id sent back. 5.4 million inputs ran without a failure when the crate was added; CI fuzzes both every night.

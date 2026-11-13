@@ -1,0 +1,7 @@
+server   workload req/s median       min       max       p50       p99  non-2xx      rss  srv%  wrk%   db%
+giong    get             69861     69568     74691     646us    1770us        0    11.6M    98    76    20
+giong    list            35943     32363     37998    1230us    4470us        0    13.9M    96    49   190
+giong    create          54099     51280     55543     823us    4370us        0    13.9M    95    68   159
+axum     get             47167     45110     49957     980us    3230us        0     9.1M    97    56    22
+axum     list            19527     17287     21459    2420us    5390us        0     9.5M    97    34   168
+axum     create          25804     24368     27231    1780us    4850us        0     9.5M    98    44   146

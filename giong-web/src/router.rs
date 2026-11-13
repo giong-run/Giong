@@ -20,6 +20,8 @@ struct RouteDef<S> {
     handler: BoxHandler<S>,
     /// From the routers it was nested in, outermost first.
     middleware: Vec<Rc<dyn DynMiddleware<S>>>,
+    /// The body limit when the body is read as a stream.
+    stream: Option<u64>,
     added_at: &'static Location<'static>,
 }
 
@@ -86,9 +88,18 @@ struct RouteDef<S> {
 /// [`Req::state`]: database pools, configuration, clients. A router is built
 /// on every worker, so the state is per worker too, and needs neither `Send`
 /// nor `Sync`.
+///
+/// ## Streaming
+///
+/// A body is normally received in full, up to the server's
+/// `max_body_size`, before the handler runs. The routes of a router with
+/// [`stream_bodies`](Router::stream_bodies) read it as it arrives instead,
+/// with [`Req::body_stream`]. A response body can be written as it is
+/// produced with [`Body::channel`](crate::Body::channel), on any route.
 pub struct Router<S = ()> {
     routes: Vec<RouteDef<S>>,
     middleware: Vec<Rc<dyn DynMiddleware<S>>>,
+    stream: Option<u64>,
 }
 
 impl<S: 'static> Default for Router<S> {
@@ -103,6 +114,7 @@ impl<S: 'static> Router<S> {
         Self {
             routes: Vec::new(),
             middleware: Vec::new(),
+            stream: None,
         }
     }
 
@@ -196,6 +208,7 @@ impl<S: 'static> Router<S> {
             pattern: parsed,
             handler,
             middleware: Vec::new(),
+            stream: None,
             added_at: Location::caller(),
         });
         self
@@ -238,6 +251,46 @@ impl<S: 'static> Router<S> {
         self
     }
 
+    /// Reads the request bodies of this router's routes as they arrive, up
+    /// to `max` bytes each, instead of receiving them in full first: for
+    /// uploads larger than the server's `max_body_size`, or to start work
+    /// before the whole body is there.
+    ///
+    /// ```
+    /// use giong_web::{Error, Req, Response, Router};
+    ///
+    /// async fn upload(req: Req) -> Result<Response, Error> {
+    ///     let body = req.body_stream().expect("a streaming route");
+    ///     let mut total = 0;
+    ///     while let Some(piece) = body.chunk().await? {
+    ///         total += piece.len(); // write it to a file, hash it, ...
+    ///     }
+    ///     Ok(Response::text(format!("{total} bytes")))
+    /// }
+    ///
+    /// let uploads = Router::new().put("/files/{*path}", upload).stream_bodies(10 << 30);
+    /// let app = Router::new().nest("/api", uploads).build(());
+    /// # let _ = app;
+    /// ```
+    ///
+    /// Handlers read the body with [`Req::body_stream`]; [`Req::body`] is
+    /// empty, and [`Req::json`] is a `500`. Nothing of the body is read
+    /// until the handler asks for it, so a handler can refuse a request
+    /// before the client sends the body (`Expect: 100-continue`).
+    ///
+    /// It applies to every route of this router, wherever the router ends
+    /// up nested, unless a router nested in it set its own. A body
+    /// announced as longer than `max` gets `413` before the handler runs; a
+    /// chunked body that grows past it fails in the handler with
+    /// `GIONG-E1111`, which `?` turns into a `413`. Each piece of the body
+    /// must arrive within the server's `request_timeout`, and the
+    /// [`Timeout`](crate::middleware::Timeout) middleware leaves these
+    /// requests alone, since the body takes as long as it takes.
+    pub fn stream_bodies(mut self, max: u64) -> Self {
+        self.stream = Some(max);
+        self
+    }
+
     /// Adds every route of `router` under `prefix`, each with `router`'s
     /// middleware around it.
     ///
@@ -268,6 +321,7 @@ impl<S: 'static> Router<S> {
             self.push(RouteDef {
                 pattern,
                 middleware,
+                stream: def.stream.or(router.stream),
                 ..def
             });
         }
@@ -280,7 +334,10 @@ impl<S: 'static> Router<S> {
         let mut table = Table::default();
         let top: Box<Chain<S>> = self.middleware.into_boxed_slice();
         let mut routes = Vec::with_capacity(self.routes.len());
+        let mut streams = false;
         for (i, def) in self.routes.into_iter().enumerate() {
+            let stream = def.stream.or(self.stream);
+            streams |= stream.is_some();
             // Duplicates were refused when the routes were added.
             let _ = table.insert(&def.pattern, def.method, i);
             let chain: Box<Chain<S>> = top.iter().cloned().chain(def.middleware).collect();
@@ -291,6 +348,7 @@ impl<S: 'static> Router<S> {
                 }),
                 chain,
                 handler: def.handler,
+                stream,
             });
         }
         App {
@@ -298,6 +356,7 @@ impl<S: 'static> Router<S> {
             table,
             routes: routes.into(),
             top,
+            streams,
         }
     }
 }
@@ -322,6 +381,7 @@ impl<S> fmt::Debug for Router<S> {
         f.debug_struct("Router")
             .field("routes", &routes)
             .field("middleware", &self.middleware.len())
+            .field("stream_bodies", &self.stream)
             .finish()
     }
 }
@@ -332,6 +392,8 @@ struct Route<S> {
     /// route was nested in.
     chain: Box<Chain<S>>,
     handler: BoxHandler<S>,
+    /// The body limit when the body is read as a stream.
+    stream: Option<u64>,
 }
 
 /// A finished [`Router`]: give it to [`Server::serve`](crate::Server::serve),
@@ -342,6 +404,8 @@ pub struct App<S = ()> {
     routes: Box<[Route<S>]>,
     /// The outermost router's middleware, for `404`, `405` and `OPTIONS`.
     top: Box<Chain<S>>,
+    /// Some route reads its body as a stream.
+    streams: bool,
 }
 
 impl<S: 'static> App<S> {
@@ -389,6 +453,22 @@ impl<S: 'static> App<S> {
         resp
     }
 
+    /// The body limit of the route `req` goes to, if that route reads its
+    /// body as a stream ([`Router::stream_bodies`]).
+    fn stream_limit(&self, req: &Request) -> Option<u64> {
+        if !self.streams {
+            return None;
+        }
+        let mut caps = Captures::new();
+        match self
+            .table
+            .lookup(&Method::parse(req.method()), req.path(), &mut caps)
+        {
+            Lookup::Found(i) => self.routes[i].stream,
+            _ => None,
+        }
+    }
+
     /// For a `404`: the same path with or without a trailing slash, when a
     /// route has it.
     fn hint(&self, path: &str) -> Option<String> {
@@ -408,6 +488,10 @@ impl<S: 'static> App<S> {
 impl<S: 'static> giong_http::Handler for App<S> {
     fn call(&self, req: Request) -> impl Future<Output = Response> {
         self.handle(req)
+    }
+
+    fn stream_body(&self, req: &Request) -> Option<u64> {
+        self.stream_limit(req)
     }
 }
 

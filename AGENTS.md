@@ -9,18 +9,19 @@ disagree, CONTRIBUTING.md wins: report the difference.
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
 driver where io_uring is blocked or the kernel is too old. One Cargo
-workspace, eight crates:
+workspace, eight crates and an example service:
 
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library, HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library (bodies whole or streamed both ways), HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
 | `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
-| `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts) and JSON on giong-http |
+| `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
+| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.

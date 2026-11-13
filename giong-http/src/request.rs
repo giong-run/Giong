@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
 
+use crate::body::{BodyStream, Pipe};
 use crate::chunked::{Decoder, Progress};
 use crate::parse::{find_head_end, header_lines, parse_head, Head};
 
@@ -13,13 +14,20 @@ pub(crate) enum BodyBytes {
     InBuffer(Range<usize>),
     /// A decoded chunked body.
     Decoded(Vec<u8>),
+    /// A body read as it arrives (see `Handler::stream_body`).
+    Stream(Rc<Pipe>),
 }
 
-/// An HTTP request with its body fully received.
+/// An HTTP request, normally with its body fully received.
 ///
 /// A request shares the connection's receive buffer instead of copying out of
 /// it, so creating one allocates nothing. It can be kept for as long as needed;
 /// the connection only reuses the buffer once the request has been dropped.
+///
+/// For a handler that asked for it with
+/// [`Handler::stream_body`](crate::Handler::stream_body), the body is not
+/// received yet: [`body`](Self::body) is empty and
+/// [`body_stream`](Self::body_stream) reads it.
 pub struct Request {
     pub(crate) buf: Rc<Vec<u8>>,
     /// Where the head starts in `buf`.
@@ -155,11 +163,24 @@ impl Request {
         self.peer
     }
 
-    /// The request body. Empty if the request has none.
+    /// The request body. Empty if the request has none, or if its body is
+    /// read as a stream ([`body_stream`](Self::body_stream)).
     pub fn body(&self) -> &[u8] {
         match &self.body {
             BodyBytes::InBuffer(range) => &self.buf[range.clone()],
             BodyBytes::Decoded(body) => body,
+            BodyBytes::Stream(_) => &[],
+        }
+    }
+
+    /// The body, read as it arrives, when the handler's
+    /// [`Handler::stream_body`](crate::Handler::stream_body) asked for it;
+    /// `None` otherwise (the body is then in [`body`](Self::body)). Every
+    /// call returns a handle to the same body.
+    pub fn body_stream(&self) -> Option<BodyStream> {
+        match &self.body {
+            BodyBytes::Stream(pipe) => Some(BodyStream::new(pipe.clone())),
+            _ => None,
         }
     }
 }
@@ -172,6 +193,7 @@ impl fmt::Debug for Request {
             .field("version_minor", &self.version_minor())
             .field("peer_addr", &self.peer)
             .field("body_len", &self.body().len())
+            .field("body_stream", &matches!(self.body, BodyBytes::Stream(_)))
             .finish()
     }
 }

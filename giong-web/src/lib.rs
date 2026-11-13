@@ -63,8 +63,16 @@
 //! [`middleware`] has [`RequestId`](middleware::RequestId),
 //! [`Logger`](middleware::Logger) (JSON lines, written off the worker),
 //! [`Cors`](middleware::Cors), [`Compression`](middleware::Compression)
-//! (gzip) and [`Timeout`](middleware::Timeout). Writing one is implementing
+//! (gzip) and [`Timeout`](middleware::Timeout); with the `tracing` feature,
+//! `Trace` (a `tracing` span per request). Writing one is implementing
 //! [`Middleware`], one `async fn`.
+//!
+//! ## Streaming
+//!
+//! The routes of a router with [`Router::stream_bodies`] read their request
+//! body as it arrives, with [`Req::body_stream`], instead of receiving it in
+//! full first. Any handler can write its response body as it is produced,
+//! with [`Body::channel`]: downloads, exports, server-sent events.
 //!
 //! ## Testing without a network
 //!
@@ -77,6 +85,8 @@
 //! * `serde`: [`Req::json`], [`Req::query`] and [`json`], through serde and
 //!   serde_json.
 //! * `tls`: [`Server::serve_tls`], for HTTPS.
+//! * `tracing`: the `Trace` middleware, a [`tracing`](https://docs.rs/tracing)
+//!   span per request.
 
 #![warn(missing_docs)]
 
@@ -101,7 +111,7 @@ mod route;
 mod router;
 
 pub use error::Error;
-pub use giong_http::{Body, Request, Response, Server};
+pub use giong_http::{Body, BodySender, BodyStream, Request, Response, Server};
 #[cfg(feature = "serde")]
 pub use json::json;
 pub use log::{flush as flush_logs, Sink};

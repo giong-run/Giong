@@ -38,6 +38,8 @@ pub(crate) struct Decoder {
     pos: usize,
     trailer_bytes: usize,
     extension_bytes: usize,
+    /// Decoded bytes so far, including those taken out of `body`.
+    decoded: usize,
     pub(crate) body: Vec<u8>,
     max: usize,
 }
@@ -49,21 +51,23 @@ impl Decoder {
             pos: 0,
             trailer_bytes: 0,
             extension_bytes: 0,
+            decoded: 0,
             body: Vec::new(),
             max,
         }
     }
 
-    /// `data` is everything received after the head so far. Returns the status
-    /// code to answer with on failure.
     /// How many bytes of the input given to `feed` have been read, which
     /// the caller may now drop: the next `feed` starts at the input's start.
-    /// For a body passed on as it arrives, with `body` taken out each time.
-    #[cfg(feature = "client")]
+    /// For a body passed on as it arrives, with `body` taken out each time;
+    /// the size limit still counts every byte decoded.
     pub(crate) fn consume(&mut self) -> usize {
         std::mem::take(&mut self.pos)
     }
 
+    /// `data` is everything received after the head so far (or since the
+    /// last [`consume`](Self::consume)). Returns the status code to answer
+    /// with on failure: `400` for bad framing, `413` past the size limit.
     pub(crate) fn feed(&mut self, data: &[u8]) -> Result<Progress, u16> {
         loop {
             let rest = &data[self.pos..];
@@ -97,7 +101,7 @@ impl Decoder {
                     let size = hex.iter().fold(0u64, |acc, &b| {
                         acc * 16 + (b as char).to_digit(16).unwrap_or(0) as u64
                     });
-                    if size > (self.max - self.body.len()) as u64 {
+                    if size > (self.max - self.decoded) as u64 {
                         return Err(413);
                     }
                     self.pos += nl + 1;
@@ -113,6 +117,7 @@ impl Decoder {
                     }
                     let n = left.min(rest.len());
                     self.body.extend_from_slice(&rest[..n]);
+                    self.decoded += n;
                     self.pos += n;
                     self.state = if n == left {
                         State::DataEnd
