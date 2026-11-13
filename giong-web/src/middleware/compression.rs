@@ -96,8 +96,9 @@ impl Compression {
     /// client that accepts gzip.
     fn eligible(&self, resp: &Response) -> bool {
         let len = resp.body_bytes().len();
-        if resp.is_streaming() {
-            // Its bytes are not known yet.
+        if resp.is_streaming() || resp.body_is_file() {
+            // Its bytes are not known yet, or not in memory: a file is sent
+            // as it is, from the page cache.
             return false;
         }
         if matches!(resp.status(), 204 | 206 | 304) || len < self.min_size || len > self.max_size {

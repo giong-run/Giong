@@ -262,10 +262,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { kernel: "5.15.225", workarounds: "" }
-          - { kernel: "6.0.19", workarounds: "" }
           # ktls: the guest loads the tls module and the kernel TLS tests
-          # must run (6.1 and 6.8 without key updates, 6.18 with them).
+          # must run (5.15 on epoll, 6.1 and 6.8 without key updates, 6.18
+          # with them). 6.0 is left out: giong-tls refuses its kernel TLS,
+          # which can crash the kernel when a connection closes.
+          - { kernel: "5.15.225", workarounds: "", ktls: "1" }
+          - { kernel: "6.0.19", workarounds: "" }
           - { kernel: "6.1.155", workarounds: "", ktls: "1" }
           - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", ktls: "1" }
           - { kernel: "6.18.63", workarounds: "", ktls: "1" }

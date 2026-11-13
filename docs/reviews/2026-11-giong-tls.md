@@ -276,7 +276,32 @@ with the `CMSG_*` macros, for viewing the `repr(C)` key structs as bytes (their 
 and layout are asserted against the kernel's in `crypto_info_has_the_kernel_layout`),
 and for the `IoBuf` implementation of a fixed-size read window. Each block has a
 `SAFETY` comment. Miri cannot run system calls, so these are covered by the tests on
-real kernels (6.1 and 6.18 in QEMU, plus the CI runner's kernel) rather than by Miri.
+real kernels (5.15, 6.1, Ubuntu's 6.8 and 6.18 in QEMU, plus the CI runner's kernel)
+rather than by Miri.
+
+#### 9. Files sent with `sendfile` (by design)
+
+`TlsStream::send_file` under kernel TLS takes the same send lock and goes through the
+same checks as a write: a broken or closed stream refuses, a key update the peer asked
+for is answered first, and the records the file will take count against the key's
+limit before the kernel sends them. The keys are not touched. A send that fails or is
+cancelled part-way marks the stream broken, as a cut write does. A file that turns out
+shorter than announced (`GIONG-E0201`) leaves the stream able to send: the kernel
+closes an unfinished record with the next write or with `close_notify`, so no partial
+record reaches the peer. In giong itself `send_file` calls `sendfile(2)` on a
+non-blocking socket with the caller's file descriptor and an offset of its own; the one
+new `unsafe` block is that call. `sendfile` cannot ask the kernel not to raise
+`SIGPIPE`, which Rust programs ignore unless they change it.
+
+#### 10. Linux 6.0 is refused (by design)
+
+Running the kTLS tests on Linux 6.0.19, the last 6.0 release, crashed the kernel when
+a connection with queued data closed (`tls_strp_done` and `tls_sw_release_resources_rx`
+freeing memory twice), and without zero-copy receive it returned the wrong length for
+an alert. 6.0 rewrote the receive path, and 6.1 carries the fixes; 6.0 is no longer
+maintained. `ktls_support()` now reports 6.0 as unavailable, naming the release, so
+`Auto` stays in the process and `Required` fails with `GIONG-E2009` there. 5.15, 6.1,
+Ubuntu's 6.8 and 6.18 pass every test.
 
 ### Recommendations
 
@@ -294,6 +319,7 @@ real kernels (6.1 and 6.18 in QEMU, plus the CI runner's kernel) rather than by 
    messages, what a receive does with records that are not data, how the TLS 1.2
    explicit nonce is built, and when new keys are accepted (Linux 6.14).
 2. Read rustls 0.23.46's `kernel` module, `ExtractedSecrets` and the unbuffered API.
-3. Ran every kTLS test on Linux 6.1.155 and 6.18.63 in QEMU with the `tls` module
-   loaded (`KTLS=1 scripts/kernels.sh`), where a skipped kTLS test counts as a failure,
-   and the fallback tests on a kernel without the module.
+3. Ran every kTLS test on Linux 5.15.225 (epoll driver), 6.0.19, 6.1.155, Ubuntu's
+   6.8.0-147 and 6.18.63 in QEMU with the `tls` module loaded (`KTLS=1
+   scripts/kernels.sh`), where a skipped kTLS test counts as a failure, and the
+   fallback tests on a kernel without the module.

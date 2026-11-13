@@ -6,7 +6,7 @@
 #
 #   bench/tls.sh [rounds] [seconds-per-measurement]
 #   SERVERS="giong-http-tls giong-http-ktls" bench/tls.sh   # a subset
-#   ENDPOINTS="bytes64k bytes1m" bench/tls.sh
+#   ENDPOINTS="bytes64k bytes1m file64k file1m" bench/tls.sh
 #
 # Method (see run.sh for the general idea)
 #   * One core for the server (SERVER_CPU), three for wrk (LOAD_CPU): the load
@@ -26,6 +26,12 @@
 #     bodies, where encrypting the body is most of the work. They are where
 #     kernel TLS can pay off; `json` and `users` show what it costs on small
 #     responses.
+#   * `file64k` and `file1m` (giong-http only) send the same sizes from a
+#     file each worker keeps open (`Body::file_range`): with `sendfile` over
+#     plain TCP and kernel TLS, so the kernel encrypts straight from the page
+#     cache; read and encrypted in pieces by rustls otherwise.
+#     `file64k-open` opens the file for every request, as a static file
+#     server without a cache of open files does.
 #   * `cpu%` is how busy the server's core was during the measurement. Well
 #     below 100 means that the load generator was the limit, not the server.
 #     `us/req` is the server's CPU time (user + system) per request: kernel
@@ -58,7 +64,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 export TLS_CERT="$TMP/cert.pem" TLS_KEY="$TMP/key.pem"
 
 read -r -a NAMES <<<"${SERVERS:-axum giong-http axum-tls giong-http-tls giong-http-ktls}"
-read -r -a EPS <<<"${ENDPOINTS:-json users handshake bytes64k bytes1m}"
+read -r -a EPS <<<"${ENDPOINTS:-json users handshake bytes64k bytes1m file64k file1m}"
 declare -A CMD=(
   [axum]="axum/target/release/bench-axum"
   [giong-http]="env -u TLS_CERT giong-http/target/release/bench-giong-http"
@@ -76,6 +82,7 @@ declare -A URL=(
 declare -A PATHS=(
   [json]=/json [users]=/users [handshake]=/json
   [bytes64k]="/bytes?n=65536" [bytes1m]="/bytes?n=1048576"
+  [file64k]="/file?n=65536" [file1m]="/file?n=1048576" [file64k-open]="/file?n=65536&open=1"
 )
 for s in "${NAMES[@]}"; do
   [ -n "${CMD[$s]:-}" ] || { echo "unknown server $s (known: ${!CMD[*]})" >&2; exit 2; }
@@ -104,7 +111,7 @@ for round in $(seq 1 "$ROUNDS"); do
     for ep in "${EPS[@]}"; do
       case $ep in
         handshake) [[ ${URL[$s]} == https:* ]] || continue ;;
-        bytes*) [[ $s == giong-http* ]] || continue ;;
+        bytes* | file*) [[ $s == giong-http* ]] || continue ;;
       esac
       args=("${URL[$s]}${PATHS[$ep]}")
       [ "$ep" = handshake ] && args=(-H "Connection: close" "${args[@]}")

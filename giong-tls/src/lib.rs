@@ -116,6 +116,22 @@ fn coded(
     giong::error::Error::new(code, message, fix).into()
 }
 
+/// `send_file` was asked for bytes past the end of the file; it stopped at
+/// `at`.
+fn file_too_short(offset: u64, len: u64, at: u64) -> io::Error {
+    let end = offset.saturating_add(len);
+    coded(
+        Code::FileTooShort,
+        format!(
+            "the file ended at byte {at}, {} bytes short of the {len} send_file was asked to send",
+            end - at
+        ),
+        "take the length from the open file (File::len), and replace a file that is being \
+         served by renaming a new one over it, not by rewriting it; the peer has fewer bytes \
+         than announced, so close the connection.",
+    )
+}
+
 /// PEM data or a certificate file that cannot be used.
 fn bad_certificate_data(e: impl std::fmt::Display) -> io::Error {
     coded(
@@ -1039,6 +1055,59 @@ impl TlsStream {
             Ok(()) => (Ok(()), bufs),
             Err(e) => (Err(e), bufs),
         }
+    }
+
+    /// Encrypts and sends `len` bytes of `file`, starting at `offset`.
+    ///
+    /// With kernel TLS (see [`is_ktls`](Self::is_ktls)) this is
+    /// [`TcpStream::send_file`]: the kernel encrypts the file straight from
+    /// its page cache, and the bytes never pass through the program. This is
+    /// where kernel TLS is faster than encrypting in the process. Without
+    /// it, the file is read in pieces of up to 256 KiB and encrypted by
+    /// rustls. Either way, the file's own position is neither used nor
+    /// moved.
+    ///
+    /// Fails with `FileTooShort` (`GIONG-E0201`) if the file ends before
+    /// `offset + len`, after sending what it had; the stream can still send.
+    /// The notes of [`TcpStream::send_file`] on cold files apply to kernel
+    /// TLS.
+    ///
+    /// Not cancel safe, as [`write_all`](Self::write_all).
+    pub async fn send_file(&self, file: &giong::fs::File, offset: u64, len: u64) -> io::Result<()> {
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > i64::MAX as u64)
+        {
+            return Err(file_too_short(offset, len, offset));
+        }
+        if self.is_ktls() {
+            return self.kernel_send_file(file, offset, len).await;
+        }
+        const PIECE: u64 = 256 * 1024;
+        let mut buf = Vec::with_capacity(len.min(PIECE) as usize);
+        let (mut at, mut left) = (offset, len);
+        while left > 0 {
+            let (res, b) = file.read_at(buf, at).await;
+            buf = b;
+            let n = match res {
+                Ok(0) => {
+                    self.flush_tls().await?;
+                    return Err(file_too_short(offset, len, at));
+                }
+                Ok(n) => (n as u64).min(left) as usize,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            let mut sent = 0;
+            while sent < n {
+                let accepted = self.conn().writer().write(&buf[sent..n]);
+                sent += accepted?;
+                self.flush_tls().await?;
+            }
+            at += n as u64;
+            left -= n as u64;
+        }
+        Ok(())
     }
 
     /// Sends the TLS `close_notify` alert and closes the sending direction.

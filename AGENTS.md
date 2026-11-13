@@ -84,7 +84,7 @@ scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh soak        # minutes of connection churn, then checks for leaks
 scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
-KTLS=1 scripts/kernels.sh 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
+KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 ```

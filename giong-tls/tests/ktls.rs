@@ -199,6 +199,49 @@ async fn exchange(a: &TlsStream, b: &TlsStream) {
             "vectored write"
         );
     }
+    // A file: whole, a range across record boundaries, and past its end.
+    let file_data: Vec<u8> = (0..1_000_003u32).map(|j| (j % 253) as u8).collect();
+    let file = TempFile::new(&file_data);
+    let f = giong::fs::File::open(&file.0).await.unwrap();
+    for (from, to) in [(a, b), (b, a)] {
+        from.send_file(&f, 0, file_data.len() as u64).await.unwrap();
+        assert!(recv_exactly(to, file_data.len()).await == file_data, "file");
+        from.send_file(&f, 16_000, 50_000).await.unwrap();
+        assert!(
+            recv_exactly(to, 50_000).await == file_data[16_000..66_000],
+            "range"
+        );
+        let err = from.send_file(&f, 999_000, 5_000).await.unwrap_err();
+        assert_eq!(code(&err), Some(Code::FileTooShort), "{err}");
+        // The stream can still send, and what the file had comes first.
+        from.write_all(b"after".to_vec()).await.0.unwrap();
+        let mut expected = file_data[999_000..].to_vec();
+        expected.extend_from_slice(b"after");
+        assert!(
+            recv_exactly(to, expected.len()).await == expected,
+            "short file"
+        );
+    }
+}
+
+/// A file under the temporary directory, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(data: &[u8]) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("giong-ktls-{}-{n}", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Both sides close with `close_notify`, and each sees the other's.
@@ -1036,21 +1079,28 @@ fn a_cancelled_kernel_write_ends_sending_instead_of_cutting_a_message() {
         return;
     }
     let pki = pki();
-    for vectored in [false, true] {
+    let sevens = TempFile::new(&vec![7u8; 64 << 20]);
+    for how in ["write_all", "vectored", "send_file"] {
         let acceptor = pki.acceptor(Some(suites::TLS13_AES_128_GCM_SHA256), Ktls::Required);
         let connector = pki.connector(Some(suites::TLS13_AES_128_GCM_SHA256), Ktls::Required);
+        let path = sevens.0.clone();
         run(async move {
             let (server, client) = tls_pair(acceptor, connector).await;
             // Nobody reads on the client, so a big write fills the buffers and
             // is cancelled half way.
             let big = vec![7u8; 64 << 20];
-            let cancelled = if vectored {
-                let write = server.write_all_vectored(vec![vec![7u8; 100], big]);
-                timeout(Duration::from_millis(200), write).await.is_err()
-            } else {
-                timeout(Duration::from_millis(200), server.write_all(big))
-                    .await
-                    .is_err()
+            let limit = Duration::from_millis(200);
+            let cancelled = match how {
+                "vectored" => {
+                    let write = server.write_all_vectored(vec![vec![7u8; 100], big]);
+                    timeout(limit, write).await.is_err()
+                }
+                "send_file" => {
+                    let file = giong::fs::File::open(&path).await.unwrap();
+                    let send = server.send_file(&file, 0, 64 << 20);
+                    timeout(limit, send).await.is_err()
+                }
+                _ => timeout(limit, server.write_all(big)).await.is_err(),
             };
             assert!(cancelled, "the write finished; make it bigger");
             let (res, _) = server.write_all(b"more".to_vec()).await;

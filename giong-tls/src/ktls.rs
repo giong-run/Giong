@@ -671,6 +671,10 @@ fn probe() -> KtlsSupport {
         ciphers: [[false; 3]; 2],
         key_update: false,
     };
+    if let Some(why) = kernel_known_bad() {
+        support.unavailable = Some(why);
+        return support;
+    }
     let listener = match std::net::TcpListener::bind("127.0.0.1:0")
         .or_else(|_| std::net::TcpListener::bind("[::1]:0"))
     {
@@ -732,6 +736,42 @@ fn probe() -> KtlsSupport {
         }
     }
     support
+}
+
+/// The release of the running kernel (`uname -r`).
+fn kernel_release() -> Option<String> {
+    // SAFETY: all-zero is a valid `utsname`; `uname` fills it.
+    let mut name: libc::utsname = unsafe { mem::zeroed() };
+    // SAFETY: a valid pointer to a `utsname`.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return None;
+    }
+    // SAFETY: the kernel NUL-terminates `release` within the array.
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    Some(release.to_string_lossy().into_owned())
+}
+
+/// `(major, minor)` of a kernel release such as `6.0.19-060019-generic`.
+fn major_minor(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split(|c: char| !c.is_ascii_digit());
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Why kernel TLS must not be used on this kernel, if it is one whose
+/// kernel TLS giong-tls knows to be broken.
+fn kernel_known_bad() -> Option<String> {
+    let release = kernel_release()?;
+    match major_minor(&release)? {
+        // Linux 6.0 rewrote the receive path; giong-tls' tests crash its last
+        // release (6.0.19) when a connection closes with data queued, and it
+        // returns the wrong length for alert records. 6.1 has the fixes, and
+        // 6.0 is no longer maintained.
+        (6, 0) => Some(format!(
+            "Linux 6.0 ({release}) has kernel TLS bugs giong-tls cannot work around (closing \
+             a connection can crash the kernel); use Linux 6.1 or newer"
+        )),
+        _ => None,
+    }
 }
 
 /// Kernel-side counters for this process: see [`ktls_stats`].
@@ -1839,6 +1879,36 @@ impl TlsStream {
         }
     }
 
+    /// `send_file` once the kernel encrypts: `sendfile(2)` straight from
+    /// the page cache, the kernel encrypting as it sends.
+    pub(crate) async fn kernel_send_file(
+        &self,
+        file: &giong::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        let sending = self.lock_send().await;
+        let records = usize::try_from(len).unwrap_or(usize::MAX);
+        if let Err(e) = self.before_kernel_send(records).await {
+            sending.done();
+            return Err(e);
+        }
+        match self.tcp.send_file(file, offset, len).await {
+            Ok(()) => {
+                sending.done();
+                Ok(())
+            }
+            // The file was short: what it had went out as whole records (a
+            // record left open is closed by the next write, or by
+            // `close_notify`), so the stream can still send.
+            Err(e) if giong::error::code(&e) == Some(Code::FileTooShort) => {
+                sending.done();
+                Err(e)
+            }
+            Err(e) => Err(kernel_error(e)),
+        }
+    }
+
     /// Refuses to send on a closed or broken stream, sends a `KeyUpdate` the
     /// peer asked for, and keeps the number of records under one key below
     /// the cipher's limit: a key update where the kernel can take new keys,
@@ -1939,6 +2009,22 @@ fn confidentiality_limit(suite: &SupportedCipherSuite) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_releases_are_read_and_6_0_is_refused() {
+        assert_eq!(major_minor("6.0.19-060019-generic"), Some((6, 0)));
+        assert_eq!(major_minor("6.1.155-0601155-generic"), Some((6, 1)));
+        assert_eq!(major_minor("7.0.0-43-generic"), Some((7, 0)));
+        assert_eq!(major_minor("5.15"), Some((5, 15)));
+        assert_eq!(major_minor("6"), None);
+        assert_eq!(major_minor("linux"), None);
+        let release = kernel_release().unwrap();
+        assert_eq!(
+            kernel_known_bad().is_some(),
+            major_minor(&release) == Some((6, 0)),
+            "{release}"
+        );
+    }
 
     #[test]
     fn the_kernel_never_reuses_a_tls12_gcm_nonce_rustls_used() {

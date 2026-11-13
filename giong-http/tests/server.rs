@@ -345,6 +345,111 @@ fn large_and_small_responses_mix_in_a_pipeline() {
     c.expect_closed();
 }
 
+/// A file under the temporary directory holding `data`, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(name: &str, data: &[u8]) -> Self {
+        let path = std::env::temp_dir().join(format!("giong-http-{}-{name}", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn file_data(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 31 % 253) as u8).collect()
+}
+
+/// Serves `/file` (all of it), `/range` (bytes 100..1100), `/small`
+/// (a 10-byte file), `/short` (100 bytes more than the file has) and
+/// anything else as `echo` does.
+fn file_handler(
+    path: std::path::PathBuf,
+) -> impl Fn(Request) -> std::pin::Pin<Box<dyn Future<Output = Response>>> + Clone + Send + Sync {
+    move |req: Request| {
+        let path = path.clone();
+        Box::pin(async move {
+            let open = || giong::fs::File::open(&path);
+            match req.path() {
+                "/file" => {
+                    Response::new(200).body(giong_http::Body::file(open().await.unwrap()).unwrap())
+                }
+                "/range" => Response::new(206).body(giong_http::Body::file_range(
+                    open().await.unwrap(),
+                    100,
+                    1000,
+                )),
+                "/small" => Response::new(200).body(giong_http::Body::file_range(
+                    open().await.unwrap(),
+                    5,
+                    10,
+                )),
+                "/short" => {
+                    let file = open().await.unwrap();
+                    let len = file.len().unwrap();
+                    Response::new(200).body(giong_http::Body::file_range(file, 0, len + 100))
+                }
+                _ => echo(req).await,
+            }
+        })
+    }
+}
+
+#[test]
+fn file_bodies_are_sent_from_the_file() {
+    let data = file_data(3_000_017);
+    let tmp = TempFile::new("file-body", &data);
+    let server = TestServer::start(Server::new(), file_handler(tmp.0.clone()));
+    let mut c = server.client();
+    // In one batch, between other responses, and after a HEAD.
+    let mut batch = String::new();
+    for path in ["/file", "/x", "/range", "/small"] {
+        batch.push_str(&format!("GET {path} HTTP/1.1\r\nHost: t\r\n\r\n"));
+    }
+    batch.push_str("HEAD /file HTTP/1.1\r\nHost: t\r\n\r\n");
+    batch.push_str("GET /file HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    c.send(batch);
+    let r = c.reply();
+    assert_eq!(r.header("content-length"), Some("3000017"));
+    assert!(r.body == data);
+    assert!(c.reply().text().starts_with("GET /x "));
+    let r = c.reply();
+    assert_eq!(r.status, 206);
+    assert!(r.body == data[100..1100]);
+    assert!(c.reply().body == data[5..15]);
+    let head = c.reply_to(true);
+    assert_eq!(head.header("content-length"), Some("3000017"));
+    let last = c.reply();
+    assert_eq!(last.header("connection"), Some("close"));
+    assert!(last.body == data);
+    c.expect_closed();
+}
+
+#[test]
+fn a_file_shorter_than_announced_closes_the_connection() {
+    let data = file_data(200_000);
+    let tmp = TempFile::new("file-short", &data);
+    let server = TestServer::start(Server::new(), file_handler(tmp.0.clone()));
+    let mut c = server.client();
+    c.send("GET /short HTTP/1.1\r\nHost: t\r\n\r\nGET /x HTTP/1.1\r\nHost: t\r\n\r\n");
+    // The head promised 100 bytes more than the file had: the file, then
+    // the end of the connection, and no answer to the second request.
+    while !c.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        assert!(c.fill());
+    }
+    while c.fill() {}
+    let text = String::from_utf8_lossy(&c.buf).into_owned();
+    assert!(text.contains("Content-Length: 200100\r\n"), "{text:.200}");
+    let end = c.buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert!(c.buf[end..] == data[..], "the file and nothing else");
+}
+
 #[test]
 fn keep_alive_follows_the_protocol_version_and_connection_header() {
     let server = default_server();
@@ -866,4 +971,46 @@ fn at_the_connection_limit_new_clients_wait_their_turn() {
         assert_eq!(c.reply().status, 200);
         c.expect_closed();
     }
+}
+
+#[test]
+fn file_bodies_are_copied_over_a_unix_socket() {
+    use std::os::unix::net::UnixStream;
+
+    let data = file_data(700_001);
+    let tmp = TempFile::new("file-unix", &data);
+    let path = std::env::temp_dir().join(format!("giong-http-{}-file.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let (tx, rx) = mpsc::channel();
+    let (server_path, handler) = (path.clone(), file_handler(tmp.0.clone()));
+    let thread = std::thread::spawn(move || {
+        rt.run(move |_| {
+            let (tx, path, handler) = (tx.clone(), server_path.clone(), handler.clone());
+            async move {
+                let listener = giong::net::UnixListener::bind(path).unwrap();
+                tx.send(()).unwrap();
+                Server::new().serve_unix(listener, handler).await;
+            }
+        })
+        .unwrap();
+    });
+    rx.recv().unwrap();
+    let mut stream = UnixStream::connect(&path).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .write_all(b"GET /file HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut all = Vec::new();
+    stream.read_to_end(&mut all).unwrap();
+    let end = all.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&all[..end]).into_owned();
+    assert!(head.contains("Content-Length: 700001\r\n"), "{head}");
+    assert!(all[end..] == data[..]);
+    handle.shutdown();
+    thread.join().unwrap();
+    let _ = std::fs::remove_file(&path);
 }

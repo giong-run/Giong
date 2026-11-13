@@ -24,7 +24,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
   the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
   the kernel would repeat the nonce of the `Finished` message under the same key. New
-  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure.
+  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
+  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
+  are tested.
+- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
+  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
+  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
+  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
+  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
+  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
+  Unix sockets read and write). A file that turns out shorter than announced is the new
+  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. Bare-metal
+  numbers are in the `giong-tls` README.
 - **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
   data, on both drivers (giong-tls sends TLS alerts and key updates through it).
 - **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
@@ -32,17 +43,25 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
 - **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
   module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
-  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 6.1, Ubuntu's 6.8 and 6.18,
-  and loads the module on its runners for the `test`, `fallback`, `tsan` and `docker`
-  jobs.
+  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
+  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
+  `fallback`, `tsan` and `docker` jobs.
 - **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
-  `Ktls::Required`), 64 KiB and 1 MiB responses, the server's CPU time per request and
-  an error count; `SERVERS` and `ENDPOINTS` pick a subset.
+  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
+  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
+  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
+  adds a giong client with kernel TLS and the same body sizes.
 - **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
   (`docs/reviews/2026-11-giong-tls.md`).
 
 ### Fixed
 
+- **giong**: on Linux 6.0 and 6.1, io_uring gives up waiting on a non-blocking socket
+  when a woken `sendmsg` or `recvmsg` still cannot proceed (it retries on a kernel
+  thread, which then sees `O_NONBLOCK`) and completes with `EAGAIN`. giong now submits
+  such an operation again instead of returning `WouldBlock`. Sockets were blocking under
+  io_uring until `send_file`, which needs `O_NONBLOCK`; a test with four writers on one
+  small buffer failed on both kernels without the fix.
 - **giong**: a `UdpSocket` bound to port 0 could get a port that another UDP socket of the
   same user already held, in this process or another, and the two sockets then split
   each other's datagrams by a hash of the sender's address: answers went to the wrong
