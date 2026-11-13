@@ -30,6 +30,60 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
     has not taken in yet. Publishing them costs about 0.1% of the instructions per request
     of a small HTTP response.
 
+- **`giong-web`**, a new crate: routing, middleware and JSON for HTTP services on
+  giong-http.
+  - A handler is an `async fn(Req<S>) -> Result<Response, Error>`, and `?` works on any
+    error. `Router::new().get("/users/{id}", user).nest("/teams/{team}", members)
+    .layer(m).build(state)` builds an `App` per worker, with no locks and nothing `Send`.
+    Patterns have parameters (`{id}`) and a catch-all (`{*path}`); a literal segment wins
+    over a parameter, a parameter over a catch-all, with backtracking. `HEAD` is answered
+    by the `GET` route, `OPTIONS` and `405` with `Allow` are answered for every path,
+    and a `404` for `/users/` names `/users` when that exists.
+  - `req.param::<u64>("id")?` and `req.query_param::<u32>("page")?` parse into any
+    `FromStr` type: a value that does not parse is a `400` (`GIONG-E1205`) naming the
+    parameter and the expected type, and asking for a parameter the route lacks is a
+    `500` (`GIONG-E1206`) whose cause names the route. With the `serde` feature,
+    `req.json::<T>()` (`415`, `400` or `422`: `GIONG-E1208`, `E1207`), `req.query::<T>()`
+    and `json(status, &value)`.
+  - Every error answer is an RFC 9457 problem+json body with a stable code (`{"status":
+    404,"code":"GIONG-E1203","title":"Not Found","detail":"no route for GET /x"}`), and
+    the request id when there is one. `Error::bad_request(code, detail)` and its
+    siblings make one with your own code; an error that is not one becomes a `500`
+    (`GIONG-E1210`) whose cause is logged and never sent, or a `503` with `Retry-After`
+    (`GIONG-E1211`) when it is a giong error for a database or service that cannot be
+    reached. A 5xx no `Logger` reported goes to stderr. Two routes for the same requests,
+    or an invalid pattern, panic at startup with a code and the line that added them.
+  - Middleware is a trait with one `async fn call(&self, req, next)`; they run in the
+    order added, and those of a nested router only for its routes. Included:
+    `RequestId` (`X-Request-Id`, incoming ids trusted only if asked), `Logger` (one JSON
+    line per request with its route, status, duration, request id and, for errors, the
+    code and cause; written by a background thread, never on the worker), `Cors`
+    (nothing allowed until named; a preflight that is refused says why, `GIONG-E1212`),
+    `Compression` (gzip at level 1 for bodies from 1 KiB, in 64 KiB slices that yield to
+    other tasks) and `Timeout` (`503`, `GIONG-E1209`). Settings that cannot work, such as
+    any origin with credentials, panic with `GIONG-E1213`.
+  - `App::handle(Request)` answers without a socket, so routes and middleware are tested
+    with plain unit tests (`Request::from_bytes`).
+  - On one core against axum 0.8 with the same serde handlers (`bench/web.sh`, median of
+    5 rounds): 152.5k requests per second on `/json` against 118.3k, 28.0k on a list of
+    100 users against 15.2k, 140.5k on `/users/{id}` against 107.1k; with request ids,
+    gzip and a timeout, 126.2k against 65.8k on `/json` and 12.0k against 5.2k on the
+    gzipped list (tower-http for axum). The router, parameters and serde cost about 5%
+    against giong-http's bare handler.
+  - Two fuzz targets (`giong-web/fuzz`, 17 in all): the route table against a slow
+    reference matcher, and any bytes as a request to an app with every middleware, whose
+    answer must be well formed (status and headers, problem+json with a code for every
+    error, gzip that decodes to what the handler wrote, one JSON log line that agrees
+    with the response, the request id sent back).
+- **`giong-http`**: `Handler`, the trait the server calls; every `Fn(Request) -> impl
+  Future<Output = Response>` is one, and a type can implement it to borrow from itself
+  while it answers (giong-web's `App` does). `Response` gains `headers()`,
+  `get_header`, `remove_header`, `body_bytes`, `take_body` and typed extensions
+  (`with_extension`, `extension`); `Request` gains `from_bytes`, to make one in a test,
+  and `with_peer_addr`. `reason_phrase(status)`.
+- `giong::try_worker_id()`: the index of the worker running the caller, or `None` off
+  the runtime. 13 new error codes, `GIONG-E1201` to `E1213`, for giong-web; 81 in all.
+
 - **`giong-http`**: what the client lacked for production traffic.
   - HTTP proxies: `ClientBuilder::proxy` with `Proxy::all`, `Proxy::http` or
     `Proxy::https`, or `Proxy::from_env` for `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and
@@ -72,6 +126,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **`giong-http`**: `Server::serve`, `serve_unix` and `serve_tls` take any `Handler`. A
+  closure passed to them needs its argument's type written (`|req: Request| async
+  move { .. }`): Rust no longer infers it.
 - **`giong-http`**: the client asks for compressed responses and decodes them by default
   (see Added); a decoded response no longer has `Content-Encoding` and `Content-Length`
   among its headers. A request that sets `Proxy-Authorization` itself is refused

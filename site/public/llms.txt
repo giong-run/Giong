@@ -15,6 +15,9 @@ Facts that are easy to get wrong:
 - There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
 - An error giong raises starts with a code, such as `GIONG-E0102`, says how to fix it, and
   links to its page; `giong::error::code(&err)` returns the code to match on.
+- giong-web: build the `Router` inside each worker's future (`run(|_| async { .. })`), since
+  an `App` is not `Send`. A handler is `async fn(Req<S>) -> Result<Response, Error>`; `?` on
+  any other error answers `500` and logs the cause, never sending it.
 - Install with `cargo add giong` (and `giong-http`, `giong-tls`). Libraries need Rust 1.80.
 
 ## Docs
@@ -25,6 +28,7 @@ Facts that are easy to get wrong:
 - [giong-postgres API](https://docs.rs/giong-postgres): a PostgreSQL client and per-worker pool; statements from every task pipeline over a few connections
 - [giong-mysql API](https://docs.rs/giong-mysql): a MySQL 8 client and per-worker pool; statements from every task pipeline over a few connections
 - [giong-redis API](https://docs.rs/giong-redis): a Redis client and per-worker pool: commands from every task pipeline over one connection; pipelines, transactions, Pub/Sub
+- [giong-web API](https://docs.rs/giong-web): a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts) and JSON on giong-http; every error is problem+json with a `GIONG-E12xx` or your own code
 - [README](https://github.com/giong-run/Giong/blob/main/README.md): design, benchmarks with their method, limitations
 - [AGENTS.md](https://github.com/giong-run/Giong/blob/main/AGENTS.md): how to build, test and change giong, for coding agents
 - [Error codes](https://github.com/giong-run/Giong/blob/main/docs/errors/README.md): what each `GIONG-E` code means and how to fix it

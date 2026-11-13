@@ -28,10 +28,10 @@
 //! # }
 //! ```
 //!
-//! The companion crates (giong-http, giong-tls, giong-postgres, giong-mysql,
-//! giong-redis) use the same codes, so one `match` covers them all. Codes are
-//! never reused or renumbered; a code that is no longer raised keeps its
-//! page.
+//! The companion crates (giong-http, giong-web, giong-tls, giong-postgres,
+//! giong-mysql, giong-redis) use the same codes, so one `match` covers them
+//! all. Codes are never reused or renumbered; a code that is no longer raised
+//! keeps its page.
 
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -47,9 +47,10 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
-        /// giong-http's client, `E2xxx` giong-tls, `E30xx` giong-postgres,
-        /// `E31xx` giong-mysql and `E32xx` giong-redis. Each has a page under
-        /// `docs/errors/` in the repository; [`url`](Code::url) links to it.
+        /// giong-http's client, `E12xx` giong-web, `E2xxx` giong-tls, `E30xx`
+        /// giong-postgres, `E31xx` giong-mysql and `E32xx` giong-redis. Each
+        /// has a page under `docs/errors/` in the repository;
+        /// [`url`](Code::url) links to it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
         #[non_exhaustive]
         #[repr(u16)]
@@ -167,6 +168,49 @@ codes! {
     /// The proxy refused the request or the tunnel, or did not answer as a
     /// proxy does.
     HttpClientProxy = 1110, Other, "the HTTP proxy refused the request";
+
+    // --------------------------------------------------------- giong-web
+    /// A route pattern given to the router is not valid. It panics with
+    /// this code when the route is added, since the pattern is a bug in the
+    /// program.
+    WebInvalidRoute = 1201, InvalidInput, "invalid route pattern";
+    /// Two routes have the same method and the same pattern (parameter
+    /// names aside). It panics with this code when the second one is added.
+    WebDuplicateRoute = 1202, AlreadyExists, "route added twice";
+    /// No route matches the request's path: answered with `404 Not Found`.
+    WebNoRoute = 1203, NotFound, "no route for the path";
+    /// Routes match the path, but none for the request's method: answered
+    /// with `405 Method Not Allowed` and an `Allow` header.
+    WebMethodNotAllowed = 1204, Unsupported, "method not allowed";
+    /// A path or query parameter is missing or cannot be read as the type
+    /// the handler asked for: answered with `400 Bad Request`.
+    WebBadParameter = 1205, InvalidInput, "invalid path or query parameter";
+    /// A handler asked for a path parameter its route does not have: a bug
+    /// in the program, answered with `500 Internal Server Error`.
+    WebNoSuchParameter = 1206, InvalidInput, "the route has no such parameter";
+    /// The request body cannot be read as the handler asked, such as JSON
+    /// that does not parse (`400`) or does not fit the expected type
+    /// (`422`).
+    WebBadBody = 1207, InvalidData, "unreadable request body";
+    /// The request body has a `Content-Type` the handler does not take:
+    /// answered with `415 Unsupported Media Type`.
+    WebUnsupportedMediaType = 1208, InvalidInput, "unsupported Content-Type";
+    /// The handler did not answer within the `Timeout` middleware's limit:
+    /// answered with `503 Service Unavailable`.
+    WebTimeout = 1209, TimedOut, "no response in time";
+    /// The handler failed: answered with `500 Internal Server Error`, the
+    /// cause written to the log, never sent.
+    WebInternal = 1210, Other, "the handler failed";
+    /// A service the handler needs (a database, a cache, another HTTP API)
+    /// cannot be reached or is overloaded: answered with `503 Service
+    /// Unavailable`.
+    WebUnavailable = 1211, Other, "a service the handler needs is unavailable";
+    /// A CORS preflight request asked for an origin, method or header the
+    /// `Cors` middleware does not allow: answered with `403 Forbidden`.
+    WebCorsRejected = 1212, PermissionDenied, "cross-origin request refused";
+    /// A giong-web middleware was given settings that cannot work together.
+    /// It panics with this code when the middleware is built.
+    WebConfig = 1213, InvalidInput, "invalid giong-web setting";
 
     // --------------------------------------------------------- giong-tls
     /// No trusted certificate authority: none installed on the machine, or

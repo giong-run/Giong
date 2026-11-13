@@ -1,0 +1,7 @@
+POST /api/json HTTP/1.1
+Host: t
+Content-Type: application/json
+Accept-Encoding: gzip
+Content-Length: 43
+
+{"a":[1,2.5,{"b":null}],"c":"x\n","d":true}

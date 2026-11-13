@@ -8,6 +8,9 @@ axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# MIDDLEWARE=1 only: the counterparts of giong-web's RequestId, Compression
+# and Timeout (bench/web.sh).
+tower-http = { version = "0.6", features = ["compression-gzip", "request-id", "timeout"] }
 
 [profile.release]
 opt-level = 3

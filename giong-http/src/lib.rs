@@ -74,8 +74,8 @@ mod response;
 mod server;
 
 pub use request::Request;
-pub use response::{Body, Response};
-pub use server::{Server, Transport};
+pub use response::{reason_phrase, Body, Response};
+pub use server::{Handler, Server, Transport};
 
 /// Entry points for the fuzz targets in `giong-http/fuzz`. Only built by
 /// `cargo fuzz` (`--cfg fuzzing`); not part of the API.

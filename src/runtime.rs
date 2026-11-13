@@ -1271,6 +1271,12 @@ pub fn worker_id() -> usize {
     with_worker(|w| w.index)
 }
 
+/// Index of the worker the current thread runs, or `None` outside of a giong
+/// runtime. For code that may also run elsewhere, such as a log writer.
+pub fn try_worker_id() -> Option<usize> {
+    try_with_worker(|w| w.index)
+}
+
 /// Future returned by [`shutdown_signal`].
 pub struct ShutdownSignal {
     rt: Arc<RuntimeShared>,

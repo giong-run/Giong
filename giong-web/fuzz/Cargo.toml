@@ -1,0 +1,34 @@
+[package]
+name = "giong-web-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+giong-web = { path = "..", features = ["serde"] }
+# The app in giong-web's src/fuzzing.rs derives its types.
+serde = { version = "1", features = ["derive"] }
+
+# Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "routes"
+path = "fuzz_targets/routes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

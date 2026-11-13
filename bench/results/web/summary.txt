@@ -1,0 +1,19 @@
+server         endpoint         req/s median       min       max       p50       p99
+axum           json                   118292    110661    140892     319us    1260us
+axum           users                   15165     14036     15793    3200us    5340us
+axum           users/42               107080     74399    124246     369us    1220us
+axum           compute?n=25             3905      3577      4071   12460us   18470us
+axum           pipelined-json          18182     18063     18219                    
+giong-web      json                   152489    146933    186894     228us     930us
+giong-web      users                   27964     25201     30616    1580us    3850us
+giong-web      users/42               140477    124471    161510     264us     824us
+giong-web      compute?n=25             3694      3659      4011   12190us   22880us
+giong-web      pipelined-json         804147    726847   1014587                    
+giong-http     json                   160355    159406    167794     196us     810us
+giong-http     users                   48310     42598     51091     910us    2590us
+giong-http     compute?n=25             3471      3391      3558   13320us   24190us
+giong-http     pipelined-json        1163628   1058051   1301214                    
+axum+mw        json                    65798     59326     75296     791us    1910us
+axum+mw        users                    5207      4588      5875    8970us   13590us
+giong-web+mw   json                   126178    124490    132921     337us    1040us
+giong-web+mw   users                   11961     11245     12232    3860us    7920us

@@ -1,8 +1,8 @@
 name: Fuzz
 
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
-# bytes from the network: giong-http's server and client, and the PostgreSQL,
-# MySQL and Redis protocol readers. Every night each target runs for 10 minutes
+# bytes from the network: giong-http's server and client, giong-web's router
+# and request handling, and the PostgreSQL, MySQL and Redis protocol readers. Every night each target runs for 10 minutes
 # and its corpus is kept in the Actions cache, so the corpus keeps growing; pull
 # requests that touch these crates get a short run of each target. A crash fails
 # the job and uploads the input that caused it.
@@ -16,6 +16,7 @@ on:
       - "giong-postgres/**"
       - "giong-mysql/**"
       - "giong-redis/**"
+      - "giong-web/**"
       - "src/**"
       - ".github/workflows/fuzz.yml"
   workflow_dispatch:
@@ -53,6 +54,8 @@ jobs:
           - { crate: giong-mysql, target: url }
           - { crate: giong-redis, target: replies }
           - { crate: giong-redis, target: url }
+          - { crate: giong-web, target: routes }
+          - { crate: giong-web, target: request }
     name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
     steps:
       - uses: actions/checkout@v4

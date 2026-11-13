@@ -1,0 +1,4 @@
+GET /search?q=caf%C3%A9+au+lait&page=3&sort=asc&n=-7 HTTP/1.1
+Host: t
+X-Request-Id: abc-123
+

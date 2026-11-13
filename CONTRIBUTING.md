@@ -86,6 +86,7 @@ cargo +nightly fuzz run inflate        # gzip and deflate bodies
 cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
 cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: url
+cd ../giong-web && cargo +nightly fuzz run request         # also: routes
 ```
 
 Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's

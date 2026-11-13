@@ -21,8 +21,8 @@ fn on_error(err: &std::io::Error) {
 }
 ```
 
-giong-http, giong-tls, giong-postgres, giong-mysql and giong-redis use the same codes. A code is never
-reused or renumbered, and its page stays when it is no longer raised.
+giong-http, giong-web, giong-tls, giong-postgres, giong-mysql and giong-redis use the same
+codes. A code is never reused or renumbered, and its page stays when it is no longer raised.
 
 ## The runtime
 
@@ -70,6 +70,24 @@ reused or renumbered, and its page stays when it is no longer raised.
 | [GIONG-E1108](E1108.md) | `HttpClientStatus` | HTTP error status |
 | [GIONG-E1109](E1109.md) | `HttpClientDecode` | cannot decode the response body |
 | [GIONG-E1110](E1110.md) | `HttpClientProxy` | the HTTP proxy refused the request |
+
+## giong-web
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E1201](E1201.md) | `WebInvalidRoute` | invalid route pattern |
+| [GIONG-E1202](E1202.md) | `WebDuplicateRoute` | route added twice |
+| [GIONG-E1203](E1203.md) | `WebNoRoute` | no route for the path |
+| [GIONG-E1204](E1204.md) | `WebMethodNotAllowed` | method not allowed |
+| [GIONG-E1205](E1205.md) | `WebBadParameter` | invalid path or query parameter |
+| [GIONG-E1206](E1206.md) | `WebNoSuchParameter` | the route has no such parameter |
+| [GIONG-E1207](E1207.md) | `WebBadBody` | unreadable request body |
+| [GIONG-E1208](E1208.md) | `WebUnsupportedMediaType` | unsupported Content-Type |
+| [GIONG-E1209](E1209.md) | `WebTimeout` | no response in time |
+| [GIONG-E1210](E1210.md) | `WebInternal` | the handler failed |
+| [GIONG-E1211](E1211.md) | `WebUnavailable` | a service the handler needs is unavailable |
+| [GIONG-E1212](E1212.md) | `WebCorsRejected` | cross-origin request refused |
+| [GIONG-E1213](E1213.md) | `WebConfig` | invalid giong-web setting |
 
 ## giong-tls
 
