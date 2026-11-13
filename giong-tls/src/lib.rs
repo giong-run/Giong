@@ -66,10 +66,23 @@
 //! The API mirrors [`giong::net::TcpStream`]: [`TlsStream::recv`] returns the
 //! next piece of decrypted data and [`TlsStream::write_all`] takes a buffer by
 //! value and hands it back.
+//!
+//! # Kernel TLS
+//!
+//! With [`TlsAcceptor::ktls`] or [`TlsConnector::ktls`], rustls does the
+//! handshake and then hands the connection's keys to the kernel (kTLS), which
+//! encrypts and decrypts from then on. The API stays the same;
+//! [`TlsStream::is_ktls`] says which way a connection went, [`ktls_support`]
+//! what the running kernel can do, and [`ktls_stats`] how many connections
+//! went to the kernel.
 
 #![warn(missing_docs)]
 
-use std::cell::{Cell, RefCell};
+mod ktls;
+
+pub use ktls::{ktls_stats, ktls_support, Ktls, KtlsStats, KtlsSupport};
+
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::future::poll_fn;
@@ -154,6 +167,33 @@ fn tls_error(e: rustls::Error) -> io::Error {
 /// How long a handshake may take unless configured otherwise.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn handshake_timed_out(limit: Duration) -> io::Error {
+    coded(
+        Code::TlsHandshakeTimeout,
+        format!("the TLS handshake did not finish within {limit:?}"),
+        "check that the other side speaks TLS on this port and is not overloaded, or raise \
+         handshake_timeout.",
+    )
+}
+
+fn handshake_eof() -> io::Error {
+    coded(
+        Code::TlsHandshakeEof,
+        "the peer closed the connection during the TLS handshake",
+        "check that the other side speaks TLS on this port, and whether it wants a client \
+         certificate or another server name.",
+    )
+}
+
+fn broken() -> io::Error {
+    coded(
+        Code::TlsBroken,
+        "a TLS write failed or was cancelled; nothing more can be sent",
+        "open a new connection. A write cancelled half-way (a dropped future, a timeout) \
+         leaves a partial record or message behind, so the stream cannot go on.",
+    )
+}
+
 /// Every certificate in `pem`, or an error if there is none.
 fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_slice_iter(pem)
@@ -176,6 +216,7 @@ fn ring() -> Arc<rustls::crypto::CryptoProvider> {
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
     handshake_timeout: Duration,
+    ktls: ktls::Plan,
 }
 
 impl TlsAcceptor {
@@ -184,6 +225,7 @@ impl TlsAcceptor {
         Self {
             config,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            ktls: ktls::Plan::Off,
         }
     }
 
@@ -210,8 +252,71 @@ impl TlsAcceptor {
         self
     }
 
+    /// Whether connections hand their keys to the kernel after the
+    /// handshake, so that the kernel encrypts and decrypts (kernel TLS).
+    /// [`Ktls::Off`] by default. See [`Ktls`] for what each mode does, and
+    /// the crate README for when it pays off.
+    ///
+    /// Decided here, once: the running kernel is probed (see
+    /// [`ktls_support`]) and checked against every cipher suite the
+    /// configuration allows. [`Ktls::Required`] fails here with `GIONG-E2009`
+    /// if the kernel cannot take them; [`Ktls::Auto`] then leaves every
+    /// connection in the process instead. A configuration that allows 0-RTT
+    /// data (`max_early_data_size` above 0) cannot use kTLS.
+    ///
+    /// Turns on rustls' `enable_secret_extraction`, which kTLS needs, in this
+    /// acceptor's copy of the configuration.
+    ///
+    /// ```no_run
+    /// use giong_tls::{Ktls, TlsAcceptor};
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let acceptor = TlsAcceptor::from_pem(&std::fs::read("cert.pem")?, &std::fs::read("key.pem")?)?
+    ///     .ktls(Ktls::Auto)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn ktls(mut self, mode: Ktls) -> io::Result<Self> {
+        let early_data = self.config.max_early_data_size > 0;
+        self.ktls = ktls::Plan::new(mode, self.config.crypto_provider(), early_data)?;
+        if mode != Ktls::Off {
+            Arc::make_mut(&mut self.config).enable_secret_extraction = true;
+        }
+        Ok(self)
+    }
+
+    /// Why connections stay in the process although [`Ktls::Auto`] asked for
+    /// kernel TLS, if they all do: the kernel has no `tls` module, lacks a
+    /// cipher suite the configuration allows, or cannot change TLS 1.3 keys.
+    /// `None` otherwise. Worth a line in the log at startup.
+    pub fn ktls_unavailable(&self) -> Option<&str> {
+        self.ktls.unavailable()
+    }
+
     /// Performs the TLS handshake on an accepted connection.
+    ///
+    /// With kernel TLS (see [`ktls`](Self::ktls)), the keys go to the kernel
+    /// once the handshake is done. Under [`Ktls::Required`], a stream that
+    /// cannot take them fails with `GIONG-E2009` before anything is sent.
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<TlsStream> {
+        let tcp = match &self.ktls {
+            ktls::Plan::Off => tcp,
+            ktls::Plan::Try { required } => {
+                let start = ktls::Start::Server(self.config.clone());
+                match ktls::handshake(tcp, start, self.handshake_timeout).await? {
+                    ktls::Outcome::Kernel(tls) => return Ok(*tls),
+                    ktls::Outcome::Declined(_, e) if *required => return Err(e),
+                    ktls::Outcome::Declined(tcp, _) => {
+                        self.ktls.stayed();
+                        tcp
+                    }
+                }
+            }
+            ktls::Plan::Unavailable(_) => {
+                self.ktls.stayed();
+                tcp
+            }
+        };
         let conn = ServerConnection::new(self.config.clone()).map_err(tls_error)?;
         TlsStream::new(tcp, conn.into())
             .handshake(self.handshake_timeout)
@@ -223,6 +328,7 @@ impl std::fmt::Debug for TlsAcceptor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsAcceptor")
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("ktls", &self.ktls)
             .finish_non_exhaustive()
     }
 }
@@ -251,6 +357,7 @@ impl std::fmt::Debug for TlsAcceptor {
 pub struct TlsConnector {
     config: Arc<ClientConfig>,
     handshake_timeout: Duration,
+    ktls: ktls::Plan,
 }
 
 impl TlsConnector {
@@ -259,6 +366,7 @@ impl TlsConnector {
         Self {
             config,
             handshake_timeout: HANDSHAKE_TIMEOUT,
+            ktls: ktls::Plan::Off,
         }
     }
 
@@ -362,6 +470,34 @@ impl TlsConnector {
         self
     }
 
+    /// Whether connections hand their keys to the kernel after the
+    /// handshake, so that the kernel encrypts and decrypts (kernel TLS).
+    /// [`Ktls::Off`] by default; see [`TlsAcceptor::ktls`], which works the
+    /// same way. Session tickets the server sends later still reach the
+    /// session cache, so reconnecting resumes as without kTLS. A
+    /// configuration that allows 0-RTT data (`enable_early_data`) cannot use
+    /// kTLS.
+    ///
+    /// A stream on which [`TcpStream::recv`] was already used, as by a
+    /// protocol that reads a plaintext greeting before TLS starts, cannot
+    /// take kTLS: under [`Ktls::Auto`] it stays in the process, under
+    /// [`Ktls::Required`] it fails with `GIONG-E2009`. Use
+    /// [`TcpStream::read`] for such greetings.
+    pub fn ktls(mut self, mode: Ktls) -> io::Result<Self> {
+        let early_data = self.config.enable_early_data;
+        self.ktls = ktls::Plan::new(mode, self.config.crypto_provider(), early_data)?;
+        if mode != Ktls::Off {
+            Arc::make_mut(&mut self.config).enable_secret_extraction = true;
+        }
+        Ok(self)
+    }
+
+    /// Why connections stay in the process although [`Ktls::Auto`] asked for
+    /// kernel TLS, if they all do; see [`TlsAcceptor::ktls_unavailable`].
+    pub fn ktls_unavailable(&self) -> Option<&str> {
+        self.ktls.unavailable()
+    }
+
     /// Performs the TLS handshake on a connection to `server_name`, which the
     /// server's certificate must be valid for. `server_name` is a DNS name,
     /// sent to the server through SNI, or an IP address (`[...]` brackets
@@ -372,6 +508,24 @@ impl TlsConnector {
     /// [`io::ErrorKind::InvalidData`] and a message saying which it was.
     pub async fn connect(&self, server_name: &str, tcp: TcpStream) -> io::Result<TlsStream> {
         let name = parse_server_name(server_name)?;
+        let tcp = match &self.ktls {
+            ktls::Plan::Off => tcp,
+            ktls::Plan::Try { required } => {
+                let start = ktls::Start::Client(self.config.clone(), name.clone());
+                match ktls::handshake(tcp, start, self.handshake_timeout).await? {
+                    ktls::Outcome::Kernel(tls) => return Ok(*tls),
+                    ktls::Outcome::Declined(_, e) if *required => return Err(e),
+                    ktls::Outcome::Declined(tcp, _) => {
+                        self.ktls.stayed();
+                        tcp
+                    }
+                }
+            }
+            ktls::Plan::Unavailable(_) => {
+                self.ktls.stayed();
+                tcp
+            }
+        };
         let conn = ClientConnection::new(self.config.clone(), name).map_err(tls_error)?;
         TlsStream::new(tcp, conn.into())
             .handshake(self.handshake_timeout)
@@ -383,6 +537,7 @@ impl std::fmt::Debug for TlsConnector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsConnector")
             .field("handshake_timeout", &self.handshake_timeout)
+            .field("ktls", &self.ktls)
             .finish_non_exhaustive()
     }
 }
@@ -520,7 +675,8 @@ impl Roots {
 /// the server side or [`TlsConnector::connect`] on the client side.
 pub struct TlsStream {
     tcp: TcpStream,
-    conn: RefCell<Connection>,
+    /// Who encrypts: rustls in the process, or the kernel.
+    engine: RefCell<Engine>,
     /// Decrypted data not handed out yet.
     plain: RefCell<Vec<u8>>,
     /// Scratch buffer for outgoing TLS records, reused between writes.
@@ -542,10 +698,31 @@ pub struct TlsStream {
     waiters: RefCell<Vec<Waker>>,
 }
 
-/// Held while TLS records are being written to the socket.
+/// Who encrypts and decrypts a [`TlsStream`].
+// Both variants are large and a stream holds one for its whole life; a box
+// would cost an allocation and a pointer to follow on every call.
+#[allow(clippy::large_enum_variant)]
+enum Engine {
+    /// rustls, in the process.
+    User(Connection),
+    /// The kernel; rustls keeps what it needs for key updates and session
+    /// tickets.
+    Kernel(ktls::Kernel),
+}
+
+/// Held while TLS records are being written to the socket. Dropped without
+/// [`done`](Self::done), as when the future writing is cancelled, it marks
+/// the stream broken.
 struct Sending<'a> {
     stream: &'a TlsStream,
     complete: bool,
+}
+
+impl Sending<'_> {
+    /// The records went out whole (or none did).
+    fn done(mut self) {
+        self.complete = true;
+    }
 }
 
 impl Drop for Sending<'_> {
@@ -563,13 +740,24 @@ impl Drop for Sending<'_> {
 
 impl TlsStream {
     fn new(tcp: TcpStream, conn: Connection) -> Self {
+        Self::with_engine(tcp, Engine::User(conn), Vec::new(), false)
+    }
+
+    /// A stream the kernel encrypts. `plain` is application data that arrived
+    /// with the end of the handshake; `peer_closed` says `close_notify` did
+    /// too.
+    fn kernel(tcp: TcpStream, kernel: ktls::Kernel, plain: Vec<u8>, peer_closed: bool) -> Self {
+        Self::with_engine(tcp, Engine::Kernel(kernel), plain, peer_closed)
+    }
+
+    fn with_engine(tcp: TcpStream, engine: Engine, plain: Vec<u8>, peer_closed: bool) -> Self {
         Self {
             tcp,
-            conn: RefCell::new(conn),
-            plain: RefCell::new(Vec::new()),
+            engine: RefCell::new(engine),
+            plain: RefCell::new(plain),
             wire: RefCell::new(Vec::new()),
-            eof: Cell::new(false),
-            close_notify: Cell::new(false),
+            eof: Cell::new(peer_closed),
+            close_notify: Cell::new(peer_closed),
             sending: Cell::new(false),
             broken: Cell::new(false),
             failed: Cell::new(None),
@@ -577,21 +765,61 @@ impl TlsStream {
         }
     }
 
+    /// rustls' connection, on a stream rustls encrypts. Never held across
+    /// an `.await`.
+    fn conn(&self) -> RefMut<'_, Connection> {
+        RefMut::map(self.engine.borrow_mut(), |e| match e {
+            Engine::User(c) => c,
+            Engine::Kernel(_) => unreachable!("rustls' connection on a kernel TLS stream"),
+        })
+    }
+
+    /// `true` if the kernel encrypts and decrypts this connection (kernel
+    /// TLS, see [`TlsAcceptor::ktls`]); `false` if rustls does, in the
+    /// process.
+    pub fn is_ktls(&self) -> bool {
+        matches!(*self.engine.borrow(), Engine::Kernel(_))
+    }
+
+    /// Waits until no other task is writing records.
+    async fn wait_for_sender(&self) {
+        poll_fn(|cx| {
+            if !self.sending.get() {
+                return Poll::Ready(());
+            }
+            // A task polled again while it waits is listed once.
+            let mut waiters = self.waiters.borrow_mut();
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+            Poll::Pending
+        })
+        .await;
+    }
+
+    /// Waits for other writers, then makes this task the one writing records
+    /// until the guard is dropped.
+    async fn lock_send(&self) -> Sending<'_> {
+        while self.sending.get() {
+            self.wait_for_sender().await;
+        }
+        self.sending.set(true);
+        Sending {
+            stream: self,
+            complete: false,
+        }
+    }
+
     /// Runs the handshake, either side, within `limit`.
     async fn handshake(self, limit: Duration) -> io::Result<Self> {
         let handshake = async {
-            while self.conn.borrow().is_handshaking() {
+            while self.conn().is_handshaking() {
                 self.flush_tls().await?;
-                if !self.conn.borrow().is_handshaking() {
+                if !self.conn().is_handshaking() {
                     break;
                 }
                 if self.eof.get() {
-                    return Err(coded(
-                        Code::TlsHandshakeEof,
-                        "the peer closed the connection during the TLS handshake",
-                        "check that the other side speaks TLS on this port, and whether it \
-                         wants a client certificate or another server name.",
-                    ));
+                    return Err(handshake_eof());
                 }
                 self.pump().await?;
             }
@@ -600,62 +828,36 @@ impl TlsStream {
         match timeout(limit, handshake).await {
             Ok(Ok(())) => Ok(self),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(coded(
-                Code::TlsHandshakeTimeout,
-                format!("the TLS handshake did not finish within {limit:?}"),
-                "check that the other side speaks TLS on this port and is not overloaded, or \
-                 raise handshake_timeout.",
-            )),
+            Err(_) => Err(handshake_timed_out(limit)),
         }
     }
 
     /// Sends every TLS record rustls has queued.
     async fn flush_tls(&self) -> io::Result<()> {
         loop {
-            if !self.conn.borrow().wants_write() {
+            if !self.conn().wants_write() {
                 return Ok(());
             }
             if self.broken.get() {
-                return Err(coded(
-                    Code::TlsBroken,
-                    "a TLS write failed or was cancelled; nothing more can be sent",
-                    "open a new connection. A write cancelled half-way (a dropped future, a \
-                     timeout) leaves a partial record behind, so the stream cannot go on.",
-                ));
+                return Err(broken());
             }
             if self.sending.get() {
                 // Another task is sending. Wait for it, then send what is
                 // left (it may already have sent this task's records too).
-                poll_fn(|cx| {
-                    if !self.sending.get() {
-                        return Poll::Ready(());
-                    }
-                    // A task polled again while it waits is listed once.
-                    let mut waiters = self.waiters.borrow_mut();
-                    if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                        waiters.push(cx.waker().clone());
-                    }
-                    Poll::Pending
-                })
-                .await;
+                self.wait_for_sender().await;
                 continue;
             }
             let mut wire = mem::take(&mut *self.wire.borrow_mut());
             {
-                let mut conn = self.conn.borrow_mut();
+                let mut conn = self.conn();
                 while conn.wants_write() {
                     conn.write_tls(&mut wire)?;
                 }
             }
-            self.sending.set(true);
-            let mut sending = Sending {
-                stream: self,
-                complete: false,
-            };
+            let sending = self.lock_send().await;
             let (res, mut wire) = self.tcp.write_all(wire).await;
             res?;
-            sending.complete = true;
-            drop(sending);
+            sending.done();
             wire.clear();
             *self.wire.borrow_mut() = wire;
         }
@@ -671,7 +873,7 @@ impl TlsStream {
             return Ok(());
         }
         let result = {
-            let mut conn = self.conn.borrow_mut();
+            let mut conn = self.conn();
             let mut plain = self.plain.borrow_mut();
             let mut input = &chunk[..];
             let mut result = Ok(());
@@ -747,6 +949,9 @@ impl TlsStream {
     ///
     /// One task may receive while another one sends.
     pub async fn recv(&self) -> io::Result<Vec<u8>> {
+        if self.is_ktls() {
+            return self.kernel_recv().await;
+        }
         loop {
             {
                 let mut plain = self.plain.borrow_mut();
@@ -777,10 +982,13 @@ impl TlsStream {
     /// connection cannot send any more: later writes return an error, while
     /// data the peer already sent can still be received.
     pub async fn write_all(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+        if self.is_ktls() {
+            return self.kernel_write_all(buf).await;
+        }
         let mut sent = 0;
         while sent < buf.len() {
             // rustls accepts a bounded amount per call; send as it fills up.
-            let accepted = self.conn.borrow_mut().writer().write(&buf[sent..]);
+            let accepted = self.conn().writer().write(&buf[sent..]);
             match accepted {
                 Ok(n) => sent += n,
                 Err(e) => return (Err(e), buf),
@@ -794,7 +1002,10 @@ impl TlsStream {
 
     /// Sends the TLS `close_notify` alert and closes the sending direction.
     pub async fn shutdown(&self) -> io::Result<()> {
-        self.conn.borrow_mut().send_close_notify();
+        if self.is_ktls() {
+            return self.kernel_shutdown().await;
+        }
+        self.conn().send_close_notify();
         self.flush_tls().await?;
         self.tcp.shutdown(Shutdown::Write)
     }
@@ -810,7 +1021,10 @@ impl TlsStream {
 
     /// The protocol agreed on through ALPN, if any (for example `http/1.1`).
     pub fn alpn_protocol(&self) -> Option<Vec<u8>> {
-        self.conn.borrow().alpn_protocol().map(<[u8]>::to_vec)
+        match &*self.engine.borrow() {
+            Engine::User(c) => c.alpn_protocol().map(<[u8]>::to_vec),
+            Engine::Kernel(k) => k.negotiated.alpn.clone(),
+        }
     }
 
     /// The certificate chain the peer presented, its own certificate first:
@@ -818,13 +1032,19 @@ impl TlsStream {
     /// client's if client authentication is configured and the client sent
     /// one.
     pub fn peer_certificates(&self) -> Option<Vec<CertificateDer<'static>>> {
-        self.conn.borrow().peer_certificates().map(<[_]>::to_vec)
+        match &*self.engine.borrow() {
+            Engine::User(c) => c.peer_certificates().map(<[_]>::to_vec),
+            Engine::Kernel(k) => k.negotiated.peer_certificates.clone(),
+        }
     }
 
     /// `true` if the handshake resumed an earlier session instead of doing a
     /// full one.
     pub fn resumed(&self) -> bool {
-        self.conn.borrow().handshake_kind() == Some(rustls::HandshakeKind::Resumed)
+        match &*self.engine.borrow() {
+            Engine::User(c) => c.handshake_kind() == Some(rustls::HandshakeKind::Resumed),
+            Engine::Kernel(k) => k.negotiated.resumed,
+        }
     }
 
     /// The underlying TCP connection.
@@ -837,6 +1057,7 @@ impl std::fmt::Debug for TlsStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsStream")
             .field("tcp", &self.tcp)
+            .field("ktls", &self.is_ktls())
             .finish_non_exhaustive()
     }
 }

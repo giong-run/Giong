@@ -184,6 +184,57 @@ fn read_and_recv_cannot_be_mixed() {
     });
 }
 
+/// One control message: `level`, `kind`, then `data`, laid out the way
+/// `CMSG_SPACE` says.
+fn control_message(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
+    // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
+    let (space, len) = unsafe {
+        (
+            libc::CMSG_SPACE(data.len() as u32) as usize,
+            libc::CMSG_LEN(data.len() as u32) as usize,
+        )
+    };
+    let header = std::mem::size_of::<libc::cmsghdr>();
+    let mut buf = vec![0u8; space];
+    // `cmsghdr` is { cmsg_len: usize, cmsg_level: i32, cmsg_type: i32 } on
+    // 64-bit Linux, the data follows it.
+    buf[..8].copy_from_slice(&(len as u64).to_ne_bytes());
+    buf[8..12].copy_from_slice(&level.to_ne_bytes());
+    buf[12..16].copy_from_slice(&kind.to_ne_bytes());
+    buf[header..header + data.len()].copy_from_slice(data);
+    buf
+}
+
+#[test]
+fn send_with_control_hands_the_control_message_to_the_kernel() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = l.accept().await.unwrap();
+        // SO_TIMESTAMPING with no flags: valid on any TCP socket.
+        let fine = control_message(libc::SOL_SOCKET, libc::SO_TIMESTAMPING, &0u32.to_ne_bytes());
+        let (res, buf, control) = c.send_with_control(b"with control".to_vec(), fine).await;
+        assert_eq!(res.unwrap(), 12);
+        assert_eq!(buf, b"with control");
+        assert!(!control.is_empty());
+        // An empty control buffer sends none.
+        let (res, _, _) = c.send_with_control(b"!".to_vec(), Vec::new()).await;
+        assert_eq!(res.unwrap(), 1);
+        let mut got = Vec::new();
+        while got.len() < 13 {
+            got.extend_from_slice(&s.recv().await.unwrap());
+        }
+        assert_eq!(got, b"with control!");
+        // The kernel reads the control message: one it does not know is
+        // refused, and nothing is sent.
+        let unknown = control_message(libc::SOL_SOCKET, 9999, &[0; 4]);
+        let (res, _, _) = c.send_with_control(b"never".to_vec(), unknown).await;
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        drop(c);
+        assert!(s.recv().await.unwrap().is_empty());
+    });
+}
+
 #[test]
 fn connect_refused() {
     giong::block_on(async {

@@ -19,7 +19,9 @@ before trusting `giong-tls` with something that matters.
 it moves records between rustls and the socket, keeps the record stream in order
 when several tasks share a connection, and loads certificates and trust roots. The
 defaults are safe, nothing in the workspace turns certificate checking off, and
-`giong-tls` has no `unsafe` code.
+`giong-tls` has no `unsafe` code. (That was true of the code reviewed here. Kernel TLS,
+added later, brings system calls and `unsafe` blocks: see the
+[addendum](#addendum-kernel-tls-2026-11-13).)
 
 The review found two medium issues, both in code that is new in 0.3.0 and had not been
 released, and one low one. All three are fixed, each with a test that fails without the
@@ -156,3 +158,142 @@ and the record-sequence limits.
 3. Wrote the tests named above against real sockets, and confirmed that the tests for
    findings 1 and 2 fail on the code before the fixes.
 4. Ran `cargo audit`.
+
+## Addendum: kernel TLS (2026-11-13)
+
+| | |
+|---|---|
+| Date | 2026-11-13 |
+| Code | branch `feat/ktls`, on `main` at `b14ca35` (0.4.0) |
+| Scope | `giong-tls/src/ktls.rs`, the parts of `giong-tls/src/lib.rs` that hand a connection to it, and `TcpStream::send_with_control` in `giong` |
+| Reviewer | Claude, the same kind of agent that wrote the code: again not an independent review |
+
+Kernel TLS (kTLS) is new and off by default. With `Ktls::Auto` or `Ktls::Required`,
+rustls still does the whole handshake, then giong-tls gives the traffic keys to the
+kernel (`setsockopt(SOL_TLS, TLS_TX / TLS_RX)`), and the kernel encrypts and decrypts
+every record after that. Records that are not application data (alerts, session
+tickets, `KeyUpdate`, TLS 1.2 renegotiation requests) come back from the kernel one at a
+time with their type, and giong-tls handles them the way rustls would have, with
+rustls's `KernelConnection` deriving new keys and storing tickets.
+
+### Does the review above still hold?
+
+- **Defaults.** Unchanged. kTLS is off unless asked for. It does not change which
+  versions or cipher suites are negotiated: `Auto` only takes connections when the
+  kernel can encrypt *and* decrypt every suite the configuration allows, and
+  `Required` fails a connection whose suite the kernel lacks instead of narrowing
+  the list. A configuration that allows 0-RTT data cannot use kTLS at all
+  (`GIONG-E2009` when the mode is set), because rustls cannot hand over a connection
+  that might still receive early data.
+- **Certificate checking.** Unchanged: the handshake is rustls's, with the same
+  verifiers. The kernel only sees keys after the handshake has succeeded.
+- **Handshake.** The kTLS handshake runs under the same time limit. It uses rustls's
+  unbuffered API so that no byte read from the socket is lost or replayed: it reads
+  exactly up to the end of the record the handshake ends in. Data the peer sent right
+  behind its last handshake flight is either already read, and then decrypted by rustls
+  and kept for the first receive, or still in the socket, where the kernel decrypts it
+  with the new keys (test `data_sent_with_the_last_handshake_flight_is_not_lost`).
+- **Memory.** A receive returns what the kernel decrypted, and one record that is not
+  application data is read at a time into a record-sized buffer. Handshake messages
+  split across records are kept until complete, up to 64 KiB for one message
+  (`GIONG-E2005` beyond it).
+- **Hostile input.** The kernel checks each record's tag; a record that fails it ends
+  the connection with `GIONG-E2005` and is never returned as data (test
+  `a_tampered_record_is_an_error_not_data`). Unlike rustls, giong-tls sends no
+  `bad_record_mac` alert in that case: the kernel has already put the socket in an
+  error state. Control records are checked as rustls
+  checks them: alerts of the wrong size or level, `KeyUpdate` that does not end its
+  record or has a bad `request_update`, handshake messages that do not belong after the
+  handshake, session tickets sent to a server. The limits are the same as rustls's: 4
+  TLS 1.2 warning alerts, one refused renegotiation, 32 `KeyUpdate` requests without
+  data in between (test `records_that_are_not_data_are_handled_as_rustls_would`).
+  After a failure every later receive returns the same error.
+- **Concurrency and cancellation.** The same rules as before: one task may receive
+  while others send, sends are serialised, and a write cancelled in the middle of a
+  record marks the stream broken (tests `kernel_recv_is_cancel_safe`,
+  `a_cancelled_kernel_write_ends_sending_instead_of_cutting_a_message`,
+  `one_task_may_receive_while_another_sends`).
+- **Truncation (finding 1).** Still told apart: a `close_notify` alert from the kernel
+  sets `received_close_notify()`, a TCP close does not (test
+  `close_notify_is_told_apart_from_a_cut_connection`).
+- **Plaintext before TLS (finding 2).** A stream on which `TcpStream::recv` was already
+  used, as `giong-mysql` and `giong-postgres` do for their plaintext start, is never
+  handed to the kernel: `Auto` keeps it in the process and `Required` fails with
+  `GIONG-E2009` (test `a_stream_already_read_with_recv_stays_in_the_process_under_auto`).
+
+### New findings
+
+#### 4. TLS 1.2 AES-GCM nonces would have been reused at the handoff (high, fixed before release)
+
+In TLS 1.2, AES-GCM records carry an 8-byte explicit nonce. rustls makes it
+`iv XOR sequence number`; the kernel takes a starting value and adds one per record.
+Handing the kernel rustls's `iv`, the obvious move, makes the kernel's first record
+reuse the nonce of the `Finished` message rustls sent under the same key. Two AES-GCM
+records with one key and one nonce reveal the authentication key, after which anyone
+on the path can forge records.
+
+**Fix.** `tls12_gcm_explicit_iv` starts the kernel past the aligned block of nonces
+rustls can have used, so the two sequences cannot meet before the cipher's record
+limit. Tests: `the_kernel_never_reuses_a_tls12_gcm_nonce_rustls_used` (the arithmetic)
+and `the_kernel_never_reuses_the_nonce_of_a_tls_1_2_finished_message`, which reads the
+records off the wire and compares their nonces. TLS 1.3 and ChaCha20-Poly1305 build the
+nonce the same way in rustls and the kernel and are not affected.
+
+#### 5. Key changes and record limits move to giong-tls (by design)
+
+rustls changes keys or closes a connection before a cipher's confidentiality limit;
+once the kernel sends the records, rustls no longer counts them. giong-tls counts them
+instead (estimated from the bytes sent, checked against the kernel's own sequence
+number when close) and, near the limit, sends a `KeyUpdate` and installs the new key
+(TLS 1.3 on Linux 6.14 or newer), or otherwise sends `close_notify` and fails further
+sends with `GIONG-E2012` (test
+`the_sending_key_changes_or_the_stream_ends_before_the_cipher_limit`). A peer's
+`KeyUpdate` is followed on Linux 6.14 and newer; on older kernels the connection ends
+with `GIONG-E2011`, which is why `Auto` keeps TLS 1.3 connections in the process there.
+
+#### 6. No silent downgrade (by design)
+
+`Required` never falls back: a connection the kernel cannot take fails with
+`GIONG-E2009` or `GIONG-E2010` and a message that says why. `Auto` does fall back, as
+documented, and the fallback can be seen: `TlsStream::is_ktls()`,
+`TlsAcceptor::ktls_unavailable()` and the counters in `ktls_stats()`. Falling back
+changes where records are encrypted, not what is negotiated or checked.
+
+#### 7. Key material
+
+The keys go from rustls (whose `AeadKey` is wiped when dropped) into the struct the
+kernel expects, which is wiped with volatile writes when dropped, including the copy
+the kernel returns when giong-tls reads the send sequence number. The kernel keeps its
+own copy for the life of the socket and wipes it when the socket closes. Anyone who
+holds the socket's descriptor can read the keys back with `getsockopt`, as anyone
+inside the process could already read them from rustls's memory.
+
+#### 8. `unsafe` code
+
+`giong-tls/src/ktls.rs` has `unsafe` blocks for `setsockopt`, `getsockopt` and
+`recvmsg` on the stream's own descriptor, for building and walking control messages
+with the `CMSG_*` macros, for viewing the `repr(C)` key structs as bytes (their size
+and layout are asserted against the kernel's in `crypto_info_has_the_kernel_layout`),
+and for the `IoBuf` implementation of a fixed-size read window. Each block has a
+`SAFETY` comment. Miri cannot run system calls, so these are covered by the tests on
+real kernels (6.1 and 6.18 in QEMU, plus the CI runner's kernel) rather than by Miri.
+
+### Recommendations
+
+- **Get the outside review the roadmap asks for**, now covering `ktls.rs` too.
+- **Hardware offload** (`TLS_HW`) was not tested. A network card that takes the records
+  may refuse a new key; giong-tls then ends the connection with `GIONG-E2011` or
+  `GIONG-E2012` rather than continuing under a worn key.
+- **Containers.** A process without `CAP_NET_ADMIN` cannot load the `tls` module;
+  `Auto` then stays in the process and `Required` fails with `GIONG-E2009`, which says
+  to run `modprobe tls` on the host.
+
+### Method
+
+1. Read the kernel's `net/tls` code for the socket options, the record-type control
+   messages, what a receive does with records that are not data, how the TLS 1.2
+   explicit nonce is built, and when new keys are accepted (Linux 6.14).
+2. Read rustls 0.23.46's `kernel` module, `ExtractedSecrets` and the unbuffered API.
+3. Ran every kTLS test on Linux 6.1.155 and 6.18.63 in QEMU with the `tls` module
+   loaded (`KTLS=1 scripts/kernels.sh`), where a skipped kTLS test counts as a failure,
+   and the fallback tests on a kernel without the module.

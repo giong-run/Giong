@@ -260,6 +260,22 @@ codes! {
     /// A TLS write failed or was cancelled, so the stream cannot send any
     /// more.
     TlsBroken = 2008, BrokenPipe, "TLS stream broken";
+    /// Kernel TLS was required (`Ktls::Required`) and cannot be used: the
+    /// kernel has no `tls` module, does not support a cipher suite the
+    /// configuration allows, the socket refused it, or `TcpStream::recv` was
+    /// already used on the stream.
+    KtlsUnavailable = 2009, Unsupported, "kernel TLS is not available";
+    /// The kernel refused a connection's TLS keys: after the handshake (the
+    /// connection was closed), or new keys for a key update (nothing more
+    /// can be sent).
+    KtlsSetup = 2010, Other, "the kernel refused the TLS keys";
+    /// The peer changed its TLS 1.3 keys and the kernel that encrypts the
+    /// connection cannot take new keys (Linux before 6.14).
+    KtlsKeyUpdate = 2011, Unsupported, "the kernel cannot change TLS keys";
+    /// The connection has sent as many TLS records as its cipher allows under
+    /// one key and cannot change keys (TLS 1.2, or TLS 1.3 on a kernel older
+    /// than 6.14), so it sent `close_notify`.
+    TlsKeysExhausted = 2012, ConnectionAborted, "TLS keys used up";
 
     // ---------------------------------------------------- giong-postgres
     /// The configuration or connection URL is not valid.

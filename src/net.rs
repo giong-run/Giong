@@ -377,6 +377,40 @@ impl StreamSocket {
         }
     }
 
+    /// One `sendmsg` of `buf` with the ancillary data in `control`.
+    pub(crate) async fn send_with_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> (io::Result<usize>, B, C) {
+        let mut iov = Box::new(libc::iovec {
+            iov_base: buf.as_ptr().cast_mut().cast(),
+            iov_len: buf.len(),
+        });
+        // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
+        let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        msg.msg_iov = &mut *iov;
+        msg.msg_iovlen = 1;
+        if !control.is_empty() {
+            msg.msg_control = control.as_ptr().cast_mut().cast();
+            msg.msg_controllen = control.len() as _;
+        }
+        let io = Io::SendMsg {
+            fd: self.sock.as_raw_fd(),
+            msg: &*msg,
+            flags: libc::MSG_NOSIGNAL as u32,
+        };
+        // The header, the iovec and both buffers stay where they are until the
+        // kernel is done with them, even if this future is dropped: `Op`
+        // keeps them until the operation completes.
+        let (res, _, (buf, control, _iov, _msg)) = Op::new(io, (buf, control, iov, msg)).await;
+        if res < 0 {
+            (Err(os_err(res)), buf, control)
+        } else {
+            (Ok(res as usize), buf, control)
+        }
+    }
+
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
         let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
@@ -688,6 +722,27 @@ impl TcpStream {
     /// been sent.
     pub async fn write_all_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
         self.inner.write_all_vectored(bufs).await
+    }
+
+    /// Sends `buf` with one `sendmsg(2)` that carries the ancillary data
+    /// (control messages) in `control`, returning how many bytes of `buf`
+    /// were sent. Both buffers are handed back.
+    ///
+    /// `control` holds complete control messages, each a `cmsghdr` followed
+    /// by its data and padded the way `CMSG_SPACE` says (an empty `control`
+    /// sends none). This is how a protocol layered on the socket tells the
+    /// kernel something about one message, such as the record type of a
+    /// kernel TLS record (`giong-tls` uses it to send TLS alerts once the
+    /// kernel encrypts the connection).
+    ///
+    /// Not cancel safe: if the future is dropped, the message may have been
+    /// sent.
+    pub async fn send_with_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> (io::Result<usize>, B, C) {
+        self.inner.send_with_control(buf, control).await
     }
 
     /// Shuts down the read half, the write half, or both.
