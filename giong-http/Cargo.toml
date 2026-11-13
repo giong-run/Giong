@@ -29,6 +29,8 @@ miniz_oxide = { version = "0.9", optional = true }
 miniz_oxide = "0.9"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# A TCP socket that is bound but does not listen. Already a dependency of giong.
+socket2 = "0.6"
 
 [[test]]
 name = "tls"

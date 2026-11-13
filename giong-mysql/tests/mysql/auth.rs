@@ -215,11 +215,14 @@ fn startup_errors_say_what_is_missing() {
 #[test]
 fn nothing_listening_is_a_connect_error() {
     run(|_| async move {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Bound but not listening, so the connect is refused for certain
+        // (a port from a closed listener could be taken in the meantime).
+        let refusing =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        refusing
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let port = refusing.local_addr().unwrap().as_socket().unwrap().port();
         let e = Client::connect(&Config::new().host("127.0.0.1").port(port).user("u"))
             .await
             .unwrap_err();

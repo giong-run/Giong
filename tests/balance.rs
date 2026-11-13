@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use giong::observe::WorkerState;
 use giong::time::sleep;
+
+mod common;
 
 #[test]
 fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
@@ -159,28 +162,33 @@ fn a_balanced_task_that_panics_reports_it_and_its_worker_carries_on() {
 /// Runs `workers` workers that each accept on a listener made by `bind`
 /// (all on one port), keep every connection open, and count them; worker 1
 /// first spawns `busy` idle tasks so that it looks busier. A plain thread
-/// opens `connections` connections. Returns the count per worker.
+/// opens `connections` connections: all at once, or `paced`, each one only
+/// once the workers have settled (see [`settle`]). Returns the count per
+/// worker.
 fn connections_per_worker(
     workers: usize,
     busy: usize,
     connections: usize,
     balanced: bool,
+    paced: bool,
 ) -> Vec<usize> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_holder, port) = common::shared_port();
     let rt = giong::Builder::new().workers(workers).build().unwrap();
     let handle = rt.handle();
     let counts = Arc::new(Mutex::new(vec![0usize; workers]));
     let ready = Arc::new(std::sync::Barrier::new(workers + 1));
     let done = Arc::new(std::sync::Barrier::new(2));
-    let (c, r, d) = (counts.clone(), ready.clone(), done.clone());
+    let (c, r, d, h) = (counts.clone(), ready.clone(), done.clone(), handle.clone());
     let client = std::thread::spawn(move || {
         r.wait();
         let streams: Vec<_> = (0..connections)
-            .map(|_| std::net::TcpStream::connect(("127.0.0.1", port)).unwrap())
+            .map(|n| {
+                if paced {
+                    // Each kept connection is one live task.
+                    settle(&h, busy + n);
+                }
+                std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()
+            })
             .collect();
         d.wait();
         drop(streams);
@@ -231,9 +239,28 @@ fn connections_per_worker(
     counts
 }
 
+/// Waits until every worker is asleep and they have published `tasks` live
+/// tasks in all: then the figures a balanced listener decides by are exact.
+fn settle(handle: &giong::Handle, tasks: usize) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let pulses: Vec<_> = (0..handle.workers()).map(|i| handle.pulse(i)).collect();
+        if pulses.iter().all(|p| p.state == WorkerState::Parked)
+            && pulses.iter().map(|p| p.tasks).sum::<usize>() == tasks
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the workers did not settle at {tasks} tasks: {pulses:?}"
+        );
+        std::thread::sleep(Duration::from_micros(100));
+    }
+}
+
 #[test]
 fn a_busy_worker_hands_new_connections_to_an_idle_one() {
-    let counts = connections_per_worker(2, 20, 8, true);
+    let counts = connections_per_worker(2, 20, 8, true, false);
     assert_eq!(
         counts,
         vec![8, 0],
@@ -242,36 +269,38 @@ fn a_busy_worker_hands_new_connections_to_an_idle_one() {
 }
 
 #[test]
-fn balanced_listeners_keep_connection_counts_close() {
-    // A worker decides from hints that can be a moment old, and cannot see
-    // the connections the kernel has queued for another worker, so a run now
-    // and then ends a few apart. Over 300 runs on 4 vCPUs the spread
-    // (busiest minus quietest) was 3 or less in 97% of them and 6 at worst;
-    // plain SO_REUSEPORT listeners had a median of 5 and reached 12. In CI's
-    // 4-vCPU virtual machine with Linux 5.15 (epoll), whose vCPUs are
-    // scheduled less evenly, runs end 4 apart more often: [0, 2, 3, 3, 4, 4,
-    // 4, 4, 4] and [0, 2, 3, 4, 4, 4, 4, 4, 4]. So the test judges the mean
-    // spread, at most 4: those meet it, plain listeners average about 5.
-    //
-    // ThreadSanitizer slows the threads down unevenly, which makes the
-    // hints staler: there the test still runs every hand-over path, but
-    // does not judge the spread.
-    let judge = !cfg!(giong_tsan);
-    const RUNS: usize = 9;
-    let mut spreads: Vec<usize> = (0..RUNS)
-        .map(|_| {
-            let counts = connections_per_worker(4, 0, 24, true);
-            assert_eq!(counts.iter().sum::<usize>(), 24);
-            let spread = counts.iter().max().unwrap() - counts.iter().min().unwrap();
-            assert!(!judge || spread <= 8, "{counts:?}");
-            spread
-        })
-        .collect();
-    spreads.sort_unstable();
-    assert!(
-        !judge || spreads.iter().sum::<usize>() <= 4 * RUNS,
-        "mean spread too wide: {spreads:?}"
-    );
+fn with_exact_figures_connection_counts_stay_within_the_margin() {
+    // Connections one at a time, each once the workers have settled: the
+    // worker that accepts one keeps it unless it already has two more than
+    // the quietest (it is awake, which counts one, and hands over only when
+    // more than two busier). So no worker ever gets more than two ahead,
+    // however the kernel spreads the connections, on any machine: unlike
+    // the burst below, nothing here depends on timing.
+    for _ in 0..5 {
+        let counts = connections_per_worker(4, 0, 24, true, true);
+        assert_eq!(counts.iter().sum::<usize>(), 24);
+        let spread = counts.iter().max().unwrap() - counts.iter().min().unwrap();
+        assert!(spread <= 2, "{counts:?}");
+    }
+}
+
+#[test]
+fn a_burst_of_connections_is_shared_out() {
+    // All 24 connections at once, so that hand-overs race each other. How
+    // evenly they end up depends on how the machine schedules the workers'
+    // threads: a worker decides from figures that can be a moment old, and
+    // cannot see the connections the kernel has queued for another worker.
+    // Over 300 runs on 4 idle vCPUs the spread (busiest minus quietest) was
+    // 3 or less in 97% of them and 6 at worst; in CI's virtual machine with
+    // Linux 5.15, runs ended 4 apart more often; with four copies of this
+    // test running at once on 4 vCPUs, one reached 9. Plain SO_REUSEPORT
+    // listeners have a median of 5 and reach 12. So the spread is printed,
+    // not judged: the rule itself is checked with exact figures above.
+    for _ in 0..9 {
+        let counts = connections_per_worker(4, 0, 24, true, false);
+        assert_eq!(counts.iter().sum::<usize>(), 24, "{counts:?}");
+        println!("{counts:?}");
+    }
 }
 
 #[test]
@@ -280,8 +309,8 @@ fn print_reuseport_spread() {
     for _ in 0..10 {
         println!(
             "plain {:?}  balanced {:?}",
-            connections_per_worker(4, 0, 24, false),
-            connections_per_worker(4, 0, 24, true)
+            connections_per_worker(4, 0, 24, false, false),
+            connections_per_worker(4, 0, 24, true, false)
         );
     }
 }

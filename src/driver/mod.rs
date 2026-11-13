@@ -488,6 +488,15 @@ impl Driver {
         }
     }
 
+    /// Hands queued SQEs to the kernel now (see `Uring::submit_queued`).
+    #[cfg(giong_tsan)]
+    pub(crate) fn submit_queued(&mut self) {
+        match self {
+            Driver::Uring(d) => d.submit_queued(),
+            Driver::Epoll(_) => {}
+        }
+    }
+
     pub(crate) fn pool(&self) -> &Rc<BufPool> {
         match self {
             Driver::Uring(d) => d.pool(),

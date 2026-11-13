@@ -11,6 +11,8 @@ use giong::net::TcpListener;
 use giong::sync::mpsc;
 use giong::time::{sleep, timeout};
 
+mod common;
+
 #[test]
 fn every_worker_runs_its_main_future_on_its_own_thread() {
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -311,12 +313,7 @@ fn channel_delivers_across_workers_and_from_plain_threads() {
 fn reuseport_listeners_on_every_worker_serve_connections() {
     const WORKERS: usize = 3;
     const CLIENTS: usize = 60;
-    // Reserve a port.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let (_holder, port) = common::shared_port();
     let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
     let handle = rt.handle();
     let ready = Arc::new(AtomicUsize::new(0));

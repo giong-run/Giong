@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 use giong::error::{code, Code};
 use giong::net::{lookup_host, Resolver, ResolverConfig, TcpListener, TcpStream};
 
+mod common;
+
 const A: u16 = 1;
 const CNAME: u16 = 5;
 const AAAA: u16 = 28;
@@ -501,14 +503,8 @@ fn connect_does_not_wait_for_an_address_that_never_answers() {
 fn connect_reports_the_last_error_when_every_address_fails() {
     giong::block_on(async {
         // Two ports with nothing listening.
-        let closed: Vec<SocketAddr> = (0..2)
-            .map(|_| {
-                StdTcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap()
-            })
-            .collect();
+        let refusing = [common::refusing_addr(), common::refusing_addr()];
+        let closed: Vec<SocketAddr> = refusing.iter().map(|(_, addr)| *addr).collect();
         let err = TcpStream::connect(&closed[..]).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConnectionRefused, "{err}");
         let err = TcpStream::connect(&[][..] as &[SocketAddr])
