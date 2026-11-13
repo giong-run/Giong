@@ -1,0 +1,9 @@
+POST /api/items HTTP/1.1
+Host: t
+Content-Type: application/json
+Transfer-Encoding: chunked
+
+25
+{"name":"pen","n":3,"tags":["a","b"]}
+0
+

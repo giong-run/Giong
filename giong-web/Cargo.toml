@@ -1,0 +1,44 @@
+[package]
+name = "giong-web"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.80"
+description = "A router, middleware and JSON for HTTP services on the giong thread-per-core runtime"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+exclude = ["fuzz/"]
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://docs.rs/giong-web"
+keywords = ["web", "router", "http", "io-uring", "thread-per-core"]
+categories = ["web-programming::http-server", "network-programming", "asynchronous"]
+
+[features]
+# `Req::json`, `Req::query` and `giong_web::json`, through serde and serde_json.
+serde = ["dep:serde", "dep:serde_json"]
+# HTTPS: `Server::serve_tls`, re-exported from giong-http.
+tls = ["giong-http/tls"]
+
+[dependencies]
+giong = { path = "..", version = "0.3.0" }
+giong-http = { path = "../giong-http", version = "0.3.0" }
+# gzip for the Compression middleware. Already a dependency of giong-http's
+# client: the deflate implementation flate2 uses, in pure Rust.
+miniz_oxide = "0.9"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[dev-dependencies]
+giong-http = { path = "../giong-http", version = "0.3.0", features = ["client"] }
+miniz_oxide = "0.9"
+serde = { version = "1", features = ["derive"] }
+
+[[test]]
+name = "serde"
+required-features = ["serde"]
+
+[lints.rust]
+# Set by `cargo fuzz` (see fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[package.metadata.docs.rs]
+all-features = true

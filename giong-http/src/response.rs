@@ -1,6 +1,8 @@
 //! The response a handler returns, and its wire format.
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::fmt;
 use std::mem;
 
 use crate::parse::{is_field_value, is_token_str};
@@ -19,12 +21,23 @@ pub enum Body {
 }
 
 impl Body {
-    fn as_bytes(&self) -> &[u8] {
+    /// The bytes of the body.
+    pub fn as_bytes(&self) -> &[u8] {
         match self {
             Body::Empty => &[],
             Body::Static(bytes) => bytes,
             Body::Owned(bytes) => bytes,
         }
+    }
+
+    /// The length of the body in bytes.
+    pub fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    /// `true` if the body has no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The bytes as a buffer the kernel can send from, without a copy.
@@ -76,6 +89,18 @@ pub struct Response {
     /// Extra header lines, already in wire format.
     headers: Vec<u8>,
     body: Body,
+    extensions: Extensions,
+}
+
+/// Values attached to a response for the code around the handler; never
+/// sent.
+#[derive(Default)]
+struct Extensions(Vec<Box<dyn Any>>);
+
+impl fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} extension(s)", self.0.len())
+    }
 }
 
 impl Response {
@@ -94,6 +119,7 @@ impl Response {
             status,
             headers: Vec::new(),
             body: Body::Empty,
+            extensions: Extensions::default(),
         }
     }
 
@@ -151,6 +177,73 @@ impl Response {
         self.status
     }
 
+    /// The header fields added with [`header`](Self::header), in order.
+    /// Those the server manages (`Content-Length`, `Date`, ...) are not
+    /// among them.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        // Written by `header` only: a token, ": ", a value without CR or LF.
+        std::str::from_utf8(&self.headers)
+            .unwrap_or("")
+            .split_terminator("\r\n")
+            .filter_map(|line| line.split_once(": "))
+    }
+
+    /// The first value of the header field `name` (case-insensitive), as
+    /// added with [`header`](Self::header).
+    pub fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
+    }
+
+    /// Removes every header field named `name` (case-insensitive).
+    pub fn remove_header(mut self, name: &str) -> Self {
+        if self.get_header(name).is_none() {
+            return self;
+        }
+        let mut kept = Vec::with_capacity(self.headers.len());
+        for (n, value) in self.headers() {
+            if !n.eq_ignore_ascii_case(name) {
+                kept.extend_from_slice(n.as_bytes());
+                kept.extend_from_slice(b": ");
+                kept.extend_from_slice(value.as_bytes());
+                kept.extend_from_slice(b"\r\n");
+            }
+        }
+        self.headers = kept;
+        self
+    }
+
+    /// The body's bytes.
+    pub fn body_bytes(&self) -> &[u8] {
+        self.body.as_bytes()
+    }
+
+    /// Takes the body out, leaving the response without one.
+    pub fn take_body(&mut self) -> Body {
+        mem::take(&mut self.body)
+    }
+
+    /// Attaches `value`, replacing a value of the same type attached before.
+    ///
+    /// Extensions are never sent. They carry information from a handler to
+    /// the code that wraps it, such as the error a framework turned into
+    /// this response, for its access log to report.
+    pub fn with_extension<T: 'static>(mut self, value: T) -> Self {
+        let list = &mut self.extensions.0;
+        match list.iter_mut().find(|v| v.is::<T>()) {
+            Some(slot) => *slot = Box::new(value),
+            None => list.push(Box::new(value)),
+        }
+        self
+    }
+
+    /// The value of type `T` attached with
+    /// [`with_extension`](Self::with_extension), if any.
+    pub fn extension<T: 'static>(&self) -> Option<&T> {
+        self.extensions.0.iter().find_map(|v| v.downcast_ref())
+    }
+
     /// Appends the response in wire format to `out`.
     pub(crate) fn write_to(&self, out: &mut Vec<u8>, minor: u8, keep_alive: bool, head_only: bool) {
         let body = self.body.as_bytes();
@@ -173,10 +266,6 @@ impl Response {
 
     pub(crate) fn body_len(&self) -> usize {
         self.body.as_bytes().len()
-    }
-
-    pub(crate) fn take_body(&mut self) -> Body {
-        mem::take(&mut self.body)
     }
 
     /// Appends the status line and the header fields, up to and including the
@@ -221,6 +310,13 @@ fn push_number(out: &mut Vec<u8>, mut n: usize) {
         }
     }
     out.extend_from_slice(&digits[at..]);
+}
+
+/// The reason phrase for a status code, as the server sends it: `"Not Found"`
+/// for 404. Codes without a phrase of their own get their class's: `"Client
+/// Error"` for 499.
+pub fn reason_phrase(status: u16) -> &'static str {
+    reason(status)
 }
 
 pub(crate) fn reason(status: u16) -> &'static str {
@@ -321,6 +417,59 @@ mod tests {
             wire(&resp, 1, true, false),
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
         );
+    }
+
+    #[test]
+    fn headers_can_be_read_back_and_removed() {
+        let resp = Response::new(200)
+            .header("ETag", "\"v1\"")
+            .header("Vary", "Origin")
+            .header("vary", "Accept-Encoding")
+            .header("Content-Length", "5");
+        assert_eq!(resp.get_header("etag"), Some("\"v1\""));
+        assert_eq!(resp.get_header("VARY"), Some("Origin"));
+        assert_eq!(resp.get_header("Content-Length"), None);
+        let names: Vec<_> = resp.headers().collect();
+        assert_eq!(
+            names,
+            [
+                ("ETag", "\"v1\""),
+                ("Vary", "Origin"),
+                ("vary", "Accept-Encoding")
+            ]
+        );
+        let resp = resp.remove_header("Vary").remove_header("missing");
+        assert_eq!(resp.headers().collect::<Vec<_>>(), [("ETag", "\"v1\"")]);
+        assert_eq!(
+            wire(&resp, 1, true, false),
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nETag: \"v1\"\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn extensions_are_kept_by_type_and_never_sent() {
+        #[derive(Debug, PartialEq)]
+        struct Cause(&'static str);
+        let resp = Response::text("x")
+            .with_extension(Cause("first"))
+            .with_extension(7u32)
+            .with_extension(Cause("second"));
+        assert_eq!(resp.extension::<Cause>(), Some(&Cause("second")));
+        assert_eq!(resp.extension::<u32>(), Some(&7));
+        assert_eq!(resp.extension::<String>(), None);
+        assert!(!wire(&resp, 1, true, false).contains("second"));
+    }
+
+    #[test]
+    fn the_body_can_be_read_and_taken() {
+        let mut resp = Response::text("hello");
+        assert_eq!(resp.body_bytes(), b"hello");
+        let body = resp.take_body();
+        assert_eq!(
+            (body.as_bytes(), body.len(), body.is_empty()),
+            (&b"hello"[..], 5, false)
+        );
+        assert!(resp.body_bytes().is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ disagree, CONTRIBUTING.md wins: report the difference.
 ## What this is
 
 giong is a thread-per-core async runtime for Linux, built on io_uring. One Cargo
-workspace, six crates:
+workspace, seven crates:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -18,6 +18,7 @@ workspace, six crates:
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
 | `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
+| `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts) and JSON on giong-http |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.
@@ -79,8 +80,8 @@ Continuous integration requires five checks on every pull request: `lint` (fmt, 
 doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
 CI also runs `loom`, the `kernels` jobs and the database crates against other server
 versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
-`giong-postgres`, `giong-mysql`, `giong-redis`, each in its `fuzz/`) and runs the soak test
-every night.
+`giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, each in its `fuzz/`) and runs
+the soak test every night.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run; `scripts/check.sh fallback` does this for you.

@@ -547,7 +547,7 @@ T = dict(
         ("Old kernels", "Three ring setups, tried in order: `DEFER_TASKRUN` (6.1+), `COOP_TASKRUN` "
                         "(6.0), no flags. The fallbacks are tested on every change by forcing them."),
     ],
-    crates=("crates", "Six crates, one version number",
+    crates=("crates", "Seven crates, one version number",
             "The runtime, and the layers a service needs on top of it. Together they serve HTTPS "
             "at 144.8k requests/s on one core, against 81.0k for Axum on the same rustls."),
     crate=[
@@ -557,13 +557,13 @@ T = dict(
           "`TcpListener`, `TcpStream`, `UdpSocket`, `UnixListener`, `UnixStream`",
           "`fs::File` with `read_at` and `write_at`, `fs::read`, `read_dir`, `rename`",
           "`net::lookup_host` without blocking; `sync::mpsc`, `bounded`, `oneshot`; `spawn_on`"],
-         "about <b>8,800</b> lines · <b>188</b> tests"),
+         "about <b>8,800</b> lines · <b>194</b> tests"),
         ("giong-http", "A small, strict HTTP/1.1 server with one async handler, and a client.",
          ["Keep-alive, pipelining, bodies by `Content-Length` or chunked",
           "Limits on head and body size; timeouts for idle, slow and slow-reading clients",
           "Answers `400` to any request a proxy in front could read differently",
           "`Server::serve`, `serve_unix`, `serve_tls`; a pooled HTTPS `Client` behind `client`"],
-         "about <b>4,500</b> lines · <b>81</b> tests · the parser fuzzed every night"),
+         "about <b>4,500</b> lines · <b>109</b> tests · the parser fuzzed every night"),
         ("giong-tls", "TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
          ["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
           "`recv()` is cancel safe",
@@ -576,27 +576,34 @@ T = dict(
           "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
           "Every statement prepared once per connection and cached",
           "TLS verified by default for remote hosts; SCRAM-SHA-256"],
-         "about <b>5,400</b> lines · <b>76</b> tests · 2.6× deadpool's statements per core"),
+         "about <b>5,400</b> lines · <b>79</b> tests · 2.6× deadpool's statements per core"),
         ("giong-mysql", "A MySQL 8 client and pool, built the same way as giong-postgres.",
          ["`Client::connect`, `query`, `execute`, `transaction`",
           "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
           "Prepared statements on the binary protocol, cached per connection",
           "TLS; `caching_sha2_password` and `mysql_native_password`"],
-         "about <b>6,300</b> lines · <b>83</b> tests · 4.7× SQLx's statements per core"),
+         "about <b>6,300</b> lines · <b>88</b> tests · 4.7× SQLx's statements per core"),
         ("giong-redis", "A Redis client and pool on RESP3. The commands of every task pipeline "
                         "over one connection.",
          ["Typed commands, `query` for any other, `Pipeline` for a batch",
           "Transactions with `watch`; Pub/Sub",
           "A `Pool` per worker; `take()` for a connection of your own",
           "TLS; Redis 6 or newer (RESP3)"],
-         "about <b>5,200</b> lines · <b>67</b> tests · 1.4× redis-rs's `GET`s per core"),
+         "about <b>5,200</b> lines · <b>71</b> tests · 1.4× redis-rs's `GET`s per core"),
+        ("giong-web", "A router, middleware and JSON on giong-http. Handlers are plain "
+                      "`async fn`s; every error is a coded problem+json answer.",
+         ["`Router::new().get(\"/users/{id}\", user).nest(\"/api\", api).build(state)`",
+          "`req.param::<u64>(\"id\")?`, `req.query::<T>()?`, `req.json::<T>()?`",
+          "`RequestId`, `Logger` (JSON lines), `Cors`, `Compression` (gzip), `Timeout`",
+          "404, 405 with `Allow`, `OPTIONS` and `HEAD` answered for you; `App::handle` tests without a socket"],
+         "about <b>5,000</b> lines · <b>68</b> tests · both fuzzed every night"),
     ],
     verified=("verified", "What has been checked, and what has not",
               "A runtime that hands buffers to the kernel has to earn trust. This is the evidence "
               "so far, and the gaps in it."),
     checked_h="Checked", unchecked_h="Not checked, and you should know it",
     checked=[
-        "**529 tests** across the six crates, repeated in release mode on all three io_uring setups "
+        "**643 tests** across the seven crates, repeated in release mode on all three io_uring setups "
         "without a failure.",
         "**ThreadSanitizer** over the tests: no data race. **loom** model-checks the cross-thread "
         "wake-up; it found a lost wake-up, now fixed.",
@@ -1138,6 +1145,9 @@ def llms():
                        "pipeline over a few connections",
         "giong-redis": "a Redis client and per-worker pool: commands from every task pipeline "
                        "over one connection; pipelines, transactions, Pub/Sub",
+        "giong-web": "a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts) "
+                     "and JSON on giong-http; every error is problem+json with a `GIONG-E12xx` "
+                     "or your own code",
     }
     api = "".join(
         f"- [{name} API](https://docs.rs/{name}): {crates.get(name, 'API reference')}\n"
@@ -1162,6 +1172,9 @@ Facts that are easy to get wrong:
 - There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
 - An error giong raises starts with a code, such as `GIONG-E0102`, says how to fix it, and
   links to its page; `giong::error::code(&err)` returns the code to match on.
+- giong-web: build the `Router` inside each worker's future (`run(|_| async {{ .. }})`), since
+  an `App` is not `Send`. A handler is `async fn(Req<S>) -> Result<Response, Error>`; `?` on
+  any other error answers `500` and logs the cause, never sending it.
 - Install with `{ADD} giong` (and `giong-http`, `giong-tls`). Libraries need Rust 1.80.
 
 ## Docs

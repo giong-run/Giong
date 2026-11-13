@@ -1,0 +1,6 @@
+OPTIONS /api/items/7 HTTP/1.1
+Host: t
+Origin: https://app.example
+Access-Control-Request-Method: DELETE
+Access-Control-Request-Headers: content-type
+

@@ -1,0 +1,4 @@
+GET /users/42 HTTP/1.1
+Host: t
+Accept-Encoding: gzip
+

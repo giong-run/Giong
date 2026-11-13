@@ -18,8 +18,9 @@ then rose a giant: giong costs next to nothing while idle and uses every core th
 load arrives.
 
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
-> timers, multi-core, graceful shutdown, and five companion crates:
+> timers, multi-core, graceful shutdown, and six companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
+> [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
 > [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8)
@@ -208,6 +209,7 @@ let runtime = giong::Builder::new()
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | MySQL | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | Redis | [`giong-redis`](giong-redis/README.md): `Client`, `Pool`, `Config`, `cmd`, `Pipeline`, `PubSub` |
+| Web services | [`giong-web`](giong-web/README.md): `Router`, `App`, `Req`, `Error`, `Middleware`; `middleware::{RequestId, Logger, Cors, Compression, Timeout}`; `json` with `serde` |
 
 Five things to remember:
 
@@ -528,6 +530,21 @@ where about half of every client's core is time in the kernel, giong-redis does 
 redis-rs on one connection and the same on four. The crate's README has the full tables
 and how many connections to use.
 
+### Routing, JSON and middleware
+
+`bench/web.sh`: [`giong-web`](giong-web/README.md#performance) against axum 0.8 with the
+same serde handlers, each on one core, 50 connections. Medians of 5 rounds, requests per
+second:
+
+| Server | `/json` | `/users` (8 KB) | `/users/{id}` | With request ids, gzip, timeout: `/json` | `/users` |
+|---|---|---|---|---|---|
+| **giong-web** | **152.5k** | **28.0k** | **140.5k** | **126.2k** | **12.0k** |
+| axum | 118.3k | 15.2k | 107.1k | 65.8k (tower-http) | 5.2k |
+
+The router, parameters and serde cost giong-web about 5% against giong-http's bare handler
+on `/json` in the same run. `/compute` is the same for both within noise; its p99 is higher
+on giong-web (22.9 against 18.5 ms).
+
 ### File I/O
 
 `bench/fs.sh`: 200,000 operations per measurement, five rounds, all data in the page cache,
@@ -565,16 +582,17 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
   (August and March 2024); their main branches may differ.
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
-`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh` and
-`bench/http-client.sh`; two cores with
+`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
+`bench/http-client.sh` and `bench/web.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-529 tests across the six crates (`cargo test --workspace --all-features`), repeated in
+643 tests across the seven crates (`cargo test --workspace --all-features`), repeated in
 release mode on all three io_uring setups without a failure. The runtime's, HTTP's and
-TLS's main suites are below; the database clients describe theirs in their READMEs.
+TLS's main suites are below; the database clients and giong-web describe theirs in their
+READMEs.
 
 | Suite | What it checks |
 |---|---|
@@ -723,9 +741,10 @@ giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
 giong-postgres/ the PostgreSQL client crate (wire protocol, authentication, statement cache, Pool)
 giong-mysql/    the MySQL client crate (client/server protocol, authentication, statement cache, Pool)
 giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub, Pool)
+giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin
-bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, the programs compared against, results/
+bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, the programs compared against, results/
 scripts/        check.sh (repeated tests, fallback setups, ThreadSanitizer), valgrind.sh
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```

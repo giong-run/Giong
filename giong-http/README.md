@@ -37,6 +37,8 @@ fn main() -> std::io::Result<()> {
 - Limits on the size of the head (64 KiB) and the body (1 MiB); timeouts for idle connections (60 s), slow requests (30 s, against slowloris) and clients that read slowly (30 s). All of them can be changed on `Server`.
 - An optional cap on open connections (`Server::max_connections`): at the cap the server stops accepting, and new clients wait in the kernel's listen queue until a connection closes.
 - Handlers that keep a worker busy (heavy computation, long responses) leave the kernel's even spread of connections uneven. Bind each worker's listener with `giong::net::TcpListener::bind_balanced` instead of `bind` and a busy worker hands new connections to a quieter one; `Server::serve` takes either.
+- A handler is an `async fn(Request) -> Response`, a closure that returns a future (write its argument's type: `|req: Request| async move { .. }`), or a type of your own that implements `Handler` and borrows from itself while it answers. [`giong-web`](../giong-web/README.md) builds routing, middleware and JSON on it.
+- `Request::from_bytes` makes a request from its bytes and `Response::headers`, `get_header` and `body_bytes` read an answer back, so handlers are tested without a socket.
 - `Request::peer_addr` gives the client's address (`None` over a Unix socket).
 - Graceful shutdown: a request in progress is answered with `Connection: close`, an idle connection is closed at once.
 - HTTPS through the `tls` feature (see below).
@@ -137,7 +139,7 @@ Results are in `bench/results/http-client/`.
 
 ## Not there yet
 
-HTTP/2, streaming request bodies on the server (a body over the limit is refused, not passed on piece by piece), compression of responses, routing. In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2.
+HTTP/2, streaming request bodies on the server (a body over the limit is refused, not passed on piece by piece). Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2.
 
 ## Tests
 

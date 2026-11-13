@@ -173,6 +173,42 @@ impl Transport for giong_tls::TlsStream {
     }
 }
 
+/// What answers requests: an `async fn(Request) -> Response`, a closure
+/// returning a future, or a type of its own, such as a router.
+///
+/// Every function or closure `Fn(Request) -> impl Future<Output = Response>`
+/// is a handler already; implement the trait for a type that needs to borrow
+/// from itself while it answers.
+///
+/// ```
+/// use giong_http::{Handler, Request, Response};
+///
+/// struct Greeter {
+///     greeting: String,
+/// }
+///
+/// impl Handler for Greeter {
+///     async fn call(&self, req: Request) -> Response {
+///         Response::text(format!("{}, {}", self.greeting, req.path()))
+///     }
+/// }
+/// ```
+pub trait Handler: 'static {
+    /// Answers one request. The future may borrow from `self`; the server
+    /// keeps the handler alive until every connection using it has closed.
+    fn call(&self, req: Request) -> impl Future<Output = Response>;
+}
+
+impl<F, Fut> Handler for F
+where
+    F: Fn(Request) -> Fut + 'static,
+    Fut: Future<Output = Response>,
+{
+    fn call(&self, req: Request) -> impl Future<Output = Response> {
+        self(req)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Config {
     idle_timeout: Duration,
@@ -305,11 +341,7 @@ impl Server {
     /// `Connection: close`, within the grace period configured on the runtime.
     ///
     /// A handler that panics takes down its connection only.
-    pub async fn serve<H, Fut>(&self, listener: TcpListener, handler: H)
-    where
-        H: Fn(Request) -> Fut + 'static,
-        Fut: Future<Output = Response> + 'static,
-    {
+    pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
@@ -334,11 +366,7 @@ impl Server {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn serve_unix<H, Fut>(&self, listener: UnixListener, handler: H)
-    where
-        H: Fn(Request) -> Fut + 'static,
-        Fut: Future<Output = Response> + 'static,
-    {
+    pub async fn serve_unix<H: Handler>(&self, listener: UnixListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
@@ -367,15 +395,12 @@ impl Server {
     /// # }
     /// ```
     #[cfg(feature = "tls")]
-    pub async fn serve_tls<H, Fut>(
+    pub async fn serve_tls<H: Handler>(
         &self,
         listener: TcpListener,
         acceptor: giong_tls::TlsAcceptor,
         handler: H,
-    ) where
-        H: Fn(Request) -> Fut + 'static,
-        Fut: Future<Output = Response> + 'static,
-    {
+    ) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
@@ -426,11 +451,10 @@ impl Server {
 
     /// Serves a single, already established connection until it is closed.
     /// For servers that run their own accept loop or their own transport.
-    pub async fn serve_connection<T, H, Fut>(&self, stream: T, handler: Rc<H>)
+    pub async fn serve_connection<T, H>(&self, stream: T, handler: Rc<H>)
     where
         T: Transport,
-        H: Fn(Request) -> Fut + 'static,
-        Fut: Future<Output = Response> + 'static,
+        H: Handler,
     {
         Conn::new(stream, self.cfg).run(handler).await;
     }
@@ -543,11 +567,7 @@ impl<T: Transport> Conn<T> {
         }
     }
 
-    async fn run<H, Fut>(mut self, handler: Rc<H>)
-    where
-        H: Fn(Request) -> Fut + 'static,
-        Fut: Future<Output = Response> + 'static,
-    {
+    async fn run<H: Handler>(mut self, handler: Rc<H>) {
         loop {
             let req = match self.next_request().await {
                 Ok(req) => req,
@@ -568,7 +588,7 @@ impl<T: Transport> Conn<T> {
             // Poll the handler once before deciding what to do with responses
             // that are waiting: if it answers at once (the common case), they
             // all go out in one write; if it has to wait, they go out first.
-            let mut fut = pin!(handler(req));
+            let mut fut = pin!(handler.call(req));
             let first = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
             let resp = match first {
                 Poll::Ready(resp) => resp,

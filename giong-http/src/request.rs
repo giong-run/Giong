@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::parse::{header_lines, Head};
+use crate::chunked::{Decoder, Progress};
+use crate::parse::{find_head_end, header_lines, parse_head, Head};
 
 pub(crate) enum BodyBytes {
     /// A range of the connection buffer (`Content-Length` bodies: no copy).
@@ -29,6 +30,60 @@ pub struct Request {
 }
 
 impl Request {
+    /// Parses one complete request (head and body) from `raw`, as the server
+    /// would: for testing handlers without a socket.
+    ///
+    /// ```
+    /// use giong_http::Request;
+    ///
+    /// let req = Request::from_bytes(
+    ///     b"POST /items?draft=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
+    /// )
+    /// .unwrap();
+    /// assert_eq!((req.method(), req.path(), req.query()), ("POST", "/items", Some("draft=1")));
+    /// assert_eq!(req.body(), b"hello");
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The status the server would answer with (`400` for a malformed head,
+    /// a body shorter or longer than announced, or bytes after the request;
+    /// `501` for an unsupported transfer coding...).
+    pub fn from_bytes(raw: &[u8]) -> Result<Request, u16> {
+        let end = find_head_end(raw, 0).ok_or(400u16)?;
+        let head = parse_head(&raw[..end])?;
+        let (body, total) = if head.chunked {
+            let mut decoder = Decoder::new(usize::MAX);
+            match decoder.feed(&raw[end..])? {
+                Progress::Done(used) => (BodyBytes::Decoded(decoder.body), end + used),
+                Progress::NeedMore => return Err(400),
+            }
+        } else {
+            let len = usize::try_from(head.content_length.unwrap_or(0)).map_err(|_| 413u16)?;
+            if raw.len() - end < len {
+                return Err(400);
+            }
+            (BodyBytes::InBuffer(end..end + len), end + len)
+        };
+        if total != raw.len() {
+            return Err(400);
+        }
+        Ok(Request {
+            buf: Rc::new(raw.to_vec()),
+            start: 0,
+            head,
+            body,
+            peer: None,
+        })
+    }
+
+    /// The same request, seen as coming from `addr`: for tests of code that
+    /// reads [`peer_addr`](Self::peer_addr).
+    pub fn with_peer_addr(mut self, addr: SocketAddr) -> Self {
+        self.peer = Some(addr);
+        self
+    }
+
     fn head_bytes(&self) -> &[u8] {
         &self.buf[self.start..self.start + self.head.len]
     }
@@ -118,5 +173,48 @@ impl fmt::Debug for Request {
             .field("peer_addr", &self.peer)
             .field("body_len", &self.body().len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_bytes_parses_heads_and_both_kinds_of_body() {
+        let req =
+            Request::from_bytes(b"GET /a/b?x=1 HTTP/1.1\r\nHost: h\r\nX-Id: 7\r\n\r\n").unwrap();
+        assert_eq!(
+            (req.method(), req.path(), req.query()),
+            ("GET", "/a/b", Some("x=1"))
+        );
+        assert_eq!(req.header_str("x-id"), Some("7"));
+        assert!(req.body().is_empty() && req.peer_addr().is_none());
+
+        let chunked = b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        assert_eq!(Request::from_bytes(chunked).unwrap().body(), b"abcde");
+
+        let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let req = Request::from_bytes(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        assert_eq!(req.with_peer_addr(addr).peer_addr(), Some(addr));
+    }
+
+    #[test]
+    fn from_bytes_refuses_what_the_server_refuses() {
+        let cases: [&[u8]; 5] = [
+            b"GET / HTTP/1.1\r\nHost: h\r\n",
+            b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nabc",
+            b"GET / HTTP/1.1\r\nHost: h\r\n\r\nextra",
+            b"GET / HTTP/1.1\r\nHost : h\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab",
+        ];
+        for raw in cases {
+            assert_eq!(
+                Request::from_bytes(raw).err(),
+                Some(400),
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 }
