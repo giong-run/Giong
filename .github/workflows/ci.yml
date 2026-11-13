@@ -102,11 +102,12 @@ jobs:
           echo "GIONG_PG_BIN=/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_ENV"
       - name: Install MySQL ${{ matrix.mysql }}
         if: matrix.mysql
-        # Oracle's generic Linux build. It links libaio.so.1, which Ubuntu
-        # 24.04 renamed libaio.so.1t64.
+        # Oracle's generic Linux build, the minimal one (no debug binaries or
+        # test suite, about 60 MB), which Oracle makes for glibc 2.17 only. It
+        # links libaio.so.1, which Ubuntu 24.04 renamed libaio.so.1t64.
         run: |
           v=${{ matrix.mysql }}
-          name=mysql-$v-linux-glibc2.28-x86_64-minimal
+          name=mysql-$v-linux-glibc2.17-x86_64-minimal
           curl -fsSL --retry 3 "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz" \
             | tar -xJ -C "$RUNNER_TEMP"
           sudo apt-get update -q
