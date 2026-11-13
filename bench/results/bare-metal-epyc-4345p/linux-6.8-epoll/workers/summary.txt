@@ -1,0 +1,31 @@
+workers server         req/s median      min      max  eff. cpu us/req  p99 ms server cpu load cpu  limited by
+1       giong                516324   499590   524521  1.00       1.94    0.25        97%   remote  server
+1       giong-http           423921   412574   429435  1.00       2.36    0.26        97%   remote  server
+1       monoio-tuned         546538   543861   548207  1.00       1.83    0.25        97%   remote  server
+1       tokio-raw            546420   537033   547488  1.00       1.83    0.24        97%   remote  server
+1       glommio              467923   460403   477503  1.00       2.14    0.25        97%   remote  server
+
+2       giong                956160   942409   985526  0.93       2.09    0.26        97%   remote  server
+2       giong-http           806266   798416   811757  0.95       2.48    0.26        97%   remote  server
+2       monoio-tuned        1014383   995764  1016126  0.93       1.97    0.25        97%   remote  server
+2       tokio-raw            934594   877569   952709  0.86       2.01    0.26        93%   remote  server
+2       glommio              852681   851958   887329  0.91       2.34    0.26        97%   remote  server
+
+4       giong               1720751  1703102  1765009  0.83       2.33    0.26        97%   remote  server
+4       giong-http          1467915  1447566  1491508  0.87       2.72    0.26        97%   remote  server
+4       monoio-tuned        1803698  1779579  1841160  0.83       2.22    0.26        97%   remote  server
+4       tokio-raw           1658326  1633617  1669777  0.76       2.24    0.27        91%   remote  server
+4       glommio             1550605  1537097  1556360  0.83       2.58    0.25        97%   remote  server
+
+8       giong               2836941  2813220  2843152  0.69       2.82    0.27        97%   remote  server
+8       giong-http          2458242  2429084  2463841  0.72       3.26    0.31        97%   remote  server
+8       monoio-tuned        2970492  2950667  2978588  0.68       2.69    0.27        97%   remote  server
+8       tokio-raw           2638885  2614054  2654776  0.60       2.61    0.34        87%   remote  neither (network or latency)
+8       glommio             2582112  2571406  2595038  0.69       3.10    0.28        97%   remote  server
+
+16      giong               3286400  3251699  3299369  0.40       4.23    0.39        91%   remote  server
+16      giong-http          3078045  3059858  3089833  0.45       5.19    0.50        97%   remote  server
+16      monoio-tuned        3275310  3255362  3289018  0.37       4.01    0.40        88%   remote  neither (network or latency)
+16      tokio-raw           3060979  3044328  3083168  0.35       3.61    0.61        76%   remote  neither (network or latency)
+16      glommio             3250623  3237213  3267563  0.43       4.93    0.48        97%   remote  server
+

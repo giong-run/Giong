@@ -1,0 +1,45 @@
+Bare metal, Linux 7.0, giong on io_uring: run on 2026-11-13 (17:57 to 19:11 UTC)
+
+The same two machines, code, tools and commands as ../linux-6.8-epoll/ (that file has
+the hardware, the network and the method), after installing Ubuntu's HWE kernel on
+both machines and rebooting them. On this kernel giong and giong-http run on io_uring:
+their benchmark servers had an io_uring file descriptor and no epoll one, and a run
+with GIONG_DRIVER=io_uring, which refuses the epoll fallback, started normally.
+
+Code: giong 2fd8ff2 (main after #46, before #52).
+Kernel: 7.0.0-43-generic (Ubuntu package linux-generic-hwe-24.04) on both machines.
+CPU settings: Linux 7.0 started with the energy-performance preference at
+  balance_performance; it was set to performance on every CPU of both machines before
+  the run, as it was under 6.8. Boost and SMT on, as before.
+Network: iperf3 over the private network after the reboot: 23.5 Gb/s with one stream
+  and with eight.
+Check before measuring: `cargo test --workspace --all-features` passed on br-1
+  (706 tests, 5 ignored), and tests/net.rs and tests/cancel.rs passed again with
+  GIONG_DRIVER=io_uring.
+
+workers/: server on br-1, wrk on br-2 over the private network, with the same wrk
+wrapper as under 6.8. workers/load-cpu.csv has how busy br-2's 16 CPUs were during
+every measurement. Medians:
+
+  workers   giong   giong-http   monoio-tuned   tokio-raw   glommio
+  1           14%          13%           14%         14%       13%
+  2           27%          24%           26%         25%       23%
+  4           45%          39%           43%         40%       38%
+  8           81%          78%           80%         69%       71%
+  16          81%          79%           82%         75%       71%
+
+Things that affect how to read the numbers:
+- From 1 to 4 workers the server's cores are saturated (92 to 97% busy) and the load
+  generator is not: those rows measure the servers. At 8 workers the servers are 78
+  to 96% busy and the load generator 69 to 81%.
+- At 16 workers every server levels off at 2.28M to 2.53M requests/s with neither
+  side saturated (server CPUs 52 to 94% busy, load generator 71 to 82%), and the
+  median p99 goes above 100 ms for four of the five servers (Tokio stays at 1.7 ms).
+  Under 6.8 the same servers reached 3.06M to 3.29M at 16 workers. 16 workers also
+  share cores (SMT siblings), as before.
+- Compared with the 6.8 run, every server is slower from 4 workers on, Tokio included,
+  which does not use io_uring (tokio-raw at 4 workers: 1.36M here, 1.66M under 6.8),
+  and the CPU time per request is higher. Since it hits epoll and io_uring servers
+  alike, it comes from the kernel or the network driver rather than the runtimes. It
+  was not investigated. Compare runtimes within one run, not across the two runs.
+- run/, scale/, tls/ and fs/ ran on br-1 alone over loopback, as under 6.8.
