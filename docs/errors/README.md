@@ -21,8 +21,9 @@ fn on_error(err: &std::io::Error) {
 }
 ```
 
-giong-http, giong-web, giong-tls, giong-postgres, giong-mysql and giong-redis use the same
-codes. A code is never reused or renumbered, and its page stays when it is no longer raised.
+giong-http, giong-web, giong-tls, giong-postgres, giong-mysql, giong-redis, giong-mcp and
+giong-compat use the same codes. A code is never reused or renumbered, and its page stays
+when it is no longer raised.
 
 ## The runtime
 
@@ -100,6 +101,14 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 |---|---|---|
 | [GIONG-E1301](E1301.md) | `McpNotLocal` | the MCP server listens on this machine only |
 | [GIONG-E1302](E1302.md) | `McpBadAddress` | invalid address for the MCP server |
+
+## giong-compat
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E1401](E1401.md) | `CompatWriteFailed` | an earlier buffered write failed |
+| [GIONG-E1402](E1402.md) | `CompatShutDown` | write after shutdown |
+| [GIONG-E1403](E1403.md) | `CompatConfig` | invalid giong-compat setting |
 
 ## giong-tls
 

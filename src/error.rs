@@ -29,7 +29,7 @@
 //! ```
 //!
 //! The companion crates (giong-http, giong-web, giong-tls, giong-postgres,
-//! giong-mysql, giong-redis) use the same codes, so one `match` covers them
+//! giong-mysql, giong-redis, giong-mcp, giong-compat) use the same codes, so one `match` covers them
 //! all. Codes are never reused or renumbered; a code that is no longer raised
 //! keeps its page.
 
@@ -47,8 +47,8 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
-        /// giong-http, `E12xx` giong-web, `E13xx` giong-mcp, `E2xxx`
-        /// giong-tls, `E30xx` giong-postgres, `E31xx` giong-mysql and `E32xx`
+        /// giong-http, `E12xx` giong-web, `E13xx` giong-mcp, `E14xx`
+        /// giong-compat, `E2xxx` giong-tls, `E30xx` giong-postgres, `E31xx` giong-mysql and `E32xx`
         /// giong-redis. Each
         /// has a page under `docs/errors/` in the repository;
         /// [`url`](Code::url) links to it.
@@ -238,6 +238,18 @@ codes! {
     McpNotLocal = 1301, PermissionDenied, "the MCP server listens on this machine only";
     /// The address given to the MCP server, or `GIONG_MCP`, is not one.
     McpBadAddress = 1302, InvalidInput, "invalid address for the MCP server";
+
+    // ------------------------------------------------------ giong-compat
+    /// A write that giong-compat's `Compat` had buffered failed earlier, so
+    /// the stream cannot be written any more. The first call after the
+    /// failure returned the kernel's own error; later ones return this.
+    CompatWriteFailed = 1401, BrokenPipe, "an earlier buffered write failed";
+    /// A write was attempted on a `Compat` stream after its sending
+    /// direction was shut down (`poll_shutdown`, `poll_close`).
+    CompatShutDown = 1402, BrokenPipe, "write after shutdown";
+    /// A `Compat` setting is out of range. It panics with this code, since
+    /// the value is a bug in the program.
+    CompatConfig = 1403, InvalidInput, "invalid giong-compat setting";
 
     // --------------------------------------------------------- giong-tls
     /// No trusted certificate authority: none installed on the machine, or

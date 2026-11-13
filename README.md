@@ -18,15 +18,17 @@ then rose a giant: giong costs next to nothing while idle and uses every core th
 load arrives.
 
 > **Status: 0.4.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
-> timers, multi-core, graceful shutdown, and seven companion crates:
+> timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
 > [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8),
-> [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool)
-> and [`giong-mcp`](giong-mcp/README.md) (an MCP server that lets AI agents look inside a
-> running service).
+> [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool),
+> [`giong-mcp`](giong-mcp/README.md) (an MCP server that lets AI agents look inside a
+> running service)
+> and [`giong-compat`](giong-compat/README.md) (the Tokio and futures-io I/O traits for
+> giong's streams, so crates such as h2, tokio-rustls and tokio-tungstenite run on giong).
 > The tests pass on three io_uring setups, on the epoll driver, inside Docker's default
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
@@ -220,6 +222,7 @@ let runtime = giong::Builder::new()
 | MySQL | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | Redis | [`giong-redis`](giong-redis/README.md): `Client`, `Pool`, `Config`, `cmd`, `Pipeline`, `PubSub` |
 | Web services | [`giong-web`](giong-web/README.md): `Router`, `App`, `Req`, `Error`, `Middleware`; `middleware::{RequestId, Logger, Cors, Compression, Timeout}`; `json` with `serde` |
+| Tokio-ecosystem crates | [`giong-compat`](giong-compat/README.md): `Compat::new(stream)` implements `AsyncRead`, `AsyncWrite` and `AsyncBufRead` from `tokio::io` and `futures_io` for `TcpStream`, `UnixStream` and `TlsStream`, for crates that take a stream and are driven by you (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`, tokio-util's codecs) |
 | Looking inside | `Handle::pulse(worker)` (counters and the task being polled, from any thread), `observe::snapshot()` (live tasks by the line that spawned them, timers, I/O, pools), `Handle::set_profiling` and `observe::take_profile()`; [`giong-mcp`](giong-mcp/README.md) serves them to AI agents over MCP |
 
 Five things to remember:
@@ -701,17 +704,17 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
 `bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
-`bench/http-client.sh`, `bench/web.sh` and `bench/memory.sh`; two cores with
+`bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh` and `bench/compat.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-720 tests across the eight crates and the example API (`cargo test --workspace
+749 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
-database clients, giong-web, giong-mcp and the example API describe theirs in their
-READMEs.
+database clients, giong-web, giong-mcp, giong-compat and the example API describe theirs
+in their READMEs.
 
 | Suite | What it checks |
 |---|---|
@@ -824,11 +827,14 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   before it calls the handler; one over the limit is refused.
 - **`giong-tls` has no kTLS yet,** and no independent audit (see the
   [self-review](docs/reviews/2026-11-giong-tls.md)).
-- **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,
-  sqlx, reqwest) do not run on giong. Crates that only use `std::future` do. For
-  PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for MySQL,
-  [`giong-mysql`](giong-mysql/README.md); for Redis, [`giong-redis`](giong-redis/README.md);
-  for HTTP requests, `giong-http`'s client.
+- **The Tokio ecosystem only through I/O traits.** Crates that are generic over the
+  stream and driven by you (h2, tokio-rustls, tokio-tungstenite, hyper's connection API,
+  tokio-util's codecs) run on giong through [`giong-compat`](giong-compat/README.md), at
+  the cost of a copy. Crates that need the Tokio runtime itself (its reactor, timers or
+  `tokio::spawn`, as in sqlx, reqwest or tonic's `transport`) do not. Crates that only use
+  `std::future` do. For PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for
+  MySQL, [`giong-mysql`](giong-mysql/README.md); for Redis,
+  [`giong-redis`](giong-redis/README.md); for HTTP requests, `giong-http`'s client.
 - **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
   `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
   `TcpListener::bind_balanced` hand new connections to less busy workers. A connection
@@ -876,9 +882,10 @@ giong-mysql/    the MySQL client crate (client/server protocol, authentication, 
 giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub, Pool)
 giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
 giong-mcp/      the MCP server for agents: Streamable HTTP, tools over giong::observe
+giong-compat/   Compat: the Tokio and futures-io I/O traits for giong's streams
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs; rest-api/, a complete REST API (PostgreSQL, a Redis cache, HTTPS)
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, ...
-bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, rest-api.sh, the programs compared against, results/
+bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, rest-api.sh, compat.sh, the programs compared against, results/
 scripts/        check.sh (repeated tests, fallback setups, epoll, seccomp, ThreadSanitizer), kernels.sh, no-io-uring.py, valgrind.sh
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```
