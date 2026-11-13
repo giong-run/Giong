@@ -36,8 +36,8 @@
 //!   a connection, connecting, sending, and reading the whole response,
 //!   redirects included; connecting has its own (10 s).
 //! * Redirects (301, 302, 303, 307, 308) are followed, up to 10. A redirect
-//!   from HTTPS to HTTP is refused, and `Authorization` and `Cookie` headers
-//!   are not sent to another origin.
+//!   from HTTPS to HTTP is refused, and `Authorization`, `Cookie` and a
+//!   `Host` set by hand are not sent to another origin.
 //! * Responses with `Content-Length`, chunked, or ending with the
 //!   connection; 1xx responses are skipped. The whole body is read, up to
 //!   [`max_response_size`](ClientBuilder::max_response_size) (16 MiB by
@@ -60,12 +60,12 @@ mod pool;
 mod proxy;
 mod url;
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use giong_tls::TlsConnector;
 
@@ -188,6 +188,10 @@ const MANAGED_HEADERS: &[&str] = &[
 /// Headers that carry credentials, which are not sent to another origin
 /// after a redirect.
 const CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
+
+/// How often, at most, the idle connections of every origin are looked at,
+/// so that those of an origin no longer asked for are closed too.
+const SWEEP_EVERY: Duration = Duration::from_secs(1);
 
 /// Settings for a [`Client`]. Every limit is finite by default.
 #[derive(Clone, Debug)]
@@ -320,6 +324,7 @@ impl ClientBuilder {
                 tls: OnceCell::new(),
                 config: self,
                 hosts: RefCell::new(HashMap::new()),
+                swept: Cell::new(Instant::now()),
             }),
         }
     }
@@ -337,6 +342,8 @@ struct Shared {
     config: ClientBuilder,
     tls: OnceCell<Result<TlsConnector, Error>>,
     hosts: RefCell<HashMap<Route, pool::Shared>>,
+    /// When the idle connections of every route were last looked at.
+    swept: Cell<Instant>,
 }
 
 /// A connection taken from the pool for one request. Dropped without
@@ -500,12 +507,33 @@ impl Client {
     }
 
     fn host(&self, route: &Route) -> pool::Shared {
+        self.sweep();
         let mut hosts = self.shared.hosts.borrow_mut();
         // Looked up first so that the route is only copied the first time.
         if let Some(pool) = hosts.get(route) {
             return pool.clone();
         }
         hosts.entry(route.clone()).or_default().clone()
+    }
+
+    /// Closes the connections of every route (an origin, directly or
+    /// through a proxy) that have been idle for the idle timeout, and
+    /// forgets the routes left with none. A route's own requests close its
+    /// expired connections as they go; this catches those of routes that are
+    /// not asked for again, which would otherwise stay open, along with their
+    /// entries, for as long as the client lives.
+    fn sweep(&self) {
+        let shared = &self.shared;
+        let idle_timeout = shared.config.idle_timeout;
+        if shared.swept.get().elapsed() < SWEEP_EVERY.min(idle_timeout) {
+            return;
+        }
+        shared.swept.set(Instant::now());
+        // A route some request still holds is kept, even when empty.
+        shared
+            .hosts
+            .borrow_mut()
+            .retain(|_, pool| !pool::sweep(pool, idle_timeout) || Rc::strong_count(pool) > 1);
     }
 
     /// A connection on `route`: an idle one unless `fresh`, otherwise a
@@ -666,8 +694,12 @@ impl Client {
                 headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-type"));
             }
             if next.origin() != url.origin() {
-                headers
-                    .retain(|(n, _)| !CREDENTIAL_HEADERS.iter().any(|c| n.eq_ignore_ascii_case(c)));
+                // A Host set for the first origin would name the wrong one
+                // to the next: it gets its own.
+                headers.retain(|(n, _)| {
+                    !n.eq_ignore_ascii_case("host")
+                        && !CREDENTIAL_HEADERS.iter().any(|c| n.eq_ignore_ascii_case(c))
+                });
             }
             // The redirect's own body is read and dropped, so that its
             // connection can serve the next request.

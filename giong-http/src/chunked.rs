@@ -3,6 +3,13 @@
 /// Longest accepted chunk-size line or trailer line.
 const MAX_LINE: usize = 4096;
 
+/// The chunk extensions one body may carry in all, in bytes. They are read
+/// and thrown away, and count toward no other limit, so without this budget
+/// `1;<4 KiB>\r\nX\r\n`, repeated, would make a peer send (and the server
+/// or client hold) about 4,000 bytes per byte of body. 16 KiB, as in hyper
+/// and Node.js (CVE-2024-22019).
+const MAX_EXTENSIONS: usize = 16 * 1024;
+
 #[derive(Debug)]
 enum State {
     /// Reading a `size[;ext]\r\n` line.
@@ -30,6 +37,7 @@ pub(crate) struct Decoder {
     /// Encoded bytes consumed so far.
     pos: usize,
     trailer_bytes: usize,
+    extension_bytes: usize,
     pub(crate) body: Vec<u8>,
     max: usize,
 }
@@ -40,6 +48,7 @@ impl Decoder {
             state: State::Size,
             pos: 0,
             trailer_bytes: 0,
+            extension_bytes: 0,
             body: Vec::new(),
             max,
         }
@@ -76,8 +85,13 @@ impl Decoder {
                     if hex.is_empty() || hex.len() > 16 || !hex.iter().all(u8::is_ascii_hexdigit) {
                         return Err(400);
                     }
-                    // Chunk extensions are ignored, but must not hide controls.
+                    // Chunk extensions are ignored, but must not hide controls,
+                    // and must not outweigh the body.
                     if !crate::parse::is_field_value(&line[digits..]) {
+                        return Err(400);
+                    }
+                    self.extension_bytes += line.len() - digits;
+                    if self.extension_bytes > MAX_EXTENSIONS {
                         return Err(400);
                     }
                     let size = hex.iter().fold(0u64, |acc, &b| {
@@ -217,5 +231,27 @@ mod tests {
             trailers.extend_from_slice(b"X-Trailer: aaaaaaaaaaaaaaaa\r\n");
         }
         assert_eq!(decode(&trailers, 1 << 20), Err(400));
+    }
+
+    #[test]
+    fn chunk_extensions_have_a_budget_for_the_whole_body() {
+        // One byte of body per 4 KiB line of extensions: refused once the
+        // extensions pass 16 KiB in all, long before the body limit.
+        let ext = format!(";{}", "e".repeat(MAX_LINE - 8));
+        let mut input = Vec::new();
+        for _ in 0..(MAX_EXTENSIONS / ext.len()) {
+            input.extend_from_slice(format!("1{ext}\r\nx\r\n").as_bytes());
+        }
+        let mut within = input.clone();
+        within.extend_from_slice(b"0\r\n\r\n");
+        let (body, _) = decode(&within, 1 << 20).unwrap();
+        assert_eq!(body.len(), MAX_EXTENSIONS / ext.len());
+
+        input.extend_from_slice(format!("1{ext}\r\nx\r\n0\r\n\r\n").as_bytes());
+        assert_eq!(decode(&input, 1 << 20), Err(400));
+        // The last chunk's extensions count too.
+        let mut last = within[..within.len() - 5].to_vec();
+        last.extend_from_slice(format!("0{ext}\r\n\r\n").as_bytes());
+        assert_eq!(decode(&last, 1 << 20), Err(400));
     }
 }

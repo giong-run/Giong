@@ -28,6 +28,8 @@ const SEPARATE_BODY_AT: usize = 32 * 1024;
 /// After an error response, how long the connection keeps discarding input so
 /// that the client can read the response instead of getting a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
+/// Blank lines before a request that still count as an idle connection.
+const IDLE_BLANK_LINES: usize = 2;
 
 thread_local! {
     /// Buffers recycled between the connections of one worker. A connection
@@ -606,11 +608,13 @@ impl<T: Transport> Conn<T> {
 
     /// Receives and parses the next request, body included.
     async fn next_request(&mut self) -> Result<Request, End> {
+        let mut blank_lines = 0;
         let head = loop {
             // Empty lines before a request line are ignored (RFC 9112 §2.2).
             while self.buf[self.pos..].starts_with(b"\r\n") {
                 self.pos += 2;
                 self.scanned = 0;
+                blank_lines += 1;
             }
             let data = &self.buf[self.pos..];
             if let Some(end) = find_head_end(data, self.scanned) {
@@ -624,7 +628,11 @@ impl<T: Transport> Conn<T> {
             }
             // The terminator may straddle the next read.
             self.scanned = data.len().saturating_sub(3);
-            let idle = data.is_empty();
+            // A client may end a body with a stray CRLF and then go quiet, so
+            // a blank line or two still leave the connection idle. More start
+            // the request timeout: otherwise a CRLF every minute would hold
+            // the connection open for ever.
+            let idle = data.is_empty() && blank_lines <= IDLE_BLANK_LINES;
             self.read_more(idle).await?;
         };
 

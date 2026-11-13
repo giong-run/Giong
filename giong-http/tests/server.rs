@@ -532,6 +532,41 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
 }
 
 #[test]
+fn blank_lines_do_not_keep_a_connection_idle_for_ever() {
+    let server = TestServer::start(
+        Server::new()
+            .request_timeout(Duration::from_millis(300))
+            .idle_timeout(Duration::from_secs(30)),
+        echo,
+    );
+
+    // A CRLF every 50 ms never lets the idle timeout run out; only the
+    // request timeout can end it.
+    let mut c = server.client();
+    let start = Instant::now();
+    for _ in 0..200 {
+        if c.stream.write_all(b"\r\n").is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        if start.elapsed() > Duration::from_secs(2) {
+            break;
+        }
+    }
+    assert_eq!(c.reply().status, 408);
+    assert!(start.elapsed() < Duration::from_secs(5));
+
+    // A stray CRLF after a body, as some clients send, leaves the
+    // connection idle and usable.
+    let mut c = server.client();
+    c.send("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nhi\r\n");
+    assert_eq!(c.reply().status, 200);
+    std::thread::sleep(Duration::from_millis(600));
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(c.reply().status, 200);
+}
+
+#[test]
 fn expect_continue_is_answered_before_the_body() {
     let server = default_server();
     let mut c = server.client();
