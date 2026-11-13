@@ -105,6 +105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "giong-mcp"
+version = "0.3.0"
+dependencies = [
+ "giong",
+ "giong-http",
+ "serde_json",
+]
+
+[[package]]
 name = "giong-mysql"
 version = "0.3.0"
 dependencies = [

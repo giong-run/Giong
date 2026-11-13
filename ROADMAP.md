@@ -204,8 +204,12 @@ a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
       Benchmarked against axum (`bench/web.sh`).
 - [ ] Structured logs as JSON lines, and an optional `tracing` feature. The JSON lines
       are done (`giong_web::middleware::Logger`); `tracing` is not.
-- [ ] `giong-mcp`, a new crate: the MCP server described under
-      [Agent-first](#agent-first).
+- [x] `giong-mcp`, a new crate: the MCP server described under
+      [Agent-first](#agent-first). Read-only, on loopback or a Unix socket, started by
+      `GIONG_MCP`; tools `overview`, `workers`, `tasks`, `sources` and `profile`, served
+      from `giong::observe` (per-worker counters, tasks named by the line that spawned
+      them, poll profiles, pools as sources). It names the task a blocked worker is stuck
+      in.
 
 **Exit criteria:** a complete example REST API (CRUD on Postgres, a Redis cache, HTTPS) in
 the repository, and a benchmark of it against the same API on axum.

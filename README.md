@@ -18,13 +18,15 @@ then rose a giant: giong costs next to nothing while idle and uses every core th
 load arrives.
 
 > **Status: 0.2.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
-> timers, multi-core, graceful shutdown, and six companion crates:
+> timers, multi-core, graceful shutdown, and seven companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
-> [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8)
-> and [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool).
+> [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8),
+> [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool)
+> and [`giong-mcp`](giong-mcp/README.md) (an MCP server that lets AI agents look inside a
+> running service).
 > The tests pass on three io_uring setups, on the epoll driver, inside Docker's default
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
@@ -215,6 +217,7 @@ let runtime = giong::Builder::new()
 | MySQL | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | Redis | [`giong-redis`](giong-redis/README.md): `Client`, `Pool`, `Config`, `cmd`, `Pipeline`, `PubSub` |
 | Web services | [`giong-web`](giong-web/README.md): `Router`, `App`, `Req`, `Error`, `Middleware`; `middleware::{RequestId, Logger, Cors, Compression, Timeout}`; `json` with `serde` |
+| Looking inside | `Handle::pulse(worker)` (counters and the task being polled, from any thread), `observe::snapshot()` (live tasks by the line that spawned them, timers, I/O, pools), `Handle::set_profiling` and `observe::take_profile()`; [`giong-mcp`](giong-mcp/README.md) serves them to AI agents over MCP |
 
 Five things to remember:
 
@@ -651,10 +654,10 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-652 tests across the seven crates (`cargo test --workspace --all-features`), run in
+678 tests across the eight crates (`cargo test --workspace --all-features`), run in
 release mode on all three io_uring setups and on the epoll driver without a failure. The runtime's, HTTP's and
-TLS's main suites are below; the database clients and giong-web describe theirs in their
-READMEs.
+TLS's main suites are below; the database clients, giong-web and giong-mcp describe theirs in
+their READMEs.
 
 | Suite | What it checks |
 |---|---|
@@ -669,6 +672,7 @@ READMEs.
 | `tests/shutdown.rs` (9) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
 | `tests/driver.rs` (6), `tests/blocked.rs` (2) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run |
+| `tests/observe.rs` (8) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time; poll profiles by spawn location; sources reported until dropped |
 | `giong-http` (81) | 16 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies); 28 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 19 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 11 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
 | `giong-tls` (34) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
@@ -810,12 +814,14 @@ src/
   fs.rs         File, OpenOptions, Metadata, the path operations
   time.rs       timing wheel, sleep, timeout
   sync.rs       mpsc channel
+  observe.rs    pulses, snapshots, profiles and sources, for diagnostics and giong-mcp
 giong-http/     the HTTP/1.1 crate: the server (parser, chunked decoding, connections, HTTPS behind `tls`), the client behind `client`
 giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
 giong-postgres/ the PostgreSQL client crate (wire protocol, authentication, statement cache, Pool)
 giong-mysql/    the MySQL client crate (client/server protocol, authentication, statement cache, Pool)
 giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub, Pool)
 giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
+giong-mcp/      the MCP server for agents: Streamable HTTP, tools over giong::observe
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, ...
 bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, the programs compared against, results/

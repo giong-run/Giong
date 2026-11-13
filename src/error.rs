@@ -47,8 +47,9 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
-        /// giong-http's client, `E12xx` giong-web, `E2xxx` giong-tls, `E30xx`
-        /// giong-postgres, `E31xx` giong-mysql and `E32xx` giong-redis. Each
+        /// giong-http's client, `E12xx` giong-web, `E13xx` giong-mcp,
+        /// `E2xxx` giong-tls, `E30xx` giong-postgres, `E31xx` giong-mysql
+        /// and `E32xx` giong-redis. Each
         /// has a page under `docs/errors/` in the repository;
         /// [`url`](Code::url) links to it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -211,6 +212,13 @@ codes! {
     /// A giong-web middleware was given settings that cannot work together.
     /// It panics with this code when the middleware is built.
     WebConfig = 1213, InvalidInput, "invalid giong-web setting";
+
+    // --------------------------------------------------------- giong-mcp
+    /// The MCP server was asked to listen on an address other machines can
+    /// reach. It only listens on loopback addresses or a Unix socket.
+    McpNotLocal = 1301, PermissionDenied, "the MCP server listens on this machine only";
+    /// The address given to the MCP server, or `GIONG_MCP`, is not one.
+    McpBadAddress = 1302, InvalidInput, "invalid address for the MCP server";
 
     // --------------------------------------------------------- giong-tls
     /// No trusted certificate authority: none installed on the machine, or

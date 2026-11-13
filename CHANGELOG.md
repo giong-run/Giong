@@ -28,6 +28,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (`scripts/no-io-uring.py`), and CI runs it inside a Docker container with the default
   profile and on a real 5.15 kernel. ThreadSanitizer runs on both drivers.
 
+- **`giong-mcp`**, a new crate: an MCP server that lets an AI agent look inside a running
+  service. Started with `GIONG_MCP=127.0.0.1:7777` (or `Config::tcp`/`Config::unix` in
+  code), it listens only on loopback or a Unix socket (`GIONG-E1301` otherwise), refuses
+  requests whose `Host` or `Origin` is not local, and takes an optional bearer token. Five
+  read-only tools: `overview` (process, workers, warnings), `workers`, `tasks` (live tasks
+  by the line that spawned them), `sources` (connection pools) and `profile` (where the
+  workers spend their time over a window). It runs on a thread of its own, so it answers
+  when every worker is stuck, and names the task a blocked worker is in.
+- **giong**: `giong::observe`, what giong-mcp reads. `Handle::pulse(worker)` returns a
+  worker's counters (event-loop turns, polls, sleeps, idle time, spawned tasks) and the
+  task it is polling, from any thread, without disturbing it. `spawn`,
+  `Handle::spawn_on` and `Handle::spawn_balanced` record the line that called them, and
+  `observe::snapshot()` groups a worker's live tasks by it, with its timers, I/O in
+  flight, receive buffers and registered `Source`s. `Handle::set_profiling` and
+  `observe::take_profile()` time task polls by spawn location. The counters cost about
+  nine instructions per task poll (callgrind, tasks that only yield); profiling, while
+  off, one load per batch of tasks.
+- **giong-postgres**, **giong-mysql**, **giong-redis**: pools register themselves as
+  `giong::observe` sources (server and database, never credentials), so giong-mcp shows
+  their connections, waiters and errors.
 - **Load balancing across workers**, without moving a task once it has started (so tasks
   still need not be `Send`):
   - `Handle::spawn_balanced(f)`: `f` waits in a queue shared by the workers, and the

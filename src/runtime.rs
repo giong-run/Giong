@@ -21,6 +21,7 @@ use crate::driver::{Driver, DriverKind, Io, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
+use crate::observe::{self, Counters, Location, Pulse, WorkerState};
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::time::Timers;
@@ -83,6 +84,8 @@ pub(crate) struct WorkerShared {
     /// Process-wide unique id of this worker instance (never 0).
     pub(crate) uid: usize,
     pub(crate) load: Load,
+    /// What the worker publishes for [`Handle::pulse`].
+    pub(crate) counters: Counters,
     injector: Mutex<Vec<Inject>>,
     /// Tells the worker that `injector` has items, and wakes it if it sleeps.
     bell: Doorbell,
@@ -100,6 +103,7 @@ impl WorkerShared {
         Ok(Arc::new(Self {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             load: Load::new(),
+            counters: Counters::new(),
             injector: Mutex::new(Vec::new()),
             bell: Doorbell::new(),
             closed: AtomicBool::new(false),
@@ -153,6 +157,8 @@ pub(crate) struct RuntimeShared {
     jobs: Mutex<VecDeque<Box<dyn FnOnce() + Send>>>,
     /// How many jobs wait in `jobs`, readable without the lock.
     jobs_len: JobCount,
+    /// Workers time every task poll (see [`Handle::set_profiling`]).
+    profiling: AtomicBool,
 }
 
 impl RuntimeShared {
@@ -166,6 +172,7 @@ impl RuntimeShared {
             next_pick: AtomicUsize::new(0),
             jobs: Mutex::new(VecDeque::new()),
             jobs_len: JobCount::new(),
+            profiling: AtomicBool::new(false),
         }))
     }
 
@@ -207,6 +214,11 @@ impl RuntimeShared {
     /// Number of workers.
     pub(crate) fn workers(&self) -> usize {
         self.workers.len()
+    }
+
+    /// `true` while workers should time task polls.
+    pub(crate) fn profiling(&self) -> bool {
+        self.profiling.load(Ordering::Relaxed)
     }
 
     /// How busy worker `i` looks; see [`least_loaded`](Self::least_loaded).
@@ -330,6 +342,10 @@ pub(crate) struct Worker {
     shutdown_grace: Duration,
     /// The main future is done and the remaining tasks are being drained.
     draining: Cell<bool>,
+    /// Where the main future was started (see [`crate::observe`]).
+    main_location: Cell<Location>,
+    /// Registered sources and the profile being gathered.
+    pub(crate) observe: observe::Local,
 }
 
 thread_local! {
@@ -365,6 +381,7 @@ impl Worker {
             pool.clone(),
             shared.eventfd.as_raw_fd(),
         )?;
+        shared.counters.set_driver(driver.kind());
         Ok(Rc::new(Self {
             index,
             shared,
@@ -381,11 +398,15 @@ impl Worker {
             shutdown_waiters: RefCell::new(Slab::new()),
             shutdown_grace: cfg.shutdown_grace,
             draining: Cell::new(false),
+            main_location: Cell::new(panic::Location::caller()),
+            observe: observe::Local::default(),
         }))
     }
 
     /// Runs `fut` to completion on this thread, then tears the worker down.
-    fn run<F: Future>(self: Rc<Self>, fut: F) -> F::Output {
+    /// `location` is where the caller started the runtime.
+    fn run<F: Future>(self: Rc<Self>, fut: F, location: Location) -> F::Output {
+        self.main_location.set(location);
         WORKER.with(|w| {
             let mut slot = w.borrow_mut();
             assert!(
@@ -473,6 +494,7 @@ impl Worker {
         let mut done = false;
         let mut tick: u32 = 0;
         loop {
+            self.shared.counters.tick();
             self.close_deferred();
             self.drain_injected();
             tick = tick.wrapping_add(1);
@@ -527,8 +549,14 @@ impl Worker {
             } else {
                 wait
             };
+            // Time spent asleep, for `Handle::pulse`: two clock reads per
+            // sleep, which costs a system call anyway.
+            let slept = matches!(mode, Park::Wait(_)).then(Instant::now);
             let graveyard = self.driver.borrow_mut().park(mode);
             self.shared.bell.unpark();
+            if let Some(start) = slept {
+                self.shared.counters.parked(start.elapsed());
+            }
             // Buffers of cancelled operations: dropped outside the driver borrow.
             drop(graveyard);
 
@@ -542,6 +570,29 @@ impl Worker {
     /// closed behind the driver's back.
     pub(crate) fn defer_close(&self, fd: RawFd) {
         self.deferred_closes.borrow_mut().push(fd);
+    }
+
+    /// Where the main future was started.
+    pub(crate) fn main_location(&self) -> Location {
+        self.main_location.get()
+    }
+
+    pub(crate) fn driver_kind(&self) -> DriverKind {
+        self.driver_kind
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.draining.get()
+    }
+
+    /// Operations the driver tracks, and armed timers.
+    pub(crate) fn io_and_timers(&self) -> (usize, usize) {
+        let io = self
+            .driver
+            .try_borrow()
+            .map(|d| d.tracked_ops())
+            .unwrap_or(0);
+        (io, self.timers.borrow().len())
     }
 
     fn close_deferred(&self) {
@@ -863,11 +914,13 @@ impl Builder {
 
     /// Runs a single future on the current thread, using this configuration
     /// with one worker. The thread is not pinned.
+    #[track_caller]
     pub fn block_on<F: Future>(self, fut: F) -> io::Result<F::Output> {
+        let location = panic::Location::caller();
         let cfg = self.config()?;
         let rt = RuntimeShared::new(1)?;
         let worker = Worker::new(0, rt, &cfg)?;
-        Ok(worker.run(fut))
+        Ok(worker.run(fut, location))
     }
 }
 
@@ -878,6 +931,7 @@ impl Builder {
 ///
 /// Panics if the runtime cannot be created (for example on a kernel without
 /// the required io_uring features) or if one is already running on this thread.
+#[track_caller]
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     Builder::new()
         .block_on(fut)
@@ -932,11 +986,13 @@ impl Runtime {
     ///
     /// A panic in a worker's main future shuts the runtime down and is
     /// propagated to the caller.
+    #[track_caller]
     pub fn run<F, Fut>(self, f: F) -> io::Result<()>
     where
         F: Fn(usize) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + 'static,
     {
+        let location = panic::Location::caller();
         let n = self.shared.workers.len();
         let cfg = self.cfg.clone();
         let cpus = allowed_cpus();
@@ -991,12 +1047,15 @@ impl Runtime {
                         }
                     }
                     let _stop = StopOnPanic(rt);
-                    worker.run(async move {
-                        if let Some(fd) = signal_fd {
-                            crate::spawn(watch_signals(fd));
-                        }
-                        f(index).await
-                    });
+                    worker.run(
+                        async move {
+                            if let Some(fd) = signal_fd {
+                                crate::spawn(watch_signals(fd));
+                            }
+                            f(index).await
+                        },
+                        location,
+                    );
                 });
             match spawned {
                 Ok(t) => threads.push(t),
@@ -1224,6 +1283,7 @@ impl Handle {
     ///
     /// [`JoinError::Cancelled`]: crate::JoinError::Cancelled
     /// [`JoinError::Panic`]: crate::JoinError::Panic
+    #[track_caller]
     pub fn spawn_on<F, Fut>(&self, worker: usize, f: F) -> RemoteJoinHandle<Fut::Output>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -1241,7 +1301,7 @@ impl Handle {
                 )
             );
         };
-        let (handle, job) = RemoteJoinHandle::new(f);
+        let (handle, job) = RemoteJoinHandle::new(f, panic::Location::caller());
         self.rt.sending(worker);
         // A stopped worker drops the job, which cancels the handle.
         shared.inject(Inject::Run(job));
@@ -1287,13 +1347,14 @@ impl Handle {
     /// })?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
+    #[track_caller]
     pub fn spawn_balanced<F, Fut>(&self, f: F) -> RemoteJoinHandle<Fut::Output>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future + 'static,
         Fut::Output: Send + 'static,
     {
-        let (handle, job) = RemoteJoinHandle::new(f);
+        let (handle, job) = RemoteJoinHandle::new(f, panic::Location::caller());
         self.rt.push_job(job);
         handle
     }
@@ -1312,6 +1373,70 @@ impl Handle {
     /// so that the next choice takes it into account.
     pub fn least_loaded_worker(&self) -> usize {
         self.rt.least_loaded(self.local_index())
+    }
+
+    /// What worker `worker` is doing and has done, read from any thread
+    /// without disturbing it: see [`observe::Pulse`].
+    ///
+    /// # Panics
+    ///
+    /// Panics with [`Code::NoSuchWorker`] if `worker` is not below
+    /// [`workers`](Self::workers).
+    pub fn pulse(&self, worker: usize) -> Pulse {
+        let Some(shared) = self.rt.workers.get(worker) else {
+            let workers = self.workers();
+            panic!(
+                "{}",
+                crate::error::Error::new(
+                    Code::NoSuchWorker,
+                    format!(
+                        "pulse was given worker {worker}, but the runtime has {workers} (0 to {})",
+                        workers.saturating_sub(1)
+                    ),
+                    "pass an index below Handle::workers().",
+                )
+            );
+        };
+        let (ticks, polls, parks, idle, spawned, polling) = shared.counters.read();
+        let state = if shared.closed.load(Ordering::Acquire) || ticks == 0 {
+            WorkerState::Stopped
+        } else if shared.bell.looks_asleep() {
+            WorkerState::Parked
+        } else {
+            WorkerState::Running
+        };
+        Pulse {
+            worker,
+            state,
+            driver: shared.counters.driver(),
+            ticks,
+            polls,
+            parks,
+            idle,
+            spawned,
+            tasks: shared.load.tasks.load(Ordering::Relaxed),
+            runnable: shared.load.queued.load(Ordering::Relaxed),
+            polling: if state == WorkerState::Running {
+                polling
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Turns the timing of task polls on or off on every worker. While it is
+    /// on, each worker reads the clock around every poll (two reads, some
+    /// tens of nanoseconds) and adds the time to the place the task was
+    /// spawned; [`observe::take_profile`] collects the result on a worker.
+    /// Workers notice the change at their next batch of tasks.
+    pub fn set_profiling(&self, on: bool) {
+        self.rt.profiling.store(on, Ordering::Relaxed);
+    }
+
+    /// `true` while task polls are being timed (see
+    /// [`set_profiling`](Self::set_profiling)).
+    pub fn is_profiling(&self) -> bool {
+        self.rt.profiling()
     }
 
     /// The caller's worker index, if it runs on a worker of this runtime.

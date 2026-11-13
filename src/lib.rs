@@ -87,6 +87,7 @@ mod slab;
 pub mod error;
 pub mod fs;
 pub mod net;
+pub mod observe;
 pub mod sync;
 pub mod time;
 
