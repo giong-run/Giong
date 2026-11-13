@@ -1,0 +1,74 @@
+Bare metal, Ubuntu 24.04's stock kernel: run on 2026-11-13 (16:33 to 17:48 UTC)
+
+giong ran on its epoll driver in this run, not on io_uring. Linux 6.8.0-147-generic
+(Ubuntu) rejects IORING_REGISTER_PBUF_RING with EINVAL. A ten-line C program gets the
+same error, also with IOU_PBUF_RING_MMAP, so it is the kernel and not giong. giong
+could not set up its receive buffer ring and fell back to epoll on its own, as #48
+made it do when io_uring cannot be used, without saying so. Every giong and giong-http
+number here is the epoll driver. Monoio, Glommio and Tokio do not use buffer rings
+(Tokio does not use io_uring at all), so for them nothing changed.
+
+#52, merged after this run, found the cause (Ubuntu's backport of a kernel change
+inverted a check on the reserved fields) and makes giong use io_uring on these
+kernels, and say which driver it runs on. The same machines were then measured again
+on Linux 7.0 with giong on io_uring: ../linux-7.0/.
+
+Code: giong 2fd8ff2 (main after #46, before #52).
+
+Machines: two Vultr Bare Metal servers in Singapore, identical. br-1 is the server,
+  br-2 the load generator.
+  Supermicro AS-3015MR-H8TNR, AMD EPYC 4345P (8 cores, 16 threads, 32 MiB L3, up to
+  5.58 GHz), 64 GB RAM, 2 x KIOXIA 1.92 TB NVMe (ext4), Intel E810-XXV (2 x 25 Gb/s).
+  Ubuntu 24.04.5, Linux 6.8.0-147-generic, io_uring_disabled=0, clocksource tsc.
+  CPU settings as delivered: amd-pstate-epp, governor powersave, EPP performance,
+  boost on, SMT on. CPUs 0-7 are the eight cores, 8-15 their SMT siblings.
+Network: Vultr's private network (VPC) on the E810's second port, MTU 1450. Between
+  the two machines, iperf3 measured 16.6 Gb/s with one stream and 23.5 Gb/s with
+  eight; ping 0.05 to 0.1 ms.
+Tools: rustc 1.100.0, wrk 4.1.0 (Debian build, epoll), Node 18.19.1, Bun 1.4.4,
+  OpenSSL 3.0.13.
+Check before measuring: `cargo test --workspace --all-features` passed on br-1
+  (706 tests, 5 ignored), on the epoll driver for the reason above. With the default
+  soft limit of 1024 open files, two tests in tests/net.rs fail with EMFILE
+  (accept_many_connections, accept_backlog_is_bounded_and_no_connection_is_lost);
+  the run that passed had `ulimit -n 1048576`. #52 makes those two tests raise the
+  limit themselves.
+
+Commands (in bench/ on br-1, as root, with ulimit -n 1048576 and ulimit -l unlimited;
+OUT pointed at the folders here):
+  BENCH_HOST=10.40.96.3 LOAD_HOST=root@10.40.96.4 LOAD_THREADS=16 SERVER_CPUS=0-15 \
+    WORKERS="1 2 4 8 16" ./workers.sh 5 6
+  ./run.sh       server on CPU 1, wrk on CPU 0, loopback, five rounds of 5 s
+  ./scale.sh     same CPUs, five rounds of 6 s
+  ./tls.sh       server on CPU 3, wrk on CPUs 0-2, loopback, five rounds of 5 s
+  ./fs.sh        CPU 2, page cache, files in /tmp (ext4), five rounds
+
+workers/: the server on br-1 and wrk on br-2, over the private network. workers.sh
+cannot see the CPUs of a remote load generator (its "load cpu" column says
+"remote"), so for this run /usr/local/bin/wrk on br-2 was a wrapper that ran the real
+wrk unchanged and logged how busy br-2's 16 CPUs were during each run.
+workers/load-cpu.csv has that number for every row of raw.csv. Medians:
+
+  workers   giong   giong-http   monoio-tuned   tokio-raw   glommio
+  1          17%       14%           17%           18%        15%
+  2          31%       27%           33%           31%        28%
+  4          59%       49%           62%           56%        52%
+  8          92%       81%           95%           85%        84%
+  16        100%       96%          100%           94%        99%
+
+Things that affect how to read the numbers:
+- From 1 to 4 workers the server's cores are saturated (97% busy) and the load
+  generator is not: those rows measure the servers. At 8 workers both sides are close
+  to saturation, and at 16 the load generator is the limit for giong, Monoio and
+  Glommio. Measuring 8 and 16 workers needs a load machine with more cores than the
+  server.
+- 16 workers run on the SMT siblings of the first 8, two workers to a core, so the
+  "eff." column at 16 is not scaling across cores.
+- Boost is on, so a core's clock drops as more cores get busy. That is probably part
+  of the fall in efficiency from 1 to 8 workers; the CPU time per request rises with
+  the worker count (1.94 to 2.82 us for giong).
+- run/, scale/, tls/ and fs/ ran on br-1 alone over loopback, like the 4-vCPU
+  virtual machine in the README.
+- fs/: on the epoll driver, giong's file operations go to its blocking threads, which
+  is why giong is far below its io_uring numbers from the virtual machine (random
+  reads with one task: 0.40M operations/s here, 1.01M there).

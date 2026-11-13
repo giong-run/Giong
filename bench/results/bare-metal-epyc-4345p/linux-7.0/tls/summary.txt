@@ -1,0 +1,14 @@
+endpoint  server           req/s median       min       max   p50 ms   p99 ms  cpu%
+json      axum                   351158    347935    354069     0.14     0.15   102
+json      giong-http             478174    471336    480639     0.08     0.17   102
+json      axum-tls               313329    311530    315053     0.16     0.17   101
+json      giong-http-tls         413163    411175    414660     0.10     0.20   101
+
+users     axum                    49438     49216     49766     1.01     1.02   102
+users     giong-http             113001    111460    113667     0.35     0.71   101
+users     axum-tls                49866     49816     49948     1.00     1.01   102
+users     giong-http-tls         100602    100474    100766     0.40     0.80   102
+
+handshake axum-tls                14482     14472     14510     1.57     2.66   102
+handshake giong-http-tls          14009     13915     14019     1.28     2.31   102
+
