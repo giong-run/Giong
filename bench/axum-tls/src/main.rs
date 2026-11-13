@@ -38,8 +38,12 @@ async fn main() {
     let cert = std::env::var("TLS_CERT").expect("TLS_CERT");
     let key = std::env::var("TLS_KEY").expect("TLS_KEY");
     let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await.unwrap();
-    axum_server::bind_rustls("127.0.0.1:3011".parse().unwrap(), tls)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let server = axum_server::bind_rustls("127.0.0.1:3011".parse().unwrap(), tls);
+    // TCP_NODELAY=1 (bench/h2.sh): set it on each connection, as giong does.
+    if std::env::var_os("TCP_NODELAY").is_some() {
+        let server = server.map(|tls| tls.acceptor(axum_server::accept::NoDelayAcceptor::new()));
+        server.serve(app.into_make_service()).await.unwrap();
+    } else {
+        server.serve(app.into_make_service()).await.unwrap();
+    }
 }
