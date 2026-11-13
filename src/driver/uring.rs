@@ -44,29 +44,30 @@ const UD_WAKE: u64 = u64::MAX - 1;
 /// `user_data` of batched closes, which must finish before shutdown cancels I/O.
 const UD_CLOSE: u64 = u64::MAX - 2;
 
-/// Backpressure for multishot receive. Once this many completions are queued
-/// for a stream that is not being read fast enough:
+/// Backpressure for multishot receive. Once a stream has this many
+/// completions its reader has not taken yet:
 ///
-/// * the multishot receive is paused (cancelled; re-armed when the queue has
-///   been drained), which pushes back on the peer through TCP flow control, and
-/// * anything that still arrives is copied to the heap so that its pool buffer
-///   can be recycled immediately.
+/// * its multishot receive is paused (cancelled; re-armed when the queue has
+///   been drained), which pushes back on the peer through TCP flow control,
+///   and
+/// * while the pool runs low (under a quarter of its buffers free), what
+///   still arrives for it is copied to the heap so that its pool buffer can
+///   be recycled at once.
 ///
-/// Together with [`Uring::evacuate`] this guarantees that slow or stalled
-/// connections cannot pin the shared buffer pool.
-const RECV_BACKLOG_LIMIT: usize = 8;
+/// The limit is an eighth of the pool, and at least 8: a busy stream fills
+/// dozens of buffers between two turns of the event loop, and a reader that
+/// keeps up should get them all without copies or pauses. (A limit of 8 for
+/// every pool copied most of a bulk transfer out of the pool.) Together with
+/// [`Uring::evacuate`] this guarantees that slow or stalled connections
+/// cannot pin the shared buffer pool.
+fn recv_backlog_limit(pool: &BufPool) -> usize {
+    (pool.count() as usize / 8).max(8)
+}
 
 /// A multishot accept is paused once this many accepted connections are
 /// waiting for the application; further connections then wait in the
 /// kernel's listen backlog instead of piling up as open descriptors.
 const ACCEPT_BACKLOG_LIMIT: usize = 1024;
-
-fn backlog_limit(kind: MultiKind) -> usize {
-    match kind {
-        MultiKind::Accept => ACCEPT_BACKLOG_LIMIT,
-        MultiKind::Recv => RECV_BACKLOG_LIMIT,
-    }
-}
 
 enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
@@ -84,8 +85,13 @@ enum Queued {
     /// an accepted descriptor, the end of a stream, an error.
     Raw(i32),
     /// Received data in a pool buffer, held as one piece (see
-    /// [`BufPool::received`]).
-    Piece { bid: u16, off: u32, len: u32 },
+    /// [`BufPool::received`]), and the event loop turn it arrived in.
+    Piece {
+        bid: u16,
+        off: u32,
+        len: u32,
+        turn: u32,
+    },
     /// Received data that was moved out of the pool.
     Heap(Vec<u8>),
 }
@@ -128,6 +134,14 @@ pub(crate) struct Uring {
     starved: bool,
     /// Queued receive completions that hold a piece of a pool buffer.
     pooled_queued: usize,
+    /// [`recv_backlog_limit`] of the pool.
+    recv_limit: usize,
+    /// Received bytes moved out of the pool to the heap.
+    recv_copied: u64,
+    /// Counts the event loop's turns (calls to `park`), wrapping. Tasks run
+    /// between two turns, so data that arrived in an earlier turn than the
+    /// current one has been in front of its reader at least once.
+    turn: u32,
     /// io_uring features this ring uses.
     features: Vec<IoUringFeature>,
     /// Resources of cancelled operations, handed to the event loop to drop
@@ -483,6 +497,7 @@ impl Uring {
             pool.set_registered(RingId::Packed);
             features.push(IoUringFeature::PackedBuffers);
         }
+        let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
@@ -495,6 +510,9 @@ impl Uring {
             to_pause: Vec::new(),
             starved: false,
             pooled_queued: 0,
+            recv_limit,
+            recv_copied: 0,
+            turn: 0,
             graveyard: Vec::new(),
             wake_fd,
             wake_buf: Box::new(0),
@@ -655,7 +673,7 @@ impl Uring {
         };
         match m.queue.pop_front() {
             Some(Queued::Raw(res)) => return MultiPoll::Item(res),
-            Some(Queued::Piece { bid, off, len }) => {
+            Some(Queued::Piece { bid, off, len, .. }) => {
                 self.pooled_queued -= 1;
                 let pool = self.pool.clone();
                 return MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len));
@@ -717,31 +735,49 @@ impl Uring {
         }
     }
 
-    /// Moves all received-but-unread data out of the buffer pool and onto the
-    /// heap, so every buffer that is not in the hands of user code becomes
+    /// Moves received data that its reader left unread for a whole turn out
+    /// of the buffer pool and onto the heap, so those buffers become
     /// available to the kernel again.
     ///
-    /// Called when a receive finds the pool empty. Costs a scan over all
-    /// tracked operations, which is fine for something that only happens
-    /// under buffer starvation.
+    /// Called when a receive finds the pool empty. Data that arrived in this
+    /// turn stays: its reader has not had a chance to run yet, and on kernels
+    /// without `DEFER_TASKRUN` one fast stream can fill the whole pool in a
+    /// single turn; copying that out only lets the kernel fill the pool with
+    /// the same stream again. The reader takes it in the coming turn, and if
+    /// it does not, the next receive that finds the pool empty moves it.
+    /// Costs a scan over all tracked operations, which is fine for something
+    /// that only happens under buffer starvation.
     pub(crate) fn evacuate(&mut self) {
         if self.pooled_queued == 0 {
             return;
         }
-        self.pooled_queued = 0;
         let pool = &self.pool;
+        let now = self.turn;
+        let mut kept = 0;
         for op in self.ops.iter_mut() {
             let OpState::Multi(m) = op else { continue };
             if m.kind != MultiKind::Recv {
                 continue;
             }
             for item in m.queue.iter_mut() {
-                if let Queued::Piece { bid, off, len } = *item {
+                if let Queued::Piece {
+                    bid,
+                    off,
+                    len,
+                    turn,
+                } = *item
+                {
+                    if turn == now {
+                        kept += 1;
+                        continue;
+                    }
                     *item = Queued::Heap(pool.copy_out(bid, off, len));
                     pool.release(bid);
+                    self.recv_copied += u64::from(len);
                 }
             }
         }
+        self.pooled_queued = kept;
     }
 
     /// Closes a descriptor through the ring (batched with everything else).
@@ -827,6 +863,7 @@ impl Uring {
     /// Enters the kernel: submits queued SQEs, optionally waits, then dispatches
     /// completions. Returns resources that must be dropped outside the driver.
     pub(crate) fn park(&mut self, mode: Park) -> Vec<Box<dyn Any>> {
+        self.turn = self.turn.wrapping_add(1);
         if !self.wake_armed && !self.closing {
             self.arm_wake();
         }
@@ -935,9 +972,12 @@ impl Uring {
                             Some(bid) if m.kind == MultiKind::Recv => {
                                 let more_in_buf = flags & F_BUF_MORE != 0;
                                 match self.pool.received(m.ring, bid, res, more_in_buf) {
-                                    Received::Data { bid, off, len } => {
-                                        Queued::Piece { bid, off, len }
-                                    }
+                                    Received::Data { bid, off, len } => Queued::Piece {
+                                        bid,
+                                        off,
+                                        len,
+                                        turn: self.turn,
+                                    },
                                     Received::Nothing => Queued::Raw(res),
                                 }
                             }
@@ -960,15 +1000,30 @@ impl Uring {
                                 // The cancellation we asked for when pausing.
                                 Self::release(&self.pool, m.kind, item);
                             } else {
-                                let limit = backlog_limit(m.kind);
+                                let limit = match m.kind {
+                                    MultiKind::Accept => ACCEPT_BACKLOG_LIMIT,
+                                    MultiKind::Recv => self.recv_limit,
+                                };
+                                // Behind: the oldest unread piece was already
+                                // there in an earlier turn, so the reader ran
+                                // and did not take it.
+                                let behind = matches!(
+                                    m.queue.front(),
+                                    Some(Queued::Piece { turn, .. }) if *turn != self.turn
+                                );
+                                let pool_low = self.pool.free() * 4 < self.pool.count() as usize;
                                 match item {
-                                    Queued::Piece { bid, off, len } if m.queue.len() >= limit => {
-                                        // Nobody is keeping up with this stream: do not
-                                        // let it sit on pool buffers.
+                                    Queued::Piece { bid, off, len, .. }
+                                        if m.queue.len() >= limit && behind && pool_low =>
+                                    {
+                                        // Nobody is keeping up with this stream, and
+                                        // others need buffers: do not let it sit on
+                                        // pool buffers.
                                         m.queue.push_back(Queued::Heap(
                                             self.pool.copy_out(bid, off, len),
                                         ));
                                         self.pool.release(bid);
+                                        self.recv_copied += u64::from(len);
                                     }
                                     item => {
                                         if let Queued::Piece { .. } = item {
@@ -1051,6 +1106,11 @@ impl Uring {
     /// Number of tracked operations (used by tests to detect leaks).
     pub(crate) fn tracked_ops(&self) -> usize {
         self.ops.len()
+    }
+
+    /// Received bytes moved out of the pool to the heap so far.
+    pub(crate) fn recv_copied(&self) -> u64 {
+        self.recv_copied
     }
 
     /// Kernel bugs worked around while setting the ring up.

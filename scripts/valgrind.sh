@@ -8,7 +8,8 @@
 # Not covered, because valgrind (3.22) treats io_uring_enter as non-blocking
 # and so stalls programs with more than one thread waiting in it:
 #   * tests/multi.rs and tests/spin.rs
-#   * net::interoperates_with_blocking_std_clients, and
+#   * net::interoperates_with_blocking_std_clients,
+#     net::a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies, and
 #     works_with_the_standard_library_on_the_other_side in tests/udp.rs and
 #     tests/unix.rs: a std socket on its own thread is the other side
 #   * udp::every_worker_can_bind_the_same_port, which runs three workers
@@ -28,6 +29,7 @@ SUITES=("$@")
 SKIP="interoperates_with_blocking_std_clients"
 SKIP+=" works_with_the_standard_library_on_the_other_side"
 SKIP+=" every_worker_can_bind_the_same_port"
+SKIP+=" a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies"
 TIMEOUT=${TIMEOUT:-300}
 
 total=0
