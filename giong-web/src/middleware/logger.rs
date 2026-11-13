@@ -91,7 +91,7 @@ impl<S: 'static> Middleware<S> for Logger {
             // Written after this line, piece by piece.
             line.null("bytes");
         } else {
-            line.u64("bytes", resp.body_bytes().len() as u64);
+            line.u64("bytes", resp.body_len() as u64);
         }
         let rendered = resp.extension::<Rendered>();
         let id = id.or_else(|| {

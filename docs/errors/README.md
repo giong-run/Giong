@@ -56,6 +56,7 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | Code | `Code::` | Meaning |
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
+| [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
 
 ## giong-http
 
@@ -113,6 +114,10 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | [GIONG-E2006](E2006.md) | `TlsHandshakeTimeout` | TLS handshake timed out |
 | [GIONG-E2007](E2007.md) | `TlsHandshakeEof` | connection closed during the TLS handshake |
 | [GIONG-E2008](E2008.md) | `TlsBroken` | TLS stream broken |
+| [GIONG-E2009](E2009.md) | `KtlsUnavailable` | kernel TLS is not available |
+| [GIONG-E2010](E2010.md) | `KtlsSetup` | the kernel refused the TLS keys |
+| [GIONG-E2011](E2011.md) | `KtlsKeyUpdate` | the kernel cannot change TLS keys |
+| [GIONG-E2012](E2012.md) | `TlsKeysExhausted` | TLS keys used up |
 
 ## giong-postgres
 

@@ -72,6 +72,7 @@ name = "giong-tls"
 version = "0.4.0"
 dependencies = [
  "giong",
+ "libc",
  "rustls",
 ]
 

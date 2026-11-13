@@ -106,7 +106,8 @@ pub trait Transport: 'static {
     ///
     /// The default copies the body after the head and calls
     /// [`write_all`](Self::write_all). [`TcpStream`] and [`UnixStream`] send
-    /// both with one vectored write instead, without the copy.
+    /// both with one vectored write instead, without the copy, and
+    /// `giong_tls::TlsStream` hands both to TLS without the copy.
     fn write_all_with_body(
         &self,
         head: Vec<u8>,
@@ -118,6 +119,33 @@ pub trait Transport: 'static {
             head.extend_from_slice(&body.into_cow());
             let (res, mut head) = self.write_all(head).await;
             head.truncate(len);
+            (res, head)
+        }
+    }
+
+    /// Sends all of `head`, then `len` bytes of `file` from `offset`, and
+    /// hands `head` back. The server uses it for [`Body::File`].
+    ///
+    /// The default sends the head, then reads the file in pieces of up to
+    /// 256 KiB and writes each with [`write_all`](Self::write_all).
+    /// [`TcpStream`] and `giong_tls::TlsStream` use their `send_file`
+    /// instead, which over plain TCP and kernel TLS sends the file straight
+    /// from the page cache. A file that ends before `offset + len` is an
+    /// error (`GIONG-E0201`) after what it had was sent.
+    fn write_all_with_file(
+        &self,
+        head: Vec<u8>,
+        file: &giong::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
+        async move {
+            let (res, mut head) = self.write_all(head).await;
+            if res.is_err() {
+                return (res, head);
+            }
+            let res = copy_file(file, offset, len, |piece| self.write_all(piece)).await;
+            head.clear();
             (res, head)
         }
     }
@@ -148,6 +176,20 @@ impl Transport for TcpStream {
         let bufs = vec![Cow::Owned(head), body.into_cow()];
         let (res, bufs) = TcpStream::write_all_vectored(self, bufs).await;
         (res, into_head(bufs))
+    }
+
+    async fn write_all_with_file(
+        &self,
+        head: Vec<u8>,
+        file: &giong::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> (io::Result<()>, Vec<u8>) {
+        let (res, head) = TcpStream::write_all(self, head).await;
+        if res.is_err() {
+            return (res, head);
+        }
+        (TcpStream::send_file(self, file, offset, len).await, head)
     }
 
     async fn close_write(&self) {
@@ -191,6 +233,29 @@ impl Transport for giong_tls::TlsStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         giong_tls::TlsStream::write_all(self, buf)
+    }
+
+    async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
+        let bufs = vec![Cow::Owned(head), body.into_cow()];
+        let (res, bufs) = giong_tls::TlsStream::write_all_vectored(self, bufs).await;
+        (res, into_head(bufs))
+    }
+
+    async fn write_all_with_file(
+        &self,
+        head: Vec<u8>,
+        file: &giong::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> (io::Result<()>, Vec<u8>) {
+        let (res, head) = giong_tls::TlsStream::write_all(self, head).await;
+        if res.is_err() {
+            return (res, head);
+        }
+        (
+            giong_tls::TlsStream::send_file(self, file, offset, len).await,
+            head,
+        )
     }
 
     async fn close_write(&self) {
@@ -584,6 +649,50 @@ fn push_hex(out: &mut Vec<u8>, n: usize) {
     let _ = write!(out, "{n:x}");
 }
 
+/// Reads `len` bytes of `file` from `offset` in pieces of up to 256 KiB and
+/// hands each to `write`: [`Transport::write_all_with_file`] for transports
+/// that cannot send from the file itself.
+async fn copy_file<W, F>(file: &giong::fs::File, offset: u64, len: u64, write: W) -> io::Result<()>
+where
+    W: Fn(Vec<u8>) -> F,
+    F: Future<Output = (io::Result<()>, Vec<u8>)>,
+{
+    const PIECE: u64 = 256 * 1024;
+    let mut buf = Vec::with_capacity(len.min(PIECE) as usize);
+    let (mut at, mut left) = (offset, len);
+    while left > 0 {
+        let (res, mut b) = file.read_at(buf, at).await;
+        let n = match res {
+            Ok(0) => {
+                return Err(giong::error::Error::new(
+                    giong::error::Code::FileTooShort,
+                    format!(
+                        "the file ended at byte {at}, {left} bytes short of the {len} the \
+                         response announced"
+                    ),
+                    "take the length from the open file (Body::file does), and replace a \
+                     file that is being served by renaming a new one over it, not by \
+                     rewriting it.",
+                )
+                .into())
+            }
+            Ok(n) => (n as u64).min(left),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                buf = b;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        b.truncate(n as usize);
+        let (res, back) = write(b).await;
+        res?;
+        buf = back;
+        at += n;
+        left -= n;
+    }
+    Ok(())
+}
+
 /// The head buffer back from a vectored write of `[head, body]`.
 fn into_head(mut bufs: Vec<Cow<'static, [u8]>>) -> Vec<u8> {
     match bufs.swap_remove(0) {
@@ -731,7 +840,9 @@ impl<T: Transport> Conn<T> {
                         Body::Stream(body) => Some(body),
                         _ => None,
                     }
-                } else if resp.sends_body(head_only) && resp.body_len() >= SEPARATE_BODY_AT {
+                } else if resp.sends_body(head_only)
+                    && (resp.body_len() >= SEPARATE_BODY_AT || resp.body_is_file())
+                {
                     // Sent from where it is, right after its head.
                     resp.write_head(&mut self.out, minor, keep_alive);
                     self.body = resp.take_body();
@@ -1172,6 +1283,12 @@ impl<T: Transport> Conn<T> {
         let out = mem::take(&mut self.out);
         let wrote = match mem::take(&mut self.body) {
             Body::Empty => timeout(self.cfg.write_timeout, self.stream.write_all(out)).await,
+            Body::File(f) => {
+                let write = self
+                    .stream
+                    .write_all_with_file(out, &f.file, f.offset, f.len);
+                timeout(self.cfg.write_timeout, write).await
+            }
             body => {
                 let write = self.stream.write_all_with_body(out, body);
                 timeout(self.cfg.write_timeout, write).await

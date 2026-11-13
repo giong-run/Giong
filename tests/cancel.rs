@@ -142,6 +142,85 @@ fn dropping_an_in_flight_write_keeps_its_buffer_alive() {
 }
 
 #[test]
+fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
+    giong::block_on(async {
+        let (c, s) = pair().await;
+        // Fill the socket buffers so sends stay pending, then abandon them.
+        // The control message (SO_TIMESTAMPING, no flags) must outlive the
+        // send as much as the data.
+        let big = vec![7u8; 4 * 1024 * 1024];
+        // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
+        let (space, len) = unsafe { (libc::CMSG_SPACE(4) as usize, libc::CMSG_LEN(4) as u64) };
+        let mut control = vec![0u8; space];
+        control[..8].copy_from_slice(&len.to_ne_bytes());
+        control[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
+        control[12..16].copy_from_slice(&libc::SO_TIMESTAMPING.to_ne_bytes());
+        let mut abandoned = 0;
+        for _ in 0..20 {
+            let send = c.send_with_control(big.clone(), control.clone());
+            if timeout(Duration::from_millis(2), send).await.is_err() {
+                abandoned += 1;
+            }
+        }
+        assert!(abandoned > 0, "expected at least one send to block");
+        // Drain on the other side; every byte that arrives must be a 7.
+        let mut total = 0usize;
+        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
+            if data.is_empty() {
+                break;
+            }
+            assert!(data.iter().all(|&b| b == 7));
+            total += data.len();
+        }
+        assert!(total > 0);
+        drop((c, s));
+        sleep(Duration::from_millis(20)).await;
+        let stats = giong::stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
+fn a_dropped_send_file_leaves_nothing_behind() {
+    giong::block_on(async {
+        let (c, s) = pair().await;
+        let path =
+            std::env::temp_dir().join(format!("giong-cancel-{}-send-file", std::process::id()));
+        std::fs::write(&path, vec![7u8; 8 * 1024 * 1024]).unwrap();
+        let file = giong::fs::File::open(&path).await.unwrap();
+        // Nobody reads: the sends fill the socket and wait until they are
+        // dropped.
+        let mut abandoned = 0;
+        for _ in 0..20 {
+            if timeout(
+                Duration::from_millis(2),
+                c.send_file(&file, 0, 8 * 1024 * 1024),
+            )
+            .await
+            .is_err()
+            {
+                abandoned += 1;
+            }
+        }
+        assert!(abandoned > 0, "expected at least one send to wait");
+        let mut total = 0usize;
+        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
+            if data.is_empty() {
+                break;
+            }
+            assert!(data.iter().all(|&b| b == 7));
+            total += data.len();
+        }
+        assert!(total > 0);
+        drop((c, s, file));
+        std::fs::remove_file(&path).unwrap();
+        sleep(Duration::from_millis(20)).await;
+        let stats = giong::stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
 fn aborting_a_task_blocked_on_io_cleans_up() {
     giong::block_on(async {
         let (c, s) = pair().await;

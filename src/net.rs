@@ -44,6 +44,11 @@ use crate::runtime::{self, Worker};
 /// The most buffers one `sendmsg` takes (`IOV_MAX` on Linux); a vectored
 /// write with more sends them in several calls.
 const IOV_MAX: usize = 1024;
+/// The most one `sendfile` call is asked for (Linux sends at most this much
+/// in one call anyway).
+const SENDFILE_MAX: u64 = 0x7fff_f000;
+/// Bytes `send_file` sends before it lets the worker's other tasks run.
+const SENDFILE_YIELD: u64 = 512 * 1024;
 
 pub(crate) fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
@@ -177,6 +182,9 @@ impl Drop for ListenSocket {
 pub(crate) struct StreamSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
+    /// `O_NONBLOCK` is known to be set: always under epoll, and under
+    /// io_uring once `send_file` has set it.
+    nonblocking: Cell<bool>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -185,6 +193,7 @@ impl StreamSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
+            nonblocking: Cell::new(false),
             _not_send: PhantomData,
         }
     }
@@ -363,6 +372,122 @@ impl StreamSocket {
         } else {
             (Ok(res as usize), bufs)
         }
+    }
+
+    /// One `sendmsg` of `buf` with the ancillary data in `control`.
+    pub(crate) async fn send_with_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> (io::Result<usize>, B, C) {
+        let mut iov = Box::new(libc::iovec {
+            iov_base: buf.as_ptr().cast_mut().cast(),
+            iov_len: buf.len(),
+        });
+        // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
+        let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        msg.msg_iov = &mut *iov;
+        msg.msg_iovlen = 1;
+        if !control.is_empty() {
+            msg.msg_control = control.as_ptr().cast_mut().cast();
+            msg.msg_controllen = control.len() as _;
+        }
+        let io = Io::SendMsg {
+            fd: self.sock.as_raw_fd(),
+            msg: &*msg,
+            flags: libc::MSG_NOSIGNAL as u32,
+        };
+        // The header, the iovec and both buffers stay where they are until the
+        // kernel is done with them, even if this future is dropped: `Op`
+        // keeps them until the operation completes.
+        let (res, _, (buf, control, _iov, _msg)) = Op::new(io, (buf, control, iov, msg)).await;
+        if res < 0 {
+            (Err(os_err(res)), buf, control)
+        } else {
+            (Ok(res as usize), buf, control)
+        }
+    }
+
+    /// Sends `len` bytes of the file `file` from `offset` with
+    /// `sendfile(2)`. See [`TcpStream::send_file`].
+    pub(crate) async fn send_file(&self, file: RawFd, offset: u64, len: u64) -> io::Result<()> {
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > i64::MAX as u64)
+        {
+            // No file reaches that far.
+            return Err(raise(
+                Code::FileTooShort,
+                format!(
+                    "send_file was asked for {len} bytes from offset {offset}, past any file's end"
+                ),
+                "pass an offset and a length within the file: offset + len must not exceed \
+                 File::len.",
+            ));
+        }
+        self.set_nonblocking()?;
+        let fd = self.sock.as_raw_fd();
+        let (mut offset, mut left) = (offset, len);
+        let mut since_yield = 0;
+        while left > 0 {
+            let mut off = offset as libc::off_t;
+            let count = left.min(SENDFILE_MAX) as usize;
+            // SAFETY: plain system call on descriptors the caller keeps open;
+            // `off` is a valid `off_t` the kernel reads and advances. The
+            // socket is non-blocking, so the call never waits.
+            let n = unsafe { libc::sendfile64(fd, file, &mut off, count) };
+            match n {
+                n if n > 0 => {
+                    let n = n as u64;
+                    offset += n;
+                    left -= n;
+                    since_yield += n;
+                    if left > 0 && since_yield >= SENDFILE_YIELD {
+                        // A fast peer never makes this wait: let the other
+                        // tasks of the worker run in between.
+                        since_yield = 0;
+                        crate::yield_now().await;
+                    }
+                }
+                0 => {
+                    return Err(raise(
+                        Code::FileTooShort,
+                        format!(
+                            "the file ended at byte {offset}, {left} bytes short of the {len} \
+                             send_file was asked to send"
+                        ),
+                        "take the length from the open file (File::len), and replace a file \
+                         that is being served by renaming a new one over it, not by \
+                         rewriting it; the peer has fewer bytes than announced, so close the \
+                         connection.",
+                    ));
+                }
+                _ => {
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EINTR) => {}
+                        Some(libc::EAGAIN) => {
+                            let (res, _, ()) = Op::new(Io::Writable { fd }, ()).await;
+                            if res < 0 {
+                                return Err(os_err(res));
+                            }
+                        }
+                        _ => return Err(err),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets `O_NONBLOCK`, once. io_uring does not need it for its own
+    /// operations, and stays correct with it (see [`Op`]).
+    fn set_nonblocking(&self) -> io::Result<()> {
+        if !self.nonblocking.get() {
+            self.sock.set_nonblocking(true)?;
+            self.nonblocking.set(true);
+        }
+        Ok(())
     }
 
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
@@ -676,6 +801,67 @@ impl TcpStream {
     /// been sent.
     pub async fn write_all_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
         self.inner.write_all_vectored(bufs).await
+    }
+
+    /// Sends `buf` with one `sendmsg(2)` that carries the ancillary data
+    /// (control messages) in `control`, returning how many bytes of `buf`
+    /// were sent. Both buffers are handed back.
+    ///
+    /// `control` holds complete control messages, each a `cmsghdr` followed
+    /// by its data and padded the way `CMSG_SPACE` says (an empty `control`
+    /// sends none). This is how a protocol layered on the socket tells the
+    /// kernel something about one message, such as the record type of a
+    /// kernel TLS record (`giong-tls` uses it to send TLS alerts once the
+    /// kernel encrypts the connection).
+    ///
+    /// Not cancel safe: if the future is dropped, the message may have been
+    /// sent.
+    pub async fn send_with_control<B: IoBuf, C: IoBuf>(
+        &self,
+        buf: B,
+        control: C,
+    ) -> (io::Result<usize>, B, C) {
+        self.inner.send_with_control(buf, control).await
+    }
+
+    /// Sends `len` bytes of `file`, starting at `offset`, straight from the
+    /// kernel's page cache with `sendfile(2)`: the bytes are never copied
+    /// into the program. The file's own position is neither used nor moved,
+    /// so many streams can send from one open file at once.
+    ///
+    /// On a stream whose TLS records the kernel encrypts (kernel TLS, see
+    /// `giong-tls`), the kernel encrypts the file as it sends it; that is
+    /// the fastest way to serve a file over TLS.
+    ///
+    /// Two things to know:
+    ///
+    /// - The file is read where the call is made: a part of the file that
+    ///   is not in the page cache is read from disk while the worker waits,
+    ///   as with nginx's `sendfile on`. Files that are served often stay
+    ///   cached; for cold files on slow disks, read with
+    ///   [`File::read_at`](crate::fs::File::read_at) and write instead.
+    /// - `sendfile` cannot ask the kernel not to raise `SIGPIPE` when the
+    ///   peer has gone. Rust programs ignore `SIGPIPE` unless they change
+    ///   that, and then the call fails with `BrokenPipe`.
+    ///
+    /// Fails with [`FileTooShort`](crate::error::Code::FileTooShort) if the
+    /// file ends before `offset + len`, after sending what it had.
+    ///
+    /// Not cancel safe: if the future is dropped, part of the file may have
+    /// been sent. After the first call, the socket is non-blocking.
+    ///
+    /// ```no_run
+    /// # use giong::net::TcpStream;
+    /// # async fn serve(stream: &TcpStream) -> std::io::Result<()> {
+    /// let file = giong::fs::File::open("index.html").await?;
+    /// let len = file.len()?;
+    /// let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {len}\r\n\r\n");
+    /// stream.write_all(head.into_bytes()).await.0?;
+    /// stream.send_file(&file, 0, len).await
+    /// # }
+    /// ```
+    pub async fn send_file(&self, file: &crate::fs::File, offset: u64, len: u64) -> io::Result<()> {
+        self.inner.send_file(file.as_raw_fd(), offset, len).await
     }
 
     /// Shuts down the read half, the write half, or both.

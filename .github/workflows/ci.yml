@@ -59,6 +59,8 @@ jobs:
       # giong must choose io_uring by itself on the runner: if a runner kernel
       # ever refuses it, the run fails instead of quietly testing epoll only.
       GIONG_TEST_EXPECT_DRIVER: io_uring
+      # The kernel TLS tests fail instead of skipping without the module.
+      GIONG_KTLS_REQUIRED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,6 +72,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q redis-server
           sudo systemctl stop redis-server
+      - name: Load the kernel's tls module, so the kernel TLS tests run
+        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - run: scripts/check.sh test
 
   # The database crates against the other server versions they support; the
@@ -163,6 +167,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
+      GIONG_KTLS_REQUIRED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -173,6 +178,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q redis-server
           sudo systemctl stop redis-server
+      - name: Load the kernel's tls module, so the kernel TLS tests run
+        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - run: scripts/check.sh fallback
 
   # The epoll driver where it is needed: a container with Docker's default
@@ -196,11 +203,15 @@ jobs:
                   print(msg["executable"])
           ' > target/test-binaries.txt
           wc -l target/test-binaries.txt
+      # A container cannot load kernel modules, but uses the host's: kernel
+      # TLS on the epoll driver, inside the container.
+      - name: Load the kernel's tls module, so the kernel TLS tests run
+        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - name: Run them in a container with the default seccomp profile
         run: |
           docker info --format '{{.SecurityOptions}}' | grep -q seccomp
           docker run --rm -v "$PWD:$PWD" -w "$PWD" -v /etc/ssl/certs:/etc/ssl/certs:ro \
-            -e GIONG_TEST_EXPECT_DRIVER=epoll ubuntu:24.04 sh -ec '
+            -e GIONG_TEST_EXPECT_DRIVER=epoll -e GIONG_KTLS_REQUIRED=1 ubuntu:24.04 sh -ec '
               for t in $(cat target/test-binaries.txt); do
                 echo "== $t"
                 "$t" -q
@@ -210,6 +221,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
+      GIONG_KTLS_REQUIRED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -225,6 +237,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q redis-server
           sudo systemctl stop redis-server
+      - name: Load the kernel's tls module, so the kernel TLS tests run
+        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - run: ROUNDS=2 scripts/check.sh tsan
       # The epoll driver hands file operations to threads of its own.
       - run: GIONG_DRIVER=epoll ROUNDS=1 scripts/check.sh tsan
@@ -249,11 +263,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { kernel: "5.15.225", workarounds: "", features: "" }
+          # ktls: the guest loads the tls module and the kernel TLS tests
+          # must run (5.15 on epoll, 6.1 and 6.8 without key updates, 6.18
+          # with them). 6.0 is left out: giong-tls refuses its kernel TLS,
+          # which can crash the kernel when a connection closes. features:
+          # the optional io_uring features giong must find.
+          - { kernel: "5.15.225", workarounds: "", features: "", ktls: "1" }
           - { kernel: "6.0.19", workarounds: "", features: "" }
-          - { kernel: "6.1.155", workarounds: "", features: "" }
+          - { kernel: "6.1.155", workarounds: "", features: "", ktls: "1" }
           - { kernel: "6.12.117", workarounds: "", features: "packed-buffers" }
-          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "" }
+          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "", ktls: "1" }
+          - { kernel: "6.18.63", workarounds: "", features: "packed-buffers", ktls: "1" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -270,11 +290,12 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/kernels/linux-${{ matrix.kernel }}
-          key: kernel-${{ matrix.kernel }}
+          key: kernel-${{ matrix.kernel }}${{ matrix.ktls && '-ktls' || '' }}
       - run: scripts/kernels.sh ${{ matrix.kernel }}
         env:
           GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS: ${{ matrix.workarounds }}
           GIONG_TEST_EXPECT_IO_URING_FEATURES: ${{ matrix.features }}
+          KTLS: ${{ matrix.ktls || '0' }}
       - name: Keep the guest's log
         if: always()
         uses: actions/upload-artifact@v4
