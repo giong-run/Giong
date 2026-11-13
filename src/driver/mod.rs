@@ -242,6 +242,10 @@ pub(crate) enum Io {
         len: u32,
         flags: i32,
     },
+    /// Waits until a socket can take more data (`POLLOUT`), for a caller
+    /// that writes to it itself and got `EAGAIN`. Completes with a
+    /// non-negative value when the caller should try again.
+    Writable { fd: RawFd },
     /// `sendmsg(2)`.
     SendMsg {
         fd: RawFd,
@@ -302,6 +306,21 @@ pub(crate) enum Io {
         from: *const libc::c_char,
         to: *const libc::c_char,
     },
+}
+
+impl Io {
+    /// `true` for the socket transfers that wait until they can proceed, so
+    /// that `EAGAIN` from them is never an answer: io_uring returns it when
+    /// the socket is non-blocking and it stopped waiting (see
+    /// [`Op`](crate::op::Op)), and the epoll driver never does.
+    pub(crate) fn waits_when_not_ready(&self) -> bool {
+        match *self {
+            Io::Recv { .. } | Io::RecvMsg { .. } => true,
+            Io::Send { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
+            Io::SendMsg { flags, .. } => flags & libc::MSG_DONTWAIT as u32 == 0,
+            _ => false,
+        }
+    }
 }
 
 /// A multishot operation: it keeps producing results until it is dropped.

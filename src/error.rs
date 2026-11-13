@@ -148,6 +148,9 @@ codes! {
     // -------------------------------------------------------------- files
     /// A path contains a NUL byte, which Linux paths cannot.
     InvalidPath = 200, InvalidInput, "invalid path";
+    /// [`TcpStream::send_file`](crate::net::TcpStream::send_file) was asked
+    /// for bytes past the end of the file. What the file had was sent.
+    FileTooShort = 201, UnexpectedEof, "the file ended before the bytes to send";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not

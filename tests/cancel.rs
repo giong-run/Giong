@@ -181,6 +181,46 @@ fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
 }
 
 #[test]
+fn a_dropped_send_file_leaves_nothing_behind() {
+    giong::block_on(async {
+        let (c, s) = pair().await;
+        let path =
+            std::env::temp_dir().join(format!("giong-cancel-{}-send-file", std::process::id()));
+        std::fs::write(&path, vec![7u8; 8 * 1024 * 1024]).unwrap();
+        let file = giong::fs::File::open(&path).await.unwrap();
+        // Nobody reads: the sends fill the socket and wait until they are
+        // dropped.
+        let mut abandoned = 0;
+        for _ in 0..20 {
+            if timeout(
+                Duration::from_millis(2),
+                c.send_file(&file, 0, 8 * 1024 * 1024),
+            )
+            .await
+            .is_err()
+            {
+                abandoned += 1;
+            }
+        }
+        assert!(abandoned > 0, "expected at least one send to wait");
+        let mut total = 0usize;
+        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
+            if data.is_empty() {
+                break;
+            }
+            assert!(data.iter().all(|&b| b == 7));
+            total += data.len();
+        }
+        assert!(total > 0);
+        drop((c, s, file));
+        std::fs::remove_file(&path).unwrap();
+        sleep(Duration::from_millis(20)).await;
+        let stats = giong::stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
 fn aborting_a_task_blocked_on_io_cleans_up() {
     giong::block_on(async {
         let (c, s) = pair().await;

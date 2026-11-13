@@ -235,6 +235,199 @@ fn send_with_control_hands_the_control_message_to_the_kernel() {
     });
 }
 
+/// A file under the temporary directory holding `data`, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(name: &str, data: &[u8]) -> Self {
+        let path = std::env::temp_dir().join(format!("giong-net-{}-{name}", std::process::id()));
+        std::fs::write(&path, data).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn send_file_sends_the_file_and_leaves_the_stream_usable() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = Rc::new(l.accept().await.unwrap());
+        // Larger than the socket buffers, so sends stop part-way and wait.
+        let data = payload((9 << 20) + 123, 7);
+        let tmp = TempFile::new("send-file", &data);
+        let file = giong::fs::File::open(&tmp.0).await.unwrap();
+
+        let reader = {
+            let s = s.clone();
+            let len = data.len();
+            giong::spawn(async move { recv_exact(&s, len).await })
+        };
+        c.send_file(&file, 0, data.len() as u64).await.unwrap();
+        assert!(reader.await.unwrap() == data);
+
+        // A range from the middle, then nothing at all.
+        c.send_file(&file, 1000, 5000).await.unwrap();
+        assert!(recv_exact(&s, 5000).await == data[1000..6000]);
+        c.send_file(&file, 0, 0).await.unwrap();
+        // The file's own position did not move.
+        let (n, buf) = file.read_at(Vec::with_capacity(16), 0).await;
+        assert_eq!(n.unwrap(), 16);
+        assert_eq!(buf, data[..16]);
+
+        // The stream now has O_NONBLOCK set; every other operation works as
+        // before, in both directions, with full socket buffers.
+        let big = payload(6 << 20, 8);
+        let reader = {
+            let s = s.clone();
+            let len = big.len();
+            giong::spawn(async move { recv_exact(&s, len).await })
+        };
+        let (res, _) = c.write_all(big.clone()).await;
+        res.unwrap();
+        assert!(reader.await.unwrap() == big);
+        let reader = giong::spawn(async move {
+            let mut out = Vec::new();
+            loop {
+                let chunk = c.recv().await.unwrap();
+                if chunk.is_empty() {
+                    break out;
+                }
+                out.extend_from_slice(&chunk);
+            }
+        });
+        let (res, _) = s
+            .write_all_vectored(vec![big.clone(), b"end".to_vec()])
+            .await;
+        res.unwrap();
+        s.shutdown(Shutdown::Write).unwrap();
+        let back = reader.await.unwrap();
+        assert!(back.len() == big.len() + 3 && back[..big.len()] == big[..]);
+    });
+}
+
+#[test]
+fn send_file_past_the_end_sends_what_there_is_and_says_so() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = l.accept().await.unwrap();
+        let data = payload(1000, 9);
+        let tmp = TempFile::new("send-file-short", &data);
+        let file = giong::fs::File::open(&tmp.0).await.unwrap();
+
+        let err = c.send_file(&file, 200, 2000).await.unwrap_err();
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::FileTooShort)
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("1200 bytes short"), "{err}");
+        assert!(recv_exact(&s, 800).await == data[200..]);
+
+        // A range no file can have fails before sending anything.
+        for (offset, len) in [(u64::MAX, 1), (1, u64::MAX), (i64::MAX as u64, 1)] {
+            let err = c.send_file(&file, offset, len).await.unwrap_err();
+            assert_eq!(
+                giong::error::code(&err),
+                Some(giong::error::Code::FileTooShort)
+            );
+        }
+        c.write_all(&b"!"[..]).await.0.unwrap();
+        assert_eq!(recv_exact(&s, 1).await, b"!");
+    });
+}
+
+#[test]
+fn send_file_to_a_closed_peer_is_an_error_not_a_signal() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        drop(l.accept().await.unwrap());
+        sleep(Duration::from_millis(20)).await;
+        let tmp = TempFile::new("send-file-closed", &payload(256 * 1024, 10));
+        let file = giong::fs::File::open(&tmp.0).await.unwrap();
+        let mut failed = false;
+        for _ in 0..50 {
+            if let Err(e) = c.send_file(&file, 0, 256 * 1024).await {
+                assert!(
+                    matches!(
+                        e.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "{e}"
+                );
+                failed = true;
+                break;
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        assert!(failed, "sends to a closed peer kept succeeding");
+    });
+}
+
+#[test]
+fn a_non_blocking_stream_never_reports_would_block() {
+    // io_uring stops waiting on a non-blocking socket in some cases (Linux
+    // 6.0 and 6.1: when a woken sendmsg still finds the buffer full, it is
+    // retried on a kernel thread, which then sees O_NONBLOCK) and completes
+    // with EAGAIN; giong submits again. Four writers on one small buffer
+    // keep waking each other into exactly that case. (Several writers at
+    // once interleave their bytes, which is why streams allow one; it is
+    // safe, and the byte count still adds up.)
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = Rc::new(TcpStream::connect(addr).await.unwrap());
+        let s = Rc::new(l.accept().await.unwrap());
+        let tmp = TempFile::new("send-file-nonblocking", b"x");
+        let file = giong::fs::File::open(&tmp.0).await.unwrap();
+        c.send_file(&file, 0, 0).await.unwrap();
+        s.send_file(&file, 0, 0).await.unwrap();
+        // A small send buffer, so the writers keep waiting for room.
+        let small: libc::c_int = 4096;
+        // SAFETY: a valid descriptor and option value.
+        let res = unsafe {
+            libc::setsockopt(
+                std::os::fd::AsRawFd::as_raw_fd(&*c),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&small as *const libc::c_int).cast(),
+                std::mem::size_of_val(&small) as libc::socklen_t,
+            )
+        };
+        assert_eq!(res, 0);
+        const EACH: usize = 2 << 20;
+        let writers: Vec<_> = (0..4u8)
+            .map(|w| {
+                let c = c.clone();
+                giong::spawn(async move {
+                    for _ in 0..EACH / 16384 {
+                        let pieces = vec![vec![w; 8192], vec![w; 8192]];
+                        c.write_all_vectored(pieces).await.0.unwrap();
+                    }
+                })
+            })
+            .collect();
+        let reader = giong::spawn(async move {
+            let mut total = 0;
+            while total < 4 * EACH {
+                let (res, _) = s.read(Vec::with_capacity(64 * 1024)).await;
+                total += res.unwrap();
+            }
+            total
+        });
+        for w in writers {
+            w.await.unwrap();
+        }
+        assert_eq!(reader.await.unwrap(), 4 * EACH);
+    });
+}
+
 #[test]
 fn connect_refused() {
     giong::block_on(async {

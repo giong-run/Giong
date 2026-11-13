@@ -239,6 +239,7 @@ unsafe fn run_blocking(io: Io) -> i32 {
         Io::Connect { .. }
         | Io::Recv { .. }
         | Io::Send { .. }
+        | Io::Writable { .. }
         | Io::SendMsg { .. }
         | Io::RecvMsg { .. }
         | Io::ReadReady { .. } => unreachable!("socket operations never block a thread"),
@@ -459,6 +460,7 @@ impl Epoll {
             Io::Connect { fd, .. }
             | Io::Recv { fd, .. }
             | Io::Send { fd, .. }
+            | Io::Writable { fd }
             | Io::SendMsg { fd, .. }
             | Io::RecvMsg { fd, .. }
             | Io::ReadReady { fd, .. }
@@ -489,6 +491,16 @@ impl Epoll {
                     // EAGAIN (a Unix socket whose listener's backlog is full)
                     // means "try again": the connect is repeated when ready.
                     (res, Dir::Write)
+                }
+                Io::Writable { fd } => {
+                    // The caller just got EAGAIN, so the socket is full: wait
+                    // for the next "writable" edge, then let the caller try
+                    // again (`connecting` marks a wait that has begun).
+                    if *connecting {
+                        return Attempt::Done(0);
+                    }
+                    *connecting = true;
+                    return Attempt::Wait(fd, Dir::Write);
                 }
                 Io::Recv { fd, buf, len } => (
                     retry(|| libc::recv(fd, buf.cast(), len as usize, libc::MSG_DONTWAIT)),
@@ -586,6 +598,7 @@ impl Epoll {
             Io::Connect { .. }
             | Io::Recv { .. }
             | Io::Send { .. }
+            | Io::Writable { .. }
             | Io::SendMsg { .. }
             | Io::RecvMsg { .. }
             | Io::ReadReady { .. } => false,

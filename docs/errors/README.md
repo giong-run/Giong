@@ -56,6 +56,7 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | Code | `Code::` | Meaning |
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
+| [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
 
 ## giong-http
 
