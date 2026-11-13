@@ -3,7 +3,12 @@
 #
 #   scripts/check.sh test       release tests, repeated (default 5 rounds)
 #   scripts/check.sh fallback   the same tests on the io_uring setup tiers used
-#                               by kernels older than 6.1 (COOP_TASKRUN, no flags)
+#                               by kernels older than 6.1 (COOP_TASKRUN, no flags),
+#                               then on the epoll driver (GIONG_DRIVER=epoll)
+#   scripts/check.sh epoll      the tests on the epoll driver only
+#   scripts/check.sh seccomp    the tests with io_uring blocked as in Docker's
+#                               default seccomp profile (scripts/no-io-uring.py),
+#                               so that giong falls back to epoll by itself
 #   scripts/check.sh tsan       all tests under ThreadSanitizer (needs nightly
 #                               with the rust-src component)
 #   scripts/check.sh loom       model-check the wake-up handshakes (src/notify.rs)
@@ -11,7 +16,7 @@
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
 #                               driver state (tests/soak.rs)
-#   scripts/check.sh all        everything above except soak
+#   scripts/check.sh all        everything above except seccomp and soak
 #
 # ROUNDS=n changes how often each test binary is repeated.
 set -euo pipefail
@@ -33,6 +38,21 @@ run_test() {
 run_fallback() {
     for tier in coop basic; do
         GIONG_RING_TIER="$tier" repeat_tests "ring tier '$tier'"
+    done
+    run_epoll
+}
+
+run_epoll() {
+    GIONG_DRIVER=epoll repeat_tests "epoll driver"
+}
+
+run_seccomp() {
+    # Built once first, so that each round only runs the tests.
+    cargo test --release --quiet --workspace --all-features --no-run
+    for round in $(seq 1 "$ROUNDS"); do
+        echo "== io_uring blocked by seccomp: round $round/$ROUNDS"
+        env -u GIONG_DRIVER python3 scripts/no-io-uring.py \
+            cargo test --release --quiet --workspace --all-features
     done
 }
 
@@ -72,10 +92,12 @@ run_soak() {
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback ;;
+    epoll) run_epoll ;;
+    seccomp) run_seccomp ;;
     tsan) run_tsan ;;
     loom) run_loom ;;
     soak) run_soak ;;
     all) run_test; run_fallback; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|tsan|loom|soak|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|all]" >&2; exit 2 ;;
 esac
 echo "ok"

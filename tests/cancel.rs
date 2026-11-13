@@ -387,7 +387,15 @@ fn a_cancelled_operation_owns_its_buffer_until_the_kernel_confirms() {
             !freed.get(),
             "buffer freed while the kernel could still write to it"
         );
-        assert_eq!(giong::stats().tracked_ops, 1);
+        // io_uring keeps the operation until the kernel confirms; epoll was
+        // only waiting for readiness, so nothing can write to the buffer and
+        // the operation is gone at once (the buffer is dropped at the next
+        // turn of the event loop).
+        let expected = match giong::driver_kind() {
+            giong::DriverKind::IoUring => 1,
+            _ => 0,
+        };
+        assert_eq!(giong::stats().tracked_ops, expected);
 
         // After the completion arrives, the buffer is released — no leak.
         sleep(Duration::from_millis(20)).await;

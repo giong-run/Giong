@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
+use super::{Io, MultiIo, MultiKind, MultiPoll, Park};
 use crate::buf::BufPool;
 use crate::error::{Code, Error};
 use crate::slab::Slab;
@@ -52,7 +53,7 @@ const UD_CLOSE: u64 = u64::MAX - 2;
 /// * anything that still arrives is copied to the heap so that its pool buffer
 ///   can be recycled immediately.
 ///
-/// Together with [`Driver::evacuate`] this guarantees that slow or stalled
+/// Together with [`Uring::evacuate`] this guarantees that slow or stalled
 /// connections cannot pin the shared buffer pool.
 const RECV_BACKLOG_LIMIT: usize = 8;
 
@@ -73,14 +74,6 @@ fn holds_pool_buffer(kind: MultiKind, res: i32, flags: u32) -> bool {
     kind == MultiKind::Recv && res > 0 && cqueue::buffer_select(flags).is_some()
 }
 
-/// How the event loop wants to enter the kernel.
-pub(crate) enum Park {
-    /// Submit and collect completions without blocking.
-    Poll,
-    /// Block until a completion arrives, or for at most the given duration.
-    Wait(Option<Duration>),
-}
-
 enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
     Waiting(Waker),
@@ -89,12 +82,6 @@ enum Lifecycle {
     /// The future was dropped while in flight. Holds the operation's resources
     /// until the kernel is done with them.
     Ignored(Option<Box<dyn Any>>),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MultiKind {
-    Accept,
-    Recv,
 }
 
 /// A multishot completion waiting to be consumed.
@@ -124,17 +111,7 @@ enum OpState {
     Multi(Multi),
 }
 
-/// Result of polling a multishot operation.
-pub(crate) enum MultiPoll {
-    Item(i32, u32),
-    /// Received data that lives on the heap rather than in a pool buffer.
-    Heap(Vec<u8>),
-    /// Nothing queued and no SQE in flight: the caller must arm it.
-    NeedArm,
-    Pending,
-}
-
-pub(crate) struct Driver {
+pub(crate) struct Uring {
     ring: IoUring,
     ops: Slab<OpState>,
     /// SQEs pushed whose final CQE has not been seen yet.
@@ -198,10 +175,11 @@ fn explain_setup_error(e: io::Error) -> io::Error {
             Error::new(
                 Code::IoUringUnavailable,
                 format!("giong needs io_uring, which is not available here ({e})"),
-                "allow io_uring for this process. Docker's default seccomp profile blocks it, \
-                 sandboxes such as gVisor do not have it, and the kernel.io_uring_disabled \
-                 sysctl turns it off; docs/DEPLOYMENT.md shows how to allow it in Docker and \
-                 Kubernetes.",
+                "allow io_uring for this process, or let giong use its epoll driver by not \
+                 asking for io_uring (Builder::driver, GIONG_DRIVER). Docker's default seccomp \
+                 profile blocks io_uring, sandboxes such as gVisor do not have it, and the \
+                 kernel.io_uring_disabled sysctl turns it off; docs/DEPLOYMENT.md shows how to \
+                 allow it in Docker and Kubernetes.",
             )
             .with_source(e),
         ),
@@ -245,7 +223,74 @@ fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
     b.build(entries)
 }
 
-impl Driver {
+/// The SQE for a single-shot operation.
+fn sqe_for(io: &Io) -> squeue::Entry {
+    let cwd = types::Fd(libc::AT_FDCWD);
+    match *io {
+        Io::Connect { fd, addr, len } => opcode::Connect::new(types::Fd(fd), addr, len).build(),
+        Io::Recv { fd, buf, len } => opcode::Recv::new(types::Fd(fd), buf, len).build(),
+        Io::Send {
+            fd,
+            buf,
+            len,
+            flags,
+        } => opcode::Send::new(types::Fd(fd), buf, len)
+            .flags(flags)
+            .build(),
+        Io::SendMsg { fd, msg, flags } => opcode::SendMsg::new(types::Fd(fd), msg)
+            .flags(flags)
+            .build(),
+        Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
+        Io::ReadReady { fd, buf, len } => opcode::Read::new(types::Fd(fd), buf, len).build(),
+        Io::Read {
+            fd,
+            buf,
+            len,
+            offset,
+        } => opcode::Read::new(types::Fd(fd), buf, len)
+            .offset(offset)
+            .build(),
+        Io::Write {
+            fd,
+            buf,
+            len,
+            offset,
+        } => opcode::Write::new(types::Fd(fd), buf, len)
+            .offset(offset)
+            .build(),
+        Io::OpenAt { path, flags, mode } => opcode::OpenAt::new(cwd, path)
+            .flags(flags)
+            .mode(mode)
+            .build(),
+        Io::Close { fd } => opcode::Close::new(types::Fd(fd)).build(),
+        Io::Statx {
+            dir,
+            path,
+            flags,
+            mask,
+            out,
+        } => opcode::Statx::new(types::Fd(dir), path, out.cast())
+            .flags(flags)
+            .mask(mask)
+            .build(),
+        Io::Fsync { fd, datasync } => {
+            let flags = if datasync {
+                types::FsyncFlags::DATASYNC
+            } else {
+                types::FsyncFlags::empty()
+            };
+            opcode::Fsync::new(types::Fd(fd)).flags(flags).build()
+        }
+        Io::Fallocate { fd, offset, len } => opcode::Fallocate::new(types::Fd(fd), len)
+            .offset(offset)
+            .build(),
+        Io::UnlinkAt { path, flags } => opcode::UnlinkAt::new(cwd, path).flags(flags).build(),
+        Io::MkDirAt { path, mode } => opcode::MkDirAt::new(cwd, path).mode(mode).build(),
+        Io::RenameAt { from, to } => opcode::RenameAt::new(cwd, from, cwd, to).build(),
+    }
+}
+
+impl Uring {
     pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
         let ring = build_ring(entries)?;
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
@@ -259,7 +304,9 @@ impl Driver {
                         Error::new(
                             Code::KernelTooOld,
                             format!("giong needs io_uring buffer rings, from Linux 6.0 ({e})"),
-                            "run on Linux 6.0 or newer (6.1 or newer is faster).",
+                            "run on Linux 6.0 or newer (6.1 or newer is faster), or let giong \
+                             use its epoll driver by not asking for io_uring (Builder::driver, \
+                             GIONG_DRIVER).",
                         )
                         .with_source(e),
                     )
@@ -314,11 +361,11 @@ impl Driver {
     }
 
     /// Submits a single-shot operation; `waker` is woken on completion.
-    pub(crate) fn submit_op(&mut self, sqe: squeue::Entry, waker: &Waker) -> usize {
+    pub(crate) fn submit_op(&mut self, io: &Io, waker: &Waker) -> usize {
         let key = self
             .ops
             .insert(OpState::Single(Lifecycle::Waiting(waker.clone())));
-        self.push(sqe.user_data(key as u64));
+        self.push(sqe_for(io).user_data(key as u64));
         key
     }
 
@@ -379,7 +426,16 @@ impl Driver {
         }))
     }
 
-    pub(crate) fn arm_multi(&mut self, key: usize, sqe: squeue::Entry) {
+    pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
+        let sqe = match io {
+            MultiIo::Accept { fd } => opcode::AcceptMulti::new(types::Fd(fd))
+                .flags(libc::SOCK_CLOEXEC)
+                .build(),
+            MultiIo::Recv { fd } => opcode::RecvMulti::new(types::Fd(fd), BGID).build(),
+            MultiIo::RecvMsg { fd, hdr } => {
+                opcode::RecvMsgMulti::new(types::Fd(fd), hdr, BGID).build()
+            }
+        };
         match self.ops.get_mut(key) {
             Some(OpState::Multi(m)) if !m.armed => m.armed = true,
             _ => panic!("giong: arming an invalid multishot operation"),
@@ -781,6 +837,18 @@ mod tests {
     /// that `GIONG_RING_TIER` really exercises the older-kernel paths.
     #[test]
     fn every_ring_tier_builds() {
+        // Where io_uring is blocked (a container's seccomp profile, a
+        // sandbox) there is no ring to build; giong runs on epoll there, and
+        // tests/blocked.rs covers that.
+        if let Err(e) = build_ring_from(64, RingTier::Basic) {
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
+            ) {
+                eprintln!("skipped: io_uring is blocked here ({e})");
+                return;
+            }
+        }
         // `SINGLE_ISSUER` is only requested by the preferred tier.
         let coop = build_ring_from(64, RingTier::Coop).expect("coop tier");
         assert!(!coop.params().is_setup_single_issuer());

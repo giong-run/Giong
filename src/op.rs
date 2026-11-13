@@ -1,4 +1,4 @@
-//! A single-shot io_uring operation as a future.
+//! A single-shot I/O operation as a future, on either driver.
 
 use std::any::Any;
 use std::future::Future;
@@ -7,18 +7,18 @@ use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use io_uring::squeue;
-
+use crate::driver::{Io, Start};
 use crate::runtime;
 
-/// One SQE → one CQE.
+/// One operation → one result.
 ///
-/// `T` are the resources the SQE points at (typically the buffer). They are
-/// owned by the future while the operation is in flight and returned together
-/// with the result. If the future is dropped first, ownership moves to the
-/// driver until the kernel reports completion (see `driver` module docs).
+/// `T` are the resources the operation points at (typically the buffer).
+/// They are owned by the future while the operation is in flight and
+/// returned together with the result. If the future is dropped first,
+/// ownership moves to the driver until nothing can use them any more (see
+/// the `driver` module docs).
 pub(crate) struct Op<T: 'static> {
-    sqe: Option<squeue::Entry>,
+    io: Option<Io>,
     /// Driver key while in flight.
     key: Option<usize>,
     data: Option<T>,
@@ -34,11 +34,11 @@ impl<T: 'static> Unpin for Op<T> {}
 impl<T: 'static> Op<T> {
     /// # Safety contract (upheld by callers in this crate)
     ///
-    /// Every pointer in `sqe` must point into memory owned by `data` (or into
+    /// Every pointer in `io` must point into memory owned by `data` (or into
     /// `'static` memory) at an address that does not change when `data` moves.
-    pub(crate) fn new(sqe: squeue::Entry, data: T) -> Self {
+    pub(crate) fn new(io: Io, data: T) -> Self {
         Self {
-            sqe: Some(sqe),
+            io: Some(io),
             key: None,
             data: Some(data),
             worker_uid: 0,
@@ -48,7 +48,7 @@ impl<T: 'static> Op<T> {
 }
 
 impl<T: 'static> Future for Op<T> {
-    /// `(result, cqe flags, resources)`.
+    /// `(result, completion flags, resources)`.
     type Output = (i32, u32, T);
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -57,13 +57,21 @@ impl<T: 'static> Future for Op<T> {
             let mut driver = w.driver.borrow_mut();
             match this.key {
                 None => {
-                    let sqe = this
-                        .sqe
+                    let io = this
+                        .io
                         .take()
                         .expect("giong: operation polled after completion");
-                    this.key = Some(driver.submit_op(sqe, cx.waker()));
-                    this.worker_uid = w.shared.uid;
-                    Poll::Pending
+                    match driver.start(&io, cx.waker()) {
+                        Start::Done(res, flags) => {
+                            let data = this.data.take().expect("operation resources");
+                            Poll::Ready((res, flags, data))
+                        }
+                        Start::Submitted(key) => {
+                            this.key = Some(key);
+                            this.worker_uid = w.shared.uid;
+                            Poll::Pending
+                        }
+                    }
                 }
                 Some(key) => {
                     assert_eq!(

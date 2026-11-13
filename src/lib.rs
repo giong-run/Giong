@@ -1,6 +1,7 @@
 //! # giong
 //!
-//! A thread-per-core async runtime for Linux, built directly on **io_uring**.
+//! A thread-per-core async runtime for Linux, built on **io_uring**, with an
+//! epoll driver for the places where io_uring is blocked or too old.
 //!
 //! Named after Thánh Gióng, the child of Vietnamese legend who lay silent for
 //! three years and then rose a giant: giong costs next to nothing while idle
@@ -22,6 +23,11 @@
 //! * **One ring for everything.** TCP, UDP and Unix sockets ([`net`]) and
 //!   files ([`fs`]) all go through the worker's io_uring. File I/O needs no
 //!   pool of blocking threads.
+//! * **An epoll driver when io_uring is not there.** In a container whose
+//!   seccomp profile blocks io_uring, under gVisor, or on a kernel older than
+//!   6.0, a worker runs on epoll instead, by itself and with the same API.
+//!   [`Builder::driver`] or `GIONG_DRIVER` choose explicitly, and
+//!   [`driver_kind`] tells which one a worker got.
 //! * **A latency dial.** [`Builder::spin_before_park`] lets a worker watch its
 //!   ring instead of sleeping, for services where microseconds matter more
 //!   than an idle core.
@@ -58,8 +64,9 @@
 //!
 //! ## Requirements
 //!
-//! Linux 6.0 or newer (6.1+ recommended). giong does not build on other
-//! platforms.
+//! Linux. The io_uring driver needs 6.0 or newer (6.1+ recommended); older
+//! kernels, tested down to 5.15, run on the epoll driver. giong does not
+//! build on other platforms.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/giong-run/Giong/main/assets/giong-icon.svg",
@@ -67,7 +74,7 @@
 )]
 
 #[cfg(not(target_os = "linux"))]
-compile_error!("giong only supports Linux: it is built directly on io_uring (kernel >= 6.0)");
+compile_error!("giong only supports Linux: it is built on io_uring and epoll");
 
 mod buf;
 mod driver;
@@ -84,10 +91,11 @@ pub mod sync;
 pub mod time;
 
 pub use buf::{IoBuf, IoBufMut, RecvBuf};
+pub use driver::DriverKind;
 pub use executor::{spawn, yield_now, JoinError, JoinHandle, RemoteJoinHandle};
 pub use runtime::{
-    block_on, handle, is_shutting_down, shutdown_signal, try_worker_id, until_shutdown, worker_id,
-    Builder, Handle, Runtime, ShutdownSignal,
+    block_on, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,
+    until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal,
 };
 
 #[doc(hidden)]

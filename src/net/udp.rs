@@ -9,12 +9,11 @@ use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::task::{Context, Poll};
 
-use io_uring::{cqueue, opcode, types};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::{close_socket, inet_addr, no_addresses, os_err, unexpected, wait_for_pool, MultiSlot};
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
-use crate::driver::{MultiKind, MultiPoll, BGID};
+use crate::driver::{buffer_id, Io, MultiIo, MultiKind, MultiPoll};
 use crate::error::{raise, Code};
 use crate::op::Op;
 use crate::runtime;
@@ -235,7 +234,7 @@ impl UdpSocket {
             loop {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res, flags) => {
-                        let bid = cqueue::buffer_select(flags);
+                        let bid = buffer_id(flags);
                         return Poll::Ready(match (res, bid) {
                             (n, Some(bid)) if n > 0 => Datagram::parse(RecvBuf::pooled(
                                 driver.pool().clone(),
@@ -261,13 +260,11 @@ impl UdpSocket {
                         if !wait_for_pool(&mut driver, cx) {
                             return Poll::Pending;
                         }
-                        let sqe = opcode::RecvMsgMulti::new(
-                            types::Fd(self.sock.as_raw_fd()),
-                            &RECV_HEADER.0,
-                            BGID,
-                        )
-                        .build();
-                        driver.arm_multi(key, sqe);
+                        let io = MultiIo::RecvMsg {
+                            fd: self.sock.as_raw_fd(),
+                            hdr: &RECV_HEADER.0,
+                        };
+                        driver.arm_multi(key, io);
                     }
                     MultiPoll::Pending => return Poll::Pending,
                 }
@@ -296,8 +293,11 @@ impl UdpSocket {
         }
         let mut msg = Message::new(buf.as_mut_ptr(), buf.capacity());
         msg.hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        let sqe = opcode::RecvMsg::new(types::Fd(self.sock.as_raw_fd()), &mut msg.hdr).build();
-        let (res, _, (msg, mut buf)) = Op::new(sqe, (msg, buf)).await;
+        let io = Io::RecvMsg {
+            fd: self.sock.as_raw_fd(),
+            msg: &mut msg.hdr,
+        };
+        let (res, _, (msg, mut buf)) = Op::new(io, (msg, buf)).await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
@@ -344,10 +344,12 @@ impl UdpSocket {
             );
         }
         msg.hdr.msg_namelen = addr.len();
-        let sqe = opcode::SendMsg::new(types::Fd(self.sock.as_raw_fd()), &msg.hdr)
-            .flags(libc::MSG_NOSIGNAL as u32)
-            .build();
-        let (res, _, (_msg, buf)) = Op::new(sqe, (msg, buf)).await;
+        let io = Io::SendMsg {
+            fd: self.sock.as_raw_fd(),
+            msg: &msg.hdr,
+            flags: libc::MSG_NOSIGNAL as u32,
+        };
+        let (res, _, (_msg, buf)) = Op::new(io, (msg, buf)).await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -359,10 +361,13 @@ impl UdpSocket {
     /// [`connect`](Self::connect).
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         let len = buf.len().min(u32::MAX as usize) as u32;
-        let sqe = opcode::Send::new(types::Fd(self.sock.as_raw_fd()), buf.as_ptr(), len)
-            .flags(libc::MSG_NOSIGNAL)
-            .build();
-        let (res, _, buf) = Op::new(sqe, buf).await;
+        let io = Io::Send {
+            fd: self.sock.as_raw_fd(),
+            buf: buf.as_ptr(),
+            len,
+            flags: libc::MSG_NOSIGNAL,
+        };
+        let (res, _, buf) = Op::new(io, buf).await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {

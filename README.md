@@ -5,12 +5,12 @@
   </picture>
 </p>
 
-<p align="center"><b>A thread-per-core async runtime for Linux, built directly on io_uring.</b></p>
+<p align="center"><b>A thread-per-core async runtime for Linux, built on io_uring, with an epoll driver wherever io_uring is blocked.</b></p>
 
 <p align="center">
   <a href="https://github.com/giong-run/Giong/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/giong-run/Giong/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
-  <img alt="Platform: Linux 6.0+" src="https://img.shields.io/badge/platform-Linux%206.0%2B-informational">
+  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-informational">
 </p>
 
 Named after Thánh Gióng, the child of Vietnamese legend who lay silent for three years and
@@ -25,7 +25,8 @@ load arrives.
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
 > [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8)
 > and [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool).
-> 173 tests pass on three io_uring setups and on real 6.0 and 6.1 kernels; ThreadSanitizer
+> The tests pass on three io_uring setups, on the epoll driver, inside Docker's default
+> seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
 > fuzzed and a soak test churns connections for two hours every night. It has **not** run
 > in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
@@ -49,8 +50,12 @@ load arrives.
 - **Cancellation-safe by construction.** Dropping an I/O future never frees memory the
   kernel may still write to, and wrapping `recv`, `recv_from` or `accept` in a timeout
   loses neither data nor connections.
-- **Small enough to read.** About 5,400 lines for the runtime, three dependencies, and a
-  comment on every `unsafe` block.
+- **Runs where io_uring cannot.** In a Docker container with the default seccomp profile,
+  under gVisor or on a kernel older than 6.0, a worker switches to an epoll driver by
+  itself: same API, same tests, and as fast as raw Tokio there. See
+  [Two drivers](#two-drivers-io_uring-and-epoll).
+- **Small enough to read.** About 8,200 lines of code for the runtime, both drivers
+  included, three dependencies, and a comment on every `unsafe` block.
 
 What it is **not**: faster than everything at everything. On the classic 50-connection
 benchmark giong, a tuned Monoio and raw Tokio are within noise of each other, because the
@@ -79,15 +84,15 @@ connection, the same as the others.
 
 ## Requirements
 
-- **Linux 6.0 or newer** (6.1+ recommended). Developed and tested on 6.18.
+- **Linux.** For the io_uring driver, 6.0 or newer (6.1+ recommended) with io_uring
+  allowed; developed and tested on 6.18. Elsewhere giong runs on its epoll driver, tested
+  down to 5.15: in containers whose seccomp profile blocks io_uring (Docker's and
+  containerd's default ones), under gVisor, or with the `kernel.io_uring_disabled` sysctl.
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow io_uring in Docker, Docker
+  Compose and Kubernetes.
 - Rust 1.80 or newer.
-- io_uring must be allowed. Docker's and containerd's default seccomp profiles block it;
-  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow just io_uring in Docker,
-  Docker Compose and Kubernetes.
-- giong does **not** build on Windows or macOS: io_uring is a Linux interface. On Windows
-  use WSL2 with a 6.x kernel (`uname -r`; run `wsl --update` if it is older), a Linux
-  virtual machine, or Docker with the profile from
-  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+- giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
+  `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker.
 
 ## Quick start
 
@@ -193,7 +198,7 @@ let runtime = giong::Builder::new()
 | Area | API |
 |---|---|
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
-| Configuration | `.workers(n)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)` |
+| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`; `giong::driver_kind()` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
 | TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
@@ -263,6 +268,63 @@ run the tasks that are ready  →  io_uring_enter (submit everything, collect ev
 | **Panics** | A panic in a task is caught and reported through its `JoinHandle`. | One bad connection does not take down the worker. |
 | **Shutdown** | With a grace period, a worker keeps running its tasks after its main future returns, until they finish or the period ends. Then: cancel everything, wait for the kernel to confirm, free. If confirmation does not come, leak on purpose. | Requests in progress are answered. Memory safety matters more than a few megabytes at exit. |
 | **Old kernels** | Three ring setups, tried in order: `DEFER_TASKRUN` (6.1+), `COOP_TASKRUN` (6.0), no flags. | The same code runs on 6.0; the two fallbacks are tested on every change by forcing them. |
+| **No io_uring** | An epoll driver behind the same operations, chosen when the ring cannot be set up. | Containers and sandboxes that block io_uring still run giong (see [Two drivers](#two-drivers-io_uring-and-epoll)). |
+
+## Two drivers: io_uring and epoll
+
+Each worker runs on one of two I/O drivers, behind the same API:
+
+- **io_uring**, the default, which everything above describes. It needs Linux 6.0 or newer
+  and the three io_uring system calls.
+- **epoll**, chosen without being told where io_uring cannot be set up: a Docker container
+  with the default seccomp profile, Kubernetes with `RuntimeDefault`, gVisor, the
+  `kernel.io_uring_disabled` sysctl, or a kernel older than 6.0 (tested on 5.15).
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow io_uring where it is blocked.
+
+`Builder::driver(DriverKind::IoUring)`, or `GIONG_DRIVER=io_uring`, makes the runtime fail
+to start where io_uring is missing ([GIONG-E0001](docs/errors/E0001.md)) instead of falling
+back; `DriverKind::Epoll`, or `GIONG_DRIVER=epoll`, chooses epoll anywhere.
+`giong::driver_kind()` tells which one a worker got. The whole test suite runs on both, and
+in CI also inside a Docker container with the default profile and on a real 5.15 kernel.
+
+| | io_uring | epoll |
+|---|---|---|
+| A socket read or write | queued, and handed to the kernel with the rest of the tick in one `io_uring_enter` | tried at once with a non-blocking system call; on `EAGAIN` the task waits until the socket is ready |
+| Accept and receive | multishot, into a buffer the kernel picks | tried when the socket becomes readable, into the same pool of buffers |
+| Registering a socket | nothing to register | once, edge-triggered, when it is first used |
+| Waiting | `io_uring_enter` | `epoll_pwait2` |
+| Files | entries in the same ring | a pool of blocking threads; pipes and sockets opened as files use readiness |
+| Cancelling a file read or write | the kernel cancels it | one already running on a thread finishes there, and its buffer is freed then |
+| A task whose I/O never waits | yields at the end of the tick | yields after 128 operations, so it cannot starve the others |
+
+The same server program on both drivers (`GIONG_DRIVER`), against raw Tokio and the
+hand-written epoll server from [Benchmarks](#benchmarks), on the same machine with the same
+method, one core each. The first rows are `bench/run.sh` at 50 connections (medians of five
+rounds), the next ones `bench/scale.sh` (three rounds) and `bench/syscalls.sh`:
+
+| | giong, io_uring | giong, epoll | Raw Tokio | Hand-written epoll |
+|---|---|---|---|---|
+| `/json`: requests/s | 151.8k (141–167k) | 158.3k (156–166k) | 161.8k (158–168k) | 155.4k (148–164k) |
+| `/users` (8 KB): requests/s | **55.7k** (53–59k) | 32.7k (31–35k) | 34.0k (29–36k) | 32.9k (31–35k) |
+| Pipelined `/json`: requests/s | 1.43M | 1.44M | 1.43M | 1.45M |
+| System calls per request | **0.04** | 2.02 | 2.05 | 2.03 |
+| CPU per request, `/json` | 4.68 µs | 5.00 µs | 5.08 µs | 5.00 µs |
+| CPU per request, `/users` | **18.7 µs** | 31.0 µs | 33.6 µs | 31.1 µs |
+| 1 connection: median latency | 30 µs | 32 µs | 30 µs | 29 µs |
+| 1,000 connections: p99 | 6.1 ms | 7.6 ms | 83.9 ms | 7.1 ms |
+| 5,000 connections: requests/s | 150.0k | **152.6k** | 118.6k | 118.7k |
+| 5,000 connections: CPU per request | **4.92 µs** | 5.72 µs | 6.09 µs | 5.51 µs |
+| 5,000 connections: p99 | **37 ms** | 43 ms | 175 ms | 39 ms |
+
+- **On epoll, giong is an epoll runtime like the others, and as fast as they are**: two
+  system calls per request, and the same throughput as raw Tokio and the hand-written
+  server on every route. At 5,000 connections it keeps the throughput of io_uring, 29%
+  above the other two, at 16% more CPU per request than on io_uring.
+- **What sets giong apart comes from io_uring**: a batch of responses in one system call,
+  which on the 8 KB response is worth 70% more requests per second and 40% less CPU per
+  request. Allow io_uring where you can.
+- `giong-http` on epoll: 160.1k requests/s on `/json` against 175.6k on io_uring, and 1.05M
+  against 1.28M pipelined; we have not found yet where the pipelined gap comes from.
 
 ## Benchmarks
 
@@ -589,8 +651,8 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-643 tests across the seven crates (`cargo test --workspace --all-features`), repeated in
-release mode on all three io_uring setups without a failure. The runtime's, HTTP's and
+652 tests across the seven crates (`cargo test --workspace --all-features`), run in
+release mode on all three io_uring setups and on the epoll driver without a failure. The runtime's, HTTP's and
 TLS's main suites are below; the database clients and giong-web describe theirs in their
 READMEs.
 
@@ -601,28 +663,34 @@ READMEs.
 | `tests/net.rs` (15) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/udp.rs` (16) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, sockets closed on drop |
-| `tests/fs.rs` (19) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight |
+| `tests/fs.rs` (20) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll) |
 | `tests/cancel.rs` (11) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; teardown with everything in flight |
 | `tests/multi.rs` (14) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (9) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
+| `tests/driver.rs` (6), `tests/blocked.rs` (2) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run |
 | `giong-http` (81) | 16 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies); 28 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 19 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 11 end-to-end HTTPS tests with a rustls client; 5 documentation examples |
 | `giong-tls` (34) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
 
-- **ThreadSanitizer** (`scripts/check.sh tsan`, Rust nightly) over the workspace's tests:
-  no data race. Two things are handled specially, both because of the tool:
+- **ThreadSanitizer** (`scripts/check.sh tsan`, Rust nightly) over the workspace's tests,
+  on both drivers: no data race. Two things are handled specially, both because of the tool:
   sanitizer builds close descriptors with `close(2)` (it cannot see a close that goes
   through the ring and then reports races on reused descriptor numbers), and the SIGTERM
   test is skipped (the sanitizer delivers signals only inside libc calls it intercepts,
   and giong's threads wait in raw system calls).
-- **The fallback io_uring setups** (`scripts/check.sh fallback`): the whole suite again
-  with `GIONG_RING_TIER=coop` (the flags of kernel 6.0) and `basic` (no flags at all).
-- **Real 6.0 and 6.1 kernels** (`scripts/kernels.sh`): the test binaries booted in QEMU
-  on Linux 6.0.19 and 6.1.155, in CI on every change. It found that a runtime could fail
-  to start on 6.0, which pins one page more than the buffer ring needs; fixed.
+- **The fallback io_uring setups and the epoll driver** (`scripts/check.sh fallback`): the
+  whole suite again with `GIONG_RING_TIER=coop` (the flags of kernel 6.0), `basic` (no
+  flags at all) and `GIONG_DRIVER=epoll`.
+- **io_uring blocked as in a container** (`scripts/check.sh seccomp`, and the `docker` CI
+  job inside Docker's default seccomp profile): the whole suite with no driver named, so
+  every runtime has to fall back to epoll by itself.
+- **Real 5.15, 6.0 and 6.1 kernels** (`scripts/kernels.sh`): the test binaries booted in
+  QEMU on Linux 5.15.225 (epoll: its io_uring has no buffer rings), 6.0.19 and 6.1.155,
+  in CI on every change. It found that a runtime could fail to start on 6.0, which pins
+  one page more than the buffer ring needs; fixed.
 - **loom** (`scripts/check.sh loom`): the two handshakes between a worker and the threads
   that wake its tasks (`src/notify.rs`) are model-checked under every interleaving and
   memory-ordering outcome loom explores. It found a lost wake-up: a task waiting on state
@@ -645,8 +713,9 @@ Also:
 - **Graceful shutdown under load**: SIGTERM during 40 slow requests. Without a grace
   period 156 of 200 requests were answered; with one, 400 of 400.
 - **CI** runs formatting, clippy, the documentation build, a build with Rust 1.80, the
-  repeated tests, the fallback setups, ThreadSanitizer, the loom models and the real 6.0
-  and 6.1 kernels on every change, and fuzzing and the soak test every night.
+  repeated tests, the fallback setups and the epoll driver, the tests inside Docker,
+  ThreadSanitizer, the loom models and the real 5.15, 6.0 and 6.1 kernels on every change,
+  and fuzzing and the soak test every night.
 
 Not verified, and you should know it:
 
@@ -663,7 +732,7 @@ Not verified, and you should know it:
 
 | | giong 0.3 | Monoio 0.2.4 | Glommio 0.9.0 |
 |---|---|---|---|
-| Platforms | Linux ≥ 6.0 | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
+| Platforms | Linux: io_uring on ≥ 6.0, an epoll driver elsewhere | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
 | Receiving | multishot, kernel-provided buffers | one submission per read, caller's buffer | direct `recv`, io_uring to wait |
 | Accepting | multishot | one submission per accept | one submission per accept |
 | Buffer API | ownership passing | ownership passing | borrowed (`AsyncRead` / `AsyncWrite`) |
@@ -674,7 +743,7 @@ Not verified, and you should know it:
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
 | Ecosystem | its own HTTP/1.1 server and client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
-| Size | ~8,800 lines, plus ~5,500 for HTTP and TLS and ~17,000 for the database clients | ~25,000 lines | ~40,500 lines |
+| Size | ~11,400 lines, plus ~7,800 for HTTP and TLS and ~17,500 for the database clients | ~25,000 lines | ~40,500 lines |
 
 Monoio is the mature choice and runs in production at ByteDance; if you need HTTP/2 or
 Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
@@ -689,7 +758,9 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   Name Service Switch sources (mDNS, LDAP) are not used. `bind` still resolves with a
   blocking call, which only matters at startup. `fs::read_dir` reads each batch of
   entries with a direct system call on the worker (io_uring cannot read directories):
-  quick on a local disk, a network round trip on NFS. Also missing: Unix datagram
+  quick on a local disk, a network round trip on NFS. On the epoll driver, file
+  operations run on a pool of blocking threads, and one that is cancelled while running
+  finishes there. Also missing: Unix datagram
   sockets, multicast, `set_len`, file locks, `O_DIRECT` with registered buffers.
 - **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
   before it calls the handler; one over the limit is refused.
@@ -727,8 +798,11 @@ src/
   lib.rs        entry point and docs
   runtime.rs    Builder, Runtime, Handle, the event loop, shutdown, signals
   executor.rs   tasks, wakers, spawn, JoinHandle
-  driver.rs     io_uring: submit and reap, operation tracking, cancellation, backpressure
-  op.rs         a single operation (one SQE, one CQE) as a future
+  driver/       the drivers behind one interface (mod.rs: operations, choosing, falling back)
+    uring.rs    io_uring: submit and reap, operation tracking, cancellation, backpressure
+    epoll.rs    epoll: readiness, edge-triggered registration, the per-task budget
+    blocking.rs the thread pool for file operations on epoll
+  op.rs         a single operation as a future
   buf.rs        IoBuf / IoBufMut, the kernel-shared buffer pool, RecvBuf
   net.rs        the core shared by stream sockets, TcpListener, TcpStream
   net/unix.rs   UnixListener, UnixStream
@@ -743,9 +817,9 @@ giong-mysql/    the MySQL client crate (client/server protocol, authentication, 
 giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub, Pool)
 giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs
-tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin
+tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, ...
 bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, the programs compared against, results/
-scripts/        check.sh (repeated tests, fallback setups, ThreadSanitizer), valgrind.sh
+scripts/        check.sh (repeated tests, fallback setups, epoll, seccomp, ThreadSanitizer), kernels.sh, no-io-uring.py, valgrind.sh
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```
 

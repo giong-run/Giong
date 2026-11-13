@@ -492,6 +492,7 @@ impl Worker {
             let Some(id) = self.queue.borrow_mut().pop_front() else {
                 break;
             };
+            crate::driver::refill_budget();
             if id == MAIN_TASK {
                 poll_main();
                 continue;

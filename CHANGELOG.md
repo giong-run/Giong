@@ -10,6 +10,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **An epoll driver**, so that giong runs where io_uring is blocked or missing: in a
+  Docker container with the default seccomp profile, in Kubernetes with `RuntimeDefault`,
+  under gVisor, with the `kernel.io_uring_disabled` sysctl, and on kernels older than 6.0
+  (tested on 5.15). A worker falls back to it by itself when io_uring cannot be set up;
+  `Builder::driver(DriverKind::IoUring | DriverKind::Epoll)` or `GIONG_DRIVER=io_uring|epoll`
+  choose explicitly (asking for io_uring where it is blocked fails with `GIONG-E0001`, as
+  before), and `giong::driver_kind()` tells which driver a worker got. Every API behaves
+  the same on both; on epoll, file operations run on a pool of blocking threads, except on
+  pipes and sockets, and a file is closed only once the threads are done with it. On one
+  core, epoll does what raw Tokio and a hand-written epoll server do (158k requests per
+  second on a small response at 50 connections, 2.02 system calls per request), while
+  io_uring keeps its lead where batching counts: 55.7k against 32.7k requests per second
+  on an 8 KB response. The README has the full comparison.
+- **Verification**: `scripts/check.sh fallback` also runs the suite on epoll;
+  `scripts/check.sh seccomp` runs it with io_uring blocked the way Docker blocks it
+  (`scripts/no-io-uring.py`), and CI runs it inside a Docker container with the default
+  profile and on a real 5.15 kernel. ThreadSanitizer runs on both drivers.
+
 - **Load balancing across workers**, without moving a task once it has started (so tasks
   still need not be `Send`):
   - `Handle::spawn_balanced(f)`: `f` waits in a queue shared by the workers, and the
@@ -126,6 +144,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong**: a runtime that cannot use io_uring now starts on epoll instead of failing with
+  `GIONG-E0001` or `GIONG-E0002`; those errors are raised only when io_uring was asked
+  for. An unknown `GIONG_DRIVER` value fails with `GIONG-E0004`. `docs/DEPLOYMENT.md`
+  explains when each driver is used.
 - **`giong-http`**: `Server::serve`, `serve_unix` and `serve_tls` take any `Handler`. A
   closure passed to them needs its argument's type written (`|req: Request| async
   move { .. }`): Rust no longer infers it.

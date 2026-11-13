@@ -1,36 +1,64 @@
-//! What a user sees when io_uring is blocked, as in a Docker container with
-//! the default seccomp profile: the test runs itself again in a child process
+//! What happens where io_uring is blocked, as in a Docker container with the
+//! default seccomp profile: each test runs itself again in a child process
 //! that installs a seccomp filter making `io_uring_setup` fail with `EPERM`.
+//!
+//! By default giong then runs on its epoll driver; a runtime that insists on
+//! io_uring fails with an error that says why and what to do.
 
 use std::process::Command;
 
+use giong::DriverKind;
+
 const CHILD: &str = "GIONG_TEST_BLOCKED_CHILD";
 
-#[test]
-fn a_blocked_io_uring_is_explained() {
-    if std::env::var_os(CHILD).is_some() {
-        block_io_uring_setup();
-        let rt = giong::Builder::new().workers(1).build().unwrap();
-        let err = rt.run(|_| async {}).unwrap_err();
-        println!("run: {err}");
-        println!("code: {:?}", giong::error::code(&err));
-        let err = giong::Builder::new().block_on(async {}).unwrap_err();
-        println!("block_on: {err}");
-        return;
-    }
-
+/// Runs the test `name` again in a child process with io_uring blocked, and
+/// returns what it printed. Panics if the child failed.
+fn run_blocked_child(name: &str) -> String {
     let out = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "a_blocked_io_uring_is_explained", "--nocapture"])
+        .args(["--exact", name, "--nocapture"])
         .env(CHILD, "1")
+        .env_remove("GIONG_DRIVER")
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success(),
         "{stdout}{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    for call in ["run", "block_on"] {
+    stdout
+}
+
+fn in_child() -> bool {
+    std::env::var_os(CHILD).is_some()
+}
+
+#[test]
+fn a_runtime_that_requires_io_uring_says_why_it_cannot_start() {
+    if in_child() {
+        block_io_uring_setup();
+        let rt = giong::Builder::new()
+            .workers(1)
+            .driver(DriverKind::IoUring)
+            .build()
+            .unwrap();
+        let err = rt.run(|_| async {}).unwrap_err();
+        println!("run: {err}");
+        println!("code: {:?}", giong::error::code(&err));
+        let err = giong::Builder::new()
+            .driver(DriverKind::IoUring)
+            .block_on(async {})
+            .unwrap_err();
+        println!("block_on: {err}");
+        // The environment variable asks for the same thing.
+        std::env::set_var("GIONG_DRIVER", "io_uring");
+        let err = giong::Builder::new().block_on(async {}).unwrap_err();
+        println!("env: {err}");
+        return;
+    }
+
+    let stdout = run_blocked_child("a_runtime_that_requires_io_uring_says_why_it_cannot_start");
+    for call in ["run", "block_on", "env"] {
         let line = stdout
             .lines()
             .find(|l| l.starts_with(&format!("{call}: ")))
@@ -41,6 +69,7 @@ fn a_blocked_io_uring_is_explained() {
         );
         assert!(line.contains("giong needs io_uring"), "{line}");
         assert!(line.contains("seccomp"), "{line}");
+        assert!(line.contains("epoll driver"), "{line}");
         assert!(line.contains("docs/DEPLOYMENT.md"), "{line}");
         assert!(line.contains("docs/errors/E0001.md"), "{line}");
     }
@@ -48,6 +77,50 @@ fn a_blocked_io_uring_is_explained() {
         stdout.contains("code: Some(IoUringUnavailable)"),
         "{stdout}"
     );
+}
+
+#[test]
+fn the_default_runtime_falls_back_to_epoll_and_works() {
+    if in_child() {
+        block_io_uring_setup();
+        let rt = giong::Builder::new().workers(2).build().unwrap();
+        rt.run(|worker| async move {
+            assert_eq!(giong::driver_kind(), DriverKind::Epoll);
+            if worker != 0 {
+                return;
+            }
+            // A connection, a file and a timer: the three kinds of work the
+            // epoll driver does differently.
+            let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = giong::spawn(async move {
+                let stream = listener.accept().await.unwrap();
+                let data = stream.recv().await.unwrap();
+                let reply = data.to_vec();
+                drop(data);
+                stream.write_all(reply).await.0.unwrap();
+            });
+            let client = giong::net::TcpStream::connect(addr).await.unwrap();
+            client.write_all(&b"xin chao"[..]).await.0.unwrap();
+            let echo = client.recv().await.unwrap();
+            assert_eq!(&echo[..], b"xin chao");
+            drop(echo);
+            server.await.unwrap();
+
+            let path = std::env::temp_dir().join(format!("giong-blocked-{}", std::process::id()));
+            giong::fs::write(&path, "epoll").await.unwrap();
+            assert_eq!(giong::fs::read(&path).await.unwrap(), b"epoll");
+            giong::fs::remove_file(&path).await.unwrap();
+
+            giong::time::sleep(std::time::Duration::from_millis(5)).await;
+            println!("worked on epoll");
+        })
+        .unwrap();
+        return;
+    }
+
+    let stdout = run_blocked_child("the_default_runtime_falls_back_to_epoll_and_works");
+    assert!(stdout.contains("worked on epoll"), "{stdout}");
 }
 
 /// Makes `io_uring_setup` fail with `EPERM` in every thread of this process,
