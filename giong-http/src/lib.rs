@@ -57,8 +57,7 @@
 //!
 //! ## What it does not do (yet)
 //!
-//! Compression, routing (see the `giong-web` crate), server push, and
-//! HTTP/2 in the client.
+//! Compression, routing (see the `giong-web` crate) and server push.
 //!
 //! ## HTTPS
 //!
@@ -101,7 +100,9 @@ pub use server::{Handler, Server, Transport};
 #[doc(hidden)]
 pub mod fuzzing {
     #[cfg(feature = "client")]
-    pub use crate::client::fuzzing::{check_inflate, check_response_head, check_url};
+    pub use crate::client::fuzzing::{
+        check_h2_client, check_inflate, check_response_head, check_url,
+    };
     pub use crate::invariants::{
         check_chunked, check_h2_output, check_head, check_hpack, check_huffman, h2_connection,
         h2_input,

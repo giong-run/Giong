@@ -1,4 +1,5 @@
-//! An HTTP/1.1 client (feature `client`).
+//! An HTTP client (feature `client`): HTTP/1.1, and HTTP/2 where the server
+//! offers it.
 //!
 //! ```no_run
 //! use giong_http::client::Client;
@@ -32,6 +33,16 @@
 //!   closing under it is sent once more on a new one.
 //! * HTTPS through giong-tls (rustls), with certificates checked against
 //!   the machine's certificate authorities and the host name.
+//! * HTTP/2 when an `https` server chooses it through ALPN (see
+//!   [`ClientBuilder::http2`]): one connection carries every request to the
+//!   origin at once, as many as the server allows (another connection is
+//!   opened, up to the limit, when it allows no more), and what a server
+//!   can make the client hold is bounded by flow control (1 MiB for each
+//!   response, 4 MiB for the connection, granted again only as bodies are
+//!   read). A request the server refused unprocessed is sent again, and a
+//!   dropped request resets its stream instead of closing the connection.
+//!   [`ClientBuilder::http2_prior_knowledge`] speaks it to `http` servers
+//!   known to accept it; [`Response::version`] says which was spoken.
 //! * Every request has a timeout (30 s by default) that covers waiting for
 //!   a connection, connecting, sending, and reading the whole response,
 //!   redirects included; connecting has its own (10 s).
@@ -50,11 +61,12 @@
 //!   `https` requests go through a `CONNECT` tunnel, so they stay encrypted
 //!   end to end. The environment is not read unless asked.
 //!
-//! Not there yet: streaming bodies, compression, cookies, HTTP/2.
+//! Not there yet: streaming request bodies, cookies.
 
 mod conn;
 mod decode;
 mod error;
+mod h2;
 mod head;
 mod pool;
 mod proxy;
@@ -69,12 +81,13 @@ use std::time::{Duration, Instant};
 
 use giong_tls::TlsConnector;
 
-use self::conn::{Answer, Conn, Failure};
+use self::conn::{Conn, Failure};
 use self::decode::{DecodeError, Encoding, Inflate};
 use self::head::Head;
 use self::proxy::Route;
 use self::url::Url;
 use crate::parse::{is_field_value, is_token_str};
+use crate::Version;
 
 pub use self::error::{Error, ErrorKind};
 pub use self::proxy::Proxy;
@@ -169,6 +182,15 @@ pub mod fuzzing {
         }
         d.finish().is_ok()
     }
+
+    /// Frames an HTTP/2 server might send, built from `data`, fed in
+    /// pieces to a client connection while requests come and go: what the
+    /// client holds stays within the windows it grants, and what it writes
+    /// is well formed and within the server's windows. Returns the number
+    /// of responses read.
+    pub fn check_h2_client(data: &[u8]) -> usize {
+        super::h2::fuzzing::check_server_frames(data)
+    }
 }
 
 /// Headers the client sets itself, because they decide how the message is
@@ -207,6 +229,8 @@ pub struct ClientBuilder {
     tls: Option<TlsConnector>,
     proxy: Option<Proxy>,
     decompress: bool,
+    http2: bool,
+    http2_prior_knowledge: bool,
 }
 
 impl Default for ClientBuilder {
@@ -223,6 +247,8 @@ impl Default for ClientBuilder {
             tls: None,
             proxy: None,
             decompress: true,
+            http2: true,
+            http2_prior_knowledge: false,
         }
     }
 }
@@ -289,7 +315,26 @@ impl ClientBuilder {
     /// authorities ([`TlsConnector::with_system_roots`]), loaded when the
     /// first `https` request is made.
     pub fn tls(mut self, connector: TlsConnector) -> Self {
-        self.tls = Some(connector.alpn(&[b"http/1.1"]));
+        self.tls = Some(connector);
+        self
+    }
+
+    /// Whether to offer HTTP/2 to `https` servers through ALPN (default
+    /// `true`). A server that chooses it gets every request to its origin on
+    /// one connection, as many at once as it allows; one that does not is
+    /// spoken to over HTTP/1.1. The connector given to [`tls`](Self::tls)
+    /// gets its ALPN protocols from this.
+    pub fn http2(mut self, on: bool) -> Self {
+        self.http2 = on;
+        self
+    }
+
+    /// Speaks HTTP/2 to `http` URLs from the first byte, without asking
+    /// ("prior knowledge", default `false`): for servers known to accept it,
+    /// such as gRPC backends and giong-http's own server. Not through a
+    /// proxy, where `http` URLs stay on HTTP/1.1.
+    pub fn http2_prior_knowledge(mut self, on: bool) -> Self {
+        self.http2_prior_knowledge = on;
         self
     }
 
@@ -330,7 +375,7 @@ impl ClientBuilder {
     }
 }
 
-/// An HTTP/1.1 client with a pool of connections for each origin.
+/// An HTTP client with a pool of connections for each origin.
 ///
 /// Cheap to clone; clones share the pool. Not `Send`: make one per worker.
 #[derive(Clone)]
@@ -391,6 +436,18 @@ impl Drop for Opening<'_> {
             pool::free(pool);
         }
     }
+}
+
+/// What a request got to be sent on.
+enum Checkout {
+    /// An HTTP/1.1 connection of its own.
+    H1(Lease),
+    /// An HTTP/2 connection just opened.
+    H2(h2::Connection),
+    /// An HTTP/2 connection that was there already.
+    Shared(h2::Connection),
+    /// Room may have appeared on an HTTP/2 connection: look again.
+    Retry,
 }
 
 impl Default for Client {
@@ -476,12 +533,17 @@ impl Client {
     }
 
     fn tls(&self) -> Result<TlsConnector, Error> {
+        let alpn: &[&[u8]] = if self.shared.config.http2 {
+            &[b"h2", b"http/1.1"]
+        } else {
+            &[b"http/1.1"]
+        };
         self.shared
             .tls
             .get_or_init(|| match &self.shared.config.tls {
-                Some(c) => Ok(c.clone()),
+                Some(c) => Ok(c.clone().alpn(alpn)),
                 None => TlsConnector::with_system_roots()
-                    .map(|c| c.alpn(&[b"http/1.1"]))
+                    .map(|c| c.alpn(alpn))
                     .map_err(|e| {
                         Error::io(
                             ErrorKind::Connect,
@@ -538,23 +600,30 @@ impl Client {
 
     /// A connection on `route`: an idle one unless `fresh`, otherwise a
     /// new one, waiting in line while the origin has as many open as
-    /// allowed.
-    async fn checkout(&self, route: &Route, fresh: bool) -> Result<Lease, Error> {
+    /// allowed. A new connection that speaks HTTP/2 joins the pool, shared.
+    async fn checkout(&self, route: &Route, fresh: bool) -> Result<Checkout, Error> {
         let config = &self.shared.config;
         let pool = self.host(route);
+        let prior_knowledge =
+            config.http2_prior_knowledge && !route.origin.https && route.proxy.is_none();
         let taken = pool::acquire(
             &pool,
             config.max_connections_per_host,
             config.idle_timeout,
             fresh,
+            prior_knowledge,
         )
         .await;
-        if let pool::Taken::Reused(conn) = taken {
-            return Ok(Lease {
-                conn: Some(conn),
-                pool,
-                reused: true,
-            });
+        match taken {
+            pool::Taken::Reused(conn) => {
+                return Ok(Checkout::H1(Lease {
+                    conn: Some(conn),
+                    pool,
+                    reused: true,
+                }))
+            }
+            pool::Taken::Retry => return Ok(Checkout::Retry),
+            pool::Taken::Open => {}
         }
         let mut opening = Opening { pool: Some(&pool) };
         let tls = if route.origin.https {
@@ -568,17 +637,46 @@ impl Client {
         let conn = Box::pin(Conn::open(route, tls.as_ref(), config)).await?;
         opening.pool = None;
         drop(opening);
-        Ok(Lease {
+        if conn.is_h2() || prior_knowledge {
+            return Ok(Checkout::H2(self.start_h2(&pool, conn)));
+        }
+        if route.origin.https {
+            pool::opened_h1(&pool);
+        }
+        Ok(Checkout::H1(Lease {
             conn: Some(conn),
             pool,
             reused: false,
-        })
+        }))
+    }
+
+    /// Speaks HTTP/2 on a connection just opened, and puts it in the pool.
+    fn start_h2(&self, pool: &pool::Shared, conn: Conn) -> h2::Connection {
+        let config = &self.shared.config;
+        let id = pool::next_h2_id(pool);
+        let weak = Rc::downgrade(pool);
+        let notify = Box::new(move |event| {
+            if let Some(pool) = weak.upgrade() {
+                match event {
+                    h2::Event::StreamClosed => pool::h2_stream_closed(&pool),
+                    h2::Event::Closed => pool::h2_closed(&pool, id),
+                }
+            }
+        });
+        let settings = h2::Settings {
+            max_head_size: config.max_head_size,
+            idle_timeout: config.idle_timeout,
+            write_timeout: config.timeout,
+        };
+        let h2 = h2::Connection::start(conn.into_stream(), settings, notify);
+        pool::add_h2(pool, id, h2.clone());
+        h2
     }
 
     /// Sends one request and reads the head of its response, without
     /// following redirects. An idempotent request that finds its
     /// kept-alive connection closed under it is sent again on a new
-    /// connection.
+    /// connection; so is any request an HTTP/2 server refused unprocessed.
     async fn execute(
         &self,
         method: &str,
@@ -593,46 +691,116 @@ impl Client {
             && !headers
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case("accept-encoding"));
-        let request = encode_request(
-            method,
-            url,
-            headers,
-            body,
-            &config.user_agent,
-            route.absolute_form(),
-            decompress,
-        );
+        let mut request = None;
         let mut fresh = false;
+        let mut refused = 0;
         loop {
-            let mut lease = self.checkout(&route, fresh).await?;
-            let reused = lease.reused;
-            match lease
-                .conn()
-                .send(
-                    request.clone(),
-                    method == "HEAD",
-                    config.max_head_size,
-                    &what,
-                )
-                .await
-            {
-                Ok(answer) => return Ok(Pending::new(lease, answer, url, what, decompress)),
-                Err(Failure::NothingReceived(_)) if reused && is_idempotent(method) => {
-                    drop(lease);
-                    fresh = true;
+            // An HTTP/2 connection with room takes the request at once.
+            let pool = self.host(&route);
+            let checkout = match pool::h2_with_room(&pool) {
+                Some(conn) => Checkout::Shared(conn),
+                None => self.checkout(&route, fresh).await?,
+            };
+            drop(pool);
+            let (conn, reused) = match checkout {
+                Checkout::Retry => continue,
+                Checkout::Shared(conn) => (conn, true),
+                Checkout::H2(conn) => (conn, false),
+                Checkout::H1(mut lease) => {
+                    let request = request.get_or_insert_with(|| {
+                        encode_request(
+                            method,
+                            url,
+                            headers,
+                            body,
+                            &config.user_agent,
+                            route.absolute_form(),
+                            decompress,
+                        )
+                    });
+                    let reused = lease.reused;
+                    match lease
+                        .conn()
+                        .send(
+                            request.clone(),
+                            method == "HEAD",
+                            config.max_head_size,
+                            &what,
+                        )
+                        .await
+                    {
+                        Ok(answer) => {
+                            return Ok(Pending::new(
+                                Some(lease),
+                                Body::H1(answer.body),
+                                answer.head,
+                                url,
+                                what,
+                                decompress,
+                            ))
+                        }
+                        Err(Failure::NothingReceived(_)) if reused && is_idempotent(method) => {
+                            drop(lease);
+                            fresh = true;
+                            continue;
+                        }
+                        Err(Failure::NothingReceived(e)) if reused => {
+                            return Err(not_sent_again(e, method))
+                        }
+                        Err(failure) => return Err(failure.into_error()),
+                    }
                 }
-                Err(Failure::NothingReceived(e)) if reused => {
-                    return Err(Error::new(
-                        ErrorKind::Closed,
-                        format!(
-                            "{e}; the connection had been used before, so the server probably \
-                             closed it as the request was sent. A {method} request is not sent \
-                             again by itself, because the server may have processed it: retry \
-                             if that is safe"
-                        ),
+            };
+            let fields = h2_fields(method, headers, body, &config.user_agent, decompress);
+            let authority = headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+                .map_or_else(|| url.host_header(), |(_, v)| v.clone());
+            let req = h2::Request {
+                method,
+                scheme: if url.https { "https" } else { "http" },
+                authority: &authority,
+                path: &url.target,
+                fields: &fields,
+                body,
+                head_request: method == "HEAD",
+            };
+            let Some(mut stream) = conn.send(&req) else {
+                // Its room went to another request meanwhile.
+                continue;
+            };
+            match stream.response().await {
+                Ok(()) => {
+                    let head = h2_head(stream.head());
+                    return Ok(Pending::new(
+                        None,
+                        Body::H2(stream),
+                        head,
+                        url,
+                        what,
+                        decompress,
                     ));
                 }
-                Err(failure) => return Err(failure.into_error()),
+                Err(h2::StreamError::Refused(m)) => {
+                    refused += 1;
+                    if refused > 5 {
+                        return Err(Error::new(
+                            ErrorKind::Closed,
+                            format!("{what}: {m}, five times in a row"),
+                        ));
+                    }
+                }
+                Err(h2::StreamError::Closed {
+                    received: false,
+                    message,
+                }) if reused => {
+                    let e = Error::new(ErrorKind::Closed, format!("{what}: {message}"));
+                    if !is_idempotent(method) {
+                        return Err(not_sent_again(e, method));
+                    }
+                    fresh = true;
+                }
+                Err(e) => return Err(h2_error(e, &what)),
             }
         }
     }
@@ -713,10 +881,12 @@ impl Client {
 /// A response whose head has arrived, with the connection its body comes
 /// on.
 struct Pending {
-    lease: Lease,
+    /// The HTTP/1.1 connection; none over HTTP/2, where the stream is in
+    /// `body`.
+    lease: Option<Lease>,
     head: Head,
     /// Holds the head's bytes too.
-    body: conn::Body,
+    body: Body,
     /// Set when the body is compressed and the client asked for that.
     inflate: Option<Box<Inflate>>,
     url: String,
@@ -724,9 +894,81 @@ struct Pending {
     what: String,
 }
 
+/// The body of a response, over either protocol.
+enum Body {
+    H1(conn::Body),
+    H2(h2::Stream),
+}
+
+impl Body {
+    fn head_bytes(&self) -> &[u8] {
+        match self {
+            Body::H1(b) => b.head_bytes(),
+            Body::H2(s) => &s.head().bytes,
+        }
+    }
+
+    /// The length of the body, when known.
+    fn length(&self) -> Option<u64> {
+        match self {
+            Body::H1(b) => b.length(),
+            Body::H2(s) => s.body_length(),
+        }
+    }
+
+    /// The buffer holding the head and what came with it, when that is
+    /// the whole body.
+    fn take_with_head(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Body::H1(b) => b.take_with_head(),
+            Body::H2(_) => None,
+        }
+    }
+
+    /// Appends the next part of the body to `out`, about `limit` bytes at
+    /// most; `false` at the end.
+    async fn read(
+        &mut self,
+        conn: Option<&Conn>,
+        out: &mut Vec<u8>,
+        limit: usize,
+        what: &str,
+    ) -> Result<bool, Error> {
+        match self {
+            Body::H1(b) => {
+                let conn = conn.expect("an HTTP/1.1 body comes with its connection");
+                b.read(conn, out, what).await
+            }
+            Body::H2(s) => s.read(out, limit).await.map_err(|e| h2_error(e, what)),
+        }
+    }
+
+    /// The body has been read to its end.
+    fn is_done(&self) -> bool {
+        match self {
+            Body::H1(b) => b.is_done(),
+            Body::H2(s) => s.is_done(),
+        }
+    }
+
+    /// The HTTP/1.1 connection can carry another request.
+    fn reusable(&self) -> bool {
+        match self {
+            Body::H1(b) => b.reusable(),
+            Body::H2(_) => false,
+        }
+    }
+}
+
 impl Pending {
-    fn new(lease: Lease, answer: Answer, url: &Url, what: String, decompress: bool) -> Self {
-        let Answer { mut head, body } = answer;
+    fn new(
+        lease: Option<Lease>,
+        body: Body,
+        mut head: Head,
+        url: &Url,
+        what: String,
+        decompress: bool,
+    ) -> Self {
         let head_bytes = body.head_bytes();
         let mut inflate = None;
         if decompress && head.status != 206 && body.length() != Some(0) {
@@ -749,6 +991,39 @@ impl Pending {
             inflate,
             url: url.to_string(),
             what,
+        }
+    }
+
+    fn version(&self) -> Version {
+        match (&self.body, self.head.minor) {
+            (Body::H2(_), _) => Version::Http2,
+            (Body::H1(_), 0) => Version::Http10,
+            (Body::H1(_), _) => Version::Http11,
+        }
+    }
+
+    /// The HTTP/1.1 connection, if the body comes on one.
+    fn conn(&self) -> Option<&Conn> {
+        self.lease.as_ref().and_then(|l| l.conn.as_ref())
+    }
+
+    /// The body has ended or failed: nothing more comes.
+    fn finished(&self) -> bool {
+        match &self.body {
+            Body::H1(_) => self.conn().is_none(),
+            Body::H2(s) => s.is_finished(),
+        }
+    }
+
+    /// Stops reading: closes the HTTP/1.1 connection, or resets the stream.
+    fn close(&mut self) {
+        match &mut self.body {
+            Body::H1(_) => {
+                if let Some(lease) = &mut self.lease {
+                    close(lease);
+                }
+            }
+            Body::H2(s) => s.cancel(),
         }
     }
 
@@ -784,14 +1059,10 @@ impl Pending {
         if let Some(n) = self.body.length() {
             data.reserve(n as usize);
         }
-        let conn = self
-            .lease
-            .conn
-            .as_ref()
-            .expect("a lease holds its connection");
+        let conn = self.lease.as_ref().and_then(|l| l.conn.as_ref());
         match &mut self.inflate {
             None => {
-                while self.body.read(conn, &mut data, what).await? {
+                while self.body.read(conn, &mut data, usize::MAX, what).await? {
                     if data.len() - start > max {
                         return Err(too_large(false));
                     }
@@ -802,7 +1073,7 @@ impl Pending {
                 let mut received = 0;
                 loop {
                     raw.clear();
-                    let more = self.body.read(conn, &mut raw, what).await?;
+                    let more = self.body.read(conn, &mut raw, usize::MAX, what).await?;
                     received += raw.len();
                     if received > max {
                         return Err(too_large(false));
@@ -822,10 +1093,13 @@ impl Pending {
             }
         }
         if self.body.reusable() {
-            self.lease.give_back(config.idle_timeout);
+            if let Some(lease) = self.lease.take() {
+                lease.give_back(config.idle_timeout);
+            }
         }
         Ok(Response {
             status: self.head.status,
+            version: self.version(),
             fields: self.head.fields,
             body_start: start,
             data,
@@ -852,6 +1126,81 @@ fn decode_error(what: &str, e: DecodeError) -> Error {
              ClientBuilder::decompress(false)"
         ),
     )
+}
+
+/// A request that may have been processed is not sent again.
+fn not_sent_again(e: Error, method: &str) -> Error {
+    Error::new(
+        ErrorKind::Closed,
+        format!(
+            "{e}; the connection had been used before, so the server probably closed it as \
+             the request was sent. A {method} request is not sent again by itself, because the \
+             server may have processed it: retry if that is safe"
+        ),
+    )
+}
+
+/// The fields of an HTTP/2 request after its pseudo-headers: the same as
+/// over HTTP/1.1, in lowercase, with `Host` turned into `:authority`.
+fn h2_fields(
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    user_agent: &str,
+    accept_encoding: bool,
+) -> Vec<(String, String)> {
+    let mut fields = Vec::with_capacity(headers.len() + 3);
+    let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
+    if !has("user-agent") && !user_agent.is_empty() {
+        fields.push(("user-agent".to_owned(), user_agent.to_owned()));
+    }
+    if accept_encoding {
+        fields.push((
+            "accept-encoding".to_owned(),
+            decode::ACCEPT_ENCODING.to_owned(),
+        ));
+    }
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        fields.push((name.to_ascii_lowercase(), value.clone()));
+    }
+    if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
+        fields.push((
+            "content-length".to_owned(),
+            body.map_or(0, <[u8]>::len).to_string(),
+        ));
+    }
+    fields
+}
+
+/// The head of an HTTP/2 response, as the rest of the client reads heads.
+fn h2_head(head: &h2::ResponseHead) -> Head {
+    Head {
+        status: head.status,
+        minor: 1,
+        fields: head.fields.clone(),
+        len: head.bytes.len(),
+        content_length: head.content_length,
+        chunked: false,
+        close: false,
+    }
+}
+
+fn h2_error(e: h2::StreamError, what: &str) -> Error {
+    match e {
+        h2::StreamError::Refused(m)
+        | h2::StreamError::Reset(m)
+        | h2::StreamError::Closed { message: m, .. } => {
+            Error::new(ErrorKind::Closed, format!("{what}: {m}"))
+        }
+        h2::StreamError::Protocol(m) => Error::new(
+            ErrorKind::Protocol,
+            format!("{what}: the server sent an invalid HTTP/2 response: {m}"),
+        ),
+        h2::StreamError::TooLarge(m) => Error::new(ErrorKind::TooLarge, format!("{what}: {m}")),
+    }
 }
 
 impl fmt::Debug for Client {
@@ -1079,6 +1428,7 @@ impl fmt::Debug for RequestBuilder {
 /// A response, read whole.
 pub struct Response {
     status: u16,
+    version: Version,
     /// The head's bytes, then the body.
     data: Vec<u8>,
     fields: Vec<(Range<usize>, Range<usize>)>,
@@ -1090,6 +1440,13 @@ impl Response {
     /// The status code, such as 200 or 404.
     pub fn status(&self) -> u16 {
         self.status
+    }
+
+    /// The version of HTTP the response came in: [`Version::Http2`] when
+    /// the server chose it (through ALPN, or with
+    /// [`ClientBuilder::http2_prior_knowledge`]).
+    pub fn version(&self) -> Version {
+        self.version
     }
 
     /// Whether the status is 2xx.
@@ -1169,6 +1526,7 @@ impl fmt::Debug for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Response")
             .field("status", &self.status)
+            .field("version", &self.version)
             .field("url", &self.url)
             .field("headers", &self.fields.len())
             .field("body", &self.body().len())
@@ -1200,8 +1558,10 @@ impl fmt::Debug for Response {
 /// # }
 /// ```
 ///
-/// The connection goes back to the pool once the body has been read to
-/// its end. Dropped before that, the response closes its connection.
+/// An HTTP/1.1 connection goes back to the pool once the body has been
+/// read to its end. Dropped before that, the response closes its
+/// connection; over HTTP/2 it resets its stream, and the connection goes
+/// on carrying the others.
 pub struct StreamingResponse {
     /// Its lease holds no connection once the body has ended or failed.
     pending: Pending,
@@ -1220,6 +1580,11 @@ impl StreamingResponse {
     /// The status code, such as 200 or 404.
     pub fn status(&self) -> u16 {
         self.pending().head.status
+    }
+
+    /// The version of HTTP the response comes in.
+    pub fn version(&self) -> Version {
+        self.pending().version()
     }
 
     /// Whether the status is 2xx.
@@ -1274,7 +1639,7 @@ impl StreamingResponse {
     /// further call returns `None`.
     pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, Error> {
         let pending = &mut self.pending;
-        if pending.lease.conn.is_none() {
+        if pending.finished() {
             return Ok(None);
         }
         let timeout = self.timeout;
@@ -1294,19 +1659,21 @@ impl StreamingResponse {
             Ok(None) => {
                 // The end: the connection can serve another request.
                 if pending.body.reusable() {
-                    if let Some(conn) = pending.lease.conn.take() {
-                        let lease = Lease {
-                            conn: Some(conn),
-                            pool: pending.lease.pool.clone(),
-                            reused: true,
-                        };
-                        lease.give_back(self.idle_timeout);
+                    if let Some(lease) = &mut pending.lease {
+                        if let Some(conn) = lease.conn.take() {
+                            let lease = Lease {
+                                conn: Some(conn),
+                                pool: lease.pool.clone(),
+                                reused: true,
+                            };
+                            lease.give_back(self.idle_timeout);
+                        }
                     }
                 } else {
-                    close(&mut pending.lease);
+                    pending.close();
                 }
             }
-            Err(_) => close(&mut pending.lease),
+            Err(_) => pending.close(),
         }
         result
     }
@@ -1322,12 +1689,12 @@ fn close(lease: &mut Lease) {
 }
 
 async fn next_piece(p: &mut Pending) -> Result<Option<Vec<u8>>, Error> {
-    let conn = p.lease.conn.as_ref().expect("checked by the caller");
+    let conn = p.lease.as_ref().and_then(|l| l.conn.as_ref());
     let what = &p.what;
     match &mut p.inflate {
         None => {
             let mut out = Vec::new();
-            if p.body.read(conn, &mut out, what).await? {
+            if p.body.read(conn, &mut out, MAX_CHUNK, what).await? {
                 Ok(Some(out))
             } else {
                 Ok(None)
@@ -1348,7 +1715,7 @@ async fn next_piece(p: &mut Pending) -> Result<Option<Vec<u8>>, Error> {
                     return Ok(None);
                 }
                 raw.clear();
-                p.body.read(conn, &mut raw, what).await?;
+                p.body.read(conn, &mut raw, MAX_CHUNK, what).await?;
                 inflate.push(&raw);
             }
         }

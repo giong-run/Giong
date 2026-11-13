@@ -279,3 +279,22 @@ fn http2_connections_answer_with_well_formed_frames_whatever_the_client_sends() 
         .unwrap();
     assert!(responses > ROUNDS / 10, "only {responses} responses");
 }
+
+#[cfg(feature = "client")]
+#[test]
+fn the_http2_client_stays_within_its_windows_whatever_the_server_sends() {
+    use crate::client::fuzzing::check_h2_client;
+
+    const ROUNDS: usize = 3_000;
+    let seed = std::env::var("GIONG_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut rng = Rng(seed.unwrap_or(0x5DEE_CE66_D1CE_4E5B));
+    let mut responses = 0;
+    for _ in 0..ROUNDS {
+        let len = 1 + rng.below(300);
+        let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        responses += check_h2_client(&data);
+    }
+    assert!(responses > ROUNDS / 20, "only {responses} responses");
+}
