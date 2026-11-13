@@ -96,7 +96,7 @@ pub use driver::DriverKind;
 pub use executor::{spawn, yield_now, JoinError, JoinHandle, RemoteJoinHandle};
 pub use runtime::{
     block_on, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,
-    until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal,
+    until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,
 };
 
 #[doc(hidden)]

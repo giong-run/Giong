@@ -16,6 +16,10 @@ fn query_n(q: &str) -> u32 {
         .min(40)
 }
 
+fn query_ms(q: &str) -> u64 {
+    q.split('&').find_map(|kv| kv.strip_prefix("ms=")).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 async fn handler(req: Request) -> Response {
     match req.path() {
         "/json" => Response::json(r#"{"message":"Hello, World!"}"#),
@@ -34,6 +38,12 @@ async fn handler(req: Request) -> Response {
             let n = query_n(req.query().unwrap_or(""));
             Response::json(format!(r#"{{"result":{}}}"#, fib(black_box(n))))
         }
+        // `/wait?ms=N` answers after N milliseconds, like a handler waiting
+        // for a database or another service (bench/memory.sh).
+        "/wait" => {
+            giong::time::sleep(std::time::Duration::from_millis(query_ms(req.query().unwrap_or("")))).await;
+            Response::json(r#"{"message":"Hello, World!"}"#)
+        }
         _ => Response::new(404),
     }
 }
@@ -44,7 +54,20 @@ fn main() -> std::io::Result<()> {
         (Ok(cert), Ok(key)) => Some(TlsAcceptor::from_pem(&std::fs::read(cert)?, &std::fs::read(key)?)?),
         _ => None,
     };
-    giong::Builder::new()
+    // GIONG_WORKERS=N: N workers instead of one per CPU (bench/memory.sh
+    // compares runtimes at the same thread count).
+    let mut builder = giong::Builder::new();
+    if let Some(n) = std::env::var("GIONG_WORKERS").ok().and_then(|v| v.parse().ok()) {
+        builder = builder.workers(n);
+    }
+    // GIONG_RECV_BUFS=COUNT,SIZE: the receive buffer pool of each worker.
+    if let Some((count, size)) = std::env::var("GIONG_RECV_BUFS").ok().and_then(|v| {
+        let (count, size) = v.split_once(',')?;
+        Some((count.parse().ok()?, size.parse().ok()?))
+    }) {
+        builder = builder.recv_buffers(count, size);
+    }
+    builder
         .shutdown_on_signals(true)
         .shutdown_grace(std::time::Duration::from_secs(5))
         .build()?

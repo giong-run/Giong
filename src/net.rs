@@ -401,12 +401,12 @@ impl Drop for StreamSocket {
 /// receive is armed. Returns `false` if the caller has to wait for one (its
 /// waker is registered with the pool).
 pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>) -> bool {
-    if driver.pool().free() == 0 {
+    if !driver.pool().ensure_published() {
         // The pool is exhausted. Reclaim buffers that hold unread data of
         // other sockets ...
         driver.evacuate();
     }
-    if driver.pool().free() == 0 {
+    if !driver.pool().ensure_published() {
         // ... and if user code holds all the rest, wait for one to come back
         // instead of spinning on ENOBUFS.
         driver.pool().wait(cx.waker());

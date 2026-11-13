@@ -412,6 +412,51 @@ from `/proc`. It is the number to trust when the load generator is the limit.
 - p99 is the noisiest number in the table. Raw Tokio's 50 ms at 1,000 connections is the
   median of five rounds, not a single outlier, but it is still one machine.
 
+### Memory per connection
+
+`bench/memory.sh`: 10,000 connections from one client, four threads per server (giong
+workers, Tokio worker threads, `GOMAXPROCS`), median of three rounds, a fresh server for
+each measurement. The first three columns are the server's resident memory with the
+connections held, minus before, per connection. "Idle" is a keep-alive connection that
+has had one request answered, the usual state of a connection from a browser, an app or
+a pool; "pending" has a request whose handler is waiting (`/wait`, as for a database or
+another service). "Under load" is the peak while `wrk` keeps 5,000 connections busy.
+
+| Server | Open | Idle | Pending | Under load |
+|---|---|---|---|---|
+| **giong-http** | **1.9 KiB** | **1.9 KiB** | 7.2 KiB | 19.6 MiB |
+| **giong-http** on epoll | 2.1 KiB | 2.1 KiB | **6.3 KiB** | **10.2 MiB** |
+| Axum (Tokio + hyper) | 5.7 KiB | 20.4 KiB | 19.3 KiB | 115 MiB |
+| Raw Tokio, own parser | 12.9 KiB | 13.1 KiB | 12.9 KiB | 64 MiB |
+| Go `net/http` | 10.8 KiB | 18.9 KiB | 18.3 KiB | 155 MiB |
+
+- **An idle giong connection holds no buffer.** What it costs is its task (about 1.2 KB
+  for giong-http's connection), the multishot receive, an idle timer and the socket. The
+  kernel picks a receive buffer only when data arrives; the request and response buffers
+  are taken from a per-worker pool for the length of a request. Hyper keeps an 8 KiB read
+  buffer per connection, Go a 4 KiB reader and writer and a goroutine stack.
+- **A handler's future is on the heap only while it runs**, in blocks the worker reuses.
+  In giong 0.3 it lived inside the connection's future, and every idle connection was as
+  large as the largest future its handler could make: a handler holding 8 KiB across an
+  `.await` cost 43 KiB per idle connection. Each wrapper that took a future by value
+  (spawn, `timeout`, `until_shutdown`) also kept two copies of it; an idle giong-http
+  connection took 10.9 KiB, one with a pending request 15.0 KiB.
+- **"Pending" is mostly the request buffer**: 4 KiB, held while the handler runs, because
+  the `Request` it was given points into it.
+- **Receive buffers are a cost per worker, not per connection**, and only as many are
+  touched as the traffic needs: a worker lends the kernel 16 at first and twice as many
+  each time a turn of the event loop takes most of them, and reuses the most recently
+  freed first. With 20 workers and 100 busy connections, giong-http's memory rises by
+  1 MiB (it rose by 40 MiB when every worker lent all 512 buffers at once).
+- **Under load io_uring holds more than epoll**: a response's buffer stays with the
+  kernel until its send completes, and the receive buffers a turn takes stay lent until
+  their connections run, while epoll writes at once and reads only into a buffer it
+  needs. With 20 workers and 5,000 busy connections giong-http peaked 50 MiB above idle
+  on io_uring and 14 MiB on epoll, raw Tokio 64 MiB, Axum 124 MiB and Go 184 MiB
+  (`WORKERS=20 SCENARIOS=load`, in `bench/results/memory-20w/`).
+- Throughput under load is in the other tables; here the servers and `wrk` share four
+  vCPUs.
+
 ### Where the time goes
 
 `bench/syscalls.sh`, `/json` and `/users`, 50 connections, one run:
@@ -648,7 +693,7 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
 `bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
-`bench/http-client.sh` and `bench/web.sh`; two cores with
+`bench/http-client.sh`, `bench/web.sh` and `bench/memory.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`.
 

@@ -30,6 +30,14 @@ fn query_n(q: &[u8]) -> u32 {
         .unwrap_or(25)
 }
 
+fn wait_ms(path: &[u8]) -> Option<u64> {
+    let query = path.strip_prefix(b"/wait?")?;
+    Some(query.split(|&c| c == b'&').find(|kv| kv.starts_with(b"ms="))
+        .map(|kv| kv[3..].iter().take_while(|c| c.is_ascii_digit())
+            .fold(0u64, |a, &c| a * 10 + (c - b'0') as u64))
+        .unwrap_or(0))
+}
+
 fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
     body.clear();
     let (route, query) = match path.iter().position(|&c| c == b'?') {
@@ -48,6 +56,7 @@ fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
             body.push(b']');
         }
         b"/compute" => { let _ = write!(body, r#"{{"result":{}}}"#, fib(black_box(query_n(query)))); }
+        b"/wait" => body.extend_from_slice(br#"{"message":"Hello, World!"}"#),
         _ => {
             out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
             return;
@@ -76,7 +85,12 @@ async fn main() {
                     let head = &rbuf[off..off + end];
                     let total = end + 4 + content_length(head);
                     if rbuf.len() - off < total { break; }
-                    respond(path_of(head), &mut wbuf, &mut body);
+                    // `/wait?ms=N` answers after N milliseconds, like a handler
+                    // waiting for a database or another service (bench/memory.sh).
+                    if let Some(ms) = wait_ms(path_of(head)) {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    respond(path_of(&rbuf[off..off + end]), &mut wbuf, &mut body);
                     off += total;
                 }
                 rbuf.drain(..off);

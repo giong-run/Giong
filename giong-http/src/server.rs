@@ -7,7 +7,7 @@ use std::io;
 use std::mem;
 use std::net::{Shutdown, SocketAddr};
 use std::ops::Deref;
-use std::pin::pin;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
@@ -16,6 +16,7 @@ use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use giong::time::{sleep, timeout};
 
 use crate::chunked::{Decoder, Progress};
+use crate::heap::HeapFuture;
 use crate::parse::{find_head_end, parse_head};
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, Response};
@@ -31,27 +32,54 @@ const ERROR_LINGER: Duration = Duration::from_secs(1);
 /// Blank lines before a request that still count as an idle connection.
 const IDLE_BLANK_LINES: usize = 2;
 
+/// Capacity of a fresh connection buffer.
+const BUFFER_SIZE: usize = 4 * 1024;
+/// Largest buffer kept for reuse. A bigger one (grown for a large request or
+/// response) is freed instead: handed to a small request, it would be held
+/// for as long as that request's handler runs.
+const POOL_MAX_BUFFER: usize = 16 * 1024;
+/// Most bytes of buffers one worker keeps for reuse.
+const POOL_BYTES: usize = 4 * 1024 * 1024;
+
+/// Buffers recycled between the connections of one worker. A connection
+/// holds none while it is idle, so keep-alive connections cost little.
+struct Pool {
+    buffers: Vec<Vec<u8>>,
+    /// Capacity of all of `buffers`.
+    bytes: usize,
+}
+
 thread_local! {
-    /// Buffers recycled between the connections of one worker. A connection
-    /// holds none while it is idle, so keep-alive connections cost little.
-    static BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static BUFFERS: RefCell<Pool> = const {
+        RefCell::new(Pool {
+            buffers: Vec::new(),
+            bytes: 0,
+        })
+    };
 }
 
 fn take_buffer() -> Vec<u8> {
     BUFFERS
-        .with(|pool| pool.borrow_mut().pop())
-        .unwrap_or_else(|| Vec::with_capacity(4 * 1024))
+        .with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let buf = pool.buffers.pop()?;
+            pool.bytes -= buf.capacity();
+            Some(buf)
+        })
+        .unwrap_or_else(|| Vec::with_capacity(BUFFER_SIZE))
 }
 
 fn give_buffer(mut buf: Vec<u8>) {
     buf.clear();
-    if buf.capacity() == 0 || buf.capacity() > 256 * 1024 {
+    let capacity = buf.capacity();
+    if capacity == 0 || capacity > POOL_MAX_BUFFER {
         return;
     }
     BUFFERS.with(|pool| {
         let mut pool = pool.borrow_mut();
-        if pool.len() < 1024 {
-            pool.push(buf);
+        if pool.bytes + capacity <= POOL_BYTES {
+            pool.bytes += capacity;
+            pool.buffers.push(buf);
         }
     });
 }
@@ -347,8 +375,9 @@ impl Server {
         let accept = || listener.accept();
         self.accept_loop(accept, |stream: TcpStream, slot| {
             let _ = stream.set_nodelay(true);
-            let conn = Conn::new(stream, cfg).run(handler.clone());
-            drop(giong::spawn(slot.hold(conn)));
+            drop(giong::spawn(
+                Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
+            ));
         })
         .await;
     }
@@ -371,8 +400,9 @@ impl Server {
         let cfg = self.cfg;
         let accept = || listener.accept();
         self.accept_loop(accept, |stream: UnixStream, slot| {
-            let conn = Conn::new(stream, cfg).run(handler.clone());
-            drop(giong::spawn(slot.hold(conn)));
+            drop(giong::spawn(
+                Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
+            ));
         })
         .await;
     }
@@ -407,13 +437,13 @@ impl Server {
         self.accept_loop(accept, |stream: TcpStream, slot| {
             let _ = stream.set_nodelay(true);
             let (acceptor, handler) = (acceptor.clone(), handler.clone());
-            drop(giong::spawn(slot.hold(async move {
+            drop(giong::spawn(async move {
                 // A failed handshake (a port scan, a plain-HTTP client, an
                 // unknown protocol version) just ends the connection.
                 if let Ok(tls) = acceptor.accept(stream).await {
-                    Conn::new(tls, cfg).run(handler).await;
+                    Conn::new(tls, cfg, Some(slot)).serve(handler).await;
                 }
-            })));
+            }));
         })
         .await;
     }
@@ -451,12 +481,12 @@ impl Server {
 
     /// Serves a single, already established connection until it is closed.
     /// For servers that run their own accept loop or their own transport.
-    pub async fn serve_connection<T, H>(&self, stream: T, handler: Rc<H>)
+    pub fn serve_connection<T, H>(&self, stream: T, handler: Rc<H>) -> impl Future<Output = ()>
     where
         T: Transport,
         H: Handler,
     {
-        Conn::new(stream, self.cfg).run(handler).await;
+        Conn::new(stream, self.cfg, None).serve(handler)
     }
 }
 
@@ -494,14 +524,6 @@ impl Slots {
 
 /// One open connection; frees its slot when dropped.
 struct Slot(Rc<Slots>);
-
-impl Slot {
-    /// Keeps the slot taken for as long as `fut` runs.
-    async fn hold<F: Future>(self, fut: F) -> F::Output {
-        let _slot = self;
-        fut.await
-    }
-}
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -549,10 +571,14 @@ struct Conn<T> {
     closing: bool,
     /// Deadline for the request currently being received.
     deadline: Option<Instant>,
+    /// The connection's place under `max_connections`, given back when the
+    /// connection is dropped. Declared last, so that the stream is closed
+    /// first.
+    _slot: Option<Slot>,
 }
 
 impl<T: Transport> Conn<T> {
-    fn new(stream: T, cfg: Config) -> Self {
+    fn new(stream: T, cfg: Config, slot: Option<Slot>) -> Self {
         Self {
             peer: stream.peer_addr(),
             stream,
@@ -564,10 +590,22 @@ impl<T: Transport> Conn<T> {
             body: Body::Empty,
             closing: false,
             deadline: None,
+            _slot: slot,
         }
     }
 
-    async fn run<H: Handler>(mut self, handler: Rc<H>) {
+    /// The connection's task.
+    ///
+    /// The connection lives in this future and [`run`](Self::run) borrows
+    /// it there. An `async fn` that took it by value would keep it twice
+    /// (the argument, and the variable it is moved into), and every idle
+    /// connection would pay for the copy.
+    fn serve<H: Handler>(self, handler: Rc<H>) -> impl Future<Output = ()> {
+        let mut conn = self;
+        async move { conn.run(&*handler).await }
+    }
+
+    async fn run<H: Handler>(&mut self, handler: &H) {
         loop {
             let req = match self.next_request().await {
                 Ok(req) => req,
@@ -588,8 +626,13 @@ impl<T: Transport> Conn<T> {
             // Poll the handler once before deciding what to do with responses
             // that are waiting: if it answers at once (the common case), they
             // all go out in one write; if it has to wait, they go out first.
-            let mut fut = pin!(handler.call(req));
-            let first = poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx))).await;
+            //
+            // The handler's future lives on the heap for the length of one
+            // request. Kept inside the connection's own future, it would make
+            // every connection as large as the largest handler future (a
+            // database query, a call to another service) even while idle.
+            let mut fut = HeapFuture::new(handler.call(req));
+            let first = poll_fn(|cx| Poll::Ready(Pin::new(&mut fut).poll(cx))).await;
             let resp = match first {
                 Poll::Ready(resp) => resp,
                 Poll::Pending => {
@@ -713,12 +756,18 @@ impl<T: Transport> Conn<T> {
     /// Sends pending responses, then waits for more input. `idle` means that
     /// no part of a request has been received yet.
     async fn read_more(&mut self, idle: bool) -> Result<(), End> {
+        if idle {
+            // Every request received has been parsed: the read buffer goes
+            // back to the pool now rather than after the send, so that the
+            // connections of one turn of the event loop share fewer buffers.
+            self.release_read_buffer();
+        }
         self.flush().await?;
         let received = if idle {
             if self.closing {
                 return Err(End::Close);
             }
-            self.release_buffers();
+            give_buffer(mem::take(&mut self.out));
             let recv = timeout(self.cfg.idle_timeout, self.stream.recv());
             match giong::until_shutdown(recv).await {
                 Some(received) => received,
@@ -780,8 +829,9 @@ impl<T: Transport> Conn<T> {
         }
     }
 
-    /// Hands both buffers back to the worker's pool before an idle wait.
-    fn release_buffers(&mut self) {
+    /// Hands the read buffer back to the worker's pool if all of it has
+    /// been parsed. A handler that still holds a request keeps its copy.
+    fn release_read_buffer(&mut self) {
         if self.pos == self.buf.len() {
             match Rc::get_mut(&mut self.buf) {
                 Some(buf) => give_buffer(mem::take(buf)),
@@ -789,7 +839,6 @@ impl<T: Transport> Conn<T> {
             }
             self.pos = 0;
         }
-        give_buffer(mem::take(&mut self.out));
     }
 
     /// Writes everything in `out`. One send per batch of responses.
@@ -835,5 +884,36 @@ impl<T: Transport> Conn<T> {
                 _ => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What an idle connection costs is mostly its task, the connection's
+    /// future. That future must not grow with the handler's (which lives on
+    /// the heap only while a request is handled) or keep copies of itself.
+    #[test]
+    fn a_connection_future_stays_small_whatever_the_handler() {
+        giong::Builder::new()
+            .block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+                let addr = listener.local_addr().expect("address");
+                let client = giong::spawn(async move { TcpStream::connect(addr).await });
+                let stream = listener.accept().await.expect("accept");
+                let _client = client.await.expect("task").expect("connect");
+
+                // A handler that keeps 16 KiB across an `.await`.
+                let handler = |_req: Request| async move {
+                    let state = [7u8; 16 * 1024];
+                    giong::time::sleep(Duration::from_millis(1)).await;
+                    Response::new(200 + u16::from(std::hint::black_box(&state)[0] - 7))
+                };
+                let conn = Conn::new(stream, Server::new().cfg, None).serve(Rc::new(handler));
+                let size = mem::size_of_val(&conn);
+                assert!(size <= 2048, "a connection's future takes {size} bytes");
+            })
+            .expect("runtime");
     }
 }

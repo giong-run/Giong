@@ -161,9 +161,47 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: a `servers` CI job runs the database crates against PostgreSQL 14, 15
   and 17, MySQL 8.4 and 9.1, Redis 6.2 and 7.4 and Valkey 8.0, besides the PostgreSQL 16,
   MySQL 8.0 and Redis 7.0 of the other jobs.
+- **`bench/memory.sh`**: memory per connection, for 10,000 connections that are open,
+  idle after a request, or waiting for their handler, and the peak under load, against
+  Axum, raw Tokio and Go's `net/http` at the same thread count. `bench/hold` holds the
+  connections; the README has the results.
 
 ### Changed
 
+- **An idle keep-alive connection to `giong-http` costs 1.9 KiB instead of 10.9 KiB**, and
+  one whose request is being handled 7.2 instead of 15.0 (Axum: 20.4 and 19.3, Go's
+  `net/http`: 18.9 and 18.3; 10,000 connections, `bench/memory.sh`). The connection's
+  task was most of it: every wrapper that took a future by value kept two copies of it
+  (the task around a spawned future, `time::timeout`, `until_shutdown`, the connection
+  limit, `Conn::run`), so a 2.3 KB connection future took a 9.2 KB task. And the
+  handler's future lived inside the connection's, so every idle connection was as large
+  as the largest future the handler can make: one that held 8 KiB across an `.await`
+  made each idle connection cost 43 KiB, 430 MB for 10,000. Now the handler's future is
+  on the heap only while a request is handled, in blocks the worker reuses. With 20
+  workers and 5,000 busy connections the server peaks 50 MiB above its idle memory
+  instead of 120 (raw Tokio: 64 MiB, Axum: 124 MiB, Go: 184 MiB; 14 MiB on epoll).
+  Throughput is unchanged within noise (7 interleaved rounds of `/json` at 100 and 1,000
+  connections); callgrind counts 2% more instructions per request in user space.
+- **giong**: `time::timeout` returns a `time::Timeout<F>` and `until_shutdown` a
+  `giong::UntilShutdown<F>`, each only as large as the future it wraps plus a timer or a
+  shutdown signal, instead of an `async fn`'s future twice that size. Awaiting them is
+  unchanged. A spawned task is as large as its future, no longer twice.
+- **giong**: a worker lends the kernel 16 receive buffers at first, and twice as many each
+  time a turn of the event loop takes most of them, instead of all 512 at once; free
+  buffers are reused most recent first, on both drivers. The kernel takes the buffers of
+  its ring in turn, so with all of them lent every buffer was touched sooner or later
+  and the whole pool became resident, 2 to 4 MiB per worker however light the traffic:
+  with 20 workers and 100 busy connections, `giong-http`'s memory rose by 40 MiB, now by
+  1 MiB.
+- **`giong-http`**: a connection hands its read buffer back before its responses are
+  sent rather than after, so on io_uring, where a buffer stays with the kernel until the
+  send completes, the connections of one turn share fewer buffers. The buffers a worker
+  keeps for connections to reuse are bounded at 4 MiB, and one that grew past 16 KiB is
+  freed rather than kept. Before, up to 1,024 of
+  up to 256 KiB each could stay, and a large one could be handed to a small request and
+  held for as long as its handler ran.
+- **`giong-http`**: `Server::serve_connection` returns its future instead of being an
+  `async fn`; the future no longer borrows the `Server`.
 - **giong**: a runtime that cannot use io_uring now starts on epoll instead of failing with
   `GIONG-E0001` or `GIONG-E0002`; those errors are raised only when io_uring was asked
   for. An unknown `GIONG_DRIVER` value fails with `GIONG-E0004`. `docs/DEPLOYMENT.md`

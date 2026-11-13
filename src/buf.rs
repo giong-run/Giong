@@ -204,14 +204,30 @@ pub(crate) struct BufPool {
     buf_len: usize,
     /// Our private copy of the ring tail (the published copy lives in `ring`).
     tail: Cell<u16>,
-    /// Where the next buffer is taken from the ring when user space plays
-    /// the kernel's part (the epoll driver); unused with io_uring.
-    head: Cell<u16>,
-    /// Buffers currently available to the kernel.
-    free: Cell<usize>,
+    /// Buffers in the ring, available to the kernel.
+    published: Cell<usize>,
+    /// How many free buffers to keep in the ring: 0 with the epoll driver,
+    /// which takes buffers from `spare` itself.
+    target: Cell<usize>,
+    /// A receive found the ring empty since the last refill.
+    ran_dry: Cell<bool>,
+    /// Free buffers that are not in the ring, the most recently used on top.
+    ///
+    /// The kernel takes ring entries in order and every buffer given back
+    /// goes to the end of the ring, so a ring holding all `count` buffers
+    /// cycles through every one of them and makes all of their memory
+    /// resident, however few are in use at a time. Keeping only `target` in
+    /// the ring and the rest here, reused last-in first-out, keeps the
+    /// memory a worker touches close to what its traffic needs.
+    spare: RefCell<Vec<u16>>,
     /// Tasks waiting for a buffer to come back.
     waiters: RefCell<Vec<Waker>>,
 }
+
+/// Buffers an io_uring worker keeps in its ring at first. The number doubles,
+/// up to the pool's size, whenever a batch of completions takes most of them
+/// or the kernel finds the ring empty.
+const FIRST_TARGET: usize = 16;
 
 impl BufPool {
     pub(crate) fn new(count: u16, buf_len: usize) -> io::Result<Rc<Self>> {
@@ -254,16 +270,64 @@ impl BufPool {
             count,
             buf_len,
             tail: Cell::new(0),
-            head: Cell::new(0),
-            free: Cell::new(0),
+            published: Cell::new(0),
+            target: Cell::new(0),
+            ran_dry: Cell::new(false),
+            // Buffer 0 on top: the lowest addresses are used first.
+            spare: RefCell::new((0..count).rev().collect()),
             waiters: RefCell::new(Vec::new()),
         };
-        for bid in 0..count {
-            pool.push(bid);
-        }
-        pool.publish_tail();
-        pool.free.set(count as usize);
         Ok(Rc::new(pool))
+    }
+
+    /// The io_uring driver registered the ring: start filling it.
+    pub(crate) fn start_ring(&self) {
+        let target = FIRST_TARGET.min(self.count as usize);
+        self.target.set(target);
+        self.fill_to(target);
+    }
+
+    /// Tops the ring up to its target from the spare buffers once it is
+    /// half empty. The io_uring driver calls it after every batch of
+    /// completions, before the kernel can take more. If the kernel found the
+    /// ring empty during the batch, or the batch took three quarters of it,
+    /// the target doubles first (once per batch, however many receives ran
+    /// dry).
+    pub(crate) fn refill(&self) {
+        let target = self.target.get();
+        if target == 0 {
+            return;
+        }
+        let ran_dry = self.ran_dry.replace(false);
+        let published = self.published.get();
+        if ran_dry || published * 4 < target {
+            self.target.set((target * 2).min(self.count as usize));
+        } else if published * 2 >= target {
+            // Plenty left: the buffers this batch took go straight back into
+            // the ring when their readers drop them.
+            return;
+        }
+        self.fill_to(self.target.get());
+    }
+
+    /// The kernel found the ring empty: the next [`refill`](Self::refill)
+    /// keeps more buffers in it.
+    pub(crate) fn ran_dry(&self) {
+        self.ran_dry.set(true);
+    }
+
+    fn fill_to(&self, target: usize) {
+        let mut spare = self.spare.borrow_mut();
+        let before = self.published.get();
+        while self.published.get() < target {
+            let Some(bid) = spare.pop() else { break };
+            self.push(bid);
+            self.published.set(self.published.get() + 1);
+        }
+        drop(spare);
+        if self.published.get() != before {
+            self.publish_tail();
+        }
     }
 
     pub(crate) fn ring_addr(&self) -> u64 {
@@ -278,27 +342,35 @@ impl BufPool {
         self.count
     }
 
-    /// Buffers currently available to the kernel.
+    /// Buffers not in use: in the ring or spare.
     pub(crate) fn free(&self) -> usize {
-        self.free.get()
+        self.published.get() + self.spare.borrow().len()
     }
 
-    /// Records that the kernel handed buffer ownership to user space.
-    pub(crate) fn taken(&self) {
-        self.free.set(self.free.get().saturating_sub(1));
-    }
-
-    /// The epoll driver: the buffer the kernel would fill next, as its id
-    /// and its memory, or `None` if every buffer is in use. It stays free
-    /// until [`take_next`](Self::take_next).
-    pub(crate) fn next_free(&self) -> Option<(u16, *mut u8, usize)> {
-        if self.free.get() == 0 {
-            return None;
+    /// Makes sure the ring holds a buffer before a receive is armed, if any
+    /// buffer is free. Returns `false` if none is.
+    pub(crate) fn ensure_published(&self) -> bool {
+        if self.target.get() != 0 && self.published.get() == 0 {
+            self.fill_to(1);
         }
-        let idx = (self.head.get() & (self.count - 1)) as usize;
-        // SAFETY: `idx < count`, and the entries from the head up to the
-        // published tail were written by `push`.
-        let bid = unsafe { (*self.ring_ptr().add(idx)).bid() };
+        self.free() > 0
+    }
+
+    /// `true` if every free buffer is in the ring.
+    pub(crate) fn no_spare(&self) -> bool {
+        self.spare.borrow().is_empty()
+    }
+
+    /// Records that the kernel took a buffer from the ring.
+    pub(crate) fn taken(&self) {
+        self.published.set(self.published.get().saturating_sub(1));
+    }
+
+    /// The epoll driver: the buffer to receive into next (the most recently
+    /// used free one), as its id and its memory, or `None` if every buffer
+    /// is in use. It stays free until [`take_next`](Self::take_next).
+    pub(crate) fn next_free(&self) -> Option<(u16, *mut u8, usize)> {
+        let bid = *self.spare.borrow().last()?;
         debug_assert!(bid < self.count);
         // SAFETY: `bid < count`, so the buffer lies inside `mem`.
         let ptr = unsafe { self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) };
@@ -308,17 +380,21 @@ impl BufPool {
     /// The epoll driver: the buffer [`next_free`](Self::next_free) returned
     /// now holds data and belongs to user space until it is recycled.
     pub(crate) fn take_next(&self) {
-        debug_assert!(self.free.get() > 0);
-        self.head.set(self.head.get().wrapping_add(1));
-        self.free.set(self.free.get() - 1);
+        let taken = self.spare.borrow_mut().pop();
+        debug_assert!(taken.is_some());
     }
 
-    /// Gives a buffer back to the kernel and wakes tasks starved for buffers.
+    /// Gives a buffer back (to the ring if it is below its target, else to
+    /// the spare buffers) and wakes tasks starved for buffers.
     pub(crate) fn recycle(&self, bid: u16) {
         debug_assert!(bid < self.count);
-        self.push(bid);
-        self.publish_tail();
-        self.free.set(self.free.get() + 1);
+        if self.published.get() < self.target.get() {
+            self.push(bid);
+            self.publish_tail();
+            self.published.set(self.published.get() + 1);
+        } else {
+            self.spare.borrow_mut().push(bid);
+        }
         if !self.waiters.borrow().is_empty() {
             let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
             for waker in waiters {

@@ -266,3 +266,13 @@ fn in_flight_requests_complete_and_idle_connections_close() {
         "the runtime waited for the whole grace period: {elapsed:?}"
     );
 }
+
+/// `until_shutdown` adds a shutdown signal to the future it wraps, and no
+/// second copy of it.
+#[test]
+fn until_shutdown_is_as_large_as_its_future_plus_a_signal() {
+    type Big = std::future::Ready<[u8; 4096]>;
+    let size = std::mem::size_of::<giong::UntilShutdown<Big>>();
+    let parts = std::mem::size_of::<Big>() + std::mem::size_of::<giong::ShutdownSignal>();
+    assert!(size <= parts + 8, "{size} bytes for {parts} bytes of parts");
+}

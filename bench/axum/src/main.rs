@@ -15,6 +15,9 @@ struct User { id: u32, name: String, email: String, active: bool, score: f64 }
 #[derive(Deserialize)]
 struct N { n: Option<u32> }
 
+#[derive(Deserialize)]
+struct Ms { ms: Option<u64> }
+
 fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }
 
 fn make_user(i: u32) -> User {
@@ -33,13 +36,21 @@ async fn compute(Query(q): Query<N>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "result": fib(n) }))
 }
 
+/// `/wait?ms=N` answers after N milliseconds, like a handler waiting for a
+/// database or another service (bench/memory.sh).
+async fn wait(Query(q): Query<Ms>) -> Json<Msg> {
+    tokio::time::sleep(Duration::from_millis(q.ms.unwrap_or(0))).await;
+    Json(Msg { message: "Hello, World!" })
+}
+
 #[tokio::main]
 async fn main() {
     let mut app = Router::new()
         .route("/json", get(json))
         .route("/users", get(users))
         .route("/users/{id}", get(user))
-        .route("/compute", get(compute));
+        .route("/compute", get(compute))
+        .route("/wait", get(wait));
     // MIDDLEWARE=1: what bench/giong-web adds with RequestId, Compression
     // (gzip level 1 from 1 KiB) and Timeout, from tower-http. Layers listed
     // last run first.
