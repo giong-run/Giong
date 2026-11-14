@@ -485,6 +485,67 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
 }
 
 #[test]
+fn a_stuck_file_operation_does_not_hold_up_the_others() {
+    // On epoll, file operations run on the process's blocking threads. Opening
+    // a FIFO for reading blocks until a writer opens it. A burst of such opens
+    // queued while one blocking thread was idle used to go to that one thread
+    // alone, so the first stuck open held up every other file operation of
+    // the process.
+    const OPENS: usize = 16;
+    let dir = TempDir::new("stuck");
+    for i in 0..OPENS {
+        let path = std::ffi::CString::new(dir.path(&i.to_string()).to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let paths: Vec<PathBuf> = (0..OPENS).map(|i| dir.path(&i.to_string())).collect();
+    let last = paths[OPENS - 1].clone();
+    // A writer for the last FIFO only, after 200 ms.
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::OpenOptions::new().write(true).open(last).unwrap()
+    });
+    let opens = paths.clone();
+    giong::Builder::new()
+        .driver(giong::DriverKind::Epoll)
+        .block_on(async move {
+            // One quick operation, so that a blocking thread exists and is idle.
+            fs::metadata("/").await.unwrap();
+            giong::time::sleep(Duration::from_millis(20)).await;
+            let start = Instant::now();
+            let mut handles: Vec<_> = opens
+                .into_iter()
+                .map(|path| giong::spawn(async move { File::open(path).await.map(drop) }))
+                .collect();
+            let last = handles.pop().unwrap();
+            let opened = timeout(Duration::from_secs(5), last).await;
+            assert!(
+                matches!(opened, Ok(Ok(Ok(())))),
+                "the open with a writer did not complete after {:?}: {opened:?}",
+                start.elapsed()
+            );
+            // Let the other opens finish, so that they do not keep blocking
+            // threads busy: a FIFO opened for reading and writing has a writer.
+            let ends: Vec<std::fs::File> = paths[..OPENS - 1]
+                .iter()
+                .map(|path| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+            drop(ends);
+        })
+        .unwrap();
+    drop(writer.join().unwrap());
+}
+
+#[test]
 fn files_work_on_every_worker() {
     let dir = TempDir::new("workers");
     let base = dir.0.clone();

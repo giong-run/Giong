@@ -237,6 +237,40 @@ fn a_remote_task_is_cancelled_when_its_worker_stops() {
     assert!(wait(late).unwrap_err().is_cancelled());
 }
 
+#[test]
+fn work_sent_to_a_stopped_runtime_is_cancelled() {
+    // spawn_balanced after run returned: the job used to wait in the queue
+    // for as long as a Handle existed.
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    rt.run(|_| async {}).unwrap();
+    let job = handle.spawn_balanced(|| async { 1 });
+    assert!(job.is_finished());
+    assert!(wait(job).unwrap_err().is_cancelled());
+    let job = handle.spawn_on(1, || async { 1 });
+    assert!(wait(job).unwrap_err().is_cancelled());
+
+    // A runtime dropped without running: work already sent to it, and work
+    // sent afterwards.
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let early_on = handle.spawn_on(0, || async { 1 });
+    let early_balanced = handle.spawn_balanced(|| async { 1 });
+    drop(rt);
+    assert!(early_on.is_finished() && early_balanced.is_finished());
+    assert!(wait(early_on).unwrap_err().is_cancelled());
+    assert!(wait(early_balanced).unwrap_err().is_cancelled());
+    assert!(wait(handle.spawn_balanced(|| async { 1 }))
+        .unwrap_err()
+        .is_cancelled());
+
+    // The handle of a block_on runtime, used after block_on returned.
+    let handle = giong::block_on(async { giong::handle() });
+    let job = handle.spawn_balanced(|| async { 1 });
+    assert!(job.is_finished());
+    assert!(wait(job).unwrap_err().is_cancelled());
+}
+
 /// Blocks the current (plain) thread on a future.
 fn wait<F: std::future::Future>(fut: F) -> F::Output {
     struct Unpark(std::thread::Thread);
@@ -423,6 +457,72 @@ fn sigterm_triggers_a_graceful_shutdown() {
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
     assert!(child.wait().unwrap().success());
+    assert!(
+        rest.iter().any(|l| l.contains("clean exit")),
+        "child output: {rest:?}"
+    );
+}
+
+#[test]
+fn sigterm_still_works_after_worker_0_returned() {
+    // Signals used to be watched by a task on worker 0 only: once worker 0's
+    // main future had returned, SIGTERM and SIGINT did nothing while the
+    // other workers kept running.
+    if std::env::var_os("GIONG_SIGNAL_CHILD_0").is_some() {
+        giong::Builder::new()
+            .workers(2)
+            .shutdown_on_signals(true)
+            .build()
+            .unwrap()
+            .run(|index| async move {
+                if index == 0 {
+                    return;
+                }
+                // Let worker 0 finish first.
+                sleep(Duration::from_millis(50)).await;
+                println!("ready");
+                giong::shutdown_signal().await;
+            })
+            .unwrap();
+        println!("clean exit");
+        return;
+    }
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(exe)
+        .args([
+            "--exact",
+            "sigterm_still_works_after_worker_0_returned",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("GIONG_SIGNAL_CHILD_0", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert!(
+        lines.by_ref().any(|l| l.unwrap().contains("ready")),
+        "child never became ready"
+    );
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    // The child must exit by itself; kill it if it does not.
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
+    assert!(status.is_some(), "SIGTERM was ignored: {rest:?}");
+    assert!(status.unwrap().success());
     assert!(
         rest.iter().any(|l| l.contains("clean exit")),
         "child output: {rest:?}"

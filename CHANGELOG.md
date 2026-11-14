@@ -139,6 +139,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong**: the default number of workers follows the CPU quota. It was the number of CPUs
+  in the process's affinity mask, which in a container with a CPU limit is every CPU of the
+  machine: a Kubernetes pod with `limits.cpu: 2` on a 64-core node ran 64 pinned workers
+  that the quota throttled. It is now the smaller of the affinity mask and the quota
+  (`std::thread::available_parallelism`), so 2 there. Under such a quota workers are no
+  longer pinned by default, since the CPUs are shared with other processes and pinning
+  stacked the workers on CPUs 0 and 1; `Builder::pin_cores(true)` pins them anyway.
+- **giong**, breaking: `JoinError` is `#[non_exhaustive]`, so that a reason can be added
+  without breaking code; a `match` on it needs a `_` arm.
+- **giong**: the panics an agent or a person meets first now carry a code, the cause and
+  the fix, like giong's errors: `GIONG-E0011` (a giong function called outside a giong
+  runtime, for example on Tokio's executor), `GIONG-E0012` (`block_on` inside a runtime)
+  and `GIONG-E0013` (a giong future polled on another worker).
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
   registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
   the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
@@ -164,6 +177,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**, epoll driver: file operations no longer queue behind one that blocks. A burst
+  of file operations started while one blocking thread was idle all went to that thread, so
+  one open of a FIFO without a writer (or a read from a hung network filesystem) stalled
+  every file operation of the process. A thread now starts whenever more jobs wait than idle
+  threads can take.
+- **giong**: work sent through a `Handle` to a runtime that has stopped, or was dropped
+  without running, is cancelled instead of waiting forever: `spawn_balanced` after `run`
+  returned, jobs still queued when the last worker stopped, and `spawn_on` to a runtime that
+  never ran now resolve to `JoinError::Cancelled`, as documented.
+- **giong**: with `shutdown_on_signals`, SIGINT and SIGTERM are seen as long as any worker
+  runs. Only worker 0 watched for them, so once its main future had returned the signals
+  did nothing and the process had to be killed.
+- **giong**: `Cargo.toml` asked for `libc` 0.2, but giong needs 0.2.172 (what socket2 0.6
+  needs), so a lockfile holding an older `libc` failed to build. CI now builds and tests the
+  core crate with every direct dependency at the lowest version its `Cargo.toml` allows
+  (`minimal-versions` job), and a test checks that I/O completes while another task on the
+  worker keeps yielding, which io-uring 0.7.0 to 0.7.14 broke before 0.5.0.
+- **giong**: a balanced listener could leave a connection in the mailbox of a worker whose
+  last balanced listener closed at the same moment, open and unanswered. The hand-over now
+  checks under the mailbox's lock and keeps the connection, or gives it to another member.
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
   (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the

@@ -18,7 +18,7 @@ exclude = ["bench"]
 
 [dependencies]
 io-uring = "0.7"
-libc = "0.2"
+libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
 
 [lints.rust]
@@ -38,4 +38,4 @@ inherits = "release"
 loom = "0.7"
 
 [dev-dependencies]
-libc = "0.2"
+libc = "0.2.172"
