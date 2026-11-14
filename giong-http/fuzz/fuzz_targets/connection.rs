@@ -270,9 +270,12 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // HTTP/1.1 only: a connection that starts with the HTTP/2 preface is
+    // the `h2` target's.
     let server = Server::new()
         .max_head_size(MAX_HEAD)
-        .max_body_size(MAX_BODY);
+        .max_body_size(MAX_BODY)
+        .http2(false);
     let (done, result) = mpsc::channel();
     let job = Job {
         input,

@@ -24,8 +24,12 @@ pub(crate) enum Failure {
     Cut,
     /// The handler answered and the connection stopped reading the body.
     Abandoned,
-    /// Broken chunked framing.
+    /// Broken chunked framing, or an HTTP/2 stream that broke the protocol
+    /// (a body that does not match its `content-length`, data past the
+    /// flow-control window), which the server reset.
     Malformed,
+    /// The client reset the HTTP/2 stream.
+    Reset,
 }
 
 impl Failure {
@@ -55,8 +59,18 @@ impl Failure {
             .into(),
             Failure::Malformed => Error::new(
                 Code::HttpBodyMalformed,
-                "the request body's chunked framing is broken",
-                "answer 400 Bad Request; the client sent an invalid chunked body",
+                "the request body's framing is broken: invalid chunked encoding, or an \
+                 HTTP/2 stream that broke the protocol (a body longer or shorter than its \
+                 content-length, data past the flow-control window), which the server reset",
+                "answer 400 Bad Request; the client sent an invalid body",
+            )
+            .into(),
+            Failure::Reset => Error::new(
+                Code::HttpBodyIncomplete,
+                "the request body was cut short: the client cancelled the HTTP/2 stream \
+                 (RST_STREAM)",
+                "nothing to fix on the server: the client gave up on the request; stop \
+                 working on it",
             )
             .into(),
         }
@@ -125,6 +139,43 @@ impl Pipe {
             Poll::Ready(())
         })
         .await
+    }
+
+    /// Hands `piece` to the handler if it has taken the previous one, or
+    /// gives it back; `waker` is then woken once the handler takes it. For
+    /// HTTP/2, where one connection feeds many streams and cannot wait for
+    /// one of them.
+    pub(crate) fn offer(&self, piece: Vec<u8>, waker: &Waker) -> Result<(), Vec<u8>> {
+        let mut inlet = self.inlet.borrow_mut();
+        if inlet.piece.is_some() {
+            set_waker(&mut inlet.writer, waker);
+            return Err(piece);
+        }
+        inlet.piece = Some(piece);
+        if let Some(reader) = inlet.reader.take() {
+            reader.wake();
+        }
+        Ok(())
+    }
+
+    /// Whether the handler has asked for the body; if not, `waker` is woken
+    /// when it does.
+    pub(crate) fn poll_asked(&self, waker: &Waker) -> bool {
+        let mut inlet = self.inlet.borrow_mut();
+        if !inlet.asked {
+            set_waker(&mut inlet.writer, waker);
+        }
+        inlet.asked
+    }
+
+    /// Bytes the handler has taken so far; `waker` is woken when it takes
+    /// more.
+    pub(crate) fn poll_taken(&self, waker: &Waker) -> u64 {
+        let mut inlet = self.inlet.borrow_mut();
+        if inlet.piece.is_some() {
+            set_waker(&mut inlet.writer, waker);
+        }
+        inlet.taken
     }
 
     /// Ends the body, well or badly. The first end counts.
@@ -310,24 +361,27 @@ pub struct StreamBody {
 impl StreamBody {
     /// The next piece the producer sent.
     pub(crate) async fn next(&self) -> Next {
-        poll_fn(|cx| {
-            let mut outlet = self.outlet.borrow_mut();
-            if let Some(piece) = outlet.piece.take() {
-                if let Some(sender) = outlet.sender.take() {
-                    sender.wake();
-                }
-                return Poll::Ready(Next::Piece(piece));
+        poll_fn(|cx| self.poll_next(cx.waker())).await
+    }
+
+    /// The next piece the producer sent, if there is one yet; `waker` is
+    /// woken when there is.
+    pub(crate) fn poll_next(&self, waker: &Waker) -> Poll<Next> {
+        let mut outlet = self.outlet.borrow_mut();
+        if let Some(piece) = outlet.piece.take() {
+            if let Some(sender) = outlet.sender.take() {
+                sender.wake();
             }
-            match outlet.end {
-                Some(Ok(())) => Poll::Ready(Next::End),
-                Some(Err(())) => Poll::Ready(Next::Aborted),
-                None => {
-                    outlet.receiver = Some(cx.waker().clone());
-                    Poll::Pending
-                }
+            return Poll::Ready(Next::Piece(piece));
+        }
+        match outlet.end {
+            Some(Ok(())) => Poll::Ready(Next::End),
+            Some(Err(())) => Poll::Ready(Next::Aborted),
+            None => {
+                set_waker(&mut outlet.receiver, waker);
+                Poll::Pending
             }
-        })
-        .await
+        }
     }
 }
 
@@ -445,6 +499,13 @@ fn not_sent() -> io::Error {
         "stop producing the body; nothing more will reach the client",
     )
     .into()
+}
+
+/// Stores `waker` unless the one stored already wakes the same task.
+fn set_waker(slot: &mut Option<Waker>, waker: &Waker) {
+    if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        *slot = Some(waker.clone());
+    }
 }
 
 /// A connected sender and body.

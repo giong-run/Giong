@@ -18,6 +18,37 @@ pub(crate) enum BodyBytes {
     Stream(Rc<Pipe>),
 }
 
+/// The HTTP version of a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Version {
+    /// HTTP/1.0.
+    Http10,
+    /// HTTP/1.1.
+    Http11,
+    /// HTTP/2, over TLS (chosen through ALPN) or over plain TCP with prior
+    /// knowledge.
+    Http2,
+}
+
+impl Version {
+    /// The version as it is written on the wire: `HTTP/1.0`, `HTTP/1.1`,
+    /// `HTTP/2`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Version::Http10 => "HTTP/1.0",
+            Version::Http11 => "HTTP/1.1",
+            Version::Http2 => "HTTP/2",
+        }
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// An HTTP request, normally with its body fully received.
 ///
 /// A request shares the connection's receive buffer instead of copying out of
@@ -130,7 +161,19 @@ impl Request {
         self.target().split_once('?').map(|(_, query)| query)
     }
 
-    /// `1` for HTTP/1.1, `0` for HTTP/1.0.
+    /// The HTTP version the request came with.
+    pub fn version(&self) -> Version {
+        match (self.head.h2, self.head.minor) {
+            (true, _) => Version::Http2,
+            (false, 0) => Version::Http10,
+            (false, _) => Version::Http11,
+        }
+    }
+
+    /// `1` for HTTP/1.1, `0` for HTTP/1.0. An HTTP/2 request reports `1`:
+    /// it can do everything HTTP/1.1 can that HTTP/1.0 cannot (keep the
+    /// connection open, stream a body). [`version`](Self::version) tells
+    /// HTTP/2 apart.
     pub fn version_minor(&self) -> u8 {
         self.head.minor
     }
@@ -190,7 +233,7 @@ impl fmt::Debug for Request {
         f.debug_struct("Request")
             .field("method", &self.method())
             .field("target", &self.target())
-            .field("version_minor", &self.version_minor())
+            .field("version", &self.version())
             .field("peer_addr", &self.peer)
             .field("body_len", &self.body().len())
             .field("body_stream", &matches!(self.body, BodyBytes::Stream(_)))

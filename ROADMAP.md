@@ -223,7 +223,11 @@ the repository, and a benchmark of it against the same API on axum.
       load generator on a second machine over a physical network card, for scaling
       efficiency and the Monoio and Glommio comparison on a real network (two machines
       rented by the hour are enough).
-- [ ] HTTP/2 in `giong-http`, over TLS with ALPN.
+- [x] HTTP/2 in `giong-http`'s server, over TLS with ALPN and over plain TCP with prior
+      knowledge, for the same handlers (`giong-web` included). Hardened against rapid reset,
+      frame and CONTINUATION floods, HPACK bombs and readers that stall, with coded errors
+      (`GIONG-E1115` to `E1118`); `h2spec` in CI; HPACK and whole connections fuzzed.
+- [ ] HTTP/2 in `giong-http`'s client, chosen through ALPN.
 - [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
       over the transport can run on giong.
 - [ ] Decide, based on demand, whether a hyper integration is worth maintaining.

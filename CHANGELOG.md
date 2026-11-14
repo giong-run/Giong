@@ -58,6 +58,41 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   adds a giong client with kernel TLS and the same body sizes.
 - **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
   (`docs/reviews/2026-11-giong-tls.md`).
+- **`giong-http`: HTTP/2** (RFC 9113) for the same handlers. Over TLS, `serve_tls` offers
+  `h2` and `http/1.1` through ALPN, so browsers get HTTP/2; without TLS, a connection that
+  opens with the HTTP/2 preface is served over HTTP/2 ("prior knowledge"), on the same
+  port as HTTP/1.1. Each stream is a `Request` like any other, so handlers and `giong-web`
+  apps serve HTTP/2 unchanged; `Request::version()` returns the new `Version` (`Http10`,
+  `Http11`, `Http2`). Flow control both ways, HPACK with its dynamic table, streamed
+  bodies both ways, file bodies (`Body::File`, read in 64 KiB pieces into DATA frames; a
+  file shorter than announced resets its stream), `Expect: 100-continue`, trailers, and
+  graceful shutdown with a GOAWAY after which the streams in progress finish. A stream
+  the client resets drops its handler at once. `Server::http2(false)` serves HTTP/1.1
+  only, and `Server::max_concurrent_streams` (default 100) caps the streams of one
+  connection. `h2spec` passes all 147 cases over TLS in strict mode, and runs in CI.
+- **`giong-http`**: every resource an HTTP/2 client can make the server hold is bounded,
+  and a client that overdraws a limit gets a GOAWAY whose debug data carries a code with
+  a page in `docs/errors`: `GIONG-E1115` (protocol error), `GIONG-E1116` (rapid reset:
+  too many streams reset or refused), `GIONG-E1117` (a flood of frames that do no work:
+  PING, SETTINGS, PRIORITY, empty DATA or CONTINUATION, needless WINDOW_UPDATE) and
+  `GIONG-E1118` (a header block larger than `max_head_size`, the CONTINUATION flood). A
+  header list that decodes larger than `max_head_size` (an HPACK bomb) is answered with
+  `431`. Request bodies are received only as fast as the handler takes them, and the
+  bodies one connection holds share a budget (the larger of `max_body_size` and 1 MiB)
+  instead of growing with the number of streams; a client that stops reading stops
+  being read from, and a stream its flow control keeps waiting longer than
+  `write_timeout` is reset.
+- **`giong-http`**: on one core, HTTP/2 serves 3.8 to 4.4 times the requests per second
+  of axum 0.8 (hyper) on small answers and 2.5 to 3.0 times on 8.5 KiB ones, over HTTPS
+  and with prior knowledge (502k against 131k for a 27-byte answer over HTTPS). An idle
+  HTTP/2 connection costs 4.2 KiB (axum 23.8), one with a request in progress 5.9 KiB
+  (23.0), and each further request 1.1 KiB (2.0); an idle HTTP/1.1 connection still
+  costs 1.9 KiB. `bench/h2.sh` measures both; results are in `bench/results/h2/`.
+- **Verification**: two new fuzz targets in the nightly fuzz workflow, `hpack` (header
+  blocks decoded, encoded again and compared; Huffman both ways) and `h2` (whole
+  connections from a client that follows the protocol mostly, every frame the server
+  writes checked against RFC 9113 and the client's flow control). The same checks run
+  in `cargo test` (100,000 header blocks and 3,000 connections a run).
 - **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
   worker uses (`giong::IoUringFeature`), and its one-line form names them
   (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker

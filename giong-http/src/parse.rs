@@ -22,6 +22,9 @@ pub(crate) struct Head {
     /// `Connection: keep-alive` was sent.
     pub(crate) keep_alive: bool,
     pub(crate) expect_continue: bool,
+    /// The request came over HTTP/2 (the head was rebuilt from its
+    /// header fields; see `h2::request`).
+    pub(crate) h2: bool,
 }
 
 /// Position just past the `\r\n\r\n` that ends a head, searching from `from`.
@@ -125,6 +128,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
         close: false,
         keep_alive: false,
         expect_continue: false,
+        h2: false,
     };
     let mut hosts = 0;
     let mut transfer_encoding = false;
