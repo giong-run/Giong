@@ -248,10 +248,19 @@ the repository, and a benchmark of it against the same API on axum.
 
 Each item lands only with a benchmark showing what it buys.
 
-- [ ] Registered ring fd and fixed files (direct descriptors) to skip fd lookups.
-- [ ] Zero-copy send for large responses.
+- [x] Registered ring fd: about 11 ns saved of ~130 per `io_uring_enter`, which no
+  benchmark of a whole server can see (neutral on bare metal); on by default from 5.18.
+  Fixed files (direct descriptors) are not done: they would save about 11.5 ns per send,
+  0.6% of a request, less than keeping the descriptor table costs.
+- [x] Zero-copy send for large responses: on bare metal, CPU time per request falls by 16%
+  at 64 KiB, 62% at 256 KiB, 72% at 1 MiB and 85% at 16 MiB, at the same request rate (the
+  link is full); bytes that cannot change only.
+- [x] Receive buffers filled piece by piece (Linux 6.12): memory at 20 workers 49.9 → 23.4
+  MiB, requests per second unchanged.
 - [ ] Receive bundles (several buffers per completion).
-- [ ] Optional `SQPOLL` mode.
+- [x] Optional `SQPOLL` mode: tried and not merged. With its threads on CPUs of their own it
+  lost on bare metal (8 workers and 8 kernel threads: 2.32M req/s against 2.41M for 8
+  workers alone, 73% more CPU per request, since the threads spin).
 - [ ] Optional NAPI busy polling.
 - [x] Kernel TLS (kTLS) for `giong-tls`: +36% serving 1 MiB files over HTTPS with `sendfile`
   on bare metal; slower than rustls from memory, so off by default

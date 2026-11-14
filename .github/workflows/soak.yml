@@ -24,8 +24,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - run: uname -r && nproc
       - name: Soak
         run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak
@@ -34,8 +36,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: Install QEMU and a static busybox
         run: |
           sudo apt-get update -q
@@ -46,7 +50,7 @@ jobs:
             sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/kernels/linux-6.18.63
           key: kernel-6.18.63
@@ -60,7 +64,7 @@ jobs:
         run: grep -E ', [1-9][0-9]* messages received in pieces' target/kernels/linux-6.18.63.log
       - name: Keep the guest's log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: soak-linux-6.18.63-log
           path: target/kernels/linux-6.18.63.log
