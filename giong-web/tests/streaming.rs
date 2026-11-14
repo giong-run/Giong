@@ -240,7 +240,7 @@ fn a_streamed_response_passes_through_the_middleware_untouched() {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.header("transfer-encoding"), Some("chunked"));
         assert_eq!(resp.header("content-encoding"), None);
-        assert_eq!(resp.header("x-request-id").map(str::len), Some(20));
+        assert_eq!(resp.header("x-request-id").map(str::len), Some(32));
         let mut body = Vec::new();
         while let Some(piece) = resp.chunk().await.unwrap() {
             body.extend_from_slice(&piece);

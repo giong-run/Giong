@@ -466,19 +466,41 @@ fn attach_ulp(fd: RawFd) -> io::Result<()> {
     setsockopt(fd, libc::IPPROTO_TCP, TCP_ULP, b"tls")
 }
 
-/// The sequence number of the next record the kernel will send.
-fn sent_records(fd: RawFd, cipher: Cipher, version: Version) -> io::Result<u64> {
+/// The key material the kernel holds for one direction, with the sequence
+/// number of the next record.
+fn installed(fd: RawFd, cipher: Cipher, version: Version, sending: bool) -> io::Result<CryptoInfo> {
     let mut info = CryptoInfo::dummy(version, cipher, 0);
+    let name = if sending { TLS_TX } else { TLS_RX };
     let bytes = info.bytes_mut();
     let mut len = bytes.len() as libc::socklen_t;
     // SAFETY: `bytes` is writable for `len` bytes for the whole call, and
     // `len` is a valid `socklen_t`. The kernel copies the key back too; the
     // struct is wiped when `info` is dropped.
-    let res = unsafe { libc::getsockopt(fd, SOL_TLS, TLS_TX, bytes.as_mut_ptr().cast(), &mut len) };
+    let res = unsafe { libc::getsockopt(fd, SOL_TLS, name, bytes.as_mut_ptr().cast(), &mut len) };
     if res != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(info.rec_seq())
+    Ok(info)
+}
+
+/// The sequence number of the next record the kernel will send.
+fn sent_records(fd: RawFd, cipher: Cipher, version: Version) -> io::Result<u64> {
+    Ok(installed(fd, cipher, version, true)?.rec_seq())
+}
+
+/// Lets the kernel receive again after it took a record for a `KeyUpdate`
+/// that was none.
+///
+/// Linux 6.14+ reads the first byte of every handshake record it decrypts,
+/// and after a 24 (`KeyUpdate`) fails every receive with `EKEYEXPIRED` until
+/// it is given keys. It does not join handshake messages, so the next piece
+/// of a message split over records, which can start with any byte, stops it
+/// too. giong-tls joins the messages, and gives the kernel the peer's new
+/// keys as soon as a real `KeyUpdate` is complete; so when the kernel still
+/// waits, the keys have not changed, and it gets back the ones it has, at the
+/// sequence number it has reached.
+fn resume_receiving(fd: RawFd, cipher: Cipher, version: Version) -> io::Result<()> {
+    installed(fd, cipher, version, false)?.install(fd, false)
 }
 
 /// A control message that sets the type of the record `sendmsg` sends.
@@ -1653,6 +1675,7 @@ impl TlsStream {
     /// failure) is settled before the first `.await` that follows it, and a
     /// `KeyUpdate` the peer asked for stays owed until something is sent.
     pub(crate) async fn kernel_recv(&self) -> io::Result<Vec<u8>> {
+        let mut resumed = false;
         loop {
             {
                 let mut plain = self.plain.borrow_mut();
@@ -1686,12 +1709,23 @@ impl TlsStream {
                     // A record that is not application data, which the
                     // kernel only hands to a receive with room for its type.
                     match recv_record(self.tcp.as_raw_fd()) {
-                        Ok(record) => self.control_record(record),
+                        Ok(record) => {
+                            resumed = false;
+                            self.control_record(record)
+                        }
                         Err(r) if r.kind() == io::ErrorKind::WouldBlock => return Err(e),
                         Err(r) => Control::Fail(kernel_error(r), None),
                     }
                 }
                 Err(e) => match e.raw_os_error() {
+                    // Twice in a row, the kernel did not take the keys.
+                    Some(libc::EKEYEXPIRED) if !resumed => match self.resume_receiving() {
+                        Ok(()) => {
+                            resumed = true;
+                            continue;
+                        }
+                        Err(r) => Control::Fail(r, None),
+                    },
                     Some(libc::EBADMSG | libc::EMSGSIZE | libc::EKEYEXPIRED) => {
                         Control::Fail(kernel_error(e), None)
                     }
@@ -1730,6 +1764,36 @@ impl TlsStream {
         RefMut::map(self.engine.borrow_mut(), |e| match e {
             Engine::Kernel(k) => k,
             Engine::User(_) => unreachable!("not a kernel TLS stream"),
+        })
+    }
+
+    /// The kernel stopped receiving for a `KeyUpdate` this side has not
+    /// seen: see [`resume_receiving`]. TLS 1.2 has no key updates, and there
+    /// the kernel takes no keys twice: a peer that sends a piece of a
+    /// handshake message starting with 24 (it can only be asking to
+    /// renegotiate, which is refused anyway) loses the connection.
+    fn resume_receiving(&self) -> io::Result<()> {
+        let k = self.kernel_mut();
+        if k.version == Version::Tls12 {
+            return Err(coded(
+                Code::KtlsKeyUpdate,
+                "the kernel took a piece of a handshake message from the peer for a change of \
+                 keys, which TLS 1.2 does not have, and receives nothing more",
+                "open a new connection. The peer asked to renegotiate, which giong-tls refuses; \
+                 Ktls::Off keeps the connection in the process, where the refusal is an alert \
+                 and the connection goes on.",
+            ));
+        }
+        resume_receiving(self.tcp.as_raw_fd(), k.cipher, k.version).map_err(|e| {
+            coded(
+                Code::KtlsKeyUpdate,
+                format!(
+                    "the kernel waits for new TLS keys the peer did not change to, and did not \
+                     take back the ones it has: {e}"
+                ),
+                "this is a bug in giong-tls; please report it at \
+                 https://github.com/giong-run/Giong/issues.",
+            )
         })
     }
 

@@ -74,11 +74,12 @@ fn main() -> std::io::Result<()> {
 ## What it does
 
 - **One way to write a handler.** `async fn(Req<S>) -> Result<Response, Error>`, where `S` is the state given to `build`. `?` works on any error type: what the client should know is an `Error` with a status, a code and a detail; anything else becomes a `500` whose cause goes to the log and never to the client.
-- **Typed parameters.** `req.param::<u64>("id")?` and `req.query_param::<u32>("page")?` parse into any `FromStr` type. A value that does not parse is a `400` naming the parameter, the value and the type expected. With `serde`, `req.query::<T>()` reads the whole query string into a struct and `req.json::<T>()` the body.
+- **A panic fails one request, not the connection.** A handler or middleware that panics is answered with a `500` (`GIONG-E1210`) whose logged cause is the panic's message, with the request id and the log line of any other error; the connection, and over HTTP/2 every other request on it, carries on. (With `panic = "abort"` the process still stops.)
+- **Typed parameters.** `req.param::<u64>("id")?` and `req.query_param::<u32>("page")?` parse into any `FromStr` type. A value that does not parse is a `400` naming the parameter, the value and the type expected. With `serde`, `req.query::<T>()` reads the whole query string into a struct and `req.json::<T>()` the body; their string fields are `String`, or `Cow<'a, str>` with `#[serde(borrow)]`, never `&str`, which cannot hold an escaped value (giong-web answers that `500` with a cause that says so, rather than blame the client). Both query APIs follow one strict rule: a key that is read appears once, and the whole query string is valid percent-encoding, or the answer is a `400`.
 - **Routing that answers what it can for you.** Patterns with parameters (`/users/{id}`) and a catch-all (`/files/{*path}`). A literal segment wins over a parameter and a parameter over a catch-all, with backtracking, so `/users/me` and `/users/{id}` live side by side. `HEAD` is answered by the `GET` route, `OPTIONS` and `405` with `Allow` for every path, and a `404` for `/users/` asks "did you mean /users?" when that route exists.
 - **Errors that explain themselves.** Every error answer is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem+json body with a code an agent or a client can match on, and the request id when there is one. The codes giong-web uses itself (`GIONG-E1201` to `GIONG-E1213`) each have a page with the cause and the fix in [docs/errors](../docs/errors/README.md).
 - **Mistakes in the program fail at startup, not on the first request.** Two routes that would answer the same requests, a pattern that is not valid, or middleware settings that cannot work (any origin with credentials) panic with a code and the line that added them.
-- **Middleware is one `async fn`.** They run in the order added, and those of a nested router only for its routes. Included: request ids, JSON-line logs, CORS, gzip and timeouts, and with the `tracing` feature a `tracing` span per request.
+- **Middleware is one `async fn`.** They run in the order added, and those of a nested router only for its routes and the `404`, `405` and preflight answers under its prefix. Included: request ids, JSON-line logs, CORS, gzip and timeouts, and with the `tracing` feature a `tracing` span per request.
 - **Bodies of any size.** The routes of a router with `stream_bodies(max)` read their request body as it arrives; any handler can write its response body as it is produced. See "Streaming".
 - **Tested without a socket.** `App::handle(request)` answers a `Request` built with `Request::from_bytes`, so routes and middleware are tested with plain unit tests.
 - **Per-worker and lock-free.** The app, its state and its middleware live on one worker. A worker that compresses a large body yields to the others' requests every 64 KiB.
@@ -89,14 +90,24 @@ fn main() -> std::io::Result<()> {
 let members = Router::new()
     .get("/", list_members)          // GET /teams/{team}
     .get("/members/{id}", member)    // GET /teams/{team}/members/{id}
-    .layer(RequireAuth);             // only for these two routes
+    .layer(RequireAuth);             // for these routes, and the 404s under /teams/{team}
 let app = Router::new()
     .get("/files/{*path}", file)     // path = "a/b c.txt" for /files/a/b%20c.txt
     .nest("/teams/{team}", members)
     .build(state);
+
+async fn file(req: Req<State>) -> Result<Response, Error> {
+    // Never `..`, `.`, NUL or absolute, so it stays under the root.
+    let path: String = req.param("path")?;
+    let full = req.state().root.join(&path);
+    // ...
+}
 ```
 
 - A path parameter is one segment, percent-decoded; the catch-all takes the rest of the path, at least one character. A pattern has at most 16 parameters.
+- `req.param` refuses (`400`, `GIONG-E1205`) a value that could leave a directory once decoded: a `.` or `..` segment (`/files/../x`, `%2E%2E`, `..%2F`), a NUL (`%00`), a `/` (`%2F`) in a one-segment parameter, or a catch-all value starting with `/`. A route that wants such values reads `req.param_raw(name)`, the value as sent, and checks it itself.
+- **Which route answers.** At each segment a literal beats a parameter and a parameter beats a catch-all. Among the paths that match, the most specific one *with a route for the request's method* answers: with `GET /users/me` and `DELETE /users/{id}`, `DELETE /users/me` goes to `/users/{id}` with `id = "me"`. (Routers such as axum's pick the path first and answer `405`.) So `Allow`, in a `405` and in the automatic answer to `OPTIONS`, lists every method that would route to the URL, from every path that matches. To keep a literal path to its own methods, give it routes for the others.
+- Middleware layered on a nested router run for its routes, and for what giong-web answers by itself for its paths: the automatic `OPTIONS` (CORS preflights included, through the middleware of the route the preflight asks about) and the `405` for a path of one of its routes, and the `404` for a path under its prefix. So `Cors` can be layered on the router nested at `/api`.
 - `/users` and `/users/` are different paths. giong-web does not redirect from one to the other; its `404` names the one that exists.
 - `req.route()` gives the pattern that matched (`/teams/{team}/members/{id}`), for logs and metrics.
 - `Router::route(method, pattern, handler)` takes any method; `get`, `post`, `put`, `patch` and `delete` are shortcuts.
@@ -104,7 +115,7 @@ let app = Router::new()
 ## Errors
 
 ```json
-{"status":400,"code":"GIONG-E1205","title":"Bad Request","detail":"path parameter `id`: cannot read \"abc\" (invalid digit found in string); expected an unsigned integer","request_id":"3f9a0c1e02000000002a"}
+{"status":400,"code":"GIONG-E1205","title":"Bad Request","detail":"path parameter `id`: cannot read \"abc\" (invalid digit found in string); expected an unsigned integer","request_id":"3f9a0c1e7d2b4a59000200000000002a"}
 ```
 
 | Status | Code | When |
@@ -116,11 +127,13 @@ let app = Router::new()
 | 400, 422 | `GIONG-E1207` | a JSON body that is not JSON (`400`) or does not fit the type (`422`) |
 | 415 | `GIONG-E1208` | a body that should be JSON and has another `Content-Type` |
 | 503 | `GIONG-E1209` | `Timeout` ran out |
-| 500 | `GIONG-E1210` | the handler failed; the cause is logged, never sent |
+| 500 | `GIONG-E1210` | the handler failed, or a handler or middleware panicked; the cause is logged, never sent |
 | 503 | `GIONG-E1211` | a database or service the handler needs cannot be reached (giong's connect, timeout and pool errors); `Retry-After: 1` |
 | 403 | `GIONG-E1212` | a CORS preflight that `Cors` refused, saying which of origin, method or header |
 
-Your own errors take your own codes: `Error::not_found("user_not_found", "no user 42")`, `Error::conflict(..)`, `Error::new(429, "rate_limited", ..).with_header("Retry-After", "30")`. `Error::of(&response)` reads the error back from a response, for middleware and tests. Every error response has `Cache-Control: no-store`.
+Your own errors take your own codes: `Error::not_found("user_not_found", "no user 42")`, `Error::conflict(..)`, `Error::new(429, "rate_limited", ..).with_header("Retry-After", "30")`. `Error::new` and `with_header` panic on a status outside `400..=599` and on a header value with a control character, which suits literals; a status or a value that comes from elsewhere goes through `Error::from_status` (anything else becomes `502`, the status given logged) and `try_with_header` (`Err` gives the error back without the header). `Error::of(&response)` reads the error back from a response, for middleware and tests. Every error response has `Cache-Control: no-store`.
+
+`?` finds a giong code anywhere down the error's `source()` chain, so a pool timeout wrapped in your own error type is still a `503`. It reads the code from the type of giong's errors and from the start of the companion crates' messages, never from the text of an `io::Error`.
 
 ## Middleware
 
@@ -149,7 +162,7 @@ impl<S: 'static> Middleware<S> for RequireAuth {
 |---|---|---|
 | `RequestId::new()` | gives every request an id (`req.request_id()`) and sends it back in `X-Request-Id` | ids made here; an incoming one is used only with `.trust_incoming(true)` |
 | `Logger::new(Sink::Stdout)` | one JSON line per request: time, method, path, route, status, duration, bytes, request id, peer, worker, and for errors the code, detail and cause | query strings left out (`.include_query(true)`); written by a background thread, never on the worker |
-| `Cors::new()` | answers preflights and adds `Access-Control-Allow-*` for the origins named | no origin allowed until named with `.allow_origin(..)`; methods `GET`, `HEAD`, `POST`; no extra headers |
+| `Cors::new()` | answers preflights and adds `Access-Control-Allow-*` for the origins named; on the outermost router or a nested one, before any credentials check (preflights carry none) | no origin allowed until named with `.allow_origin(..)`; methods `GET`, `HEAD`, `POST`; no extra headers |
 | `Compression::new()` | gzip for clients that accept it | level 1, bodies from 1 KiB to 16 MiB; text, JSON, JavaScript, XML (SVG too) and WebAssembly |
 | `Timeout::new(d)` | answers `503` (`GIONG-E1209`) when the handler takes longer than `d` | not for routes that stream their request body |
 | `Trace::new()` (feature `tracing`) | runs each request in a `tracing` span with OpenTelemetry's field names (`http.request.method`, `url.path`, `http.route`, `http.response.status_code`, `client.address`) plus `request_id` and `worker`, ended by one event; a `5xx` at `ERROR` with its code and cause | instead of `Logger`, or beside it |
@@ -157,10 +170,10 @@ impl<S: 'static> Middleware<S> for RequireAuth {
 A log line:
 
 ```json
-{"ts":"2026-11-13T09:21:04.118302Z","level":"info","event":"request","method":"GET","path":"/users/42","route":"/users/{id}","status":200,"duration_us":84,"bytes":51,"request_id":"3f9a0c1e02000000002a","peer":"10.0.0.7:51122","worker":2}
+{"ts":"2026-11-13T09:21:04.118302Z","level":"info","event":"request","method":"GET","path":"/users/42","route":"/users/{id}","status":200,"duration_us":84,"bytes":51,"request_id":"3f9a0c1e7d2b4a59000200000000002a","peer":"10.0.0.7:51122","worker":2}
 ```
 
-The log thread batches lines every 10 ms. When it falls behind by more than 1 MiB per worker, lines are dropped and counted in a `log_dropped` line, instead of the workers waiting or memory growing. `giong_web::flush_logs()` waits for what is queued (up to 2 s); dropping an `App` calls it.
+The log thread batches lines every 10 ms. When it falls behind by more than 1 MiB per worker, lines are dropped and counted in a `log_dropped` line, instead of the workers waiting or memory growing. Once written, a worker's buffer shrinks back to 64 KiB, and a thread's buffer goes when the thread ends. A path or query string longer than 4 KiB is cut, ending `...(+N bytes)`. `giong_web::flush_logs()` waits for what is queued (up to 2 s); dropping an `App` calls it.
 
 ## Streaming
 
@@ -168,12 +181,14 @@ The log thread batches lines every 10 ms. When it falls behind by more than 1 Mi
 use giong_web::{Body, Error, Req, Response, Router};
 
 async fn upload(req: Req) -> Result<Response, Error> {
+    // Checked by `param`: no `..` or `.` segment, no NUL, not absolute.
+    let name: String = req.param("path")?;
     let body = req.body_stream().expect("a streaming route");
     let mut total = 0;
     while let Some(piece) = body.chunk().await? {
-        total += piece.len(); // write it to a file, hash it, ...
+        total += piece.len(); // write it under the uploads directory, hash it, ...
     }
-    Ok(Response::text(format!("{total} bytes")))
+    Ok(Response::text(format!("{name}: {total} bytes")))
 }
 
 async fn events(_req: Req) -> Result<Response, Error> {
@@ -196,7 +211,7 @@ let app = Router::new().get("/events", events).nest("/api", uploads).build(());
 - `stream_bodies(max)` applies to every route of its router, wherever the router is nested. Other routes still get their body in full, within the server's `max_body_size`.
 - Nothing of the body is read until the handler asks, so a handler can refuse an upload (no credentials, no space) before the client sends it. One piece is in flight at a time: a slow handler slows the client down instead of filling memory.
 - `?` on a body error answers `413` (`GIONG-E1111`, past `max`) or `400` (`GIONG-E1112` cut short, `GIONG-E1113` malformed). A body announced past `max` gets `413` before the handler runs. `req.json()` on a streaming route is a `500` whose logged cause says to read the stream.
-- `Timeout` does not limit a streaming route, whose handler runs while the body arrives; each piece still has the server's `request_timeout`. `Compression` leaves streamed responses alone, and `Logger` writes `"bytes":null` for them.
+- `Timeout` does not limit a streaming route, whose handler runs while the body arrives; each piece still has the server's `request_timeout`. Work done once the body is in (a database call, an upstream request) needs its own limit: wrap it in `giong::time::timeout` (the `Timeout` docs show how). `Compression` leaves streamed responses alone, and `Logger` writes `"bytes":null` for them.
 - A streamed response goes out chunked, each piece as soon as it is sent. `send` fails once the client has gone (noticed at the next write), so the producer stops.
 
 ## Testing
@@ -251,6 +266,6 @@ Cookies and sessions, forms and multipart bodies, WebSockets, serving static fil
 
 ## Tests
 
-`cargo test -p giong-web --all-features`: 23 tests without a socket, most through `App::handle`: text beating parameters beating catch-alls, `HEAD`, `404` with its hint, `405` and `OPTIONS` with `Allow`, parameters that do not parse and a parameter the route lacks, query strings, errors from `?`, state and nested routers, the order middleware run in and which routes they see, a middleware answering by itself and passing values to the handler, closures, the startup panics for bad and duplicate routes; request ids (made, trusted only when asked, sent back), log lines and their fields, timeouts, CORS preflights allowed and refused and simple requests, every middleware setting that cannot work, gzip and when not to use it; JSON bodies in and out, `415`, `400` and `422`, typed queries. One test over real TCP with giong-http's client: gzip on the wire, CORS, `405`, 50 requests on one kept-alive connection. 5 tests of streamed bodies over real TCP: uploads past the server's body limit on a streaming route, `413` with its code for one past the route's limit, a slow upload that the timeout leaves alone, `req.json()` on a streaming route, a streamed response that passes through every middleware untouched. 2 tests of `Trace` with a recording subscriber: the span's fields, and the code and cause of errors. 32 unit tests, among them 30,000 random route sets matched against a slow reference matcher, 4,000 random requests through every middleware with the checks below, and bodies around the 64 KiB compression slice. 14 documentation examples.
+`cargo test -p giong-web --all-features`: 35 tests without a socket, most through `App::handle`: text beating parameters beating catch-alls, `HEAD`, `404` with its hint, `405` and `OPTIONS` with `Allow` (the union of every route that matches the path), parameters that do not parse and a parameter the route lacks, `..`, `.`, NUL and `%2F` refused in parameters, query strings, errors from `?`, state and nested routers, the order middleware run in and which routes they see, the router's own `404`, `405` and `OPTIONS` answers passing through a nested router's middleware, a middleware answering by itself and passing values to the handler, closures, the startup panics for bad and duplicate routes; a panicking handler or middleware answered `500` and logged once; request ids (made, trusted only when asked, sent back), log lines and their fields, long paths cut in them, timeouts, CORS preflights allowed and refused and simple requests, on the outermost router and a nested one, every middleware setting that cannot work, gzip and when not to use it, `HEAD` with the headers of `GET`; JSON bodies in and out, `415`, `400` and `422`, escaped strings and the `500` for a `&str` field that cannot borrow, typed queries, a repeated key and a bad escape refused by both query APIs. 4 tests over real TCP with giong-http's client, over HTTP/1.1 and HTTP/2: gzip on the wire for `GET` and `HEAD`, CORS, `405`, 50 requests on one kept-alive connection; a panic that leaves the connection, and the other HTTP/2 streams, alone. 5 tests of streamed bodies over real TCP: uploads past the server's body limit on a streaming route, `413` with its code for one past the route's limit, a slow upload that the timeout leaves alone, `req.json()` on a streaming route, a streamed response that passes through every middleware untouched. 2 tests of `Trace` with a recording subscriber: the span's fields, and the code and cause of errors. 40 unit tests, among them 30,000 random route sets matched against a slow reference matcher (which works out `Allow` its own way), 4,000 random requests through every middleware with the checks below, bodies around the 64 KiB compression slice, giong codes found down an error's `source()` chain, and the log writer giving back memory and the slot of a thread that ended. 19 documentation examples.
 
 Two fuzz targets in `fuzz/` (`cargo +nightly fuzz run request`, or `routes`): `routes` checks that the route table finds the route a slow reference finds, with the same parameters, or the same `404`, `405` or `OPTIONS` answer; `request` sends any bytes as a request to an app with every middleware and checks that the answer is well formed: a valid status and headers, a problem+json body with a code for every error, gzip only when asked and decoding to what the handler wrote, one log line that is JSON and agrees with the response, and the request id sent back. 5.4 million inputs ran without a failure when the crate was added; CI fuzzes both every night.

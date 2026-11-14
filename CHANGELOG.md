@@ -56,6 +56,32 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   made of the fuzzer's bytes, in memory, and checks that every request ends, that nothing
   is left in flight, and that what the client wrote is whole packets of known commands.
   590,000 runs in 5 minutes found no crash. CI fuzzes it with the other targets.
+- **giong-http**: `Server::http2_prior_knowledge(false)` keeps HTTP/2 to TLS connections
+  that choose it through ALPN, so that a plain port behind an HTTP/1.1 proxy speaks only
+  HTTP/1.1. `Server::http2(true)` used to turn on both, and still does by default.
+- **Verification**: a fuzz target for the HTTP/1.1 client reading a response on a
+  connection, `response_body` (in the nightly fuzz workflow): whatever a server sends, in
+  whatever pieces, the head and body must be what the bytes hold, the body ending exactly
+  where its length, its chunked framing or the close says (or failing with the error
+  that framing calls for), and the connection may be reused only when the bytes received
+  end exactly at the end of the body. The reading code now takes its bytes through a
+  small trait, so the target drives the code the client runs. 100,000 responses run in
+  `cargo test`.
+- **giong-http**: `Response::try_header` and `Response::try_new`, the forms of
+  `Response::header` and `Response::new` that return an error instead of panicking on a
+  header name or value that is not valid (a line break that would split the response)
+  or a status outside 200 to 599, for values that come from the request: a redirect
+  target from a decoded query parameter, a file name in `Content-Disposition`. The error
+  is a `giong::error::Error` with the code `GIONG-E1101` (`Code::HttpClientRequest`, the
+  code giong-http already gives a message that cannot be sent as written). `header` and
+  `new` are unchanged and their documentation points to the new forms.
+- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
+  forms of `Error::new` and `with_header` that never panic, for a status or a header
+  value that comes from an upstream service or the request: a status outside
+  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
+  gives the error back without it. The docs say which form takes which values, and
+  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
+  (takes JSON already written).
 - **giong-tls**: a fuzz target, `ktls_records`, for what kernel TLS reads of the peer's
   records outside the kernel (the record framing during the handshake, and handshake
   messages after it), in the nightly fuzz workflow; a unit test runs the same checks on
@@ -177,6 +203,31 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   used to wait as long as the server's default allows: a year on MySQL. On MySQL a
   write that holds its locks and runs long is still not stopped; on MariaDB,
   `max_statement_time` stops it.
+- **giong-web**, **Breaking**: `Req::query_param` and `Req::query` follow one strict rule.
+  `query_param` used to take the first of a repeated key and skip a key that did not
+  decode; it now answers `400` (`GIONG-E1205`) for a repeated key it is asked for and
+  for a bad escape anywhere in the query string, as `query` did. `query` into a map
+  (`HashMap`, `serde_json::Value`) refuses a repeated key instead of keeping the last
+  value; a struct still ignores the keys it does not know.
+- **giong-web**, **Breaking**: `Sink` is `#[non_exhaustive]`, so that sinks can be added
+  without breaking a `match`.
+- **giong-web**, **Breaking**: request ids made by `RequestId` are 32 hexadecimal digits
+  instead of 20: 64 random bits per process instead of 32, 16 bits for the worker instead
+  of 8, then a 48-bit counter. With 32 random bits, two processes of a fleet shared ids
+  with even odds after about 77,000 starts, and workers above 256 shared them within a
+  process. Code that checks an id's length, or a column sized for it, needs the new one.
+- **giong-web**: `Logger` cuts a path or query string longer than 4 KiB in its lines,
+  ending `...(+N bytes)`. Sixteen requests with a 64 KiB path filled a worker's 1 MiB
+  log buffer, and the lines after them were dropped.
+- **giong-web**: the log writer shrinks a worker's buffer back to 64 KiB once written,
+  instead of keeping the memory of a burst (up to 1 MiB per worker and stream), and
+  removes the buffer of a thread that ended, after writing its last lines, instead of
+  keeping one per thread that ever logged.
+- **giong-web**: the `Timeout` docs no longer say that every giong operation is safe to
+  cancel: dropping is memory-safe, the database and HTTP clients close a connection whose
+  request was abandoned, and some I/O (a vectored write, `send_file`) may be cut halfway.
+  They show how to limit the work a streaming route does once its body is in, which
+  `Timeout` does not cover.
 - **giong-tls (breaking)**: `TlsStream::write_all` takes any buffer giong can send
   (`B: giong::IoBuf + AsRef<[u8]>`: `Vec<u8>`, `&'static [u8]`, `String`, `Box<[u8]>`,
   `Rc<[u8]>`, `Arc<[u8]>`, ...) and hands it back, as `write_all_vectored` already did.
@@ -390,6 +441,127 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   connection attribute names the system it runs on.
 - **giong-mysql**: `insert()`'s error when no id was generated says that the statement ran
   and must not be run again, and its documentation says so.
+- **giong-http**: an HTTP/2 client could make the server hold a whole answer for each of
+  its streams. Handlers ran as soon as their requests arrived, and their response bodies
+  waited in memory for the client's flow control, with no limit: a client that set its
+  window to 0 and opened 100 streams to an endpoint answering 1 MiB made the server hold
+  100 MiB per connection for `write_timeout` (5 such connections: 2.8 to 505 MiB of
+  resident memory). Handlers now run only while the response bytes a connection holds,
+  answered and not sent yet, are within a budget (the larger of `max_body_size` and
+  1 MiB); past it the connection's other handlers wait, those already running included,
+  until the client takes enough or the stream it does not take is reset. The same test
+  now holds 1.1 MiB per connection. A `&'static` body does not count, and a file only for
+  the 64 KiB piece of it being sent.
+- **giong-http**: pending HTTP/2 request bodies were not bounded by the body budget the
+  documentation promised (the larger of `max_body_size` and 1 MiB): every stream could
+  send the protocol's 64 KiB whatever the budget, so 100 streams held 6.4 MiB per
+  connection (measured: 7.2 MiB, against 1.2 MiB for HTTP/1.1). The server now announces
+  a smaller first window (`SETTINGS_INITIAL_WINDOW_SIZE`: half the budget divided by
+  `max_concurrent_streams`, 5,242 bytes by default, within 4 and 64 KiB), sets aside the
+  first windows of streams that may still open before it grants more, and, until the
+  client has acknowledged its settings, refuses (`REFUSED_STREAM`) streams with a body
+  beyond what the budget holds at 64 KiB each. A connection now holds at most the budget
+  plus 256 KiB (measured: 1.65 MiB). A request body larger than the first window waits
+  one round trip for more, as one larger than 64 KiB did before.
+- **giong-http**: a handler that panicked took its whole connection down, and over
+  HTTP/2 that meant every other request on it, without a GOAWAY. Its request is now
+  answered with `500 Internal Server Error`: over HTTP/2 only that stream ends and the
+  connection goes on; over HTTP/1.1 the connection closes after the `500` instead of
+  being cut without an answer. The same holds for a panic in `Handler::stream_body`.
+- **giong-http**: 0.5.0 closed HTTP/2 connections of clients that only read their answers
+  fast, with GOAWAY `ENHANCE_YOUR_CALM` (`GIONG-E1117`). A WINDOW_UPDATE that arrived when
+  the rest of the answer was already sent, or its stream closed, counted as a frame that
+  does no work, of which 1,000 and then 500 a second are allowed. Go's `net/http` client
+  gives window back for every 4 KiB it reads, on the stream and on the connection: with
+  32 requests at a time on one connection it was cut off after about 2,000 answers of
+  2 KiB, 500 of 8 KiB or 30 of 1 MiB, and again on each new connection (it sends the
+  requests again, so few failed, but every one of them is a connection lost). Ten such
+  WINDOW_UPDATE frames for each DATA frame sent are no longer counted; more than that
+  still is a flood. Clients that give window back in larger steps were not affected:
+  curl, h2load and Node.js (nghttp2), and giong-http's own client.
+- **giong-http**: `Handler::stream_body` said that answering early closes the connection;
+  over HTTP/2 only the stream ends.
+- **giong-http**, **Breaking**: an HTTP/1.1 request whose target is a whole URL (absolute
+  form, `GET http://host/path`, which servers must accept) was served whatever its scheme
+  (`foo://x/y` too), and its host was ignored: the handler saw `path() == "/path"` and the
+  host in `Host`, which could name another one than the URL a proxy in front routed or
+  authorised on. Such a target must now be `http` or `https` (in any case), carry no user
+  name or password, and name the host the `Host` header names (compared without regard to
+  case; a port on one side only is a difference), or the request is answered with `400`,
+  as HTTP/2 already did for a `host` that differs from `:authority`. An HTTP/1.0 request
+  in absolute form without `Host` is refused too, `*` is accepted only with `OPTIONS`, and
+  a target that is none of path, URL, `*` or (with `CONNECT`) `host:port` is refused. The
+  path of such a URL now ends where its query starts (`http://h?to=/next` had the path
+  `/next`).
+- **giong-http**: over HTTP/2, a `host` field that names the `:authority` host in another
+  case is no longer refused (host names are case-insensitive, and HTTP/1.1 now compares
+  the same way), and an `:authority` with a user name or password is (RFC 9113, section
+  8.3.1).
+- **giong-http**: trailer lines after a chunked body were dropped without being looked at,
+  so a line without a colon, with a bare CR in it, or with a name that is not a token
+  was accepted, which a proxy in front that ends lines at a bare CR would read
+  differently. They are now held to the rules of a header line: the server answers
+  `400` (`GIONG-E1113` for a body read as a stream), and the client, which shares the
+  decoder, fails with `GIONG-E1107` (`ErrorKind::Protocol`).
+- **giong-http**: the errors of a request body read as a stream, and of a response body
+  that can no longer be sent, ran their fix into the link after it ("... the limit
+  `Handler::stream_body` returns See https://..."): their fixes now end with a full stop.
+- **giong-web**: a handler or middleware that panicked took its connection down with no
+  response, no log line and no request id, and over HTTP/2 every other request on that
+  connection with it. A panic, in the handler, in a closure before it returns its future
+  or in a middleware, is now caught where it happens and answered like any other failure:
+  `500` problem+json with `GIONG-E1210`, whose logged cause is "the handler panicked:
+  ..." or "a middleware panicked: ...", so `Logger`, `Trace` and `RequestId` see an
+  ordinary error response. A header value from the request that makes
+  `Response::header` panic (`%0A` in a query parameter) is one such case.
+- **giong-web**: middleware layered on a nested router never saw the requests giong-web
+  answers by itself, so `Cors` on the router nested at `/api` never answered a preflight
+  (browsers then blocked every JSON or authenticated cross-origin call to those routes),
+  and errors under the prefix had no `Access-Control-Allow-Origin`. A CORS preflight now
+  runs through the middleware of the route its `Access-Control-Request-Method` would go
+  to; another automatic `OPTIONS` or a `405`, through those of the first route at the most
+  specific path that matches; a `404`, through those of the router nested at the most
+  specific prefix of the path (the outermost router's elsewhere, as before).
+- **giong-web**: `Allow`, in a `405` and in the automatic answer to `OPTIONS`, named the
+  methods of the most specific matching path only, though the method picks among every
+  path that matches (`DELETE /users/me` goes to `DELETE /users/{id}`). It now lists every
+  method that would route to the URL. The rule is now in the README.
+- **giong-web**, **Breaking**: `Req::param` refuses with `400` (`GIONG-E1205`) a value
+  that once percent-decoded has a `.` or `..` segment (sent as is or as `%2E%2E`/`..%2F`;
+  giong-http does not remove dot segments), a NUL, a `/` in a one-segment parameter, or,
+  for a catch-all, a leading `/`. `/files/{*path}` joined to a directory was a path
+  traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
+  that wants it.
+- **giong-web**: the docs of `Req::json` showed a `&str` field, which serde can only lend
+  when the string needs no unescaping, so valid JSON with `\"` or `\u00e9` (and a query
+  value with `+` or `%XX`) was answered `422`/`400`, blaming the client. The examples now
+  use `String` or `#[serde(borrow)] Cow<'a, str>`, and such a failure is a `500` whose
+  logged cause (`GIONG-E1213`) says to use one of them.
+- **giong-web**: `?` looked for a giong code in the top error only, and read it from the
+  message of any error, `io::Error` included. A giong error wrapped in an application's
+  error type (a pool timeout inside a `RepoError`) was a `500` instead of a `503`, and an
+  upstream's message relayed in `io::Error::other("GIONG-E1111: ...")` was a `413`. The
+  code is now looked for down the whole `source()` chain, by type for giong's own errors
+  and by message only for the companion crates' error types, never in an `io::Error`'s
+  text.
+- **giong-web**: `Compression` answered `HEAD` without `Content-Encoding: gzip` and with
+  the uncompressed `Content-Length`, while `GET` got the compressed ones; RFC 9110 asks
+  for the same header fields. `HEAD` is now compressed like `GET`, and the server sends
+  the compressed length without the body.
+- **giong**: an idle HTTP/2 connection costs what it did before 0.5.0's zero-copy send. That
+  change made every TCP write future 48 to 88 bytes larger (a wide pointer for the hold,
+  and the retry for sockets that refuse zero-copy kept alive across the send), and
+  `giong-http` keeps several in each connection, so an idle HTTP/2 connection went from
+  4.30 to 4.55 KiB. The hold is now a thin pointer, an operation's driver key is 32 bits,
+  and an operation sends the same bytes again with a copy itself when the socket refuses
+  zero-copy, so a write of one buffer is 8 bytes larger than before zero-copy send and an idle
+  HTTP/2 connection costs 4.33 KiB (5,000 idle connections, 1 worker, RSS, `bench/giong-http`
+  with `bench/hold h2-idle`, on a 4-core VM; the bare-metal pass measured 3.99 and 4.21
+  KiB before and after). The same change takes back most of the instructions zero-copy
+  send had added to each small request: over rustls 15,571 before it, 15,715 with it,
+  15,618 now; over plain HTTP/1.1 9,109, 9,242, 9,130 (`/json`, counted by the new
+  `bench/instructions.sh`, results in `bench/results/instructions/`). That was the
+  largest part of the 2% fewer small HTTPS requests the bare-metal pass measured.
 - **giong-tls**: in the process, a TLS 1.2 AES-GCM connection whose key had sent 2^24
   records went on returning `Ok` from `write_all` while rustls dropped the data and sent
   `close_notify` in its place, so the peer saw a clean close and part of the data was
@@ -411,6 +583,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   decrypts and joins in place. A peer that cut a message after its `Finished` over
   three or more records could make the handoff read once too often or fail with "record
   larger than TLS allows". Tested with a peer that cuts its records to 32 bytes.
+- **giong-tls**: on Linux 6.14 and newer, a TLS 1.3 connection in the kernel could fail
+  with `GIONG-E2011` ("the kernel waits for new TLS keys") when the peer split a
+  handshake message over records, a session ticket for example. Those kernels take every
+  handshake record whose first byte is 24 for a `KeyUpdate` and receive nothing more
+  until they get keys, and a later piece of a split message starts with 24 once in 256
+  times. giong-tls, which joins the messages, now gives the kernel its keys back at the
+  sequence number it has reached when no `KeyUpdate` came, and the connection goes on.
+  Found by the test with a peer that cuts its records to 32 bytes, which failed once in
+  CI; a new test cuts a ticket so that it happens every time.
 - **giong-tls**: the docs say that `Ktls::Auto` can still fail with `GIONG-E2010` if the
   kernel refuses keys after the handshake (rustls has handed them over by then), that
   only one task may receive at a time, and that `tcp()` is for addresses and socket

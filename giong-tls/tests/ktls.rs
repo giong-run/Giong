@@ -1036,6 +1036,54 @@ fn records_that_are_not_data_are_handled_as_rustls_would() {
 }
 
 #[test]
+fn a_piece_of_a_handshake_message_that_starts_like_a_key_update_is_not_one() {
+    if !kernel_tls() {
+        return;
+    }
+    // Linux 6.14+ takes every handshake record whose first byte is 24 for a
+    // KeyUpdate, and receives nothing more until it is given new keys. A
+    // piece of a message split over records can start with any byte: here a
+    // session ticket is cut so that its second and third records start
+    // with 24. Older kernels do not look, so this passes there either way.
+    const HANDSHAKE: u8 = 22;
+    let suite = suites::TLS13_AES_128_GCM_SHA256;
+    let pki = pki();
+    let acceptor = pki.acceptor(Some(suite), Ktls::Required);
+    let connector = pki.connector(Some(suite), Ktls::Required);
+    run(async move {
+        let (server, client) = tls_pair(acceptor, connector).await;
+        // NewSessionTicket: lifetime, age_add, nonce, ticket, extensions.
+        let mut ticket = vec![4, 0, 0, 46];
+        ticket.extend_from_slice(&[0, 0, 0, 60, 1, 2, 3, 4, 1, 0, 0, 32]);
+        ticket.extend_from_slice(&[24; 32]);
+        ticket.extend_from_slice(&[0, 0]);
+        assert_eq!(ticket.len(), 50);
+        for round in 0..3 {
+            for piece in [&ticket[..20], &ticket[20..30], &ticket[30..]] {
+                let control = record_type(HANDSHAKE);
+                let (res, _, _) = server
+                    .tcp()
+                    .send_with_control(piece.to_vec(), control)
+                    .await;
+                res.unwrap();
+            }
+            let (res, _) = server
+                .write_all(format!("after {round}").into_bytes())
+                .await;
+            res.unwrap();
+            let got = timeout(Duration::from_secs(20), client.recv())
+                .await
+                .expect("data within 20 s")
+                .unwrap();
+            assert_eq!(got, format!("after {round}").as_bytes());
+        }
+        // The stream is whole: the kernel still counts its records right.
+        exchange(&server, &client).await;
+        close_both(&server, &client).await;
+    });
+}
+
+#[test]
 fn a_stream_already_read_with_recv_stays_in_the_process_under_auto() {
     if !kernel_tls() {
         return;
