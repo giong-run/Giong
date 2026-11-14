@@ -157,7 +157,7 @@ pub(crate) struct RuntimeShared {
     /// Where the next search for the least loaded worker starts.
     next_pick: AtomicUsize,
     /// Jobs from [`Handle::spawn_balanced`] that no worker has taken yet.
-    jobs: Mutex<VecDeque<Box<dyn FnOnce() + Send>>>,
+    jobs: Mutex<Jobs>,
     /// How many jobs wait in `jobs`, readable without the lock.
     jobs_len: JobCount,
     /// Workers time every task poll (see [`Handle::set_profiling`]).
@@ -173,7 +173,10 @@ impl RuntimeShared {
             workers,
             shutdown: AtomicBool::new(false),
             next_pick: AtomicUsize::new(0),
-            jobs: Mutex::new(VecDeque::new()),
+            jobs: Mutex::new(Jobs {
+                queue: VecDeque::new(),
+                stopped: false,
+            }),
             jobs_len: JobCount::new(),
             profiling: AtomicBool::new(false),
         }))
@@ -271,7 +274,16 @@ impl RuntimeShared {
     /// No wake-up is lost: see [`JobCount`] (modelled with loom in
     /// `notify`).
     fn push_job(&self, job: Box<dyn FnOnce() + Send>) {
-        lock(&self.jobs).push_back(job);
+        {
+            let mut jobs = lock(&self.jobs);
+            if jobs.stopped {
+                drop(jobs);
+                // Dropping the job cancels its handle.
+                drop(job);
+                return;
+            }
+            jobs.queue.push_back(job);
+        }
         self.jobs_len.added();
         let n = self.workers.len();
         let start = self.next_pick.fetch_add(1, Ordering::Relaxed);
@@ -289,11 +301,33 @@ impl RuntimeShared {
         if !self.jobs_len.any() {
             return None;
         }
-        let job = lock(&self.jobs).pop_front();
+        let job = lock(&self.jobs).queue.pop_front();
         if job.is_some() {
             self.jobs_len.taken();
         }
         job
+    }
+
+    /// The runtime will run no more work: every worker has stopped, or it
+    /// never ran. Drops the work still queued for it, and from now on drops
+    /// new work at once, so that every handle to such work resolves to
+    /// [`JoinError::Cancelled`](crate::JoinError::Cancelled) instead of
+    /// waiting forever. Idempotent.
+    fn stop(&self) {
+        for worker in &self.workers {
+            worker.close();
+        }
+        let stranded = {
+            let mut jobs = lock(&self.jobs);
+            jobs.stopped = true;
+            mem::take(&mut jobs.queue)
+        };
+        for _ in 0..stranded.len() {
+            self.jobs_len.taken();
+        }
+        // Outside the lock: dropping a job cancels its handle, which wakes
+        // whoever awaits it.
+        drop(stranded);
     }
 
     fn shutdown(&self) {
@@ -306,6 +340,15 @@ impl RuntimeShared {
             worker.inject(Inject::Shutdown);
         }
     }
+}
+
+/// The queue behind [`Handle::spawn_balanced`].
+struct Jobs {
+    queue: VecDeque<Box<dyn FnOnce() + Send>>,
+    /// The runtime has stopped (or will never run): no worker will take a
+    /// job any more, so a new one is dropped at once, which cancels its
+    /// handle.
+    stopped: bool,
 }
 
 // ---------------------------------------------------------------------- worker
@@ -371,9 +414,30 @@ pub(crate) fn try_with_worker<R>(f: impl FnOnce(&Worker) -> R) -> Option<R> {
         .flatten()
 }
 
-/// Runs `f` with the current worker. Panics outside of a runtime.
+/// Runs `f` with the current worker. Panics with [`Code::NotInRuntime`]
+/// outside of a runtime.
 pub(crate) fn with_worker<R>(f: impl FnOnce(&Worker) -> R) -> R {
-    try_with_worker(f).expect("giong: this must be called from inside a giong runtime")
+    match try_with_worker(f) {
+        Some(r) => r,
+        None => not_in_runtime(),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn not_in_runtime() -> ! {
+    panic!(
+        "{}",
+        crate::error::Error::new(
+            Code::NotInRuntime,
+            "this must be called from inside a giong runtime, and this thread runs none (a \
+             plain thread, or another runtime's executor such as Tokio's)",
+            "start a runtime with giong::block_on or Builder::build()?.run(..), and call this \
+             from the futures it runs. giong's futures cannot be awaited on another executor \
+             (giong-compat adapts the I/O traits, not the runtime). Code that may run outside \
+             giong can check giong::try_worker_id() first.",
+        )
+    )
 }
 
 impl Worker {
@@ -417,10 +481,20 @@ impl Worker {
         self.main_location.set(location);
         WORKER.with(|w| {
             let mut slot = w.borrow_mut();
-            assert!(
-                slot.is_none(),
-                "giong: a runtime is already running on this thread"
-            );
+            if slot.is_some() {
+                drop(slot);
+                panic!(
+                    "{}",
+                    crate::error::Error::new(
+                        Code::RuntimeAlreadyRunning,
+                        "block_on was called on a thread where a giong runtime already runs, \
+                         such as from inside a task",
+                        "await the future instead. To run work elsewhere, use giong::spawn, \
+                         Handle::spawn_on or Handle::spawn_balanced; to start a separate \
+                         runtime, start it on a thread of its own.",
+                    )
+                );
+            }
             *slot = Some(self.clone());
         });
         CURRENT_UID.with(|c| c.set(self.shared.uid));
@@ -744,7 +818,9 @@ impl Worker {
 pub struct Builder {
     workers: Option<usize>,
     driver: Option<DriverKind>,
-    pin_cores: bool,
+    /// `None`: pin unless a CPU quota gives the process fewer CPUs than its
+    /// affinity mask (see [`Builder::pin_cores`]).
+    pin_cores: Option<bool>,
     ring_entries: u32,
     buf_count: u16,
     buf_size: usize,
@@ -760,13 +836,15 @@ impl Default for Builder {
 }
 
 impl Builder {
-    /// A builder with the default configuration: one worker per available CPU,
-    /// each pinned to its own core.
+    /// A builder with the default configuration: one worker per CPU the
+    /// process may use, each pinned to its own core where the process has
+    /// those CPUs to itself (see [`workers`](Self::workers) and
+    /// [`pin_cores`](Self::pin_cores)).
     pub fn new() -> Self {
         Self {
             workers: None,
             driver: None,
-            pin_cores: true,
+            pin_cores: None,
             ring_entries: 1024,
             buf_count: 512,
             buf_size: 8 * 1024,
@@ -776,7 +854,16 @@ impl Builder {
         }
     }
 
-    /// Number of worker threads. Defaults to the CPUs this process may run on.
+    /// Number of worker threads.
+    ///
+    /// Defaults to the number of CPUs the process may use: the CPUs it may run
+    /// on (its affinity mask, as `taskset` or a cpuset sets it), or fewer when
+    /// a CPU quota allows less (a container's CPU limit: `cpu.max` in cgroup
+    /// v2, `cpu.cfs_quota_us` in v1), rounded down and at least one. A
+    /// Kubernetes pod with `limits.cpu: 2` on a 64-core node gets 2 workers,
+    /// not 64 that the quota would throttle. This is
+    /// [`std::thread::available_parallelism`], never more than the affinity
+    /// mask allows.
     pub fn workers(mut self, n: usize) -> Self {
         self.workers = Some(n.max(1));
         self
@@ -807,9 +894,17 @@ impl Builder {
         self
     }
 
-    /// Pin each worker thread to one CPU (default: `true`).
+    /// Pin each worker thread to one CPU of the process's affinity mask, in
+    /// order.
+    ///
+    /// By default workers are pinned, unless a CPU quota gives the process
+    /// fewer CPUs than its affinity mask (most containers with a CPU limit):
+    /// the process then shares those CPUs with others, and pinning would put
+    /// every worker on the lowest-numbered ones, so the workers are left to
+    /// the kernel's scheduler. `pin_cores(true)` pins them anyway, and
+    /// `pin_cores(false)` never pins.
     pub fn pin_cores(mut self, pin: bool) -> Self {
-        self.pin_cores = pin;
+        self.pin_cores = Some(pin);
         self
     }
 
@@ -823,8 +918,11 @@ impl Builder {
     /// of two, at most 32768) of `size` bytes each. Default: 512 × 8 KiB.
     ///
     /// The pool only needs to cover the connections that receive data within
-    /// one turn of the event loop; when it runs short, giong falls back to
-    /// heap copies instead of failing.
+    /// one turn of the event loop; when it runs short, giong moves data that
+    /// nobody has read yet to the heap instead of failing. Buffers the
+    /// application holds ([`RecvBuf`](crate::buf::RecvBuf)s it keeps) are not
+    /// copied: while they are all held, receives on the worker wait for one
+    /// to come back.
     ///
     /// `count` is an upper bound, not what a worker uses. The memory is
     /// reserved, not touched; free buffers are reused most recent first, and
@@ -927,7 +1025,9 @@ impl Builder {
     /// Creates the runtime. Nothing runs until [`Runtime::run`] is called.
     pub fn build(self) -> io::Result<Runtime> {
         let cfg = self.config()?;
-        let workers = self.workers.unwrap_or_else(|| allowed_cpus().len().max(1));
+        let workers = self
+            .workers
+            .unwrap_or_else(|| default_workers(allowed_cpus().len(), parallelism()));
         let shared = RuntimeShared::new(workers)?;
         Ok(Runtime {
             builder: self,
@@ -943,6 +1043,9 @@ impl Builder {
         let location = panic::Location::caller();
         let cfg = self.config()?;
         let rt = RuntimeShared::new(1)?;
+        // Work sent through a `Handle` after the runtime is gone is cancelled
+        // rather than left waiting, on every exit path.
+        let _stop = Stop(rt.clone());
         let worker = Worker::new(0, rt, &cfg)?;
         Ok(worker.run(fut, location))
     }
@@ -967,6 +1070,24 @@ pub struct Runtime {
     builder: Builder,
     cfg: Config,
     shared: Arc<RuntimeShared>,
+}
+
+impl Drop for Runtime {
+    /// Runs when [`run`](Runtime::run) returns, or when the runtime is
+    /// dropped without running: work sent to it through a [`Handle`] from now
+    /// on, or still queued, is cancelled.
+    fn drop(&mut self) {
+        self.shared.stop();
+    }
+}
+
+/// Stops a runtime when dropped (see [`RuntimeShared::stop`]).
+struct Stop(Arc<RuntimeShared>);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 /// Lets all workers start together, or not at all.
@@ -1020,6 +1141,10 @@ impl Runtime {
         let n = self.shared.workers.len();
         let cfg = self.cfg.clone();
         let cpus = allowed_cpus();
+        let pin = self
+            .builder
+            .pin_cores
+            .unwrap_or_else(|| pin_by_default(cpus.len(), parallelism()));
         let f = Arc::new(f);
         let gate = Arc::new(Gate {
             state: Mutex::new(None),
@@ -1038,9 +1163,7 @@ impl Runtime {
         for index in 0..n {
             let (f, gate, tx, cfg) = (f.clone(), gate.clone(), tx.clone(), cfg.clone());
             let rt = self.shared.clone();
-            let cpu =
-                (self.builder.pin_cores && !cpus.is_empty()).then(|| cpus[index % cpus.len()]);
-            let signal_fd = if index == 0 { signal_fd } else { None };
+            let cpu = (pin && !cpus.is_empty()).then(|| cpus[index % cpus.len()]);
             let spawned = thread::Builder::new()
                 .name(format!("giong-{index}"))
                 .spawn(move || {
@@ -1073,6 +1196,9 @@ impl Runtime {
                     let _stop = StopOnPanic(rt);
                     worker.run(
                         async move {
+                            // Every worker watches, so that signals are seen as
+                            // long as any worker runs, not only while worker 0
+                            // does.
                             if let Some(fd) = signal_fd {
                                 crate::spawn(watch_signals(fd));
                             }
@@ -1219,9 +1345,11 @@ impl Drop for SignalGuard {
 }
 
 /// Waits for the signal handler to poke the eventfd, then requests shutdown.
+/// Runs on every worker; whichever reads the eventfd first requests the
+/// shutdown, and the others see it and end.
 ///
-/// Ends as soon as a shutdown is requested by any other means, so that it never
-/// keeps a draining worker alive.
+/// Ends as soon as a shutdown is requested by any other means, or the worker
+/// drains, so that it never keeps a draining worker alive.
 async fn watch_signals(fd: RawFd) {
     until_shutdown(async {
         let mut buf: Vec<u8> = Vec::with_capacity(8);
@@ -1328,7 +1456,9 @@ impl Handle {
         let (handle, job) = RemoteJoinHandle::new(f, panic::Location::caller());
         self.rt.sending(worker);
         // A stopped worker drops the job, which cancels the handle.
-        shared.inject(Inject::Run(job));
+        if !shared.inject(Inject::Run(job)) {
+            self.rt.received(worker);
+        }
         handle
     }
 
@@ -1348,8 +1478,9 @@ impl Handle {
     /// `f` (giong never moves a running task, so tasks need not be `Send`).
     /// Otherwise it behaves like [`spawn_on`](Self::spawn_on): only `f` and
     /// the output cross threads, and the handle reports a panic or a
-    /// cancellation the same way. Jobs still queued when the runtime stops
-    /// are dropped, which cancels their handles.
+    /// cancellation the same way. Jobs still queued when the runtime stops,
+    /// and jobs sent after it stopped (or to a runtime dropped without
+    /// running), are dropped, which cancels their handles.
     ///
     /// ```no_run
     /// let rt = giong::Builder::new().workers(4).build()?;
@@ -1384,8 +1515,11 @@ impl Handle {
     }
 
     /// The index of the worker that looks least busy, for code that places
-    /// work itself, for example handing a new connection to another worker
-    /// with [`spawn_on`](Self::spawn_on).
+    /// work itself with [`spawn_on`](Self::spawn_on): a job, or the data a
+    /// task on that worker needs. (giong's sockets and files stay on the
+    /// worker that opened them; to spread new connections over the workers,
+    /// bind each worker's listener with
+    /// [`TcpListener::bind_balanced`](crate::net::TcpListener::bind_balanced).)
     ///
     /// The score is the worker's live tasks plus its runnable ones and the
     /// work sent to it that it has not started yet, plus one if it is awake
@@ -1752,6 +1886,31 @@ pub fn stats() -> Stats {
 
 // -------------------------------------------------------------------- affinity
 
+/// How many CPUs the process may use, as the standard library sees it: the
+/// affinity mask, lowered by a cgroup CPU quota. `None` if it cannot tell.
+fn parallelism() -> Option<usize> {
+    thread::available_parallelism().ok().map(|n| n.get())
+}
+
+/// The default worker count: one per CPU the process may use. `allowed` is
+/// the number of CPUs in the affinity mask, `parallelism` what
+/// [`parallelism`] found (the mask, or a CPU quota if that is lower).
+fn default_workers(allowed: usize, parallelism: Option<usize>) -> usize {
+    match parallelism {
+        Some(p) => allowed.min(p),
+        None => allowed,
+    }
+    .max(1)
+}
+
+/// Workers are pinned by default only where the process may use every CPU of
+/// its affinity mask. Under a CPU quota smaller than the mask, the CPUs are
+/// shared with other processes, and pinning would stack the workers of every
+/// such process on the lowest-numbered CPUs.
+fn pin_by_default(allowed: usize, parallelism: Option<usize>) -> bool {
+    parallelism.map_or(true, |p| p >= allowed)
+}
+
 /// CPUs the calling thread is allowed to run on.
 fn allowed_cpus() -> Vec<usize> {
     // SAFETY: `set` is a valid, zeroed cpu_set_t of the size we pass.
@@ -1775,5 +1934,35 @@ fn pin_to_cpu(cpu: usize) {
         let mut set: libc::cpu_set_t = mem::zeroed();
         libc::CPU_SET(cpu, &mut set);
         libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_workers, pin_by_default};
+
+    #[test]
+    fn the_default_worker_count_follows_the_cpu_quota() {
+        // No quota: one worker per CPU of the affinity mask.
+        assert_eq!(default_workers(64, Some(64)), 64);
+        // A container limited to 2 CPUs on a 64-core node (the affinity mask
+        // still lists all 64): 2 workers, not 64 throttled ones.
+        assert_eq!(default_workers(64, Some(2)), 2);
+        // A cpuset of 4 CPUs: 4, whatever the quota says above that.
+        assert_eq!(default_workers(4, Some(4)), 4);
+        // The standard library cannot tell: the affinity mask.
+        assert_eq!(default_workers(8, None), 8);
+        // Never zero.
+        assert_eq!(default_workers(0, None), 1);
+        assert_eq!(default_workers(0, Some(1)), 1);
+    }
+
+    #[test]
+    fn workers_are_pinned_by_default_only_on_cpus_of_their_own() {
+        assert!(pin_by_default(64, Some(64)));
+        assert!(pin_by_default(4, None));
+        // Under a quota the CPUs are shared: leave the workers to the
+        // scheduler rather than stack every process on CPUs 0 and 1.
+        assert!(!pin_by_default(64, Some(2)));
     }
 }

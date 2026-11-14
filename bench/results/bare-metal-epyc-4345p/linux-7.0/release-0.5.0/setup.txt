@@ -1,0 +1,4 @@
+commit d5a0b0c4dafe30b32c25919a60de8c610c0d4c26 tree 3c23b194e1c5206d233a64e1f3341b4175887c3c
+br-1: 7.0.0-43-generic, ulimit -l 7919472, ulimit -n 1048576, Combined: 16, irdma loaded: 0, EPP performance, tls module: yes
+br-2: 7.0.0-43-generic, ulimit -l 7919472, Combined: 16, irdma loaded: 0, EPP performance
+rustc: rustc 1.100.0 (0ef1bc386 2026-11-09); wrk: wrk debian/4.1.0-4build2 [epoll] Copyright (C) 2012 Will Glozer; h2load: h2load nghttp2/1.59.0

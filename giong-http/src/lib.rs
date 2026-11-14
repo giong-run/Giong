@@ -1,8 +1,8 @@
 //! # giong-http
 //!
 //! A small, strict HTTP/1.1 and HTTP/2 server for the [giong]
-//! thread-per-core runtime, and (with the `client` feature) an HTTP/1.1
-//! client: see `giong_http::client`.
+//! thread-per-core runtime, and (with the `client` feature) an HTTP/1.1 and
+//! HTTP/2 client: see `giong_http::client`.
 //!
 //! ```no_run
 //! use giong::net::TcpListener;

@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=226,
+        layer="runtime", tests=250,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
@@ -34,23 +34,25 @@ CRATES = {
                "`spawn_on`, `spawn_balanced` and `bind_balanced` to spread new work"],
         fact="3 dependencies: `io-uring`, `libc`, `socket2`"),
     "giong-http": dict(
-        layer="protocols", tests=131,
-        short="A strict HTTP/1.1 server, HTTPS behind a feature, and a pooled client.",
-        lede="A small, strict HTTP/1.1 server with one async handler, and a client.",
-        items=["Keep-alive, pipelining, bodies by `Content-Length` or chunked",
-               "Limits on head and body size; timeouts for idle, slow and slow-reading clients",
+        layer="protocols", tests=191,
+        short="A strict HTTP/1.1 and HTTP/2 server, HTTPS behind a feature, and a pooled client.",
+        lede="A small, strict HTTP/1.1 and HTTP/2 server with one async handler, and a client that speaks both.",
+        items=["HTTP/2 through ALPN or with prior knowledge, for the same handlers",
+               "Keep-alive, pipelining, bodies by `Content-Length` or chunked, streamed both ways",
+               "Limits and timeouts everywhere; HTTP/2 rapid reset and floods answered with a GOAWAY",
                "Answers `400` to any request a proxy in front could read differently",
                "`Server::serve`, `serve_unix`, `serve_tls`; a pooled HTTPS `Client` with proxies "
                "and gzip behind `client`"],
-        fact="the parser fuzzed every night"),
+        fact="`h2spec`: all 147 cases pass"),
     "giong-tls": dict(
-        layer="protocols", tests=34,
+        layer="protocols", tests=64,
         short="TLS 1.2 and 1.3 for servers and clients on rustls. No OpenSSL.",
         lede="TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
         items=["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
                "`recv()` is cancel safe",
                "A cancelled write poisons the sending side instead of corrupting the record stream",
-               "ALPN, client certificates and a handshake timeout"],
+               "ALPN, client certificates and a handshake timeout",
+               "Kernel TLS after the handshake (`Ktls::Auto`), and files sent with `sendfile`"],
         fact="TLS costs 4% on `/json`"),
     "giong-postgres": dict(
         layer="clients", tests=79,
@@ -80,7 +82,7 @@ CRATES = {
                "TLS; Redis 6 or newer (RESP3)"],
         fact="1.4× redis-rs's `GET`s per core"),
     "giong-web": dict(
-        layer="framework", tests=77,
+        layer="framework", tests=79,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
         lede="A router, middleware and JSON on giong-http. Handlers are plain `async fn`s; every "
              "error is a coded problem+json answer.",
@@ -101,7 +103,7 @@ CRATES = {
                "Loopback or a Unix socket only; `Host` and `Origin` checked; optional token"],
         fact="about 9 instructions per task poll"),
     "giong-compat": dict(
-        layer="protocols", tests=29,
+        layer="protocols", tests=30,
         short="Tokio's and futures-io's I/O traits for giong's streams, for h2, tokio-rustls and the like.",
         lede="`AsyncRead`, `AsyncWrite` and `AsyncBufRead` from Tokio and futures-io for giong's "
              "streams, so protocol crates that take a stream run on giong with no Tokio runtime.",
@@ -110,7 +112,7 @@ CRATES = {
                "tokio-util's codecs",
                "Buffered writes like `BufWriter`; reads lose nothing when cancelled",
                "Says plainly which crates cannot work: those that need Tokio's reactor, timers or `spawn`"],
-        fact="one copy per byte; sending costs 13% of throughput"),
+        fact="one copy per byte; sending costs 10–20% of throughput"),
 }
 
 # Crates on the roadmap that do not exist yet. Each disappears from this list on its
@@ -183,15 +185,15 @@ AGENTS = dict(
 
 CHECKED = [
     "Tests repeated in release mode on all three io_uring setups and on epoll",
-    "Real Linux 5.15, 6.0, 6.1 and Ubuntu 24.04 kernels in QEMU, and Docker's default profile, on every change",
+    "Real Linux 5.15, 6.0, 6.1, 6.12, 6.18 and Ubuntu 24.04 kernels in QEMU, and Docker's default profile, on every change",
     "ThreadSanitizer: no data race",
     "`loom` model check of the cross-thread wake-up",
-    "Parsers fuzzed every night; a two-hour soak test",
+    "Parsers and HTTP/2 fuzzed every night; `h2spec` on every change; a two-hour soak test",
     "valgrind memcheck: no invalid access, no leak",
 ]
 NOT_YET = [
     "giong has **not run in production**",
-    "No bare-metal scaling numbers: the multi-core run was under WSL2, over loopback",
+    "Bare metal measured on one pair of 8-core machines only; nothing larger yet",
     "`giong-tls` has had no independent security audit, only a review by the project's AI agent",
 ]
 
@@ -421,8 +423,9 @@ CAVEATS = [
     "**One machine.** Everything is loopback inside a 4-vCPU virtual machine, where the load "
     "generator competes for the same few cores. The 14-core run in the README (1 to 10 workers, "
     "peak 1.50M requests/s) is loopback too, on a desktop under WSL2.",
-    "**Not measured:** a physical network, scaling on bare metal, and disks. The file benchmark "
-    "reads cached data only.",
+    "**Bare metal** is in the README: two 8-core EPYC machines over 25 GbE, 1 to 16 workers. At 8 "
+    "workers giong served 2.45M requests/s, level with tuned Monoio (2.44M) and ahead of raw Tokio "
+    "(2.16M). **Not measured:** disks; the file benchmark reads cached data only.",
     "**8 KB responses:** giong and Monoio serve 63–64k requests/s, everything else 35–37k. Most of "
     "that gap comes from the virtual machine. On physical hardware expect a smaller one.",
     "**`/compute` is the same for everyone**, as it should be: the time goes into the function, "
@@ -451,7 +454,8 @@ COMPARE = [
      "weighted queues with latency classes"),
     ("I/O", "TCP, UDP, Unix sockets, files", "TCP, UDP, Unix sockets, files",
      "TCP, UDP, Unix sockets, Direct I/O files"),
-    ("Ecosystem", "its own HTTP/1.1 server and client, web framework, TLS for both sides, DNS, "
+    ("Ecosystem", "its own HTTP/1.1 and HTTP/2 server and client, web framework, TLS for both sides "
+                  "(kernel TLS too), DNS, "
                   "PostgreSQL, MySQL and Redis clients; Tokio's I/O traits for crates such as h2",
      "TLS, HTTP, codecs, Tokio compatibility layer", "channels, semaphores, rate control"),
 ]
@@ -491,10 +495,11 @@ EXAMPLES = [
 LIMITS = [
     ("Linux only", "io_uring on 6.0 or newer, epoll elsewhere. On epoll giong is as fast as other "
                    "epoll runtimes, not faster. macOS and Windows are planned for after 1.0."),
-    ("Not Tokio's ecosystem", "Crates that need the Tokio runtime (hyper, sqlx, reqwest) do not run "
-                              "on giong. Crates that only use `std::future` do."),
-    ("No HTTP/2", "`giong-http` speaks HTTP/1.1. A request body over the limit is refused."),
-    ("No kTLS", "TLS runs in user space on rustls, and certificates are not reloaded for you."),
+    ("Not Tokio's ecosystem", "Crates that need the Tokio runtime (sqlx, reqwest, tonic's transport) "
+                              "do not run on giong. Crates generic over a Tokio or futures-io stream "
+                              "(h2, tokio-rustls) run through `giong-compat`, at the cost of a copy."),
+    ("TLS certificates", "Certificates are not reloaded for you. Kernel TLS is off by default: it "
+                         "pays off for large files, not for data in memory."),
     ("Running tasks stay put", "New work can go to the least busy worker (`spawn_balanced`, "
                                "`bind_balanced`), but a task never moves once it has started."),
     ("Some gaps", "Names come from `/etc/hosts` and DNS, not mDNS or LDAP. Also missing: Unix "
@@ -502,8 +507,8 @@ LIMITS = [
 ]
 
 ELSEWHERE = [
-    "**Monoio** is the mature choice and runs in production at ByteDance. If you need HTTP/2 or "
-    "Tokio-compatible crates today, use it.",
+    "**Monoio** is the mature choice and runs in production at ByteDance. If you need a runtime "
+    "proven in production today, or macOS, use it.",
     "**Glommio** is built for storage engines: Direct I/O and priority scheduling are its strengths.",
     "**Tokio** is the general-purpose runtime. giong is not trying to replace it for every workload.",
 ]
@@ -524,13 +529,14 @@ FAQ = [
      "io_uring is blocked, it runs on its epoll driver (tested on 5.15)."),
     ("Can I use hyper, reqwest, sqlx or other Tokio crates?",
      "Not crates that need the Tokio runtime; giong has its own HTTP, TLS, PostgreSQL, MySQL and "
-     "Redis crates instead. Crates that only use `std::future` work. Adapters for the `futures-io` "
-     "and Tokio I/O traits are on the roadmap."),
+     "Redis crates instead. Crates that only use `std::future` work, and crates generic over a "
+     "Tokio or futures-io stream (h2, tokio-rustls, tokio-tungstenite, hyper's connection API) run "
+     "through `giong-compat`."),
     ("Is it faster than Tokio?",
      "Sometimes, and the benchmarks page says where. Small responses at 50 connections are a tie. "
      "giong makes about 0.03 system calls per request against 2.05, spends the least CPU per "
-     "request at 5,000 connections, and reads files 5.5 times faster than Tokio on one core. Every "
-     "number is over loopback on one machine."),
+     "request at 5,000 connections, and reads files 5.5 times faster than Tokio on one core. On "
+     "bare metal with 8 workers it served 2.45M requests/s against raw Tokio's 2.16M."),
     ("How do I report a security problem?",
      "Privately, through GitHub's private vulnerability reporting (the Security link at the "
      "bottom of every page), not in a public issue."),
