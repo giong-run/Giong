@@ -94,6 +94,30 @@ fn an_empty_datagram_is_a_datagram() {
 }
 
 #[test]
+fn read_from_refuses_a_buffer_with_no_room_and_keeps_the_datagram() {
+    // Vec::new() has no capacity: the datagram used to be received into it
+    // and lost, with Ok(0) as the only sign.
+    giong::block_on(async {
+        let (a, a_addr) = socket();
+        let (b, b_addr) = socket();
+        a.send_to("hello", b_addr).await.0.unwrap();
+        sleep(Duration::from_millis(5)).await;
+        let (res, _) = b.read_from(Vec::new()).await;
+        let err = res.unwrap_err();
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::EmptyBuffer),
+            "{err}"
+        );
+        let (res, buf) = timeout(Duration::from_secs(5), b.read_from(Vec::with_capacity(64)))
+            .await
+            .expect("the datagram was lost");
+        assert_eq!(res.unwrap(), (5, a_addr));
+        assert_eq!(buf, b"hello");
+    });
+}
+
+#[test]
 fn ipv6_works_too() {
     giong::block_on(async {
         let Ok(a) = UdpSocket::bind("[::1]:0") else {

@@ -97,7 +97,26 @@ impl Sealed for str {
                  \"[::1]:443\".",
             )
         };
+        if let Ok(ip) = self.parse::<std::net::IpAddr>() {
+            let example = match ip {
+                std::net::IpAddr::V4(_) => format!("\"{ip}:8080\""),
+                std::net::IpAddr::V6(_) => format!("\"[{ip}]:8080\""),
+            };
+            return Err(raise(
+                Code::InvalidAddress,
+                format!("{self:?} is an IP address without a port"),
+                format!("add the port, as in {example}."),
+            ));
+        }
         let (host, port) = self.rsplit_once(':').ok_or_else(invalid)?;
+        if host.contains(':') && !host.starts_with('[') {
+            return Err(raise(
+                Code::InvalidAddress,
+                format!("{self:?} looks like an IPv6 address without brackets"),
+                "put an IPv6 address in brackets before the port, as in \"[::1]:443\" or \
+                 \"[2001:db8::1]:8080\".",
+            ));
+        }
         let port = port.parse::<u16>().map_err(|_| invalid())?;
         Ok(host_port(host, port))
     }

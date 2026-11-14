@@ -39,6 +39,9 @@ when it is no longer raised.
 | [GIONG-E0008](E0008.md) | `NoSuchWorker` | no such worker |
 | [GIONG-E0009](E0009.md) | `BufferRingRefused` | the kernel refused io_uring buffer rings |
 | [GIONG-E0010](E0010.md) | `LockedMemoryLimit` | the locked-memory limit is used up |
+| [GIONG-E0011](E0011.md) | `NotInRuntime` | not inside a giong runtime |
+| [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
+| [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
 
 ## Network and name resolution
 
@@ -52,6 +55,8 @@ when it is no longer raised.
 | [GIONG-E0105](E0105.md) | `DnsTimeout` | DNS server did not answer |
 | [GIONG-E0106](E0106.md) | `DnsServerFailure` | DNS server failed |
 | [GIONG-E0107](E0107.md) | `DnsBadResponse` | malformed DNS answer |
+| [GIONG-E0108](E0108.md) | `DnsServerUnreachable` | cannot reach the DNS server |
+| [GIONG-E0109](E0109.md) | `EmptyBuffer` | buffer with no room |
 
 ## Files
 
@@ -59,6 +64,8 @@ when it is no longer raised.
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
 | [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
+| [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
+| [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
 
 ## giong-http
 
