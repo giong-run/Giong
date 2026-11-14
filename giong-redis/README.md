@@ -4,8 +4,8 @@ A Redis client and connection pool for the [giong](../README.md) runtime. It spe
 
 ```toml
 [dependencies]
-giong = "0.4"
-giong-redis = "0.4"
+giong = "0.5"
+giong-redis = "0.5"
 ```
 
 ```rust

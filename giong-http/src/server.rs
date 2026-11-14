@@ -340,8 +340,8 @@ pub(crate) struct Config {
     pub(crate) max_concurrent_streams: u32,
 }
 
-/// An HTTP/1.1 server. Configure it, then call [`serve`](Server::serve) from
-/// each worker of a giong runtime.
+/// An HTTP/1.1 and HTTP/2 server. Configure it, then call
+/// [`serve`](Server::serve) from each worker of a giong runtime.
 ///
 /// ```no_run
 /// use std::time::Duration;
