@@ -307,9 +307,9 @@ jobs:
           - { kernel: "5.15.225", workarounds: "", features: "", ktls: "1" }
           - { kernel: "6.0.19", workarounds: "", features: "registered-ring" }
           - { kernel: "6.1.155", workarounds: "", features: "registered-ring", ktls: "1" }
-          - { kernel: "6.12.117", workarounds: "", features: "packed-buffers,registered-ring", soak: "60" }
-          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "registered-ring", ktls: "1" }
-          - { kernel: "6.18.63", workarounds: "", features: "packed-buffers,registered-ring", ktls: "1", soak: "60" }
+          - { kernel: "6.12.117", workarounds: "", features: "packed-buffers,registered-ring,zero-copy-send", soak: "60" }
+          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "registered-ring,zero-copy-send", ktls: "1" }
+          - { kernel: "6.18.63", workarounds: "", features: "packed-buffers,registered-ring,zero-copy-send", ktls: "1", soak: "60" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

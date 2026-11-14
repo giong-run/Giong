@@ -435,6 +435,9 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         if kernel_version() >= (5, 18) {
             assert!(got.contains(&"registered-ring"), "{got:?}");
         }
+        if kernel_version() >= (6, 2) {
+            assert!(got.contains(&"zero-copy-send"), "{got:?}");
+        }
     }
 
     // Turned off, one by one and all at once. Each child sets its own

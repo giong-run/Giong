@@ -173,6 +173,57 @@ fn a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies() {
 }
 
 #[test]
+fn large_writes_arrive_intact_with_or_without_zero_copy() {
+    // Sizes around the zero-copy threshold (16 KiB), twice on each fresh
+    // connection, from buffers that can change (sent with a copy) and from
+    // ones that cannot (`Rc<[u8]>`, `'static` bytes, also behind a head that
+    // can change: without a copy where the kernel offers it). Such a write
+    // returns before the kernel is done with the bytes; the head it gives
+    // back is overwritten at once, which must not change what was sent. On
+    // loopback the kernel copies after all, and once it has said so the
+    // socket sends with a copy.
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let sizes = [16 * 1024 - 1, 16 * 1024, 64 * 1024 + 7, 1024 * 1024 + 3];
+        for (i, &size) in sizes.iter().enumerate() {
+            let data: &'static [u8] = Box::leak(payload(size, i as u64).into_boxed_slice());
+            for way in ["vec", "rc", "static", "vectored vec", "vectored head"] {
+                let c = TcpStream::connect(addr).await.unwrap();
+                let s = l.accept().await.unwrap();
+                let reader = giong::spawn(async move { recv_exact(&s, 2 * size).await });
+                let (head, body) = data.split_at(100);
+                for _ in 0..2 {
+                    match way {
+                        "vec" => c.write_all(data.to_vec()).await.0.unwrap(),
+                        "rc" => c.write_all(Rc::<[u8]>::from(data)).await.0.unwrap(),
+                        "static" => c.write_all(data).await.0.unwrap(),
+                        "vectored vec" => {
+                            let pieces = vec![head.to_vec(), body.to_vec()];
+                            c.write_all_vectored(pieces).await.0.unwrap();
+                        }
+                        _ => {
+                            let pieces = vec![Cow::Owned(head.to_vec()), Cow::Borrowed(body)];
+                            let (res, mut pieces) = c.write_all_vectored(pieces).await;
+                            res.unwrap();
+                            pieces[0].to_mut().fill(0xEE);
+                        }
+                    }
+                }
+                let got = reader.await.unwrap();
+                assert!(
+                    got[..size] == data[..] && got[size..] == data[..],
+                    "{size} bytes, {way}"
+                );
+            }
+        }
+        drop(l);
+        sleep(Duration::from_millis(20)).await;
+        let stats = giong::stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
 fn recv_reports_eof_and_keeps_reporting_it() {
     giong::block_on(async {
         let (l, addr) = listener();

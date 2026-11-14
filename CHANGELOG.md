@@ -136,6 +136,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong**: on Linux 6.2 and newer, TCP sends of 16 KiB and more from bytes that cannot
+  change (`&'static [u8]`, `Rc<[u8]>`, `Arc<[u8]>`, so `giong-http`'s static bodies) go
+  out without a copy into the kernel (`IORING_OP_SEND_ZC`, `zero-copy-send`): the network
+  card reads them, and the write still returns as soon as they are queued, so a writer is
+  never held to the peer's acknowledgements. A vectored write may add up to 4 KiB from
+  other buffers (an HTTP head), which are copied aside. Bytes that can change once the
+  write returns (a `Vec`) are copied as before. A socket goes back to plain sends for good
+  when the kernel reports that it copied the data anyway (loopback, a card without
+  scatter-gather) or cannot send this way (kTLS); Unix sockets never use it. On bare metal
+  (Linux 7.0, 25 GbE) it cuts the CPU time per request by 16% at 64 KiB, 62% at 256 KiB,
+  72% at 1 MiB and 85% at 16 MiB, at the same request rate.
+  `bench/uring-features.sh` measures each optional io_uring feature against the rest, on
+  one machine or two.
 
 ### Changed
 

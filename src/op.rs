@@ -22,6 +22,9 @@ pub(crate) struct Op<T: 'static> {
     /// Driver key while in flight.
     key: Option<usize>,
     data: Option<T>,
+    /// What a zero-copy send leaves with the driver when it returns at its
+    /// result (a [`ZeroCopyHold`](crate::driver::ZeroCopyHold)).
+    hold: Option<Box<dyn Any>>,
     /// The worker whose driver owns `key`.
     worker_uid: usize,
     /// Operations are tied to one worker thread.
@@ -41,9 +44,19 @@ impl<T: 'static> Op<T> {
             io: Some(io),
             key: None,
             data: Some(data),
+            hold: None,
             worker_uid: 0,
             _not_send: PhantomData,
         }
+    }
+
+    /// A zero-copy send that completes once it has its result, rather than
+    /// once the kernel stops reading its buffers: `hold` keeps what the
+    /// kernel may still read alive, with the driver, until then.
+    pub(crate) fn with_hold(io: Io, data: T, hold: Box<dyn Any>) -> Self {
+        let mut op = Self::new(io, data);
+        op.hold = Some(hold);
+        op
     }
 }
 
@@ -73,7 +86,7 @@ impl<T: 'static> Future for Op<T> {
                             this.worker_uid, w.shared.uid,
                             "giong: operation polled on a different runtime"
                         );
-                        match driver.poll_op(key, cx.waker()) {
+                        match driver.poll_op(key, cx.waker(), &mut this.hold) {
                             Poll::Ready(done) => {
                                 this.key = None;
                                 done
@@ -100,7 +113,7 @@ impl<T: 'static> Drop for Op<T> {
     fn drop(&mut self) {
         // Never submitted, or already completed: nothing is in flight.
         let Some(key) = self.key.take() else { return };
-        let mut data = self.data.take();
+        let mut data = self.data.take().map(|data| (data, self.hold.take()));
         let handed_over = runtime::try_with_worker(|w| {
             if w.shared.uid != self.worker_uid {
                 return false;
