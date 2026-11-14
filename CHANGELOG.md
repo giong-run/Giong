@@ -8,72 +8,33 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-14
+
+HTTP/2, and less work per byte. `giong-http` speaks HTTP/2 as a server and as a client,
+through ALPN or with prior knowledge, with the same handlers; it is hardened against rapid
+reset, floods and HPACK bombs, `h2spec` passes all 147 cases, and on one core of a
+bare-metal server it answers 2.3 to 4.3 times as many HTTP/2 requests as axum. `giong-tls`
+can hand a connection to the kernel's TLS after the handshake, and files go out with
+`sendfile`: on bare metal a 1 MiB file over HTTPS is served 36% faster than with rustls,
+level with nginx. On io_uring, large static bodies leave without a copy on Linux 6.2 and
+newer (up to 85% less CPU per request), connections share receive buffers piece by piece
+on 6.12 and newer (less than half the memory under load), and bulk receives are no longer
+copied out of the pool. `SQPOLL` was tried and left out: on bare metal it served fewer
+requests with 73% more CPU per request. The new `giong-compat` gives giong's streams the
+Tokio and futures-io I/O traits, so crates such as h2, tokio-rustls and tokio-tungstenite
+run on giong. On Linux 6.14 to 7.2, a worker past the locked-memory limit now runs on
+epoll and says why (`GIONG-E0010`) instead of stopping the runtime. No change breaks code
+written for 0.4, but a stream's `recv` may now return one write of the peer in two pieces.
+
+The release candidate was measured again on the two bare-metal machines
+(`bench/results/bare-metal-epyc-4345p/linux-7.0/release-0.5.0/`): on 4 workers giong
+served 1.75M requests/s against 1.69M for tuned Monoio and 1.59M for raw Tokio, two
+15-minute soaks passed, and nothing moved beyond the 2% noise between runs except two
+small losses not explained yet: an idle HTTP/2 connection costs 4.21 KiB where an earlier
+build measured 3.99, and giong-http over TLS answers about 2% fewer small requests.
+
 ### Added
 
-- **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
-  the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
-  `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
-  their transport run on giong with no Tokio runtime: tested with tokio-rustls,
-  futures-rustls, tokio-tungstenite, h2 (also over giong-tls with ALPN), hyper's HTTP/1
-  connection API (against giong-http both ways) and tokio-util's codecs, on io_uring and
-  epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
-  the buffer is full or when a read waits; a partly read chunk never holds the worker's
-  receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
-  through `AsyncBufRead`), measured by `bench/compat.sh` in four sessions (sending 10–20%
-  slower, receiving with `read` 6–13% more CPU per byte). Errors `GIONG-E1401` (an earlier
-  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting). A
-  hyper server over `Compat` needs a `hyper::rt::Timer` for its header timeout; the README
-  shows one built on giong's timers.
-- **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
-  for futures written by hand and for adapters such as giong-compat.
-- **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
-  hand a connection's keys to the kernel once rustls has done the handshake, and the
-  kernel encrypts and decrypts from then on; the `TlsStream` API stays the same.
-  `Ktls::Off` is the default; `Ktls::Auto` uses the kernel where it can do everything
-  rustls would have done (the `tls` module, every cipher suite the configuration
-  allows in both directions, and new TLS 1.3 keys on a live connection, Linux 6.14+)
-  and keeps the connection in the process otherwise; `Ktls::Required` fails with
-  `GIONG-E2009` instead. What the kernel can do is probed once per process
-  (`giong_tls::ktls_support()`, one line for a log); `TlsStream::is_ktls()`,
-  `ktls_unavailable()` and `giong_tls::ktls_stats()` say which way connections went.
-  Session tickets, key updates from either side, alerts, refused renegotiation and
-  `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
-  the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
-  the kernel would repeat the nonce of the `Finished` message under the same key. New
-  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
-  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
-  are tested.
-- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
-  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
-  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
-  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
-  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
-  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
-  Unix sockets read and write). A file that turns out shorter than announced is the new
-  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
-  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
-  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
-  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
-  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
-  `giong-tls` README has the table and when to turn it on. Recorded in
-  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
-- **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
-  data, on both drivers (giong-tls sends TLS alerts and key updates through it).
-- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
-  and a body for example, without copying them into one first. `giong-http` uses it for
-  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
-- **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
-  module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
-  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
-  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
-  `fallback`, `tsan` and `docker` jobs.
-- **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
-  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
-  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
-  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
-  adds a giong client with kernel TLS and the same body sizes.
-- **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
-  (`docs/reviews/2026-11-giong-tls.md`).
 - **`giong-http`: HTTP/2** (RFC 9113) for the same handlers. Over TLS, `serve_tls` offers
   `h2` and `http/1.1` through ALPN, so browsers get HTTP/2; without TLS, a connection that
   opens with the HTTP/2 preface is served over HTTP/2 ("prior knowledge"), on the same
@@ -122,23 +83,40 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   and 1.2 to 1.3 times on 8.5 KiB ones. `bench/http-client.sh` measures HTTP/2 over TLS
   and with prior knowledge (`h2`, `h2c`), and tells both clients to speak HTTP/1.1 for
   `http` and `https`.
-- **Verification**: two new fuzz targets in the nightly fuzz workflow, `hpack` (header
-  blocks decoded, encoded again and compared; Huffman both ways) and `h2` (whole
-  connections from a client that follows the protocol mostly, every frame the server
-  writes checked against RFC 9113 and the client's flow control). The same checks run
-  in `cargo test` (100,000 header blocks and 3,000 connections a run).
-- **Verification**: a fuzz target for the client's side of HTTP/2, `h2_client`: frames a
-  server might send, fed in pieces while requests come and go, with checks that the
-  client holds no more than the windows it grants and writes only well-formed frames
-  within the server's windows. 3,000 such connections run in `cargo test`.
-- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
-  worker uses (`giong::IoUringFeature`), and its one-line form names them
-  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
-  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
-  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
-- **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
-  suite with the optional features off, and the QEMU kernels include 6.12, the first with
-  packed buffer rings; every QEMU run checks which features giong found.
+- **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
+  hand a connection's keys to the kernel once rustls has done the handshake, and the
+  kernel encrypts and decrypts from then on; the `TlsStream` API stays the same.
+  `Ktls::Off` is the default; `Ktls::Auto` uses the kernel where it can do everything
+  rustls would have done (the `tls` module, every cipher suite the configuration
+  allows in both directions, and new TLS 1.3 keys on a live connection, Linux 6.14+)
+  and keeps the connection in the process otherwise; `Ktls::Required` fails with
+  `GIONG-E2009` instead. What the kernel can do is probed once per process
+  (`giong_tls::ktls_support()`, one line for a log); `TlsStream::is_ktls()`,
+  `ktls_unavailable()` and `giong_tls::ktls_stats()` say which way connections went.
+  Session tickets, key updates from either side, alerts, refused renegotiation and
+  `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
+  the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
+  the kernel would repeat the nonce of the `Finished` message under the same key. New
+  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
+  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
+  are tested.
+- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
+  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
+  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
+  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
+  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
+  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
+  Unix sockets read and write). A file that turns out shorter than announced is the new
+  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
+  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
+  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
+  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
+  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
+  `giong-tls` README has the table and when to turn it on. Recorded in
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
+- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
+  and a body for example, without copying them into one first. `giong-http` uses it for
+  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
 - **giong**: on Linux 6.2 and newer, TCP sends of 16 KiB and more from bytes that cannot
   change (`&'static [u8]`, `Rc<[u8]>`, `Arc<[u8]>`, so `giong-http`'s static bodies) go
   out without a copy into the kernel (`IORING_OP_SEND_ZC`, `zero-copy-send`): the network
@@ -149,9 +127,56 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   when the kernel reports that it copied the data anyway (loopback, a card without
   scatter-gather) or cannot send this way (kTLS); Unix sockets never use it. On bare metal
   (Linux 7.0, 25 GbE) it cuts the CPU time per request by 16% at 64 KiB, 62% at 256 KiB,
-  72% at 1 MiB and 85% at 16 MiB, at the same request rate.
+  68 to 72% at 1 MiB and 85 to 86% at 16 MiB across runs, at the same request rate.
   `bench/uring-features.sh` measures each optional io_uring feature against the rest, on
   one machine or two.
+- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
+  worker uses (`giong::IoUringFeature`), and its one-line form names them
+  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
+  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
+  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
+- **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
+  for futures written by hand and for adapters such as giong-compat.
+- **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
+  data, on both drivers (giong-tls sends TLS alerts and key updates through it).
+- **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
+  the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
+  `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
+  their transport run on giong with no Tokio runtime: tested with tokio-rustls,
+  futures-rustls, tokio-tungstenite, h2 (also over giong-tls with ALPN), hyper's HTTP/1
+  connection API (against giong-http both ways) and tokio-util's codecs, on io_uring and
+  epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
+  the buffer is full or when a read waits; a partly read chunk never holds the worker's
+  receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
+  through `AsyncBufRead`), measured by `bench/compat.sh` in four sessions (sending 10–20%
+  slower, receiving with `read` 6–13% more CPU per byte). Errors `GIONG-E1401` (an earlier
+  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting). A
+  hyper server over `Compat` needs a `hyper::rt::Timer` for its header timeout; the README
+  shows one built on giong's timers.
+- **Verification**: two new fuzz targets in the nightly fuzz workflow, `hpack` (header
+  blocks decoded, encoded again and compared; Huffman both ways) and `h2` (whole
+  connections from a client that follows the protocol mostly, every frame the server
+  writes checked against RFC 9113 and the client's flow control). The same checks run
+  in `cargo test` (100,000 header blocks and 3,000 connections a run).
+- **Verification**: a fuzz target for the client's side of HTTP/2, `h2_client`: frames a
+  server might send, fed in pieces while requests come and go, with checks that the
+  client holds no more than the windows it grants and writes only well-formed frames
+  within the server's windows. 3,000 such connections run in `cargo test`.
+- **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
+  module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
+  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
+  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
+  `fallback`, `tsan` and `docker` jobs.
+- **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
+  suite with the optional features off, and the QEMU kernels include 6.12, the first with
+  packed buffer rings; every QEMU run checks which features giong found.
+- **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
+  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
+  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
+  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
+  adds a giong client with kernel TLS and the same body sizes.
+- **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
+  (`docs/reviews/2026-11-giong-tls.md`).
 
 ### Changed
 
@@ -993,7 +1018,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/giong-run/Giong/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/giong-run/Giong/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
