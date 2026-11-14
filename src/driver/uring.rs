@@ -144,6 +144,9 @@ pub(crate) struct Uring {
     turn: u32,
     /// io_uring features this ring uses.
     features: Vec<IoUringFeature>,
+    /// The ring's index in this thread's registered ring table, with
+    /// [`IoUringFeature::RegisteredRing`].
+    registered_ring: Option<u32>,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -432,6 +435,85 @@ unsafe fn register_packed_ring(
     register_pbuf(ring.as_raw_fd(), REGISTER_PBUF_RING, &reg).is_ok()
 }
 
+/// `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS`.
+const REGISTER_RING_FDS: libc::c_uint = 20;
+const UNREGISTER_RING_FDS: libc::c_uint = 21;
+/// `IORING_ENTER_GETEVENTS`, `IORING_ENTER_EXT_ARG` and
+/// `IORING_ENTER_REGISTERED_RING`.
+const ENTER_GETEVENTS: u32 = 1 << 0;
+const ENTER_EXT_ARG: u32 = 1 << 3;
+const ENTER_REGISTERED_RING: u32 = 1 << 4;
+
+/// `struct io_uring_rsrc_update`, the argument of both.
+#[repr(C)]
+struct RsrcUpdate {
+    offset: u32,
+    resv: u32,
+    data: u64,
+}
+
+/// `struct io_uring_getevents_arg`, for a wait with a timeout.
+#[repr(C)]
+struct GeteventsArg {
+    sigmask: u64,
+    sigmask_sz: u32,
+    min_wait_usec: u32,
+    ts: u64,
+}
+
+/// `struct __kernel_timespec`.
+#[repr(C)]
+struct KernelTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Puts `ring` in this thread's registered ring table, returning its index
+/// there, or `None` where the kernel cannot (before 5.18, or the table is
+/// full: it holds 16 rings per thread).
+///
+/// The table belongs to the thread, so the ring must be entered from this
+/// thread only (which `SINGLE_ISSUER` asks anyway) and taken out of it on
+/// this thread ([`unregister_ring_fd`]).
+fn register_ring_fd(ring: &IoUring) -> Option<u32> {
+    let mut up = RsrcUpdate {
+        // Any free index.
+        offset: u32::MAX,
+        resv: 0,
+        data: ring.as_raw_fd() as u64,
+    };
+    // SAFETY: the argument is one `io_uring_rsrc_update`, as the count says.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring.as_raw_fd(),
+            REGISTER_RING_FDS,
+            &mut up as *mut RsrcUpdate,
+            1u32,
+        )
+    };
+    (ret == 1).then_some(up.offset)
+}
+
+/// Takes the ring at `index` out of this thread's registered ring table.
+fn unregister_ring_fd(ring: &IoUring, index: u32) {
+    let mut up = RsrcUpdate {
+        offset: index,
+        resv: 0,
+        data: 0,
+    };
+    // SAFETY: as in `register_ring_fd`.
+    unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring.as_raw_fd(),
+            UNREGISTER_RING_FDS,
+            &mut up as *mut RsrcUpdate,
+            1u32,
+        )
+    };
+}
+
 /// The running kernel's release (`uname -r`), or `"unknown"`.
 fn kernel_release() -> String {
     // SAFETY: `utsname` is plain data, for which all zeroes is a valid value.
@@ -497,10 +579,17 @@ impl Uring {
             pool.set_registered(RingId::Packed);
             features.push(IoUringFeature::PackedBuffers);
         }
+        let registered_ring = super::feature_enabled(IoUringFeature::RegisteredRing)
+            .then(|| register_ring_fd(&ring))
+            .flatten();
+        if registered_ring.is_some() {
+            features.push(IoUringFeature::RegisteredRing);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
+            registered_ring,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -533,8 +622,8 @@ impl Uring {
                 break;
             }
             // Submission queue full: hand what we have to the kernel.
-            match self.ring.submit() {
-                Ok(_) => {}
+            match self.enter(0, None) {
+                Ok(()) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
@@ -818,8 +907,8 @@ impl Uring {
     pub(crate) fn submit_queued(&mut self) {
         let mut attempts = 0u32;
         while !self.ring.submission().is_empty() {
-            match self.ring.submit() {
-                Ok(_) => {}
+            match self.enter(0, None) {
+                Ok(()) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
@@ -874,17 +963,12 @@ impl Uring {
                     (sq.len(), sq.taskrun() || sq.cq_overflow())
                 };
                 if queued > 0 || pending {
-                    self.ring.submit_and_wait(0).map(drop)
+                    self.enter(0, None)
                 } else {
                     Ok(())
                 }
             }
-            Park::Wait(None) => self.ring.submit_and_wait(1).map(drop),
-            Park::Wait(Some(dur)) => {
-                let ts = types::Timespec::from(dur);
-                let args = types::SubmitArgs::new().timespec(&ts);
-                self.ring.submitter().submit_with_args(1, &args).map(drop)
-            }
+            Park::Wait(timeout) => self.enter(1, timeout),
         };
         if let Err(e) = res {
             match e.raw_os_error() {
@@ -895,6 +979,68 @@ impl Uring {
         }
         self.reap();
         mem::take(&mut self.graveyard)
+    }
+
+    /// `io_uring_enter`: submits every queued SQE, then waits until `want`
+    /// completions are ready (0: does not wait), for at most `timeout`.
+    ///
+    /// The same as the `io-uring` crate's `submit_and_wait` and
+    /// `submit_with_args`, except that it enters through the registered ring
+    /// where there is one: the crate remembers a registration only in the
+    /// short-lived `Submitter` that made it.
+    fn enter(&mut self, want: u32, timeout: Option<Duration>) -> io::Result<()> {
+        let (to_submit, pending) = {
+            let mut sq = self.ring.submission();
+            sq.sync();
+            (sq.len() as u32, sq.taskrun() || sq.cq_overflow())
+        };
+        let (fd, mut flags) = match self.registered_ring {
+            Some(index) => (index as i32, ENTER_REGISTERED_RING),
+            None => (self.ring.as_raw_fd(), 0),
+        };
+        // Deferred task work and overflowed completions are only processed
+        // by an enter that asks for completions.
+        if want > 0 || pending {
+            flags |= ENTER_GETEVENTS;
+        }
+        let ts;
+        let arg;
+        let (arg_ptr, arg_len) = match timeout {
+            None => (std::ptr::null::<GeteventsArg>(), 0),
+            Some(d) => {
+                ts = KernelTimespec {
+                    tv_sec: d.as_secs().min(i64::MAX as u64) as i64,
+                    tv_nsec: i64::from(d.subsec_nanos()),
+                };
+                arg = GeteventsArg {
+                    sigmask: 0,
+                    sigmask_sz: 0,
+                    min_wait_usec: 0,
+                    ts: &ts as *const KernelTimespec as u64,
+                };
+                flags |= ENTER_EXT_ARG;
+                (&arg as *const GeteventsArg, mem::size_of::<GeteventsArg>())
+            }
+        };
+        // SAFETY: the SQEs up to the published tail are complete (`push`),
+        // and `arg_ptr` is null or points at a `GeteventsArg` (and its
+        // timespec) that outlives the call.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_enter,
+                fd,
+                to_submit,
+                want,
+                flags,
+                arg_ptr,
+                arg_len,
+            )
+        };
+        if ret < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     /// Dispatches every completion currently in the completion queue.
@@ -1064,8 +1210,8 @@ impl Uring {
         self.closing = true;
         for _ in 0..100 {
             // Push out queued SQEs (cancels, closes) and collect completions.
-            match self.ring.submit_and_wait(0) {
-                Ok(_) => {}
+            match self.enter(0, None) {
+                Ok(()) => {}
                 Err(e)
                     if matches!(
                         e.raw_os_error(),
@@ -1086,9 +1232,7 @@ impl Uring {
                     types::CancelBuilder::any().all(),
                 );
             }
-            let ts = types::Timespec::from(Duration::from_millis(10));
-            let args = types::SubmitArgs::new().timespec(&ts);
-            let _ = self.ring.submitter().submit_with_args(1, &args);
+            let _ = self.enter(1, Some(Duration::from_millis(10)));
         }
         self.reap();
         self.inflight == 0
@@ -1121,6 +1265,16 @@ impl Uring {
     /// io_uring features this ring uses.
     pub(crate) fn features(&self) -> &[IoUringFeature] {
         &self.features
+    }
+}
+
+impl Drop for Uring {
+    fn drop(&mut self) {
+        // The thread's table holds a reference to the ring, which would keep
+        // it (and its memory) alive until the thread exits.
+        if let Some(index) = self.registered_ring {
+            unregister_ring_fd(&self.ring, index);
+        }
     }
 }
 
