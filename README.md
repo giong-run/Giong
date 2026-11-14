@@ -94,7 +94,8 @@ connection, the same as the others.
   Compose and Kubernetes.
 - Rust 1.80 or newer.
 - giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
-  `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker.
+  `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
+  are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
 
 ## Quick start
 

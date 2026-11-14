@@ -1012,8 +1012,9 @@ def llms():
 
 Facts that are easy to get wrong:
 
-- Linux 6.0 or newer only, with io_uring allowed. It does not build on macOS or Windows.
-  Docker's default seccomp profile blocks io_uring.
+- Linux only: io_uring on 6.0 or newer, and an epoll driver where io_uring is blocked
+  (Docker's default seccomp profile, gVisor) or the kernel is older. It does not build on
+  macOS or Windows yet.
 - Buffers are passed by value and handed back, because the kernel uses them after the call:
   `stream.write_all(buf).await` returns `(io::Result<()>, buf)`.
 - `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may

@@ -16,6 +16,10 @@ Kubernetes setup. Each crate that replaces a Tokio-based one is measured against
 reproducible benchmark (tokio-postgres with deadpool, mysql_async and SQLx, redis-rs,
 reqwest, axum), and the README says where giong does not win.
 
+After 1.0, the 1.x releases add gRPC, macOS, HTTP/3 and Windows, one at a time and without
+breaking the 1.0 API (see the milestones after 1.0 below). Linux stays the platform giong is
+tuned and measured on.
+
 ## Agent-first
 
 More and more code is written by AI agents, so giong is built for them to use correctly on
@@ -48,11 +52,12 @@ tighter the checks around it have to be.
 
 These are deliberate. Proposals that need them will be declined.
 
-- **Production on other operating systems.** Linux is the only platform giong is tuned and
+- **The same tuning on every operating system.** Linux is the platform giong is tuned and
   measured on, and io_uring stays the main path; the epoll driver (0.4) covers the Linux
-  machines where io_uring is blocked, such as Docker's default seccomp profile. Running on
-  macOS for development (kqueue) may follow; Windows (IOCP) not before 1.0, and only if
-  users need it.
+  machines where io_uring is blocked, such as Docker's default seccomp profile. macOS (1.2)
+  is for developing and testing on a Mac, and Windows (1.4) for services that have to run
+  there. Both will pass the same test suite, but speed work lands on Linux first, and
+  neither comes before 1.0.
 - **Work stealing.** A task that has started stays on its worker, so tasks need not be
   `Send`. Balancing happens where new work starts: `Handle::spawn_balanced` and
   `TcpListener::bind_balanced`.
@@ -259,4 +264,97 @@ A stable API. Requires: a review of every public item against the
 documented, the limitations section of the README reduced to deliberate non-goals, and at
 least one production user reporting back.
 
-WebSocket and gRPC come later, when someone needs them.
+The review also makes sure that nothing public ties the API to Linux or to HTTP/2 in a way
+that the releases below would have to break. A first pass over `main` found nothing that
+forces a 2.0, and a short list to settle before the freeze
+([findings](docs/reviews/2026-11-api-portability.md)).
+
+After 1.0, each minor release adds one thing and breaks nothing: code written for 1.0 keeps
+compiling. gRPC comes first because it builds on HTTP/2, which is done; macOS next, because
+its kqueue driver follows the path the epoll driver opened; HTTP/3 after that, the largest
+piece of protocol work, once UDP has been measured on bare metal; Windows last, the largest
+change of platform. WebSocket comes later, when someone needs it.
+
+## 1.1 — gRPC
+
+gRPC on `giong-http`'s HTTP/2 server and client, in a new crate, `giong-grpc`.
+
+- [ ] Trailers in `giong-http`: a streamed response body that ends with trailers, and
+      trailers that can be read at the end of a request body and of a client response. gRPC
+      sends its status in them.
+- [ ] A client request body sent as it is produced, and a response that can be read while
+      the request body is still being sent, for client-streaming and bidirectional calls.
+      The server already keeps reading a request body while its answer streams; this
+      milestone adds the test that holds it to that.
+- [ ] `giong-grpc`: unary, server-streaming, client-streaming and bidirectional calls;
+      deadlines (`grpc-timeout`), status codes, metadata, cancellation, message size limits
+      and gzip. Code generated from `.proto` files at build time, with no macros in user
+      code. Errors carry giong codes.
+- [ ] Health checking and server reflection, so standard tools (`grpcurl`, Kubernetes gRPC
+      probes) work against a giong service.
+- [ ] Tested against grpc-go in both directions with gRPC's interoperability test cases,
+      the message framing fuzzed, and benchmarked against tonic.
+
+**Exit criteria:** the interoperability test cases pass against grpc-go as client and as
+server, and a benchmark compares unary and streaming calls with tonic.
+
+## 1.2 — macOS
+
+giong builds and runs on macOS, for developing and testing services on a Mac. Production
+stays on Linux.
+
+- [ ] A kqueue driver behind the same operations as io_uring and epoll: readiness like
+      epoll, file operations on the pool of blocking threads, `EVFILT_USER` for wake-ups
+      from other threads and `EVFILT_SIGNAL` for shutdown signals.
+- [ ] What macOS does differently: workers share one listening socket where
+      `SO_REUSEPORT` does not spread connections, CPU pinning is skipped (macOS has no hard
+      affinity), and `sendfile` and `fallocate` use their macOS counterparts.
+- [ ] Trust roots for `giong-tls` from the keychain, and DNS servers from the system
+      configuration. Kernel TLS stays Linux only: `Ktls::Auto` keeps connections in the
+      process.
+- [ ] CI on Apple Silicon: the test suite and the examples.
+
+**Exit criteria:** the test suite passes on macOS in CI, and the examples run there
+unchanged.
+
+## 1.3 — HTTP/3
+
+HTTP/3 (RFC 9114) over QUIC (RFC 9000) in `giong-http`'s server and client, for the same
+handlers.
+
+- [ ] QUIC. The first decision, made with a benchmark: build on a sans-I/O implementation
+      that needs no runtime (quinn-proto) or write one here. Then TLS 1.3 through rustls's
+      QUIC support (RFC 9001), loss recovery and congestion control (RFC 9002), connection
+      migration, and 0-RTT off by default.
+- [ ] UDP for QUIC in `giong::net`: segmentation offload on send (GSO) and receive (GRO),
+      ECN, the local address of each datagram, path MTU probing, and many datagrams per
+      system call. A connection's packets reach the worker that owns it by connection ID,
+      not by the sender's address, which changes when a client moves between networks.
+- [ ] HTTP/3 and QPACK (RFC 9204) in the server and the client, advertised with `Alt-Svc`,
+      with the same limits and coded errors as HTTP/2. Frames, QPACK and packets fuzzed.
+- [ ] Tested with the QUIC interop runner and with browsers; benchmarked on bare metal
+      against HTTP/2 on giong and against quinn with h3 on Tokio.
+
+**Exit criteria:** browsers load pages from a giong server over HTTP/3, the interop
+runner's core test cases pass, and the bare-metal benchmark is published with its method.
+
+## 1.4 — Windows
+
+giong builds and runs on Windows, for services that have to run there. Linux stays the
+platform it is tuned for.
+
+- [ ] An IOCP driver. I/O completion ports complete operations the way io_uring does, so
+      buffers handed over and handed back fit as they are: `AcceptEx`, `ConnectEx`,
+      `WSARecv`, `WSASend`, `TransmitFile` and overlapped file I/O, with `CancelIoEx` and
+      each buffer kept until the kernel has let go of it. A zero-byte receive keeps idle
+      connections from holding a pool buffer each.
+- [ ] What Windows does differently: no Unix domain sockets or file modes at first, workers
+      share one listening socket instead of `SO_REUSEPORT`, Ctrl+C, Ctrl+Break and closing
+      the console stop the runtime, and CPU pinning goes through processor groups.
+- [ ] Trust roots for `giong-tls` from the Windows certificate store, and DNS servers from
+      the network adapters.
+- [ ] CI on Windows: the test suite and the examples. Speed measured against Tokio on the
+      same Windows machine, and published as it comes out.
+
+**Exit criteria:** the test suite passes on Windows in CI, and a benchmark against Tokio on
+Windows is published with its method.
