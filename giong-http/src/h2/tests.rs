@@ -1046,6 +1046,67 @@ fn floods_of_frames_that_do_no_work_end_the_connection() {
 }
 
 #[test]
+fn window_updates_for_data_already_sent_are_not_a_flood() {
+    let server = TestServer::start(Server::new());
+    // Windows so wide that the server sends each answer at once. The client
+    // gives window back in fifths of every DATA frame (Go's net/http does
+    // it for every 4 KiB it reads), on the stream and on the connection,
+    // and only when the answer is complete: each of its WINDOW_UPDATEs then
+    // finds nothing left to send, and its stream closed. That is a client
+    // reading a fast download, not a flood, however many frames it comes
+    // to.
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 1 << 30)]);
+    c.auto_window = false;
+    let mut out = Vec::new();
+    frame::write_window_update(&mut out, 0, 1 << 30);
+    c.conn_window += 1 << 30;
+    c.write(&out);
+    let mut updates = 0;
+    for _ in 0..10 {
+        let id = c.get("/bytes?n=1048576");
+        let mut out = Vec::new();
+        loop {
+            let f = c.frame().unwrap();
+            assert_ne!(f.head.kind, frame::GOAWAY, "after {updates} WINDOW_UPDATEs");
+            if f.head.kind != frame::DATA || f.payload.is_empty() {
+                continue;
+            }
+            let n = f.payload.len() as u32;
+            assert!(n >= 5, "{n}");
+            for part in 0..5 {
+                let piece = if part < 4 { n / 5 } else { n - 4 * (n / 5) };
+                frame::write_window_update(&mut out, 0, piece);
+                frame::write_window_update(&mut out, id, piece);
+            }
+            c.conn_window += i64::from(n);
+            updates += 10;
+            if f.head.has(frame::END_STREAM) {
+                break;
+            }
+        }
+        assert_eq!(c.reply(id).unwrap().body, pattern(1 << 20));
+        c.write(&out);
+    }
+    // Several times the budget for frames that do no work.
+    assert!(updates > 5000, "{updates}");
+    assert_eq!(c.request("GET", "/", &[], b"").status, 200);
+
+    // What comes on top of that is a flood, as before.
+    let mut out = Vec::new();
+    for _ in 0..3000 {
+        frame::write_window_update(&mut out, 0, 1);
+    }
+    c.try_write(&out);
+    match c.goaway() {
+        Ended::GoAway(code, debug) => {
+            assert_eq!(reason(code), "ENHANCE_YOUR_CALM");
+            assert!(debug.starts_with("GIONG-E1117"), "{debug}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn continuation_floods_end_the_connection() {
     let server = TestServer::start(Server::new());
 

@@ -393,6 +393,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   answered with `500 Internal Server Error`: over HTTP/2 only that stream ends and the
   connection goes on; over HTTP/1.1 the connection closes after the `500` instead of
   being cut without an answer. The same holds for a panic in `Handler::stream_body`.
+- **giong-http**: 0.5.0 closed HTTP/2 connections of clients that only read their answers
+  fast, with GOAWAY `ENHANCE_YOUR_CALM` (`GIONG-E1117`). A WINDOW_UPDATE that arrived when
+  the rest of the answer was already sent, or its stream closed, counted as a frame that
+  does no work, of which 1,000 and then 500 a second are allowed. Go's `net/http` client
+  gives window back for every 4 KiB it reads, on the stream and on the connection: with
+  32 requests at a time on one connection it was cut off after about 2,000 answers of
+  2 KiB, 500 of 8 KiB or 30 of 1 MiB, and again on each new connection (it sends the
+  requests again, so few failed, but every one of them is a connection lost). Ten such
+  WINDOW_UPDATE frames for each DATA frame sent are no longer counted; more than that
+  still is a flood. Clients that give window back in larger steps were not affected:
+  curl, h2load and Node.js (nghttp2), and giong-http's own client.
 - **giong-http**: `Handler::stream_body` said that answering early closes the connection;
   over HTTP/2 only the stream ends.
 

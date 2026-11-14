@@ -36,8 +36,9 @@
 //! * header blocks: `max_head_size`, encoded and decoded, and no frame of
 //!   another stream may interleave (the CONTINUATION flood);
 //! * frames that do no work (PING, SETTINGS, PRIORITY, empty DATA or
-//!   CONTINUATION, WINDOW_UPDATE with nothing to send, frames for streams
-//!   already closed, unknown types) and streams reset by the client or
+//!   CONTINUATION, WINDOW_UPDATE with nothing to send beyond ten for each
+//!   DATA frame sent, frames for streams already closed, unknown types)
+//!   and streams reset by the client or
 //!   refused: two budgets that refill over time. A client that overdraws
 //!   one gets `ENHANCE_YOUR_CALM` (the rapid-reset and flood attacks);
 //! * answers to PING and SETTINGS: no input is read while too much output
@@ -94,6 +95,11 @@ const CLOSED_MEMORY: usize = 64;
 /// Frames that do no work: a burst, and the rate at which it refills.
 const CHEAP_BURST: u32 = 1_000;
 const CHEAP_PER_SEC: u32 = 500;
+/// WINDOW_UPDATE frames with nothing left to send that each DATA frame sent
+/// pays for (see `late_window_update`). Go's net/http gives window back for
+/// every 4 KiB it reads, on the stream and on the connection: 8 frames for
+/// one DATA frame of 16 KiB. Envoy allows 10 as well.
+const WINDOW_UPDATES_PER_DATA: u32 = 10;
 /// After an error, how long the connection keeps reading (and discarding)
 /// so that the client sees the GOAWAY rather than a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
@@ -382,6 +388,11 @@ pub(crate) struct Session {
     failed: bool,
     resets: Budget,
     cheap: Budget,
+    /// WINDOW_UPDATE frames that may still arrive with nothing left to send
+    /// before they count as frames that do no work:
+    /// `WINDOW_UPDATES_PER_DATA` for each DATA frame sent, less those that
+    /// came (see `late_window_update`).
+    window_credit: u32,
     events: Vec<Event>,
     pub(crate) wakers: Wakers,
     /// Since when no stream has been open.
@@ -424,6 +435,7 @@ impl Session {
             failed: false,
             resets: Budget::new(max.saturating_mul(2).max(100), max.max(50)),
             cheap: Budget::new(CHEAP_BURST, CHEAP_PER_SEC),
+            window_credit: 0,
             events: Vec::new(),
             wakers: Wakers::default(),
             idle_since: Instant::now(),
@@ -1253,6 +1265,22 @@ impl Session {
         Ok(())
     }
 
+    /// A WINDOW_UPDATE that lets nothing be sent. A client gives window back
+    /// as it reads the DATA frames of an answer, some of them a few KiB at a
+    /// time, on the stream and on the connection; by then the rest of the
+    /// answer is often on its way already, or the stream is closed. Such
+    /// frames are a client reading, however fast the answers go out, so
+    /// every DATA frame sent pays for `WINDOW_UPDATES_PER_DATA` of them.
+    /// Only what a client sends beyond that are frames that do no work.
+    fn late_window_update(&mut self) -> Result<(), ConnError> {
+        if self.window_credit > 0 {
+            self.window_credit -= 1;
+            Ok(())
+        } else {
+            self.cheap()
+        }
+    }
+
     fn on_window_update(&mut self, head: Head, payload: &[u8]) -> Result<(), ConnError> {
         if payload.len() != 4 {
             return Err(frame_size("WINDOW_UPDATE with a length other than 4"));
@@ -1269,7 +1297,7 @@ impl Session {
             // Streams the connection window holds back stay in the queue,
             // so there is nothing to wake; with none, the frame did nothing.
             if self.queue.is_empty() {
-                self.cheap()?;
+                self.late_window_update()?;
             }
             return Ok(());
         }
@@ -1277,13 +1305,13 @@ impl Session {
             if head.stream > self.last_id {
                 return Err(protocol("WINDOW_UPDATE on a stream that was never opened"));
             }
-            return self.cheap();
+            return self.late_window_update();
         };
         if increment == 0 {
             return self.reset(slot, Reason::Protocol);
         }
         if !self.stream(slot).is_some_and(|st| st.has_data()) {
-            self.cheap()?;
+            self.late_window_update()?;
         }
         let Some(st) = self.stream(slot) else {
             return Ok(());
@@ -1766,6 +1794,7 @@ impl Session {
             st.send_window -= sent as i64;
             self.conn_send -= sent as i64;
             if sent > 0 {
+                self.window_credit = self.window_credit.saturating_add(WINDOW_UPDATES_PER_DATA);
                 st.blocked_since = None;
                 // What went out of an owned body or a piece no longer
                 // counts; a `&'static` body never did.
