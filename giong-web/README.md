@@ -240,12 +240,14 @@ HTTPS and a database behind the handlers are measured with the [example REST API
 | Feature | Adds |
 |---|---|
 | `serde` | `req.json::<T>()`, `req.query::<T>()` and `json(status, &value)`, through serde and serde_json |
-| `tls` | `Server::serve_tls`, through giong-http |
+| `tls` | `Server::serve_tls`, through giong-http: HTTP/2 or HTTP/1.1, as ALPN picks |
 | `tracing` | `middleware::Trace`, through `tracing` 0.1 |
+
+Apps are served over HTTP/2 as well as HTTP/1.1, with nothing to change: giong-http turns each HTTP/2 stream into the request a handler already knows (see [its HTTP/2 section](../giong-http/README.md#http2)). Over TLS, ALPN picks the protocol; without TLS, a client that knows the server speaks HTTP/2 (prior knowledge) gets it on the same port.
 
 ## Not there yet
 
-HTTP/2, cookies and sessions, forms and multipart bodies, WebSockets, serving static files, and compressions other than gzip. The crate has had no independent security audit.
+Cookies and sessions, forms and multipart bodies, WebSockets, serving static files, and compressions other than gzip. The crate has had no independent security audit.
 
 ## Tests
 

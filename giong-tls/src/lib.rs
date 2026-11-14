@@ -261,6 +261,19 @@ impl TlsAcceptor {
         Ok(Self::new(Arc::new(config)))
     }
 
+    /// The protocols to accept through ALPN, most preferred first, for
+    /// example `&[b"h2", b"http/1.1"]`. A client that offers none of them
+    /// fails the handshake; one that offers no ALPN at all is accepted.
+    /// The protocol agreed on is [`TlsStream::alpn_protocol`].
+    ///
+    /// giong-http's `Server::serve_tls` sets this itself, to the protocols
+    /// the server speaks.
+    pub fn alpn(mut self, protocols: &[&[u8]]) -> Self {
+        Arc::make_mut(&mut self.config).alpn_protocols =
+            protocols.iter().map(|p| p.to_vec()).collect();
+        self
+    }
+
     /// How long a client may take to complete the TLS handshake (default:
     /// 10 s).
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {

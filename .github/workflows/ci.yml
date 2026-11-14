@@ -76,6 +76,32 @@ jobs:
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - run: scripts/check.sh test
 
+  # HTTP/2 conformance: h2spec against giong-http's h2 example, over TLS
+  # (HTTP/2 chosen through ALPN) with the strict cases too, and over plain TCP
+  # with prior knowledge. On the plain port a connection that does not start
+  # with the HTTP/2 preface is an HTTP/1.1 one, so the case that sends a broken
+  # preface (3.5/2) runs over TLS only. h2spec is built from source at a pinned
+  # commit (the Go checksum database checks the download).
+  h2spec:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - run: go install github.com/summerwind/h2spec/cmd/h2spec@v1.5.1-0.20220625142712-af83a65f0b62
+      - run: cargo build --release -p giong-http --features tls --example h2
+      - name: Run h2spec
+        run: |
+          GIONG_WORKERS=2 target/release/examples/h2 127.0.0.1:8443 127.0.0.1:8080 &
+          for _ in $(seq 100); do curl -fs -o /dev/null http://127.0.0.1:8080/ && break; sleep 0.1; done
+          h2spec=$(go env GOPATH)/bin/h2spec
+          "$h2spec" --strict --tls --insecure --port 8443 --timeout 5
+          "$h2spec" --strict --port 8080 --timeout 5 \
+            generic hpack http2/3.5/1 http2/4 http2/5 http2/6 http2/7 http2/8
+
   # The database crates against the other server versions they support; the
   # jobs above use the runner's PostgreSQL 16, MySQL 8.0 and Ubuntu's Redis
   # 7.0. Each entry installs one server and runs one crate's tests on it.

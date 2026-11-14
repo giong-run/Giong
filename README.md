@@ -19,7 +19,7 @@ load arrives.
 
 > **Status: 0.4.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and seven companion crates:
-> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
+> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server, and a client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
@@ -29,9 +29,9 @@ load arrives.
 > running service).
 > The tests pass on three io_uring setups, on the epoll driver, inside Docker's default
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
-> and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
-> fuzzed and a soak test churns connections for two hours every night. It has **not** run
-> in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
+> and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser and
+> the HTTP/2 server are fuzzed, `h2spec` passes, and a soak test churns connections for two
+> hours every night. It has **not** run in production. See [Limitations](#limitations).
 
 ## Why giong
 
@@ -811,11 +811,11 @@ Not verified, and you should know it:
 | Multi-core | built-in builder with graceful draining and signals | `#[monoio::main(threads = N)]` | executor pools placed by CPU topology |
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
-| Ecosystem | its own HTTP/1.1 server and client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
-| Size | ~11,400 lines, plus ~7,800 for HTTP and TLS and ~17,500 for the database clients | ~25,000 lines | ~40,500 lines |
+| Ecosystem | its own HTTP/1.1 and HTTP/2 server, HTTP/1.1 client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
+| Size | ~11,400 lines, plus ~13,200 for HTTP and TLS and ~17,500 for the database clients | ~25,000 lines | ~40,500 lines |
 
-Monoio is the mature choice and runs in production at ByteDance; if you need HTTP/2 or
-Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
+Monoio is the mature choice and runs in production at ByteDance; if you need an HTTP/2
+client or Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
 priority scheduling are its strengths, not HTTP. giong's case is narrower: the receive
 path (multishot with provided buffers, cancel safe without a second API), good defaults,
 the latency dial, a strict HTTP server on top, and code small enough to audit.
@@ -831,8 +831,8 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   operations run on a pool of blocking threads, and one that is cancelled while running
   finishes there. Also missing: Unix datagram
   sockets, multicast, `set_len`, file locks, `O_DIRECT` with registered buffers.
-- **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
-  before it calls the handler; one over the limit is refused.
+- **No HTTP/2 in the HTTP client.** `giong-http`'s server speaks HTTP/1.1 and HTTP/2; its
+  client speaks HTTP/1.1 only.
 - **`giong-tls` has had no independent audit** (see the
   [self-review](docs/reviews/2026-11-giong-tls.md)).
 - **Not compatible with the Tokio ecosystem.** Crates that need the Tokio runtime (hyper,

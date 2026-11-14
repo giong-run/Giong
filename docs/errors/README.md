@@ -76,6 +76,10 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | [GIONG-E1112](E1112.md) | `HttpBodyIncomplete` | request body cut short |
 | [GIONG-E1113](E1113.md) | `HttpBodyMalformed` | malformed request body |
 | [GIONG-E1114](E1114.md) | `HttpBodyNotSent` | response body not sent |
+| [GIONG-E1115](E1115.md) | `Http2Protocol` | HTTP/2 protocol error |
+| [GIONG-E1116](E1116.md) | `Http2TooManyResets` | too many HTTP/2 streams reset |
+| [GIONG-E1117](E1117.md) | `Http2Flood` | too many HTTP/2 control frames |
+| [GIONG-E1118](E1118.md) | `Http2HeadersTooLarge` | HTTP/2 header block too large |
 
 ## giong-web
 
