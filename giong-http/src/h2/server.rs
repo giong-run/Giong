@@ -12,13 +12,27 @@
 //! Every resource a client can make the server hold is bounded:
 //!
 //! * streams at once: `max_concurrent_streams` (beyond it, `REFUSED_STREAM`);
-//! * request bodies: by the flow-control windows the server grants. A
-//!   stream whose handler reads its body as it arrives gets more only as
-//!   the handler takes it, the others up to `max_body_size`; and together
-//!   the bodies a connection holds stay within a budget (the larger of
-//!   `max_body_size` and 1 MiB) beyond which only the oldest stream still
-//!   receiving gets more, so that bodies are served in turn instead of
-//!   piling up `max_concurrent_streams` times over;
+//! * request bodies: by the flow-control windows the server grants. Each
+//!   stream starts with a share of a budget (the larger of `max_body_size`
+//!   and 1 MiB): half of it divided among `max_concurrent_streams`, the
+//!   other half kept for streams that need more. A stream whose
+//!   handler reads its body as it arrives gets more only as the handler
+//!   takes it, the others up to `max_body_size`; and together the bodies a
+//!   connection holds stay within the budget, beyond which only the oldest
+//!   stream still receiving gets more, so that bodies are served in turn
+//!   instead of piling up `max_concurrent_streams` times over. Until the
+//!   client has acknowledged our SETTINGS, its streams have the protocol's
+//!   64 KiB windows, so only as many of them as the budget holds may carry
+//!   a body (the others are refused);
+//! * response bodies: handlers run while the response bytes the
+//!   connection holds (answered, not sent yet) are within the same budget.
+//!   Past it, a client that does not take what it asked for keeps the
+//!   connection's other handlers waiting, as a client that does not read
+//!   its HTTP/1.1 connection does, instead of making the server hold
+//!   `max_concurrent_streams` answers at once;
+//! * handler panics: a handler that panics gets its stream answered with
+//!   `500` (or reset, if its answer had begun); the connection and its
+//!   other streams go on;
 //! * header blocks: `max_head_size`, encoded and decoded, and no frame of
 //!   another stream may interleave (the CONTINUATION flood);
 //! * frames that do no work (PING, SETTINGS, PRIORITY, empty DATA or
@@ -53,11 +67,12 @@ use crate::body::{Failure, Next, Pipe, StreamBody};
 use crate::heap::HeapFuture;
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, FileBody, Response};
-use crate::server::{give_buffer, take_buffer, Config, Handler, Transport};
+use crate::server::{catching, drop_quietly, give_buffer, take_buffer, Config, Handler, Transport};
 
-/// The window each stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`):
-/// the protocol's default, which a stream cannot be denied.
-const INITIAL_WINDOW: u32 = frame::DEFAULT_WINDOW;
+/// The smallest window a stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`
+/// is half the body budget divided among the streams, within this and the
+/// protocol's default).
+const MIN_INITIAL_WINDOW: u32 = 4 * 1024;
 /// The window a stream receiving a body is topped up to, while the
 /// connection's body budget allows.
 const STREAM_WINDOW: u32 = 256 * 1024;
@@ -82,6 +97,25 @@ const CHEAP_PER_SEC: u32 = 500;
 /// After an error, how long the connection keeps reading (and discarding)
 /// so that the client sees the GOAWAY rather than a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
+
+/// The larger of `max_body_size` and 1 MiB: what one connection may hold of
+/// request bodies, and of responses not sent yet.
+fn budget(cfg: &Config) -> u64 {
+    cfg.http2_budget
+        .unwrap_or_else(|| (cfg.max_body_size as u64).max(1 << 20))
+}
+
+/// The window each stream starts with, once the client has our SETTINGS:
+/// half the body budget shared among `max_concurrent_streams`, so that
+/// streams opening at once cannot hold more than that half, and the other
+/// half is left for streams to receive more than their first window.
+pub(crate) fn initial_window(cfg: &Config) -> u32 {
+    let share = budget(cfg) / 2 / u64::from(cfg.max_concurrent_streams.max(1));
+    share.clamp(
+        u64::from(MIN_INITIAL_WINDOW),
+        u64::from(frame::DEFAULT_WINDOW),
+    ) as u32
+}
 
 /// An error that ends the connection: answered with GOAWAY.
 #[derive(Clone, Copy, Debug)]
@@ -255,6 +289,23 @@ impl Stream {
             _ => false,
         }
     }
+
+    /// Bytes of the response held in memory and not sent yet: what counts
+    /// against the connection's budget for responses. A `&'static` body
+    /// costs nothing.
+    fn unsent(&self) -> u64 {
+        match &self.send {
+            Send::Bytes {
+                body: Body::Owned(bytes),
+                at,
+            } => (bytes.len() - *at) as u64,
+            // A file's piece is taken out while the next one is read.
+            Send::Stream { piece, at, .. } | Send::File { piece, at, .. } => {
+                piece.len().saturating_sub(*at) as u64
+            }
+            _ => 0,
+        }
+    }
 }
 
 /// What a header block is for.
@@ -281,8 +332,6 @@ struct Block {
 
 /// What the loop must do for the handlers.
 pub(crate) enum Event {
-    /// Run the handler for this request in this slot.
-    Start(usize, Request),
     /// Drop the handler of this slot: its stream is gone.
     Stop(usize),
 }
@@ -302,6 +351,17 @@ pub(crate) struct Session {
     /// Body bytes the streams hold, and how many they may.
     held: u64,
     body_budget: u64,
+    /// The window streams start with once the client has our SETTINGS.
+    initial_window: u32,
+    /// The client has acknowledged our SETTINGS: streams it opens from now
+    /// on start with `initial_window` instead of the protocol's default.
+    settings_acked: bool,
+    /// Response bytes the streams hold, not sent yet, and how many they may
+    /// before handlers wait.
+    unsent: u64,
+    unsent_budget: u64,
+    /// Requests whose handlers are due to start, in order.
+    starts: VecDeque<(usize, Request)>,
     /// Window may be due: data was dealt with, or the budget freed.
     grant_due: bool,
     streams: Vec<Option<Stream>>,
@@ -344,7 +404,12 @@ impl Session {
             conn_recv: i64::from(CONN_WINDOW),
             conn_unacked: 0,
             held: 0,
-            body_budget: (cfg.max_body_size as u64).max(u64::from(CONN_WINDOW)),
+            body_budget: budget(&cfg),
+            initial_window: initial_window(&cfg),
+            settings_acked: false,
+            unsent: 0,
+            unsent_budget: budget(&cfg),
+            starts: VecDeque::new(),
             grant_due: false,
             streams: Vec::new(),
             free: Vec::new(),
@@ -376,7 +441,7 @@ impl Session {
                     frame::MAX_CONCURRENT_STREAMS,
                     self.cfg.max_concurrent_streams,
                 ),
-                (frame::INITIAL_WINDOW_SIZE, INITIAL_WINDOW),
+                (frame::INITIAL_WINDOW_SIZE, self.initial_window),
                 (
                     frame::MAX_HEADER_LIST_SIZE,
                     u32::try_from(self.cfg.max_head_size).unwrap_or(u32::MAX),
@@ -396,6 +461,39 @@ impl Session {
 
     pub(crate) fn take_events(&mut self) -> Vec<Event> {
         mem::take(&mut self.events)
+    }
+
+    /// Handlers wait: the connection holds as many response bytes as it
+    /// may, and the client has not taken them yet.
+    pub(crate) fn handlers_wait(&self) -> bool {
+        self.unsent >= self.unsent_budget
+    }
+
+    /// Requests whose handlers have not started yet.
+    pub(crate) fn starts_waiting(&self) -> bool {
+        !self.starts.is_empty()
+    }
+
+    /// The next request whose handler may start, unless handlers wait.
+    pub(crate) fn next_start(&mut self) -> Option<(usize, Request)> {
+        if self.handlers_wait() {
+            return None;
+        }
+        self.starts.pop_front()
+    }
+
+    /// The handler of the stream in `slot` panicked: the stream is
+    /// answered with `500`, or reset if its answer had begun. The
+    /// connection goes on.
+    pub(crate) fn handler_panicked(&mut self, slot: usize) {
+        let Some(st) = self.stream(slot) else {
+            return;
+        };
+        if matches!(st.send, Send::Waiting) {
+            let _ = self.answer_status(slot, 500);
+        } else {
+            let _ = self.reset(slot, Reason::Internal);
+        }
     }
 
     /// No more frames will be read: an error, or a GOAWAY with every
@@ -678,7 +776,7 @@ impl Session {
             Recv::Buffer(mut req) => {
                 let start = req.head.len;
                 req.body = BodyBytes::InBuffer(start..req.buf.len());
-                self.events.push(Event::Start(slot, req));
+                self.starts.push_back((slot, req));
             }
             pipe @ Recv::Pipe { .. } => {
                 st.recv = pipe;
@@ -855,6 +953,10 @@ impl Session {
                 if self.ids.len() >= self.cfg.max_concurrent_streams as usize {
                     return self.reset_closed(id, Reason::RefusedStream);
                 }
+                if !end_stream && !self.settings_acked && self.early_bodies_full() {
+                    // Not processed: the client sends it again later.
+                    return self.reset_closed(id, Reason::RefusedStream);
+                }
                 match builder.finish(self.peer) {
                     Built::Malformed(_) => self.reset_closed(id, Reason::Protocol),
                     Built::Status(status) => {
@@ -870,6 +972,22 @@ impl Session {
         }
     }
 
+    /// Before the client has acknowledged our SETTINGS, every stream it
+    /// opens may send the protocol's 64 KiB of body: no more such streams
+    /// than the body budget holds.
+    fn early_bodies_full(&self) -> bool {
+        let receiving = self
+            .ids
+            .iter()
+            .filter(|&&(_, slot)| {
+                self.streams[slot]
+                    .as_ref()
+                    .is_some_and(|st| !st.remote_done && !matches!(st.recv, Recv::Done))
+            })
+            .count() as u64;
+        receiving > 0 && (receiving + 1) * u64::from(frame::DEFAULT_WINDOW) > self.body_budget
+    }
+
     /// Adds a stream.
     fn open(
         &mut self,
@@ -878,16 +996,21 @@ impl Session {
         content_length: Option<u64>,
         head_only: bool,
     ) -> usize {
+        let initial = if self.settings_acked {
+            self.initial_window
+        } else {
+            frame::DEFAULT_WINDOW
+        };
         let stream = Stream {
             id,
             remote_done: end_stream,
-            recv_window: i64::from(INITIAL_WINDOW),
+            recv_window: i64::from(initial),
             // A stream with a body is owed the rest of a full window, which
             // `grant` gives when the budget allows.
             unacked: if end_stream {
                 0
             } else {
-                STREAM_WINDOW - INITIAL_WINDOW
+                STREAM_WINDOW - initial
             },
             content_length,
             received: 0,
@@ -935,10 +1058,14 @@ impl Session {
                 let _ = self.reset(slot, Reason::Protocol);
                 return;
             }
-            self.events.push(Event::Start(slot, req));
+            self.starts.push_back((slot, req));
             return;
         }
-        match handler.stream_body(&req) {
+        let Ok(stream_body) = catching(|| handler.stream_body(&req)) else {
+            self.handler_panicked(slot);
+            return;
+        };
+        match stream_body {
             Some(limit) => {
                 if content_length.is_some_and(|cl| cl > limit) {
                     let _ = self.answer_status(slot, 413);
@@ -954,7 +1081,7 @@ impl Session {
                     taken: 0,
                 };
                 st.expect_continue = expect_continue;
-                self.events.push(Event::Start(slot, req));
+                self.starts.push_back((slot, req));
             }
             None => {
                 if content_length.is_some_and(|cl| cl > max_body) {
@@ -1029,6 +1156,19 @@ impl Session {
         if head.has(frame::ACK) {
             if !payload.is_empty() {
                 return Err(frame_size("SETTINGS acknowledgement with a payload"));
+            }
+            if !self.settings_acked {
+                // Our SETTINGS are the only ones we send: from here on the
+                // client counts with our initial window. Streams opened
+                // before it lose the difference (RFC 9113, section 6.9.2).
+                self.settings_acked = true;
+                let delta = i64::from(frame::DEFAULT_WINDOW - self.initial_window);
+                for &(_, slot) in &self.ids {
+                    if let Some(st) = self.streams[slot].as_mut() {
+                        st.recv_window -= delta;
+                    }
+                }
+                self.grant_due = true;
             }
             return self.cheap();
         }
@@ -1202,8 +1342,12 @@ impl Session {
         };
         self.held -= st.held;
         self.grant_due |= st.held > 0;
+        self.unsent -= st.unsent();
         if let Recv::Pipe { pipe, .. } = &st.recv {
             pipe.finish(Err(failure));
+        }
+        if !self.starts.is_empty() {
+            self.starts.retain(|&(queued, _)| queued != slot);
         }
         if let Ok(i) = self.ids.binary_search_by_key(&st.id, |&(id, _)| id) {
             self.ids.remove(i);
@@ -1379,6 +1523,8 @@ impl Session {
             },
             body => Send::Bytes { body, at: 0 },
         };
+        let unsent = st.unsent();
+        self.unsent += unsent;
         self.service(slot);
         self.enqueue(slot);
     }
@@ -1431,6 +1577,7 @@ impl Session {
                 st.deadline = None;
             }
         }
+        let unsent_before = st.unsent();
         if let Send::Stream { body, piece, at } = &mut st.send {
             if *at >= piece.len() {
                 match body.poll_next(&waker) {
@@ -1465,6 +1612,8 @@ impl Session {
         if ended {
             st.send = Send::End;
         }
+        let unsent_after = st.unsent();
+        self.unsent = self.unsent + unsent_after - unsent_before;
         self.held -= released;
         if released > 0 {
             self.grant_due = true;
@@ -1484,9 +1633,10 @@ impl Session {
     ///
     /// The connection window comes back as soon as the data is received;
     /// what bounds the bodies held is the windows of the streams. A stream
-    /// gets more only while the bodies held, and the windows open for more
-    /// of them, stay within the budget; except the oldest stream still
-    /// receiving, so that one body always makes progress.
+    /// gets more only while the bodies held, the windows open for more of
+    /// them and the first windows of the streams that may still open stay
+    /// within the budget; except the oldest stream still receiving, so
+    /// that one body always makes progress.
     fn grant(&mut self) {
         self.grant_due = false;
         if self.failed {
@@ -1499,7 +1649,15 @@ impl Session {
         }
         let max_body = self.cfg.max_body_size as u64;
         let receiving = |st: &Stream| !st.remote_done && !matches!(st.recv, Recv::Done);
-        let mut committed = self.held;
+        // Streams that may still open start with a window of their own.
+        let first_window = if self.settings_acked {
+            self.initial_window
+        } else {
+            frame::DEFAULT_WINDOW
+        };
+        let unopened =
+            u64::from(self.cfg.max_concurrent_streams).saturating_sub(self.ids.len() as u64);
+        let mut committed = self.held + unopened * u64::from(first_window);
         for &(_, slot) in &self.ids {
             if let Some(st) = self.streams[slot].as_ref().filter(|st| receiving(st)) {
                 committed += st.recv_window.max(0) as u64;
@@ -1609,6 +1767,17 @@ impl Session {
             self.conn_send -= sent as i64;
             if sent > 0 {
                 st.blocked_since = None;
+                // What went out of an owned body or a piece no longer
+                // counts; a `&'static` body never did.
+                if !matches!(
+                    st.send,
+                    Send::Bytes {
+                        body: Body::Static(_),
+                        ..
+                    }
+                ) {
+                    self.unsent -= sent as u64;
+                }
             }
             if end {
                 st.send = Send::Done;
@@ -1726,6 +1895,7 @@ impl Session {
             self.free = Vec::new();
             self.ids = Vec::new();
             self.queue = VecDeque::new();
+            self.starts = VecDeque::new();
             self.events = Vec::new();
             self.name = Vec::new();
             self.wakers.release();
@@ -1793,6 +1963,41 @@ fn itoa(n: usize) -> String {
     n.to_string()
 }
 
+/// Drops the handlers of the streams that are gone.
+fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
+    for event in s.take_events() {
+        let Event::Stop(slot) = event;
+        if let Some(task) = tasks.get_mut(slot) {
+            drop_quietly(task.take());
+        }
+    }
+}
+
+/// Polls the handler of the stream in `slot`, if it has one, and sends its
+/// answer. A handler that panics loses its stream only.
+fn poll_handler<F: Future<Output = Response>>(
+    s: &mut Session,
+    tasks: &mut [Option<HeapFuture<F>>],
+    slot: usize,
+) {
+    let Some(Some(task)) = tasks.get_mut(slot) else {
+        return;
+    };
+    let waker = s.wakers.get(slot).clone();
+    let mut cx = Context::from_waker(&waker);
+    match catching(|| Pin::new(task).poll(&mut cx)) {
+        Ok(Poll::Pending) => {}
+        Ok(Poll::Ready(resp)) => {
+            tasks[slot] = None;
+            s.respond(slot, resp);
+        }
+        Err(()) => {
+            drop_quietly(tasks[slot].take());
+            s.handler_panicked(slot);
+        }
+    }
+}
+
 /// What woke the connection.
 enum Wake<R, W> {
     Read(R),
@@ -1838,6 +2043,8 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
 
     let mut tasks: Vec<Option<HeapFuture<_>>> = Vec::new();
     let mut polls: Vec<usize> = Vec::new();
+    // Handlers woken while handlers wait for the client to take responses.
+    let mut parked: Vec<usize> = Vec::new();
     let mut recv = pin!(Some(io.recv()));
     let mut write = pin!(None);
     let mut write_deadline: Option<Instant> = None;
@@ -1858,51 +2065,40 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
                 give_buffer(mem::take(&mut input));
             }
         }
-        // Handlers to start and stop; then poll the new ones and the woken.
-        for event in s.take_events() {
-            match event {
-                Event::Start(slot, req) => {
-                    if tasks.len() <= slot {
-                        tasks.resize_with(slot + 1, || None);
-                    }
-                    tasks[slot] = Some(HeapFuture::new(handler.call(req)));
-                    polls.push(slot);
-                }
-                Event::Stop(slot) => {
-                    if let Some(task) = tasks.get_mut(slot) {
-                        *task = None;
-                    }
-                }
+        stop_handlers(&mut s, &mut tasks);
+        // Handlers to start, each polled at once, so that its answer counts
+        // against the budget for responses before the next one starts.
+        while let Some((slot, req)) = s.next_start() {
+            if tasks.len() <= slot {
+                tasks.resize_with(slot + 1, || None);
             }
+            match catching(|| HeapFuture::new(handler.call(req))) {
+                Ok(task) => {
+                    tasks[slot] = Some(task);
+                    poll_handler(&mut s, &mut tasks, slot);
+                }
+                Err(()) => s.handler_panicked(slot),
+            }
+            s.service(slot);
+            stop_handlers(&mut s, &mut tasks);
+        }
+        // Then the woken ones, unless handlers wait.
+        if !s.handlers_wait() {
+            polls.append(&mut parked);
         }
         polls.sort_unstable();
         polls.dedup();
         for slot in mem::take(&mut polls) {
-            if let Some(Some(task)) = tasks.get_mut(slot) {
-                let waker = s.wakers.get(slot).clone();
-                let mut cx = Context::from_waker(&waker);
-                if let Poll::Ready(resp) = Pin::new(task).poll(&mut cx) {
-                    tasks[slot] = None;
-                    s.respond(slot, resp);
-                }
+            if s.handlers_wait() {
+                parked.push(slot);
+            } else {
+                poll_handler(&mut s, &mut tasks, slot);
             }
             s.service(slot);
-            for event in s.take_events() {
-                if let Event::Stop(slot) = event {
-                    if let Some(task) = tasks.get_mut(slot) {
-                        *task = None;
-                    }
-                }
-            }
+            stop_handlers(&mut s, &mut tasks);
         }
         s.fill();
-        for event in s.take_events() {
-            if let Event::Stop(slot) = event {
-                if let Some(task) = tasks.get_mut(slot) {
-                    *task = None;
-                }
-            }
-        }
+        stop_handlers(&mut s, &mut tasks);
 
         if write.is_none() && !s.out.is_empty() {
             let out = mem::replace(&mut s.out, take_buffer());
@@ -1924,6 +2120,10 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         // worker run first, then poll them.
         if s.wakers.drain(&mut polls) {
             giong::yield_now().await;
+            continue;
+        }
+        if (!parked.is_empty() || s.starts_waiting()) && !s.handlers_wait() {
+            // The client took enough of the responses meanwhile.
             continue;
         }
 

@@ -136,6 +136,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong-http**: `Server::http2_prior_knowledge(false)` keeps HTTP/2 to TLS connections
+  that choose it through ALPN, so that a plain port behind an HTTP/1.1 proxy speaks only
+  HTTP/1.1. `Server::http2(true)` used to turn on both, and still does by default.
 
 ### Changed
 
@@ -203,6 +206,36 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+- **giong-http**: an HTTP/2 client could make the server hold a whole answer for each of
+  its streams. Handlers ran as soon as their requests arrived, and their response bodies
+  waited in memory for the client's flow control, with no limit: a client that set its
+  window to 0 and opened 100 streams to an endpoint answering 1 MiB made the server hold
+  100 MiB per connection for `write_timeout` (5 such connections: 2.8 to 505 MiB of
+  resident memory). Handlers now run only while the response bytes a connection holds,
+  answered and not sent yet, are within a budget (the larger of `max_body_size` and
+  1 MiB); past it the connection's other handlers wait, those already running included,
+  until the client takes enough or the stream it does not take is reset. The same test
+  now holds 1.1 MiB per connection. A `&'static` body does not count, and a file only for
+  the 64 KiB piece of it being sent.
+- **giong-http**: pending HTTP/2 request bodies were not bounded by the body budget the
+  documentation promised (the larger of `max_body_size` and 1 MiB): every stream could
+  send the protocol's 64 KiB whatever the budget, so 100 streams held 6.4 MiB per
+  connection (measured: 7.2 MiB, against 1.2 MiB for HTTP/1.1). The server now announces
+  a smaller first window (`SETTINGS_INITIAL_WINDOW_SIZE`: half the budget divided by
+  `max_concurrent_streams`, 5,242 bytes by default, within 4 and 64 KiB), sets aside the
+  first windows of streams that may still open before it grants more, and, until the
+  client has acknowledged its settings, refuses (`REFUSED_STREAM`) streams with a body
+  beyond what the budget holds at 64 KiB each. A connection now holds at most the budget
+  plus 256 KiB (measured: 1.65 MiB). A request body larger than the first window waits
+  one round trip for more, as one larger than 64 KiB did before.
+- **giong-http**: a handler that panicked took its whole connection down, and over
+  HTTP/2 that meant every other request on it, without a GOAWAY. Its request is now
+  answered with `500 Internal Server Error`: over HTTP/2 only that stream ends and the
+  connection goes on; over HTTP/1.1 the connection closes after the `500` instead of
+  being cut without an answer. The same holds for a panic in `Handler::stream_body`.
+- **giong-http**: the crate's documentation still called the server "an HTTP/1.1
+  server", and `Handler::stream_body` said that answering early closes the connection;
+  over HTTP/2 only the stream ends.
 
 ## [0.4.0] - 2026-11-13
 

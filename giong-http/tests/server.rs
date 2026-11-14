@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use giong::net::TcpListener;
 use giong::time::sleep;
-use giong_http::{Request, Response, Server};
+use giong_http::{Handler, Request, Response, Server};
 
 // ------------------------------------------------------------------ harness
 
@@ -22,10 +22,9 @@ struct TestServer {
 }
 
 impl TestServer {
-    fn start<H, Fut>(server: Server, handler: H) -> Self
+    fn start<H>(server: Server, handler: H) -> Self
     where
-        H: Fn(Request) -> Fut + Clone + Send + Sync + 'static,
-        Fut: Future<Output = Response> + 'static,
+        H: Handler + Clone + Send + Sync,
     {
         let rt = giong::Builder::new()
             .workers(1)
@@ -715,21 +714,42 @@ fn a_waiting_handler_does_not_hold_back_earlier_responses() {
 }
 
 #[test]
-fn a_panicking_handler_only_takes_down_its_own_connection() {
-    async fn handler(req: Request) -> Response {
-        if req.path() == "/panic" {
-            panic!("handler panic (expected by this test)");
+fn a_panicking_handler_gets_500_and_only_its_connection_closes() {
+    #[derive(Clone)]
+    struct Panics;
+    impl Handler for Panics {
+        fn stream_body(&self, req: &Request) -> Option<u64> {
+            if req.path() == "/panic-deciding" {
+                panic!("stream_body panic (expected by this test)");
+            }
+            req.path().starts_with("/stream").then_some(1 << 20)
         }
-        Response::text("fine")
+
+        async fn call(&self, req: Request) -> Response {
+            if req.path().contains("panic") {
+                panic!("handler panic (expected by this test)");
+            }
+            Response::text("fine")
+        }
     }
-    let server = TestServer::start(Server::new(), handler);
+    let server = TestServer::start(Server::new(), Panics);
     let mut other = server.client();
     other.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
     assert_eq!(other.reply().text(), "fine");
 
-    let mut c = server.client();
-    c.send("GET /panic HTTP/1.1\r\nHost: t\r\n\r\n");
-    c.expect_closed();
+    for request in [
+        // A request behind it is not answered: the connection closes.
+        "GET /panic HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHost: t\r\n\r\n",
+        "POST /stream-panic HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello",
+        "POST /panic-deciding HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello",
+    ] {
+        let mut c = server.client();
+        c.send(request);
+        let reply = c.reply();
+        assert_eq!(reply.status, 500, "{request}");
+        assert_eq!(reply.header("connection"), Some("close"), "{request}");
+        c.expect_closed();
+    }
 
     other.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
     assert_eq!(other.reply().text(), "fine");

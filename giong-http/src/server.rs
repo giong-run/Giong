@@ -7,9 +7,10 @@ use std::io::{self, Write as _};
 use std::mem;
 use std::net::{Shutdown, SocketAddr};
 use std::ops::Deref;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -33,6 +34,40 @@ const SEPARATE_BODY_AT: usize = 32 * 1024;
 const ERROR_LINGER: Duration = Duration::from_secs(1);
 /// Blank lines before a request that still count as an idle connection.
 const IDLE_BLANK_LINES: usize = 2;
+
+/// Runs `f`; a panic comes back as `Err` instead of unwinding into the
+/// connection. The panic hook has reported it by then.
+pub(crate) fn catching<R>(f: impl FnOnce() -> R) -> Result<R, ()> {
+    catch_unwind(AssertUnwindSafe(f)).map_err(drop_quietly)
+}
+
+/// Drops `value`, and swallows a panic of its destructor: a handler's
+/// future that panicked once may panic again while it is dropped.
+pub(crate) fn drop_quietly<T>(value: T) {
+    let _ = catch_unwind(AssertUnwindSafe(move || drop(value)));
+}
+
+/// A handler's future whose panic becomes `Err`. A handler that panics
+/// gets its request answered with `500` instead of taking down the
+/// connection with it.
+struct Caught<F>(F);
+
+impl<F: Future + Unpin> Future for Caught<F> {
+    type Output = Result<F::Output, ()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match catching(|| Pin::new(&mut self.0).poll(cx)) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(()) => Poll::Ready(Err(())),
+        }
+    }
+}
+
+/// The answer to a request whose handler panicked.
+fn panicked() -> Response {
+    Response::new(500)
+}
 
 /// Capacity of a fresh connection buffer.
 const BUFFER_SIZE: usize = 4 * 1024;
@@ -310,7 +345,9 @@ pub trait Handler: 'static {
     /// server's `max_body_size` does not apply.
     ///
     /// A handler that answers before reading the body to its end makes the
-    /// connection close after the response.
+    /// connection close after the response over HTTP/1.1; over HTTP/2 only
+    /// its stream ends (the client is told to stop sending with
+    /// `RST_STREAM`).
     fn stream_body(&self, req: &Request) -> Option<u64> {
         let _ = req;
         None
@@ -337,11 +374,16 @@ pub(crate) struct Config {
     pub(crate) shutdown_linger: Duration,
     pub(crate) max_connections: usize,
     pub(crate) http2: bool,
+    pub(crate) http2_prior_knowledge: bool,
     pub(crate) max_concurrent_streams: u32,
+    /// What an HTTP/2 connection may hold of request bodies and of
+    /// responses not sent yet, instead of the larger of `max_body_size`
+    /// and 1 MiB: for the fuzz harness, which needs a small one.
+    pub(crate) http2_budget: Option<u64>,
 }
 
-/// An HTTP/1.1 server. Configure it, then call [`serve`](Server::serve) from
-/// each worker of a giong runtime.
+/// An HTTP/1.1 and HTTP/2 server. Configure it, then call
+/// [`serve`](Server::serve) from each worker of a giong runtime.
 ///
 /// ```no_run
 /// use std::time::Duration;
@@ -390,7 +432,9 @@ impl Server {
                 shutdown_linger: Duration::from_millis(100),
                 max_connections: usize::MAX,
                 http2: true,
+                http2_prior_knowledge: true,
                 max_concurrent_streams: 100,
+                http2_budget: None,
             },
         }
     }
@@ -461,9 +505,10 @@ impl Server {
     /// `http/1.1` through ALPN, and each client picks; browsers pick `h2`.
     /// Without TLS, a connection that starts with the HTTP/2 preface is
     /// served over HTTP/2 ("prior knowledge", as gRPC clients and proxies
-    /// such as Envoy speak to backends), and any other over HTTP/1.1.
-    /// Handlers are the same either way: [`Request::version`] tells them
-    /// apart.
+    /// such as Envoy speak to backends), and any other over HTTP/1.1; see
+    /// [`http2_prior_knowledge`](Self::http2_prior_knowledge) to keep plain
+    /// connections on HTTP/1.1. Handlers are the same either way:
+    /// [`Request::version`] tells them apart.
     ///
     /// `false` serves HTTP/1.1 only, and offers only `http/1.1` through
     /// ALPN.
@@ -474,17 +519,43 @@ impl Server {
         self
     }
 
+    /// Whether a connection without TLS that starts with the HTTP/2
+    /// preface is served over HTTP/2 (default: yes, when
+    /// [`http2`](Self::http2) is on).
+    ///
+    /// `false` keeps HTTP/2 to TLS connections that choose it through ALPN:
+    /// for a server whose plain port sits behind a proxy that speaks
+    /// HTTP/1.1 only, so that nothing but HTTP/1.1 is spoken there. A
+    /// connection that starts with the preface then gets `505 HTTP Version
+    /// Not Supported`, as with `http2(false)`.
+    pub fn http2_prior_knowledge(mut self, enabled: bool) -> Self {
+        self.cfg.http2_prior_knowledge = enabled;
+        self
+    }
+
     /// Most requests one HTTP/2 connection may have in progress at once
     /// (default: 100, the least RFC 9113 recommends). Further streams are
     /// refused with `REFUSED_STREAM`, and the client retries them later.
     ///
-    /// Memory for request bodies does not grow with it as it would with as
-    /// many connections. Each stream may send 64 KiB of its body before
-    /// the server grants more; beyond that, the bodies one connection holds
-    /// share a budget of the larger of
-    /// [`max_body_size`](Self::max_body_size) and 1 MiB. The oldest stream
-    /// still receiving always gets more, so that past the budget bodies are
-    /// received in turn instead of together.
+    /// Memory does not grow with it as it would with as many connections.
+    /// Request bodies: the bodies one connection holds share a budget of
+    /// the larger of [`max_body_size`](Self::max_body_size) and 1 MiB. Each
+    /// stream may send its share of the budget (half the budget divided by
+    /// this limit, at least 4 KiB and at most 64 KiB) before the server
+    /// grants more; the server grants more while the budget allows, after
+    /// setting aside the shares of streams that may still open, and always to
+    /// the oldest stream still receiving, so that past the budget bodies are
+    /// received in turn instead of together. A connection therefore holds
+    /// at most the budget and 256 KiB more, or this limit times 4 KiB if
+    /// that is larger.
+    ///
+    /// Responses: handlers run while the response bytes a connection holds
+    /// (answered, not sent yet) are within the same budget. A client that
+    /// does not take what it asked for keeps the other handlers of its
+    /// connection waiting, as an HTTP/1.1 client that does not read keeps
+    /// its next request waiting, so a connection holds at most the budget
+    /// and the answer that went past it. A `&'static` body does not count,
+    /// and a file only for the 64 KiB piece of it being sent.
     pub fn max_concurrent_streams(mut self, max: u32) -> Self {
         self.cfg.max_concurrent_streams = max.max(1);
         self
@@ -500,7 +571,12 @@ impl Server {
     /// in progress finish), within the grace period configured on the
     /// runtime.
     ///
-    /// A handler that panics takes down its connection only.
+    /// A handler that panics has its request answered with `500 Internal
+    /// Server Error` (the panic hook reports the panic as usual). Over
+    /// HTTP/1.1 its connection then closes; over HTTP/2 only its stream
+    /// ends, and the other requests on the connection go on. A handler
+    /// whose answer had begun when it panicked (a streamed body's producer
+    /// runs elsewhere, so this is rare) has its stream reset instead.
     pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
@@ -877,18 +953,30 @@ impl<T: Transport> Conn<T> {
                     // future, it would make every connection as large as the
                     // largest handler future (a database query, a call to
                     // another service) even while idle.
-                    let mut fut = HeapFuture::new(handler.call(req));
-                    let first = poll_fn(|cx| Poll::Ready(Pin::new(&mut fut).poll(cx))).await;
-                    let resp = match first {
-                        Poll::Ready(resp) => resp,
-                        Poll::Pending => {
-                            if self.flush().await.is_err() {
-                                return;
+                    let answer = match catching(|| HeapFuture::new(handler.call(req))) {
+                        Ok(fut) => {
+                            let mut fut = Caught(fut);
+                            let first =
+                                poll_fn(|cx| Poll::Ready(Pin::new(&mut fut).poll(cx))).await;
+                            match first {
+                                Poll::Ready(answer) => answer,
+                                Poll::Pending => {
+                                    if self.flush().await.is_err() {
+                                        return;
+                                    }
+                                    fut.await
+                                }
                             }
-                            fut.await
                         }
+                        Err(()) => Err(()),
                     };
-                    (resp, true)
+                    match answer {
+                        Ok(resp) => (resp, true),
+                        // The connection closes after the answer, as after
+                        // a body that was not read: requests behind it are
+                        // dropped, and the client still reads the `500`.
+                        Err(()) => (panicked(), false),
+                    }
                 }
                 Some(body) => {
                     // The body may take long to arrive: answers to earlier
@@ -974,23 +1062,32 @@ impl<T: Transport> Conn<T> {
         body: Streamed,
     ) -> (Response, bool) {
         let mut pumped = None;
-        let resp = {
-            let mut pump = pin!(self.pump(&body));
-            let mut fut = pin!(handler.call(req));
-            poll_fn(|cx| {
-                if pumped.is_none() {
-                    if let Poll::Ready(result) = pump.as_mut().poll(cx) {
-                        pumped = Some(result);
+        let answer = match catching(|| handler.call(req)) {
+            Ok(fut) => {
+                let mut pump = pin!(self.pump(&body));
+                // Bound first: Rust 1.80 does not extend `pin!` inside a call.
+                let fut = pin!(fut);
+                let mut fut = Caught(fut);
+                poll_fn(|cx| {
+                    if pumped.is_none() {
+                        if let Poll::Ready(result) = pump.as_mut().poll(cx) {
+                            pumped = Some(result);
+                        }
                     }
-                }
-                fut.as_mut().poll(cx)
-            })
-            .await
+                    Pin::new(&mut fut).poll(cx)
+                })
+                .await
+            }
+            Err(()) => Err(()),
         };
         // If the handler answered first, nothing reads the rest of the body;
         // a stream it kept says so. (The first end counts.)
         body.pipe.finish(Err(Failure::Abandoned));
-        (resp, pumped == Some(Ok(())))
+        match answer {
+            Ok(resp) => (resp, pumped == Some(Ok(()))),
+            // The rest of the body is not read, so the connection closes.
+            Err(()) => (panicked(), false),
+        }
     }
 
     /// Reads a streamed request body into its pipe, piece by piece, from
@@ -1162,7 +1259,7 @@ impl<T: Transport> Conn<T> {
                 blank_lines += 1;
             }
             let data = &self.buf[self.pos..];
-            if self.first && self.cfg.http2 && !data.is_empty() {
+            if self.first && self.cfg.http2 && self.cfg.http2_prior_knowledge && !data.is_empty() {
                 // HTTP/2 with prior knowledge: the preface, before anything
                 // else was sent on the connection.
                 let n = data.len().min(PREFACE.len());
@@ -1203,7 +1300,9 @@ impl<T: Transport> Conn<T> {
                 body: BodyBytes::InBuffer(start..start),
                 peer: self.peer,
             };
-            match handler.stream_body(&req) {
+            let stream_body =
+                catching(|| handler.stream_body(&req)).map_err(|()| End::Status(500))?;
+            match stream_body {
                 Some(limit) => {
                     let length = req.head.content_length;
                     if length.is_some_and(|len| len > limit) {

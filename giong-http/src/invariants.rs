@@ -581,15 +581,18 @@ pub mod h2_connection {
     }
 
     /// The server for fuzzing: short timeouts, so that a stalled stream
-    /// costs milliseconds.
+    /// costs milliseconds, and a budget of 2 KiB for bodies held, so that
+    /// a `big` answer the client does not take makes handlers wait.
     pub fn server() -> Server {
-        Server::new()
+        let mut server = Server::new()
             .max_head_size(1024)
             .max_body_size(64)
             .request_timeout(Duration::from_millis(20))
             .write_timeout(Duration::from_millis(20))
             .idle_timeout(Duration::from_millis(20))
-            .max_concurrent_streams(8)
+            .max_concurrent_streams(8);
+        server.cfg.http2_budget = Some(2 * 1024);
+        server
     }
 
     /// Splits `bytes` into the pieces the transport delivers.
