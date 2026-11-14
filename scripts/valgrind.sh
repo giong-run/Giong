@@ -3,7 +3,11 @@
 # process, and fails if any test fails or valgrind reports an error or a
 # definite leak.
 #
-#   scripts/valgrind.sh [suite ...]        default: executor time net cancel fs udp unix
+#   scripts/valgrind.sh [suite ...]
+#
+# A suite is a file in tests/ of the giong crate, or CRATE:SUITE for another
+# crate in the workspace. Default: executor time net cancel fs udp unix
+# giong-compat:compat giong-compat:memory
 #
 # Not covered, because valgrind (3.22) treats io_uring_enter as non-blocking
 # and so stalls programs with more than one thread waiting in it:
@@ -25,7 +29,8 @@ cd "$(dirname "$0")/.."
 command -v valgrind >/dev/null || { echo "valgrind is not installed" >&2; exit 2; }
 
 SUITES=("$@")
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix)
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix
+  giong-compat:compat giong-compat:memory)
 SKIP="interoperates_with_blocking_std_clients"
 SKIP+=" works_with_the_standard_library_on_the_other_side"
 SKIP+=" every_worker_can_bind_the_same_port"
@@ -35,7 +40,11 @@ TIMEOUT=${TIMEOUT:-300}
 total=0
 failed=0
 for suite in "${SUITES[@]}"; do
-  bin=$(cargo test --no-run --test "$suite" 2>&1 | sed -n 's/.*Executable.*(\(.*\))/\1/p')
+  case "$suite" in
+    *:*) pkg=(-p "${suite%%:*}"); name=${suite#*:} ;;
+    *) pkg=(); name=$suite ;;
+  esac
+  bin=$(cargo test --no-run "${pkg[@]}" --test "$name" 2>&1 | sed -n 's/.*Executable.*(\(.*\))/\1/p')
   if [ -z "$bin" ]; then
     echo "could not build test suite '$suite'" >&2
     exit 2

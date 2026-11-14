@@ -1,0 +1,22 @@
+[package]
+name = "giong-tls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+giong-tls = { path = ".." }
+
+# Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "ktls_records"
+path = "fuzz_targets/ktls_records.rs"
+test = false
+doc = false
+bench = false

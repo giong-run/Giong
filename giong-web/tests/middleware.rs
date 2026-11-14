@@ -56,7 +56,7 @@ fn request_ids_reach_the_response_the_error_body_and_the_handler() {
         .build(());
     let resp = get(&app, "/id", "");
     let id = resp.get_header("x-request-id").unwrap().to_string();
-    assert_eq!(id.len(), 20);
+    assert_eq!(id.len(), 32);
     assert_eq!(body(&resp), id);
     let other = get(&app, "/id", "")
         .get_header("x-request-id")
@@ -150,6 +150,33 @@ fn the_logger_can_include_the_query_string() {
         .build(());
     get(&app, "/s?q=rust", "");
     assert!(lines.borrow()[0].contains("\"query\":\"q=rust\""));
+}
+
+#[test]
+fn the_logger_cuts_a_long_path_and_query_with_a_marker() {
+    let (sink, lines) = memory();
+    let app = Router::new()
+        .get("/s", ok)
+        .layer(Logger::new(sink).include_query(true))
+        .build(());
+    let path = format!("/{}", "a".repeat(20_000));
+    let query = format!("q={}", "b".repeat(10_000));
+    get(&app, &format!("{path}?{query}"), "");
+    get(&app, &format!("/s?{query}"), "");
+
+    let lines = lines.borrow();
+    let field = |line: &str, name: &str| -> String {
+        let start = line.find(&format!("\"{name}\":\"")).unwrap() + name.len() + 4;
+        let len = line[start..].find('"').unwrap();
+        line[start..start + len].to_string()
+    };
+    assert!(lines[0].contains("\"status\":404"), "{}", &lines[0][..200]);
+    let logged = field(&lines[0], "path");
+    assert_eq!(logged, format!("{}...(+15905 bytes)", &path[..4096]));
+    let logged = field(&lines[1], "query");
+    assert_eq!(logged, format!("{}...(+5906 bytes)", &query[..4096]));
+    assert_eq!(field(&lines[1], "path"), "/s");
+    assert!(lines.iter().all(|l| l.len() < 10_000));
 }
 
 #[test]
@@ -309,6 +336,87 @@ fn cors_marks_responses_for_allowed_origins() {
     assert!(resp.get_header("vary").is_none());
 }
 
+#[test]
+fn cors_on_a_nested_router_answers_its_preflights_and_errors() {
+    let api = Router::new()
+        .get("/items", ok)
+        .post("/items", ok)
+        .delete("/items/{id}", ok)
+        .layer(
+            Cors::new()
+                .allow_origin("https://app.example.com")
+                .allow_methods(&["GET", "POST", "DELETE"])
+                .allow_headers(&["content-type"]),
+        );
+    let app = Router::new()
+        .get("/health", ok)
+        .nest("/api", api)
+        .layer(RequestId::new())
+        .build(());
+    let origin = "Origin: https://app.example.com\r\n";
+
+    let resp = send(
+        &app,
+        &format!(
+            "OPTIONS /api/items HTTP/1.1\r\nHost: t\r\n{origin}\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: content-type\r\n\r\n"
+        ),
+    );
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        resp.get_header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+    assert_eq!(
+        resp.get_header("access-control-allow-methods"),
+        Some("GET, POST, DELETE")
+    );
+    assert_eq!(
+        resp.get_header("access-control-allow-headers"),
+        Some("content-type")
+    );
+    assert!(resp.get_header("x-request-id").is_some());
+
+    // A preflight for a path whose route has a parameter.
+    let resp = send(
+        &app,
+        &format!(
+            "OPTIONS /api/items/7 HTTP/1.1\r\nHost: t\r\n{origin}\
+             Access-Control-Request-Method: DELETE\r\n\r\n"
+        ),
+    );
+    assert_eq!(resp.status(), 204);
+    assert!(resp.get_header("access-control-allow-methods").is_some());
+
+    // Errors under the prefix carry the header too, so the page can read them.
+    for (method, target, status) in [("GET", "/api/nothing", 404), ("PUT", "/api/items", 405)] {
+        let resp = send(
+            &app,
+            &format!("{method} {target} HTTP/1.1\r\nHost: t\r\n{origin}\r\n"),
+        );
+        assert_eq!(resp.status(), status, "{method} {target}");
+        assert_eq!(
+            resp.get_header("access-control-allow-origin"),
+            Some("https://app.example.com"),
+            "{method} {target}"
+        );
+    }
+
+    // Outside the prefix, the nested Cors does not run.
+    let resp = get(&app, "/health", origin);
+    assert!(resp.get_header("access-control-allow-origin").is_none());
+    let resp = send(
+        &app,
+        &format!(
+            "OPTIONS /health HTTP/1.1\r\nHost: t\r\n{origin}\
+             Access-Control-Request-Method: GET\r\n\r\n"
+        ),
+    );
+    assert_eq!(resp.status(), 204);
+    assert!(resp.get_header("access-control-allow-methods").is_none());
+}
+
 fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
     let err = std::panic::catch_unwind(f).unwrap_err();
     err.downcast_ref::<String>().cloned().unwrap_or_default()
@@ -420,11 +528,17 @@ fn compression_gzips_text_for_clients_that_accept_it() {
     assert_eq!(resp.get_header("etag"), Some("\"v1\""));
     assert_eq!(body(&resp), json);
 
-    let resp = send(
+    // HEAD gets the header fields GET would get (RFC 9110, section 9.3.2):
+    // the server sends the length of the body it keeps and leaves the body out.
+    let got = get(&app, "/users", "Accept-Encoding: gzip\r\n");
+    let head = send(
         &app,
         "HEAD /users HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n",
     );
-    assert_eq!(resp.get_header("content-encoding"), None);
+    for name in ["content-encoding", "vary", "etag", "content-type"] {
+        assert_eq!(head.get_header(name), got.get_header(name), "HEAD {name}");
+    }
+    assert_eq!(head.body_bytes().len(), got.body_bytes().len());
 
     for path in ["/small", "/png", "/done", "/no-transform"] {
         let resp = get(&app, path, "Accept-Encoding: gzip\r\n");

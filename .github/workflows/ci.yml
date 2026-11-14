@@ -56,7 +56,35 @@ jobs:
       # dependencies need a newer compiler.
       - run: cargo check --workspace --all-features
 
+  # The release build of every test binary, once for the whole run: fat LTO
+  # makes it the slowest step by far, and the jobs `test`, `fallback`, `docker`
+  # and `kernels` all run these binaries. They take this job's target/release
+  # and then run the same cargo commands as before, which find it up to date
+  # (scripts/shared-build.sh says how, and what makes that safe).
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: scripts/shared-build.sh pack "$RUNNER_TEMP/release-build.tar.zst"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/release-build.tar.zst
+          if-no-files-found: error
+          # Packed with zstd already.
+          compression-level: 0
+          retention-days: 1
+          # A run started again uploads it again.
+          overwrite: true
+
   test:
+    needs: build
+    # A required check that is skipped counts as passed, and a job is skipped
+    # when one it needs fails: this one always runs, and fails by itself.
+    if: always()
     runs-on: ubuntu-24.04
     env:
       # giong must choose io_uring by itself on the runner: if a runner kernel
@@ -64,19 +92,34 @@ jobs:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       # The kernel TLS tests fail instead of skipping without the module.
       GIONG_KTLS_REQUIRED: 1
+      # giong-postgres's tests through PgBouncer fail instead of skipping
+      # without it.
+      GIONG_PGBOUNCER_REQUIRED: 1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
+      - name: The build must have succeeded
+        run: test "${{ needs.build.result }}" = success
       - run: uname -r
-      - name: Install redis-server
-        # Ubuntu's Redis 7.0. The tests start their own server; the
-        # service apt starts is stopped.
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      - name: Install redis-server and pgbouncer
+        # Ubuntu's Redis 7.0 and PgBouncer 1.22. The tests start their own
+        # servers; the services apt starts are stopped.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
-          sudo systemctl stop redis-server
+          sudo apt-get install -y -q redis-server pgbouncer
+          sudo systemctl stop redis-server pgbouncer
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # Linux 6.14 to 7.2 count every io_uring ring against the
@@ -119,7 +162,10 @@ jobs:
   # 7.0. Each entry installs one server and runs one crate's tests on it.
   servers:
     name: servers (${{ matrix.server }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
+    # These take a few minutes. A server that does not start, or a test that
+    # waits for one for ever, must not hold a runner for six hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -127,11 +173,22 @@ jobs:
           - { server: postgres 14, crate: giong-postgres, postgres: "14" }
           - { server: postgres 15, crate: giong-postgres, postgres: "15" }
           - { server: postgres 17, crate: giong-postgres, postgres: "17" }
-          - { server: mysql 8.4, crate: giong-mysql, mysql: "8.4.3" }
-          - { server: mysql 9.1, crate: giong-mysql, mysql: "9.1.0" }
-          - { server: redis 6.2, crate: giong-redis, redis: "6.2.16" }
-          - { server: redis 7.4, crate: giong-redis, redis: "7.4.1" }
-          - { server: valkey 8.0, crate: giong-redis, valkey: "8.0.1" }
+          - { server: postgres 18, crate: giong-postgres, postgres: "18" }
+          # `sha256` is the archive's hash, checked before it is unpacked:
+          # TLS protects the download, the hash protects against a changed
+          # archive on the server. Redis's come from github.com/redis/redis-hashes.
+          - { server: mysql 8.4, crate: giong-mysql, mysql: "8.4.3", sha256: b614e51fddac1bbec1dd9cf0a96fcf2426007a8dbbbc3f6b17c555e3b92b017e }
+          - { server: mysql 9.1, crate: giong-mysql, mysql: "9.1.0", sha256: 8d853ff095a72cb263e22dcca2b3ce6e3bd49cb2e05b89aeddb0bab626f4b102 }
+          # MariaDB comes from its apt repository, whose packages apt checks
+          # against MariaDB's signing key; the key is checked by fingerprint.
+          # The repository has 10.6 for Ubuntu 22.04 and older only.
+          - { server: mariadb 10.6, crate: giong-mysql, mariadb: "10.6", os: ubuntu-22.04 }
+          - { server: mariadb 10.11, crate: giong-mysql, mariadb: "10.11" }
+          - { server: mariadb 11.4, crate: giong-mysql, mariadb: "11.4" }
+          - { server: mariadb 11.8, crate: giong-mysql, mariadb: "11.8" }
+          - { server: redis 6.2, crate: giong-redis, redis: "6.2.16", sha256: 846bff83c26d827d49f8cc8114ea9d1e72eea1169f7de36b8135ea2cec104e7d }
+          - { server: redis 7.4, crate: giong-redis, redis: "7.4.1", sha256: bc34b878eb89421bbfca6fa78752343bf37af312a09eb0fae47c9575977dfaa2 }
+          - { server: valkey 8.0, crate: giong-redis, valkey: "8.0.1", sha256: 1e1d6dfbed2f932a87afbc7402be050a73974a9b19a9116897e537a6638e5e1d }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -159,9 +216,10 @@ jobs:
         run: |
           v=${{ matrix.mysql }}
           name=mysql-$v-linux-glibc2.17-x86_64-minimal
-          curl -fsSL --retry 3 "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz" \
-            | tar -xJ -C "$RUNNER_TEMP"
           cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o "$name.tar.xz" "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz"
+          echo "${{ matrix.sha256 }}  $name.tar.xz" | sha256sum -c -
+          tar -xJf "$name.tar.xz"
           pool=http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses
           curl -fsSL --retry 3 -O "$pool/libtinfo5_6.3-2_amd64.deb" -O "$pool/libncurses5_6.3-2_amd64.deb"
           printf '%s\n' \
@@ -174,14 +232,65 @@ jobs:
           "$RUNNER_TEMP/$name/bin/mysqld" --version
           "$RUNNER_TEMP/$name/bin/mysql" --version
           echo "GIONG_MYSQL_BIN=$RUNNER_TEMP/$name/bin" >> "$GITHUB_ENV"
+      - name: Install MariaDB ${{ matrix.mariadb }}
+        if: matrix.mariadb
+        # MariaDB's own packages for this Ubuntu, from its apt repository
+        # (apt checks them against MariaDB's signing key, and the key is
+        # checked against its fingerprint), unpacked into a directory rather
+        # than installed over the runner's MySQL; what they need from Ubuntu
+        # is installed. Ubuntu has MariaDB packages of its own under the same
+        # names, so each is taken at the version MariaDB's repository has,
+        # and the server's version is checked.
+        env:
+          MARIADB: ${{ matrix.mariadb }}
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/mariadb-keyring.pgp" \
+            https://mariadb.org/mariadb_release_signing_key.pgp
+          fingerprint=$(gpg --show-keys --with-colons "$RUNNER_TEMP/mariadb-keyring.pgp" \
+            | awk -F: '$1 == "fpr" && !seen++ { print $10 }')
+          if [ "$fingerprint" != 177F4010FE56CA3336300305F1656F24C74CD1D8 ]; then
+            echo "MariaDB's signing key has the fingerprint $fingerprint, not the one expected"
+            exit 1
+          fi
+          sudo install -D -m 644 "$RUNNER_TEMP/mariadb-keyring.pgp" /etc/apt/keyrings/mariadb-keyring.pgp
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [signed-by=/etc/apt/keyrings/mariadb-keyring.pgp] https://deb.mariadb.org/$MARIADB/ubuntu $codename main" \
+            | sudo tee /etc/apt/sources.list.d/mariadb.list
+          sudo apt-get update -q
+          mkdir -p "$RUNNER_TEMP/mariadb-debs" && cd "$RUNNER_TEMP/mariadb-debs"
+          pkgs=()
+          for base in mariadb-server-core mariadb-server mariadb-client-core mariadb-client \
+            mariadb-common libmariadb3; do
+            # Older series name some packages with the version (mariadb-server-10.6).
+            for p in "$base" "$base-$MARIADB"; do
+              v=$(apt-cache madison "$p" 2>/dev/null | awk -F'|' '$2 ~ /maria/ && !seen++ { gsub(/ /, "", $2); print $2 }')
+              if [ -n "$v" ]; then pkgs+=("$p=$v"); fi
+            done
+          done
+          echo "${pkgs[@]}"
+          apt-get download "${pkgs[@]}"
+          root="$RUNNER_TEMP/mariadb"
+          for deb in *.deb; do dpkg -x "$deb" "$root"; done
+          deps=$(for deb in *.deb; do dpkg-deb -f "$deb" Depends; done \
+            | tr ',' '\n' | sed -e 's/([^)]*)//g' -e 's/|.*//' -e 's/:any//' -e 's/ //g' \
+            | grep -v -E '^(mariadb|mysql|libmariadb|galera|default-mysql|debconf|adduser|passwd|lsb-base|init-system|perl|libdbi|libdbd|psmisc|rsync|procps|iproute2|socat|sed|\$)' \
+            | sort -u)
+          sudo apt-get install -y -q --no-install-recommends $deps
+          export LD_LIBRARY_PATH="$root/usr/lib/x86_64-linux-gnu"
+          if ldd "$root"/usr/sbin/mariadbd "$root"/usr/bin/mariadb | grep 'not found'; then exit 1; fi
+          "$root/usr/sbin/mariadbd" --version | tee /dev/stderr | grep -E -q "Ver $MARIADB\.[0-9]+-MariaDB"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "GIONG_MYSQL_BIN=$root/usr/sbin" >> "$GITHUB_ENV"
       - name: Build Redis ${{ matrix.redis }}
         if: matrix.redis
         # From source, with TLS, which the tests use.
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libssl-dev
-          curl -fsSL --retry 3 "https://download.redis.io/releases/redis-${{ matrix.redis }}.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/redis.tar.gz" \
+            "https://download.redis.io/releases/redis-${{ matrix.redis }}.tar.gz"
+          echo "${{ matrix.sha256 }}  $RUNNER_TEMP/redis.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/redis.tar.gz" -C "$RUNNER_TEMP"
           make -C "$RUNNER_TEMP/redis-${{ matrix.redis }}" -j4 BUILD_TLS=yes > /dev/null
           echo "GIONG_REDIS_BIN=$RUNNER_TEMP/redis-${{ matrix.redis }}/src" >> "$GITHUB_ENV"
       - name: Build Valkey ${{ matrix.valkey }}
@@ -191,8 +300,10 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libssl-dev
-          curl -fsSL --retry 3 "https://github.com/valkey-io/valkey/archive/refs/tags/${{ matrix.valkey }}.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/valkey.tar.gz" \
+            "https://github.com/valkey-io/valkey/archive/refs/tags/${{ matrix.valkey }}.tar.gz"
+          echo "${{ matrix.sha256 }}  $RUNNER_TEMP/valkey.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/valkey.tar.gz" -C "$RUNNER_TEMP"
           src="$RUNNER_TEMP/valkey-${{ matrix.valkey }}/src"
           make -C "$src/.." -j4 BUILD_TLS=yes > /dev/null
           ln -sf valkey-server "$src/redis-server"
@@ -202,10 +313,17 @@ jobs:
 
   # The io_uring of older kernels, forced on the runner's newer one: without
   # the optional io_uring features (GIONG_IO_URING_OFF), then also on the
-  # setup tiers of kernels older than 6.1 (GIONG_RING_TIER); then the epoll
-  # driver (GIONG_DRIVER=epoll).
-  fallback:
+  # setup tiers of kernels older than 6.1 (GIONG_RING_TIER); and the epoll
+  # driver (GIONG_DRIVER=epoll). What `scripts/check.sh fallback` runs one
+  # after the other, as four jobs side by side.
+  fallback-tiers:
+    name: fallback (${{ matrix.tier }})
+    needs: build
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [no-features, coop, basic, epoll]
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
@@ -214,6 +332,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
       - name: Install redis-server
         # Ubuntu's Redis 7.0. The tests start their own server; the
         # service apt starts is stopped.
@@ -224,20 +352,40 @@ jobs:
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # The locked-memory limit is lifted as in the test job.
-      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback ${{ matrix.tier }}
+
+  # The required check: every tier above passed. It always runs, because a
+  # skipped required check counts as passed.
+  fallback:
+    needs: fallback-tiers
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.fallback-tiers.result }}" = success
 
   # The epoll driver where it is needed: a container with Docker's default
   # seccomp profile, which blocks io_uring. Nothing names a driver, so the
   # tests also show that giong falls back to epoll by itself. The database
   # crates' tests skip here (no servers in the image).
   docker:
+    needs: build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - name: Build the test binaries
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      - name: List the test binaries
         run: |
           mkdir -p target
           cargo test --release --workspace --all-features --no-run --message-format=json |
@@ -263,8 +411,19 @@ jobs:
                 "$t" -q
               done'
 
-  tsan:
+  # ThreadSanitizer over every test: twice on io_uring and once on the epoll
+  # driver, which hands file operations to threads of its own. Three jobs side
+  # by side, each with its own build (the standard library included).
+  tsan-runs:
+    name: tsan (${{ matrix.driver }}, run ${{ matrix.run }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { driver: io_uring, run: 1 }
+          - { driver: io_uring, run: 2 }
+          - { driver: epoll, run: 1 }
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
@@ -287,9 +446,32 @@ jobs:
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # The locked-memory limit is lifted as in the test job.
-      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && ROUNDS=2 scripts/check.sh tsan
-      # The epoll driver hands file operations to threads of its own.
-      - run: GIONG_DRIVER=epoll ROUNDS=1 scripts/check.sh tsan
+      - name: ThreadSanitizer on ${{ matrix.driver }}
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          if [ "${{ matrix.driver }}" = epoll ]; then export GIONG_DRIVER=epoll; fi
+          ROUNDS=1 scripts/check.sh tsan
+
+  # The required check: every ThreadSanitizer job above passed.
+  tsan:
+    needs: tsan-runs
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.tsan-runs.result }}" = success
+
+  # The unsafe code under Miri, which checks every access against Rust's
+  # memory and aliasing rules: the unit tests and the tests it can run, on the
+  # epoll driver (scripts/check.sh says which).
+  miri:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - run: scripts/check.sh miri
 
   # Model-check the wake-up handshakes in src/notify.rs with loom, then run the
   # same race on the runner's real CPUs.
@@ -302,12 +484,38 @@ jobs:
           toolchain: stable
       - run: scripts/check.sh loom
 
+  # The core crate's tests with each of its direct dependencies at the lowest
+  # version its Cargo.toml allows, so that the floors there are checked, not
+  # assumed: io-uring 0.7.0 to 0.7.14 once hung a busy worker's I/O, which a
+  # fresh lockfile (with the newest versions) never shows. Only the core crate
+  # for now; the other crates' floors are not all consistent yet, and a crate
+  # joins `members` here once they are.
+  minimal-versions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Resolve the direct dependencies to their lowest versions
+        run: |
+          sed -i 's/^members = \[.*\]$/members = ["."]/' Cargo.toml
+          grep -q '^members = \["."\]$' Cargo.toml
+          cargo +nightly update -Z direct-minimal-versions
+          cargo tree -p giong --depth 1 -e normal
+      # The locked-memory limit is lifted as in the test job.
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && cargo test --release -p giong --all-features
+
   # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM),
   # on 5.15, whose io_uring lacks buffer rings: giong runs on epoll there, and
   # on the kernel Ubuntu 24.04 ships, whose buffer-ring bug (6.8.0-135 and
   # later) giong works around to stay on io_uring. Each run checks the driver
   # giong chose by itself and the kernel bugs it had to work around.
   kernels:
+    needs: build
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -331,6 +539,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
       - name: Install QEMU and a static busybox
         run: |
           sudo apt-get update -q

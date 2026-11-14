@@ -77,6 +77,7 @@ fn whole_files_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn large_files_survive_byte_for_byte() {
     let dir = TempDir::new("large");
     giong::block_on(async {
@@ -131,6 +132,46 @@ fn reads_and_writes_name_their_offset() {
         file.sync_all().await.unwrap();
         file.close().await.unwrap();
     });
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri's pread refuses offsets near i64::MAX")]
+fn offsets_above_i64_max_are_refused_on_every_driver() {
+    // io_uring reads an offset of u64::MAX as "the current file position":
+    // read_at and write_at used to read and write wherever that was, on
+    // io_uring only.
+    let dir = TempDir::new("offsets");
+    let path = dir.path("digits");
+    std::fs::write(&path, b"0123456789").unwrap();
+    giong::block_on(async move {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let is_range_error = |e: &std::io::Error| {
+            giong::error::code(e) == Some(giong::error::Code::OffsetOutOfRange)
+        };
+        for offset in [u64::MAX, i64::MAX as u64 + 1] {
+            let (res, buf) = file.read_at(Vec::with_capacity(4), offset).await;
+            assert!(is_range_error(&res.unwrap_err()), "read_at({offset})");
+            assert!(buf.is_empty());
+            let (res, _) = file.write_at(&b"XY"[..], offset).await;
+            assert!(is_range_error(&res.unwrap_err()), "write_at({offset})");
+            let (res, _) = file.write_all_at(&b"XY"[..], offset).await;
+            assert!(is_range_error(&res.unwrap_err()), "write_all_at({offset})");
+        }
+        // Nothing moved or changed: the file and its position are as they were.
+        let (res, buf) = file.read_at(Vec::with_capacity(16), 0).await;
+        assert_eq!((res.unwrap(), &buf[..]), (10, &b"0123456789"[..]));
+        // Offsets up to the largest are passed on (a read there finds the end).
+        let (res, _) = file
+            .read_at(Vec::with_capacity(4), i64::MAX as u64 - 4)
+            .await;
+        assert_eq!(res.unwrap(), 0);
+    });
+    assert_eq!(std::fs::read(dir.path("digits")).unwrap(), b"0123456789");
 }
 
 #[test]
@@ -200,19 +241,83 @@ fn open_options_behave_like_the_standard_library() {
             .unwrap();
         assert_eq!(file.metadata().await.unwrap().mode() & 0o777, 0o600);
 
-        // Combinations that make no sense are refused before any I/O.
-        for options in [
-            OpenOptions::new(),
-            OpenOptions::new().read(true).truncate(true),
-            OpenOptions::new().read(true).create(true),
-            OpenOptions::new().append(true).truncate(true),
-        ] {
-            let err = options.open(&path).await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{options:?}");
-        }
         let err = File::open("nul\0byte").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     });
+}
+
+#[test]
+fn invalid_open_options_are_coded_errors() {
+    // They used to fail with a bare EINVAL that did not say which option
+    // was wrong.
+    let dir = TempDir::new("bad-options");
+    let path = dir.path("f");
+    std::fs::write(&path, b"keep").unwrap();
+    giong::block_on(async {
+        for (options, says) in [
+            (OpenOptions::new(), "neither read, write nor append"),
+            (
+                OpenOptions::new().read(true).truncate(true),
+                "truncate without write",
+            ),
+            (
+                OpenOptions::new().read(true).create(true),
+                "create without write",
+            ),
+            (
+                OpenOptions::new().read(true).create_new(true),
+                "create_new without write",
+            ),
+            (
+                OpenOptions::new().append(true).truncate(true),
+                "both append and truncate",
+            ),
+        ] {
+            let err = options.open(&path).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{options:?}");
+            assert_eq!(
+                giong::error::code(&err),
+                Some(giong::error::Code::InvalidOpenOptions),
+                "{options:?}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(says), "{options:?}: {message}");
+            assert!(message.contains("Fix: "), "{options:?}: {message}");
+        }
+        // The same options with what they lacked are fine.
+        let file = OpenOptions::new().read(true).write(true).truncate(true);
+        drop(file.open(&path).await.unwrap());
+        let options = OpenOptions::new()
+            .append(true)
+            .truncate(true)
+            .create_new(true);
+        let err = options.open(&path).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    });
+}
+
+#[test]
+fn allocating_nothing_does_nothing() {
+    let dir = TempDir::new("allocate-nothing");
+    let path = dir.path("f");
+    std::fs::write(&path, b"0123").unwrap();
+    giong::block_on(async {
+        let file = OpenOptions::new().write(true).open(&path).await.unwrap();
+        // fallocate(2) refuses a length of 0 with a bare EINVAL.
+        file.allocate(0, 0).await.unwrap();
+        file.allocate(1 << 20, 0).await.unwrap();
+        assert_eq!(file.len().unwrap(), 4);
+        // A range that ends past the largest offset Linux has.
+        for (offset, len) in [(i64::MAX as u64, 1), (u64::MAX, 1), (1, u64::MAX)] {
+            let err = file.allocate(offset, len).await.unwrap_err();
+            assert_eq!(
+                giong::error::code(&err),
+                Some(giong::error::Code::OffsetOutOfRange),
+                "allocate({offset}, {len}): {err}"
+            );
+        }
+    });
+    assert_eq!(std::fs::read(&path).unwrap(), b"0123");
 }
 
 #[test]
@@ -248,6 +353,7 @@ fn metadata_describes_files_directories_and_links() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no renameat")]
 fn files_and_directories_can_be_renamed_and_removed() {
     let dir = TempDir::new("paths");
     giong::block_on(async {
@@ -284,6 +390,7 @@ fn files_and_directories_can_be_renamed_and_removed() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn many_tasks_share_one_file() {
     let dir = TempDir::new("shared");
     giong::block_on(async {
@@ -326,6 +433,7 @@ fn many_tasks_share_one_file() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "counts descriptors in /proc, where Miri's do not show")]
 fn closed_and_dropped_files_release_their_descriptors() {
     let dir = TempDir::new("fds");
     let path = dir.path("f");
@@ -406,6 +514,7 @@ fn a_read_that_never_completes_can_be_cancelled() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri cannot open a pseudo-terminal")]
 fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
     // On epoll a read from a terminal runs on a blocking thread and waits
     // there for input. Dropping the read and then the file must not close the
@@ -485,6 +594,68 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no mkfifo")]
+fn a_stuck_file_operation_does_not_hold_up_the_others() {
+    // On epoll, file operations run on the process's blocking threads. Opening
+    // a FIFO for reading blocks until a writer opens it. A burst of such opens
+    // queued while one blocking thread was idle used to go to that one thread
+    // alone, so the first stuck open held up every other file operation of
+    // the process.
+    const OPENS: usize = 16;
+    let dir = TempDir::new("stuck");
+    for i in 0..OPENS {
+        let path = std::ffi::CString::new(dir.path(&i.to_string()).to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let paths: Vec<PathBuf> = (0..OPENS).map(|i| dir.path(&i.to_string())).collect();
+    let last = paths[OPENS - 1].clone();
+    // A writer for the last FIFO only, after 200 ms.
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::OpenOptions::new().write(true).open(last).unwrap()
+    });
+    let opens = paths.clone();
+    giong::Builder::new()
+        .driver(giong::DriverKind::Epoll)
+        .block_on(async move {
+            // One quick operation, so that a blocking thread exists and is idle.
+            fs::metadata("/").await.unwrap();
+            giong::time::sleep(Duration::from_millis(20)).await;
+            let start = Instant::now();
+            let mut handles: Vec<_> = opens
+                .into_iter()
+                .map(|path| giong::spawn(async move { File::open(path).await.map(drop) }))
+                .collect();
+            let last = handles.pop().unwrap();
+            let opened = timeout(Duration::from_secs(5), last).await;
+            assert!(
+                matches!(opened, Ok(Ok(Ok(())))),
+                "the open with a writer did not complete after {:?}: {opened:?}",
+                start.elapsed()
+            );
+            // Let the other opens finish, so that they do not keep blocking
+            // threads busy: a FIFO opened for reading and writing has a writer.
+            let ends: Vec<std::fs::File> = paths[..OPENS - 1]
+                .iter()
+                .map(|path| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+            drop(ends);
+        })
+        .unwrap();
+    drop(writer.join().unwrap());
+}
+
+#[test]
 fn files_work_on_every_worker() {
     let dir = TempDir::new("workers");
     let base = dir.0.clone();
@@ -558,6 +729,87 @@ fn a_std_file_can_be_adopted_and_knows_its_length() {
     });
 }
 
+/// Marks the child process that `standard_input_pipes_stay_blocking` starts.
+const STDIN_CHILD: &str = "GIONG_TEST_STDIN_CHILD";
+
+/// Whether `fd` is in non-blocking mode.
+fn nonblocking(fd: i32) -> bool {
+    // SAFETY: F_GETFL on a descriptor this process owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "fcntl: {}", std::io::Error::last_os_error());
+    flags & libc::O_NONBLOCK != 0
+}
+
+/// A pipe on standard input is shared with the shell pipeline around the
+/// process, and non-blocking mode belongs to the pipe: the epoll driver
+/// must read it on a blocking thread rather than switch the mode (which
+/// would make `cat` on the same pipe fail with `EAGAIN`). A pipe the
+/// process made itself still goes through epoll.
+#[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
+fn standard_input_pipes_stay_blocking() {
+    if std::env::var_os(STDIN_CHILD).is_some() {
+        giong::block_on(async {
+            // SAFETY: fd 0 is open (the parent piped it) and this process
+            // gives it to giong for good.
+            let stdin = File::from_std(unsafe { std::fs::File::from_raw_fd(0) });
+            let (res, buf) = stdin.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 2);
+            println!(
+                "stdin: {} nonblocking={}",
+                String::from_utf8_lossy(&buf),
+                nonblocking(0)
+            );
+            std::mem::forget(stdin);
+
+            let mut fds = [0; 2];
+            // SAFETY: a valid array of two descriptors.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: both ends are fresh descriptors this process owns.
+            let (read, mut write) = unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[0]),
+                    std::fs::File::from_raw_fd(fds[1]),
+                )
+            };
+            std::io::Write::write_all(&mut write, b"ok").unwrap();
+            let read = File::from_std(read);
+            let (res, buf) = read.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 2);
+            println!(
+                "pipe: {} nonblocking={}",
+                String::from_utf8_lossy(&buf),
+                nonblocking(fds[0])
+            );
+        });
+        return;
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "standard_input_pipes_stay_blocking",
+            "--nocapture",
+        ])
+        .env(STDIN_CHILD, "1")
+        .env("GIONG_DRIVER", "epoll")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"hi").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("stdin: hi nonblocking=false"), "{stdout}");
+    assert!(stdout.contains("pipe: ok nonblocking=true"), "{stdout}");
+}
+
 /// Every entry `read_dir` lists for `dir`, sorted by name.
 async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
     let mut entries = Vec::new();
@@ -570,6 +822,7 @@ async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn directories_list_like_the_standard_library() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirEntryExt, MetadataExt};
@@ -643,6 +896,7 @@ fn directories_list_like_the_standard_library() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn large_directories_are_read_in_batches() {
     let dir = TempDir::new("read-dir-many");
     // About 80 bytes per entry, so an 8 KiB batch holds about 100 of them.
@@ -703,6 +957,7 @@ fn large_directories_are_read_in_batches() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn read_dir_reports_what_it_cannot_list() {
     let dir = TempDir::new("read-dir-errors");
     giong::block_on(async {
@@ -727,6 +982,7 @@ fn read_dir_reports_what_it_cannot_list() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "counts descriptors in /proc, where Miri's do not show")]
 fn dropped_listings_release_their_descriptors() {
     let dir = TempDir::new("read-dir-fds");
     for i in 0..1_000 {
@@ -753,6 +1009,7 @@ fn dropped_listings_release_their_descriptors() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri's fallocate does not reserve blocks")]
 fn allocate_reserves_space_without_touching_data() {
     use std::os::unix::fs::MetadataExt;
 
@@ -793,9 +1050,9 @@ fn allocate_reserves_space_without_touching_data() {
         file.allocate(2 << 20, 4096).await.unwrap();
         assert_eq!(file.len().unwrap(), (2 << 20) + 4096);
 
-        // The kernel's own errors come back as they are.
-        let err = file.allocate(0, 0).await.unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        // The kernel's own errors come back as they are. (A length of 0,
+        // which fallocate refuses with EINVAL, does nothing: see
+        // allocating_nothing_does_nothing.)
         let read_only = File::open(&path).await.unwrap();
         let err = read_only.allocate(0, 1).await.unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
