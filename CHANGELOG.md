@@ -219,6 +219,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   case is no longer refused (host names are case-insensitive, and HTTP/1.1 now compares
   the same way), and an `:authority` with a user name or password is (RFC 9113, section
   8.3.1).
+- **giong-http**: trailer lines after a chunked body were dropped without being looked at,
+  so a line without a colon, with a bare CR in it, or with a name that is not a token
+  was accepted, which a proxy in front that ends lines at a bare CR would read
+  differently. They are now held to the rules of a header line: the server answers
+  `400` (`GIONG-E1113` for a body read as a stream), and the client, which shares the
+  decoder, fails with `GIONG-E1107` (`ErrorKind::Protocol`).
 
 ## [0.4.0] - 2026-11-13
 

@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn from_bytes_refuses_what_the_server_refuses() {
-        let cases: [&[u8]; 7] = [
+        let cases: [&[u8]; 8] = [
             b"GET / HTTP/1.1\r\nHost: h\r\n",
             b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nabc",
             b"GET / HTTP/1.1\r\nHost: h\r\n\r\nextra",
@@ -308,6 +308,9 @@ mod tests {
             // another in the target.
             b"GET http://internal.example/admin HTTP/1.1\r\nHost: public.example\r\n\r\n",
             b"GET foo://h/x HTTP/1.1\r\nHost: h\r\n\r\n",
+            // A trailer line a proxy that ends lines at a bare CR would
+            // read as two.
+            b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nno colon\rbare CR\r\n\r\n",
         ];
         for raw in cases {
             assert_eq!(

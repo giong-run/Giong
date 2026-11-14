@@ -601,7 +601,12 @@ impl Body {
                         self.buf.extend_from_slice(&chunk);
                     }
                     Err(_) => {
-                        return Err(protocol(what, "the chunked body is malformed").into_error());
+                        return Err(protocol(
+                            what,
+                            "the chunked body is malformed (a chunk size line, the end of a \
+                             chunk or a trailer line)",
+                        )
+                        .into_error());
                     }
                 },
                 Kind::UntilClose => {
