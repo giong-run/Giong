@@ -244,6 +244,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-http**: the package description on crates.io and the crate's documentation said
   the client speaks HTTP/1.1 only (and the description, the server too); both speak
   HTTP/1.1 and HTTP/2.
+- **giong-http**: the errors of a request body read as a stream, and of a response body
+  that can no longer be sent, ran their fix into the link after it ("... the limit
+  `Handler::stream_body` returns See https://..."): their fixes now end with a full stop.
 
 ## [0.4.0] - 2026-11-13
 

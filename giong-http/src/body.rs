@@ -38,7 +38,7 @@ impl Failure {
             Failure::TooLarge(limit) => Error::new(
                 Code::HttpBodyTooLarge,
                 format!("the request body is larger than the {limit} bytes this handler accepts"),
-                "answer 413 Content Too Large, or raise the limit `Handler::stream_body` returns",
+                "answer 413 Content Too Large, or raise the limit `Handler::stream_body` returns.",
             )
             .into(),
             Failure::Cut => Error::new(
@@ -46,7 +46,7 @@ impl Failure {
                 "the request body was cut short: the client closed the connection or sent \
                  nothing for the request timeout",
                 "nothing to fix on the server; the client may retry. A slow client gets \
-                 `Server::request_timeout` between two pieces of the body",
+                 `Server::request_timeout` between two pieces of the body.",
             )
             .into(),
             Failure::Abandoned => Error::new(
@@ -54,7 +54,7 @@ impl Failure {
                 "the handler answered before reading the whole request body, so the \
                  connection stopped reading it",
                 "read the body to its end before returning the response, or stop reading \
-                 it once the response is returned",
+                 it once the response is returned.",
             )
             .into(),
             Failure::Malformed => Error::new(
@@ -62,7 +62,7 @@ impl Failure {
                 "the request body's framing is broken: invalid chunked encoding, or an \
                  HTTP/2 stream that broke the protocol (a body longer or shorter than its \
                  content-length, data past the flow-control window), which the server reset",
-                "answer 400 Bad Request; the client sent an invalid body",
+                "answer 400 Bad Request; the client sent an invalid body.",
             )
             .into(),
             Failure::Reset => Error::new(
@@ -70,7 +70,7 @@ impl Failure {
                 "the request body was cut short: the client cancelled the HTTP/2 stream \
                  (RST_STREAM)",
                 "nothing to fix on the server: the client gave up on the request; stop \
-                 working on it",
+                 working on it.",
             )
             .into(),
         }
@@ -496,7 +496,7 @@ fn not_sent() -> io::Error {
     Error::new(
         Code::HttpBodyNotSent,
         "the response body cannot be sent: the client went away, or the response has no body",
-        "stop producing the body; nothing more will reach the client",
+        "stop producing the body; nothing more will reach the client.",
     )
     .into()
 }
@@ -517,4 +517,32 @@ pub(crate) fn channel() -> (BodySender, StreamBody) {
         },
         StreamBody { outlet },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fix is a sentence: the message reads "... Fix: <fix>. See <url>".
+    #[test]
+    fn every_fix_is_a_sentence() {
+        let failures = [
+            Failure::TooLarge(10),
+            Failure::Cut,
+            Failure::Abandoned,
+            Failure::Malformed,
+            Failure::Reset,
+        ];
+        for io in failures
+            .into_iter()
+            .map(Failure::into_io)
+            .chain([not_sent()])
+        {
+            let error = io
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<Error>())
+                .expect("a giong error");
+            assert!(error.fix().ends_with('.'), "{error}");
+        }
+    }
 }
