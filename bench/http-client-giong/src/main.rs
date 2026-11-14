@@ -7,7 +7,10 @@
 //! the server (16 by default, the client's own default). With CA set to a
 //! PEM file, that authority is trusted for `https` URLs, and GIONG_KTLS=auto
 //! or required hands the connections to kernel TLS after the handshake.
-//! Prints `ops=<per second> p50_us=<..> p99_us=<..> cpu=<%> ktls=<connections>`
+//! HTTP=1 speaks HTTP/1.1 only; HTTP=h2c speaks HTTP/2 to `http` URLs (prior
+//! knowledge); otherwise HTTP/2 is offered through ALPN to `https` URLs.
+//! Prints `ops=<per second> p50_us=<..> p99_us=<..> cpu=<%> ktls=<connections>
+//! version=<..>`
 //! for the measured part, after a warm-up of 2 seconds.
 
 use std::cell::{Cell, RefCell};
@@ -41,9 +44,15 @@ fn main() {
         };
         builder = builder.tls(connector.ktls(mode).unwrap());
     }
+    match std::env::var("HTTP").as_deref() {
+        Ok("1") => builder = builder.http2(false),
+        Ok("h2c") => builder = builder.http2_prior_knowledge(true),
+        _ => {}
+    }
     let client = builder.build();
 
     giong::block_on(async move {
+        let version = client.get(&url).send().await.unwrap().version().as_str();
         let measuring = Rc::new(Cell::new(false));
         let stop = Rc::new(Cell::new(false));
         let samples = Rc::new(RefCell::new(Vec::<u32>::with_capacity(1 << 22)));
@@ -88,7 +97,7 @@ fn main() {
         s.sort_unstable();
         let pct = |p: f64| s[((s.len() as f64 * p) as usize).min(s.len() - 1)];
         println!(
-            "ops={:.0} p50_us={} p99_us={} cpu={:.0} sink={} ktls={}",
+            "ops={:.0} p50_us={} p99_us={} cpu={:.0} sink={} ktls={} version={version}",
             s.len() as f64 / elapsed,
             pct(0.50),
             pct(0.99),

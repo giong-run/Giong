@@ -6,9 +6,11 @@
 //! One `reqwest::Client` shared by every task, with its default pool (no
 //! limit on connections per host; it keeps up to `usize::MAX` idle). With
 //! POOL_SIZE set, at most that many are kept idle. With CA set to a PEM
-//! file, that authority is trusted for `https` URLs.
-//! Prints `ops=<per second> p50_us=<..> p99_us=<..> cpu=<%>` for the measured
-//! part, after a warm-up of 2 seconds.
+//! file, that authority is trusted for `https` URLs. HTTP=1 speaks
+//! HTTP/1.1 only; HTTP=h2c speaks HTTP/2 to `http` URLs (prior knowledge);
+//! otherwise HTTP/2 is offered through ALPN to `https` URLs.
+//! Prints `ops=<per second> p50_us=<..> p99_us=<..> cpu=<%> version=<..>`
+//! for the measured part, after a warm-up of 2 seconds.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -40,7 +42,13 @@ fn main() {
                 .tls_built_in_root_certs(false)
                 .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap());
         }
+        match std::env::var("HTTP").as_deref() {
+            Ok("1") => builder = builder.http1_only(),
+            Ok("h2c") => builder = builder.http2_prior_knowledge(),
+            _ => {}
+        }
         let client = builder.build().unwrap();
+        let version = format!("{:?}", client.get(&url).send().await.unwrap().version());
         let measuring = Rc::new(Cell::new(false));
         let stop = Rc::new(Cell::new(false));
         let samples = Rc::new(RefCell::new(Vec::<u32>::with_capacity(1 << 22)));
@@ -86,7 +94,7 @@ fn main() {
         s.sort_unstable();
         let pct = |p: f64| s[((s.len() as f64 * p) as usize).min(s.len() - 1)];
         println!(
-            "ops={:.0} p50_us={} p99_us={} cpu={:.0} sink={}",
+            "ops={:.0} p50_us={} p99_us={} cpu={:.0} sink={} version={version}",
             s.len() as f64 / elapsed,
             pct(0.50),
             pct(0.99),

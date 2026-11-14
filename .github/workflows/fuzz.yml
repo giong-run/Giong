@@ -48,6 +48,7 @@ jobs:
           - { crate: giong-http, target: inflate }
           - { crate: giong-http, target: hpack }
           - { crate: giong-http, target: h2 }
+          - { crate: giong-http, target: h2_client }
           - { crate: giong-postgres, target: messages }
           - { crate: giong-postgres, target: scram }
           - { crate: giong-postgres, target: url }

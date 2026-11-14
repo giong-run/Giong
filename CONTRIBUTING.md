@@ -89,6 +89,9 @@ cargo +nightly fuzz run connection     # a whole connection, over an in-memory t
 cargo +nightly fuzz run response_head  # the client's response-head parser
 cargo +nightly fuzz run url            # URLs and redirect locations
 cargo +nightly fuzz run inflate        # gzip and deflate bodies
+cargo +nightly fuzz run hpack          # HTTP/2 header compression
+cargo +nightly fuzz run h2             # a whole HTTP/2 connection, the server's side
+cargo +nightly fuzz run h2_client      # the client's side of HTTP/2
 cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
 cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: url
@@ -96,8 +99,8 @@ cd ../giong-web && cargo +nightly fuzz run request         # also: routes
 ```
 
 Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's
-`src/fuzzing.rs` (in `giong-http`, `src/invariants.rs`, `src/client/mod.rs` and
-`fuzz/fuzz_targets/connection.rs`). The randomised tests (`src/fuzz_tests.rs`) run the
+`src/fuzzing.rs` (in `giong-http`, `src/invariants.rs`, `src/client/mod.rs`,
+`src/client/h2.rs` and `fuzz/fuzz_targets/connection.rs`). The randomised tests (`src/fuzz_tests.rs`) run the
 same checks on every `cargo test`. CI fuzzes every night and on pull requests that touch
 these crates. If a target finds a crash, add the input as a regression test.
 
