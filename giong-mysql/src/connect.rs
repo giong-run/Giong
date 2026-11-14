@@ -2,7 +2,7 @@
 //! authentication.
 
 use std::io;
-use std::net::Shutdown;
+use std::net::{Shutdown, SocketAddr};
 use std::ops::{Deref, Range};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::Duration;
@@ -12,10 +12,82 @@ use giong::RecvBuf;
 use giong_tls::TlsStream;
 use socket2::{SockRef, TcpKeepalive};
 
+use std::rc::Rc;
+
 use crate::auth;
 use crate::config::{Config, Host};
 use crate::error::{DbError, Error, ErrorKind};
 use crate::protocol::{self, cap, header, HandshakeResponse, MAX_PAYLOAD};
+
+/// Which server it is: MySQL (8.0 and later, and its forks), or MariaDB
+/// (10.6 and later), whose session variables and collations differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Server {
+    MySql,
+    MariaDb,
+}
+
+impl Server {
+    /// Reads the version from the greeting: the kind of server, and the
+    /// version as it should be shown (MariaDB before 11 puts `5.5.5-` in
+    /// front, for old clients). Servers too old for giong-mysql are refused.
+    fn from_version(config: &Config, version: &str) -> Result<(Server, String), Error> {
+        let (server, shown) = if version.contains("MariaDB") {
+            let shown = version.strip_prefix("5.5.5-").unwrap_or(version);
+            (Server::MariaDb, shown.to_owned())
+        } else {
+            (Server::MySql, version.to_owned())
+        };
+        let mut numbers = shown
+            .split(|c: char| !c.is_ascii_digit())
+            .map(|n| n.parse::<u32>().unwrap_or(0));
+        let major = numbers.next().unwrap_or(0);
+        let minor = numbers.next().unwrap_or(0);
+        let too_old = match server {
+            Server::MySql => major < 8,
+            Server::MariaDb => (major, minor) < (10, 6),
+        };
+        if too_old {
+            return Err(Error::new(
+                ErrorKind::Connect,
+                format!(
+                    "the server at {} is {shown}; giong-mysql works with MySQL 8.0 and later and \
+                     MariaDB 10.6 and later",
+                    config.target()
+                ),
+            ));
+        }
+        Ok((server, shown))
+    }
+
+    /// The collation the handshake asks for: one the server knows.
+    fn handshake_collation(self) -> u8 {
+        match self {
+            Server::MySql => protocol::UTF8MB4_0900_AI_CI,
+            Server::MariaDb => protocol::UTF8MB4_GENERAL_CI,
+        }
+    }
+
+    /// What is read from the server after the session is set up: the
+    /// character set it really uses, whether a lock wait timeout rolls back
+    /// the whole transaction, and which server it is (for
+    /// [`kill_query`]).
+    fn facts_sql(self) -> &'static str {
+        match self {
+            Server::MySql => {
+                "SELECT @@character_set_client, @@character_set_connection, \
+                 @@character_set_results, @@innodb_rollback_on_timeout, @@server_uuid"
+            }
+            // MariaDB has no server_uuid (measured on 10.11); host name,
+            // port and server id tell its servers apart.
+            Server::MariaDb => {
+                "SELECT @@character_set_client, @@character_set_connection, \
+                 @@character_set_results, @@innodb_rollback_on_timeout, \
+                 CONCAT(@@hostname, ':', @@port, ':', @@server_id)"
+            }
+        }
+    }
+}
 
 /// A dead peer is noticed after about a minute: keepalive probes start after
 /// 30 s of silence and give up after three more 10 s apart, and data the
@@ -33,6 +105,9 @@ pub(crate) enum Stream {
     Tcp(TcpStream),
     Unix(UnixStream),
     Tls(Box<TlsStream>),
+    /// A server played from bytes, for the fuzz targets and the tests.
+    #[cfg(any(test, fuzzing))]
+    Memory(crate::fuzzing::Memory),
 }
 
 /// Received bytes, from whichever socket.
@@ -58,6 +133,8 @@ impl Stream {
             Stream::Tcp(s) => s.recv().await.map(Chunk::Pooled),
             Stream::Unix(s) => s.recv().await.map(Chunk::Pooled),
             Stream::Tls(s) => s.recv().await.map(Chunk::Owned),
+            #[cfg(any(test, fuzzing))]
+            Stream::Memory(s) => s.recv().await.map(Chunk::Owned),
         }
     }
 
@@ -66,6 +143,8 @@ impl Stream {
             Stream::Tcp(s) => s.write_all(buf).await,
             Stream::Unix(s) => s.write_all(buf).await,
             Stream::Tls(s) => s.write_all(buf).await,
+            #[cfg(any(test, fuzzing))]
+            Stream::Memory(s) => s.write_all(buf).await,
         }
     }
 
@@ -76,6 +155,11 @@ impl Stream {
             Stream::Tcp(s) => s.shutdown(how),
             Stream::Unix(s) => s.shutdown(how),
             Stream::Tls(s) => s.tcp().shutdown(how),
+            #[cfg(any(test, fuzzing))]
+            Stream::Memory(s) => {
+                s.shutdown(how);
+                Ok(())
+            }
         };
     }
 
@@ -141,6 +225,11 @@ impl ReadBuf {
         if self.start == self.data.len() {
             self.data.clear();
             self.start = 0;
+            // A large row once must not keep every pooled connection holding
+            // a buffer its size.
+            if self.data.capacity() > crate::client::KEEP_CAPACITY && chunk.len() < 8192 {
+                self.data = Vec::with_capacity(8192);
+            }
         } else if self.start > 0 && self.start >= self.data.len() / 2 {
             self.data.drain(..self.start);
             self.start = 0;
@@ -247,6 +336,24 @@ pub(crate) struct Startup {
     pub connection_id: u32,
     pub server_version: String,
     pub status: u16,
+    /// The `SET` that set the session up, run again after a reset.
+    pub session_sql: Rc<str>,
+    /// Who to ask to cancel this connection's statements.
+    pub identity: Identity,
+    /// `innodb_rollback_on_timeout`: a lock wait timeout (1205) rolls back
+    /// the whole transaction, not only the statement.
+    pub rollback_on_timeout: bool,
+}
+
+/// Where a connection went, so that [`kill_query`] reaches the same server
+/// and makes sure of it before killing anything.
+#[derive(Clone, Debug)]
+pub(crate) struct Identity {
+    /// The address the connection reached, for TCP; a name the
+    /// configuration gives can resolve to another server next time.
+    pub peer: Option<SocketAddr>,
+    /// `@@server_uuid` on MySQL; host name, port and server id on MariaDB.
+    pub server_id: String,
 }
 
 fn connect_error(config: &Config, message: impl std::fmt::Display, e: io::Error) -> Error {
@@ -270,7 +377,11 @@ fn tune(tcp: &TcpStream) -> io::Result<()> {
             .with_interval(KEEPALIVE_INTERVAL)
             .with_retries(KEEPALIVE_RETRIES),
     )?;
-    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))
+    // Only Linux and its relatives have TCP_USER_TIMEOUT; elsewhere the
+    // keepalive probes alone notice a vanished server.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))?;
+    Ok(())
 }
 
 /// A connection being set up: the stream, what was read, and the sequence
@@ -328,6 +439,60 @@ impl Setup {
         Ok(())
     }
 
+    /// Reads the answer to a text query (`COM_QUERY`) that returns one row,
+    /// as text; `None` for each `NULL`.
+    async fn text_row(&mut self, what: &str) -> Result<Vec<Option<String>>, Error> {
+        let first = self.read().await?;
+        if first.first() == Some(&0xFF) {
+            return Err(Error::from_db(
+                DbError::parse(&first)?,
+                Some(what.to_owned()),
+            ));
+        }
+        let columns = protocol::Reader::new(&first).lenenc("a column count")?;
+        if columns == 0 || columns > 64 {
+            return Err(Error::protocol(format!(
+                "the server answered {what} with no row"
+            )));
+        }
+        for _ in 0..columns {
+            self.read().await?;
+        }
+        let mut row = None;
+        loop {
+            let packet = self.read().await?;
+            match packet.first() {
+                Some(0xFF) => {
+                    return Err(Error::from_db(
+                        DbError::parse(&packet)?,
+                        Some(what.to_owned()),
+                    ))
+                }
+                _ if protocol::is_end_of_rows(&packet) => break,
+                _ if row.is_some() => {
+                    return Err(Error::protocol(format!(
+                        "the server answered {what} with more than one row"
+                    )))
+                }
+                _ => {
+                    let mut r = protocol::Reader::new(&packet);
+                    let mut values = Vec::new();
+                    for _ in 0..columns {
+                        if r.rest().first() == Some(&0xFB) {
+                            r.u8(what)?;
+                            values.push(None);
+                        } else {
+                            let v = r.lenenc_bytes(what)?;
+                            values.push(Some(String::from_utf8_lossy(v).into_owned()));
+                        }
+                    }
+                    row = Some(values);
+                }
+            }
+        }
+        row.ok_or_else(|| Error::protocol(format!("the server answered {what} with no row")))
+    }
+
     /// Sends one packet with the next sequence number.
     async fn send(&mut self, body: impl FnOnce(&mut Vec<u8>)) -> Result<(), Error> {
         let mut out = Vec::new();
@@ -372,8 +537,8 @@ fn startup_error(config: &Config, payload: &[u8]) -> Error {
 async fn open(
     config: &Config,
     capabilities: u32,
-) -> Result<(Setup, protocol::Handshake, u32), Error> {
-    let (stream, tls) = match &config.host {
+) -> Result<(Setup, protocol::Handshake, u32, Server, Option<SocketAddr>), Error> {
+    let (stream, tls, peer) = match &config.host {
         Host::Unix(path) => {
             let stream = UnixStream::connect(path).await.map_err(|e| {
                 connect_error(
@@ -382,7 +547,7 @@ async fn open(
                     e,
                 )
             })?;
-            (Stream::Unix(stream), None)
+            (Stream::Unix(stream), None, None)
         }
         Host::Tcp(host) => {
             let tls = config.tls_connector()?;
@@ -390,7 +555,9 @@ async fn open(
                 .await
                 .map_err(|e| connect_error(config, "is the server running and reachable?", e))?;
             tune(&tcp).map_err(|e| connect_error(config, "cannot set socket options", e))?;
-            (Stream::Tcp(tcp), tls.map(|c| (c, host.clone())))
+            let peer = tcp.peer_addr().ok();
+            let name = config.tls_name.clone().unwrap_or_else(|| host.clone());
+            (Stream::Tcp(tcp), tls.map(|c| (c, name)), peer)
         }
     };
     let mut setup = Setup {
@@ -402,14 +569,17 @@ async fn open(
     if greeting.first() == Some(&0xFF) {
         return Err(startup_error(config, &greeting));
     }
-    let hello = protocol::handshake(&greeting)?;
+    let mut hello = protocol::handshake(&greeting)?;
+    let (server, version) = Server::from_version(config, &hello.server_version)?;
+    hello.server_version = version;
     let missing = protocol::REQUIRED & !hello.capabilities;
     if missing != 0 {
         return Err(Error::new(
             ErrorKind::Connect,
             format!(
                 "the server at {} ({}) lacks protocol features giong-mysql needs (capability \
-                 bits 0x{missing:08X}); it works with MySQL 8.0 and later",
+                 bits 0x{missing:08X}); it works with MySQL 8.0 and later and MariaDB 10.6 and \
+                 later",
                 config.target(),
                 hello.server_version
             ),
@@ -422,7 +592,7 @@ async fn open(
         caps |= cap::CONNECT_WITH_DB;
     }
     let Some((connector, host)) = tls else {
-        return Ok((setup, hello, caps));
+        return Ok((setup, hello, caps, server, peer));
     };
     if hello.capabilities & cap::SSL == 0 {
         return Err(Error::new(
@@ -445,7 +615,7 @@ async fn open(
         ));
     }
     let mut out = Vec::new();
-    protocol::ssl_request(&mut out, caps);
+    protocol::ssl_request(&mut out, caps, server.handshake_collation());
     setup.seq = 2;
     setup.write(out).await?;
     let Stream::Tcp(tcp) = setup.stream else {
@@ -456,7 +626,7 @@ async fn open(
         .await
         .map_err(|e| connect_error(config, format!("the TLS handshake with {host} failed"), e))?;
     setup.stream = Stream::Tls(Box::new(tls));
-    Ok((setup, hello, caps))
+    Ok((setup, hello, caps, server, peer))
 }
 
 /// What to answer for an authentication plugin's first request.
@@ -474,6 +644,7 @@ async fn authenticate(
     setup: &mut Setup,
     hello: &protocol::Handshake,
     caps: u32,
+    server: Server,
 ) -> Result<(), Error> {
     let user = config.user.as_deref().ok_or_else(|| {
         Error::config(
@@ -496,13 +667,14 @@ async fn authenticate(
     let mut attrs = vec![
         ("_client_name", "giong-mysql"),
         ("_client_version", version),
-        ("_os", "Linux"),
+        ("_os", std::env::consts::OS),
     ];
     if let Some(app) = &config.application_name {
         attrs.push(("program_name", app));
     }
     let request = HandshakeResponse {
         capabilities: caps,
+        collation: server.handshake_collation(),
         user,
         auth: &response,
         database: config.database.as_deref(),
@@ -612,14 +784,19 @@ async fn authenticate(
 
 /// Opens a connection, logs in and sets up the session.
 async fn startup(config: &Config) -> Result<Startup, Error> {
-    let (mut setup, hello, caps) = open(config, protocol::REQUIRED | protocol::WANTED).await?;
-    authenticate(config, &mut setup, &hello, caps).await?;
+    let (mut setup, hello, caps, server, peer) =
+        open(config, protocol::REQUIRED | protocol::WANTED).await?;
+    authenticate(config, &mut setup, &hello, caps, server).await?;
 
-    // The session: UTC, the statement timeout and the caller's variables.
-    let sql = config.session_sql()?;
+    // The session (the character set, UTC, the time limits and the
+    // caller's variables), then what the server makes of it, in one round
+    // trip.
+    let sql = config.session_sql(server)?;
     let mut out = Vec::new();
-    setup.seq = protocol::command_text(&mut out, protocol::com::QUERY, &sql);
+    protocol::command_text(&mut out, protocol::com::QUERY, &sql);
+    protocol::command_text(&mut out, protocol::com::QUERY, server.facts_sql());
     setup.write(out).await?;
+    setup.seq = 1;
     let answer = setup.read().await?;
     let status = match answer.first() {
         Some(0x00) => protocol::ok(&answer)?.status,
@@ -637,12 +814,36 @@ async fn startup(config: &Config) -> Result<Startup, Error> {
             ))
         }
     };
+    setup.seq = 1;
+    let facts = setup.text_row("the session check").await?;
+    let fact = |i: usize| facts.get(i).cloned().flatten().unwrap_or_default();
+    // A proxy between the two can still undo SET NAMES; text would then be
+    // stored in another character set without any error.
+    let charsets = [fact(0), fact(1), fact(2)];
+    if charsets.iter().any(|c| c != "utf8mb4") {
+        return Err(Error::new(
+            ErrorKind::Connect,
+            format!(
+                "the server at {} uses the character sets {charsets:?} for this connection (client, \
+                 connection, results) after SET NAMES utf8mb4; giong-mysql sends and reads \
+                 UTF-8, which would be stored converted. Look for a proxy that changes the \
+                 character set",
+                config.target()
+            ),
+        ));
+    }
     Ok(Startup {
         stream: setup.stream,
         buf: setup.buf,
         connection_id: hello.connection_id,
         server_version: hello.server_version,
         status,
+        session_sql: sql.into(),
+        identity: Identity {
+            peer,
+            server_id: fact(4),
+        },
+        rollback_on_timeout: fact(3) == "1",
     })
 }
 
@@ -664,9 +865,34 @@ pub(crate) async fn connect(config: &Config) -> Result<Startup, Error> {
 
 /// Asks the server, over a connection of its own, to stop the statement
 /// that connection `id` is running.
-pub(crate) async fn kill_query(config: &Config, id: u32) -> Result<(), Error> {
+///
+/// Connection ids are unique only within one server. Behind DNS round
+/// robin or a load balancer, a new connection to the same name can reach
+/// another server, where `id` belongs to some other session: the new
+/// connection goes to the address the first one reached, and `KILL` is sent
+/// only if the server there is the same one.
+pub(crate) async fn kill_query(config: &Config, identity: &Identity, id: u32) -> Result<(), Error> {
     let attempt = async {
+        let mut config = config.clone();
+        if let (Some(peer), Host::Tcp(name)) = (identity.peer, &config.host) {
+            config.tls_name = Some(name.clone());
+            config.host = Host::Tcp(peer.ip().to_string());
+            config.port = peer.port();
+        }
+        let config = &config;
         let startup = startup(config).await?;
+        if startup.identity.server_id != identity.server_id {
+            return Err(Error::new(
+                ErrorKind::Connect,
+                format!(
+                    "the cancel request reached a different server ({}) than the connection it is \
+                     for ({}), as can happen behind a load balancer; KILL QUERY was not sent, since \
+                     connection {id} there is someone else's. Cancel by dropping the statement's \
+                     future and closing its connection instead",
+                    startup.identity.server_id, identity.server_id
+                ),
+            ));
+        }
         let mut setup = Setup {
             stream: startup.stream,
             buf: startup.buf,
@@ -711,6 +937,56 @@ pub(crate) async fn kill_query(config: &Config, id: u32) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servers_are_told_apart_and_old_ones_refused_by_version() {
+        let config = Config::new().host("db").user("u");
+        let server = |v: &str| Server::from_version(&config, v);
+        let (s, shown) = server("8.0.46-0ubuntu0.24.04.5").unwrap();
+        assert_eq!(
+            (s, shown.as_str()),
+            (Server::MySql, "8.0.46-0ubuntu0.24.04.5")
+        );
+        assert_eq!(server("9.1.0").unwrap().0, Server::MySql);
+        // MariaDB 10 puts 5.5.5- in front, for old clients; 11 does not.
+        let (s, shown) = server("5.5.5-10.11.14-MariaDB-0ubuntu0.24.04.1").unwrap();
+        assert_eq!(
+            (s, shown.as_str()),
+            (Server::MariaDb, "10.11.14-MariaDB-0ubuntu0.24.04.1")
+        );
+        assert_eq!(server("5.5.5-10.6.20-MariaDB").unwrap().0, Server::MariaDb);
+        assert_eq!(server("11.4.4-MariaDB-ubu2404").unwrap().0, Server::MariaDb);
+        for old in [
+            "5.7.44-log",
+            "5.6.51",
+            "5.5.5-10.5.27-MariaDB",
+            "10.4.34-MariaDB",
+            "",
+        ] {
+            let e = server(old).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Connect, "{old}");
+            assert!(e.to_string().contains("MariaDB 10.6 and later"), "{e}");
+        }
+        assert_eq!(Server::MariaDb.handshake_collation(), 45);
+        assert_eq!(Server::MySql.handshake_collation(), 255);
+    }
+
+    #[test]
+    fn a_large_message_does_not_leave_a_large_buffer_behind() {
+        let mut buf = ReadBuf::new();
+        buf.extend(&packet(1, &vec![7; 2 << 20]));
+        let Some(Message::Here { payload, .. }) = buf.next(usize::MAX) else {
+            panic!()
+        };
+        buf.consume(&payload);
+        assert!(buf.data.capacity() > crate::client::KEEP_CAPACITY);
+        buf.extend(&packet(2, b"small"));
+        assert!(buf.data.capacity() < 64 * 1024, "{}", buf.data.capacity());
+        let Some(Message::Here { seq, payload }) = buf.next(100) else {
+            panic!()
+        };
+        assert_eq!((seq, buf.bytes(payload)), (2, &b"small"[..]));
+    }
 
     fn packet(seq: u8, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();

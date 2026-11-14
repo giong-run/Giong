@@ -405,7 +405,8 @@ async fn prepared(client: &Client) -> i64 {
     client
         .query_one(
             "SELECT COUNT(*) FROM performance_schema.prepared_statements_instances \
-             WHERE OWNER_THREAD_ID = PS_CURRENT_THREAD_ID()",
+             WHERE OWNER_THREAD_ID = (SELECT THREAD_ID FROM performance_schema.threads \
+             WHERE PROCESSLIST_ID = CONNECTION_ID())",
             &[],
         )
         .await
@@ -522,14 +523,11 @@ const SLOW_SELECT: &str = "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i 
 #[test]
 fn the_statement_timeout_is_enforced_by_the_server() {
     run(|s| async move {
-        let config = s
-            .local()
-            .statement_timeout(Duration::from_millis(100))
-            .session_variable("cte_max_recursion_depth", "4294967295");
+        let config = s.deep_recursion(s.local().statement_timeout(Duration::from_millis(100)));
         let client = Client::connect(&config).await.unwrap();
         let started = std::time::Instant::now();
         let e = client.query(SLOW_SELECT, &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some(3024), "{e}");
+        assert_eq!(e.code(), Some(s.timeout_code()), "{e}");
         assert!(e.to_string().contains("Config::statement_timeout"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(
@@ -547,14 +545,7 @@ fn the_statement_timeout_is_enforced_by_the_server() {
 #[test]
 fn a_cancel_request_stops_the_running_statement() {
     run(|s| async move {
-        let client = Rc::new(
-            Client::connect(
-                &s.local()
-                    .session_variable("cte_max_recursion_depth", "4294967295"),
-            )
-            .await
-            .unwrap(),
-        );
+        let client = Rc::new(Client::connect(&s.deep_recursion(s.local())).await.unwrap());
         let token = client.cancel_token();
         let slow = giong::spawn({
             let client = client.clone();
@@ -668,9 +659,17 @@ fn session_variables_are_set_when_connecting() {
             .session_variable("sql_mode", "'STRICT_ALL_TABLES'")
             .session_variable("group_concat_max_len", "4096");
         let client = Client::connect(&config).await.unwrap();
+        let timeout = if s.mariadb {
+            "@@max_statement_time * 1000"
+        } else {
+            "@@max_execution_time"
+        };
         let row = client
             .query_one(
-                "SELECT @@sql_mode, @@group_concat_max_len, @@max_execution_time",
+                &format!(
+                    "SELECT @@sql_mode, @@group_concat_max_len, CAST({timeout} AS UNSIGNED), \
+                     @@lock_wait_timeout"
+                ),
                 &[],
             )
             .await
@@ -678,6 +677,8 @@ fn session_variables_are_set_when_connecting() {
         assert_eq!(row.get::<&str>(0).unwrap(), "STRICT_ALL_TABLES");
         assert_eq!(row.get::<u64>(1).unwrap(), 4096);
         assert_eq!(row.get::<u64>(2).unwrap(), 30_000, "the statement timeout");
+        // Metadata lock waits are bounded by it too (one year by default).
+        assert_eq!(row.get::<u64>(3).unwrap(), 30);
     });
 }
 
@@ -747,7 +748,7 @@ fn a_transaction_the_server_committed_cannot_go_on_silently() {
             "{e}"
         );
         let e = tx.commit().await.unwrap_err();
-        assert!(e.to_string().contains("commit it"), "{e}");
+        assert!(e.to_string().contains("made it commit"), "{e}");
         // Only the row before the DDL is there, and the client works again.
         assert_eq!(count(&client, "ddl_tx").await, 1);
     });
@@ -787,7 +788,11 @@ fn a_deadlock_ends_the_transaction_and_says_to_retry() {
             .execute("UPDATE deadlock SET v = 9 WHERE id = 1", &[])
             .await
             .unwrap_err();
-        assert!(e.to_string().contains("rolled back by the server"), "{e}");
+        assert!(
+            e.to_string()
+                .contains("server rolled this transaction back"),
+            "{e}"
+        );
         assert!(loser.commit().await.is_err());
         winner.commit().await.unwrap();
         let rows = a
@@ -859,5 +864,118 @@ fn tls_and_tcp_connections_behave_the_same() {
         for (i, t) in tasks.into_iter().enumerate() {
             assert_eq!(t.await.unwrap(), i as i64);
         }
+    });
+}
+
+#[test]
+fn a_lock_wait_timeout_leaves_the_transaction_open_where_the_server_does() {
+    run(|s| async move {
+        // innodb_rollback_on_timeout is off (the default): the timeout undoes
+        // the statement only, and the transaction goes on.
+        let config = s.local().session_variable("innodb_lock_wait_timeout", "1");
+        let mut a = Client::connect(&config).await.unwrap();
+        let mut b = Client::connect(&config).await.unwrap();
+        table(&a, "lock_wait", "id INT PRIMARY KEY").await;
+        a.execute("INSERT INTO lock_wait VALUES (1)", &[])
+            .await
+            .unwrap();
+        let tx_a = a.transaction().await.unwrap();
+        tx_a.query("SELECT id FROM lock_wait WHERE id = 1 FOR UPDATE", &[])
+            .await
+            .unwrap();
+        let tx_b = b.transaction().await.unwrap();
+        tx_b.execute("INSERT INTO lock_wait VALUES (10)", &[])
+            .await
+            .unwrap();
+        let e = tx_b
+            .execute("UPDATE lock_wait SET id = 2 WHERE id = 1", &[])
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), Some(1205), "{e}");
+        tx_b.execute("INSERT INTO lock_wait VALUES (11)", &[])
+            .await
+            .unwrap();
+        tx_a.rollback().await.unwrap();
+        tx_b.commit().await.unwrap();
+        let ids: Vec<i64> = a
+            .query("SELECT id FROM lock_wait ORDER BY id", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0).unwrap())
+            .collect();
+        assert_eq!(ids, [1, 10, 11]);
+    });
+}
+
+#[test]
+fn a_write_waiting_for_a_table_lock_is_bounded_by_the_statement_timeout() {
+    run(|s| async move {
+        let holder = connect(s).await;
+        table(&holder, "table_lock", "id INT").await;
+        holder
+            .batch_execute("LOCK TABLES table_lock WRITE")
+            .await
+            .unwrap();
+        let client = Client::connect(&s.local().statement_timeout(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let e = timeout(
+            Duration::from_secs(10),
+            client.execute("INSERT INTO table_lock VALUES (1)", &[]),
+        )
+        .await
+        .expect("the server stops the wait")
+        .unwrap_err();
+        // lock_wait_timeout; on MariaDB, max_statement_time covers writes
+        // too and may come first.
+        assert!(
+            e.code() == Some(1205) || (s.mariadb && e.code() == Some(1969)),
+            "{e}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        holder.batch_execute("UNLOCK TABLES").await.unwrap();
+        client
+            .execute("INSERT INTO table_lock VALUES (1)", &[])
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
+    run(|s| async move {
+        let mut client = connect(s).await;
+        table(&client, "given_up", "id INT").await;
+        let tx = client.transaction().await.unwrap();
+        tx.execute("INSERT INTO given_up VALUES (1)", &[])
+            .await
+            .unwrap();
+        // It still runs on the server, after the caller stopped waiting.
+        let late = timeout(
+            Duration::from_millis(20),
+            tx.execute("INSERT INTO given_up SELECT SLEEP(0.2) + 2", &[]),
+        )
+        .await;
+        assert!(late.is_err());
+        let e = tx.commit().await.unwrap_err();
+        assert!(e.to_string().contains("given up"), "{e}");
+        assert_eq!(count(&client, "given_up").await, 0, "rolled back");
+    });
+}
+
+#[test]
+fn execute_keeps_no_rows_so_their_size_does_not_matter() {
+    run(|s| async move {
+        let client = Client::connect(&s.local().max_result_size(1000))
+            .await
+            .unwrap();
+        // A row larger than any limit is thrown away as it arrives.
+        let sql = "SELECT REPEAT('x', 2 * 1024 * 1024)";
+        assert_eq!(client.execute(sql, &[]).await.unwrap(), 1);
+        let e = client.query(sql, &[]).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::TooLarge, "{e}");
+        assert_eq!(client.execute(sql, &[]).await.unwrap(), 1);
     });
 }

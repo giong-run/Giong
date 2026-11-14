@@ -464,6 +464,9 @@ fn malformed_responses_are_errors_and_their_connection_is_dropped() {
                 "/not-http" => b"SSH-2.0-OpenSSH_9.6\r\n\r\n",
                 "/gzip" => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
                 "/bad-chunk" => b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+                "/bad-trailer" => {
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nno colon\rbare CR\r\n\r\n"
+                }
                 "/switch" => b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n",
                 "/cut" => b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort",
                 _ => b"",
@@ -483,6 +486,11 @@ fn malformed_responses_are_errors_and_their_connection_is_dropped() {
             ("/gzip", ErrorKind::Protocol, "does not decode"),
             (
                 "/bad-chunk",
+                ErrorKind::Protocol,
+                "chunked body is malformed",
+            ),
+            (
+                "/bad-trailer",
                 ErrorKind::Protocol,
                 "chunked body is malformed",
             ),
