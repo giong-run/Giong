@@ -167,8 +167,10 @@ Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 **Types:** `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`, `ci`, `chore`.
 
-**Scopes:** `runtime`, `executor`, `driver`, `net`, `fs`, `time`, `sync`, `buf`,
-`http`, `tls`, `examples`, `bench`. Leave the scope out when a change spans several.
+**Scopes:** the runtime's parts (`runtime`, `executor`, `driver`, `net`, `fs`, `time`,
+`sync`, `buf`), a companion crate by its name without `giong-` (`http`, `tls`, `web`,
+`postgres`, `mysql`, `redis`, `mcp`, `compat`), and `examples`, `bench`, `site`,
+`release`. Leave the scope out when a change spans several.
 
 Examples:
 

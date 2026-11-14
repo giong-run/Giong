@@ -28,6 +28,7 @@ __pycache__/
 site/public/*.html
 site/public/*/index.html
 site/public/llms.txt
+site/public/llms-full.txt
 site/public/robots.txt
 site/public/sitemap.xml
 

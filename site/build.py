@@ -23,6 +23,7 @@ import html
 import json
 import math
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -55,6 +56,31 @@ def read(rel):
 VERSION = release.workspace_version()
 TAG = "v" + VERSION
 MINOR = ".".join(VERSION.split(".")[:2])
+# The documentation as released: what `cargo add` installs is what the tag
+# holds, while main may already describe the next version.
+REL_BLOB = f"{REPO}/blob/{TAG}/"
+REL_TREE = f"{REPO}/tree/{TAG}/"
+
+
+def git(*args):
+    try:
+        return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+# A shallow clone has no tags: then the working tree stands in for the tag,
+# and the build says so. The deploy job fetches the tags.
+TAG_HERE = git("rev-parse", "--verify", "--quiet", TAG + "^{commit}") is not None
+
+
+def released(path):
+    """`path` as the release tag has it, or None if it has no such file."""
+    if TAG_HERE:
+        out = git("show", f"{TAG}:{path}")
+        return None if out is None else out.decode("utf-8")
+    f = ROOT / path
+    return f.read_text(encoding="utf-8") if f.is_file() else None
 CRATE_DIRS = release.workspace_crates()          # {name: dir}, in dependency order
 
 
@@ -999,16 +1025,36 @@ def sitemap():
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + urls + '</urlset>\n')
 
 
+def released_crates():
+    """The crates the release has, in dependency order, with their directory."""
+    return [(c, d) for c, d in ((c["name"], CRATE_DIRS[c["name"]]) for c in CRATES)
+            if released(release.manifest(d)) is not None]
+
+
 def llms():
     """llms.txt (https://llmstxt.org): where a language model finds the docs."""
-    api = "".join(f"- [{c['name']} API](https://docs.rs/{c['name']}): {c['description']}\n" for c in CRATES)
-    examples = "".join(f"- [examples/{name}.rs]({BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
-                       for name, desc, _, _ in C.EXAMPLES)
+    crates = released_crates()
+    names = {name for name, _ in crates}
+    def description(d):
+        pkg = release.section(released(release.manifest(d)), "package") or ""
+        m = re.search(r'^description\s*=\s*"([^"]*)"', pkg, re.M)
+        return m.group(1) if m else ""
+    api = "".join(f"- [{name} API](https://docs.rs/{name}/{VERSION}): {description(d)}\n"
+                  for name, d in crates)
+    readmes = "".join(f"- [{name} README]({REL_BLOB}{'' if d == '.' else d + '/'}README.md)\n"
+                      for name, d in crates if d != ".")
+    examples = "".join(f"- [examples/{name}.rs]({REL_BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
+                       for name, desc, _, _ in C.EXAMPLES if released(f"examples/{name}.rs") is not None)
+    mcp = ("- To let an agent look inside a running service (which task blocks a worker, which line\n"
+           "  spawned the tasks that leak, how full the pools are), add giong-mcp and call\n"
+           "  `giong_mcp::start_from_env` with the runtime's handle: it serves MCP on the address\n"
+           "  in `GIONG_MCP`. Its README says how to connect a client.\n") if "giong-mcp" in names else ""
     return f"""# giong
 
 > A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
 > worker owns its ring, tasks and buffers; tasks never move between threads, so futures
-> need not be `Send`. Version {VERSION}.
+> need not be `Send`. Version {VERSION}; every link below is to the documentation of that
+> release, which is what `cargo add` installs.
 
 Facts that are easy to get wrong:
 
@@ -1025,26 +1071,67 @@ Facts that are easy to get wrong:
 - giong-web: build the `Router` inside each worker's future (`run(|_| async {{ .. }})`), since
   an `App` is not `Send`. A handler is `async fn(Req<S>) -> Result<Response, Error>`; `?` on
   any other error answers `500` and logs the cause, never sending it.
-- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
+{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs
 
 {api}- [Get started]({SITE}docs/): requirements, a first server, examples, limits
-- [README]({BLOB}README.md): design, benchmarks with their method, limitations
-- [AGENTS.md]({BLOB}AGENTS.md): how to build, test and change giong, for coding agents
-- [Error codes]({BLOB}docs/errors/README.md): what each `GIONG-E` code means and how to fix it
-- [CONTRIBUTING.md]({BLOB}CONTRIBUTING.md): the rules every change follows
-- [ROADMAP.md]({BLOB}ROADMAP.md): milestones and deliberate non-goals
-- [CHANGELOG.md]({BLOB}CHANGELOG.md): what changed in each release
+- [README]({REL_BLOB}README.md): design, benchmarks with their method, limitations
+{readmes}- [Error codes]({REL_BLOB}docs/errors/README.md): what each `GIONG-E` code means and how to fix it
+- [Deployment]({REL_BLOB}docs/DEPLOYMENT.md): io_uring in containers, limits, kernels
+- [CHANGELOG.md]({REL_BLOB}CHANGELOG.md): what changed in each release
+- [Everything above in one file]({SITE}llms-full.txt): the READMEs and error pages of {TAG}
 
 ## Examples
 
 {examples}
 ## Optional
 
-- [Benchmark results]({TREE}bench/results): raw numbers behind the README
-- [giong-http README]({BLOB}giong-http/README.md), [giong-web README]({BLOB}giong-web/README.md)
+- [Benchmark results]({REL_TREE}bench/results): raw numbers behind the README
+- [ROADMAP.md]({BLOB}ROADMAP.md): milestones and deliberate non-goals
+- [AGENTS.md]({BLOB}AGENTS.md) and [CONTRIBUTING.md]({BLOB}CONTRIBUTING.md): how to build,
+  test and change giong itself, on its main branch
 """
+
+
+def absolute_links(text, src_dir):
+    """Markdown links and images relative to `src_dir`, made absolute at the tag."""
+    def fix(m):
+        url = m.group(2)
+        if re.match(r"^[a-z]+:", url) or url.startswith("#"):
+            return m.group(0)
+        path = (Path(src_dir) / url).as_posix() if src_dir not in ("", ".") else url
+        path = re.sub(r"(^|/)\./", r"\1", path)
+        while "/../" in path or path.startswith("../"):
+            new = re.sub(r"[^/]+/\.\./", "", path, count=1)
+            if new == path:
+                break
+            path = new
+        return f"{m.group(1)}({(REL_TREE if path.endswith('/') else REL_BLOB) + path})"
+    return re.sub(r"(\]\s?)\(([^)\s]+)\)", fix, text)
+
+
+def llms_full():
+    """llms-full.txt: every crate's README, the deployment notes and every error page
+    of the release, in one file, for a model that reads it whole."""
+    docs = [("README.md", ".")]
+    docs += [(f"{d}/README.md", d) for _, d in released_crates() if d != "."]
+    docs += [("docs/DEPLOYMENT.md", "docs"), ("docs/errors/README.md", "docs/errors")]
+    index = released("docs/errors/README.md") or ""
+    docs += [(f"docs/errors/{page}", "docs/errors")
+             for page in dict.fromkeys(re.findall(r"\]\((E\d{4}\.md)\)", index))]
+    parts = [f"""# giong {VERSION}: the documentation in one file
+
+> The README of every crate, the deployment notes and every error code page of giong
+> {VERSION}, as released in {TAG}. Links point at the same release. The short index is
+> {SITE}llms.txt.
+"""]
+    for path, d in docs:
+        text = released(path)
+        if text is None:
+            continue
+        parts.append(f"\n---\n\n<!-- {REL_BLOB}{path} -->\n\n{absolute_links(text.strip(), d)}\n")
+    return "".join(parts)
 
 
 def check_links(out, files):
@@ -1087,6 +1174,7 @@ def build(out):
         "sitemap.xml": sitemap(),
         "robots.txt": f"User-agent: *\nAllow: /\nSitemap: {SITE}sitemap.xml\n",
         "llms.txt": llms(),
+        "llms-full.txt": llms_full(),
     }
     for name, text in files.items():
         (out / name).parent.mkdir(parents=True, exist_ok=True)
@@ -1097,6 +1185,9 @@ def build(out):
         print("note: no entry in content.py CRATES for " + ", ".join(missing)
               + "; the site shows their Cargo.toml description", file=sys.stderr)
     print(f"wrote {len(files)} files to {out}")
+    if not TAG_HERE:
+        print(f"note: {TAG} is not in this checkout, so llms.txt and llms-full.txt were made "
+              "from the working tree; the deploy job fetches the tags", file=sys.stderr)
     problems = check_links(out, files)
     if problems:
         sys.exit("broken links on the site:\n  " + "\n  ".join(problems))

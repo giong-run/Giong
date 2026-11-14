@@ -26,7 +26,12 @@ site/
 | Roadmap | `/roadmap/` | `ROADMAP.md` |
 | Releases | `/releases/` | `CHANGELOG.md` |
 
-`llms.txt`, `sitemap.xml`, `robots.txt` and `404.html` are generated too.
+`llms.txt`, `llms-full.txt`, `sitemap.xml`, `robots.txt` and `404.html` are generated too.
+`llms.txt` and `llms-full.txt` are for language models, so they describe the release that
+`cargo add` installs, not `main`: their links point at the release tag (`blob/vX.Y.Z/`),
+and `llms-full.txt` (every crate's README, `docs/DEPLOYMENT.md` and every error page in one
+file) is read from the tag with `git show`. A checkout without the tag, such as CI's
+shallow one, uses the working tree instead and says so; the deploy job fetches the tags.
 
 ## What updates by itself
 
