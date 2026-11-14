@@ -49,6 +49,13 @@
 //! status, a stable code and a detail; anything else becomes a `500` whose
 //! cause goes to the log and never to the client.
 //!
+//! A handler or a middleware that panics is answered the same way: a `500`
+//! (`GIONG-E1210`) whose logged cause is the panic's message, with the
+//! request id and the log line of any other error. One request fails, not
+//! the connection it came on (nor, over HTTP/2, the other requests on that
+//! connection). A program built with `panic = "abort"` still stops at the
+//! first panic.
+//!
 //! ## Errors that explain themselves
 //!
 //! Every error response is a JSON problem-details body with a stable `code`.

@@ -74,6 +74,7 @@ fn main() -> std::io::Result<()> {
 ## What it does
 
 - **One way to write a handler.** `async fn(Req<S>) -> Result<Response, Error>`, where `S` is the state given to `build`. `?` works on any error type: what the client should know is an `Error` with a status, a code and a detail; anything else becomes a `500` whose cause goes to the log and never to the client.
+- **A panic fails one request, not the connection.** A handler or middleware that panics is answered with a `500` (`GIONG-E1210`) whose logged cause is the panic's message, with the request id and the log line of any other error; the connection, and over HTTP/2 every other request on it, carries on. (With `panic = "abort"` the process still stops.)
 - **Typed parameters.** `req.param::<u64>("id")?` and `req.query_param::<u32>("page")?` parse into any `FromStr` type. A value that does not parse is a `400` naming the parameter, the value and the type expected. With `serde`, `req.query::<T>()` reads the whole query string into a struct and `req.json::<T>()` the body.
 - **Routing that answers what it can for you.** Patterns with parameters (`/users/{id}`) and a catch-all (`/files/{*path}`). A literal segment wins over a parameter and a parameter over a catch-all, with backtracking, so `/users/me` and `/users/{id}` live side by side. `HEAD` is answered by the `GET` route, `OPTIONS` and `405` with `Allow` for every path, and a `404` for `/users/` asks "did you mean /users?" when that route exists.
 - **Errors that explain themselves.** Every error answer is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem+json body with a code an agent or a client can match on, and the request id when there is one. The codes giong-web uses itself (`GIONG-E1201` to `GIONG-E1213`) each have a page with the cause and the fix in [docs/errors](../docs/errors/README.md).
@@ -116,7 +117,7 @@ let app = Router::new()
 | 400, 422 | `GIONG-E1207` | a JSON body that is not JSON (`400`) or does not fit the type (`422`) |
 | 415 | `GIONG-E1208` | a body that should be JSON and has another `Content-Type` |
 | 503 | `GIONG-E1209` | `Timeout` ran out |
-| 500 | `GIONG-E1210` | the handler failed; the cause is logged, never sent |
+| 500 | `GIONG-E1210` | the handler failed, or a handler or middleware panicked; the cause is logged, never sent |
 | 503 | `GIONG-E1211` | a database or service the handler needs cannot be reached (giong's connect, timeout and pool errors); `Retry-After: 1` |
 | 403 | `GIONG-E1212` | a CORS preflight that `Cors` refused, saying which of origin, method or header |
 

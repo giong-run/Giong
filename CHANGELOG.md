@@ -203,6 +203,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+- **giong-web**: a handler or middleware that panicked took its connection down with no
+  response, no log line and no request id, and over HTTP/2 every other request on that
+  connection with it. A panic, in the handler, in a closure before it returns its future
+  or in a middleware, is now caught where it happens and answered like any other failure:
+  `500` problem+json with `GIONG-E1210`, whose logged cause is "the handler panicked:
+  ..." or "a middleware panicked: ...", so `Logger`, `Trace` and `RequestId` see an
+  ordinary error response. A header value from the request that makes
+  `Response::header` panic (`%0A` in a query parameter) is one such case.
 
 ## [0.4.0] - 2026-11-13
 
