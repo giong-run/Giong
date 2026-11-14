@@ -456,6 +456,49 @@ fn what_the_handshake_settled_survives_the_handoff() {
 }
 
 #[test]
+fn a_peer_that_cuts_its_records_small_still_hands_over_cleanly() {
+    if !kernel_tls() {
+        return;
+    }
+    // rustls in the process on the other side, sending records of at most
+    // 32 bytes: every handshake message and session ticket is spread over
+    // several records, which rustls joins in place before the handoff and
+    // the kernel stream joins after it.
+    let pki = pki();
+    for suite in [
+        suites::TLS13_AES_128_GCM_SHA256,
+        suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    ] {
+        for kernel_side in ["client", "server"] {
+            let mut server = pki.server(Some(suite));
+            let mut client = pki.client(Some(suite));
+            let (acceptor, connector) = if kernel_side == "client" {
+                server.max_fragment_size = Some(32);
+                let acceptor = TlsAcceptor::new(Arc::new(server));
+                let connector = TlsConnector::new(Arc::new(client)).ktls(Ktls::Required);
+                (acceptor, connector.unwrap())
+            } else {
+                client.max_fragment_size = Some(32);
+                let acceptor = TlsAcceptor::new(Arc::new(server)).ktls(Ktls::Required);
+                (acceptor.unwrap(), TlsConnector::new(Arc::new(client)))
+            };
+            let label = format!("{:?}, kernel on the {kernel_side}", suite.suite());
+            run(async move {
+                // The second connection resumes: the tickets got through.
+                for round in 0..2 {
+                    let (server, client) = tls_pair(acceptor.clone(), connector.clone()).await;
+                    assert_eq!(client.is_ktls(), kernel_side == "client", "{label}");
+                    assert_eq!(server.is_ktls(), kernel_side == "server", "{label}");
+                    assert_eq!(client.resumed(), round == 1, "{label} round {round}");
+                    exchange(&server, &client).await;
+                    close_both(&server, &client).await;
+                }
+            });
+        }
+    }
+}
+
+#[test]
 fn data_sent_with_the_last_handshake_flight_is_not_lost() {
     if !kernel_tls() {
         return;
@@ -931,6 +974,24 @@ fn records_that_are_not_data_are_handled_as_rustls_would() {
             vec![(HANDSHAKE, vec![4, 0, 0, 0])],
             Err("handshake message 4"),
         ),
+        // Another record in the middle of a handshake message split over
+        // records: the data that follows, or an alert. (Not a KeyUpdate,
+        // which Linux 6.14+ reads itself.)
+        (
+            tls13,
+            vec![(HANDSHAKE, vec![4, 0, 0, 10])],
+            Err("in the middle of a handshake message"),
+        ),
+        (
+            tls13,
+            vec![(HANDSHAKE, vec![4, 0]), (ALERT, vec![1, 90])],
+            Err("in the middle of a handshake message"),
+        ),
+        (
+            tls12,
+            vec![(HANDSHAKE, vec![0, 0, 0, 2, 0])],
+            Err("in the middle of a handshake message"),
+        ),
     ];
     let pki = pki();
     for (suite, records, expected) in cases {
@@ -972,6 +1033,54 @@ fn records_that_are_not_data_are_handled_as_rustls_would() {
             }
         });
     }
+}
+
+#[test]
+fn a_piece_of_a_handshake_message_that_starts_like_a_key_update_is_not_one() {
+    if !kernel_tls() {
+        return;
+    }
+    // Linux 6.14+ takes every handshake record whose first byte is 24 for a
+    // KeyUpdate, and receives nothing more until it is given new keys. A
+    // piece of a message split over records can start with any byte: here a
+    // session ticket is cut so that its second and third records start
+    // with 24. Older kernels do not look, so this passes there either way.
+    const HANDSHAKE: u8 = 22;
+    let suite = suites::TLS13_AES_128_GCM_SHA256;
+    let pki = pki();
+    let acceptor = pki.acceptor(Some(suite), Ktls::Required);
+    let connector = pki.connector(Some(suite), Ktls::Required);
+    run(async move {
+        let (server, client) = tls_pair(acceptor, connector).await;
+        // NewSessionTicket: lifetime, age_add, nonce, ticket, extensions.
+        let mut ticket = vec![4, 0, 0, 46];
+        ticket.extend_from_slice(&[0, 0, 0, 60, 1, 2, 3, 4, 1, 0, 0, 32]);
+        ticket.extend_from_slice(&[24; 32]);
+        ticket.extend_from_slice(&[0, 0]);
+        assert_eq!(ticket.len(), 50);
+        for round in 0..3 {
+            for piece in [&ticket[..20], &ticket[20..30], &ticket[30..]] {
+                let control = record_type(HANDSHAKE);
+                let (res, _, _) = server
+                    .tcp()
+                    .send_with_control(piece.to_vec(), control)
+                    .await;
+                res.unwrap();
+            }
+            let (res, _) = server
+                .write_all(format!("after {round}").into_bytes())
+                .await;
+            res.unwrap();
+            let got = timeout(Duration::from_secs(20), client.recv())
+                .await
+                .expect("data within 20 s")
+                .unwrap();
+            assert_eq!(got, format!("after {round}").as_bytes());
+        }
+        // The stream is whole: the kernel still counts its records right.
+        exchange(&server, &client).await;
+        close_both(&server, &client).await;
+    });
 }
 
 #[test]

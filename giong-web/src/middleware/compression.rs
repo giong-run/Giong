@@ -18,7 +18,7 @@ const CHUNK: usize = 64 * 1024;
 /// A response is compressed when all of these hold:
 ///
 /// * the request's `Accept-Encoding` accepts `gzip` (q-values are read; `*`
-///   counts) and its method is not `HEAD`;
+///   counts);
 /// * the `Content-Type` is text: `text/*` (but not `text/event-stream`),
 ///   JSON (`application/json`, `*+json`, `application/x-ndjson`), XML
 ///   (`application/xml`, `*+xml`, so SVG too), JavaScript or WebAssembly;
@@ -32,6 +32,10 @@ const CHUNK: usize = 64 * 1024;
 /// Accept-Encoding`, compressed or not, so that caches keep the two apart. A
 /// strong `ETag` becomes weak (`W/"..."`) on a compressed body, since the
 /// bytes differ from the uncompressed ones.
+///
+/// A `HEAD` request is answered as its `GET` would be, `Content-Encoding`
+/// included, as RFC 9110 asks: the body is compressed, and the server sends
+/// its length and leaves it out.
 ///
 /// Large bodies are compressed 64 KiB at a time, letting the worker's other
 /// connections run in between, so one big response does not hold up the
@@ -120,13 +124,12 @@ impl Compression {
 impl<S: 'static> Middleware<S> for Compression {
     async fn call(&self, req: Req<S>, next: Next<'_, S>) -> Result<Response, Error> {
         let accepts = req.header_str("accept-encoding").is_some_and(accepts_gzip);
-        let head = req.method() == "HEAD";
         let resp = next.run(req).await;
         if !self.eligible(&resp) {
             return Ok(resp);
         }
         let mut resp = vary(resp, "Accept-Encoding");
-        if !accepts || head {
+        if !accepts {
             return Ok(resp);
         }
         let body = resp.take_body();

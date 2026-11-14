@@ -80,8 +80,13 @@ enum Lifecycle {
     /// Finished; the result has not been collected yet.
     Done(i32, u32),
     /// The future was dropped while in flight. Holds the operation's resources
-    /// until the kernel is done with them.
-    Ignored(Option<Box<dyn Any>>),
+    /// until the kernel is done with them. With `closes_result`, a result
+    /// that is not negative is a descriptor nobody owns (an open), which the
+    /// driver closes.
+    Ignored {
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    },
 }
 
 /// A multishot completion waiting to be consumed.
@@ -727,8 +732,8 @@ impl Uring {
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
         pool.set_registered(RingId::Whole);
         let mut features = Vec::new();
-        // SAFETY: as above, for the pool's second ring.
         if super::feature_enabled(IoUringFeature::PackedBuffers)
+            // SAFETY: as above, for the pool's second ring.
             && unsafe { register_packed_ring(&ring, &pool, &workarounds) }
         {
             pool.set_registered(RingId::Packed);
@@ -790,7 +795,7 @@ impl Uring {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
-                    _ => panic!("giong: io_uring submit failed: {e}"),
+                    _ => super::event_loop_failed("io_uring submit", e),
                 },
             }
             attempts += 1;
@@ -813,13 +818,13 @@ impl Uring {
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
-    /// A zero-copy send that has its result is done if the caller leaves its
-    /// `hold`: the entry keeps that until the notification.
+    /// A zero-copy send that has sent something is done if the caller leaves
+    /// its `hold`: the entry keeps that until the notification.
     pub(crate) fn poll_op(
         &mut self,
         key: usize,
         waker: &Waker,
-        hold: &mut Option<Box<dyn Any>>,
+        hold: &mut Option<Box<ZeroCopyHold>>,
     ) -> Poll<(i32, u32)> {
         match self.ops.get_mut(key) {
             Some(OpState::Single(Lifecycle::Done(res, flags))) => {
@@ -827,11 +832,19 @@ impl Uring {
                 self.ops.remove(key);
                 Poll::Ready(out)
             }
-            Some(OpState::Single(lc @ Lifecycle::Sent(..))) if hold.is_some() => {
+            // A failed send waits for its notification, which comes at once
+            // (the kernel has nothing to read), so that the caller keeps its
+            // hold and can send the same bytes again (see `Op`).
+            Some(OpState::Single(lc @ Lifecycle::Sent(..)))
+                if hold.is_some() && matches!(*lc, Lifecycle::Sent(_, res, _) if res >= 0) =>
+            {
                 let Lifecycle::Sent(_, res, flags) = *lc else {
                     unreachable!()
                 };
-                *lc = Lifecycle::Ignored(hold.take());
+                *lc = Lifecycle::Ignored {
+                    data: hold.take().map(|hold| hold as Box<dyn Any>),
+                    closes_result: false,
+                };
                 Poll::Ready((res, flags))
             }
             Some(OpState::Single(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..))) => {
@@ -846,10 +859,18 @@ impl Uring {
 
     /// Called when the future of a single-shot operation is dropped before its
     /// result was collected. `data` are the resources the kernel may still use.
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>) {
+    pub(crate) fn cancel_op(
+        &mut self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    ) {
         match self.ops.get_mut(key) {
             Some(OpState::Single(lc @ Lifecycle::Waiting(_))) => {
-                *lc = Lifecycle::Ignored(data);
+                *lc = Lifecycle::Ignored {
+                    data,
+                    closes_result,
+                };
                 self.push(
                     opcode::AsyncCancel::new(key as u64)
                         .build()
@@ -859,13 +880,20 @@ impl Uring {
             Some(OpState::Single(lc @ Lifecycle::Sent(..))) => {
                 // Sent: nothing to cancel, but the kernel may still read the
                 // buffer until the notification.
-                *lc = Lifecycle::Ignored(data);
+                *lc = Lifecycle::Ignored {
+                    data,
+                    closes_result: false,
+                };
             }
-            Some(OpState::Single(Lifecycle::Done(..))) => {
+            Some(&mut OpState::Single(Lifecycle::Done(res, _))) => {
                 self.ops.remove(key);
                 // Completed: the kernel no longer references the resources.
                 if let Some(data) = data {
                     self.graveyard.push(data);
+                }
+                // An open that finished before its future was dropped.
+                if closes_result && res >= 0 {
+                    self.close_fd(res);
                 }
             }
             _ => {
@@ -1095,7 +1123,7 @@ impl Uring {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
-                    _ => panic!("giong: io_uring submit failed: {e}"),
+                    _ => super::event_loop_failed("io_uring submit", e),
                 },
             }
             attempts += 1;
@@ -1156,7 +1184,7 @@ impl Uring {
             match e.raw_os_error() {
                 // Interrupted, timed out, or completion queue backed up (drained below).
                 Some(libc::EINTR) | Some(libc::ETIME) | Some(libc::EBUSY) | Some(libc::EAGAIN) => {}
-                _ => panic!("giong: io_uring_enter failed: {e}"),
+                _ => super::event_loop_failed("io_uring_enter", e),
             }
         }
         self.reap();
@@ -1273,9 +1301,20 @@ impl Uring {
             UD_CLOSE => self.pending_closes -= 1,
             key => {
                 let key = key as usize;
+                // A descriptor an ignored open produced: nobody will take it.
+                let mut orphan_fd = None;
                 let remove = match self.ops.get_mut(key) {
                     None => false,
                     Some(OpState::Single(lc)) => {
+                        if let Lifecycle::Ignored {
+                            closes_result: true,
+                            ..
+                        } = lc
+                        {
+                            if !more && res >= 0 {
+                                orphan_fd = Some(res);
+                            }
+                        }
                         Self::complete(lc, res, flags, more, &mut self.graveyard)
                     }
                     Some(OpState::Multi(m)) => {
@@ -1366,6 +1405,9 @@ impl Uring {
                 if remove {
                     self.ops.remove(key);
                 }
+                if let Some(fd) = orphan_fd {
+                    self.close_fd(fd);
+                }
             }
         }
     }
@@ -1415,7 +1457,7 @@ impl Uring {
                 waker.wake();
                 false
             }
-            Lifecycle::Ignored(data) => {
+            Lifecycle::Ignored { data, .. } => {
                 if let Some(data) = data {
                     if flags & F_NOTIF != 0 && res as u32 & NOTIF_COPIED != 0 {
                         if let Some(hold) = data.downcast_ref::<ZeroCopyHold>() {
@@ -1447,10 +1489,14 @@ impl Uring {
                         e.raw_os_error(),
                         Some(libc::EINTR | libc::EBUSY | libc::EAGAIN)
                     ) => {}
-                Err(_) => return false,
+                Err(_) => {
+                    self.drain_multis();
+                    return false;
+                }
             }
             self.reap();
             if self.inflight == 0 {
+                self.drain_multis();
                 return true;
             }
             // A cancelled close can leave its descriptor open. Retrying a
@@ -1465,7 +1511,28 @@ impl Uring {
             let _ = self.enter(1, Some(Duration::from_millis(10)));
         }
         self.reap();
+        self.drain_multis();
         self.inflight == 0
+    }
+
+    /// Closes the accepted descriptors and gives back the pool pieces that
+    /// every multishot operation still holds. Its owner (a listener or
+    /// stream) can outlive the runtime, and on a later runtime gets a new
+    /// operation: what was queued here would never be taken.
+    fn drain_multis(&mut self) {
+        let pool = &self.pool;
+        let mut pieces = 0;
+        for op in self.ops.iter_mut() {
+            if let OpState::Multi(m) = op {
+                for item in mem::take(&mut m.queue) {
+                    if let Queued::Piece { .. } = item {
+                        pieces += 1;
+                    }
+                    Self::release(pool, m.kind, item);
+                }
+            }
+        }
+        self.pooled_queued -= pieces;
     }
 
     pub(crate) fn take_graveyard(&mut self) -> Vec<Box<dyn Any>> {
@@ -1693,7 +1760,10 @@ mod tests {
 
         // A send whose future already returned (`Ignored`) wakes nobody,
         // and its hold goes when the notification comes.
-        let mut lc = Lifecycle::Ignored(Some(Box::new(())));
+        let mut lc = Lifecycle::Ignored {
+            data: Some(Box::new(())),
+            closes_result: false,
+        };
         assert!(!Uring::complete(
             &mut lc,
             65536,

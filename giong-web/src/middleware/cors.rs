@@ -43,6 +43,14 @@ enum Origins {
 /// settings) on their response; requests from other origins get none, so the
 /// browser keeps the response from the page. Responses get `Vary: Origin`
 /// whenever the answer depends on the origin.
+///
+/// It can be layered on the outermost router or on a nested one: a
+/// preflight runs through the middleware of the route its
+/// `Access-Control-Request-Method` would go to, and the `404` and `405`
+/// answers under a nested router's prefix through that router's middleware
+/// (see [`Router::layer`](crate::Router::layer)). Layer it before any
+/// middleware that checks credentials: browsers send preflights without
+/// cookies or an `Authorization` header.
 #[derive(Clone, Debug)]
 pub struct Cors {
     origins: Origins,

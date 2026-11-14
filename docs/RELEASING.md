@@ -109,7 +109,8 @@ What a new crate needs:
    with every workspace crate it depends on in one command, for example
    `cargo publish -p giong -p giong-tls -p giong-http -p giong-web` (Cargo 1.90 or newer
    puts them in dependency order). Then add the trusted publisher and re-run the
-   workflow: it skips what is already published.
+   workflow: it skips what is already published. Dev-dependencies count too: giong-compat's
+   tests use giong-http, so 0.5.0 published giong, giong-tls, giong-http and giong-compat.
 3. **Add its trusted publisher** at `https://crates.io/crates/<new-crate>/settings`:
    *Trusted Publishing → Add → GitHub*, owner `giong-run`, repository `Giong`, workflow
    `release.yml`, environment `release`.
@@ -124,7 +125,7 @@ Done once per repository; listed so it can be checked or rebuilt.
 
 | What | Where | State |
 |---|---|---|
-| Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http, giong-postgres, giong-mysql, giong-redis: done (2026-11-13); giong-web, giong-mcp: first version published by hand, then added (see [Adding a crate](#adding-a-crate)); giong-compat: not on crates.io yet, its first version goes out by hand with the first release after 0.4.0, together with giong and giong-tls (it needs `poll_recv`, which giong 0.4.0 does not have) |
+| Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http, giong-postgres, giong-mysql, giong-redis: done (2026-11-13); giong-web, giong-mcp (0.4.0) and giong-compat (0.5.0): first version published by hand, then added (see [Adding a crate](#adding-a-crate)). All nine crates done (2026-11-14) |
 | Environment `release`, deployments from `v*` tags only | repo Settings → Environments | done |
 | Branch protection on `main` with the CI checks `lint`, `msrv`, `test`, `fallback`, `tsan` | repo Settings → Branches | done |
 | *Allow GitHub Actions to create and approve pull requests* | org Settings → Actions → General, then repo Settings → Actions → General | needed for Prepare release |

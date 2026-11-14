@@ -8,6 +8,9 @@
 #                               also on the setup tiers of kernels older than 6.1
 #                               (COOP_TASKRUN, no flags), then on the epoll driver
 #                               (GIONG_DRIVER=epoll)
+#   scripts/check.sh fallback <tier>
+#                               one of those four only: no-features, coop, basic
+#                               or epoll (CI runs them side by side)
 #   scripts/check.sh epoll      the tests on the epoll driver only
 #   scripts/check.sh seccomp    the tests with io_uring blocked as in Docker's
 #                               default seccomp profile (scripts/no-io-uring.py),
@@ -19,7 +22,11 @@
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
 #                               driver state (tests/soak.rs)
-#   scripts/check.sh all        everything above except seccomp and soak
+#   scripts/check.sh miri       the unit tests and the tests Miri can run, on the
+#                               epoll driver, under Miri, which checks the unsafe
+#                               code against Rust's memory and aliasing rules
+#                               (needs nightly with the miri component)
+#   scripts/check.sh all        everything above except seccomp, soak and miri
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -41,11 +48,17 @@ run_test() {
 }
 
 run_fallback() {
-    GIONG_IO_URING_OFF=all repeat_tests "io_uring without optional features"
-    for tier in coop basic; do
-        GIONG_IO_URING_OFF=all GIONG_RING_TIER="$tier" repeat_tests "ring tier '$tier'"
-    done
-    run_epoll
+    case "$1" in
+        no-features) GIONG_IO_URING_OFF=all repeat_tests "io_uring without optional features" ;;
+        coop | basic) GIONG_IO_URING_OFF=all GIONG_RING_TIER="$1" repeat_tests "ring tier '$1'" ;;
+        epoll) run_epoll ;;
+        all)
+            for tier in no-features coop basic epoll; do
+                run_fallback "$tier"
+            done
+            ;;
+        *) echo "usage: $0 fallback [no-features|coop|basic|epoll]" >&2; exit 2 ;;
+    esac
 }
 
 run_epoll() {
@@ -69,7 +82,7 @@ run_tsan() {
     # an intercepted libc function. giong's threads sit in raw io_uring_enter
     # and futex syscalls, so the SIGTERM handler would never run and the test
     # would hang. It runs in every non-sanitizer job instead.
-    local skip=(--skip sigterm_triggers_a_graceful_shutdown)
+    local skip=(--skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned)
     # `--cfg giong_tsan` makes giong close sockets with close(2) instead of
     # IORING_OP_CLOSE, which TSan cannot see (see Driver::close_fd).
     for round in $(seq 1 "$ROUNDS"); do
@@ -95,15 +108,39 @@ run_soak() {
     GIONG_SOAK_SECS="${SOAK_SECS:-300}" cargo test --release --quiet --test soak -- --ignored --nocapture
 }
 
+run_miri() {
+    # Miri cannot run io_uring, so the epoll driver; it reads and writes real
+    # files (isolation off); the blocking threads may outlive a test (leaks
+    # ignored); and it would otherwise make reads short at random, which the
+    # tests check exactly.
+    export GIONG_DRIVER=epoll
+    export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-no-short-fd-operations"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/miri"
+    echo "== Miri: unit tests"
+    cargo +nightly miri test --quiet --lib
+    # The test files whose tests Miri can mostly run; the rest of their tests
+    # are marked `#[cfg_attr(miri, ignore = "why")]`. Miri has no sendmsg,
+    # SO_REUSEPORT or Unix sockets, so the network tests stay out, except for
+    # the file test in cancel.rs.
+    local files=(fs executor channels observe time multi)
+    for file in "${files[@]}"; do
+        echo "== Miri: tests/$file.rs"
+        cargo +nightly miri test --quiet --test "$file"
+    done
+    echo "== Miri: tests/cancel.rs (files)"
+    cargo +nightly miri test --quiet --test cancel -- --exact a_dropped_open_closes_the_descriptor_it_produced
+}
+
 case "${1:-all}" in
     test) run_test ;;
-    fallback) run_fallback ;;
+    fallback) run_fallback "${2:-all}" ;;
     epoll) run_epoll ;;
     seccomp) run_seccomp ;;
     tsan) run_tsan ;;
     loom) run_loom ;;
     soak) run_soak ;;
-    all) run_test; run_fallback; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|all]" >&2; exit 2 ;;
+    miri) run_miri ;;
+    all) run_test; run_fallback all; run_tsan; run_loom ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|all]" >&2; exit 2 ;;
 esac
 echo "ok"

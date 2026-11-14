@@ -1,6 +1,6 @@
 # giong-mysql
 
-A MySQL client and connection pool for the [giong](../README.md) runtime. It speaks the client/server protocol itself (no libmysqlclient), encrypts with [`giong-tls`](../giong-tls/README.md), and depends on nothing from the Tokio ecosystem.
+A MySQL and MariaDB client and connection pool for the [giong](../README.md) runtime. It speaks the client/server protocol itself (no libmysqlclient), encrypts with [`giong-tls`](../giong-tls/README.md), and depends on nothing from the Tokio ecosystem.
 
 ```toml
 [dependencies]
@@ -52,12 +52,12 @@ fn main() -> std::io::Result<()> {
 ## What it does
 
 - **Pipelining across tasks.** Tasks that share a connection send their statements together, and one round trip answers all of them. A few connections serve hundreds of concurrent tasks, none of them waiting for a free connection. The usual MySQL clients (libmysqlclient, mysql_async, SQLx) have one statement in flight per connection.
-- **Prepared statements, kept.** Every statement is prepared the first time a connection runs it and kept in a bounded cache (256 per connection by default), so from then on it takes one round trip, and parameters and rows travel in MySQL's binary format.
-- **A pool per worker.** Statements that stand alone share connections; `pool.get()` takes one connection for a transaction or session settings, and rolls back a transaction left open when it comes back. Transactions never run on the shared connections: the pool's own methods refuse `BEGIN`, `COMMIT` and the like, and a batch that leaves a transaction open closes its connection rather than let the statements of other tasks run inside it. The pool steers new statements away from a connection whose oldest statement has been running for more than 5 ms, so a slow query does not hold up the fast ones behind it.
-- **Transactions that cannot end silently.** In MySQL, a deadlock rolls the whole transaction back, and `CREATE`, `ALTER` or `DROP` commits it; the statements after that run on their own, outside any transaction, without a word. Here they fail instead, and so does `commit`.
+- **Prepared statements, kept.** Every statement is prepared the first time a connection runs it and kept in a bounded cache (64 per connection by default), so from then on it takes one round trip, and parameters and rows travel in MySQL's binary format. The server's `max_prepared_stmt_count` bounds the statements of all its clients together; when it is reached anyway (error 1461), the connection closes its statements that are not in use and prepares again, once.
+- **A pool per worker.** Statements that stand alone share connections; `pool.get()` takes one connection for a transaction, session settings or a slow statement. A connection comes back clean: if its session may have changed (a `SET`, a temporary table, a lock, a transaction left open), it is reset before anything else runs on it, without waiting for a round trip; one that ran only plain statements keeps its prepared statements. Tasks waiting in `get()` are served in order, and shared statements cannot keep them waiting: a connection is set aside for the oldest and handed over once the statements on it are answered. Transactions and session changes never run on the shared connections: the pool's own methods refuse `BEGIN`, `COMMIT`, `SET`, `LOCK TABLES` and the like, and a batch that leaves a transaction open closes its connection rather than let the statements of other tasks run inside it. The pool steers new statements away from a connection whose oldest statement has been running for more than 5 ms, so a slow query does not hold up the fast ones behind it.
+- **Transactions that cannot end silently.** In MySQL, a deadlock rolls the whole transaction back, so does a lock wait timeout when the server has `innodb_rollback_on_timeout` on, and `CREATE`, `ALTER` or `DROP` commits it; the statements after that run on their own, outside any transaction, without a word. Here they fail instead, and so does `commit`. So does a transaction in which a statement was given up (its future dropped by a timeout), since it may have run.
 - **TLS on by default for remote hosts, always verified.** `caching_sha2_password` (MySQL 8's default) and `mysql_native_password`. A password is never sent where it could be read on the way (see [Passwords](#passwords)).
 - **Errors that say what to do.** Every error has an `ErrorKind`; errors from the server carry MySQL's error number and SQLSTATE.
-- **Finite limits everywhere.** Connecting, running a `SELECT`, the size of a result, the statement cache and waiting for the pool all have a limit by default, so nothing waits forever and nothing grows without bound.
+- **Finite limits everywhere.** Connecting, running a `SELECT`, waiting for a lock, the size of a result, the statement cache and waiting for the pool all have a limit by default, so nothing grows without bound. The one thing MySQL does not bound is a write that holds its locks and runs long; MariaDB bounds that too (see [Limits](#limits)).
 
 ## Connecting
 
@@ -77,7 +77,14 @@ let same_place = Config::new()
 
 A URL is `mysql://user:password@host:port/database?param=value`. The host can be an IPv6 address in brackets, or empty with the server's Unix socket in a `socket` parameter: `mysql://app@/shop?socket=/var/run/mysqld/mysqld.sock` (in code, a host starting with `/` is a socket). The parameters understood are `ssl-mode`, `ssl-ca`, `socket`, `server-public-key-path`, `connect-timeout` (seconds) and `application-name`. Any other parameter is an error, not silently ignored.
 
-Each connection starts with its session time zone set to UTC (`+00:00`), so `TIMESTAMP` columns, `NOW()` and `SystemTime` agree, and with `max_execution_time` set from the statement timeout. `Config::session_variable("sql_mode", "'STRICT_ALL_TABLES'")` sets other session variables when connecting.
+Each connection starts its session with:
+
+- the character set `utf8mb4` (`SET NAMES`), checked in the same round trip: a server that would store text in another character set without a word, because it ignores the handshake's or something undoes `SET NAMES`, is refused (`ErrorKind::Connect`);
+- the time zone UTC (`+00:00`), so `TIMESTAMP` columns, `NOW()` and `SystemTime` agree;
+- the statement timeout, as `max_execution_time` and `lock_wait_timeout` on MySQL, as `max_statement_time` and `lock_wait_timeout` on MariaDB;
+- `autocommit` on, and the session tracker on, which tells the pool when a statement changed the session.
+
+`Config::session_variable("sql_mode", "'STRICT_ALL_TABLES'")` sets other session variables; the ones above are refused there, except `lock_wait_timeout`. They are all set again whenever a pooled connection's session is reset.
 
 **TLS.** Unless `Config::tls` or `ssl-mode` says otherwise:
 
@@ -87,7 +94,17 @@ Each connection starts with its session time zone set to UTC (`+00:00`), so `TIM
 | A loopback address (`localhost`, `127.0.0.0/8`, `::1`) | No TLS. |
 | Anywhere else | TLS, with the certificate checked against the certificate authorities installed on the machine and against the host name. |
 
-`ssl-mode=DISABLED` turns TLS off. `REQUIRED`, `VERIFY_CA` and `VERIFY_IDENTITY` all check the certificate and the host name, which is stricter than MySQL's own client (it checks nothing for `REQUIRED`). `PREFERRED` is refused, because it falls back to an unencrypted connection without saying so. `ssl-ca=/path/ca.pem` trusts only that authority; in code, use `Tls::Verify(TlsConnector::with_root_pem(..)?)`. When TLS is requested and the server does not offer it, connecting fails.
+`ssl-ca=/path/ca.pem` trusts only that authority instead of the machine's. `ssl-mode` is one of:
+
+| `ssl-mode` | The certificate is checked against | In code |
+|---|---|---|
+| `DISABLED` | Nothing: no TLS. | `Tls::Disable` |
+| `VERIFY_IDENTITY` | The authorities (`ssl-ca`, or the machine's) and the host name. | `Tls::Verify(TlsConnector::with_root_pem(..)?)` |
+| `VERIFY_CA` | The authority in `ssl-ca`, which it needs, and not the host name. | `Tls::verify_ca(..)?` |
+| `REQUIRED` | With `ssl-ca`, like `VERIFY_CA`, as in MySQL's own client. Without it, like `VERIFY_IDENTITY` against the machine's authorities, where MySQL's client checks nothing and anyone on the path could pose as the server. | |
+| `PREFERRED` | Refused: it falls back to an unencrypted connection without saying so. | |
+
+`VERIFY_CA` is for the certificates MySQL generates when it is installed, which name no host (`MySQL_Server_<version>_Auto_Generated_Server_Certificate`), so a host name check always fails: give it the server's own `ca.pem`, from its data directory. Use it only with an authority that signs for this server alone; with a public one, a certificate it issued for any name would pass. When TLS is requested and the server does not offer it, connecting fails.
 
 ### Passwords
 
@@ -110,10 +127,11 @@ Each connection starts with its session time zone set to UTC (`+00:00`), so `TIM
 | `client.query(sql, &[&a, &b])` | All the rows, as `Vec<Row>`. Parameters are `?`. A stored procedure (`CALL`) gives the rows of its first result. |
 | `client.query_one(..)`, `query_opt(..)` | Exactly one row (`ErrorKind::RowCount` otherwise); at most one. |
 | `client.execute(..)` | The number of rows inserted, updated (matched, including rows already holding the new values) or deleted. |
-| `client.insert(..)` | The `AUTO_INCREMENT` id an `INSERT` generated (of its first row); `ErrorKind::RowCount` if it generated none. |
+| `client.insert(..)` | The `AUTO_INCREMENT` id an `INSERT` generated (of its first row); `ErrorKind::RowCount` if it generated none, after the statement ran: do not retry on it. |
 | `client.batch_execute(sql)` | Several statements separated by `;`, with no parameters and no results, stopping at the first error. For migrations and setup. |
-| `client.transaction()` | Starts a transaction and borrows the client mutably until it ends. `tx.commit()` or `tx.rollback()`; dropping the transaction rolls it back. A transaction the server ended early (deadlock, DDL) refuses further statements, and its `commit` fails. |
-| `client.cancel_token()` | A `CancelToken` whose `cancel()` runs `KILL QUERY` over a separate connection, stopping the statement running now. |
+| `client.transaction()` | Starts a transaction and borrows the client mutably until it ends. `tx.commit()` or `tx.rollback()`; dropping the transaction rolls it back. A transaction the server ended early (deadlock, lock wait timeout with `innodb_rollback_on_timeout`, DDL), or one with a statement given up, refuses further statements, and its `commit` fails. |
+| `client.reset_session()` | Resets the session the way the pool does when a connection comes back: rolls back, releases locks, drops temporary tables and variables, and sets the session up again. For a stored function or trigger that takes a named lock or sets a user variable, which the server does not report. |
+| `client.cancel_token()` | A `CancelToken` whose `cancel()` runs `KILL QUERY` over a separate connection, stopping the statement running now. It goes to the address the connection reached and only if the server there is the same one, so behind a load balancer it cannot stop another session's statement. |
 | `client.server_version()`, `client.connection_id()` | What the server said when connecting; the id is the one `KILL` and `SHOW PROCESSLIST` use. |
 | `client.is_closed()`, `client.in_flight()` | Whether the connection is closed; how many requests are waiting for their answer. |
 | `row.get::<T>(column)` | A column by position or name, converted to `T` (see [Types](#types)). Borrowed types (`&str`, `&[u8]`) borrow from the row. |
@@ -121,8 +139,8 @@ Each connection starts with its session time zone set to UTC (`+00:00`), so `TIM
 | `Pool::new(config, max_size)` | A pool for the current worker. Connections are opened when needed, up to `max_size`. Size it to the database server's cores, shared among the workers (see [Performance](#performance)). |
 | `.wait_timeout(duration)` | How long `get()` and the statement methods wait when every connection is taken, 5 s by default. |
 | `pool.query(..)` and the other statement methods | Run on the least busy connection, pipelined with other tasks' statements. |
-| `pool.get()` | A `PooledClient` for this task alone, which derefs to `Client`. For transactions, session settings and statements known to be slow. |
-| `pool.stats()` | Connections open, taken, being opened; requests in flight; tasks waiting; and counters for connections opened, connect errors and wait timeouts. |
+| `pool.get()` | A `PooledClient` for this task alone, which derefs to `Client`. For transactions, session settings and statements known to be slow. Its session is reset when it comes back, if it may have changed. |
+| `pool.stats()` | Connections open, taken, being opened, set aside for `get()`; requests in flight; tasks waiting; and counters for connections opened, connect errors, wait timeouts, sessions reset and prepares refused for `max_prepared_stmt_count`. |
 
 A `Client` belongs to the worker that opened it (it is not `Send`, like everything in giong). Its methods take `&self`, so tasks share one by cloning an `Rc` or by holding a reference, and their statements are pipelined.
 
@@ -150,7 +168,7 @@ Conversions never lose anything silently: a value that does not fit, a binary co
 | `ErrorKind` | Code | Meaning |
 |---|---|---|
 | `Config` | [E3101](../docs/errors/E3101.md) | The configuration or URL is not valid, or the server refused a session variable. |
-| `Connect` | [E3102](../docs/errors/E3102.md) | Name resolution, TCP, TLS, or the connect timeout. Also an unknown database (1049) and a server older than MySQL 8.0. |
+| `Connect` | [E3102](../docs/errors/E3102.md) | Name resolution, TCP, TLS, or the connect timeout. Also an unknown database (1049), a server older than MySQL 8.0 or MariaDB 10.6, a session whose character set is not `utf8mb4`, and a cancel request that reached another server. |
 | `Auth` | [E3103](../docs/errors/E3103.md) | The server refused the credentials, asked for a plugin this crate does not support, or would have needed the password where it could be read. |
 | `Db` | [E3104](../docs/errors/E3104.md) | The server reported an error for the statement; `error.code()` is MySQL's error number (1062 for a duplicate key, 1213 for a deadlock...) and `error.db()` has the SQLSTATE too. |
 | `Type` | [E3105](../docs/errors/E3105.md) | A value could not be converted between Rust and MySQL, or the number of parameters is wrong. The message names the parameter or column and suggests the Rust type to use. |
@@ -159,7 +177,7 @@ Conversions never lose anything silently: a value that does not fit, a binary co
 | `Closed` | [E3108](../docs/errors/E3108.md) | The connection is closed. A `Pool` replaces it by itself. |
 | `PoolTimeout` | [E3109](../docs/errors/E3109.md) | No pooled connection became free within `wait_timeout`. |
 | `Protocol` | [E3110](../docs/errors/E3110.md) | The server sent something this crate cannot understand. The connection is closed. |
-| `Statement` | [E3111](../docs/errors/E3111.md) | Refused before sending: a transaction statement on the connections a `Pool` shares. Use `pool.get()` and `transaction()`. |
+| `Statement` | [E3111](../docs/errors/E3111.md) | Refused before sending: a transaction statement, or one that changes the session (`SET`, `USE`, `LOCK TABLES`, a temporary table, `GET_LOCK`, a user variable), on the connections a `Pool` shares. Use `pool.get()`, and `transaction()`. |
 
 An error from the server affects only its own statement: the statements that other tasks pipelined on the same connection get their own results.
 
@@ -168,9 +186,9 @@ An error from the server affects only its own statement: the statements that oth
 | Setting | Default | What happens at the limit |
 |---|---|---|
 | `Config::connect_timeout` | 10 s | `ErrorKind::Connect`, "connect timeout". |
-| `Config::statement_timeout` | 30 s | Sent as the session's `max_execution_time`, so the server stops the `SELECT` that ran too long (error 3024). MySQL applies it to read-only `SELECT`s only; writes are bounded by `innodb_lock_wait_timeout`. |
+| `Config::statement_timeout` | 30 s | On MySQL, sent as the session's `max_execution_time`, so the server stops a `SELECT` that runs too long (error 3024), and as `lock_wait_timeout`, so a statement waiting for a table or metadata lock gives up (1205). A write waiting for a row lock gives up after `innodb_lock_wait_timeout` (50 s by default); one that holds its locks and runs long is not stopped. On MariaDB, sent as `max_statement_time`, which stops every statement (1969), and as `lock_wait_timeout`. |
 | `Config::max_result_size` | 64 MiB of row data | `ErrorKind::TooLarge`; the rest of the result is read and thrown away. |
-| `Config::statement_cache_capacity` | 256 per connection | The least recently used statement is closed. 0 prepares and closes every statement each time. The server's `max_prepared_stmt_count` (16,382 by default) bounds the total. |
+| `Config::statement_cache_capacity` | 64 per connection | The least recently used statement is closed. 0 prepares and closes every statement each time. The server's `max_prepared_stmt_count` (16,382 by default) bounds the statements of all its clients: processes × workers × pool size × this must stay below it (64 allows 255 connections). At that limit (error 1461), the connection closes its unused statements and prepares again, once. |
 | `Pool::wait_timeout` | 5 s | `ErrorKind::PoolTimeout`. |
 
 Values over 16 MiB are split into packets and joined again, both ways. The server's `max_allowed_packet` (64 MiB by default) limits the size of a statement with its parameters, and of a row.
@@ -199,10 +217,10 @@ Not measured: a server on another machine (network latency, where pipelining sho
 
 ## Not there yet
 
-Streaming a result one row at a time (a result is collected in full, up to `max_result_size`) and cursors, the result sets after the first from a `CALL`, `LOAD DATA LOCAL INFILE` (the server is never sent a file), compression, several hosts with failover, MariaDB's own extensions, and authentication plugins other than those above. Tested against MySQL 8.0 only so far. The crate has had no independent security audit.
+Streaming a result one row at a time (a result is collected in full, up to `max_result_size`) and cursors, the result sets after the first from a `CALL`, `LOAD DATA LOCAL INFILE` (the server is never sent a file), compression, several hosts with failover, MariaDB's own extensions (its `client_ed25519` login among them), and authentication plugins other than those above. MySQL 8.0 and later and MariaDB 10.6 and later are supported; older versions are refused when connecting.
 
 ## Tests
 
-`cargo test -p giong-mysql`: 49 tests against a real MySQL server that the test binary starts for itself (a throwaway data directory from `mysqld --initialize-insecure`, with a user for each authentication plugin and path and one that requires TLS, listening on a Unix socket, 127.0.0.1 and 127.0.0.2): every supported type in both directions; conversion errors that name the column; server errors and their fields; pipelining across tasks, and a failing statement in the middle of a pipeline; the statement cache and its bound, counted on the server, and a cached statement after a schema change; values of 16 MiB and more, both ways; the result-size limit; the statement timeout; `KILL QUERY` through a cancel token; a query dropped mid-flight; a connection the server kills; a stored procedure with two results; `LOAD DATA LOCAL INFILE` refused; transactions committed, rolled back, dropped, ended by DDL and by a deadlock; no task or connection left behind after a client is dropped; TLS against the right and the wrong authority and host; `caching_sha2_password` over a socket, TCP and TLS, with RSA (the key asked for on loopback, or configured), and from a non-loopback address (through a forwarder on this machine's network address) where only the fast path may log in; `mysql_native_password`; `sha256_password` only over TLS; fake servers that ask for the password over the network, lack TLS, or predate MySQL 8; the connect timeout; and the pool (spreading statements, exclusive use and the rollback on return, even with `BEGIN` still in flight, waiting, and waking when a dropped statement frees the connection, replacing broken connections, connect errors, a slow statement not holding up the others, transaction statements refused on shared connections and a batch that leaves a transaction open). 30 unit tests: packets and their splitting, the scrambles checked the way the server checks them, RSA-OAEP decrypted by the `openssl` command, URLs, type conversions, and 47,000 random inputs for the packet parsers, the framing, rows of every column type, URLs and key files. 8 documentation examples.
+`cargo test -p giong-mysql`: 70 tests against a real MySQL or MariaDB server that the test binary starts for itself (a throwaway data directory from `mysqld --initialize-insecure` or `mariadb-install-db`, with a user for each authentication plugin and path and one that requires TLS, listening on a Unix socket, 127.0.0.1 and 127.0.0.2), and a second one set up the way some production servers are (`init_connect` setting latin1, `innodb_rollback_on_timeout` on, the certificates MySQL generates itself): every supported type in both directions; conversion errors that name the column; server errors and their fields; pipelining across tasks, and a failing statement in the middle of a pipeline; the statement cache and its bound, counted on the server, and a cached statement after a schema change; values of 16 MiB and more, both ways; the result-size limit; the statement timeout; `KILL QUERY` through a cancel token; a query dropped mid-flight; a connection the server kills; a stored procedure with two results; `LOAD DATA LOCAL INFILE` refused; transactions committed, rolled back, dropped, ended by DDL and by a deadlock; no task or connection left behind after a client is dropped; TLS against the right and the wrong authority and host; `caching_sha2_password` over a socket, TCP and TLS, with RSA (the key asked for on loopback, or configured), and from a non-loopback address (through a forwarder on this machine's network address) where only the fast path may log in; `mysql_native_password`; `sha256_password` only over TLS; fake servers that ask for the password over the network, lack TLS, or predate MySQL 8; the connect timeout; and the pool (spreading statements, exclusive use and the rollback on return, even with `BEGIN` still in flight, waiting, and waking when a dropped statement frees the connection, replacing broken connections, connect errors, a slow statement not holding up the others, transaction statements refused on shared connections and a batch that leaves a transaction open); a connection taken and given back with session variables, a temporary table, user variables, `autocommit` off, `LOCK TABLES` and `GET_LOCK` comes back clean, and one that ran only plain statements keeps its prepared statements; session statements refused on shared connections, and a reset after a shared batch or trigger that changed the session; a failed reset closes the connection; `get()` not starved by 32 tasks of shared statements, waiting tasks served in order, and a connection set aside for a task that gave up going back; text stored as `utf8mb4` where the server would make it latin1; the server-wide limit on prepared statements reached; a cancel request through a round-robin balancer that must not stop another server's statement; lock wait timeouts with and without the rollback of the transaction; a write waiting for a table lock bounded by the statement timeout; a statement given up inside a transaction stopping the commit; and `VERIFY_CA` with the certificates MySQL generates. 40 unit tests: packets and their splitting, the scrambles checked the way the server checks them, RSA-OAEP decrypted by the `openssl` command, URLs, type conversions, the certificate check of `VERIFY_CA`, the versions refused, and random inputs for the packet parsers, the framing, rows of every column type, URLs, key files and the connection's state machine (3,000 sessions against a scripted server that sends mutated answers). 8 documentation examples. The fuzz targets in `fuzz/` cover the same parsers and the state machine (`session`) with coverage guidance.
 
-The tests find `mysqld` through `GIONG_MYSQL_BIN` (the directory that holds it), `/usr/sbin` or `PATH`, and the `mysql` client next to it or on `PATH`. They skip when MySQL is not installed, unless `GIONG_MYSQL_REQUIRED=1` (CI sets it). They also pass under ThreadSanitizer and on the fallback io_uring setups (`scripts/check.sh tsan` and `fallback`). They have passed against MySQL 8.0.46; MySQL 8.4 and 9 are not tested yet.
+The tests find `mysqld` through `GIONG_MYSQL_BIN` (the directory that holds it), `/usr/sbin` or `PATH`, and the `mysql` client next to it or on `PATH`. They skip when MySQL is not installed, unless `GIONG_MYSQL_REQUIRED=1` (CI sets it). They also pass under ThreadSanitizer and on the fallback io_uring setups (`scripts/check.sh tsan` and `fallback`). They have passed against MySQL 8.0.46 and MariaDB 10.11 here; CI runs them against MySQL 8.0, 8.4 and 9.1 and MariaDB 10.6, 10.11, 11.4 and 11.8. For MariaDB, point `GIONG_MYSQL_BIN` at the directory that holds `mariadbd`.

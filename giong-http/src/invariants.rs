@@ -36,6 +36,31 @@ pub fn check_head(input: &[u8], from: usize) -> bool {
                 lines.iter().filter(|&&b| b == b'\n').count()
             );
             assert!(!(parsed.chunked && parsed.content_length.is_some()));
+            // A target is a path, `*` for OPTIONS, anything visible for
+            // CONNECT, or an http or https URL whose host is the one in
+            // `Host` (so that a handler reading `Host` sees the host a
+            // proxy routing on the URL saw).
+            let method = &head[parsed.method.clone()];
+            let target = &head[parsed.target.clone()];
+            if !(target.starts_with(b"/")
+                || (method == b"OPTIONS" && target == b"*")
+                || method == b"CONNECT")
+            {
+                let lower = target.to_ascii_lowercase();
+                let rest = lower
+                    .strip_prefix(b"http://")
+                    .or_else(|| lower.strip_prefix(b"https://"))
+                    .unwrap_or_else(|| panic!("target {:?}", String::from_utf8_lossy(target)));
+                let authority = rest
+                    .split(|&b| matches!(b, b'/' | b'?' | b'#'))
+                    .next()
+                    .unwrap_or_default();
+                assert!(!authority.is_empty() && !authority.contains(&b'@'));
+                let host = header_lines(&head[parsed.headers.clone()])
+                    .find(|(name, _)| name.eq_ignore_ascii_case(b"host"))
+                    .map(|(_, value)| value.to_ascii_lowercase());
+                assert_eq!(host.as_deref(), Some(authority));
+            }
             true
         }
         Err(status) => {
@@ -581,15 +606,18 @@ pub mod h2_connection {
     }
 
     /// The server for fuzzing: short timeouts, so that a stalled stream
-    /// costs milliseconds.
+    /// costs milliseconds, and a budget of 2 KiB for bodies held, so that
+    /// a `big` answer the client does not take makes handlers wait.
     pub fn server() -> Server {
-        Server::new()
+        let mut server = Server::new()
             .max_head_size(1024)
             .max_body_size(64)
             .request_timeout(Duration::from_millis(20))
             .write_timeout(Duration::from_millis(20))
             .idle_timeout(Duration::from_millis(20))
-            .max_concurrent_streams(8)
+            .max_concurrent_streams(8);
+        server.cfg.http2_budget = Some(2 * 1024);
+        server
     }
 
     /// Splits `bytes` into the pieces the transport delivers.

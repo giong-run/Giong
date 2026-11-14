@@ -23,7 +23,7 @@ load arrives.
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
-> [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8),
+> [`giong-mysql`](giong-mysql/README.md) (the same for MySQL 8 and MariaDB 10.6+),
 > [`giong-redis`](giong-redis/README.md) (a Redis client with Pub/Sub and a pool),
 > [`giong-mcp`](giong-mcp/README.md) (an MCP server that lets AI agents look inside a
 > running service)
@@ -220,7 +220,7 @@ let runtime = giong::Builder::new()
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response`; with the `client` feature, `client::Client` (`get`, `post`, ... `send`), `client::Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
-| MySQL | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
+| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md): `Client`, `Pool`, `Config`, `Row`, `Transaction` |
 | Redis | [`giong-redis`](giong-redis/README.md): `Client`, `Pool`, `Config`, `cmd`, `Pipeline`, `PubSub` |
 | Web services | [`giong-web`](giong-web/README.md): `Router`, `App`, `Req`, `Error`, `Middleware`; `middleware::{RequestId, Logger, Cors, Compression, Timeout}`; `json` with `serde` |
 | Tokio-ecosystem crates | [`giong-compat`](giong-compat/README.md): `Compat::new(stream)` implements `AsyncRead`, `AsyncWrite` and `AsyncBufRead` from `tokio::io` and `futures_io` for `TcpStream`, `UnixStream` and `TlsStream`, for crates that take a stream and are driven by you (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`, tokio-util's codecs) |
@@ -784,7 +784,9 @@ Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/sysc
 `bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
 `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh` and `bench/compat.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
-Recorded output is in `bench/results/`.
+Recorded output is in `bench/results/`. A change of a percent or two per request is below
+the noise of these runs; `bench/instructions.sh` counts the server's instructions per
+request with callgrind instead, which repeats within 0.1%.
 
 ## Testing and safety
 

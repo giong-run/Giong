@@ -295,8 +295,9 @@ fn a_server_name_that_is_not_a_name_is_refused_before_the_handshake() {
 fn alpn_settles_on_a_protocol_both_sides_speak() {
     let pki = pki();
     // The server offers http/1.1 only.
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes())
+        .unwrap()
+        .alpn(&[b"http/1.1"]);
     let plain = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     let alpn = plain.clone().alpn(&[b"h2", b"http/1.1"]);
     giong::block_on(async move {
@@ -455,7 +456,8 @@ fn trust_roots_must_be_certificates() {
     let err = TlsConnector::with_root_pem(b"no pem here").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
+    // The same kind as when the machine has none (`with_system_roots`).
     let err = TlsConnector::with_roots(RootCertStore::empty()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     assert_eq!(code(&err), Some(Code::NoTrustedRoots), "{err}");
 }

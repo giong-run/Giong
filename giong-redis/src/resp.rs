@@ -9,7 +9,9 @@
 //! A reply larger than the limit is thrown away as it arrives, without
 //! being kept, and reported as [`Next::TooLarge`], which says whether it
 //! was a push message (one no command waits for): the connection stays in
-//! step with the server.
+//! step with the server. A reply's size is what it will take in memory:
+//! its bytes, and [`ELEMENT_COST`] for each element, since each becomes a
+//! [`Value`].
 
 use crate::error::{Error, ServerError};
 use crate::value::Value;
@@ -28,6 +30,11 @@ const INITIAL_CAPACITY: usize = 16 * 1024;
 
 /// A buffer grown past this by a large reply shrinks back once it is empty.
 const SHRINK_ABOVE: usize = 1 << 20;
+
+/// What each element of a reply counts for, besides its bytes, against the
+/// size limit: the [`Value`] it becomes. Without it, an array of 20 million
+/// nulls, 57 MiB on the wire, took 960 MB once read.
+pub(crate) const ELEMENT_COST: usize = std::mem::size_of::<Value>();
 
 /// What [`ReadBuf::next`] found.
 #[derive(Debug, PartialEq, Eq)]
@@ -63,6 +70,15 @@ struct Scan {
     skip: usize,
     /// A string being thrown away has ended: one element is complete.
     skipped_one: bool,
+    /// Elements of the reply in progress read so far, each counting
+    /// [`ELEMENT_COST`] against the limit.
+    elements: usize,
+    /// Attributes read in front of the reply's own value, each in front of
+    /// the next.
+    attributes: usize,
+    /// The reply's own type, behind any attributes, has been read, and
+    /// `push` says whether it is a push message.
+    typed: bool,
 }
 
 /// Finds `\r\n` at or after `from`; returns the index of `\r`.
@@ -154,7 +170,7 @@ impl ReadBuf {
     }
 
     /// Whether nothing is waiting to be read.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn is_empty(&self) -> bool {
         self.start == self.data.len() && self.scan.skip == 0 && self.scan.stack.is_empty()
     }
@@ -169,11 +185,11 @@ impl ReadBuf {
                 return Ok(Next::Pending);
             }
             if std::mem::take(&mut scan.skipped_one) && scan.complete_one() {
-                return Ok(scan.finish(&self.data, &mut self.start, limit));
+                return Ok(scan.finish(&mut self.start, limit));
             }
             let buf = &self.data[self.start..];
-            if !scan.discarding && scan.pos > limit {
-                scan.discard(&self.data, &mut self.start);
+            if !scan.discarding && scan.cost(scan.pos) > limit {
+                scan.discard(&mut self.start);
                 continue;
             }
             let pos = scan.pos;
@@ -193,11 +209,28 @@ impl ReadBuf {
             };
             let line = &buf[pos + 1..end];
             let after = end + 2;
+            scan.elements += 1;
+            if !scan.typed
+                && scan.stack.len() == scan.attributes
+                && scan.stack.last().map_or(true, |&left| left == 1)
+            {
+                // The reply's own value, or the last element of the
+                // attributes in front of it, which is the value they
+                // describe: whether it is a push message is decided here,
+                // not from what is left in the buffer when the reply turns
+                // out to be too large.
+                if kind == b'|' {
+                    scan.attributes += 1;
+                } else {
+                    scan.typed = true;
+                    scan.push = kind == b'>';
+                }
+            }
             match kind {
                 b'+' | b'-' | b':' | b',' | b'#' | b'_' | b'(' => {
                     scan.pos = after;
                     if scan.complete_one() {
-                        return Ok(scan.finish(&self.data, &mut self.start, limit));
+                        return Ok(scan.finish(&mut self.start, limit));
                     }
                 }
                 b'$' | b'!' | b'=' => {
@@ -205,7 +238,7 @@ impl ReadBuf {
                         Some(-1) if kind == b'$' => {
                             scan.pos = after;
                             if scan.complete_one() {
-                                return Ok(scan.finish(&self.data, &mut self.start, limit));
+                                return Ok(scan.finish(&mut self.start, limit));
                             }
                             continue;
                         }
@@ -222,20 +255,19 @@ impl ReadBuf {
                         }
                         scan.pos = after + total;
                         if scan.complete_one() {
-                            return Ok(scan.finish(&self.data, &mut self.start, limit));
+                            return Ok(scan.finish(&mut self.start, limit));
                         }
-                    } else if scan.discarding || after + total > limit {
+                    } else if scan.discarding || scan.cost(after + total) > limit {
                         // Throw away what is here, and the rest as it comes.
-                        if !scan.discarding {
-                            scan.discarding = true;
-                            scan.push = starts_push(buf);
-                        }
+                        scan.discarding = true;
                         self.start += buf.len();
                         scan.pos = 0;
                         scan.skip = total - have;
                         scan.skipped_one = true;
                         return Ok(Next::Pending);
                     } else {
+                        // Read again once the string has arrived.
+                        scan.elements -= 1;
                         return Ok(Next::Pending);
                     }
                 }
@@ -244,7 +276,7 @@ impl ReadBuf {
                         Some(-1) if kind == b'*' => {
                             scan.pos = after;
                             if scan.complete_one() {
-                                return Ok(scan.finish(&self.data, &mut self.start, limit));
+                                return Ok(scan.finish(&mut self.start, limit));
                             }
                             continue;
                         }
@@ -260,7 +292,7 @@ impl ReadBuf {
                     scan.pos = after;
                     if elements == 0 {
                         if scan.complete_one() {
-                            return Ok(scan.finish(&self.data, &mut self.start, limit));
+                            return Ok(scan.finish(&mut self.start, limit));
                         }
                     } else {
                         if scan.stack.len() >= MAX_DEPTH {
@@ -299,6 +331,12 @@ impl ReadBuf {
         Ok(value)
     }
 
+    /// The bytes of the reply of `len` bytes found by [`next`](Self::next).
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn peek(&self, len: usize) -> &[u8] {
+        &self.data[self.start..self.start + len]
+    }
+
     /// Moves past the reply of `len` bytes found by [`next`](Self::next).
     pub(crate) fn skip(&mut self, len: usize) {
         self.start += len;
@@ -306,6 +344,12 @@ impl ReadBuf {
 }
 
 impl Scan {
+    /// What the reply in progress counts for against the limit with `bytes`
+    /// of it: the bytes, and [`ELEMENT_COST`] for each element.
+    fn cost(&self, bytes: usize) -> usize {
+        bytes.saturating_add(self.elements.saturating_mul(ELEMENT_COST))
+    }
+
     /// Counts one element as complete; returns whether the whole reply is.
     fn complete_one(&mut self) -> bool {
         loop {
@@ -324,15 +368,15 @@ impl Scan {
 
     /// Ends the reply: what to report, and resets for the next one.
     /// `data[*start..]` holds what is left of the reply.
-    fn finish(&mut self, data: &[u8], start: &mut usize, limit: usize) -> Next {
+    fn finish(&mut self, start: &mut usize, limit: usize) -> Next {
+        let over = self.cost(self.pos) > limit;
         let pos = std::mem::take(&mut self.pos);
         let push = std::mem::take(&mut self.push);
-        if std::mem::take(&mut self.discarding) {
-            *start += pos;
-            Next::TooLarge { push }
-        } else if pos > limit {
-            // Whole, but over the limit: all of it is still here.
-            let push = starts_push(&data[*start..]);
+        self.elements = 0;
+        self.attributes = 0;
+        self.typed = false;
+        if std::mem::take(&mut self.discarding) || over {
+            // Thrown away as it came, or whole but over the limit.
             *start += pos;
             Next::TooLarge { push }
         } else {
@@ -342,9 +386,8 @@ impl Scan {
 
     /// Starts throwing away the reply in progress, which begins at
     /// `data[*start..]`.
-    fn discard(&mut self, data: &[u8], start: &mut usize) {
+    fn discard(&mut self, start: &mut usize) {
         self.discarding = true;
-        self.push = starts_push(&data[*start..]);
         *start += self.pos;
         self.pos = 0;
     }
@@ -792,6 +835,67 @@ mod tests {
     }
 
     #[test]
+    fn each_element_counts_against_the_limit_for_the_value_it_becomes() {
+        // 1,000 nulls: 3,007 bytes on the wire, but 1,001 values once read.
+        // Counting bytes alone, an array of 20 million nulls (57 MiB, under
+        // the 64 MiB default) took 960 MB.
+        let mut input = b"*1000\r\n".to_vec();
+        input.extend(b"_\r\n".repeat(1000));
+        let cost = input.len() + 1001 * ELEMENT_COST;
+        input.extend(b":1\r\n");
+        for piece in [1, 7, 4096] {
+            let got = read_all(&input, 10_000, piece).unwrap();
+            assert_eq!(got, [Err(false), Ok(Value::Int(1))], "in pieces of {piece}");
+            let got = read_all(&input, cost - 1, piece).unwrap();
+            assert_eq!(got[0], Err(false));
+            let got = read_all(&input, cost, piece).unwrap();
+            assert!(matches!(&got[0], Ok(Value::Array(a)) if a.len() == 1000));
+        }
+        // The same for a string that has not arrived yet.
+        let mut buf = ReadBuf::new();
+        buf.extend(b"*2\r\n$10\r\n");
+        assert_eq!(buf.next(3 * ELEMENT_COST).unwrap(), Next::Pending);
+        buf.extend(b"0123456789\r\n:1\r\n");
+        assert_eq!(
+            buf.next(3 * ELEMENT_COST).unwrap(),
+            Next::TooLarge { push: false }
+        );
+    }
+
+    #[test]
+    fn a_push_behind_attributes_is_a_push_however_large() {
+        // Before, whether a reply thrown away was a push message was
+        // decided from the bytes still in the buffer when it went over the
+        // limit, which could end inside the attributes in front of it: the
+        // push was then counted as the reply to a command, and every later
+        // reply went to the command after its own.
+        let big = "x".repeat(500);
+        let input = format!(
+            "|1\r\n+a\r\n${}\r\n{big}\r\n>2\r\n+invalidate\r\n_\r\n+one\r\n\
+             |1\r\n+a\r\n|1\r\n+b\r\n${}\r\n{big}\r\n+c\r\n>1\r\n${}\r\n{big}\r\n:2\r\n\
+             |1\r\n+a\r\n+b\r\n${}\r\n{big}\r\n",
+            big.len(),
+            big.len(),
+            big.len(),
+            big.len()
+        );
+        for piece in [1, 2, 13, 40, 600, input.len()] {
+            let got = read_all(input.as_bytes(), 100, piece).unwrap();
+            assert_eq!(
+                got,
+                [
+                    Err(true),
+                    Ok(Value::Status("one".into())),
+                    Err(true),
+                    Ok(Value::Int(2)),
+                    Err(false)
+                ],
+                "in pieces of {piece}"
+            );
+        }
+    }
+
+    #[test]
     fn what_is_not_resp_is_an_error() {
         for bad in [
             "?\r\n",
@@ -822,17 +926,17 @@ mod tests {
     fn a_push_is_told_apart() {
         let mut buf = ReadBuf::new();
         buf.extend(b">1\r\n+x\r\n|1\r\n+a\r\n+b\r\n>0\r\n:1\r\n");
-        let Next::Ready(n) = buf.next(100).unwrap() else {
+        let Next::Ready(n) = buf.next(1000).unwrap() else {
             panic!()
         };
         assert!(buf.is_push());
         buf.skip(n);
-        let Next::Ready(n) = buf.next(100).unwrap() else {
+        let Next::Ready(n) = buf.next(1000).unwrap() else {
             panic!()
         };
         assert!(buf.is_push());
         buf.skip(n);
-        let Next::Ready(_) = buf.next(100).unwrap() else {
+        let Next::Ready(_) = buf.next(1000).unwrap() else {
             panic!()
         };
         assert!(!buf.is_push());

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use giong_redis::{cmd, Client, ErrorKind, Pipeline, Value};
+use giong_redis::{cmd, ArgWriter, Client, ErrorKind, Pipeline, ToArg, Value};
 
 use crate::{key, run};
 
@@ -192,6 +192,105 @@ fn many_tasks_share_one_connection_and_each_gets_its_own_reply() {
         }
         // The commands of many tasks were in flight together.
         assert!(most > 10, "at most {most} in flight");
+        assert_eq!(c.in_flight(), 0);
+    });
+}
+
+/// A typed key, written in two pieces.
+struct Prefixed<'a>(&'a str, &'a str);
+
+impl ToArg for Prefixed<'_> {
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(self.0.as_bytes());
+        out.write(self.1.as_bytes());
+    }
+}
+
+#[test]
+fn an_argument_written_in_pieces_is_one_argument_on_a_shared_connection() {
+    // Before arguments were written through an ArgWriter, a ToArg calling
+    // its callback twice sent one bulk string more than the command's
+    // count: Redis ran it as a command of its own, and from then on every
+    // task got the reply of the command before its own (GET rv:c returned
+    // rv:a's value).
+    run(|server| async move {
+        let c = Rc::new(Client::connect(&server.tcp()).await.unwrap());
+        let prefix = key("pieces");
+        for k in ["a", "b", "c", "d", "user:1"] {
+            c.set(format!("{prefix}:{k}"), format!("secret-of-{k}"))
+                .await
+                .unwrap();
+        }
+        let mut tasks = Vec::new();
+        for round in 0..20 {
+            for k in ["user:1", "a", "b", "c", "d"] {
+                let c = c.clone();
+                let prefix = prefix.clone();
+                tasks.push(giong::spawn(async move {
+                    let got: Option<String> = if k == "user:1" {
+                        let head = format!("{prefix}:user:");
+                        c.get(Prefixed(&head, "1")).await.unwrap()
+                    } else {
+                        c.get(format!("{prefix}:{k}")).await.unwrap()
+                    };
+                    (round, k, got)
+                }));
+            }
+        }
+        for t in tasks {
+            let (round, k, got) = t.await.unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(&*format!("secret-of-{k}")),
+                "{round} {k}"
+            );
+        }
+        let head = format!("{prefix}:user:");
+        c.hset(Prefixed(&head, "2"), Prefixed("na", "me"), Prefixed("", ""))
+            .await
+            .unwrap();
+        let name: String = c.hget(Prefixed(&head, "2"), "name").await.unwrap();
+        assert_eq!(name, "");
+        assert!(!c.is_closed());
+        assert_eq!(c.in_flight(), 0);
+    });
+}
+
+/// A `ToArg` that panics half way through a command.
+struct Panicky;
+
+impl ToArg for Panicky {
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(b"half");
+        panic!("a ToArg panicked (on purpose, in a test)");
+    }
+}
+
+#[test]
+fn a_panicking_argument_leaves_nothing_behind_on_a_shared_connection() {
+    // Without the rewind in Conn::enqueue, the panicking task left `*3
+    // $4 HSET $4 half` in the connection's buffer: the next task's command
+    // was appended to it, Redis answered "Protocol error" to that task, and
+    // the connection closed.
+    run(|server| async move {
+        let c = Rc::new(Client::connect(&server.tcp()).await.unwrap());
+        let k = key("panicky");
+        c.set(&k, "value").await.unwrap();
+        for _ in 0..3 {
+            let c2 = c.clone();
+            let k2 = k.clone();
+            let panicked =
+                giong::spawn(async move { c2.hset(&k2, Panicky, "v").await.map(|_| ()) });
+            let other = {
+                let c = c.clone();
+                let k = k.clone();
+                giong::spawn(async move { c.get::<String>(&k).await })
+            };
+            assert!(panicked.await.is_err(), "the task did not panic");
+            assert_eq!(other.await.unwrap().unwrap(), "value");
+            assert_eq!(c.get::<String>(&k).await.unwrap(), "value");
+        }
+        assert!(!c.is_closed());
         assert_eq!(c.in_flight(), 0);
     });
 }
@@ -659,5 +758,130 @@ fn a_connection_the_server_closed_fails_its_commands() {
         let e = c.ping().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Closed);
         assert!(e.is_transient());
+    });
+}
+
+#[test]
+fn a_dropped_client_closes_even_if_the_server_keeps_its_side_open() {
+    // A peer that answers the handshake and PING, and keeps its socket open
+    // after reading the client's half-close, as some proxies do. Before,
+    // the read task and the socket stayed until the peer closed.
+    run(|_server| async move {
+        use std::io::{Read, Write};
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        let (looked_tx, looked_rx) = std::sync::mpsc::channel::<()>();
+        let script = std::thread::spawn(move || {
+            let (mut s, _) = fake.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"PING") {
+                let n = s.read(&mut buf).unwrap();
+                assert!(n > 0);
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(5).any(|w| w == b"HELLO") && !seen.starts_with(b"done") {
+                    s.write_all(b"%1\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n")
+                        .unwrap();
+                    seen.splice(0..0, *b"done");
+                }
+            }
+            s.write_all(b"+PONG\r\n").unwrap();
+            while s.read(&mut buf).unwrap_or(0) > 0 {}
+            eof_tx.send(()).unwrap();
+            // Holds the socket open after the client's FIN until the test
+            // has looked.
+            let _ = looked_rx.recv_timeout(Duration::from_secs(30));
+            drop(s);
+        });
+        let tasks = giong::stats().tasks;
+        let c = Client::connect(&giong_redis::Config::new().host("127.0.0.1").port(port))
+            .await
+            .unwrap();
+        c.ping().await.unwrap();
+        assert_eq!(giong::stats().tasks, tasks + 2);
+        drop(c);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while giong::stats().tasks > tasks {
+            assert!(
+                Instant::now() < deadline,
+                "the connection's tasks are still running"
+            );
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The peer saw the half-close, and still holds its side open.
+        eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        looked_tx.send(()).unwrap();
+        while !script.is_finished() {
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        script.join().unwrap();
+    });
+}
+
+#[test]
+fn commands_wait_rather_than_pile_up_when_the_server_stops_reading() {
+    // A server that answers the handshake, then reads nothing. Before, every
+    // command was added to the connection's buffer however large it grew,
+    // and sent, and run, whenever the server caught up, long after its
+    // caller had timed out.
+    run(|_server| async move {
+        use std::io::{Read, Write};
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let script = std::thread::spawn(move || {
+            let (mut s, _) = fake.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(5).any(|w| w == b"HELLO") {
+                let n = s.read(&mut buf).unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+            s.write_all(b"%1\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n")
+                .unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(60));
+        });
+        let config = giong_redis::Config::new()
+            .host("127.0.0.1")
+            .port(port)
+            .response_timeout(Duration::from_millis(500));
+        let c = Rc::new(Client::connect(&config).await.unwrap());
+        let value = Rc::new(vec![b'v'; 1 << 20]);
+        let mut tasks = Vec::new();
+        for i in 0..100 {
+            let (c, value) = (c.clone(), value.clone());
+            tasks.push(giong::spawn(async move {
+                c.set(format!("k{i}"), &*value).await.unwrap_err()
+            }));
+        }
+        let mut not_sent = 0;
+        let mut most = 0;
+        while tasks.iter().any(|t| !t.is_finished()) {
+            most = most.max(c.in_flight());
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        for t in tasks {
+            let e = t.await.unwrap();
+            assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+            assert!(e.is_transient());
+            if e.to_string().contains("It was not sent") {
+                not_sent += 1;
+            }
+        }
+        println!("{not_sent} refused, at most {most} queued");
+        // 100 MiB of commands; at most 16 MiB wait in the buffer, besides
+        // what the kernel took and one batch being written.
+        assert!(
+            not_sent >= 20,
+            "{not_sent} were refused, {most} were queued at most"
+        );
+        assert!(most <= 80, "{most} were queued");
+        drop(c);
+        done_tx.send(()).unwrap();
+        while !script.is_finished() {
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        script.join().unwrap();
     });
 }
