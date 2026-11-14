@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use giong::net::{TcpListener, TcpStream};
 use giong_mysql::{Client, Config, ErrorKind, Tls, TlsConnector};
 
-use crate::run;
 use crate::server::{
     Server, DATABASE, FAST_USER, KEY_USER, NATIVE_USER, RSA_USER, SHA256_USER, SHA2_USER, TLS_USER,
 };
+use crate::{pipe, run};
 
 async fn user(client: &Client) -> String {
     client
@@ -103,6 +103,10 @@ fn the_server_key_is_asked_for_only_on_this_machine() {
 #[test]
 fn a_configured_server_key_encrypts_the_password() {
     run(|s| async move {
+        if !s.has_caching_sha2 {
+            eprintln!("skipping: the server has no caching_sha2_password");
+            return;
+        }
         assert!(!s.public_key_pem.is_empty(), "the server wrote its key");
         let config = s.tcp(KEY_USER).server_public_key(&s.public_key_pem);
         let client = Client::connect(&config).await.unwrap();
@@ -268,6 +272,11 @@ fn packet(seq: u8, payload: &[u8]) -> Vec<u8> {
 
 /// A MySQL 8 greeting offering caching_sha2_password, and TLS if `tls`.
 fn greeting(tls: bool) -> Vec<u8> {
+    greeting_from("8.0.0-fake", tls)
+}
+
+/// A greeting from a server that says it is `version`.
+fn greeting_from(version: &str, tls: bool) -> Vec<u8> {
     let caps: u32 = 1 // LONG_PASSWORD
         | 1 << 3 // CONNECT_WITH_DB
         | 1 << 9 // PROTOCOL_41
@@ -280,7 +289,8 @@ fn greeting(tls: bool) -> Vec<u8> {
         | 1 << 21 // PLUGIN_AUTH_LENENC_CLIENT_DATA
         | 1 << 24; // DEPRECATE_EOF
     let mut p = vec![10];
-    p.extend_from_slice(b"8.0.0-fake\0");
+    p.extend_from_slice(version.as_bytes());
+    p.push(0);
     p.extend_from_slice(&7u32.to_le_bytes());
     p.extend_from_slice(b"abcdefgh\0");
     p.extend_from_slice(&(caps as u16).to_le_bytes());
@@ -436,6 +446,28 @@ fn a_server_older_than_mysql_8_is_refused() {
         let e = Client::connect(&config).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
         assert!(e.to_string().contains("MySQL 8.0 and later"), "{e}");
+
+        // MySQL 5.7 and MariaDB before 10.6 have every capability asked
+        // for, but not the collations and variables the session needs: the
+        // version says so.
+        for version in ["5.7.44-log", "5.5.5-10.5.27-MariaDB-log"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let hello = greeting_from(version, false);
+            let _server = giong::spawn(async move {
+                let conn = listener.accept().await.unwrap();
+                conn.write_all(hello).await.0.unwrap();
+                giong::time::sleep(Duration::from_secs(5)).await;
+            });
+            let config = Config::new().host("127.0.0.1").port(port).user("u");
+            let e = Client::connect(&config).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Connect, "{version}: {e}");
+            assert!(
+                e.to_string()
+                    .contains("MySQL 8.0 and later and MariaDB 10.6 and later"),
+                "{e}"
+            );
+        }
     });
 }
 
@@ -461,23 +493,13 @@ fn forward(s: &Server, ip: IpAddr) -> SocketAddr {
     addr
 }
 
-async fn pipe(from: Rc<TcpStream>, to: Rc<TcpStream>) {
-    loop {
-        match from.recv().await {
-            Ok(chunk) if !chunk.is_empty() => {
-                if to.write_all(chunk.to_vec()).await.0.is_err() {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    let _ = to.shutdown(std::net::Shutdown::Write);
-}
-
 #[test]
 fn off_this_machine_without_tls_only_the_fast_path_logs_in() {
     run(|s| async move {
+        if !s.has_caching_sha2 {
+            eprintln!("skipping: the server has no caching_sha2_password");
+            return;
+        }
         let Some(ip) = non_loopback_address() else {
             eprintln!("skipping: no non-loopback address");
             return;
@@ -500,5 +522,48 @@ fn off_this_machine_without_tls_only_the_fast_path_logs_in() {
         Client::connect(&s.socket(FAST_USER)).await.unwrap();
         let client = Client::connect(&remote).await.unwrap();
         assert_eq!(user(&client).await, "fast_user@%");
+    });
+}
+
+#[test]
+fn the_authority_alone_can_be_checked_without_the_host_name() {
+    run(|s| async move {
+        // The certificate names localhost and 127.0.0.1, not 127.0.0.2.
+        let config = s
+            .tls("127.0.0.2", TLS_USER)
+            .tls(Tls::verify_ca(&s.ca_pem).unwrap());
+        let client = Client::connect(&config).await.unwrap();
+        assert_eq!(user(&client).await, "tls_user@%");
+        // Another authority is still not trusted.
+        let other = rcgen::generate_simple_self_signed(vec!["127.0.0.2".into()]).unwrap();
+        let config = s
+            .tls("127.0.0.2", TLS_USER)
+            .tls(Tls::verify_ca(other.cert.pem().as_bytes()).unwrap());
+        let e = Client::connect(&config).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+        assert!(Tls::verify_ca(b"not a certificate").is_err());
+
+        let url = |mode: &str, ca: bool| {
+            let mut url = format!(
+                "mysql://{}:{}@127.0.0.2:{}/{DATABASE}?ssl-mode={mode}",
+                TLS_USER.0, TLS_USER.1, s.port
+            );
+            if ca {
+                url += &format!("&ssl-ca={}", s.ca_file.display());
+            }
+            url
+        };
+        for mode in ["VERIFY_CA", "REQUIRED"] {
+            let config = Config::from_url(&url(mode, true)).unwrap();
+            Client::connect(&config)
+                .await
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
+        }
+        let e = Config::from_url(&url("VERIFY_CA", false)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Config, "{e}");
+        assert!(e.to_string().contains("ssl-ca"), "{e}");
+        let config = Config::from_url(&url("VERIFY_IDENTITY", true)).unwrap();
+        let e = Client::connect(&config).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
     });
 }

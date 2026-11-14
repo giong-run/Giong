@@ -1,18 +1,22 @@
-//! A throwaway MySQL server for the tests: a fresh data directory in a
-//! temporary directory, started once per test binary and killed when the
-//! binary exits.
+//! Throwaway MySQL or MariaDB servers for the tests: a fresh data directory
+//! in a temporary directory, started once per test binary and killed when
+//! the binary exits.
 //!
-//! `mysqld` is found through `GIONG_MYSQL_BIN` (the directory that holds it,
-//! such as the `bin` of a MySQL tarball), then at `/usr/sbin/mysqld` (Debian,
-//! Ubuntu and the GitHub runners), then on `PATH`; the `mysql` client next
-//! to it or on `PATH`. Without them the tests are skipped with a message,
-//! unless `GIONG_MYSQL_REQUIRED=1`, which makes that a failure (CI sets it).
+//! `mysqld` (or `mariadbd`) is found through `GIONG_MYSQL_BIN` (the
+//! directory that holds it, such as the `bin` of a MySQL or MariaDB
+//! tarball), then at `/usr/sbin/mysqld` (Debian, Ubuntu and the GitHub
+//! runners), then on `PATH`; the `mysql` (or `mariadb`) client next to it,
+//! in the `bin` beside it, or on `PATH`. Without them the tests are skipped
+//! with a message, unless `GIONG_MYSQL_REQUIRED=1`, which makes that a
+//! failure (CI sets it).
+//!
+//! [`server`] is the one most tests use. [`odd`] starts a second one, set up
+//! the way some production servers are and the defaults are not.
 
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use giong_mysql::{Config, Tls, TlsConnector};
@@ -20,7 +24,11 @@ use giong_mysql::{Config, Tls, TlsConnector};
 pub struct Server {
     pub port: u16,
     pub socket: PathBuf,
+    /// The authority that signed the server's certificate, and its file.
     pub ca_pem: Vec<u8>,
+    pub ca_file: PathBuf,
+    /// The certificates are the ones MySQL made itself, which name no host.
+    pub auto_certificates: bool,
     /// The server's RSA key for `caching_sha2_password`.
     pub public_key_pem: Vec<u8>,
     /// Whether the server has the `mysql_native_password` plugin (gone in
@@ -28,6 +36,11 @@ pub struct Server {
     pub has_native: bool,
     /// Whether it has `sha256_password`.
     pub has_sha256: bool,
+    /// Whether it has `caching_sha2_password` (MariaDB does not; its
+    /// users log in with `mysql_native_password`).
+    pub has_caching_sha2: bool,
+    /// Whether it is MariaDB.
+    pub mariadb: bool,
     pub version: String,
     dir: PathBuf,
     bins: Bins,
@@ -37,6 +50,18 @@ pub struct Server {
 struct Bins {
     mysqld: PathBuf,
     mysql: PathBuf,
+    /// `mariadb-install-db`, for MariaDB, which has no
+    /// `--initialize-insecure`.
+    install_db: Option<PathBuf>,
+}
+
+/// How a server is set up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// With the defaults.
+    Main,
+    /// See [`odd`].
+    Odd,
 }
 
 /// Users the server is set up with, and their passwords. Each test that
@@ -54,8 +79,11 @@ pub const SHA256_USER: (&str, &str) = ("sha256_user", "sha256-secret");
 pub const DATABASE: &str = "giong";
 
 static SERVER: OnceLock<Option<Server>> = OnceLock::new();
-static PID: AtomicI32 = AtomicI32::new(0);
-static DIR: OnceLock<PathBuf> = OnceLock::new();
+static ODD: OnceLock<Server> = OnceLock::new();
+static ODD_TURN: Mutex<()> = Mutex::new(());
+/// The servers started, and their directories, for [`stop_servers`].
+static STARTED: Mutex<Vec<(i32, PathBuf)>> = Mutex::new(Vec::new());
+static AT_EXIT: Once = Once::new();
 
 /// The server, or `None` (after saying why) when MySQL is not installed.
 pub fn server() -> Option<&'static Server> {
@@ -71,9 +99,28 @@ pub fn server() -> Option<&'static Server> {
                 eprintln!("skipping: mysqld and mysql not found (set GIONG_MYSQL_BIN)");
                 return None;
             };
-            Some(start(bins))
+            Some(start(bins, Role::Main))
         })
         .as_ref()
+}
+
+/// A second server, started the first time it is asked for, with settings
+/// some production servers have and the defaults do not:
+///
+/// - `init_connect` sets the character set to latin1, as servers do that
+///   were set up when latin1 was the default (it runs after the handshake,
+///   which asked for utf8mb4, and is not run for root);
+/// - `innodb_rollback_on_timeout` is on, so a lock wait timeout rolls back
+///   the whole transaction.
+///
+/// It has the same users as [`server`] and a server id of its own. Its tests
+/// take turns (the guard), as some change its global settings.
+pub fn odd(main: &Server) -> (&'static Server, MutexGuard<'static, ()>) {
+    let turn = ODD_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    (
+        ODD.get_or_init(|| start(main.bins.clone(), Role::Odd)),
+        turn,
+    )
 }
 
 impl Server {
@@ -146,6 +193,25 @@ impl Server {
             .is_ok_and(|s| s.success())
     }
 
+    /// A session variable that lets a recursive CTE run long enough to be
+    /// stopped ([`SLOW_SELECT`](crate::client)).
+    pub fn deep_recursion(&self, config: Config) -> Config {
+        if self.mariadb {
+            config.session_variable("max_recursive_iterations", "4294967295")
+        } else {
+            config.session_variable("cte_max_recursion_depth", "4294967295")
+        }
+    }
+
+    /// The error number for a statement stopped by the statement timeout.
+    pub fn timeout_code(&self) -> u16 {
+        if self.mariadb {
+            1969
+        } else {
+            3024
+        }
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(self.dir.join("server.log")).unwrap_or_default()
     }
@@ -155,22 +221,45 @@ fn find_bins() -> Option<Bins> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
+    let names = ["mysqld", "mariadbd"];
     let mysqld = match std::env::var_os("GIONG_MYSQL_BIN") {
-        Some(dir) => PathBuf::from(dir).join("mysqld"),
+        Some(dir) => names
+            .iter()
+            .map(|n| PathBuf::from(&dir).join(n))
+            .find(|p| p.exists())?,
         None => std::iter::once(PathBuf::from("/usr/sbin"))
             .chain(path_dirs.iter().cloned())
-            .map(|d| d.join("mysqld"))
+            .flat_map(|d| names.map(|n| d.join(n)))
             .find(|p| p.exists())?,
     };
-    if !mysqld.exists() {
-        return None;
-    }
-    let mysql = std::iter::once(mysqld.parent()?.to_owned())
+    let here = mysqld.parent()?.to_owned();
+    // The `bin` beside an `sbin`, and `scripts` for MariaDB tarballs.
+    let base = here
+        .parent()
+        .map(|p| p.to_owned())
+        .unwrap_or_else(|| here.clone());
+    let near: Vec<PathBuf> = [here, base.join("bin"), base.join("scripts")]
+        .into_iter()
         .chain(path_dirs)
         .chain([PathBuf::from("/usr/bin")])
-        .map(|d| d.join("mysql"))
-        .find(|p| p.exists())?;
-    Some(Bins { mysqld, mysql })
+        .collect();
+    let find = |names: &[&str]| {
+        near.iter()
+            .flat_map(|d| names.iter().map(move |n| d.join(n)))
+            .find(|p| p.exists())
+    };
+    let mysql = find(&["mysql", "mariadb"])?;
+    let version = Command::new(&mysqld).arg("--version").output().ok()?;
+    let install_db = if String::from_utf8_lossy(&version.stdout).contains("MariaDB") {
+        Some(find(&["mariadb-install-db", "mysql_install_db"])?)
+    } else {
+        None
+    };
+    Some(Bins {
+        mysqld,
+        mysql,
+        install_db,
+    })
 }
 
 fn is_root() -> bool {
@@ -178,16 +267,18 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-extern "C" fn stop_server() {
-    let pid = PID.load(Ordering::SeqCst);
-    if pid > 0 {
-        // SAFETY: plain system calls on a child process we started.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
+extern "C" fn stop_servers() {
+    let Ok(started) = STARTED.try_lock() else {
+        return;
+    };
+    for (pid, dir) in started.iter() {
+        if *pid > 0 {
+            // SAFETY: plain system calls on a child process we started.
+            unsafe {
+                libc::kill(*pid, libc::SIGKILL);
+                libc::waitpid(*pid, std::ptr::null_mut(), 0);
+            }
         }
-    }
-    if let Some(dir) = DIR.get() {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
@@ -210,29 +301,80 @@ fn mysqld(bins: &Bins) -> Command {
     cmd
 }
 
-fn start(bins: Bins) -> Server {
+/// The directory above the one `mysqld` is in: the root of a tarball, or
+/// `/usr`.
+fn base_dir(bins: &Bins) -> PathBuf {
+    let here = bins.mysqld.parent().unwrap();
+    here.parent().unwrap_or(here).to_owned()
+}
+
+/// MariaDB's options for where its files are, which a server outside the
+/// place it was built for does not find by itself.
+fn mariadb_dirs(bins: &Bins) -> Vec<String> {
+    let base = base_dir(bins);
+    let mut args = vec![format!("--basedir={}", base.display())];
+    let share = ["share/mariadb", "share/mysql", "share"]
+        .iter()
+        .map(|d| base.join(d))
+        .find(|d| d.join("english/errmsg.sys").exists());
+    if let Some(share) = share {
+        args.push(format!("--lc-messages-dir={}", share.display()));
+    }
+    let plugins = ["lib/mysql/plugin", "lib/plugin"]
+        .iter()
+        .map(|d| base.join(d))
+        .find(|d| d.exists());
+    if let Some(plugins) = plugins {
+        args.push(format!("--plugin-dir={}", plugins.display()));
+    }
+    args
+}
+
+fn start(bins: Bins, role: Role) -> Server {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos()
         % 1_000_000_000;
+    let name = match role {
+        Role::Main => "my",
+        Role::Odd => "my2",
+    };
     // Short: the socket's path must fit in 107 bytes.
-    let dir = std::env::temp_dir().join(format!("giong-my-{}-{stamp}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("giong-{name}-{}-{stamp}", std::process::id()));
     let data = dir.join("data");
     std::fs::create_dir_all(&dir).unwrap();
-    DIR.set(dir.clone()).unwrap();
+    STARTED.lock().unwrap().push((0, dir.clone()));
     // SAFETY: registering a plain function to run at exit.
-    unsafe { libc::atexit(stop_server) };
+    AT_EXIT.call_once(|| unsafe {
+        libc::atexit(stop_servers);
+    });
+    let mariadb = bins.install_db.is_some();
 
-    let out = mysqld(&bins)
-        .arg("--initialize-insecure")
-        .arg(format!("--datadir={}", data.display()))
-        .arg(format!("--log-error={}", dir.join("init.log").display()))
-        .output()
-        .expect("run mysqld --initialize-insecure");
+    let out = match &bins.install_db {
+        None => mysqld(&bins)
+            .arg("--initialize-insecure")
+            .arg(format!("--datadir={}", data.display()))
+            .arg(format!("--log-error={}", dir.join("init.log").display()))
+            .output()
+            .expect("run mysqld --initialize-insecure"),
+        Some(install_db) => {
+            let mut cmd = Command::new(install_db);
+            cmd.arg("--no-defaults");
+            if is_root() {
+                cmd.arg("--user=root");
+            }
+            cmd.args(mariadb_dirs(&bins))
+                .arg(format!("--datadir={}", data.display()))
+                .args(["--auth-root-authentication-method=normal", "--skip-test-db"])
+                .output()
+                .expect("run mariadb-install-db")
+        }
+    };
     assert!(
         out.status.success(),
-        "mysqld --initialize-insecure failed: {}{}",
+        "setting up the data directory failed: {}{}{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
         std::fs::read_to_string(dir.join("init.log")).unwrap_or_default()
     );
@@ -268,20 +410,8 @@ fn start(bins: Bins) -> Server {
         .arg(format!("--socket={}", socket.display()))
         .arg(format!("--pid-file={}", dir.join("mysqld.pid").display()))
         .arg(format!("--log-error={}", dir.join("server.log").display()))
-        .arg(format!("--ssl-ca={}", dir.join("ca.pem").display()))
-        .arg(format!(
-            "--ssl-cert={}",
-            dir.join("server-cert.pem").display()
-        ))
-        .arg(format!(
-            "--ssl-key={}",
-            dir.join("server-key.pem").display()
-        ))
         .args([
-            "--mysqlx=OFF",
-            "--secure-file-priv=NULL",
             "--skip-name-resolve",
-            "--skip-log-bin",
             "--innodb-flush-log-at-trx-commit=0",
             "--innodb-doublewrite=0",
             "--max-connections=300",
@@ -289,8 +419,35 @@ fn start(bins: Bins) -> Server {
             // MySQL 8.4 has the plugin off by default; 8.0 does not know the
             // option, which `loose` lets it ignore.
             "--loose-mysql-native-password=ON",
-        ])
-        .stdin(Stdio::null())
+        ]);
+    if mariadb {
+        // Off by default on MariaDB; the tests look at sessions there.
+        cmd.args(mariadb_dirs(&bins)).arg("--performance-schema=ON");
+    } else {
+        cmd.args(["--mysqlx=OFF", "--secure-file-priv=NULL", "--skip-log-bin"]);
+    }
+    // MySQL makes certificates of its own when given none, as most
+    // installations use them: with no name in them, for the server's own
+    // authority. MariaDB 10 makes none.
+    let auto_certificates = role == Role::Odd && !mariadb;
+    if !auto_certificates {
+        cmd.arg(format!("--ssl-ca={}", dir.join("ca.pem").display()))
+            .arg(format!(
+                "--ssl-cert={}",
+                dir.join("server-cert.pem").display()
+            ))
+            .arg(format!(
+                "--ssl-key={}",
+                dir.join("server-key.pem").display()
+            ));
+    }
+    if role == Role::Odd {
+        cmd.args([
+            "--init-connect=SET NAMES latin1",
+            "--innodb-rollback-on-timeout=ON",
+        ]);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     std::thread::spawn(move || {
@@ -308,15 +465,25 @@ fn start(bins: Bins) -> Server {
         let _ = child.wait();
     });
     let pid = rx.recv().unwrap();
-    PID.store(pid as i32, Ordering::SeqCst);
+    STARTED
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|(_, d)| *d == dir)
+        .unwrap()
+        .0 = pid as i32;
 
     let mut server = Server {
         port,
         socket,
         ca_pem: ca.pem().into_bytes(),
+        ca_file: dir.join("ca.pem"),
+        auto_certificates,
         public_key_pem: Vec::new(),
         has_native: false,
         has_sha256: false,
+        has_caching_sha2: !mariadb,
+        mariadb,
         version: String::new(),
         dir,
         bins,
@@ -334,7 +501,7 @@ fn start(bins: Bins) -> Server {
                 .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
                 .unwrap_or_else(|e| e.to_string());
             panic!(
-                "MySQL did not answer {} within 60 s.\nThe client says: {client}\nThe server's log:\n{}",
+                "The server did not answer {} within 60 s.\nThe client says: {client}\nThe server's log:\n{}",
                 server.bins.mysql.display(),
                 server.log()
             );
@@ -342,22 +509,43 @@ fn start(bins: Bins) -> Server {
         std::thread::sleep(Duration::from_millis(50));
     }
     server.version = server.sql("SELECT VERSION()").trim().to_owned();
+    if auto_certificates {
+        server.ca_file = data.join("ca.pem");
+        server.ca_pem = std::fs::read(&server.ca_file).expect("MySQL made its certificates");
+    }
     server.public_key_pem = std::fs::read(data.join("public_key.pem")).unwrap_or_default();
 
+    if mariadb {
+        // Anonymous users would win over 'user'@'%' for logins from
+        // localhost.
+        server.sql("DELETE FROM mysql.global_priv WHERE User = ''; FLUSH PRIVILEGES");
+    }
     server.sql(&format!("CREATE DATABASE {DATABASE}"));
+    // MariaDB has no caching_sha2_password: there, these users have its
+    // default, mysql_native_password.
+    let sha2 = if mariadb {
+        ""
+    } else {
+        "WITH caching_sha2_password"
+    };
     for (user, password) in [SHA2_USER, RSA_USER, KEY_USER, FAST_USER] {
         server.sql(&format!(
-            "CREATE USER '{user}'@'%' IDENTIFIED WITH caching_sha2_password BY '{password}'; \
+            "CREATE USER '{user}'@'%' IDENTIFIED {sha2} BY '{password}'; \
              GRANT ALL ON {DATABASE}.* TO '{user}'@'%';"
         ));
     }
     server.sql(&format!(
-        "CREATE USER '{0}'@'%' IDENTIFIED WITH caching_sha2_password BY '{1}' REQUIRE SSL; \
+        "CREATE USER '{0}'@'%' IDENTIFIED {sha2} BY '{1}' REQUIRE SSL; \
          GRANT ALL ON {DATABASE}.* TO '{0}'@'%';",
         TLS_USER.0, TLS_USER.1
     ));
+    let native = if mariadb {
+        ""
+    } else {
+        "WITH mysql_native_password"
+    };
     server.has_native = server.try_sql(&format!(
-        "CREATE USER '{0}'@'%' IDENTIFIED WITH mysql_native_password BY '{1}'; \
+        "CREATE USER '{0}'@'%' IDENTIFIED {native} BY '{1}'; \
          GRANT ALL ON {DATABASE}.* TO '{0}'@'%';",
         NATIVE_USER.0, NATIVE_USER.1
     ));
@@ -367,7 +555,7 @@ fn start(bins: Bins) -> Server {
         SHA256_USER.0, SHA256_USER.1
     ));
     eprintln!(
-        "MySQL {} on port {port} (mysql_native_password: {}, sha256_password: {})",
+        "{} on port {port} (mysql_native_password: {}, sha256_password: {})",
         server.version, server.has_native, server.has_sha256
     );
     server

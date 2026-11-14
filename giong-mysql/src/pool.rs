@@ -1,6 +1,7 @@
 //! A pool of connections for one worker thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -9,10 +10,11 @@ use std::time::Duration;
 
 use giong::time::Instant;
 
-use crate::client::{Client, Transaction};
+use crate::client::{Client, Counters, Transaction};
 use crate::config::Config;
 use crate::error::{Error, ErrorKind};
 use crate::row::Row;
+use crate::session;
 use crate::types::ToSql;
 
 /// How long a connection's oldest statement may have been running before
@@ -57,20 +59,47 @@ const STALLED: Duration = Duration::from_millis(5);
 /// on its connection. Statements that wait on disk or on locks need more.
 ///
 /// [`get`](Self::get) takes a connection for one task alone, for a
-/// transaction or for session settings. While it is out, no shared statement
-/// runs on it. It comes back when the [`PooledClient`] is dropped; if a
-/// transaction was left open, or a statement is still on its way, a
-/// `ROLLBACK` is queued first. One left with autocommit off is closed.
+/// transaction, for statements known to be slow, or for statements that
+/// need the session (`SET`, `LOCK TABLES`, temporary tables). While it is
+/// out, no shared statement runs on it. A task waiting in `get` is not
+/// starved by shared statements: the pool sets a connection aside for it
+/// and hands it over as soon as the statements already on it are answered.
+/// Waiting tasks are served in order.
 ///
-/// **Transactions never run on the shared connections**, since the
-/// statements of other tasks would run inside them. `query`, `query_one`,
-/// `query_opt`, `execute` and `insert` refuse `START TRANSACTION`, `COMMIT`,
-/// `ROLLBACK`, `LOCK TABLES` and the like before sending anything
-/// ([`ErrorKind::Statement`]). [`batch_execute`](Self::batch_execute) may
-/// carry a whole transaction (`START TRANSACTION; ...; COMMIT`); if a batch
-/// leaves one open, or autocommit off, its connection is closed, which rolls
-/// it back, and the batch and every statement sent on that connection after
-/// it fail with [`ErrorKind::Closed`].
+/// **A connection comes back clean.** When the [`PooledClient`] is dropped,
+/// a connection whose session may have changed is reset before anything
+/// else runs on it: `COM_RESET_CONNECTION` (which rolls back, releases table
+/// and named locks, drops temporary tables, forgets variables), then the
+/// session settings of [`Config`] again, both queued at once with no round
+/// trip waited for. The reset also frees the connection's prepared
+/// statements, so it is skipped when the connection ran only plain
+/// statements (`SELECT`, `INSERT`, `UPDATE`, `DELETE` ... with no user
+/// variable or named lock) in transactions or on their own, and the server
+/// reported no change: a transaction of plain statements keeps the
+/// statement cache. A stored function or trigger that takes a named lock
+/// or sets a user variable with `SELECT ... INTO` is not reported by the
+/// server; call [`Client::reset_session`] before dropping such a
+/// connection.
+///
+/// **Transactions and session changes never run on the shared
+/// connections**, since the statements of other tasks would run inside them.
+/// `query`, `query_one`, `query_opt`, `execute` and `insert` refuse `START
+/// TRANSACTION`, `COMMIT`, `ROLLBACK`, `LOCK TABLES`, `SET` (but `SET
+/// GLOBAL`), `USE`, temporary tables, `GET_LOCK` and assignments to user
+/// variables before sending anything ([`ErrorKind::Statement`]).
+/// [`batch_execute`](Self::batch_execute) may carry a whole transaction
+/// (`START TRANSACTION; ...; COMMIT`); if a batch leaves one open, or
+/// autocommit off, its connection is closed, which rolls it back, and the
+/// batch and every statement sent on that connection after it fail with
+/// [`ErrorKind::Closed`]. A batch that may change the session is followed
+/// by a reset at once, and so is any statement the server reports changed
+/// it (through a trigger or a stored procedure).
+///
+/// **Prepared statements.** Each connection keeps up to
+/// [`Config::statement_cache_capacity`] statements prepared on the server,
+/// and the server's `max_prepared_stmt_count` (16,382 by default) bounds
+/// the total of all its clients: processes × workers × `max_size` ×
+/// capacity must stay below it.
 ///
 /// Connections the server closed, or that broke, are left behind as soon as
 /// that is noticed, which is when it happens: each connection is read
@@ -120,34 +149,94 @@ impl giong::observe::Source for Observed {
             ("opened", s.opened),
             ("connect_errors", s.connect_errors),
             ("timeouts", s.timeouts),
+            ("draining", n(s.draining)),
+            ("resets", s.resets),
+            ("statement_limit_errors", s.statement_limit_errors),
         ]
     }
 }
 
 fn stats_of(st: &State) -> PoolStats {
     PoolStats {
-        connections: st.shared.len() + st.taken,
+        connections: st.shared.len() + st.draining.len() + st.taken,
         taken: st.taken,
         connecting: st.connecting,
-        in_flight: st.shared.iter().map(|c| c.in_flight()).sum(),
+        in_flight: st
+            .shared
+            .iter()
+            .chain(&st.draining)
+            .map(|c| c.in_flight())
+            .sum(),
         waiting: st.waiting,
         opened: st.opened,
         connect_errors: st.connect_errors,
         timeouts: st.timeouts,
+        draining: st.draining.len(),
+        resets: st.counters.resets.get(),
+        statement_limit_errors: st.counters.statement_limit_errors.get(),
     }
 }
 
 #[derive(Default)]
 struct State {
-    /// Open connections that are not taken.
+    /// Open connections that are not taken, and that shared statements
+    /// use.
     shared: Vec<Rc<Client>>,
+    /// Open connections set aside for tasks waiting in [`Pool::get`]: no
+    /// new shared statement is sent on them, and the oldest waiting task
+    /// takes one as soon as the statements on it are answered.
+    draining: Vec<Rc<Client>>,
     taken: usize,
     connecting: usize,
     waiting: usize,
     waiters: Vec<Waker>,
+    /// The tasks waiting in `get`, oldest first.
+    tickets: VecDeque<u64>,
+    next_ticket: u64,
     opened: u64,
     connect_errors: u64,
     timeouts: u64,
+    counters: Rc<Counters>,
+}
+
+impl State {
+    fn open(&self) -> usize {
+        self.shared.len() + self.draining.len() + self.taken + self.connecting
+    }
+
+    /// Sets aside one connection for each task waiting in `get`, keeping one
+    /// for shared statements when the pool has room for more than one.
+    fn rebalance(&mut self, max: usize) {
+        let open = self.shared.len() + self.draining.len();
+        let room = if max == 1 {
+            open
+        } else {
+            open.saturating_sub(1)
+        };
+        let want = self.tickets.len().min(room);
+        while self.draining.len() < want {
+            // The one that frees up first: the fewest statements in flight.
+            let Some((i, _)) = self
+                .shared
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, c)| (c.in_flight(), Rc::strong_count(c)))
+            else {
+                break;
+            };
+            let c = self.shared.swap_remove(i);
+            self.draining.push(c);
+        }
+        while self.draining.len() > want {
+            let c = self.draining.pop().expect("more than wanted");
+            self.shared.push(c);
+        }
+    }
+}
+
+/// Free for a task of its own: nobody borrows it and nothing is in flight.
+fn idle(c: &Rc<Client>) -> bool {
+    Rc::strong_count(c) == 1 && c.in_flight() == 0
 }
 
 /// What a pool is doing, from [`Pool::stats`].
@@ -170,6 +259,15 @@ pub struct PoolStats {
     pub connect_errors: u64,
     /// Waits that ended with [`ErrorKind::PoolTimeout`].
     pub timeouts: u64,
+    /// Connections set aside for tasks waiting in [`Pool::get`].
+    pub draining: usize,
+    /// Sessions reset when a connection taken with [`Pool::get`] came back,
+    /// or after a shared statement changed one.
+    pub resets: u64,
+    /// Prepares the server refused because its `max_prepared_stmt_count`
+    /// was reached (error 1461), each retried once after closing unused
+    /// statements.
+    pub statement_limit_errors: u64,
 }
 
 enum Decision<T> {
@@ -197,6 +295,32 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// A task's place in the line for [`Pool::get`]: given up however the wait
+/// ends, so that no connection stays set aside for nobody.
+struct Ticket<'a> {
+    pool: &'a Pool,
+    number: Cell<Option<u64>>,
+}
+
+impl Ticket<'_> {
+    /// Leaves the line (the caller holds the state).
+    fn leave(&self, st: &mut State) {
+        if let Some(n) = self.number.take() {
+            st.tickets.retain(|&t| t != n);
+            st.rebalance(self.pool.inner.max_size);
+        }
+    }
+}
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        if self.number.get().is_some() {
+            self.leave(&mut self.pool.inner.state.borrow_mut());
+            self.pool.notify();
+        }
+    }
+}
+
 impl Pool {
     /// A pool of at most `max_size` connections to the server in `config`.
     /// Connections are opened when needed, not here.
@@ -212,7 +336,7 @@ impl Pool {
             max_size > 0,
             "a pool needs room for at least one connection"
         );
-        let state = Rc::new(RefCell::default());
+        let state: Rc<RefCell<State>> = Rc::new(RefCell::default());
         let observed = Rc::new(Observed {
             name: config.describe(),
             max_size,
@@ -246,11 +370,11 @@ impl Pool {
     }
 
     /// Runs a statement on a shared connection and returns its rows; see
-    /// [`Client::query`]. Transaction statements are refused
-    /// ([`ErrorKind::Statement`]): run them on a connection from
-    /// [`get`](Self::get).
+    /// [`Client::query`]. Transaction statements and statements that change
+    /// the session are refused ([`ErrorKind::Statement`]): run them on a
+    /// connection from [`get`](Self::get).
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
-        refuse_transaction(sql)?;
+        refuse_on_shared(sql)?;
         let client = self.shared().await?;
         client.query(sql, params).await
     }
@@ -258,7 +382,7 @@ impl Pool {
     /// Runs a statement that returns exactly one row; see
     /// [`Client::query_one`]. Transaction statements are refused.
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
-        refuse_transaction(sql)?;
+        refuse_on_shared(sql)?;
         let client = self.shared().await?;
         client.query_one(sql, params).await
     }
@@ -266,7 +390,7 @@ impl Pool {
     /// Runs a statement that returns at most one row; see
     /// [`Client::query_opt`]. Transaction statements are refused.
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
-        refuse_transaction(sql)?;
+        refuse_on_shared(sql)?;
         let client = self.shared().await?;
         client.query_opt(sql, params).await
     }
@@ -274,7 +398,7 @@ impl Pool {
     /// Runs a statement and returns the number of rows it changed; see
     /// [`Client::execute`]. Transaction statements are refused.
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
-        refuse_transaction(sql)?;
+        refuse_on_shared(sql)?;
         let client = self.shared().await?;
         client.execute(sql, params).await
     }
@@ -282,7 +406,7 @@ impl Pool {
     /// Runs an `INSERT` and returns the `AUTO_INCREMENT` value it generated;
     /// see [`Client::insert`]. Transaction statements are refused.
     pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
-        refuse_transaction(sql)?;
+        refuse_on_shared(sql)?;
         let client = self.shared().await?;
         client.insert(sql, params).await
     }
@@ -301,8 +425,8 @@ impl Pool {
         client.batch_execute(sql).await
     }
 
-    /// Takes a connection for this task alone, for a transaction or session
-    /// settings:
+    /// Takes a connection for this task alone, for a transaction, session
+    /// settings or a slow statement:
     ///
     /// ```no_run
     /// # async fn f(pool: &giong_mysql::Pool) -> Result<(), giong_mysql::Error> {
@@ -313,37 +437,73 @@ impl Pool {
     /// # Ok(()) }
     /// ```
     ///
-    /// Waits up to the [wait timeout](Self::wait_timeout) when every
-    /// connection is taken or busy and the pool is full.
+    /// When the pool is full and no connection is free, the task waits, in
+    /// order with the other tasks waiting here, up to the [wait
+    /// timeout](Self::wait_timeout): a connection is set aside for it (no new
+    /// shared statement goes on it) and handed over once the statements
+    /// already on it are answered, so shared statements cannot keep it
+    /// waiting. When the pool has room for more than one connection, one is
+    /// always left to the shared statements.
+    ///
+    /// The connection goes back when the [`PooledClient`] is dropped, and its
+    /// session is reset first if it may have changed (see the type's
+    /// documentation).
     pub async fn get(&self) -> Result<PooledClient, Error> {
+        let ticket = Ticket {
+            pool: self,
+            number: Cell::new(None),
+        };
         let client = self
             .acquire(|st, max| {
-                let idle = st
-                    .shared
-                    .iter()
-                    .position(|c| Rc::strong_count(c) == 1 && c.in_flight() == 0);
-                if let Some(i) = idle {
-                    let c = st.shared.swap_remove(i);
-                    st.taken += 1;
-                    return match Rc::try_unwrap(c) {
-                        Ok(client) => {
-                            client.set_shared(false);
-                            Decision::Ready(client)
-                        }
-                        Err(_) => unreachable!("checked: nobody else holds it"),
+                let my_turn = match ticket.number.get() {
+                    None => st.tickets.is_empty(),
+                    Some(n) => st.tickets.front() == Some(&n),
+                };
+                if my_turn {
+                    // A connection set aside for this task, else any free
+                    // one.
+                    let found = match st.draining.iter().position(idle) {
+                        Some(i) => Some(st.draining.swap_remove(i)),
+                        None => st
+                            .shared
+                            .iter()
+                            .position(idle)
+                            .map(|i| st.shared.swap_remove(i)),
                     };
+                    if let Some(c) = found {
+                        st.taken += 1;
+                        ticket.leave(st);
+                        return match Rc::try_unwrap(c) {
+                            Ok(client) => {
+                                client.set_shared(false);
+                                Decision::Ready(client)
+                            }
+                            Err(_) => unreachable!("checked: nobody else holds it"),
+                        };
+                    }
                 }
-                if st.shared.len() + st.taken + st.connecting < max {
+                if st.open() < max {
                     st.connecting += 1;
-                    Decision::Connect
-                } else {
-                    Decision::Wait
+                    ticket.leave(st);
+                    return Decision::Connect;
                 }
+                if ticket.number.get().is_none() {
+                    let n = st.next_ticket;
+                    st.next_ticket += 1;
+                    st.tickets.push_back(n);
+                    ticket.number.set(Some(n));
+                }
+                st.rebalance(max);
+                Decision::Wait
             })
-            .await?;
+            .await;
+        // Whoever is next in line may be able to go now.
+        drop(ticket);
+        let client = client?;
         let client = match client {
             Ok(c) => c,
             Err(new) => {
+                new.count_into(self.inner.state.borrow().counters.clone());
                 self.inner.state.borrow_mut().taken += 1;
                 new
             }
@@ -370,7 +530,7 @@ impl Pool {
         let client = self
             .acquire(|st, max| {
                 let now = Instant::now();
-                let room = st.shared.len() + st.taken + st.connecting < max;
+                let room = st.open() < max;
                 // Busy means used by other tasks right now.
                 let best = st
                     .shared
@@ -398,8 +558,10 @@ impl Pool {
             Ok(c) => c,
             Err(new) => {
                 new.set_shared(true);
+                let mut st = self.inner.state.borrow_mut();
+                new.count_into(st.counters.clone());
                 let c = Rc::new(new);
-                self.inner.state.borrow_mut().shared.push(c.clone());
+                st.shared.push(c.clone());
                 c
             }
         };
@@ -428,6 +590,7 @@ impl Pool {
             let decision = {
                 let mut st = self.inner.state.borrow_mut();
                 st.shared.retain(|c| !c.is_closed());
+                st.draining.retain(|c| !c.is_closed());
                 decide(&mut st, self.inner.max_size)
             };
             match decision {
@@ -462,7 +625,7 @@ impl Pool {
                         // tasks stopped waiting (a timeout dropped them) is
                         // free once they are answered, which nothing else
                         // would announce.
-                        for c in &st.shared {
+                        for c in st.shared.iter().chain(&st.draining) {
                             if Rc::strong_count(c) == 1 && c.in_flight() > 0 {
                                 c.wake_when_idle(cx.waker());
                             }
@@ -515,73 +678,52 @@ impl Drop for Lent<'_> {
     }
 }
 
-/// Refuses a statement that controls a transaction, which must not run on a
-/// connection that other tasks share.
-fn refuse_transaction(sql: &str) -> Result<(), Error> {
-    let words = leading_words(sql);
-    let word = |i: usize| words.get(i).map_or("", String::as_str);
-    let refused = match word(0) {
-        "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "XA" => true,
-        // Table locks belong to the session, and LOCK TABLES commits.
-        "LOCK" | "UNLOCK" => true,
-        _ => false,
-    };
-    if !refused {
-        return Ok(());
+/// Refuses a statement that controls a transaction or changes the session,
+/// which must not run on a connection that other tasks share.
+fn refuse_on_shared(sql: &str) -> Result<(), Error> {
+    let words = session::Words::of(sql);
+    // Table locks belong to the session, and LOCK TABLES commits.
+    let refused = words.is(
+        0,
+        &[
+            "BEGIN",
+            "START",
+            "COMMIT",
+            "ROLLBACK",
+            "SAVEPOINT",
+            "RELEASE",
+            "XA",
+            "LOCK",
+            "UNLOCK",
+        ],
+    );
+    if refused {
+        return Err(Error::new(
+            ErrorKind::Statement,
+            format!(
+                "{} controls a transaction, and the pool's own methods run statements on \
+                 connections that other tasks share, whose statements would run inside it; \
+                 nothing was sent. Run the transaction on a connection of this task's own: \
+                 let mut conn = pool.get().await?; let tx = conn.transaction().await?; ...; \
+                 tx.commit().await?",
+                words.get(0).to_ascii_uppercase()
+            ),
+        ));
     }
-    Err(Error::new(
-        ErrorKind::Statement,
-        format!(
-            "{} controls a transaction, and the pool's own methods run statements on \
-             connections that other tasks share, whose statements would run inside it; \
-             nothing was sent. Run the transaction on a connection of this task's own: \
-             let mut conn = pool.get().await?; let tx = conn.transaction().await?; ...; \
-             tx.commit().await?",
-            word(0)
-        ),
-    ))
-}
-
-/// The first two words of `sql`, upper-cased, after blanks and comments.
-fn leading_words(sql: &str) -> Vec<String> {
-    let b = sql.as_bytes();
-    let mut i = 0;
-    let mut words = Vec::new();
-    while words.len() < 2 && i < b.len() {
-        match b[i] {
-            c if c.is_ascii_whitespace() => i += 1,
-            // `-- ` needs a blank or control after the dashes in MySQL.
-            b'-' if b.get(i + 1) == Some(&b'-')
-                && b.get(i + 2)
-                    .map_or(true, |c| c.is_ascii_whitespace() || c.is_ascii_control()) =>
-            {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'#' => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                // MySQL's block comments do not nest.
-                i = match sql[i + 2..].find("*/") {
-                    Some(end) => i + 2 + end + 2,
-                    None => b.len(),
-                };
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                words.push(sql[start..i].to_ascii_uppercase());
-            }
-            _ => break,
-        }
+    if let Some(why) = session::changes_in(&words, sql) {
+        return Err(Error::new(
+            ErrorKind::Statement,
+            format!(
+                "{why}, and the pool's own methods run statements on connections that other \
+                 tasks share: the change would reach their statements, and this task's next \
+                 statement may run on another connection; nothing was sent. Run it on a \
+                 connection of this task's own, let conn = pool.get().await?, whose session \
+                 is reset when it goes back to the pool, or set session variables for every \
+                 connection with Config::session_variable"
+            ),
+        ));
     }
-    words
+    Ok(())
 }
 
 impl std::fmt::Debug for Pool {
@@ -628,14 +770,16 @@ impl Drop for PooledClient {
         {
             let mut st = self.pool.inner.state.borrow_mut();
             st.taken -= 1;
-            // Autocommit off would put every shared statement after it in
-            // one transaction: such a connection is closed instead.
-            let idle = client.in_flight() == 0;
-            if !client.is_closed() && (client.autocommit() || !idle) {
-                // Queued ahead of anything a shared statement sends next.
-                client.reset_transaction();
+            // Queued ahead of anything sent on the connection next: the
+            // reset rolls back, unlocks and forgets, and sets the session up
+            // again. A reset that fails closes the connection.
+            if !client.is_closed() && client.needs_reset() {
+                client.queue_reset();
+            }
+            if !client.is_closed() {
                 client.set_shared(true);
                 st.shared.push(Rc::new(client));
+                st.rebalance(self.pool.inner.max_size);
             }
         }
         self.pool.notify();

@@ -17,7 +17,7 @@ workspace, nine crates and an example service:
 | `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
-| `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
+| `giong-mysql/` | `giong-mysql` | a MySQL and MariaDB client and per-worker pool |
 | `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
@@ -58,7 +58,7 @@ Where the code is:
   ThreadSanitizer only.
 - **Database servers, for the database crates' tests.** giong-postgres, giong-mysql and
   giong-redis start their own throwaway server from the installed binaries (PostgreSQL's
-  `initdb`/`postgres`, `mysqld`, `redis-server`) and skip, with a message, when they are
+  `initdb`/`postgres`, `mysqld` or `mariadbd`, `redis-server`) and skip, with a message, when they are
   missing. `GIONG_PG_REQUIRED=1`, `GIONG_MYSQL_REQUIRED=1` and `GIONG_REDIS_REQUIRED=1`
   turn a missing server into a failure, as CI does; each crate's README says where the
   binaries are looked for.

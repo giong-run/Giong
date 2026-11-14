@@ -284,7 +284,7 @@ fn a_connection_given_back_with_begin_in_flight_is_rolled_back() {
 }
 
 #[test]
-fn a_connection_given_back_with_autocommit_off_is_closed() {
+fn a_connection_given_back_with_autocommit_off_is_reset() {
     run(|s| async move {
         let pool = Pool::new(s.local(), 1);
         pool.batch_execute("DROP TABLE IF EXISTS pool_ac; CREATE TABLE pool_ac (id INT)")
@@ -297,8 +297,10 @@ fn a_connection_given_back_with_autocommit_off_is_closed() {
         pool.execute("INSERT INTO pool_ac VALUES (1)", &[])
             .await
             .unwrap();
+        // Committed: autocommit is on again, on the same connection.
         assert_eq!(s.sql("SELECT id FROM giong.pool_ac").trim(), "1");
-        assert_eq!(pool.stats().opened, 2);
+        assert_eq!(pool.stats().opened, 1);
+        assert_eq!(pool.stats().resets, 1);
     });
 }
 
@@ -329,5 +331,365 @@ fn a_waiting_task_hears_when_a_dropped_statement_frees_the_connection() {
         // into the timeout.
         assert!(waited < Duration::from_secs(2), "waited {waited:?}");
         sleep(Duration::from_millis(1)).await;
+    });
+}
+
+#[test]
+fn a_taken_connection_comes_back_with_a_clean_session() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        pool.batch_execute("DROP TABLE IF EXISTS pool_clean; CREATE TABLE pool_clean (x INT)")
+            .await
+            .unwrap();
+        let session = "SELECT @@sql_mode, @@time_zone, @@foreign_key_checks, DATABASE(), \
+                       @secret, @selected";
+        let before = pool.query_one(session, &[]).await.unwrap();
+        {
+            let conn = pool.get().await.unwrap();
+            conn.batch_execute(
+                "SET SESSION sql_mode = ''; SET time_zone = '+07:00'; \
+                 SET foreign_key_checks = 0; SET @secret = 'user-a-token'; \
+                 CREATE TEMPORARY TABLE pool_clean (y INT); USE mysql",
+            )
+            .await
+            .unwrap();
+            conn.query("SELECT 1 INTO @selected", &[]).await.unwrap();
+        }
+        let after = pool.query_one(session, &[]).await.unwrap();
+        assert_eq!(
+            after.get::<String>(0).unwrap(),
+            before.get::<String>(0).unwrap()
+        );
+        assert_eq!(after.get::<&str>(1).unwrap(), "+00:00");
+        assert_eq!(after.get::<i64>(2).unwrap(), 1);
+        assert_eq!(after.get::<&str>(3).unwrap(), "giong");
+        assert_eq!(
+            after.get::<Option<String>>(4).unwrap(),
+            None,
+            "no user variable"
+        );
+        assert_eq!(after.get::<Option<i64>>(5).unwrap(), None);
+        // The real table, not the temporary one that shadowed it.
+        pool.execute("INSERT INTO pool_clean (x) VALUES (1)", &[])
+            .await
+            .unwrap();
+        // Timestamps read right: the time zone is UTC again.
+        let epoch: std::time::SystemTime = pool
+            .query_one("SELECT FROM_UNIXTIME(0)", &[])
+            .await
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(epoch, std::time::UNIX_EPOCH);
+        let stats = pool.stats();
+        assert_eq!((stats.opened, stats.resets), (1, 1), "{stats:?}");
+    });
+}
+
+#[test]
+fn locks_taken_on_a_taken_connection_are_released_when_it_comes_back() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        pool.batch_execute(
+            "DROP TABLE IF EXISTS pool_lt1, pool_lt2; CREATE TABLE pool_lt1 (x INT); \
+             CREATE TABLE pool_lt2 (x INT)",
+        )
+        .await
+        .unwrap();
+        {
+            let conn = pool.get().await.unwrap();
+            conn.batch_execute("LOCK TABLES pool_lt1 WRITE")
+                .await
+                .unwrap();
+            let got: i64 = conn
+                .query_one("SELECT GET_LOCK('giong-pool-test', 0)", &[])
+                .await
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(got, 1);
+        }
+        // Not "Table 'pool_lt2' was not locked with LOCK TABLES" (1100).
+        pool.query("SELECT * FROM pool_lt2", &[]).await.unwrap();
+        // Another session gets the named lock and the table at once.
+        assert_eq!(
+            s.sql("SELECT GET_LOCK('giong-pool-test', 0)").trim(),
+            "1",
+            "the named lock was released"
+        );
+        s.sql("SET SESSION lock_wait_timeout = 5; INSERT INTO giong.pool_lt1 VALUES (1)");
+    });
+}
+
+#[test]
+fn a_connection_that_only_ran_plain_statements_keeps_its_prepared_statements() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        pool.batch_execute("DROP TABLE IF EXISTS pool_keep; CREATE TABLE pool_keep (x INT)")
+            .await
+            .unwrap();
+        let resets = pool.stats().resets;
+        for i in 0..3i64 {
+            let mut conn = pool.get().await.unwrap();
+            conn.query("SELECT x FROM pool_keep WHERE x = ?", &[&i])
+                .await
+                .unwrap();
+            let tx = conn.transaction().await.unwrap();
+            tx.execute("INSERT INTO pool_keep VALUES (?)", &[&i])
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        assert_eq!(pool.stats().resets, resets, "no reset was needed");
+        // So the statements were prepared once each.
+        let prepares: i64 = pool
+            .query_one(
+                "SELECT COUNT(*) FROM performance_schema.prepared_statements_instances \
+                 WHERE SQL_TEXT LIKE '%pool_keep%' AND SQL_TEXT NOT LIKE '%performance_schema%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(prepares, 2);
+    });
+}
+
+#[test]
+fn statements_that_change_the_session_are_refused_on_shared_connections() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        for sql in [
+            "SET sql_mode = ''",
+            "set @@session.time_zone = '+07:00'",
+            "SET @token = 'a'",
+            "SET NAMES latin1",
+            "USE mysql",
+            "CREATE TEMPORARY TABLE pool_tmp (x INT)",
+            "SELECT GET_LOCK('x', 0)",
+            "SELECT 1 INTO @v",
+            "SELECT @v := 1",
+            "PREPARE p FROM 'SELECT 1'",
+            "HANDLER pool_tmp OPEN",
+        ] {
+            let e = pool.execute(sql, &[]).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Statement, "{sql:?}: {e}");
+            assert!(e.to_string().contains("pool.get()"), "{e}");
+            assert!(e.to_string().contains("session_variable"), "{e}");
+        }
+        // Reading is fine, and so is changing the server for everyone.
+        pool.query("SELECT @@sql_mode, @v, @@global.max_connections", &[])
+            .await
+            .unwrap();
+        pool.execute("SET GLOBAL max_connections = 300", &[])
+            .await
+            .unwrap();
+        assert_eq!(pool.stats().opened, 1);
+    });
+}
+
+#[test]
+fn a_shared_batch_that_changes_the_session_is_followed_by_a_reset() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        pool.batch_execute("SET @batch = 1; SET time_zone = '+07:00'; DO 1")
+            .await
+            .unwrap();
+        let row = pool
+            .query_one("SELECT @batch, @@time_zone", &[])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(row.get::<&str>(1).unwrap(), "+00:00");
+        // A batch of plain statements needs no reset.
+        pool.batch_execute("DO 1; SELECT 1").await.unwrap();
+        let stats = pool.stats();
+        assert_eq!((stats.opened, stats.resets), (1, 1), "{stats:?}");
+    });
+}
+
+#[test]
+fn a_shared_statement_the_server_says_changed_the_session_is_followed_by_a_reset() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        // A trigger changes the session behind a plain INSERT; the server
+        // says so, and the pool resets the connection.
+        pool.batch_execute(
+            "DROP TABLE IF EXISTS pool_trig; CREATE TABLE pool_trig (x INT); \
+             CREATE TRIGGER pool_trig_set BEFORE INSERT ON pool_trig \
+             FOR EACH ROW SET @from_trigger = NEW.x",
+        )
+        .await
+        .unwrap();
+        let resets = pool.stats().resets;
+        pool.execute("INSERT INTO pool_trig VALUES (7)", &[])
+            .await
+            .unwrap();
+        let row = pool.query_one("SELECT @from_trigger", &[]).await.unwrap();
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(pool.stats().resets, resets + 1);
+    });
+}
+
+#[test]
+fn a_connection_whose_reset_fails_is_closed_rather_than_shared() {
+    run(|s| async move {
+        s.sql(
+            "DROP TABLE IF EXISTS giong.pool_conf; CREATE TABLE giong.pool_conf (n INT); \
+             INSERT INTO giong.pool_conf VALUES (4096)",
+        );
+        // The session SQL reads a table, so setting the session up again
+        // fails once the table is gone.
+        let pool = Pool::new(
+            s.local()
+                .session_variable("group_concat_max_len", "(SELECT n FROM pool_conf)"),
+            1,
+        );
+        {
+            let conn = pool.get().await.unwrap();
+            conn.batch_execute("SET @dirty = 1").await.unwrap();
+            s.sql("DROP TABLE giong.pool_conf");
+        }
+        let e = pool.query("SELECT 1", &[]).await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Closed, "{e}");
+        assert!(e.to_string().contains("resetting the session"), "{e}");
+        s.sql("CREATE TABLE giong.pool_conf (n INT); INSERT INTO giong.pool_conf VALUES (4096)");
+        let row = pool
+            .query_one("SELECT @dirty, @@group_concat_max_len", &[])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(row.get::<u64>(1).unwrap(), 4096);
+        assert_eq!(pool.stats().opened, 2);
+        s.sql("DROP TABLE giong.pool_conf");
+    });
+}
+
+#[test]
+fn get_is_not_starved_by_shared_statements() {
+    run(|s| async move {
+        for max_size in [1, 2] {
+            let pool = Pool::new(s.local(), max_size).wait_timeout(Duration::from_secs(5));
+            let stop = std::rc::Rc::new(std::cell::Cell::new(false));
+            let load: Vec<_> = (0..32)
+                .map(|_| {
+                    let (pool, stop) = (pool.clone(), stop.clone());
+                    giong::spawn(async move {
+                        let mut done = 0u64;
+                        while !stop.get() {
+                            pool.execute("DO SLEEP(0.002)", &[]).await.unwrap();
+                            done += 1;
+                        }
+                        done
+                    })
+                })
+                .collect();
+            sleep(Duration::from_millis(100)).await;
+            for _ in 0..3 {
+                let started = Instant::now();
+                let conn = pool.get().await.unwrap();
+                let waited = started.elapsed();
+                assert!(
+                    waited < Duration::from_secs(2),
+                    "pool of {max_size}: get() waited {waited:?}"
+                );
+                conn.query_one("SELECT 1", &[]).await.unwrap();
+                drop(conn);
+                sleep(Duration::from_millis(20)).await;
+            }
+            stop.set(true);
+            let mut done = 0;
+            for t in load {
+                done += t.await.unwrap();
+            }
+            assert!(done > 32, "the shared statements went on too: {done}");
+            let stats = pool.stats();
+            assert_eq!(
+                (stats.draining, stats.waiting, stats.taken),
+                (0, 0, 0),
+                "{stats:?}"
+            );
+            assert_eq!(stats.timeouts, 0);
+        }
+    });
+}
+
+#[test]
+fn tasks_waiting_in_get_are_served_in_order() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        let held = pool.get().await.unwrap();
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let waiters: Vec<_> = (0..4)
+            .map(|i| {
+                let (pool, order) = (pool.clone(), order.clone());
+                let task = giong::spawn(async move {
+                    let conn = pool.get().await.unwrap();
+                    order.borrow_mut().push(i);
+                    sleep(Duration::from_millis(5)).await;
+                    drop(conn);
+                });
+                (i, task)
+            })
+            .collect();
+        // Each in line before the next arrives.
+        for _ in 0..4 {
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(pool.stats().waiting, 4);
+        drop(held);
+        for (_, task) in waiters {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.borrow(), [0, 1, 2, 3]);
+    });
+}
+
+#[test]
+fn a_connection_set_aside_for_a_task_that_gave_up_goes_back_to_the_shared_ones() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 2).wait_timeout(Duration::from_millis(200));
+        let busy: Vec<_> = (0..2)
+            .map(|_| {
+                let pool = pool.clone();
+                giong::spawn(async move { pool.execute("DO SLEEP(1)", &[]).await })
+            })
+            .collect();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.stats().connections, 2);
+        let waiter = giong::spawn({
+            let pool = pool.clone();
+            async move { pool.get().await.map(drop) }
+        });
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.stats().draining, 1);
+        let e = waiter.await.unwrap().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PoolTimeout, "{e}");
+        assert_eq!(pool.stats().draining, 0);
+        for t in busy {
+            t.await.unwrap().unwrap();
+        }
+        // Both connections take shared statements again.
+        let stats = pool.stats();
+        assert_eq!((stats.connections, stats.draining), (2, 0), "{stats:?}");
+    });
+}
+
+#[test]
+fn without_a_database_a_connection_that_changed_it_is_closed() {
+    run(|s| async move {
+        let config = giong_mysql::Config::new()
+            .host(s.socket.to_str().unwrap())
+            .user("root");
+        let pool = Pool::new(config, 1);
+        {
+            let conn = pool.get().await.unwrap();
+            conn.batch_execute("USE mysql").await.unwrap();
+        }
+        // A reset keeps the database, and there is none to go back to.
+        let row = pool.query_one("SELECT DATABASE()", &[]).await.unwrap();
+        assert_eq!(row.get::<Option<String>>(0).unwrap(), None);
+        assert_eq!(pool.stats().opened, 2);
     });
 }
