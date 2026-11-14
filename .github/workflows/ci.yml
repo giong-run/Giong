@@ -293,13 +293,15 @@ jobs:
           # must run (5.15 on epoll, 6.1 and 6.8 without key updates, 6.18
           # with them). 6.0 is left out: giong-tls refuses its kernel TLS,
           # which can crash the kernel when a connection closes. features:
-          # the optional io_uring features giong must find.
+          # the optional io_uring features giong must find. soak: seconds of
+          # tests/soak.rs after the suite, where streams receive through
+          # packed buffer rings (the runner's kernel has none).
           - { kernel: "5.15.225", workarounds: "", features: "", ktls: "1" }
           - { kernel: "6.0.19", workarounds: "", features: "" }
           - { kernel: "6.1.155", workarounds: "", features: "", ktls: "1" }
-          - { kernel: "6.12.117", workarounds: "", features: "packed-buffers" }
+          - { kernel: "6.12.117", workarounds: "", features: "packed-buffers", soak: "60" }
           - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "", ktls: "1" }
-          - { kernel: "6.18.63", workarounds: "", features: "packed-buffers", ktls: "1" }
+          - { kernel: "6.18.63", workarounds: "", features: "packed-buffers", ktls: "1", soak: "60" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -322,6 +324,7 @@ jobs:
           GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS: ${{ matrix.workarounds }}
           GIONG_TEST_EXPECT_IO_URING_FEATURES: ${{ matrix.features }}
           KTLS: ${{ matrix.ktls || '0' }}
+          SOAK_SECS: ${{ matrix.soak || '' }}
       - name: Keep the guest's log
         if: always()
         uses: actions/upload-artifact@v4
