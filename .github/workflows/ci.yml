@@ -286,6 +286,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/check.sh loom
 
+  # The core crate's tests with each of its direct dependencies at the lowest
+  # version its Cargo.toml allows, so that the floors there are checked, not
+  # assumed: io-uring 0.7.0 to 0.7.14 once hung a busy worker's I/O, which a
+  # fresh lockfile (with the newest versions) never shows. Only the core crate
+  # for now; the other crates' floors are not all consistent yet, and a crate
+  # joins `members` here once they are.
+  minimal-versions:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Resolve the direct dependencies to their lowest versions
+        run: |
+          sed -i 's/^members = \[.*\]$/members = ["."]/' Cargo.toml
+          grep -q '^members = \["."\]$' Cargo.toml
+          cargo +nightly update -Z direct-minimal-versions
+          cargo tree -p giong --depth 1 -e normal
+      # The locked-memory limit is lifted as in the test job.
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && cargo test --release -p giong --all-features
+
   # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM),
   # on 5.15, whose io_uring lacks buffer rings: giong runs on epoll there, and
   # on the kernel Ubuntu 24.04 ships, whose buffer-ring bug (6.8.0-135 and

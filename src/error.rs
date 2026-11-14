@@ -131,6 +131,20 @@ codes! {
     /// together, unless the process has `CAP_IPC_LOCK`. The kernel's error
     /// kind (`OutOfMemory`) is kept.
     LockedMemoryLimit = 10, OutOfMemory, "the locked-memory limit is used up";
+    /// Something that needs a giong worker, such as [`spawn`](crate::spawn),
+    /// [`sleep`](crate::time::sleep) or `TcpStream::connect`, was used on a
+    /// thread where no giong runtime runs: a plain thread, or another
+    /// runtime's executor. It panics with this code, since the call site is a
+    /// bug.
+    NotInRuntime = 11, Other, "not inside a giong runtime";
+    /// [`block_on`](crate::block_on) (or
+    /// [`Builder::block_on`](crate::Builder::block_on)) was called on a thread
+    /// where a giong runtime already runs, such as from inside a task. It
+    /// panics with this code.
+    RuntimeAlreadyRunning = 12, Other, "a runtime already runs on this thread";
+    /// A future that had started an I/O operation on one giong worker was
+    /// polled on another worker or runtime. It panics with this code.
+    WrongWorker = 13, Other, "an operation was polled on another worker";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.

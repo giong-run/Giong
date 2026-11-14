@@ -36,7 +36,9 @@ struct Group {
 }
 
 struct Mailbox {
-    /// Balanced listeners this worker has open on the address.
+    /// Balanced listeners this worker has open on the address. Only that
+    /// worker changes it; other workers read it as a hint when they choose
+    /// where to send a connection.
     listeners: AtomicUsize,
     inbox: Mutex<Inbox>,
 }
@@ -46,6 +48,11 @@ struct Inbox {
     sockets: VecDeque<Socket>,
     /// The task waiting in `accept` on this worker, if any.
     waiter: Option<Waker>,
+    /// The worker has a balanced listener on the address, so something will
+    /// take what is put here. Changed with `listeners` going from 0 to 1 and
+    /// back, under this lock, so that a connection is never put in a mailbox
+    /// that its worker has already emptied for the last time.
+    open: bool,
 }
 
 /// Every group alive in the process. Entries are dropped once their group
@@ -88,9 +95,10 @@ impl Member {
                 }
             }
         };
-        group.mailboxes[worker]
-            .listeners
-            .fetch_add(1, Ordering::AcqRel);
+        let mailbox = &group.mailboxes[worker];
+        if mailbox.listeners.fetch_add(1, Ordering::AcqRel) == 0 {
+            lock(&mailbox.inbox).open = true;
+        }
         Member { group, worker }
     }
 
@@ -118,15 +126,18 @@ impl Member {
                 Poll::Ready(Ok(sock)) => sock,
                 other => return other,
             };
-            match self.busier_than_another() {
-                Some(target) => group.hand_over(target, sock),
-                None => {
-                    // Counted here at once: several connections can arrive
-                    // in one batch, before this worker publishes its load.
-                    group.rt.count_local(self.worker);
-                    return Poll::Ready(Ok(sock));
-                }
-            }
+            let sock = match self.busier_than_another() {
+                Some(target) => match group.hand_over(target, sock) {
+                    Ok(()) => continue,
+                    // Its last listener went in the meantime: keep it.
+                    Err(sock) => sock,
+                },
+                None => sock,
+            };
+            // Counted here at once: several connections can arrive in one
+            // batch, before this worker publishes its load.
+            group.rt.count_local(self.worker);
+            return Poll::Ready(Ok(sock));
         }
     }
 
@@ -142,17 +153,45 @@ impl Member {
 }
 
 impl Group {
-    /// Puts `sock` in `worker`'s mailbox and wakes its `accept`.
-    fn hand_over(&self, worker: usize, sock: Socket) {
+    /// Puts `sock` in `worker`'s mailbox and wakes its `accept`, or gives it
+    /// back if that worker no longer has a balanced listener on the address
+    /// (its last one may go between the choice and this call).
+    fn hand_over(&self, worker: usize, sock: Socket) -> Result<(), Socket> {
         self.rt.sending(worker);
         let waiter = {
             let mut inbox = lock(&self.mailboxes[worker].inbox);
+            if !inbox.open {
+                drop(inbox);
+                self.rt.received(worker);
+                return Err(sock);
+            }
             inbox.sockets.push_back(sock);
             inbox.waiter.take()
         };
         if let Some(waker) = waiter {
             waker.wake();
         }
+        Ok(())
+    }
+
+    /// Hands `sock` to the least busy member other than `except`, or closes
+    /// it if there is none.
+    fn hand_to_another(&self, except: usize, mut sock: Socket) {
+        // Each refusal means a member closed its last listener; there are
+        // only so many members.
+        for _ in 0..self.mailboxes.len() {
+            let target = self.rt.least_loaded_of(None, |i| {
+                i != except && self.mailboxes[i].listeners.load(Ordering::Acquire) > 0
+            });
+            match target {
+                Some(target) => match self.hand_over(target, sock) {
+                    Ok(()) => return,
+                    Err(back) => sock = back,
+                },
+                None => break,
+            }
+        }
+        drop(sock);
     }
 }
 
@@ -163,22 +202,68 @@ impl Drop for Member {
         if mailbox.listeners.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
-        // The worker's last balanced listener on this address: connections
-        // still waiting for it go to another member, or are closed.
+        // The worker's last balanced listener on this address: close the
+        // mailbox, so that no other worker puts a connection in it from now
+        // on, and send what waits in it to another member, or close it.
         let waiting = {
             let mut inbox = lock(&mailbox.inbox);
+            inbox.open = false;
             inbox.waiter = None;
             std::mem::take(&mut inbox.sockets)
         };
         for sock in waiting {
             group.rt.received(self.worker);
-            let target = group.rt.least_loaded_of(None, |i| {
-                i != self.worker && group.mailboxes[i].listeners.load(Ordering::Acquire) > 0
-            });
-            match target {
-                Some(target) => group.hand_over(target, sock),
-                None => drop(sock),
-            }
+            group.hand_to_another(self.worker, sock);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{SocketAddr, TcpListener as StdListener};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    use socket2::Socket;
+
+    use super::Member;
+
+    /// A connected socket, for handing over.
+    fn connected(listener: &StdListener) -> Socket {
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        Socket::from(stream)
+    }
+
+    #[test]
+    fn a_mailbox_whose_last_listener_is_gone_refuses_connections() {
+        // Worker 0 picks worker 1 while it still has a listener; worker 1
+        // drops its last one; then worker 0 hands the connection over. It
+        // used to land in a mailbox nobody would read again, and the client
+        // got neither a reply nor a close.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer = StdListener::bind("127.0.0.1:0").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let result = Arc::new(Mutex::new(None));
+        let rt = crate::Builder::new().workers(2).build().unwrap();
+        let (b, r) = (barrier.clone(), result.clone());
+        let peer = Arc::new(peer);
+        rt.run(move |worker| {
+            let (barrier, result, peer) = (b.clone(), r.clone(), peer.clone());
+            async move {
+                let member = Member::join(addr);
+                barrier.wait(); // both members joined
+                if worker == 1 {
+                    drop(member);
+                    barrier.wait(); // worker 1's last listener is gone
+                    return;
+                }
+                barrier.wait();
+                let group = member.group.clone();
+                let refused = group.hand_over(1, connected(&peer)).is_err();
+                let stranded = super::lock(&group.mailboxes[1].inbox).sockets.len();
+                *result.lock().unwrap() = Some((refused, stranded));
+            }
+        })
+        .unwrap();
+        assert_eq!(*result.lock().unwrap(), Some((true, 0)));
     }
 }

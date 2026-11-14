@@ -69,10 +69,10 @@ impl<T: 'static> Future for Op<T> {
                         }
                     }
                     Some(key) => {
-                        assert_eq!(
-                            this.worker_uid, w.shared.uid,
-                            "giong: operation polled on a different runtime"
-                        );
+                        if this.worker_uid != w.shared.uid {
+                            drop(driver);
+                            wrong_worker();
+                        }
                         match driver.poll_op(key, cx.waker()) {
                             Poll::Ready(done) => {
                                 this.key = None;
@@ -118,4 +118,20 @@ impl<T: 'static> Drop for Op<T> {
             mem::forget(data);
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn wrong_worker() -> ! {
+    panic!(
+        "{}",
+        crate::error::Error::new(
+            crate::error::Code::WrongWorker,
+            "a future that started an I/O operation on one giong worker was polled on another \
+             worker or runtime",
+            "await a giong future on the worker that first polled it. Send data, not futures, \
+             between workers and threads: Handle::spawn_on builds the future on the worker that \
+             runs it.",
+        )
+    )
 }

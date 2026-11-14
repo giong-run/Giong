@@ -69,7 +69,7 @@ run_tsan() {
     # an intercepted libc function. giong's threads sit in raw io_uring_enter
     # and futex syscalls, so the SIGTERM handler would never run and the test
     # would hang. It runs in every non-sanitizer job instead.
-    local skip=(--skip sigterm_triggers_a_graceful_shutdown)
+    local skip=(--skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned)
     # `--cfg giong_tsan` makes giong close sockets with close(2) instead of
     # IORING_OP_CLOSE, which TSan cannot see (see Driver::close_fd).
     for round in $(seq 1 "$ROUNDS"); do

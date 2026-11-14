@@ -87,6 +87,11 @@ impl Wake for TaskWaker {
 }
 
 /// Why a task did not produce a value.
+///
+/// More reasons may be added, so a `match` needs a `_` arm; the
+/// [`is_cancelled`](Self::is_cancelled) and [`is_panic`](Self::is_panic)
+/// checks keep working.
+#[non_exhaustive]
 pub enum JoinError {
     /// The task was aborted, or the runtime shut down before it finished.
     Cancelled,

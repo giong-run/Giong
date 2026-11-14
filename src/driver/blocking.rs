@@ -5,10 +5,12 @@
 //! driver therefore hands file operations (opens, reads, writes, syncs,
 //! metadata) to these threads, the way other readiness-based runtimes do.
 //!
-//! One pool serves the whole process. Threads start when work arrives and
-//! nobody is idle, up to [`MAX_THREADS`], and stop after [`IDLE`] without
-//! work. A finished job pushes its result onto its worker's [`Completions`]
-//! and pokes the worker's eventfd.
+//! One pool serves the whole process. A thread starts whenever more jobs are
+//! queued than idle threads can take, up to [`MAX_THREADS`], and stops after
+//! [`IDLE`] without work: a job that blocks for a long time (a FIFO with no
+//! writer, a hung network filesystem) holds up only its own thread. A
+//! finished job pushes its result onto its worker's [`Completions`] and pokes
+//! the worker's eventfd.
 
 use std::collections::VecDeque;
 use std::io;
@@ -59,7 +61,10 @@ pub(super) fn spawn(job: Job) {
     let pool = pool();
     let mut state = lock(&pool.state);
     state.jobs.push_back(job);
-    if state.idle > 0 {
+    // Each queued job needs a thread of its own. An idle thread is counted
+    // as idle until it runs again, so jobs queued before it wakes up must not
+    // all count on it: one that blocks would hold up the rest.
+    if state.jobs.len() <= state.idle {
         drop(state);
         pool.work.notify_one();
         return;
