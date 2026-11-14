@@ -37,8 +37,8 @@
 //! `hyper::client::conn::http1::handshake(io)`, which returns a future or a
 //! connection object that your task (or a task you start with
 //! [`giong::spawn`]) polls. The crate's tests run tokio-rustls,
-//! futures-rustls, tokio-tungstenite, h2, hyper (HTTP/1) and tokio-util's
-//! codecs this way.
+//! futures-rustls, tokio-tungstenite, h2, hyper (HTTP/1 and HTTP/2) and
+//! tokio-util's codecs this way.
 //!
 //! **It does not make a crate that needs a Tokio runtime work.** I/O traits
 //! are all `Compat` provides. A crate does not work through it if it
@@ -90,9 +90,9 @@
 //!   transfer keeps the socket busy.
 //! - **A failed send is reported by the next write, flush or shutdown**,
 //!   with the kernel's error; later calls fail with
-//!   [`GIONG-E1401`](giong::error::Code::CompatWriteFailed). Writing after
-//!   `shutdown` fails with
-//!   [`GIONG-E1402`](giong::error::Code::CompatShutDown).
+//!   [`GIONG-E1401`](giong::error::Code::CompatWriteFailed), and so do the
+//!   calls after a failed shutdown. Writing once `shutdown` has started
+//!   fails with [`GIONG-E1402`](giong::error::Code::CompatShutDown).
 //! - **Dropping a `Compat` discards what was written but not flushed**, like
 //!   dropping a `BufWriter`.
 //! - **One task reads and one task writes at a time.** `tokio::io::split`
@@ -180,7 +180,7 @@ struct WriteState {
     /// it, and a read from another task leaves it alone.
     driver: Option<Waker>,
     /// The buffer of the last send, kept for the next one while more data
-    /// waits.
+    /// waits (never while idle, so idle streams hold no buffer).
     spare: Option<Vec<u8>>,
     closing: Option<CloseFuture>,
     state: WriteStatus,
@@ -192,6 +192,9 @@ enum WriteStatus {
     /// A send failed. `Some` until the error is reported once; the text is
     /// kept for the later ones.
     Failed(Option<io::Error>, String),
+    /// `shutdown`/`close` has flushed and is closing the stream (TLS
+    /// sends `close_notify`): nothing more may be written.
+    Closing,
     /// `shutdown`/`close` finished.
     Closed,
 }
@@ -231,10 +234,7 @@ impl<S: Transport> Compat<S> {
     /// for a send to finish (default [`DEFAULT_WRITE_BUFFER`], 64 KiB).
     ///
     /// While one buffer is sent the next one fills, so a busy stream holds
-    /// up to twice `limit`. An idle one may keep one empty buffer of up to
-    /// `limit` after a burst of writes (on the io_uring driver, where a
-    /// send can still be running when the next write comes): give many
-    /// mostly idle connections a smaller limit.
+    /// up to twice `limit`; an idle one holds no buffer.
     ///
     /// # Panics
     ///
@@ -354,7 +354,7 @@ impl<S: Transport> Compat<S> {
                 )
                 .into()
             })),
-            WriteStatus::Closed if writing => Some(
+            WriteStatus::Closing | WriteStatus::Closed if writing => Some(
                 Error::new(
                     Code::CompatShutDown,
                     "write after the stream was shut down",
@@ -363,7 +363,7 @@ impl<S: Transport> Compat<S> {
                 )
                 .into(),
             ),
-            WriteStatus::Closed => None,
+            WriteStatus::Closing | WriteStatus::Closed => None,
         }
     }
 
@@ -393,7 +393,9 @@ impl<S: Transport> Compat<S> {
                         buf.clear();
                         write.spare = Some(buf);
                     }
-                    Ok(()) => {}
+                    // Nothing more to send: hold no buffer while idle. `buf`
+                    // may be an old spare, as large as the limit.
+                    Ok(()) => write.buf = Vec::new(),
                     Err(e) => {
                         let text = e.to_string();
                         write.state = WriteStatus::Failed(Some(e), text);
@@ -455,18 +457,17 @@ impl<S: Transport> Compat<S> {
         // A finished send hands back its buffer (or its error) first.
         let _ = self.poll_send(cx);
         if self.write.buf.len() >= self.write.limit {
-            // Full: send it, which waits for the send before it.
-            self.start_send();
-            let _ = self.poll_send(cx);
+            // Full: wait for the send before it. `Pending` here comes from
+            // that send, which holds the waker. (Polling a send can finish
+            // it, on the epoll driver, so a `Pending` decided after another
+            // poll might have no send left to wake the task.)
+            ready!(self.poll_send(cx));
             if let Some(e) = self.write_error(true) {
                 return Poll::Ready(Err(e));
             }
-            if self.write.buf.len() >= self.write.limit {
-                // The previous send is still going; `poll_send` registered
-                // the waker.
-                return Poll::Pending;
-            }
-            // The full buffer is on its way; the next one fills meanwhile.
+            // Then send the full buffer; the next one fills meanwhile.
+            self.start_send();
+            let _ = self.poll_send(cx);
         }
         if let Some(e) = self.write_error(true) {
             return Poll::Ready(Err(e));
@@ -502,29 +503,37 @@ impl<S: Transport> Compat<S> {
             if let Some(closing) = self.write.closing.as_mut() {
                 let res = ready!(closing.as_mut().poll(cx));
                 self.write.closing = None;
-                self.write.state = WriteStatus::Closed;
-                return Poll::Ready(res);
+                return Poll::Ready(self.closed(res));
             }
             match self.write.state {
                 WriteStatus::Closed => return Poll::Ready(Ok(())),
                 WriteStatus::Failed(..) => {
                     return Poll::Ready(Err(self.write_error(false).expect("failed")))
                 }
-                WriteStatus::Open => {}
+                WriteStatus::Open | WriteStatus::Closing => {}
             }
             ready!(self.poll_flush_buffered(cx))?;
             match S::close(&self.stream) {
-                Ok(Some(closing)) => self.write.closing = Some(closing),
-                Ok(None) => {
-                    self.write.state = WriteStatus::Closed;
-                    return Poll::Ready(Ok(()));
+                Ok(Some(closing)) => {
+                    self.write.closing = Some(closing);
+                    self.write.state = WriteStatus::Closing;
                 }
-                Err(e) => {
-                    self.write.state = WriteStatus::Closed;
-                    return Poll::Ready(Err(e));
-                }
+                Ok(None) => return Poll::Ready(self.closed(Ok(()))),
+                Err(e) => return Poll::Ready(self.closed(Err(e))),
             }
         }
+    }
+
+    /// Records how closing the sending direction ended. A failure is
+    /// reported once, and by every later write, flush or shutdown as
+    /// `GIONG-E1401`, like a failed send: the close may not have reached
+    /// the peer.
+    fn closed(&mut self, res: io::Result<()>) -> io::Result<()> {
+        self.write.state = match &res {
+            Ok(()) => WriteStatus::Closed,
+            Err(e) => WriteStatus::Failed(None, e.to_string()),
+        };
+        res
     }
 }
 
@@ -546,7 +555,9 @@ impl Unread {
     /// waits for anything else.
     fn consume(&mut self, n: usize) {
         match self {
-            Unread::None => debug_assert_eq!(n, 0, "consume past the received bytes"),
+            // More than `fill_buf` returned: ignored, as std's and Tokio's
+            // `BufReader` do.
+            Unread::None => {}
             Unread::Chunk(chunk, at) => {
                 let len = chunk.as_slice().len();
                 *at = (*at + n).min(len);
@@ -571,6 +582,7 @@ impl<S: Transport> fmt::Debug for Compat<S> {
         let state = match &self.write.state {
             WriteStatus::Open => "open",
             WriteStatus::Failed(..) => "failed",
+            WriteStatus::Closing => "shutting down",
             WriteStatus::Closed => "shut down",
         };
         f.debug_struct("Compat")
@@ -700,5 +712,201 @@ mod futures_impl {
         fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.get_mut().poll_close_write(cx)
         }
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::Wake;
+    use tokio::io::{AsyncBufRead, AsyncWrite};
+
+    /// A transport whose sends finish on their `polls`-th poll, the way an
+    /// operation on the epoll driver finishes when a poll retries it and the
+    /// socket has room. While pending, a send holds the waker, as a real
+    /// operation does; `waiting` says whether one does.
+    struct Scripted {
+        polls: usize,
+        sent: RefCell<Vec<u8>>,
+        waiting: Rc<Cell<bool>>,
+        closing: Cell<Option<io::Result<()>>>,
+    }
+
+    impl Scripted {
+        fn new(polls: usize) -> Self {
+            Self {
+                polls,
+                sent: RefCell::new(Vec::new()),
+                waiting: Rc::new(Cell::new(false)),
+                closing: Cell::new(None),
+            }
+        }
+    }
+
+    struct ScriptedSend {
+        stream: Rc<Scripted>,
+        buf: Option<Vec<u8>>,
+        polls: usize,
+    }
+
+    impl Future for ScriptedSend {
+        type Output = (io::Result<()>, Vec<u8>);
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls += 1;
+            if self.polls < self.stream.polls {
+                self.stream.waiting.set(true);
+                return Poll::Pending;
+            }
+            self.stream.waiting.set(false);
+            let buf = self.buf.take().expect("polled after it finished");
+            self.stream.sent.borrow_mut().extend_from_slice(&buf);
+            Poll::Ready((Ok(()), buf))
+        }
+    }
+
+    impl Transport for Scripted {}
+
+    impl transport::sealed::Sealed for Scripted {
+        type Receiver = ();
+        const NAME: &'static str = "Scripted";
+
+        fn poll_chunk(_: &Rc<Self>, _: &mut (), _: &mut Context<'_>) -> Poll<io::Result<Chunk>> {
+            Poll::Pending
+        }
+
+        fn send(this: Rc<Self>, buf: Vec<u8>) -> SendFuture {
+            Box::pin(ScriptedSend {
+                stream: this,
+                buf: Some(buf),
+                polls: 0,
+            })
+        }
+
+        fn close(this: &Rc<Self>) -> io::Result<Option<CloseFuture>> {
+            Ok(this
+                .closing
+                .take()
+                .map(|res| Box::pin(std::future::ready(res)) as CloseFuture))
+        }
+    }
+
+    struct CountWakes(AtomicUsize);
+
+    impl Wake for CountWakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn waker() -> Waker {
+        Waker::from(Arc::new(CountWakes(AtomicUsize::new(0))))
+    }
+
+    fn write(c: &mut Compat<Scripted>, cx: &mut Context<'_>, data: &[u8]) -> Poll<usize> {
+        Pin::new(c).poll_write(cx, data).map(|r| r.unwrap())
+    }
+
+    /// `poll_write` on a full buffer used to start a send, poll the one in
+    /// flight again, and, when that poll finished it, return `Pending` with
+    /// no send left to wake the task.
+    #[test]
+    fn a_write_that_waits_always_leaves_a_send_holding_the_waker() {
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        // A send finishes on its third poll: pending on the first two.
+        let mut c = Compat::new(Scripted::new(3)).write_buffer(4);
+        let mut expected = Vec::new();
+        for round in 0..20u8 {
+            let data = [round; 4];
+            loop {
+                match write(&mut c, &mut cx, &data) {
+                    Poll::Ready(n) => {
+                        expected.extend_from_slice(&data[..n]);
+                        assert_eq!(n, 4);
+                        break;
+                    }
+                    Poll::Pending => assert!(
+                        c.stream.waiting.get(),
+                        "Pending with no send holding the waker (round {round})"
+                    ),
+                }
+            }
+        }
+        while Pin::new(&mut c).poll_flush(&mut cx).is_pending() {
+            assert!(c.stream.waiting.get());
+        }
+        assert_eq!(*c.stream.sent.borrow(), expected);
+    }
+
+    /// The buffer of an earlier send is kept for the next while data waits,
+    /// and dropped once the stream goes idle.
+    #[test]
+    fn an_idle_stream_holds_no_buffer() {
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut c = Compat::new(Scripted::new(2)).write_buffer(1024);
+        for _ in 0..64 {
+            let mut left = 100;
+            while left > 0 {
+                if let Poll::Ready(n) = write(&mut c, &mut cx, &[7; 100][..left]) {
+                    left -= n;
+                }
+            }
+        }
+        while Pin::new(&mut c).poll_flush(&mut cx).is_pending() {}
+        assert_eq!(c.stream.sent.borrow().len(), 6400);
+        assert!(c.write.sending.is_none());
+        assert_eq!(c.write.buf.capacity(), 0, "an idle stream kept its buffer");
+        assert!(c.write.spare.is_none());
+    }
+
+    #[test]
+    fn consuming_more_than_was_filled_is_ignored() {
+        let mut c = Compat::new(Scripted::new(1));
+        Pin::new(&mut c).consume(10);
+        assert_eq!(c.read.unread.bytes(), b"");
+    }
+
+    #[test]
+    fn writes_during_a_shutdown_fail_and_a_failed_shutdown_stays_failed() {
+        let waker = waker();
+        let mut cx = Context::from_waker(&waker);
+        // A shutdown that is still going (TLS sending close_notify).
+        let mut c = Compat::new(Scripted::new(1));
+        c.stream.closing.set(Some(Ok(())));
+        c.write.state = WriteStatus::Closing;
+        c.write.closing = Some(Box::pin(std::future::pending()));
+        let err = Pin::new(&mut c).poll_write(&mut cx, b"late");
+        let Poll::Ready(Err(err)) = err else {
+            panic!("a write during a shutdown was accepted: {err:?}")
+        };
+        assert_eq!(giong::error::code(&err), Some(Code::CompatShutDown));
+
+        // A shutdown that fails: reported once, then by every later call.
+        let c = Compat::new(Scripted::new(1));
+        c.stream
+            .closing
+            .set(Some(Err(io::Error::other("close_notify failed"))));
+        let mut c = c;
+        let Poll::Ready(Err(first)) = Pin::new(&mut c).poll_shutdown(&mut cx) else {
+            panic!("the failed close went unreported")
+        };
+        assert_eq!(first.to_string(), "close_notify failed");
+        for _ in 0..2 {
+            let Poll::Ready(Err(again)) = Pin::new(&mut c).poll_shutdown(&mut cx) else {
+                panic!("a second shutdown hid the failure")
+            };
+            assert_eq!(giong::error::code(&again), Some(Code::CompatWriteFailed));
+            assert!(again.to_string().contains("close_notify failed"), "{again}");
+        }
+        let Poll::Ready(Err(write)) = Pin::new(&mut c).poll_write(&mut cx, b"x") else {
+            panic!("a write after a failed shutdown was accepted")
+        };
+        assert_eq!(giong::error::code(&write), Some(Code::CompatWriteFailed));
     }
 }

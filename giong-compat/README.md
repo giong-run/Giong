@@ -55,6 +55,7 @@ These are tested in [`tests/`](tests), on giong's io_uring driver, its older rin
 | tokio-tungstenite 0.29 | A WebSocket echo server and client: text, a 4 MiB binary message, 1,000 messages queued before any is read, ping and pong, the close handshake |
 | h2 0.4 | An HTTP/2 server and client: 100 streams at once on one connection with bodies over several flow-control windows; and h2 over giong-tls with ALPN `h2` |
 | hyper 1 (HTTP/1) | hyper's client against a giong-http server, and giong-http's client against a hyper server, with keep-alive and bodies up to 500 KB; a hyper server with a timer on giong's timers closes a connection whose request head does not arrive in time |
+| hyper 1 (HTTP/2) | hyper's client and server over `Compat`, with giong's tasks as hyper's executor: 100 requests at once on one connection, bodies up to 300 KB |
 | tokio-util 0.7 | `LengthDelimitedCodec` over a Unix socket (200 frames up to 1 MB) and `LinesCodec` over TCP |
 
 ### What does not
@@ -109,15 +110,32 @@ impl hyper::rt::Timer for GiongTimer {
 
 [`tests/hyper.rs`](tests/hyper.rs) checks that a server built this way closes such a connection when the timeout ends.
 
+hyper's HTTP/2, client and server, also takes an executor for the tasks it starts. They need not be `Send`, so giong's tasks do:
+
+```rust
+#[derive(Clone, Copy, Debug)]
+struct GiongExec;
+
+impl<F: std::future::Future + 'static> hyper::rt::Executor<F> for GiongExec {
+    fn execute(&self, future: F) {
+        giong::spawn(future);
+    }
+}
+
+// hyper::server::conn::http2::Builder::new(GiongExec).timer(GiongTimer) ...
+// hyper::client::conn::http2::handshake(GiongExec, io) ...
+```
+
 ## How it behaves
 
 - **Writes are buffered**, as with `BufWriter` or a TLS stream. `poll_write` copies the bytes and returns; they are sent on `flush`, when the buffer is full, or when a read on the same task is about to wait. Call `flush` (or `shutdown`) where the data must have gone out; every crate written for these traits does. A writer in another task than the reader must flush: a read only sends what its own task wrote. While one buffer is being sent the next one fills, so a long transfer keeps the socket busy.
-- **The write buffer is bounded**: `Compat::new(stream).write_buffer(limit)`, 64 KiB by default, from 1 byte to 1 GiB (`GIONG-E1403` otherwise). A busy stream holds up to twice the limit. An idle one may keep one empty buffer of up to the limit after a burst of writes (on the io_uring driver, where a send can still be running when the next write comes); for many mostly idle connections, give them a smaller limit.
+- **The write buffer is bounded**: `Compat::new(stream).write_buffer(limit)`, 64 KiB by default, from 1 byte to 1 GiB (`GIONG-E1403` otherwise). A busy stream holds up to twice the limit; an idle one holds no buffer.
 - **`TCP_NODELAY` is turned on** for TCP streams (plain or under TLS), as every giong crate does. `Compat` already gathers small writes until a flush, and Nagle's algorithm on top of that only delays them: the HTTP/2 test with 100 streams took 2.3 s with it and 21 ms without. `compat.get_ref().set_nodelay(false)` undoes it.
-- **A failed send is reported by the next write, flush or shutdown**, with the kernel's own error; after that, writes, flushes and shutdowns fail with `GIONG-E1401`. Writing after `shutdown` (or `close`) fails with `GIONG-E1402`. Reading still works in both cases. A shutdown that finds the connection already reset counts as done, as with Tokio's `TcpStream`.
+- **A failed send is reported by the next write, flush or shutdown**, with the kernel's own error; after that, writes, flushes and shutdowns fail with `GIONG-E1401`. So does a failed shutdown (a TLS stream that cannot send its `close_notify`). Writing after `shutdown` (or `close`) has started fails with `GIONG-E1402`. Reading still works in all these cases. A shutdown that finds the connection already reset counts as done, as with Tokio's `TcpStream`.
 - **Dropping a `Compat` discards what was written but not flushed**, like dropping a `BufWriter`. Sends in flight are cancelled the way giong cancels any operation: their buffers stay alive until the kernel lets go.
 - **One task reads and one task writes at a time.** `tokio::io::split` and `futures::io::AsyncReadExt::split` work, and so does splitting a `Framed` or a WebSocket stream.
-- **Cancel safe.** A read that is dropped loses no data. A write either copies bytes and says how many, or copies nothing.
+- **Cancel safe.** A read that is dropped loses no data. A write either copies bytes and says how many, or copies nothing. [`tests/cancel.rs`](tests/cancel.rs) drops reads, writes, flushes and whole streams at random (seeded, so a failure repeats), over TCP and giong-tls and through TLS 1.3 key updates, and checks every byte and that nothing leaks.
+- **`fill_buf` holds a buffer of the worker's pool** until `consume` takes all of it, or a read or `consume` of part of it moves the rest to the heap. Do not wait on something else between `fill_buf` and `consume`: with many connections doing that, the worker's receive pool runs dry and every socket on the worker stalls. `consume` of more than `fill_buf` returned is ignored, as with std's and Tokio's `BufReader`.
 - **Reading after the end of the stream** keeps returning 0 bytes. `into_inner().await` flushes and hands back the stream with the bytes received but not yet read, to go on with giong's own API.
 
 ## What it costs
@@ -162,8 +180,8 @@ Run it with `bench/compat.sh` (the method is at the top of the script, and in [`
 
 | Code | When |
 |---|---|
-| [`GIONG-E1401`](../docs/errors/E1401.md) | A write, flush or shutdown after a buffered send failed (the first call after the failure got the kernel's error) |
-| [`GIONG-E1402`](../docs/errors/E1402.md) | A write after `shutdown` or `close` |
+| [`GIONG-E1401`](../docs/errors/E1401.md) | A write, flush or shutdown after a buffered send or a shutdown failed (the first call after the failure got the error itself) |
+| [`GIONG-E1402`](../docs/errors/E1402.md) | A write after `shutdown` or `close` started |
 | [`GIONG-E1403`](../docs/errors/E1403.md) | `write_buffer` given 0 or more than 1 GiB (a panic) |
 
 `giong::error::code(&err)` returns the code, to match on instead of the message.

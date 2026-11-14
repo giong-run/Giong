@@ -40,7 +40,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 h2 = "0.4"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["http1", "client", "server"] }
+hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 libc = "0.2"
 rcgen = "0.13"

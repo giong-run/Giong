@@ -1,7 +1,8 @@
-//! hyper's HTTP/1 connection API over `Compat` (through hyper-util's
-//! `TokioIo`), against giong-http on the other side: hyper's client asks a
-//! giong-http server, giong-http's client asks a hyper server. And hyper's
-//! header timeout, on a timer built on giong's (the README's).
+//! hyper's connection API over `Compat` (through hyper-util's `TokioIo`):
+//! HTTP/1 against giong-http on the other side (hyper's client asks a
+//! giong-http server, giong-http's client asks a hyper server), HTTP/2 with
+//! hyper on both sides and giong's tasks as its executor, and hyper's header
+//! timeout on a timer built on giong's (the README's).
 
 mod common;
 
@@ -124,6 +125,62 @@ fn giong_http_client_against_a_hyper_server() {
         assert_eq!(client.connections(&base).0, 1);
         drop(client);
         timeout(LIMIT, server).await.unwrap().unwrap();
+    });
+}
+
+/// hyper's executor on giong's tasks: hyper's HTTP/2 spawns a task per
+/// connection and per stream, and asks no `Send` of them.
+#[derive(Clone, Copy, Debug)]
+struct GiongExec;
+
+impl<F: std::future::Future + 'static> hyper::rt::Executor<F> for GiongExec {
+    fn execute(&self, future: F) {
+        giong::spawn(future);
+    }
+}
+
+#[test]
+fn hyper_http2_client_and_server_over_compat() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let server = giong::spawn(async move {
+            let tcp = l.accept().await.unwrap();
+            let service = service_fn(|req: http::Request<Incoming>| async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                Ok::<_, Infallible>(http::Response::new(Full::new(body)))
+            });
+            hyper::server::conn::http2::Builder::new(GiongExec)
+                .serve_connection(TokioIo::new(Compat::new(tcp)), service)
+                .await
+        });
+        let tcp = giong::net::TcpStream::connect(addr).await.unwrap();
+        let (sender, conn) =
+            hyper::client::conn::http2::handshake(GiongExec, TokioIo::new(Compat::new(tcp)))
+                .await
+                .unwrap();
+        let conn = giong::spawn(conn);
+        // 100 requests at once on the one connection, bodies up to 300 KB
+        // (several flow-control windows each).
+        let mut requests = Vec::new();
+        for i in 0..100usize {
+            let mut sender = sender.clone();
+            requests.push(giong::spawn(async move {
+                let sent = Bytes::from(pattern((i * 2_999) % 300_000 + 1));
+                let req = http::Request::post("http://localhost/echo")
+                    .body(Full::new(sent.clone()))
+                    .unwrap();
+                let res = sender.send_request(req).await.unwrap();
+                assert_eq!(res.status(), 200);
+                let body = res.into_body().collect().await.unwrap().to_bytes();
+                assert!(body == sent, "request {i} came back different");
+            }));
+        }
+        for request in requests {
+            timeout(LIMIT, request).await.unwrap().unwrap();
+        }
+        drop(sender);
+        timeout(LIMIT, conn).await.unwrap().unwrap().unwrap();
+        timeout(LIMIT, server).await.unwrap().unwrap().unwrap();
     });
 }
 

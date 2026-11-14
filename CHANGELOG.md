@@ -167,6 +167,25 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong-compat**: on the epoll driver, `poll_write` with a full buffer could return
+  `Pending` after the send it waited on finished on that same poll, so no operation held
+  the task's waker (hundreds of times in 2 GiB over a Unix socket). Only the epoll
+  driver's own waker list woke the task again. A write now waits for the send in flight
+  before starting the next one, so every `Pending` leaves a send holding the waker.
+- **giong-compat**: on io_uring, a stream kept its last send buffer (up to the 64 KiB
+  write buffer) while idle, though the README said an idle stream holds none. It now
+  drops the buffer when a send finishes; `tests/memory.rs` checks that an idle stream
+  holds less than 1 KiB on both drivers.
+- **giong-compat**: a write made while a TLS shutdown is in progress fails at once with
+  `GIONG-E1402` instead of being accepted and then dropped, and a shutdown that failed
+  keeps failing (`GIONG-E1401`) instead of returning `Ok` the second time.
+- **giong-compat**: `consume` with nothing buffered is ignored, as in std's and Tokio's
+  `BufReader`, instead of panicking in debug builds.
+- **giong-compat**: tests for what the review found untested: a seeded cancellation
+  stress test (`tests/cancel.rs`), hyper's HTTP/2 client and server over `Compat` with a
+  giong executor, a hyper server timeout with giong's timers, and `Compat` over kernel
+  TLS. `scripts/valgrind.sh` runs the `compat` and `memory` suites too.
+
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
   (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the
