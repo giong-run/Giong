@@ -6,7 +6,8 @@
 //! picks the most specific of those that match: at the first segment where
 //! two differ, plain text beats a parameter and a parameter beats a
 //! catch-all. The table must find the same route, with the same parameter
-//! spans, or the same `405`/`OPTIONS`/`404` answer.
+//! spans, or the same `405`/`OPTIONS`/`404` answer: for `405` and `OPTIONS`,
+//! every shape that matched, in the same order, and the same `Allow`.
 
 use std::fmt::Write;
 
@@ -121,14 +122,27 @@ pub(crate) fn check(data: &[u8]) {
             let spans: Vec<_> = (0..).map_while(|i| caps.get(i)).collect();
             assert_eq!(&spans, want_caps, "{} {path}", method.as_str());
         }
-        (Lookup::Options(ms) | Lookup::NotAllowed(ms), None, Some((_, first, _))) => {
+        (Lookup::Options(allowed) | Lookup::NotAllowed(allowed), None, Some((_, first, _))) => {
             assert_eq!(
                 matches!(got, Lookup::Options(_)),
                 method == Method::Options,
                 "{path}"
             );
-            let want: Vec<usize> = first.iter().map(|(_, r)| *r).collect();
-            assert_eq!(routes(ms), want, "{} {path}", method.as_str());
+            // Every shape that matched, most specific first: the `Allow`
+            // header names the methods of all of them.
+            let got_paths: Vec<Vec<usize>> = allowed.paths().map(routes).collect();
+            let want_paths: Vec<Vec<usize>> = matches
+                .iter()
+                .map(|(_, ms, _)| ms.iter().map(|(_, r)| *r).collect())
+                .collect();
+            assert_eq!(got_paths, want_paths, "{} {path}", method.as_str());
+            assert_eq!(allowed.first_route(), first[0].1, "{path}");
+            assert_eq!(
+                allowed.allow(),
+                reference_allow(&matches),
+                "{} {path}",
+                method.as_str()
+            );
         }
         (Lookup::NotFound, None, None) => {}
         (got, want, first) => panic!(
@@ -162,6 +176,27 @@ fn path_from(bytes: &[u8]) -> String {
         });
     }
     path
+}
+
+/// The `Allow` header for a request no route took: every method of every
+/// shape that matched, most specific shape first, since any of them would
+/// route there; `HEAD` when `GET` is there, and `OPTIONS`.
+fn reference_allow(matches: &[Match]) -> String {
+    let mut methods: Vec<&str> = Vec::new();
+    for (_, routes, _) in matches {
+        for (m, _) in routes.iter() {
+            if !methods.contains(&m.as_str()) {
+                methods.push(m.as_str());
+            }
+        }
+    }
+    if methods.contains(&"GET") && !methods.contains(&"HEAD") {
+        methods.push("HEAD");
+    }
+    if !methods.contains(&"OPTIONS") {
+        methods.push("OPTIONS");
+    }
+    methods.join(", ")
 }
 
 /// The route for `method` among one shape's routes: `HEAD` falls back to
