@@ -107,7 +107,7 @@ pub use server::{Handler, Server, Transport};
 pub mod fuzzing {
     #[cfg(feature = "client")]
     pub use crate::client::fuzzing::{
-        check_h2_client, check_inflate, check_response_head, check_url,
+        check_h2_client, check_inflate, check_response_body, check_response_head, check_url,
     };
     pub use crate::invariants::{
         check_chunked, check_h2_output, check_head, check_hpack, check_huffman, h2_connection,

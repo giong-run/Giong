@@ -191,6 +191,16 @@ pub mod fuzzing {
     pub fn check_h2_client(data: &[u8]) -> usize {
         super::h2::fuzzing::check_server_frames(data)
     }
+
+    /// An HTTP/1.1 response, fed in pieces to the code that reads one on a
+    /// connection: the body is exactly what its framing delimits (length,
+    /// chunked, or up to the close), given out in non-empty pieces or
+    /// failing as it should, and the connection is reusable only when the
+    /// bytes received end exactly where the body does. Returns `true` if
+    /// the whole body was read.
+    pub fn check_response_body(data: &[u8]) -> bool {
+        super::conn::fuzzing::check_response_body(data)
+    }
 }
 
 /// Headers the client sets itself, because they decide how the message is

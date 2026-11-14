@@ -44,6 +44,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "response_body"
+path = "fuzz_targets/response_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "url"
 path = "fuzz_targets/url.rs"
 test = false

@@ -128,6 +128,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   server might send, fed in pieces while requests come and go, with checks that the
   client holds no more than the windows it grants and writes only well-formed frames
   within the server's windows. 3,000 such connections run in `cargo test`.
+- **Verification**: a fuzz target for the HTTP/1.1 client reading a response on a
+  connection, `response_body` (in the nightly fuzz workflow): whatever a server sends, in
+  whatever pieces, the head and body must be what the bytes hold, the body ending exactly
+  where its length, its chunked framing or the close says (or failing with the error
+  that framing calls for), and the connection may be reused only when the bytes received
+  end exactly at the end of the body. The reading code now takes its bytes through a
+  small trait, so the target drives the code the client runs. 100,000 responses run in
+  `cargo test`.
 - **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
   worker uses (`giong::IoUringFeature`), and its one-line form names them
   (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker

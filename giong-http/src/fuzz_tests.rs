@@ -140,6 +140,36 @@ fn the_response_head_parser_never_panics_and_its_ranges_hold() {
 
 #[cfg(feature = "client")]
 #[test]
+fn response_bodies_end_at_their_framing_whatever_the_bytes_and_their_pieces() {
+    use crate::client::fuzzing::check_response_body;
+    // What the server sends; the first two bytes (flags and the seed for
+    // the piece sizes) are drawn for each round.
+    let seeds: &[&[u8]] = &[
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;e=1\r\nhello\r\n1\r\n!\r\n0\r\nX-T: 1\r\n\r\n",
+        b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\nabc",
+        b"HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\nx",
+        b"HTTP/1.0 200 OK\r\n\r\nuntil the end",
+        b"HTTP/1.1 204 No Content\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 4\r\n\r\n0\r\n\r\n",
+    ];
+    let mut rng = Rng(0x7A3C_9B11_E4D2_5F08);
+    let mut read = 0;
+    for round in 0..100_000 {
+        let mut input = seeds[round % seeds.len()].to_vec();
+        if round % 4 != 0 {
+            mutate(&mut rng, &mut input);
+        }
+        let mut data = vec![rng.next() as u8, rng.next() as u8];
+        data.extend_from_slice(&input);
+        read += usize::from(check_response_body(&data));
+    }
+    assert!(read > 10_000, "only {read} bodies were read");
+}
+
+#[cfg(feature = "client")]
+#[test]
 fn compressed_bodies_decode_or_fail_cleanly_whatever_the_bytes() {
     use crate::client::fuzzing::check_inflate;
     // A gzip member and a zlib stream of the same text, made by hand from
