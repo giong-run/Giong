@@ -786,7 +786,9 @@ Also:
   close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
   traffic alongside; afterwards no descriptor, memory or driver state may be left over.
   30 minutes on four workers: 39.5 million connections, resident memory flat at 15.5–15.7
-  MB. CI runs it for two hours every night.
+  MB. CI runs it for two hours every night, on the runner's kernel and on Linux 6.18 in
+  QEMU, whose packed buffer rings cut stream receives wherever a shared buffer fills up;
+  the 6.12 and 6.18 kernel jobs soak for a minute on every change.
 - **valgrind memcheck** over the single-threaded tests (`scripts/valgrind.sh`): no invalid
   access, no leak.
 - **Load** on the example HTTP server: over 250,000 connections opened and closed, 5,000

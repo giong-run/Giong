@@ -44,6 +44,8 @@ struct Counters {
     datagrams: AtomicU64,
     files: AtomicU64,
     cross_worker: AtomicU64,
+    /// Messages the server got in more than one receive.
+    split: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
 }
@@ -85,16 +87,56 @@ const STALL: u8 = b's';
 /// Close the connection without reading the rest.
 const HANG_UP: u8 = b'h';
 
+/// A message is one of the requests above, its whole length (two bytes,
+/// big-endian), a seed, then bytes that follow from the seed. TCP keeps no
+/// message boundaries: a receive can end inside a message (on Linux 6.12 and
+/// newer, wherever a shared receive buffer fills up) or hold more than one.
+/// So the server reads messages by their length, and checks every byte.
+const HEADER: usize = 4;
+
+fn message(request: u8, len: usize, seed: u8) -> Vec<u8> {
+    let mut msg: Vec<u8> = (0..len).map(|i| filler(seed, i)).collect();
+    msg[0] = request;
+    msg[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+    msg[3] = seed;
+    msg
+}
+
+fn filler(seed: u8, at: usize) -> u8 {
+    seed.wrapping_add((at % 251) as u8)
+}
+
+/// The length a message's header gives; `msg` holds at least the header.
+fn message_len(msg: &[u8]) -> usize {
+    u16::from_be_bytes([msg[1], msg[2]]).into()
+}
+
+/// Whether `msg` is a whole message with every byte where it belongs.
+fn intact(msg: &[u8]) -> bool {
+    msg.len() >= HEADER
+        && message_len(msg) == msg.len()
+        && (HEADER..msg.len()).all(|at| msg[at] == filler(msg[3], at))
+}
+
 async fn serve(stream: TcpStream, deadline: Instant, counters: Arc<Counters>) {
+    let mut pending = Vec::new();
     loop {
-        let left = deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
-        let data = match timeout(left, stream.recv()).await {
-            Ok(Ok(data)) if data.is_empty() => return,
-            Ok(Ok(data)) => data.to_vec(),
-            // Clients abort connections on purpose.
-            Ok(Err(_)) | Err(_) => return,
-        };
-        match data[0] {
+        // Read until a whole message is in; a hang-up needs its first byte
+        // only.
+        let mut receives = 0;
+        while pending.first() != Some(&HANG_UP)
+            && (pending.len() < HEADER || pending.len() < message_len(&pending))
+        {
+            let left = deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(1);
+            receives += 1;
+            match timeout(left, stream.recv()).await {
+                Ok(Ok(data)) if data.is_empty() => return,
+                Ok(Ok(data)) => pending.extend_from_slice(&data),
+                // Clients abort connections on purpose.
+                Ok(Err(_)) | Err(_) => return,
+            }
+        }
+        match pending[0] {
             HANG_UP => return,
             STALL => sleep(Duration::from_millis(20)).await,
             ECHO => {}
@@ -103,7 +145,15 @@ async fn serve(stream: TcpStream, deadline: Instant, counters: Arc<Counters>) {
                 return;
             }
         }
-        if stream.write_all(data).await.0.is_err() {
+        if receives > 1 {
+            Counters::bump(&counters.split);
+        }
+        let msg: Vec<u8> = pending.drain(..message_len(&pending)).collect();
+        if !intact(&msg) {
+            counters.unexpected("server", "a message arrived with bytes out of place");
+            return;
+        }
+        if stream.write_all(msg).await.0.is_err() {
             return;
         }
     }
@@ -149,8 +199,8 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
             }
         };
         Counters::bump(&counters.connections);
-        let len = 1 + rng.below(3000) as usize;
-        let mut msg = vec![b'x'; len];
+        let len = HEADER + rng.below(3000) as usize;
+        let mut msg = message(ECHO, len, rng.below(256) as u8);
         match rng.below(4) {
             // Some round trips, then a clean close.
             0 | 1 => {
@@ -362,11 +412,12 @@ fn soak() {
                 if t % 10 == 0 {
                     eprintln!(
                         "soak: {t:>5}s  fds {fds:>4}  rss {:>6} KiB  conns {:>9}  echoes {:>9}  \
-                         cancelled {:>8}  datagrams {:>9}  files {:>7}  hops {:>8}",
+                         cancelled {:>8}  split {:>8}  datagrams {:>9}  files {:>7}  hops {:>8}",
                         rss,
                         counters.connections.load(Ordering::Relaxed),
                         counters.round_trips.load(Ordering::Relaxed),
                         counters.cancelled_recvs.load(Ordering::Relaxed),
+                        counters.split.load(Ordering::Relaxed),
                         counters.datagrams.load(Ordering::Relaxed),
                         counters.files.load(Ordering::Relaxed),
                         counters.cross_worker.load(Ordering::Relaxed),
@@ -466,10 +517,12 @@ fn soak() {
     let c = &counters;
     eprintln!(
         "soak: done after {secs}s on {workers} workers: {} connections, {} echoes, \
-         {} cancelled receives, {} datagrams, {} files, {} cross-worker hops",
+         {} cancelled receives, {} messages received in pieces, {} datagrams, {} files, \
+         {} cross-worker hops",
         c.connections.load(Ordering::Relaxed),
         c.round_trips.load(Ordering::Relaxed),
         c.cancelled_recvs.load(Ordering::Relaxed),
+        c.split.load(Ordering::Relaxed),
         c.datagrams.load(Ordering::Relaxed),
         c.files.load(Ordering::Relaxed),
         c.cross_worker.load(Ordering::Relaxed),

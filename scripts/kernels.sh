@@ -14,6 +14,9 @@
 #   KTLS=1 scripts/kernels.sh 6.18.63  also load the kernel's tls module, so
 #                                      giong-tls' kernel TLS tests run (and
 #                                      must: GIONG_KTLS_REQUIRED is set)
+#   SOAK_SECS=60 scripts/kernels.sh 6.18.63
+#                                      then run the soak test (tests/soak.rs)
+#                                      that long, on that kernel's receive path
 #
 # The guest also checks which driver giong chooses by itself: epoll on kernels
 # older than 6.0, io_uring from 6.0 on (GIONG_TEST_EXPECT_DRIVER overrides
@@ -121,6 +124,7 @@ for arg in $(cat /proc/cmdline); do
         giong.expect_workarounds=*) export GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS="${arg#*=}" ;;
         giong.expect_features=*) export GIONG_TEST_EXPECT_IO_URING_FEATURES="${arg#*=}" ;;
         giong.ktls=1) ktls=1 ;;
+        giong.soak=*) soak="${arg#*=}" ;;
     esac
 done
 # A line of its own: the console's escape codes end up in front of the first one.
@@ -151,6 +155,18 @@ for t in /tests/*; do
         failed=$((failed + 1))
     fi
 done
+if [ -n "${soak:-}" ]; then
+    # The soak test is ignored in the run above; it gets its own here.
+    for t in /tests/soak-*; do
+        echo "GIONG-RUN soak for ${soak} s"
+        if [ -e "$t" ] && GIONG_SOAK_SECS="$soak" "$t" -q --ignored --exact soak --nocapture; then
+            echo "GIONG-PASS soak"
+        else
+            echo "GIONG-FAIL soak"
+            failed=$((failed + 1))
+        fi
+    done
+fi
 echo "GIONG-DONE failed=$failed"
 poweroff -f
 EOF
@@ -280,6 +296,9 @@ for version in "${VERSIONS[@]}"; do
     fi
     if [ -n "${GIONG_TEST_EXPECT_IO_URING_FEATURES+set}" ]; then
         cmdline+=" giong.expect_features=$GIONG_TEST_EXPECT_IO_URING_FEATURES"
+    fi
+    if [ -n "${SOAK_SECS:-}" ]; then
+        cmdline+=" giong.soak=$SOAK_SECS"
     fi
     guest_initrd="$initrd"
     if [ "${KTLS:-0}" = 1 ]; then
