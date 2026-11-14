@@ -77,6 +77,7 @@ fn whole_files_roundtrip() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn large_files_survive_byte_for_byte() {
     let dir = TempDir::new("large");
     giong::block_on(async {
@@ -134,6 +135,7 @@ fn reads_and_writes_name_their_offset() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri's pread refuses offsets near i64::MAX")]
 fn offsets_above_i64_max_are_refused_on_every_driver() {
     // io_uring reads an offset of u64::MAX as "the current file position":
     // read_at and write_at used to read and write wherever that was, on
@@ -351,6 +353,7 @@ fn metadata_describes_files_directories_and_links() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no renameat")]
 fn files_and_directories_can_be_renamed_and_removed() {
     let dir = TempDir::new("paths");
     giong::block_on(async {
@@ -387,6 +390,7 @@ fn files_and_directories_can_be_renamed_and_removed() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn many_tasks_share_one_file() {
     let dir = TempDir::new("shared");
     giong::block_on(async {
@@ -429,6 +433,7 @@ fn many_tasks_share_one_file() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "counts descriptors in /proc, where Miri's do not show")]
 fn closed_and_dropped_files_release_their_descriptors() {
     let dir = TempDir::new("fds");
     let path = dir.path("f");
@@ -509,6 +514,7 @@ fn a_read_that_never_completes_can_be_cancelled() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri cannot open a pseudo-terminal")]
 fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
     // On epoll a read from a terminal runs on a blocking thread and waits
     // there for input. Dropping the read and then the file must not close the
@@ -588,6 +594,7 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no mkfifo")]
 fn a_stuck_file_operation_does_not_hold_up_the_others() {
     // On epoll, file operations run on the process's blocking threads. Opening
     // a FIFO for reading blocks until a writer opens it. A burst of such opens
@@ -722,6 +729,87 @@ fn a_std_file_can_be_adopted_and_knows_its_length() {
     });
 }
 
+/// Marks the child process that `standard_input_pipes_stay_blocking` starts.
+const STDIN_CHILD: &str = "GIONG_TEST_STDIN_CHILD";
+
+/// Whether `fd` is in non-blocking mode.
+fn nonblocking(fd: i32) -> bool {
+    // SAFETY: F_GETFL on a descriptor this process owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "fcntl: {}", std::io::Error::last_os_error());
+    flags & libc::O_NONBLOCK != 0
+}
+
+/// A pipe on standard input is shared with the shell pipeline around the
+/// process, and non-blocking mode belongs to the pipe: the epoll driver
+/// must read it on a blocking thread rather than switch the mode (which
+/// would make `cat` on the same pipe fail with `EAGAIN`). A pipe the
+/// process made itself still goes through epoll.
+#[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
+fn standard_input_pipes_stay_blocking() {
+    if std::env::var_os(STDIN_CHILD).is_some() {
+        giong::block_on(async {
+            // SAFETY: fd 0 is open (the parent piped it) and this process
+            // gives it to giong for good.
+            let stdin = File::from_std(unsafe { std::fs::File::from_raw_fd(0) });
+            let (res, buf) = stdin.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 2);
+            println!(
+                "stdin: {} nonblocking={}",
+                String::from_utf8_lossy(&buf),
+                nonblocking(0)
+            );
+            std::mem::forget(stdin);
+
+            let mut fds = [0; 2];
+            // SAFETY: a valid array of two descriptors.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: both ends are fresh descriptors this process owns.
+            let (read, mut write) = unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[0]),
+                    std::fs::File::from_raw_fd(fds[1]),
+                )
+            };
+            std::io::Write::write_all(&mut write, b"ok").unwrap();
+            let read = File::from_std(read);
+            let (res, buf) = read.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 2);
+            println!(
+                "pipe: {} nonblocking={}",
+                String::from_utf8_lossy(&buf),
+                nonblocking(fds[0])
+            );
+        });
+        return;
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "standard_input_pipes_stay_blocking",
+            "--nocapture",
+        ])
+        .env(STDIN_CHILD, "1")
+        .env("GIONG_DRIVER", "epoll")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"hi").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "child failed: {stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("stdin: hi nonblocking=false"), "{stdout}");
+    assert!(stdout.contains("pipe: ok nonblocking=true"), "{stdout}");
+}
+
 /// Every entry `read_dir` lists for `dir`, sorted by name.
 async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
     let mut entries = Vec::new();
@@ -734,6 +822,7 @@ async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn directories_list_like_the_standard_library() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirEntryExt, MetadataExt};
@@ -807,6 +896,7 @@ fn directories_list_like_the_standard_library() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn large_directories_are_read_in_batches() {
     let dir = TempDir::new("read-dir-many");
     // About 80 bytes per entry, so an 8 KiB batch holds about 100 of them.
@@ -867,6 +957,7 @@ fn large_directories_are_read_in_batches() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn read_dir_reports_what_it_cannot_list() {
     let dir = TempDir::new("read-dir-errors");
     giong::block_on(async {
@@ -891,6 +982,7 @@ fn read_dir_reports_what_it_cannot_list() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "counts descriptors in /proc, where Miri's do not show")]
 fn dropped_listings_release_their_descriptors() {
     let dir = TempDir::new("read-dir-fds");
     for i in 0..1_000 {
@@ -917,6 +1009,7 @@ fn dropped_listings_release_their_descriptors() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri's fallocate does not reserve blocks")]
 fn allocate_reserves_space_without_touching_data() {
     use std::os::unix::fs::MetadataExt;
 

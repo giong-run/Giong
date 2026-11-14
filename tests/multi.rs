@@ -344,6 +344,7 @@ fn channel_delivers_across_workers_and_from_plain_threads() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no SO_REUSEPORT")]
 fn reuseport_listeners_on_every_worker_serve_connections() {
     const WORKERS: usize = 3;
     const CLIENTS: usize = 60;
@@ -417,6 +418,7 @@ fn a_panicking_worker_stops_the_runtime_and_propagates() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_triggers_a_graceful_shutdown() {
     // Runs in a child process so the signal cannot disturb the other tests.
     if std::env::var_os("GIONG_SIGNAL_CHILD").is_some() {
@@ -464,6 +466,7 @@ fn sigterm_triggers_a_graceful_shutdown() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_still_works_after_worker_0_returned() {
     // Signals used to be watched by a task on worker 0 only: once worker 0's
     // main future had returned, SIGTERM and SIGINT did nothing while the
@@ -530,6 +533,10 @@ fn sigterm_still_works_after_worker_0_returned() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "timing: measures wake-up latency, which Miri slows down"
+)]
 fn a_sleeping_worker_is_woken_promptly_by_another_thread() {
     // Latency of the eventfd wake-up path.
     let (tx, mut rx) = mpsc::channel::<Instant>();

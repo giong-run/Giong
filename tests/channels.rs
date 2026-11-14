@@ -251,6 +251,7 @@ fn bounded_receiver_drains_then_sees_the_end() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn bounded_carries_values_between_workers() {
     const WORKERS: usize = 4;
     const PER_WORKER: usize = 2_000;

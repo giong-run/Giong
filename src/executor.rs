@@ -430,6 +430,7 @@ impl<F: Future> Future for LocalTask<F> {
         if this.guard.is_none() {
             return Poll::Ready(());
         }
+        // SAFETY: `fut` is structurally pinned (see above).
         let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
         let result = match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
             Ok(Poll::Pending) => return Poll::Pending,
@@ -485,6 +486,8 @@ impl<Fut: Future> Future for RemoteTask<Fut> {
         let result = if aborted {
             Err(JoinError::Cancelled)
         } else {
+            // SAFETY: `fut` is structurally pinned and not yet dropped (the
+            // guard is still here).
             let fut = unsafe { Pin::new_unchecked(&mut *this.fut) };
             match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
                 Ok(Poll::Pending) => return Poll::Pending,
