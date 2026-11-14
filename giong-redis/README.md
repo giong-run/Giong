@@ -53,7 +53,7 @@ fn main() -> std::io::Result<()> {
 - **Pipelines and transactions.** `Pipeline` sends several commands at once; `.atomic()` wraps them in `MULTI`/`EXEC`. `watch` gives optimistic transactions with `WATCH`.
 - **Commands that would break sharing are refused before they are sent**, with what to use instead. On a shared connection, `SELECT` would move every task to another database, `MULTI` would pull their commands into a transaction, and `BLPOP` would hold them all up for seconds; other clients let that happen.
 - **Pub/Sub** on a connection of its own, with patterns. Waiting for a message can be cancelled (a timeout, a `select`) without losing one.
-- **A pool per worker.** Commands share the least busy connection and steer away from one stuck behind a slow command; `take()` gives a task a connection to itself, for `WATCH` and blocking commands.
+- **A pool per worker.** Commands share the least busy connection and steer away from one stuck behind a slow command; `take()` gives a task a connection to itself, for `WATCH` and blocking commands, in turn even when shared commands keep the pool busy. Connections that close, or whose server became a replica after a failover (`READONLY`), are replaced.
 - **Limits everywhere,** all finite by default: connecting, every reply, the size of a reply, waiting for the pool. A reply that times out or is too large fails alone: the connection stays usable for the other tasks.
 - **Errors that say what to do,** with the server's error code (`WRONGTYPE`, `NOSCRIPT`...) to match on.
 - **ACL users, TLS (always verified), Unix sockets,** and connection URLs.
@@ -135,14 +135,29 @@ let job: Option<(String, String)> = conn
 | `Pool::new(config, max_size)` | A pool for the current worker. Connections are opened when needed, up to `max_size`. |
 | `.wait_timeout(duration)` | How long `take()` and the command methods wait when every connection is taken, 5 s by default. |
 | `pool.query(..)`, `pool.pipeline(..)` and the command methods | Run on the least busy connection, pipelined with other tasks' commands. |
-| `pool.take()` | A `PooledClient` for this task alone, which derefs to `Client`. For `WATCH` and blocking commands. A connection whose blocking command was cancelled while still running is closed instead of coming back. |
+| `pool.take()` | A `PooledClient` for this task alone, which derefs to `Client`. For `WATCH` and blocking commands. When the pool is full, tasks waiting here are served in order: a connection is set aside for the first, shared commands go to the others (they keep at least one unless `max_size` is 1), and it is handed over once the commands already on it are answered. A connection whose blocking command was cancelled while still running is closed instead of coming back. |
 | `pool.stats()` | Connections open, taken, being opened; commands in flight; tasks waiting; and counters for connections opened, connect errors and wait timeouts. |
 
 A `Client` belongs to the worker that opened it (it is not `Send`, like everything in giong).
 
 ## Types
 
-Arguments are anything that implements `ToArg`: strings, byte slices and vectors, integers, floats, and references to them. Replies convert with `FromValue`:
+Arguments are anything that implements `ToArg`: strings, byte slices and vectors, integers, floats, and references to them. Implement it for your own types, such as typed keys: whatever `write_arg` writes, in as many pieces as it likes, is sent as one argument.
+
+```rust
+use giong_redis::{ArgWriter, ToArg};
+
+struct SessionKey(u64);
+
+impl ToArg for SessionKey {
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(b"session:");
+        self.0.write_arg(out); // "session:42", one argument
+    }
+}
+```
+
+Replies convert with `FromValue`:
 
 | Rust | Reads |
 |---|---|
@@ -224,6 +239,6 @@ Redis Cluster (a `MOVED` or `ASK` reply is an error that says so) and Sentinel, 
 
 ## Tests
 
-`cargo test -p giong-redis`: 28 tests against a real Redis server that the test binary starts for itself (a throwaway directory, listening on 127.0.0.1, a TLS port with a certificate from a test authority, and a Unix socket, with an ACL user besides the default one): strings, numbers and missing keys; every RESP3 reply type read into the Rust types; 200 tasks sharing one connection, each getting its own replies; server errors with their codes, leaving the connection usable; pipelines, transactions and a transaction the server refuses as it is queued; `WATCH` when a key changed and when it did not, and an atomic pipeline refusing to report success when a watch left behind stopped it; every command that would break sharing refused before sending; blocking commands on a connection of their own; a reply over the size limit failing alone; client-side caching invalidations over the size limit passed over, not taken for replies; the response timeout, with the late reply thrown away; commands queued behind one that gets no answer each timing out on their own deadline, never early (against a scripted server); a connection the server kills; ACL users and wrong passwords; the database and the client name; Unix sockets and TLS, against the right and the wrong authority, and TLS sent to the plain port and plain to the TLS port; connecting to a closed port, a silent server and a missing socket, fast and with a reason; a server that is not Redis; the pool (sharing a few connections among many tasks, `take()` and the return, a connection left in a cancelled blocking command closed rather than shared, a `watch` cancelled before its reply leaving no `WATCH` behind, a task waiting to take a connection woken when a dropped command frees it, connections the server closed replaced, a pool that cannot connect); and Pub/Sub (channels and patterns, binary payloads, waiting cancelled without losing a message, a subscriber whose connection was killed). 28 unit tests: command encoding and the refusals, URLs, error codes, the reply parser for every RESP3 type, attributes and pushes, replies cut anywhere and the size limit, the read buffer's memory, conversions; and 330,000 random inputs: replies cut at random places and read back with random limits, damaged replies (an error, never a panic) and URLs. 14 documentation examples.
+`cargo test -p giong-redis`: 35 tests against a real Redis server that the test binary starts for itself (a throwaway directory, listening on 127.0.0.1, a TLS port with a certificate from a test authority, and a Unix socket, with an ACL user besides the default one): strings, numbers and missing keys; every RESP3 reply type read into the Rust types; 200 tasks sharing one connection, each getting its own replies; typed keys written in pieces, and a `ToArg` that panics half way, on a shared connection, leaving every other task its own reply; server errors with their codes, leaving the connection usable; pipelines, transactions and a transaction the server refuses as it is queued; `WATCH` when a key changed and when it did not, and an atomic pipeline refusing to report success when a watch left behind stopped it; every command that would break sharing refused before sending; blocking commands on a connection of their own; a reply over the size limit failing alone; client-side caching invalidations over the size limit passed over, not taken for replies; the response timeout, with the late reply thrown away; commands queued behind one that gets no answer each timing out on their own deadline, never early (against a scripted server); a connection the server kills; ACL users and wrong passwords; the database and the client name; Unix sockets and TLS, against the right and the wrong authority, and TLS sent to the plain port and plain to the TLS port; connecting to a closed port, a silent server and a missing socket, fast and with a reason; a server that is not Redis; the pool (sharing a few connections among many tasks, `take()` and the return, a connection left in a cancelled blocking command closed rather than shared, a `watch` cancelled before its reply leaving no `WATCH` behind, a task waiting to take a connection woken when a dropped command frees it, connections the server closed replaced, a pool that cannot connect, `take()` served in order within milliseconds while 32 tasks keep a full pool busy, a taker giving up leaving no connection set aside, `wait_timeout(Duration::MAX)`, a connection whose server became a replica replaced); and Pub/Sub (channels and patterns, binary payloads, waiting cancelled without losing a message, a subscriber whose connection was killed, a late confirmation for another channel not taken for this one). 30 unit tests: command encoding (arguments written in pieces or not at all) and the refusals, URLs, error codes, the reply parser for every RESP3 type, attributes and pushes, replies cut anywhere and the size limit, the read buffer's memory, conversions; and 330,000 random inputs: replies cut at random places and read back with random limits, damaged replies (an error, never a panic) and URLs. 15 documentation examples.
 
 The tests find `redis-server` through `GIONG_REDIS_BIN` (the directory that holds it), `/usr/bin` or `PATH`. They skip when Redis is not installed, unless `GIONG_REDIS_REQUIRED=1` (CI sets it, and installs Ubuntu's Redis 7.0). They also pass under ThreadSanitizer and on the fallback io_uring setups (`scripts/check.sh tsan` and `fallback`). They have passed against Redis 7.0.15; Redis 6, 7.2+ and Valkey are not tested yet.
