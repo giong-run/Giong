@@ -135,6 +135,19 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     if target.is_empty() || !target.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
         return Err(400);
     }
+    // The version first: the rules below are HTTP/1.x's, and another
+    // version (`PRI * HTTP/2.0`, the HTTP/2 preface) is answered with 505
+    // whatever its target.
+    let minor = match version {
+        b"HTTP/1.1" => 1,
+        b"HTTP/1.0" => 0,
+        [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
+            if major.is_ascii_digit() && minor.is_ascii_digit() =>
+        {
+            return Err(505)
+        }
+        _ => return Err(400),
+    };
     // The target is a path (origin form), `*` for OPTIONS, `host:port` for
     // CONNECT, or a whole URL (absolute form, RFC 9112 section 3.2.2), as
     // a client sends to a proxy. A server must take the host from such a
@@ -156,16 +169,6 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
             }
             Some(authority)
         }
-    };
-    let minor = match version {
-        b"HTTP/1.1" => 1,
-        b"HTTP/1.0" => 0,
-        [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
-            if major.is_ascii_digit() && minor.is_ascii_digit() =>
-        {
-            return Err(505)
-        }
-        _ => return Err(400),
     };
 
     let headers = line_end + 1..head.len() - 2;
@@ -316,6 +319,7 @@ mod tests {
             ("GET  / HTTP/1.1\r\nHost: x\r\n\r\n", 400),
             ("GET / HTTP/1.1 \r\nHost: x\r\n\r\n", 400),
             ("GET / HTTP/2.0\r\nHost: x\r\n\r\n", 505),
+            ("PRI * HTTP/2.0\r\n\r\n", 505),
             ("GET / FTP/1.1\r\nHost: x\r\n\r\n", 400),
             ("G@T / HTTP/1.1\r\nHost: x\r\n\r\n", 400),
             ("GET /a\tb HTTP/1.1\r\nHost: x\r\n\r\n", 400),
