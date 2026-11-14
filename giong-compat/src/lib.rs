@@ -4,8 +4,8 @@
 //! AsyncBufRead}`) and of the futures crates (`futures_io::{AsyncRead,
 //! AsyncWrite, AsyncBufRead}`) for giong's streams, so that protocol crates
 //! which are generic over their transport run on giong: TLS (tokio-rustls,
-//! futures-rustls), WebSocket (tokio-tungstenite, async-tungstenite), HTTP/2
-//! (h2), hyper's connection API, framing (tokio-util's codecs), and the like.
+//! futures-rustls), WebSocket (tokio-tungstenite), HTTP/2 (h2), hyper's
+//! connection API, framing (tokio-util's codecs), and the like.
 //!
 //! ```no_run
 //! use giong::net::TcpStream;
@@ -24,11 +24,11 @@
 //!
 //! ## When to use it, and when not
 //!
-//! **Use the native crate when there is one.** giong-http (HTTP/1.1 server
-//! and client), giong-web, giong-tls, giong-postgres, giong-mysql and
-//! giong-redis are built on giong's owned buffers and batching and are
-//! faster than the same protocol through this adapter. `Compat` is the
-//! bridge for protocols giong has no crate for yet.
+//! **Use the native crate when there is one.** giong-http (HTTP/1.1 and
+//! HTTP/2, server and client), giong-web, giong-tls, giong-postgres,
+//! giong-mysql and giong-redis are built on giong's owned buffers and
+//! batching and are faster than the same protocol through this adapter.
+//! `Compat` is the bridge for protocols giong has no crate for yet.
 //!
 //! **It works for crates that take the stream from you and are driven by
 //! you:** a function such as `tokio_rustls::TlsConnector::connect(name,
@@ -48,7 +48,9 @@
 //!   no reactor running, must be called from the context of a Tokio 1.x
 //!   runtime", or never finishes;
 //! - uses Tokio's timers (`tokio::time::sleep`, `timeout`) or
-//!   `tokio::spawn`: the same panic;
+//!   `tokio::spawn`: the same panic. hyper takes a timer and an executor
+//!   from you instead, and its server needs a timer for
+//!   `header_read_timeout`; the README shows one on giong's timers;
 //! - requires the stream, or the futures it spawns, to be `Send` (it says
 //!   `T: Send` or `+ Send + 'static` in its bounds): `Compat` is not
 //!   `Send`, because giong's tasks stay on their worker. The compiler says
@@ -80,10 +82,12 @@
 //!
 //! - **Writes are buffered**, as with `BufWriter` or a TLS stream:
 //!   `poll_write` copies the bytes and returns; they are sent on `flush`,
-//!   when the buffer is full, or when the stream is read. Call `flush` (or
-//!   `shutdown`) where the data must have been sent; every crate written
-//!   for these traits already does. While one buffer is being sent the next
-//!   one fills, so a long transfer keeps the socket busy.
+//!   when the buffer is full, or when a read on the same task is about to
+//!   wait. Call `flush` (or `shutdown`) where the data must have been sent;
+//!   every crate written for these traits already does. A writer in another
+//!   task than the reader must flush: a read only sends what its own task
+//!   wrote. While one buffer is being sent the next one fills, so a long
+//!   transfer keeps the socket busy.
 //! - **A failed send is reported by the next write, flush or shutdown**,
 //!   with the kernel's error; later calls fail with
 //!   [`GIONG-E1401`](giong::error::Code::CompatWriteFailed). Writing after
@@ -95,8 +99,9 @@
 //!   and `futures::io::AsyncReadExt::split` work, since nothing here needs
 //!   `Send`.
 //! - **Reading after the end of the stream** keeps returning 0 bytes.
-//! - **Cancel safe**: a dropped read loses no data, and a write is either
-//!   accepted whole or not at all, as the traits require.
+//! - **Cancel safe**: a dropped read loses no data, and a write either
+//!   copies bytes and says how many (possibly fewer than given), or copies
+//!   nothing.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/giong-run/Giong/main/assets/giong-icon.svg",
@@ -175,7 +180,7 @@ struct WriteState {
     /// it, and a read from another task leaves it alone.
     driver: Option<Waker>,
     /// The buffer of the last send, kept for the next one while more data
-    /// waits (never while idle, so idle streams hold no buffer).
+    /// waits.
     spare: Option<Vec<u8>>,
     closing: Option<CloseFuture>,
     state: WriteStatus,
@@ -226,7 +231,10 @@ impl<S: Transport> Compat<S> {
     /// for a send to finish (default [`DEFAULT_WRITE_BUFFER`], 64 KiB).
     ///
     /// While one buffer is sent the next one fills, so a busy stream holds
-    /// up to twice `limit`; an idle one holds nothing.
+    /// up to twice `limit`. An idle one may keep one empty buffer of up to
+    /// `limit` after a burst of writes (on the io_uring driver, where a
+    /// send can still be running when the next write comes): give many
+    /// mostly idle connections a smaller limit.
     ///
     /// # Panics
     ///

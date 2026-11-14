@@ -10,67 +10,149 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
-- **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
-  the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
-  `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
-  their transport run on giong with no Tokio runtime: tested with tokio-rustls,
-  futures-rustls, tokio-tungstenite, h2 (also over giong-tls with ALPN), hyper's HTTP/1
-  connection API (against giong-http both ways) and tokio-util's codecs, on io_uring and
-  epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
-  the buffer is full or when a read waits; a partly read chunk never holds the worker's
-  receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
-  through `AsyncBufRead`), measured by `bench/compat.sh`. Errors `GIONG-E1401` (an earlier
-  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting).
-- **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
-  for futures written by hand and for adapters such as giong-compat.
-- **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
-  hand a connection's keys to the kernel once rustls has done the handshake, and the
-  kernel encrypts and decrypts from then on; the `TlsStream` API stays the same.
-  `Ktls::Off` is the default; `Ktls::Auto` uses the kernel where it can do everything
-  rustls would have done (the `tls` module, every cipher suite the configuration
-  allows in both directions, and new TLS 1.3 keys on a live connection, Linux 6.14+)
-  and keeps the connection in the process otherwise; `Ktls::Required` fails with
-  `GIONG-E2009` instead. What the kernel can do is probed once per process
-  (`giong_tls::ktls_support()`, one line for a log); `TlsStream::is_ktls()`,
-  `ktls_unavailable()` and `giong_tls::ktls_stats()` say which way connections went.
-  Session tickets, key updates from either side, alerts, refused renegotiation and
-  `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
-  the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
-  the kernel would repeat the nonce of the `Finished` message under the same key. New
-  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
-  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
-  are tested.
-- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
-  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
-  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
-  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
-  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
-  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
-  Unix sockets read and write). A file that turns out shorter than announced is the new
-  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
-  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
-  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
-  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
-  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
-  `giong-tls` README has the table and when to turn it on. Recorded in
-  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
-- **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
-  data, on both drivers (giong-tls sends TLS alerts and key updates through it).
-- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
-  and a body for example, without copying them into one first. `giong-http` uses it for
-  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
-- **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
-  module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
-  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
-  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
-  `fallback`, `tsan` and `docker` jobs.
-- **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
-  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
-  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
-  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
-  adds a giong client with kernel TLS and the same body sizes.
-- **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
-  (`docs/reviews/2026-11-giong-tls.md`).
+- **Verification**: fuzz targets for the core crate (`fuzz/`): `dns_response` (DNS answers,
+  up to 64 KiB, with a 2-second limit per input so that a slow answer counts as a failure)
+  and `resolv_conf` (`/etc/resolv.conf` and `/etc/hosts`), in the nightly fuzz workflow.
+
+### Changed
+
+- **giong**: the default number of workers follows the CPU quota. It was the number of CPUs
+  in the process's affinity mask, which in a container with a CPU limit is every CPU of the
+  machine: a Kubernetes pod with `limits.cpu: 2` on a 64-core node ran 64 pinned workers
+  that the quota throttled. It is now the smaller of the affinity mask and the quota
+  (`std::thread::available_parallelism`), so 2 there. Under such a quota workers are no
+  longer pinned by default, since the CPUs are shared with other processes and pinning
+  stacked the workers on CPUs 0 and 1; `Builder::pin_cores(true)` pins them anyway.
+- **giong**, breaking: `JoinError` is `#[non_exhaustive]`, so that a reason can be added
+  without breaking code; a `match` on it needs a `_` arm.
+- **giong**: the panics an agent or a person meets first now carry a code, the cause and
+  the fix, like giong's errors: `GIONG-E0011` (a giong function called outside a giong
+  runtime, for example on Tokio's executor), `GIONG-E0012` (`block_on` inside a runtime)
+  and `GIONG-E0013` (a giong future polled on another worker).
+- **giong**, breaking: `mpsc::Receiver::try_recv` and `mpsc::BoundedReceiver::try_recv`
+  return `Result<T, mpsc::TryRecvError>` instead of `Option<T>`, like
+  `oneshot::Receiver::try_recv`: `Empty` while a sender is alive, `Closed` once every
+  sender is gone and the channel is empty. The `Option` could not tell the two apart.
+- **giong**: `OpenOptions::custom_flags` ignores the access-mode bits (`O_RDONLY`,
+  `O_WRONLY`, `O_RDWR`), as the standard library does: `custom_flags(libc::O_RDWR)` no
+  longer turns a read-only open into a writable one. Combinations `open(2)` cannot do (no
+  access mode, `truncate` or `create` without `write`, `append` with `truncate`) fail with
+  `GIONG-E0203`, which names the option and the fix, instead of a bare `EINVAL`.
+- **giong**: `File::allocate` with a length of 0 does nothing and returns `Ok` (it was the
+  kernel's `EINVAL`), and a range that ends above `i64::MAX` is refused with `GIONG-E0202`.
+- **giong**: the docs of `TcpStream` and `UnixStream` `read`, `write` and `write_all` say
+  that they are not cancel safe, and `read` that a buffer with no capacity reads `Ok(0)`.
+
+### Fixed
+
+- **giong**, epoll driver: file operations no longer queue behind one that blocks. A burst
+  of file operations started while one blocking thread was idle all went to that thread, so
+  one open of a FIFO without a writer (or a read from a hung network filesystem) stalled
+  every file operation of the process. A thread now starts whenever more jobs wait than idle
+  threads can take.
+- **giong**: work sent through a `Handle` to a runtime that has stopped, or was dropped
+  without running, is cancelled instead of waiting forever: `spawn_balanced` after `run`
+  returned, jobs still queued when the last worker stopped, and `spawn_on` to a runtime that
+  never ran now resolve to `JoinError::Cancelled`, as documented.
+- **giong**: with `shutdown_on_signals`, SIGINT and SIGTERM are seen as long as any worker
+  runs. Only worker 0 watched for them, so once its main future had returned the signals
+  did nothing and the process had to be killed.
+- **giong**: `Cargo.toml` asked for `libc` 0.2, but giong needs 0.2.172 (what socket2 0.6
+  needs), so a lockfile holding an older `libc` failed to build. CI now builds and tests the
+  core crate with every direct dependency at the lowest version its `Cargo.toml` allows
+  (`minimal-versions` job), and a test checks that I/O completes while another task on the
+  worker keeps yielding, which io-uring 0.7.0 to 0.7.14 broke before 0.5.0.
+- **giong**: a balanced listener could leave a connection in the mailbox of a worker whose
+  last balanced listener closed at the same moment, open and unanswered. The hand-over now
+  checks under the mailbox's lock and keeps the connection, or gives it to another member.
+- **giong**: a DNS answer with a long chain of CNAME records froze the worker. The chain was
+  followed by rescanning every record for every name found, in cubic time: one 64 KiB TCP
+  answer of 2,300 records held the worker for 18 seconds, with no timer or other task
+  running, and whoever controls DNS answers (a resolver, or anyone on the path to it) could
+  send one. The chain is now followed from the query name in linear time, and more than 16
+  CNAME links is a malformed answer (`GIONG-E0107`), as in other resolvers.
+- **giong**: `File::read_at`, `write_at` and `write_all_at` refuse an offset above
+  `i64::MAX` with `GIONG-E0202`. io_uring reads `u64::MAX` as "the current file position",
+  so such an offset read and wrote wherever that was, on io_uring only (epoll failed with
+  `EINVAL`).
+- **giong**: a DNS server address where nothing listens gave the kernel's bare "connection
+  refused", so a failed `connect("db.internal:5432")` read as if the database refused. It
+  is now `GIONG-E0108`, naming the server and the name, with the kernel's error as its
+  source. `GIONG-E0104` says when it really applies (an empty `ResolverConfig::nameservers`;
+  a `resolv.conf` without servers means `127.0.0.1:53`).
+- **giong**: `UdpSocket::read_from` refuses a buffer with no capacity (`Vec::new()`) with
+  `GIONG-E0109`, instead of receiving the datagram into it and losing it.
+- **giong**: an IP address without a port (`"10.0.0.5"`, `"::1"`) or an IPv6 address
+  without brackets (`"2001:db8::1:8080"`) passed as `"host:port"` now gets an error that
+  says so and shows the right form, instead of "not a valid host name".
+- **giong**: a `File::open`, `File::create` or `OpenOptions::open` whose future was dropped
+  after the open started (a timeout, a cancelled request) leaked the descriptor the open
+  produced: on io_uring every one (200 of 200 in the new test), on epoll those already
+  running. The driver now closes the result of an open nobody collects, on both drivers.
+- **giong**: memory the kernel writes into during an operation (the `statx` result, the
+  `msghdr` of `UdpSocket::read_from` and `send_to`, the headers of vectored and control
+  sends, the address of `connect`, and paths) was reached through a pointer taken before its
+  `Box` moved, which Rust's aliasing rules make undefined behaviour (nothing miscompiled,
+  but Miri failed on every file test). It now lives in a small owner reached only through a
+  raw pointer, and `IoBufMut for Vec<u8>` hands the kernel a pointer valid for the whole
+  capacity. So that this stays fixed, CI runs the unit tests and the tests Miri can run
+  (files, tasks, channels, timers, `observe`, several workers) under Miri on the epoll
+  driver (`scripts/check.sh miri`), and clippy checks that every `unsafe` block and impl
+  in giong says why it is sound.
+- **giong**: the buffer ring's entries are written field by field through raw pointers.
+  The setters of `io_uring`'s `BufRingEntry` take a reference to the whole entry, whose
+  last field in entry 0 is the ring tail the kernel reads at any time (nothing
+  miscompiled). The `# Safety` sections of `IoBuf` and `IoBufMut` now also say that
+  nothing else may write the bytes (for `IoBufMut`, read or write them) while giong holds
+  the buffer, which the implementations giong provides already guaranteed.
+- **giong**: `observe` grouped tasks by the address of their spawn `Location`, so one call
+  site could show up as several entries; it groups by file, line and column.
+- **giong**: a stream or listener dropped by code the driver runs (a waker's `wake` or
+  `drop`) kept its multishot receive or accept: the kernel kept the socket open, so the
+  peer never saw it close, and the driver kept the entry. An operation's future dropped
+  there leaked its buffer and its entry. Both are now finished at the next turn of the
+  event loop.
+- **giong**: a `TcpListener` or `UnixListener` that outlived its runtime (returned from one
+  `block_on` and used in the next) leaked the connections io_uring had accepted for it but
+  nobody had taken: the descriptors stayed open and the clients waited. The runtime closes
+  them, and gives back the receive buffers of every live multishot queue, when it stops.
+- **giong**: a failure of `io_uring_enter`, of submitting to the ring or of `epoll_wait`
+  that the event loop cannot recover from still stops the runtime, but the panic is now
+  coded `GIONG-E0005` and says what the error means: `EBADR` and `ENOMEM` that the kernel
+  ran out of memory for completions, anything else that it is worth a report.
+- **giong**: on the epoll driver, reading or writing a pipe on standard input, output or
+  error through `fs::File` switched the pipe to non-blocking mode, which belongs to the
+  pipe and so changed it for the rest of the shell pipeline too (`cat` on the same pipe
+  failed with `EAGAIN`). Those pipes are now read and written on the blocking threads, as
+  terminals already were; pipes on other descriptors still go through epoll.
+
+## [0.5.0] - 2026-11-14
+
+HTTP/2, and less work per byte. `giong-http` speaks HTTP/2 as a server and as a client,
+through ALPN or with prior knowledge, with the same handlers; it is hardened against rapid
+reset, floods and HPACK bombs, `h2spec` passes all 147 cases, and on one core of a
+bare-metal server it answers 2.3 to 4.3 times as many HTTP/2 requests as axum. `giong-tls`
+can hand a connection to the kernel's TLS after the handshake, and files go out with
+`sendfile`: on bare metal a 1 MiB file over HTTPS is served 36% faster than with rustls,
+level with nginx. On io_uring, large static bodies leave without a copy on Linux 6.2 and
+newer (up to 85% less CPU per request), connections share receive buffers piece by piece
+on 6.12 and newer (less than half the memory under load), and bulk receives are no longer
+copied out of the pool. `SQPOLL` was tried and left out: on bare metal it served fewer
+requests with 73% more CPU per request. The new `giong-compat` gives giong's streams the
+Tokio and futures-io I/O traits, so crates such as h2, tokio-rustls and tokio-tungstenite
+run on giong. On Linux 6.14 to 7.2, a worker past the locked-memory limit now runs on
+epoll and says why (`GIONG-E0010`) instead of stopping the runtime. No change breaks code
+written for 0.4, but a stream's `recv` may now return one write of the peer in two pieces.
+
+The release candidate was measured again on the two bare-metal machines
+(`bench/results/bare-metal-epyc-4345p/linux-7.0/release-0.5.0/`): on 4 workers giong
+served 1.75M requests/s against 1.69M for tuned Monoio and 1.59M for raw Tokio, two
+15-minute soaks passed, and nothing moved beyond the 2% noise between runs except two
+small losses not explained yet: an idle HTTP/2 connection costs 4.21 KiB where an earlier
+build measured 3.99, and giong-http over TLS answers about 2% fewer small requests.
+
+### Added
+
 - **`giong-http`: HTTP/2** (RFC 9113) for the same handlers. Over TLS, `serve_tls` offers
   `h2` and `http/1.1` through ALPN, so browsers get HTTP/2; without TLS, a connection that
   opens with the HTTP/2 preface is served over HTTP/2 ("prior knowledge"), on the same
@@ -119,23 +201,40 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   and 1.2 to 1.3 times on 8.5 KiB ones. `bench/http-client.sh` measures HTTP/2 over TLS
   and with prior knowledge (`h2`, `h2c`), and tells both clients to speak HTTP/1.1 for
   `http` and `https`.
-- **Verification**: two new fuzz targets in the nightly fuzz workflow, `hpack` (header
-  blocks decoded, encoded again and compared; Huffman both ways) and `h2` (whole
-  connections from a client that follows the protocol mostly, every frame the server
-  writes checked against RFC 9113 and the client's flow control). The same checks run
-  in `cargo test` (100,000 header blocks and 3,000 connections a run).
-- **Verification**: a fuzz target for the client's side of HTTP/2, `h2_client`: frames a
-  server might send, fed in pieces while requests come and go, with checks that the
-  client holds no more than the windows it grants and writes only well-formed frames
-  within the server's windows. 3,000 such connections run in `cargo test`.
-- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
-  worker uses (`giong::IoUringFeature`), and its one-line form names them
-  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
-  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
-  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
-- **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
-  suite with the optional features off, and the QEMU kernels include 6.12, the first with
-  packed buffer rings; every QEMU run checks which features giong found.
+- **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
+  hand a connection's keys to the kernel once rustls has done the handshake, and the
+  kernel encrypts and decrypts from then on; the `TlsStream` API stays the same.
+  `Ktls::Off` is the default; `Ktls::Auto` uses the kernel where it can do everything
+  rustls would have done (the `tls` module, every cipher suite the configuration
+  allows in both directions, and new TLS 1.3 keys on a live connection, Linux 6.14+)
+  and keeps the connection in the process otherwise; `Ktls::Required` fails with
+  `GIONG-E2009` instead. What the kernel can do is probed once per process
+  (`giong_tls::ktls_support()`, one line for a log); `TlsStream::is_ktls()`,
+  `ktls_unavailable()` and `giong_tls::ktls_stats()` say which way connections went.
+  Session tickets, key updates from either side, alerts, refused renegotiation and
+  `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
+  the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
+  the kernel would repeat the nonce of the `Finished` message under the same key. New
+  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
+  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
+  are tested.
+- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
+  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
+  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
+  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
+  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
+  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
+  Unix sockets read and write). A file that turns out shorter than announced is the new
+  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
+  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
+  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
+  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
+  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
+  `giong-tls` README has the table and when to turn it on. Recorded in
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
+- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
+  and a body for example, without copying them into one first. `giong-http` uses it for
+  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
 - **giong**: on Linux 6.2 and newer, TCP sends of 16 KiB and more from bytes that cannot
   change (`&'static [u8]`, `Rc<[u8]>`, `Arc<[u8]>`, so `giong-http`'s static bodies) go
   out without a copy into the kernel (`IORING_OP_SEND_ZC`, `zero-copy-send`): the network
@@ -146,9 +245,56 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   when the kernel reports that it copied the data anyway (loopback, a card without
   scatter-gather) or cannot send this way (kTLS); Unix sockets never use it. On bare metal
   (Linux 7.0, 25 GbE) it cuts the CPU time per request by 16% at 64 KiB, 62% at 256 KiB,
-  72% at 1 MiB and 85% at 16 MiB, at the same request rate.
+  68 to 72% at 1 MiB and 85 to 86% at 16 MiB across runs, at the same request rate.
   `bench/uring-features.sh` measures each optional io_uring feature against the rest, on
   one machine or two.
+- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
+  worker uses (`giong::IoUringFeature`), and its one-line form names them
+  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
+  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
+  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
+- **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
+  for futures written by hand and for adapters such as giong-compat.
+- **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
+  data, on both drivers (giong-tls sends TLS alerts and key updates through it).
+- **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
+  the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
+  `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
+  their transport run on giong with no Tokio runtime: tested with tokio-rustls,
+  futures-rustls, tokio-tungstenite, h2 (also over giong-tls with ALPN), hyper's HTTP/1
+  connection API (against giong-http both ways) and tokio-util's codecs, on io_uring and
+  epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
+  the buffer is full or when a read waits; a partly read chunk never holds the worker's
+  receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
+  through `AsyncBufRead`), measured by `bench/compat.sh` in four sessions (sending 10–20%
+  slower, receiving with `read` 6–13% more CPU per byte). Errors `GIONG-E1401` (an earlier
+  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting). A
+  hyper server over `Compat` needs a `hyper::rt::Timer` for its header timeout; the README
+  shows one built on giong's timers.
+- **Verification**: two new fuzz targets in the nightly fuzz workflow, `hpack` (header
+  blocks decoded, encoded again and compared; Huffman both ways) and `h2` (whole
+  connections from a client that follows the protocol mostly, every frame the server
+  writes checked against RFC 9113 and the client's flow control). The same checks run
+  in `cargo test` (100,000 header blocks and 3,000 connections a run).
+- **Verification**: a fuzz target for the client's side of HTTP/2, `h2_client`: frames a
+  server might send, fed in pieces while requests come and go, with checks that the
+  client holds no more than the windows it grants and writes only well-formed frames
+  within the server's windows. 3,000 such connections run in `cargo test`.
+- **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
+  module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
+  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
+  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
+  `fallback`, `tsan` and `docker` jobs.
+- **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
+  suite with the optional features off, and the QEMU kernels include 6.12, the first with
+  packed buffer rings; every QEMU run checks which features giong found.
+- **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
+  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
+  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
+  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
+  adds a giong client with kernel TLS and the same body sizes.
+- **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
+  (`docs/reviews/2026-11-giong-tls.md`).
 
 ### Changed
 
@@ -177,46 +323,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
-- **giong**: a `File::open`, `File::create` or `OpenOptions::open` whose future was dropped
-  after the open started (a timeout, a cancelled request) leaked the descriptor the open
-  produced: on io_uring every one (200 of 200 in the new test), on epoll those already
-  running. The driver now closes the result of an open nobody collects, on both drivers.
-- **giong**: memory the kernel writes into during an operation (the `statx` result, the
-  `msghdr` of `UdpSocket::read_from` and `send_to`, the headers of vectored and control
-  sends, the address of `connect`, and paths) was reached through a pointer taken before its
-  `Box` moved, which Rust's aliasing rules make undefined behaviour (nothing miscompiled,
-  but Miri failed on every file test). It now lives in a small owner reached only through a
-  raw pointer, and `IoBufMut for Vec<u8>` hands the kernel a pointer valid for the whole
-  capacity. So that this stays fixed, CI runs the unit tests and the tests Miri can run
-  (files, tasks, channels, timers, `observe`, several workers) under Miri on the epoll
-  driver (`scripts/check.sh miri`), and clippy checks that every `unsafe` block and impl
-  in giong says why it is sound.
-- **giong**: the buffer ring's entries are written field by field through raw pointers.
-  The setters of `io_uring`'s `BufRingEntry` take a reference to the whole entry, whose
-  last field in entry 0 is the ring tail the kernel reads at any time (nothing
-  miscompiled). The `# Safety` sections of `IoBuf` and `IoBufMut` now also say that
-  nothing else may write the bytes (for `IoBufMut`, read or write them) while giong holds
-  the buffer, which the implementations giong provides already guaranteed.
-- **giong**: `observe` grouped tasks by the address of their spawn `Location`, so one call
-  site could show up as several entries; it groups by file, line and column.
-- **giong**: a stream or listener dropped by code the driver runs (a waker's `wake` or
-  `drop`) kept its multishot receive or accept: the kernel kept the socket open, so the
-  peer never saw it close, and the driver kept the entry. An operation's future dropped
-  there leaked its buffer and its entry. Both are now finished at the next turn of the
-  event loop.
-- **giong**: a `TcpListener` or `UnixListener` that outlived its runtime (returned from one
-  `block_on` and used in the next) leaked the connections io_uring had accepted for it but
-  nobody had taken: the descriptors stayed open and the clients waited. The runtime closes
-  them, and gives back the receive buffers of every live multishot queue, when it stops.
-- **giong**: a failure of `io_uring_enter`, of submitting to the ring or of `epoll_wait`
-  that the event loop cannot recover from still stops the runtime, but the panic is now
-  coded `GIONG-E0005` and says what the error means: `EBADR` and `ENOMEM` that the kernel
-  ran out of memory for completions, anything else that it is worth a report.
-- **giong**: on the epoll driver, reading or writing a pipe on standard input, output or
-  error through `fs::File` switched the pipe to non-blocking mode, which belongs to the
-  pipe and so changed it for the rest of the shell pipeline too (`cat` on the same pipe
-  failed with `EAGAIN`). Those pipes are now read and written on the blocking threads, as
-  terminals already were; pipes on other descriptors still go through epoll.
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
   (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the
@@ -1030,7 +1136,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/giong-run/Giong/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/giong-run/Giong/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
