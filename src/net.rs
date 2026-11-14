@@ -229,7 +229,7 @@ impl StreamSocket {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
 
-    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<io::Result<RecvBuf>> {
+    pub(crate) fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<io::Result<RecvBuf>> {
         runtime::with_worker(|w| {
             let key = self.recv.key(w);
             let mut driver = w.driver.borrow_mut();
@@ -761,6 +761,21 @@ impl TcpStream {
     /// the meantime is returned by the next call.
     pub async fn recv(&self) -> io::Result<RecvBuf> {
         self.inner.recv().await
+    }
+
+    /// The poll form of [`recv`](Self::recv), for futures written by hand
+    /// and for adapters to poll-based I/O traits (giong-compat's `Compat`).
+    ///
+    /// Returns `Poll::Pending` and arranges for `cx`'s waker to be woken when
+    /// data or the end of the stream arrives. Only the waker of the most
+    /// recent call is woken, so one task at a time should poll a stream.
+    /// Nothing is lost by not calling it again: whatever arrives waits for
+    /// the next call, as with `recv`.
+    ///
+    /// Must be called on the worker the stream is used on; it panics outside
+    /// a giong runtime.
+    pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<io::Result<RecvBuf>> {
+        self.inner.poll_recv(cx)
     }
 
     /// Reads into `buf` (from its start, up to its capacity) with a one-off

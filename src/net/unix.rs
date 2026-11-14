@@ -6,6 +6,7 @@ use std::net::Shutdown;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{SocketAddr, UnixStream as StdStream};
 use std::path::Path;
+use std::task::{Context, Poll};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
@@ -120,6 +121,12 @@ impl UnixStream {
     /// Cancel safe, like [`TcpStream::recv`](super::TcpStream::recv).
     pub async fn recv(&self) -> io::Result<RecvBuf> {
         self.inner.recv().await
+    }
+
+    /// The poll form of [`recv`](Self::recv); see
+    /// [`TcpStream::poll_recv`](super::TcpStream::poll_recv).
+    pub fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<io::Result<RecvBuf>> {
+        self.inner.poll_recv(cx)
     }
 
     /// Reads into `buf` with a one-off receive; see

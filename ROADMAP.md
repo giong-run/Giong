@@ -231,8 +231,10 @@ the repository, and a benchmark of it against the same API on axum.
       connection per origin for every request, bounded by flow control, refused requests
       sent again; tested against the server and against servers that misbehave on
       purpose, fuzzed, benchmarked against reqwest.
-- [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
-      over the transport can run on giong.
+- [x] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
+      over the transport can run on giong: `giong-compat`, tested with tokio-rustls,
+      futures-rustls, tokio-tungstenite, h2, hyper's HTTP/1 connection API and tokio-util's
+      codecs, and measured against giong's own API and Tokio (`bench/compat.sh`).
 - [ ] Decide, based on demand, whether a hyper integration is worth maintaining.
 
 **Exit criteria:** an HTTPS server serving real browsers over HTTP/2, and `h2spec` passing.
