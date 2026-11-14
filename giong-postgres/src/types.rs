@@ -142,6 +142,9 @@ impl std::fmt::Debug for Type {
 }
 
 /// The format a value arrived in.
+///
+/// These are the only two formats of PostgreSQL's protocol, so the enum is
+/// complete: a `match` on it needs no wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     /// Text, as `psql` shows it.
@@ -385,6 +388,34 @@ impl<T: ToSql + ?Sized> ToSql for Box<T> {
 ///
 /// `'a` is the lifetime of the row, so that `&str` and `&[u8]` can borrow
 /// from it without copying.
+///
+/// **Which format a column arrives in** depends on its type alone, not on
+/// the Rust type it is read as: `boolean`, `bytea`, `smallint`, `integer`,
+/// `bigint`, `oid`, `real`, `double precision` and `timestamptz` come in
+/// binary, and every other type (`uuid`, `numeric`, `date`, `jsonb`, enums,
+/// arrays...) as text, as `psql` would show it. An implementation for one of
+/// those types reads the text, and should still check `format` and refuse
+/// the format it does not handle with [`Error::conversion`], rather than
+/// assume it, so that a value in another format is an error and never a
+/// wrong value.
+///
+/// ```
+/// use giong_postgres::types::Format;
+/// use giong_postgres::{Error, FromSql, Type};
+///
+/// /// A `uuid` column, kept as its text.
+/// struct Uuid(String);
+///
+/// impl<'a> FromSql<'a> for Uuid {
+///     fn from_sql(ty: Type, format: Format, raw: &'a [u8]) -> Result<Self, Error> {
+///         if ty != Type::UUID || format != Format::Text {
+///             return Err(Error::conversion(format!("expected uuid as text, got {ty} as {format:?}")));
+///         }
+///         let text = std::str::from_utf8(raw).map_err(|_| Error::conversion("uuid is not UTF-8"))?;
+///         Ok(Uuid(text.to_owned()))
+///     }
+/// }
+/// ```
 pub trait FromSql<'a>: Sized {
     /// Converts a value that is not `NULL`, of type `ty`, in `format`.
     ///

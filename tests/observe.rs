@@ -133,6 +133,10 @@ fn a_pulse_shows_the_task_a_blocked_worker_is_stuck_in() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "timing: under Miri a 5 ms sleep is often over before the worker parks"
+)]
 fn counters_go_up_and_idle_time_is_counted() {
     giong::block_on(async {
         let h = giong::handle();

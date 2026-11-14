@@ -29,5 +29,5 @@ rcgen = "0.13"
 all-features = true
 
 [lints.rust]
-# Set by `cargo fuzz` (see fuzz/).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+# Set by `cargo fuzz` (see fuzz/), and by `scripts/check.sh tsan`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(giong_tsan)'] }

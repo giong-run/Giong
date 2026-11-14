@@ -277,15 +277,17 @@ pub struct PollProfile {
 #[derive(Default)]
 pub(crate) struct Local {
     sources: RefCell<Vec<Weak<dyn Source>>>,
-    profile: RefCell<HashMap<usize, PollProfile>>,
+    /// Keyed by the location's value (file, line, column), not its address:
+    /// one call site can have several `Location`s (Miri gives every call its
+    /// own; natively, code inlined into several codegen units can).
+    profile: RefCell<HashMap<Location, PollProfile>>,
 }
 
 impl Local {
     /// Adds one timed poll of a task spawned at `location`.
     pub(crate) fn record(&self, location: Location, took: Duration) {
-        let key = location as *const panic::Location<'static> as usize;
         let mut profile = self.profile.borrow_mut();
-        let entry = profile.entry(key).or_insert(PollProfile {
+        let entry = profile.entry(location).or_insert(PollProfile {
             location,
             polls: 0,
             total: Duration::ZERO,
@@ -318,12 +320,12 @@ impl fmt::Debug for Local {
 /// Panics when called outside of a giong runtime.
 pub fn snapshot() -> Snapshot {
     runtime::with_worker(|w| {
-        let mut by_location: HashMap<usize, (Location, usize)> = HashMap::new();
+        // By value: see `Local::profile`.
+        let mut by_location: HashMap<Location, (Location, usize)> = HashMap::new();
         let mut tasks = 0;
         for location in w.task_locations() {
             tasks += 1;
-            let key = location as *const panic::Location<'static> as usize;
-            by_location.entry(key).or_insert((location, 0)).1 += 1;
+            by_location.entry(location).or_insert((location, 0)).1 += 1;
         }
         let mut tasks_by_location: Vec<_> = by_location.into_values().collect();
         tasks_by_location.sort_by(|a, b| {

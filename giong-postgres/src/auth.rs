@@ -2,13 +2,16 @@
 //! MD5 scheme.
 
 use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use giong::sync::oneshot;
 use ring::{digest, hmac, pbkdf2, rand::SecureRandom};
 
 use crate::error::{Error, ErrorKind};
 
-/// More iterations than this would hold the worker thread for seconds: a
-/// server asking for them is misconfigured or hostile.
+/// More iterations than this would take seconds of CPU for each new key: a
+/// server asking for them is misconfigured or hostile. (PostgreSQL's default
+/// is 4096; guides for PBKDF2-SHA-256 ask for 600,000.)
 const MAX_ITERATIONS: u32 = 1_000_000;
 
 fn auth_error(message: impl Into<String>) -> Error {
@@ -25,6 +28,12 @@ pub(crate) struct Scram {
 
 enum State {
     Started,
+    /// After the server's first message, which the client's final one
+    /// answers once the key is derived.
+    Received {
+        server_first: String,
+        nonce: String,
+    },
     /// After the client's final message: the signature the server must send.
     Sent {
         server_signature: [u8; 32],
@@ -66,8 +75,26 @@ impl Scram {
         format!("n,,{}", self.client_first_bare).into_bytes()
     }
 
-    /// Answers the server's first message with the client's final one.
+    /// Answers the server's first message with the client's final one,
+    /// deriving the key on this thread.
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn client_final(&mut self, server_first: &[u8]) -> Result<Vec<u8>, Error> {
+        let (salt, iterations) = self.server_first(server_first)?;
+        let salted = salted_password(&self.password, &salt, iterations);
+        self.client_final_salted(&salted)
+    }
+
+    /// The password, for deriving the key.
+    pub(crate) fn password(&self) -> &[u8] {
+        &self.password
+    }
+
+    /// Reads the server's first message: the salt and the iteration count to
+    /// derive the key with ([`salted_password`]).
+    pub(crate) fn server_first(
+        &mut self,
+        server_first: &[u8],
+    ) -> Result<(Vec<u8>, NonZeroU32), Error> {
         if !matches!(self.state, State::Started) {
             return Err(Error::protocol(
                 "the server sent SCRAM messages out of order",
@@ -108,15 +135,25 @@ impl Scram {
             )));
         }
 
-        let mut salted = [0u8; 32];
-        pbkdf2::derive(
-            pbkdf2::PBKDF2_HMAC_SHA256,
-            iterations,
-            &salt,
-            &self.password,
-            &mut salted,
-        );
-        let salted_key = hmac::Key::new(hmac::HMAC_SHA256, &salted);
+        self.state = State::Received {
+            server_first: server_first.to_owned(),
+            nonce: nonce.to_owned(),
+        };
+        Ok((salt, iterations))
+    }
+
+    /// The client's final message, from the key [`salted_password`] derived.
+    pub(crate) fn client_final_salted(&mut self, salted: &[u8; 32]) -> Result<Vec<u8>, Error> {
+        let State::Received {
+            server_first,
+            nonce,
+        } = std::mem::replace(&mut self.state, State::Started)
+        else {
+            return Err(Error::protocol(
+                "the server sent SCRAM messages out of order",
+            ));
+        };
+        let salted_key = hmac::Key::new(hmac::HMAC_SHA256, salted);
         let client_key = hmac::sign(&salted_key, b"Client Key");
         let stored_key = digest::digest(&digest::SHA256, client_key.as_ref());
 
@@ -182,6 +219,159 @@ impl Scram {
         }
         self.state = State::Done;
         Ok(())
+    }
+}
+
+/// SCRAM's SaltedPassword: PBKDF2-HMAC-SHA-256 of the password. This is the
+/// expensive step (about 0.5 µs per iteration), which a [`Config`] caches.
+///
+/// [`Config`]: crate::Config
+pub(crate) fn salted_password(password: &[u8], salt: &[u8], iterations: NonZeroU32) -> [u8; 32] {
+    let mut salted = [0u8; 32];
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA256,
+        iterations,
+        salt,
+        password,
+        &mut salted,
+    );
+    salted
+}
+
+/// How many derived SCRAM keys a [`KeyCache`] keeps.
+const CACHED_KEYS: usize = 8;
+
+/// The SCRAM keys derived for one [`Config`] and its clones, by password,
+/// salt and iteration count. A role's salt and iteration count stay the same
+/// until its password is set again, so only the first connection of a
+/// process pays for the derivation, and it pays on a thread of its own:
+/// every connection after a failover would otherwise stall its worker's
+/// tasks for 2 ms at PostgreSQL's default of 4096 iterations, and for 175 ms
+/// at a million.
+///
+/// [`Config`]: crate::Config
+#[derive(Default)]
+pub(crate) struct KeyCache {
+    entries: Mutex<Vec<(KeyId, KeyState)>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct KeyId {
+    /// SHA-256 of the password.
+    password: [u8; 32],
+    salt: Vec<u8>,
+    iterations: u32,
+}
+
+enum KeyState {
+    Ready([u8; 32]),
+    /// Being derived; these connections wait for it.
+    Deriving(Vec<oneshot::Sender<[u8; 32]>>),
+}
+
+impl KeyCache {
+    /// [`salted_password`], derived once on another thread and kept.
+    pub(crate) async fn salted_password(
+        self: &Arc<Self>,
+        password: &[u8],
+        salt: &[u8],
+        iterations: NonZeroU32,
+    ) -> [u8; 32] {
+        let mut digest_of_password = [0u8; 32];
+        digest_of_password.copy_from_slice(digest::digest(&digest::SHA256, password).as_ref());
+        let id = KeyId {
+            password: digest_of_password,
+            salt: salt.to_vec(),
+            iterations: iterations.get(),
+        };
+        let (tx, rx) = oneshot::channel();
+        let start = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            match entries.iter_mut().find(|(k, _)| *k == id) {
+                Some((_, KeyState::Ready(key))) => return *key,
+                Some((_, KeyState::Deriving(waiting))) => {
+                    waiting.push(tx);
+                    false
+                }
+                None => {
+                    if entries.len() >= CACHED_KEYS {
+                        let ready = entries
+                            .iter()
+                            .position(|(_, s)| matches!(s, KeyState::Ready(_)));
+                        if let Some(i) = ready {
+                            entries.remove(i);
+                        }
+                    }
+                    entries.push((id.clone(), KeyState::Deriving(vec![tx])));
+                    true
+                }
+            }
+        };
+        if start {
+            let job = Derive {
+                cache: Arc::clone(self),
+                id,
+                password: password.to_vec(),
+                salt: salt.to_vec(),
+                iterations,
+            };
+            let spawned = std::thread::Builder::new()
+                .name("giong-postgres-scram".to_owned())
+                .spawn(move || job.run());
+            if spawned.is_err() {
+                // No thread to be had: derive here (the job was dropped,
+                // which took its entry out).
+                return salted_password(password, salt, iterations);
+            }
+        }
+        match rx.await {
+            Ok(key) => key,
+            Err(_) => salted_password(password, salt, iterations),
+        }
+    }
+}
+
+/// A key derivation on its thread. If it ends without a key (it cannot,
+/// short of a panic), its entry goes, so that nobody waits for it.
+struct Derive {
+    cache: Arc<KeyCache>,
+    id: KeyId,
+    password: Vec<u8>,
+    salt: Vec<u8>,
+    iterations: NonZeroU32,
+}
+
+impl Derive {
+    fn run(self) {
+        let key = salted_password(&self.password, &self.salt, self.iterations);
+        let waiting = {
+            let mut entries = self
+                .cache
+                .entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match entries.iter_mut().find(|(k, _)| *k == self.id) {
+                Some((_, state)) => match std::mem::replace(state, KeyState::Ready(key)) {
+                    KeyState::Deriving(waiting) => waiting,
+                    KeyState::Ready(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            }
+        };
+        for tx in waiting {
+            let _ = tx.send(key);
+        }
+    }
+}
+
+impl Drop for Derive {
+    fn drop(&mut self) {
+        let mut entries = self
+            .cache
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|(k, s)| !(*k == self.id && matches!(s, KeyState::Deriving(_))));
     }
 }
 
