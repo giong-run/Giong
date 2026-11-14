@@ -40,9 +40,11 @@ pub enum ErrorKind {
     /// A redirect was not followed: too many of them, from HTTPS to HTTP,
     /// or a `Location` that is not a valid URL.
     Redirect,
-    /// The connection closed before the whole response arrived.
+    /// The connection closed before the whole response arrived, or the
+    /// server reset the request's HTTP/2 stream.
     Closed,
-    /// The server sent something that is not a valid HTTP/1.1 response.
+    /// The server sent something that is not a valid HTTP/1.1 response, or
+    /// broke a rule of HTTP/2.
     Protocol,
     /// [`Response::error_for_status`](super::Response::error_for_status)
     /// found a 4xx or 5xx status.

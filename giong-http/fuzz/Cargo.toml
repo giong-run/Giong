@@ -57,5 +57,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "hpack"
+path = "fuzz_targets/hpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2"
+path = "fuzz_targets/h2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h2_client"
+path = "fuzz_targets/h2_client.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

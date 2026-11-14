@@ -9,18 +9,19 @@ disagree, CONTRIBUTING.md wins: report the difference.
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
 driver where io_uring is blocked or the kernel is too old. One Cargo
-workspace, eight crates and an example service:
+workspace, nine crates and an example service:
 
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library (bodies whole or streamed both ways), HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
 | `giong-redis/` | `giong-redis` | a Redis client (RESP3) with Pub/Sub and a per-worker pool |
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
+| `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
 | `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
@@ -171,6 +172,12 @@ is loaded.
   under TSan on purpose (see the comment in `scripts/check.sh`).
 - **A fresh target directory** takes a few minutes for `scripts/check.sh tsan`, because it
   rebuilds the standard library.
+- **Crates from the Tokio ecosystem.** Prefer the giong crate for the job (the table
+  above). A crate that takes a stream and is driven by your task (h2, tokio-rustls,
+  tokio-tungstenite, hyper's `conn`, tokio-util's codecs) runs over
+  `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
+  reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
+  cannot fix that (see `giong-compat/README.md`).
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 

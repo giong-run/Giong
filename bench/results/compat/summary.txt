@@ -1,0 +1,16 @@
+
+recv: MiB/s and CPU ns/KiB, median [min-max] of 9 runs
+  giong                2215 [1390-3059]      375.60 [259.60-659.90]
+  compat               2353 [1451-2661]      330.80 [306.20-661.50]
+  compat-bufread       2071 [1424-3120]      411.20 [243.20-663.20]
+  tokio                3131 [2395-4388]      144.90 [104.10-196.30]
+
+send: MiB/s and CPU ns/KiB, median [min-max] of 9 runs
+  giong                3148 [2116-4340]      309.20 [224.60-459.20]
+  compat               2707 [2386-2878]      360.20 [338.80-408.60]
+  tokio                3097 [2405-4331]      313.60 [224.80-402.90]
+
+rr: round trips/s and CPU us/round trip, median [min-max] of 9 runs
+  giong               33008 [28013-38662]       14.40 [12.59-16.79]
+  compat              32273 [27118-38079]       14.97 [13.11-17.29]
+  tokio               32213 [28904-36759]       14.83 [12.66-17.09]

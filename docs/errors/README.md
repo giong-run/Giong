@@ -21,8 +21,9 @@ fn on_error(err: &std::io::Error) {
 }
 ```
 
-giong-http, giong-web, giong-tls, giong-postgres, giong-mysql and giong-redis use the same
-codes. A code is never reused or renumbered, and its page stays when it is no longer raised.
+giong-http, giong-web, giong-tls, giong-postgres, giong-mysql, giong-redis, giong-mcp and
+giong-compat use the same codes. A code is never reused or renumbered, and its page stays
+when it is no longer raised.
 
 ## The runtime
 
@@ -76,6 +77,10 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 | [GIONG-E1112](E1112.md) | `HttpBodyIncomplete` | request body cut short |
 | [GIONG-E1113](E1113.md) | `HttpBodyMalformed` | malformed request body |
 | [GIONG-E1114](E1114.md) | `HttpBodyNotSent` | response body not sent |
+| [GIONG-E1115](E1115.md) | `Http2Protocol` | HTTP/2 protocol error |
+| [GIONG-E1116](E1116.md) | `Http2TooManyResets` | too many HTTP/2 streams reset |
+| [GIONG-E1117](E1117.md) | `Http2Flood` | too many HTTP/2 control frames |
+| [GIONG-E1118](E1118.md) | `Http2HeadersTooLarge` | HTTP/2 header block too large |
 
 ## giong-web
 
@@ -101,6 +106,14 @@ codes. A code is never reused or renumbered, and its page stays when it is no lo
 |---|---|---|
 | [GIONG-E1301](E1301.md) | `McpNotLocal` | the MCP server listens on this machine only |
 | [GIONG-E1302](E1302.md) | `McpBadAddress` | invalid address for the MCP server |
+
+## giong-compat
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E1401](E1401.md) | `CompatWriteFailed` | an earlier buffered write failed |
+| [GIONG-E1402](E1402.md) | `CompatShutDown` | write after shutdown |
+| [GIONG-E1403](E1403.md) | `CompatConfig` | invalid giong-compat setting |
 
 ## giong-tls
 

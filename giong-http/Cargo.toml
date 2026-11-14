@@ -40,6 +40,14 @@ required-features = ["tls"]
 name = "client"
 required-features = ["client", "tls"]
 
+[[test]]
+name = "client_h2"
+required-features = ["client", "tls"]
+
+[[example]]
+name = "h2"
+required-features = ["tls"]
+
 [lints.rust]
 # Set by `cargo fuzz` (see fuzz/).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

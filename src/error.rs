@@ -29,7 +29,7 @@
 //! ```
 //!
 //! The companion crates (giong-http, giong-web, giong-tls, giong-postgres,
-//! giong-mysql, giong-redis) use the same codes, so one `match` covers them
+//! giong-mysql, giong-redis, giong-mcp, giong-compat) use the same codes, so one `match` covers them
 //! all. Codes are never reused or renumbered; a code that is no longer raised
 //! keeps its page.
 
@@ -47,8 +47,8 @@ macro_rules! codes {
         ///
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
-        /// giong-http, `E12xx` giong-web, `E13xx` giong-mcp, `E2xxx`
-        /// giong-tls, `E30xx` giong-postgres, `E31xx` giong-mysql and `E32xx`
+        /// giong-http, `E12xx` giong-web, `E13xx` giong-mcp, `E14xx`
+        /// giong-compat, `E2xxx` giong-tls, `E30xx` giong-postgres, `E31xx` giong-mysql and `E32xx`
         /// giong-redis. Each
         /// has a page under `docs/errors/` in the repository;
         /// [`url`](Code::url) links to it.
@@ -191,6 +191,24 @@ codes! {
     /// away, or the response is to a `HEAD` request or has a status without
     /// a body.
     HttpBodyNotSent = 1114, BrokenPipe, "response body not sent";
+    /// The other end broke the HTTP/2 protocol. The server closes the
+    /// connection with a GOAWAY frame whose debug data carries this code
+    /// and the rule that was broken.
+    Http2Protocol = 1115, InvalidData, "HTTP/2 protocol error";
+    /// An HTTP/2 client cancelled (or had refused) more streams than the
+    /// server allows in a short time, the pattern of the "rapid reset"
+    /// attack. The server closes the connection with `ENHANCE_YOUR_CALM`.
+    Http2TooManyResets = 1116, ConnectionAborted, "too many HTTP/2 streams reset";
+    /// An HTTP/2 client sent more frames that do no work (PING, SETTINGS,
+    /// PRIORITY, empty DATA or CONTINUATION frames, WINDOW_UPDATE frames
+    /// with nothing to send, frames for closed streams, unknown frame
+    /// types) than the server allows in a short time. The server closes
+    /// the connection with `ENHANCE_YOUR_CALM`.
+    Http2Flood = 1117, ConnectionAborted, "too many HTTP/2 control frames";
+    /// An HTTP/2 header block (HEADERS and its CONTINUATION frames) grew
+    /// past the limit before it ended. The server closes the connection
+    /// with `ENHANCE_YOUR_CALM`.
+    Http2HeadersTooLarge = 1118, InvalidData, "HTTP/2 header block too large";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
@@ -241,6 +259,18 @@ codes! {
     McpNotLocal = 1301, PermissionDenied, "the MCP server listens on this machine only";
     /// The address given to the MCP server, or `GIONG_MCP`, is not one.
     McpBadAddress = 1302, InvalidInput, "invalid address for the MCP server";
+
+    // ------------------------------------------------------ giong-compat
+    /// A write that giong-compat's `Compat` had buffered failed earlier, so
+    /// the stream cannot be written any more. The first call after the
+    /// failure returned the kernel's own error; later ones return this.
+    CompatWriteFailed = 1401, BrokenPipe, "an earlier buffered write failed";
+    /// A write was attempted on a `Compat` stream after its sending
+    /// direction was shut down (`poll_shutdown`, `poll_close`).
+    CompatShutDown = 1402, BrokenPipe, "write after shutdown";
+    /// A `Compat` setting is out of range. It panics with this code, since
+    /// the value is a bug in the program.
+    CompatConfig = 1403, InvalidInput, "invalid giong-compat setting";
 
     // --------------------------------------------------------- giong-tls
     /// No trusted certificate authority: none installed on the machine, or

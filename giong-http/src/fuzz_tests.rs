@@ -192,3 +192,109 @@ fn compressed_bodies_decode_or_fail_cleanly_whatever_the_bytes() {
     }
     assert!(decoded > 1_000, "only {decoded} bodies decoded");
 }
+
+#[test]
+fn hpack_decodes_or_fails_cleanly_and_round_trips_whatever_the_blocks() {
+    use crate::invariants::{check_hpack, check_huffman};
+    // RFC 7541, C.3 and C.4: three requests on one connection, without and
+    // with Huffman coding.
+    let c3: &[&[u8]] = &[
+        b"\x82\x86\x84\x41\x0fwww.example.com",
+        b"\x82\x86\x84\xbe\x58\x08no-cache",
+        b"\x82\x87\x85\xbf\x40\x0acustom-key\x0ccustom-value",
+    ];
+    let c4: &[&[u8]] = &[
+        b"\x82\x86\x84\x41\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
+        b"\x82\x86\x84\xbe\x58\x86\xa8\xeb\x10\x64\x9c\xbf",
+        b"\x82\x87\x85\xbf\x40\x88\x25\xa8\x49\xe9\x5b\xa9\x7d\x7f\x89\x25\xa8\x49\xe9\x5b\xb8\xe8\xb4\xbf",
+    ];
+    let seeds: Vec<Vec<u8>> = [c3, c4]
+        .iter()
+        .map(|blocks| {
+            let mut input = vec![4];
+            for block in *blocks {
+                input.push(block.len() as u8);
+                input.extend_from_slice(block);
+            }
+            input
+        })
+        .collect();
+    for seed in &seeds {
+        assert!(check_hpack(seed));
+    }
+    let mut rng = Rng(0xA076_1D64_78BD_642F);
+    let mut decoded = 0;
+    for round in 0..100_000 {
+        let mut input = seeds[round % seeds.len()].clone();
+        mutate(&mut rng, &mut input);
+        decoded += usize::from(check_hpack(&input));
+    }
+    assert!(decoded > 1_000, "only {decoded} inputs decoded");
+
+    let mut huffman = 0;
+    for round in 0..100_000 {
+        let mut input = c4[round % 3][5..].to_vec();
+        mutate(&mut rng, &mut input);
+        huffman += usize::from(check_huffman(&input));
+    }
+    assert!(huffman > 1_000, "only {huffman} inputs decoded");
+}
+
+#[test]
+fn http2_connections_answer_with_well_formed_frames_whatever_the_client_sends() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::invariants::h2_connection::{pieces, server, Fuzzed, Memory};
+
+    use crate::invariants::{check_h2_output, h2_input};
+
+    const ROUNDS: usize = 3_000;
+    let seed = std::env::var("GIONG_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut rng = Rng(seed.unwrap_or(0xE703_7ED1_A0B4_28DB));
+    let responses = giong::Builder::new()
+        .workers(1)
+        .block_on(async move {
+            let handler = Rc::new(Fuzzed);
+            let mut responses = 0;
+            for round in 0..ROUNDS {
+                let len = 1 + rng.below(200);
+                let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                let input = h2_input(&data);
+                let output = Rc::new(RefCell::new(Vec::new()));
+                let stream = Memory {
+                    input: RefCell::new(pieces(
+                        &input,
+                        if round % 3 == 0 { 0 } else { rng.next() as u8 },
+                    )),
+                    output: output.clone(),
+                };
+                server().serve_connection(stream, handler.clone()).await;
+                responses += check_h2_output(&input, &output.borrow());
+            }
+            responses
+        })
+        .unwrap();
+    assert!(responses > ROUNDS / 10, "only {responses} responses");
+}
+
+#[cfg(feature = "client")]
+#[test]
+fn the_http2_client_stays_within_its_windows_whatever_the_server_sends() {
+    use crate::client::fuzzing::check_h2_client;
+
+    const ROUNDS: usize = 3_000;
+    let seed = std::env::var("GIONG_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut rng = Rng(seed.unwrap_or(0x5DEE_CE66_D1CE_4E5B));
+    let mut responses = 0;
+    for _ in 0..ROUNDS {
+        let len = 1 + rng.below(300);
+        let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        responses += check_h2_client(&data);
+    }
+    assert!(responses > ROUNDS / 20, "only {responses} responses");
+}

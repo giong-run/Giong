@@ -100,6 +100,17 @@ CRATES = {
                "A worker stuck in one poll is reported with the line that spawned the task",
                "Loopback or a Unix socket only; `Host` and `Origin` checked; optional token"],
         fact="about 9 instructions per task poll"),
+    "giong-compat": dict(
+        layer="protocols", tests=29,
+        short="Tokio's and futures-io's I/O traits for giong's streams, for h2, tokio-rustls and the like.",
+        lede="`AsyncRead`, `AsyncWrite` and `AsyncBufRead` from Tokio and futures-io for giong's "
+             "streams, so protocol crates that take a stream run on giong with no Tokio runtime.",
+        items=["`Compat::new(stream)` for `TcpStream`, `UnixStream` and `TlsStream`",
+               "Tested with tokio-rustls, futures-rustls, tokio-tungstenite, h2, hyper's `conn` and "
+               "tokio-util's codecs",
+               "Buffered writes like `BufWriter`; reads lose nothing when cancelled",
+               "Says plainly which crates cannot work: those that need Tokio's reactor, timers or `spawn`"],
+        fact="one copy per byte; sending costs 14% of throughput"),
 }
 
 # Crates on the roadmap that do not exist yet. Each disappears from this list on its
@@ -441,7 +452,7 @@ COMPARE = [
     ("I/O", "TCP, UDP, Unix sockets, files", "TCP, UDP, Unix sockets, files",
      "TCP, UDP, Unix sockets, Direct I/O files"),
     ("Ecosystem", "its own HTTP/1.1 server and client, web framework, TLS for both sides, DNS, "
-                  "PostgreSQL, MySQL and Redis clients",
+                  "PostgreSQL, MySQL and Redis clients; Tokio's I/O traits for crates such as h2",
      "TLS, HTTP, codecs, Tokio compatibility layer", "channels, semaphores, rate control"),
 ]
 

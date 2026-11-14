@@ -63,5 +63,16 @@ async fn main() {
             .layer(SetRequestIdLayer::new(id, MakeRequestUuid));
     }
     let l = tokio::net::TcpListener::bind("127.0.0.1:3003").await.unwrap();
-    axum::serve(l, app).await.unwrap();
+    // TCP_NODELAY=1 (bench/h2.sh): set it on each connection, as giong does.
+    // Without it, over HTTP/2 the first answer on a new connection waits
+    // about 40 ms for a delayed ACK (Nagle's algorithm).
+    if std::env::var_os("TCP_NODELAY").is_some() {
+        use axum::serve::ListenerExt;
+        let l = l.tap_io(|tcp| {
+            let _ = tcp.set_nodelay(true);
+        });
+        axum::serve(l, app).await.unwrap();
+    } else {
+        axum::serve(l, app).await.unwrap();
+    }
 }

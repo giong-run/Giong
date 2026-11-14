@@ -223,9 +223,18 @@ the repository, and a benchmark of it against the same API on axum.
       load generator on a second machine over a physical network card, for scaling
       efficiency and the Monoio and Glommio comparison on a real network (two machines
       rented by the hour are enough).
-- [ ] HTTP/2 in `giong-http`, over TLS with ALPN.
-- [ ] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
-      over the transport can run on giong.
+- [x] HTTP/2 in `giong-http`'s server, over TLS with ALPN and over plain TCP with prior
+      knowledge, for the same handlers (`giong-web` included). Hardened against rapid reset,
+      frame and CONTINUATION floods, HPACK bombs and readers that stall, with coded errors
+      (`GIONG-E1115` to `E1118`); `h2spec` in CI; HPACK and whole connections fuzzed.
+- [x] HTTP/2 in `giong-http`'s client, chosen through ALPN or with prior knowledge: one
+      connection per origin for every request, bounded by flow control, refused requests
+      sent again; tested against the server and against servers that misbehave on
+      purpose, fuzzed, benchmarked against reqwest.
+- [x] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
+      over the transport can run on giong: `giong-compat`, tested with tokio-rustls,
+      futures-rustls, tokio-tungstenite, h2, hyper's HTTP/1 connection API and tokio-util's
+      codecs, and measured against giong's own API and Tokio (`bench/compat.sh`).
 - [ ] Decide, based on demand, whether a hyper integration is worth maintaining.
 
 **Exit criteria:** an HTTPS server serving real browsers over HTTP/2, and `h2spec` passing.

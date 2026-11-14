@@ -141,7 +141,7 @@ impl Body {
     /// `len` bytes of an open file from `offset`, as for a range request.
     /// See [`file`](Self::file). Nothing is checked until the response is
     /// sent: then, if the file ends before `offset + len`, the connection
-    /// is closed after what it had.
+    /// is closed after what it had (over HTTP/2, the stream is reset).
     pub fn file_range(file: impl Into<Rc<giong::fs::File>>, offset: u64, len: u64) -> Body {
         Body::File(FileBody {
             file: file.into(),
