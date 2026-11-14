@@ -7,7 +7,7 @@ and the three io_uring system calls: `io_uring_setup`, `io_uring_enter` and
 Where io_uring cannot be used, giong runs on its **epoll driver** instead, without being
 told: in a Docker container with the default seccomp profile, in Kubernetes with the
 `RuntimeDefault` profile, under gVisor, with the `kernel.io_uring_disabled` sysctl set,
-on a kernel older than 6.0, or on Linux 6.14 and newer when the
+on a kernel older than 6.0, or on Linux 6.14 to 7.2 when the
 [locked-memory limit](#locked-memory-limit) is used up. Every API works the same way on
 both drivers; epoll makes more system calls per request, and file operations run on a
 pool of blocking threads.
@@ -41,7 +41,7 @@ when you want its speed:
 ```sh
 uname -r                              # 6.0 or newer
 cat /proc/sys/kernel/io_uring_disabled  # Linux 6.6+: 0 = allowed
-ulimit -l                             # Linux 6.14+: unlimited, or about 150 KiB per worker
+ulimit -l                             # Linux 6.14-7.2: unlimited, or 150 KiB per worker
 ```
 
 `kernel.io_uring_disabled` (Linux 6.6 and newer): `0` allows io_uring for every process,
@@ -51,15 +51,15 @@ user in that group.
 
 ## Locked-memory limit
 
-Since Linux 6.14 the kernel counts the memory of every io_uring ring against the
-locked-memory limit (`RLIMIT_MEMLOCK`, `ulimit -l`) of a process that lacks
-`CAP_IPC_LOCK`. The count is kept per user ID and summed over all of that user's
-processes, and the memory of a closed ring is given back a moment after the close. A
-giong worker locks about 150 KiB with the default settings: the submission and
-completion queues take 136 KiB of it (`Builder::ring_entries`), the two rings of receive
-buffers 8 KiB each (`Builder::recv_buffers`). The usual default limit of 8 MiB holds about
-fifty workers, for all of the user's processes together; the 64 KiB of older systems
-holds none.
+Linux 6.14 to 7.2 count the memory of every io_uring ring against the locked-memory limit
+(`RLIMIT_MEMLOCK`, `ulimit -l`) of a process that lacks `CAP_IPC_LOCK`. Linux 7.3 stopped,
+and so did 6.18 from 6.18.58; distribution kernels may have taken the change too. The
+count is kept per user ID and summed over all of that user's processes, and the memory of
+a closed ring is given back a moment after the close. A giong worker locks about 150 KiB
+with the default settings: the submission and completion queues take 136 KiB of it
+(`Builder::ring_entries`), the two rings of receive buffers 8 KiB each
+(`Builder::recv_buffers`). The usual default limit of 8 MiB holds about fifty workers, for
+all of the user's processes together; the 64 KiB of older systems holds none.
 
 A worker that cannot lock the memory gets `ENOMEM` from the kernel, which giong reports as
 [GIONG-E0010](errors/E0010.md), naming the limit; without an explicit driver it runs that
@@ -89,7 +89,8 @@ Raise the limit, or lift it, for any service that is not root:
 - A shell: `ulimit -l unlimited` as root before starting the service, or an entry in
   `/etc/security/limits.conf` for its user.
 
-Or need less: fewer workers, a smaller `Builder::ring_entries`, fewer receive buffers.
+Or need less: fewer workers, a smaller `Builder::ring_entries`, fewer receive buffers. Or
+run a kernel that does not count the rings.
 
 ## Ubuntu 24.04
 

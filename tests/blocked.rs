@@ -242,7 +242,7 @@ fn a_kernel_that_refuses_buffer_rings_is_named_not_called_old() {
     assert!(lines[0].contains(number), "{}", lines[0]);
 }
 
-/// Since Linux 6.14 every io_uring counts against the locked-memory limit
+/// Linux 6.14 to 7.2 count every io_uring against the locked-memory limit
 /// (RLIMIT_MEMLOCK), so a service under a low limit fails to set up its
 /// rings with a bare ENOMEM. The child sets the limit to nothing and drops
 /// CAP_IPC_LOCK, which would lift it: workers then run on epoll, and the
@@ -283,19 +283,11 @@ fn a_used_up_locked_memory_limit_is_named_and_falls_back_to_epoll() {
     if stdout.contains("skipped:") {
         return;
     }
-    let release = stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("release: "))
-        .unwrap();
-    let mut version = release.split(|c: char| !c.is_ascii_digit());
-    let version: (u32, u32) = (
-        version.next().unwrap().parse().unwrap(),
-        version.next().unwrap().parse().unwrap(),
-    );
     if stdout.contains("kind: io_uring") {
-        // Kernels before 6.14 do not count the rings, and the limit does
-        // not matter.
-        assert!(version < (6, 14), "{stdout}");
+        // This kernel does not count the rings, and the limit does not
+        // matter: Linux before 6.14, 7.3 and newer, 6.18.58 and newer, or a
+        // distribution kernel with the change backported. Where a kernel
+        // counts them and giong did not see why, the child fails instead.
         assert!(stdout.contains("named: ok"), "{stdout}");
         return;
     }

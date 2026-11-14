@@ -209,13 +209,14 @@ fn explain_setup_error(e: io::Error) -> io::Error {
     }
 }
 
-/// Since Linux 6.14 the kernel counts the memory of every io_uring ring (the
+/// Linux 6.14 to 7.2 count the memory of every io_uring ring (the
 /// submission and completion queues, and each buffer ring) against the
 /// locked-memory limit, `RLIMIT_MEMLOCK`, summed over all of the user's
-/// processes, unless the process has `CAP_IPC_LOCK`. Once the limit is used
-/// up, setting up a ring fails with a bare `ENOMEM`, which reads as "out of
-/// memory" on a machine with plenty of it; with a default limit of 8 MiB
-/// that happens at about fifty workers. Say what it is here.
+/// processes, unless the process has `CAP_IPC_LOCK`; 7.3 stopped, and so
+/// did 6.18 from 6.18.58. Once the limit is used up, setting up a ring
+/// fails with a bare `ENOMEM`, which reads as "out of memory" on a machine
+/// with plenty of it; with a default limit of 8 MiB that happens at about
+/// fifty workers. Say what it is here.
 ///
 /// `what` names the memory: "rings" or "buffer ring". Other errors, and an
 /// `ENOMEM` where no such limit applies, pass through.
@@ -277,7 +278,7 @@ fn locked_memory_error(e: io::Error, what: &str, limit: u64) -> io::Error {
             ),
             "raise the limit for this service: LimitMEMLOCK=infinity in its systemd unit, \
              --ulimit memlock=-1 with docker run, ulimit -l unlimited in a shell, or give it \
-             CAP_IPC_LOCK, which lifts the limit. Since Linux 6.14 every io_uring counts \
+             CAP_IPC_LOCK, which lifts the limit. Linux 6.14 to 7.2 count every io_uring \
              against it, summed over all processes of the same user: a giong worker locks \
              about 150 KiB with the default settings, more with a larger \
              Builder::ring_entries or Builder::recv_buffers. Without \

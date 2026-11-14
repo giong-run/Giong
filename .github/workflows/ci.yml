@@ -74,7 +74,7 @@ jobs:
           sudo systemctl stop redis-server
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
-      # Linux 6.14 and newer count every io_uring ring against the
+      # Linux 6.14 to 7.2 count every io_uring ring against the
       # locked-memory limit, summed over the runner user's processes, and
       # tests run runtimes side by side: lift the limit, so that each of them
       # gets io_uring (docs/DEPLOYMENT.md, "Locked-memory limit"). tests/
