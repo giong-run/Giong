@@ -1288,8 +1288,13 @@ impl Uring {
         if more {
             // The result of a zero-copy send; the notification follows. A
             // dropped send stays `Ignored`: its buffer waits for it too.
+            // The task is woken now, so that a future with a hold collects
+            // the result here instead of at the notification, which comes
+            // only once the peer has acknowledged every byte (up to a
+            // delayed acknowledgement, 40 ms, later).
             if let Lifecycle::Waiting(waker) = lc {
                 let waker = waker.clone();
+                waker.wake_by_ref();
                 *lc = Lifecycle::Sent(waker, res, flags & !F_MORE);
             }
             return false;
@@ -1503,6 +1508,64 @@ mod tests {
             }
         }
         drop(ring);
+    }
+
+    /// The result of a zero-copy send wakes the task that waits for it, so
+    /// that a write leaving a `ZeroCopyHold` returns then. Without the wake
+    /// it returned only at the notification, after the peer acknowledged
+    /// the data: one connection sending 16 MiB from memory that never
+    /// changes stalled for 40 ms (a delayed acknowledgement) on about one
+    /// response in five on bare metal. Loopback copies and notifies at once,
+    /// so no test over a real socket here can tell the difference.
+    #[test]
+    fn the_result_of_a_zero_copy_send_wakes_its_task() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(Count(AtomicUsize::new(0)));
+        let mut lc = Lifecycle::Waiting(Waker::from(woken.clone()));
+        let mut graveyard = Vec::new();
+
+        assert!(!Uring::complete(
+            &mut lc,
+            65536,
+            F_MORE,
+            true,
+            &mut graveyard
+        ));
+        assert_eq!(
+            woken.0.load(Ordering::SeqCst),
+            1,
+            "the result must wake the task"
+        );
+        assert!(matches!(lc, Lifecycle::Sent(_, 65536, 0)));
+
+        // A task that did not collect it is woken again by the notification.
+        assert!(!Uring::complete(&mut lc, 0, F_NOTIF, false, &mut graveyard));
+        assert_eq!(woken.0.load(Ordering::SeqCst), 2);
+        assert!(matches!(lc, Lifecycle::Done(65536, 0)));
+
+        // A send whose future already returned (`Ignored`) wakes nobody,
+        // and its hold goes when the notification comes.
+        let mut lc = Lifecycle::Ignored(Some(Box::new(())));
+        assert!(!Uring::complete(
+            &mut lc,
+            65536,
+            F_MORE,
+            true,
+            &mut graveyard
+        ));
+        assert!(Uring::complete(&mut lc, 0, F_NOTIF, false, &mut graveyard));
+        assert_eq!(graveyard.len(), 1);
+        assert_eq!(woken.0.load(Ordering::SeqCst), 2);
     }
 
     /// Every setup tier must produce a working ring on a current kernel, so
