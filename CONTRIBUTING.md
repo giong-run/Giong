@@ -96,11 +96,12 @@ cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
 cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: url
 cd ../giong-web && cargo +nightly fuzz run request         # also: routes
+cd ../giong-tls && cargo +nightly fuzz run ktls_records    # record framing and handshake messages around kernel TLS
 ```
 
 Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's
 `src/fuzzing.rs` (in `giong-http`, `src/invariants.rs`, `src/client/mod.rs`,
-`src/client/h2.rs` and `fuzz/fuzz_targets/connection.rs`). The randomised tests (`src/fuzz_tests.rs`) run the
+`src/client/h2.rs` and `fuzz/fuzz_targets/connection.rs`; in `giong-tls`, the end of `src/ktls.rs`). The randomised tests (`src/fuzz_tests.rs`) run the
 same checks on every `cargo test`. CI fuzzes every night and on pull requests that touch
 these crates. If a target finds a crash, add the input as a regression test.
 

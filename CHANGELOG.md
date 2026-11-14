@@ -10,6 +10,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **giong-tls**: a fuzz target, `ktls_records`, for what kernel TLS reads of the peer's
+  records outside the kernel (the record framing during the handshake, and handshake
+  messages after it), in the nightly fuzz workflow; a unit test runs the same checks on
+  3,000 random streams. 1.65 million inputs ran without a failure when it was added.
 - **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
   the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
   `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over

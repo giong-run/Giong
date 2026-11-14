@@ -82,6 +82,14 @@ mod ktls;
 
 pub use ktls::{ktls_stats, ktls_support, Ktls, KtlsStats, KtlsSupport};
 
+/// Entry points for the fuzz targets in `giong-tls/fuzz`. Only built by
+/// `cargo fuzz` (`--cfg fuzzing`); not part of the API.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::ktls::{check_handshake_messages, check_record_framing};
+}
+
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::ffi::OsStr;

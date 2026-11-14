@@ -1445,6 +1445,159 @@ impl Framing {
     }
 }
 
+/// The complete handshake messages at the start of `buf`, each as its type
+/// and body. It stops at a message that has not all arrived (it starts at
+/// `at`), and fails with the length of a message longer than giong-tls
+/// accepts.
+struct HandshakeMessages<'a> {
+    buf: &'a [u8],
+    /// Where the next message starts.
+    at: usize,
+}
+
+impl<'a> HandshakeMessages<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        HandshakeMessages { buf, at: 0 }
+    }
+}
+
+impl<'a> Iterator for HandshakeMessages<'a> {
+    type Item = Result<(u8, &'a [u8]), usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let &[typ, a, b, c, ..] = &self.buf[self.at..] else {
+            return None;
+        };
+        let len = u32::from_be_bytes([0, a, b, c]) as usize;
+        if len > MAX_HANDSHAKE_MESSAGE {
+            return Some(Err(len));
+        }
+        let body = self.buf.get(self.at + 4..self.at + 4 + len)?;
+        self.at += 4 + len;
+        Some(Ok((typ, body)))
+    }
+}
+
+/// For the fuzz target and the randomised tests: [`Framing`], fed `stream`
+/// in pieces of the sizes `piece` picks, agrees after every piece with a
+/// plain walk over the whole stream, and fails exactly when a record header
+/// announces more than TLS allows.
+#[cfg(any(test, fuzzing))]
+pub fn check_record_framing(stream: &[u8], mut piece: impl FnMut() -> usize) {
+    // The records as (start, end), end unknown for a header cut short; and
+    // where the header of a record too large ends.
+    let mut records = Vec::new();
+    let mut too_large = None;
+    let mut start = 0;
+    while start < stream.len() {
+        let Some(header) = stream.get(start..start + 5) else {
+            records.push((start, None));
+            break;
+        };
+        let end = start + 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if end - start > MAX_RECORD {
+            too_large = Some(start + 5);
+            records.push((start, None));
+            break;
+        }
+        records.push((start, Some(end)));
+        start = end;
+    }
+    let expected = |fed: usize| -> usize {
+        for &(start, end) in &records {
+            if fed == start {
+                return 0;
+            }
+            if fed < start + 5 {
+                return start + 5 - fed;
+            }
+            if let Some(end) = end {
+                if fed < end {
+                    return end - fed;
+                }
+            }
+        }
+        0
+    };
+    let mut framing = Framing::default();
+    let mut fed = 0;
+    while fed < stream.len() {
+        let n = (1 + piece() % 300).min(stream.len() - fed);
+        let result = framing.feed(&stream[fed..fed + n]);
+        fed += n;
+        if too_large.is_some_and(|at| fed >= at) {
+            assert!(
+                result.is_err(),
+                "a record too large was taken, {fed} bytes in"
+            );
+            return;
+        }
+        assert!(result.is_ok(), "{result:?} {fed} bytes in");
+        assert_eq!(framing.to_boundary(), expected(fed), "{fed} bytes in");
+    }
+}
+
+/// For the fuzz target and the randomised tests: handshake messages that
+/// arrive in records of the sizes `piece` picks, kept between records as
+/// [`TlsStream`]'s receive path keeps them, come out the same as from the
+/// whole stream at once, and a message too long fails at the same place.
+#[cfg(any(test, fuzzing))]
+pub fn check_handshake_messages(stream: &[u8], mut piece: impl FnMut() -> usize) {
+    // A plain walk over the whole stream.
+    let mut whole = Vec::new();
+    let mut too_long = None;
+    let mut at = 0;
+    while let Some(&[typ, a, b, c]) = stream.get(at..at + 4) {
+        let len = u32::from_be_bytes([0, a, b, c]) as usize;
+        if len > MAX_HANDSHAKE_MESSAGE {
+            too_long = Some((at + 4, len));
+            break;
+        }
+        let Some(body) = stream.get(at + 4..at + 4 + len) else {
+            break;
+        };
+        whole.push((typ, body.to_vec()));
+        at += 4 + len;
+    }
+    // The same in pieces.
+    let mut pieces = Vec::new();
+    let mut kept = Vec::new();
+    let mut fed = 0;
+    while fed < stream.len() {
+        let n = (1 + piece() % 300).min(stream.len() - fed);
+        kept.extend_from_slice(&stream[fed..fed + n]);
+        fed += n;
+        let mut parsed = HandshakeMessages::new(&kept);
+        for message in &mut parsed {
+            match message {
+                Ok((typ, body)) => pieces.push((typ, body.to_vec())),
+                Err(len) => {
+                    let (end, expected) = too_long.expect("only a message too long fails");
+                    assert_eq!(len, expected);
+                    assert!(fed >= end, "failed before the length arrived");
+                    assert_eq!(pieces, whole[..pieces.len()], "before the failure");
+                    assert_eq!(pieces.len(), whole.len());
+                    return;
+                }
+            }
+        }
+        let at = parsed.at;
+        kept.drain(..at);
+        assert!(
+            kept.len() < 4 + MAX_HANDSHAKE_MESSAGE,
+            "{} bytes kept",
+            kept.len()
+        );
+    }
+    assert!(too_long.is_none(), "a message too long was taken");
+    assert_eq!(pieces, whole);
+    assert_eq!(
+        kept,
+        stream[at..],
+        "what is left is the message still to come"
+    );
+}
+
 // ---------------------------------------------------- the kernel's stream
 
 /// Maps what the kernel's TLS layer returns to an error that says what
@@ -1678,29 +1831,27 @@ impl TlsStream {
             mem::take(&mut k.handshake)
         };
         let mut result = Control::Done;
-        let mut at = 0;
-        while messages.len() - at >= 4 {
-            let typ = messages[at];
-            let len = u32::from_be_bytes([0, messages[at + 1], messages[at + 2], messages[at + 3]])
-                as usize;
-            if len > MAX_HANDSHAKE_MESSAGE {
-                return Control::Fail(
-                    peer_misbehaved(format!("the peer sent a handshake message of {len} bytes")),
-                    Some(DECODE_ERROR),
-                );
-            }
-            if messages.len() - at - 4 < len {
-                break;
-            }
-            let body = &messages[at + 4..at + 4 + len];
-            at += 4 + len;
-            let last_in_record = at == messages.len();
+        let mut parsed = HandshakeMessages::new(&messages);
+        while let Some(message) = parsed.next() {
+            let (typ, body) = match message {
+                Ok(message) => message,
+                Err(len) => {
+                    return Control::Fail(
+                        peer_misbehaved(format!(
+                            "the peer sent a handshake message of {len} bytes"
+                        )),
+                        Some(DECODE_ERROR),
+                    )
+                }
+            };
+            let last_in_record = parsed.at == messages.len();
             match self.post_handshake(typ, body, last_in_record) {
                 Control::Done => {}
                 fail @ Control::Fail(..) => return fail,
                 other => result = other,
             }
         }
+        let at = parsed.at;
         messages.drain(..at);
         if messages.len() > MAX_HANDSHAKE_MESSAGE + 4 {
             return Control::Fail(
@@ -2188,6 +2339,49 @@ mod tests {
         let mut huge = vec![23, 3, 3];
         huge.extend_from_slice(&u16::MAX.to_be_bytes());
         assert!(Framing::default().feed(&huge).is_err());
+    }
+
+    /// What the fuzz target `ktls_records` checks, on streams built from
+    /// records and handshake messages of random sizes, cut at random places
+    /// and sometimes damaged. xorshift, so a failure can be replayed.
+    #[test]
+    fn records_and_handshake_messages_agree_however_they_are_split() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for round in 0..3000 {
+            let mut stream = Vec::new();
+            for _ in 0..1 + next() % 6 {
+                // Lengths around the limits, and small ones.
+                let len = match next() % 4 {
+                    0 => next() % 40,
+                    1 => MAX_RECORD - 5 - 2 + next() % 4,
+                    2 => MAX_HANDSHAKE_MESSAGE - 1 + next() % 3,
+                    _ => next() % 2000,
+                };
+                if round % 2 == 0 {
+                    stream.extend_from_slice(&[23, 3, 3]);
+                    stream.extend_from_slice(&(len.min(0xffff) as u16).to_be_bytes());
+                } else {
+                    stream.push(NEW_SESSION_TICKET);
+                    stream.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
+                }
+                stream.extend((0..len.min(5000)).map(|_| next() as u8));
+            }
+            if next() % 3 == 0 {
+                let at = next() % stream.len();
+                stream[at] = next() as u8;
+            }
+            if next() % 3 == 0 {
+                stream.truncate(next() % stream.len());
+            }
+            check_record_framing(&stream, &mut next);
+            check_handshake_messages(&stream, &mut next);
+        }
     }
 
     #[test]

@@ -25,5 +25,9 @@ webpki-roots = { version = "1", optional = true }
 [dev-dependencies]
 rcgen = "0.13"
 
+[lints.rust]
+# Set by `cargo fuzz` (see fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [package.metadata.docs.rs]
 all-features = true
