@@ -24,6 +24,8 @@ struct State {
     released: AtomicBool,
     /// Handlers started.
     started: AtomicUsize,
+    /// Handlers that have answered.
+    answered: AtomicUsize,
     log: Mutex<Vec<String>>,
 }
 
@@ -46,6 +48,19 @@ impl State {
             std::thread::sleep(Duration::from_millis(5));
         }
         false
+    }
+}
+
+/// How long a client waits for the server before the test fails: long,
+/// because a panic's backtrace under ThreadSanitizer takes seconds.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Waits for `done`, for as long as a slow run (a sanitizer) may need.
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let until = Instant::now() + READ_TIMEOUT;
+    while !done() {
+        assert!(Instant::now() < until, "still waiting for {what}");
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -84,12 +99,24 @@ fn file_path() -> std::path::PathBuf {
 
 impl Handler for App {
     fn stream_body(&self, req: &Request) -> Option<u64> {
+        if req.path() == "/panic-deciding" {
+            panic!("stream_body panic (expected by this test)");
+        }
         req.path().starts_with("/pipe").then_some(4 << 20)
     }
 
     async fn call(&self, req: Request) -> Response {
         let state = &self.0;
         state.started.fetch_add(1, Ordering::SeqCst);
+        let resp = self.answer(req).await;
+        state.answered.fetch_add(1, Ordering::SeqCst);
+        resp
+    }
+}
+
+impl App {
+    async fn answer(&self, req: Request) -> Response {
+        let state = &self.0;
         match req.path() {
             "/" => Response::text("hello"),
             "/echo" => Response::new(200).body(req.body().to_vec()),
@@ -128,6 +155,14 @@ impl Handler for App {
             "/sleep" => {
                 sleep(Duration::from_millis(query_number(&req, "ms") as u64)).await;
                 Response::text("slept")
+            }
+            "/sleep-bytes" => {
+                sleep(Duration::from_millis(query_number(&req, "ms") as u64)).await;
+                Response::new(200).body(pattern(query_number(&req, "n")))
+            }
+            "/panic" => {
+                sleep(Duration::from_millis(query_number(&req, "ms") as u64)).await;
+                panic!("handler panic (expected by this test)");
             }
             "/pipe" | "/pipe-slow" => {
                 let body = req.body_stream().expect("a streamed body");
@@ -301,9 +336,7 @@ impl Client {
     fn connect(addr: SocketAddr) -> Self {
         let stream = TcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         Client {
             stream,
             buf: Vec::new(),
@@ -619,9 +652,7 @@ impl Client {
                 Err(e) => panic!("reading: {e}"),
             }
         }
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
+        self.stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
         frames
     }
 }
@@ -756,20 +787,23 @@ fn responses_follow_the_clients_flow_control() {
 
 #[test]
 fn bodies_held_by_a_connection_stay_within_a_budget() {
-    // Bodies of up to 64 KiB: the budget is then 1 MiB.
+    // Bodies of up to 64 KiB: the budget is then 1 MiB, half of it shared
+    // by 100 streams at first.
     let server = TestServer::start(Server::new().max_body_size(64 * 1024));
     let mut c = server.client();
+    assert_eq!(c.peer_initial, (1 << 20) / 200);
     let body = pattern(60_000);
     let mut ids = Vec::new();
-    for _ in 0..30 {
+    for _ in 0..100 {
         ids.push(c.open("POST", "/echo", &[("content-length", "60000")], false));
     }
     c.frames_within(Duration::from_millis(100));
-    // Every stream has the protocol's 64 KiB; beyond that, no more than
-    // the budget. Thirty streams at full window would be 7.5 MiB.
+    // No more than the budget, and the oldest stream's top-up. A hundred
+    // streams at the protocol's 64 KiB would be 6.4 MiB, at full window
+    // 25 MiB.
     let granted: i64 = ids.iter().map(|id| c.send_windows[id]).sum();
     assert!(
-        granted <= 30 * 65_535 + (1 << 20),
+        granted <= (1 << 20) + 256 * 1024,
         "{granted} bytes of window granted"
     );
     // Sent in turn as the windows allow, every body gets through.
@@ -779,6 +813,107 @@ fn bodies_held_by_a_connection_stay_within_a_budget() {
     for &id in &ids {
         assert_eq!(c.reply(id).unwrap().body, body);
     }
+}
+
+#[test]
+fn streams_opened_before_our_settings_are_acknowledged_share_the_budget() {
+    // A client that has not acknowledged our SETTINGS counts with the
+    // protocol's 64 KiB windows: only as many streams may carry a body as
+    // the 1 MiB budget holds.
+    let server = TestServer::start(Server::new());
+    let mut c = Client::connect(server.addr);
+    let mut out = PREFACE.to_vec();
+    frame::write_settings(&mut out, &[]);
+    c.write(&out);
+    let ids: Vec<u32> = (0..30)
+        .map(|_| c.open("POST", "/echo", &[("content-length", "60000")], false))
+        .collect();
+    c.frames_within(Duration::from_millis(200));
+    let refused: Vec<u32> = ids
+        .iter()
+        .copied()
+        .filter(|id| c.resets.get(id) == Some(&(Reason::RefusedStream as u32)))
+        .collect();
+    assert_eq!(refused, ids[16..], "the streams past the budget");
+    // The others get their bodies through; then the window is the budget's
+    // share.
+    let body = pattern(60_000);
+    for &id in &ids[..16] {
+        c.send_body(id, &body, true);
+    }
+    for &id in &ids[..16] {
+        assert_eq!(c.reply(id).unwrap().body, body);
+    }
+    assert_eq!(c.peer_initial, (1 << 20) / 200);
+    assert_eq!(c.request("POST", "/echo", &[], &body).body, body);
+}
+
+#[test]
+fn responses_a_client_does_not_take_stay_within_a_budget() {
+    let server = TestServer::start(Server::new());
+    // The client takes nothing: each 1 MiB answer is held until it does.
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    let ids: Vec<u32> = (0..20).map(|_| c.get("/bytes?n=1048576")).collect();
+    let started = || server.state.started.load(Ordering::SeqCst);
+    let answered = || server.state.answered.load(Ordering::SeqCst);
+    // The first answer fills the budget: the other handlers wait.
+    wait_until("the first handler", || started() == 1);
+    c.frames_within(Duration::from_millis(200));
+    assert_eq!(started(), 1);
+
+    // Handlers that were already running when the budget filled up wait
+    // too, instead of adding their answers.
+    let mut d = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    d.auto_window = false;
+    let waiting: Vec<u32> = (0..20)
+        .map(|_| d.get("/sleep-bytes?ms=50&n=1048576"))
+        .collect();
+    // They all start (this connection holds nothing yet); the first to
+    // wake from its sleep answers and fills the budget.
+    wait_until("20 handlers and one answer", || {
+        started() == 21 && answered() == 2
+    });
+    d.frames_within(Duration::from_millis(300));
+    assert_eq!((started(), answered()), (21, 2));
+    // Given up on: the handlers are dropped. (Between two of the resets,
+    // a waiting handler may get to answer.)
+    let mut out = Vec::new();
+    for id in waiting {
+        frame::write_rst(&mut out, id, Reason::Cancel);
+    }
+    d.write(&out);
+
+    // As the client takes the answers, the others are made and sent in
+    // turn, and every one arrives whole.
+    c.auto_window = true;
+    let mut out = Vec::new();
+    frame::write_settings(&mut out, &[(frame::INITIAL_WINDOW_SIZE, 1 << 20)]);
+    frame::write_window_update(&mut out, 0, 30 << 20);
+    c.conn_window += 30 << 20;
+    c.write(&out);
+    for &id in &ids {
+        let reply = c.reply(id).unwrap();
+        assert_eq!(reply.body, pattern(1 << 20));
+    }
+}
+
+#[test]
+fn a_handler_panic_ends_its_stream_only() {
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let slow = c.get("/sleep?ms=300");
+    let panics = c.get("/panic?ms=50");
+    let deciding = c.open("POST", "/panic-deciding", &[("content-length", "5")], false);
+    c.send_body(deciding, b"hello", true);
+    let reply = c.reply(panics).unwrap();
+    assert_eq!(reply.status, 500);
+    assert_eq!(reply.header("content-length"), Some("0"));
+    assert_eq!(c.reply(deciding).unwrap().status, 500);
+    // The other stream, and the connection, go on.
+    assert_eq!(c.reply(slow).unwrap().text(), "slept");
+    assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
+    assert!(c.goaway.is_none(), "{:?}", c.goaway);
 }
 
 #[test]
@@ -1040,13 +1175,19 @@ fn http1_and_http2_share_a_port() {
     let mut c = server.client();
     assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
 
-    // Turned off, the preface is just a malformed HTTP/1.1 request.
-    let server = TestServer::start(Server::new().http2(false));
-    let mut c = Client::connect(server.addr);
-    c.write(PREFACE);
-    let mut answer = String::new();
-    c.stream.read_to_string(&mut answer).unwrap();
-    assert!(answer.starts_with("HTTP/1.1 "), "{answer}");
+    // Turned off, the preface is just a malformed HTTP/1.1 request; the
+    // same with only prior knowledge turned off.
+    for server in [
+        Server::new().http2(false),
+        Server::new().http2_prior_knowledge(false),
+    ] {
+        let server = TestServer::start(server);
+        let mut c = Client::connect(server.addr);
+        c.write(PREFACE);
+        let mut answer = String::new();
+        c.stream.read_to_string(&mut answer).unwrap();
+        assert!(answer.starts_with("HTTP/1.1 505 "), "{answer}");
+    }
 }
 
 #[test]
