@@ -136,6 +136,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
+  forms of `Error::new` and `with_header` that never panic, for a status or a header
+  value that comes from an upstream service or the request: a status outside
+  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
+  gives the error back without it. The docs say which form takes which values, and
+  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
+  (takes JSON already written).
 
 ### Changed
 
@@ -169,13 +176,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   value; a struct still ignores the keys it does not know.
 - **giong-web**, **Breaking**: `Sink` is `#[non_exhaustive]`, so that sinks can be added
   without breaking a `match`.
-- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
-  forms of `Error::new` and `with_header` that never panic, for a status or a header
-  value that comes from an upstream service or the request: a status outside
-  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
-  gives the error back without it. The docs say which form takes which values, and
-  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
-  (takes JSON already written).
 - **giong-web**, **Breaking**: request ids made by `RequestId` are 32 hexadecimal digits
   instead of 20: 64 random bits per process instead of 32, 16 bits for the worker instead
   of 8, then a 48-bit counter. With 32 random bits, two processes of a fleet shared ids
@@ -262,7 +262,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
   that wants it.
 - **giong-web**: the docs of `Req::json` showed a `&str` field, which serde can only lend
-  when the string needs no unescaping, so valid JSON with `\"` or `é` (and a query
+  when the string needs no unescaping, so valid JSON with `\"` or `\u00e9` (and a query
   value with `+` or `%XX`) was answered `422`/`400`, blaming the client. The examples now
   use `String` or `#[serde(borrow)] Cow<'a, str>`, and such a failure is a `500` whose
   logged cause (`GIONG-E1213`) says to use one of them.
