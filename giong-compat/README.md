@@ -33,10 +33,10 @@ Use the native crate when there is one. It is built on giong's owned buffers and
 
 | You need | Use |
 |---|---|
-| An HTTP/1.1 server or client | [`giong-http`](../giong-http/README.md); [`giong-web`](../giong-web/README.md) for routing and JSON |
+| An HTTP/1.1 or HTTP/2 server or client | [`giong-http`](../giong-http/README.md); [`giong-web`](../giong-web/README.md) for routing and JSON |
 | TLS | [`giong-tls`](../giong-tls/README.md) |
 | PostgreSQL, MySQL, Redis | [`giong-postgres`](../giong-postgres/README.md), [`giong-mysql`](../giong-mysql/README.md), [`giong-redis`](../giong-redis/README.md) |
-| HTTP/2 (until `giong-http` has it) | [h2](https://docs.rs/h2) over `Compat`, plain or over `giong-tls` with ALPN `h2` |
+| h2's own API (HTTP/2 frames and streams, or a library built on h2) | [h2](https://docs.rs/h2) over `Compat`, plain or over `giong-tls` with ALPN `h2` |
 | WebSocket | [tokio-tungstenite](https://docs.rs/tokio-tungstenite) (`accept_async`, `client_async`) over `Compat` |
 | A protocol framed by length or by line | [tokio-util](https://docs.rs/tokio-util)'s `Framed` with a codec over `Compat` |
 | hyper's API in particular | `hyper::{client, server}::conn` over `hyper_util::rt::TokioIo::new(Compat::new(..))` |
