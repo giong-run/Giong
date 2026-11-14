@@ -35,11 +35,15 @@ pub(crate) struct Op<T: 'static> {
 impl<T: 'static> Unpin for Op<T> {}
 
 impl<T: 'static> Op<T> {
-    /// # Safety contract (upheld by callers in this crate)
+    /// # Safety
     ///
     /// Every pointer in `io` must point into memory owned by `data` (or into
-    /// `'static` memory) at an address that does not change when `data` moves.
-    pub(crate) fn new(io: Io, data: T) -> Self {
+    /// `'static` memory) at an address that does not change when `data` moves,
+    /// and stays valid when `data` moves: heap memory reached through a raw
+    /// pointer or a `Vec`, an [`IoBuf`](crate::buf::IoBuf), or a
+    /// [`KernelBox`](crate::kbox::KernelBox), never a pointer taken from a
+    /// `Box` that then moves.
+    pub(crate) unsafe fn new(io: Io, data: T) -> Self {
         Self {
             io: Some(io),
             key: None,
@@ -53,8 +57,14 @@ impl<T: 'static> Op<T> {
     /// A zero-copy send that completes once it has its result, rather than
     /// once the kernel stops reading its buffers: `hold` keeps what the
     /// kernel may still read alive, with the driver, until then.
-    pub(crate) fn with_hold(io: Io, data: T, hold: Box<dyn Any>) -> Self {
-        let mut op = Self::new(io, data);
+    ///
+    /// # Safety
+    ///
+    /// As for [`new`](Self::new), and what the kernel still reads after the
+    /// result must be owned by `hold`.
+    pub(crate) unsafe fn with_hold(io: Io, data: T, hold: Box<dyn Any>) -> Self {
+        // SAFETY: the caller upholds `new`'s contract.
+        let mut op = unsafe { Self::new(io, data) };
         op.hold = Some(hold);
         op
     }
@@ -82,10 +92,10 @@ impl<T: 'static> Future for Op<T> {
                         }
                     }
                     Some(key) => {
-                        assert_eq!(
-                            this.worker_uid, w.shared.uid,
-                            "giong: operation polled on a different runtime"
-                        );
+                        if this.worker_uid != w.shared.uid {
+                            drop(driver);
+                            wrong_worker();
+                        }
                         match driver.poll_op(key, cx.waker(), &mut this.hold) {
                             Poll::Ready(done) => {
                                 this.key = None;
@@ -114,14 +124,18 @@ impl<T: 'static> Drop for Op<T> {
         // Never submitted, or already completed: nothing is in flight.
         let Some(key) = self.key.take() else { return };
         let mut data = self.data.take().map(|data| (data, self.hold.take()));
+        let result_is_fd = self.io.is_some_and(|io| io.result_is_fd());
         let handed_over = runtime::try_with_worker(|w| {
             if w.shared.uid != self.worker_uid {
                 return false;
             }
-            let Ok(mut driver) = w.driver.try_borrow_mut() else {
-                return false;
-            };
-            driver.cancel_op(key, data.take().map(|d| Box::new(d) as Box<dyn Any>));
+            let data = data.take().map(|d| Box::new(d) as Box<dyn Any>);
+            match w.driver.try_borrow_mut() {
+                Ok(mut driver) => driver.cancel_op(key, data, result_is_fd),
+                // Dropped by code the driver runs (a waker's `wake` or
+                // `drop`): cancelled at the next turn, still on this worker.
+                Err(_) => w.defer_cancel(key, data, result_is_fd),
+            }
             true
         })
         .unwrap_or(false);
@@ -131,4 +145,20 @@ impl<T: 'static> Drop for Op<T> {
             mem::forget(data);
         }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn wrong_worker() -> ! {
+    panic!(
+        "{}",
+        crate::error::Error::new(
+            crate::error::Code::WrongWorker,
+            "a future that started an I/O operation on one giong worker was polled on another \
+             worker or runtime",
+            "await a giong future on the worker that first polled it. Send data, not futures, \
+             between workers and threads: Handle::spawn_on builds the future on the worker that \
+             runs it.",
+        )
+    )
 }

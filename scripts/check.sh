@@ -19,7 +19,11 @@
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
 #                               driver state (tests/soak.rs)
-#   scripts/check.sh all        everything above except seccomp and soak
+#   scripts/check.sh miri       the unit tests and the tests Miri can run, on the
+#                               epoll driver, under Miri, which checks the unsafe
+#                               code against Rust's memory and aliasing rules
+#                               (needs nightly with the miri component)
+#   scripts/check.sh all        everything above except seccomp, soak and miri
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -69,7 +73,7 @@ run_tsan() {
     # an intercepted libc function. giong's threads sit in raw io_uring_enter
     # and futex syscalls, so the SIGTERM handler would never run and the test
     # would hang. It runs in every non-sanitizer job instead.
-    local skip=(--skip sigterm_triggers_a_graceful_shutdown)
+    local skip=(--skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned)
     # `--cfg giong_tsan` makes giong close sockets with close(2) instead of
     # IORING_OP_CLOSE, which TSan cannot see (see Driver::close_fd).
     for round in $(seq 1 "$ROUNDS"); do
@@ -95,6 +99,29 @@ run_soak() {
     GIONG_SOAK_SECS="${SOAK_SECS:-300}" cargo test --release --quiet --test soak -- --ignored --nocapture
 }
 
+run_miri() {
+    # Miri cannot run io_uring, so the epoll driver; it reads and writes real
+    # files (isolation off); the blocking threads may outlive a test (leaks
+    # ignored); and it would otherwise make reads short at random, which the
+    # tests check exactly.
+    export GIONG_DRIVER=epoll
+    export MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks -Zmiri-no-short-fd-operations"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/miri"
+    echo "== Miri: unit tests"
+    cargo +nightly miri test --quiet --lib
+    # The test files whose tests Miri can mostly run; the rest of their tests
+    # are marked `#[cfg_attr(miri, ignore = "why")]`. Miri has no sendmsg,
+    # SO_REUSEPORT or Unix sockets, so the network tests stay out, except for
+    # the file test in cancel.rs.
+    local files=(fs executor channels observe time multi)
+    for file in "${files[@]}"; do
+        echo "== Miri: tests/$file.rs"
+        cargo +nightly miri test --quiet --test "$file"
+    done
+    echo "== Miri: tests/cancel.rs (files)"
+    cargo +nightly miri test --quiet --test cancel -- --exact a_dropped_open_closes_the_descriptor_it_produced
+}
+
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback ;;
@@ -103,7 +130,8 @@ case "${1:-all}" in
     tsan) run_tsan ;;
     loom) run_loom ;;
     soak) run_soak ;;
+    miri) run_miri ;;
     all) run_test; run_fallback; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|all]" >&2; exit 2 ;;
 esac
 echo "ok"
