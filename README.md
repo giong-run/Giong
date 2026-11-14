@@ -864,7 +864,8 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   remaining connections are dropped. Set `.shutdown_grace(..)` and use `until_shutdown` in
   the connection loop (`giong-http` does). Connections still in the kernel's accept queue
   when the listener closes are refused; have the load balancer stop sending first.
-- **Unused so far:** fixed files, `SQPOLL`. Zero-copy send covers only bytes that cannot
+- **Unused so far:** fixed files, which would save 0.6% of a request, and `SQPOLL`, which
+  cost more CPU than it saved on bare metal. Zero-copy send covers only bytes that cannot
   change (`&'static`, `Rc<[u8]>`, `Arc<[u8]>`); a `Vec` is copied.
 
 ## Project
