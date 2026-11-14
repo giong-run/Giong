@@ -39,6 +39,9 @@ when it is no longer raised.
 | [GIONG-E0008](E0008.md) | `NoSuchWorker` | no such worker |
 | [GIONG-E0009](E0009.md) | `BufferRingRefused` | the kernel refused io_uring buffer rings |
 | [GIONG-E0010](E0010.md) | `LockedMemoryLimit` | the locked-memory limit is used up |
+| [GIONG-E0011](E0011.md) | `NotInRuntime` | not inside a giong runtime |
+| [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
+| [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
 
 ## Network and name resolution
 

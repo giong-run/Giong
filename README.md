@@ -17,7 +17,7 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 0.4.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
+> **Status: 0.5.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server and client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
@@ -350,7 +350,7 @@ program, with the same minimal HTTP parser, so they compare runtimes; `giong-htt
 library, with strict parsing, a `Date` header, timeouts and limits. Each server is pinned
 to its own core and `wrk` runs on another. Servers are measured in interleaved rounds and
 the tables show the median, with the range in parentheses. Machine, except for the
-14-core run under [One worker to N](#one-worker-to-n): a 4-vCPU virtual machine (Xeon
+runs under [One worker to N](#one-worker-to-n): a 4-vCPU virtual machine (Xeon
 2.1 GHz), Linux 6.18, Rust 1.97, Node 22, Bun 1.4, Tokio 1.54, Monoio 0.2.4, Glommio
 0.9.0, wrk 4.1.
 
@@ -525,6 +525,67 @@ server's and the load generator's CPUs were, so a run says which side set the nu
 It can drive the server from a second machine over ssh (`LOAD_HOST`, `BENCH_HOST`), which
 is how it should be run.
 
+**On bare metal.** Two identical machines, AMD EPYC 4345P (8 cores, 16 threads, boost on),
+64 GB, Intel E810 over a 25 GbE private network (23.5 Gb/s measured with `iperf3`): the
+server on one, `wrk` with 16 threads on the other. Linux 7.0, giong on io_uring, code as
+of 0.4.0; `/json`, five rounds of 6 s. Requests per second, median:
+
+| Server | 1 worker | 2 | 4 | 8 | 16 ¹ |
+|---|---|---|---|---|---|
+| giong | **509k** | **928k** | **1.51M** | **2.45M** | 2.52M |
+| giong-http | 437k | 792k | 1.32M | 2.35M | 2.49M |
+| Monoio (tuned) | 489k | 893k | 1.46M | 2.44M | 2.53M |
+| Raw Tokio | 508k | 868k | 1.36M | 2.16M ² | 2.33M |
+| Glommio | 440k | 796k | 1.31M | 2.21M | 2.28M |
+
+CPU time per request, in µs:
+
+| Server | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| giong | 1.86 | 2.13 | 2.64 | 2.95 | 3.54 |
+| giong-http | 2.27 | 2.51 | 3.02 | 3.33 | 3.79 |
+| Monoio (tuned) | 2.00 | 2.24 | 2.73 | 3.03 | 3.63 |
+| Raw Tokio | 1.92 | 2.17 | 2.65 | 2.77 | 3.44 |
+| Glommio | 2.27 | 2.51 | 3.05 | 3.59 | 5.16 |
+
+¹ 16 workers share the 8 cores (SMT siblings). Every server levels off there with neither
+side saturated, and the median p99 goes above 100 ms for four of the five (raw Tokio:
+1.7 ms).
+² Neither side was saturated (server 78% busy, load generator 69%).
+
+- **From 1 to 4 workers the servers were the limit** (their cores 92–97% busy, the load
+  generator 13–45%), so these rows measure the servers. giong had the highest median at
+  every worker count up to 8, level with raw Tokio at 1 worker (509k against 508k) and
+  with tuned Monoio at 8 (2.45M against 2.44M).
+- **From 1 to 8 workers giong grew 4.8 times**, Monoio 5.0, Glommio 5.0 and raw Tokio
+  4.3. The CPU time per request rises with the number of workers for every server alike
+  (giong 1.86 to 2.95 µs); boost, which lowers the clock as more cores get busy, is
+  probably part of it.
+- **On Ubuntu's 6.8 kernel** (`linux-6.8-epoll/`), giong fell back to its epoll driver
+  (the kernel bug that [#52](https://github.com/giong-run/Giong/pull/52) works around), and
+  every server, Tokio included, was faster from 4 workers on than under 7.0, which points
+  at the kernel or the network driver: compare runtimes within one run, not across runs.
+  There, on epoll, giong was 4–6% behind tuned Monoio from 1 to 8 workers and ahead of raw
+  Tokio from 2 workers on (2.84M against 2.64M at 8).
+
+Recorded output, with the machines, the method and what limited each row:
+`bench/results/bare-metal-epyc-4345p/`.
+
+The 0.5.0 release candidate (d5a0b0c) on the same machines, with 16 queues on the card,
+three rounds; requests per second, median:
+
+| Server | 1 worker | 2 | 4 | 8 ³ | 16 ³ |
+|---|---|---|---|---|---|
+| giong | **560k** | **1.06M** | **1.75M** | **2.94M** | 3.24M |
+| giong-http | 458k | 858k | 1.49M | 2.60M | 3.12M |
+| Monoio (tuned) | 524k | 997k | 1.69M | 2.87M | 3.24M |
+| Raw Tokio | 556k | 962k | 1.59M | 2.54M | 2.82M |
+
+³ From 8 workers on, `wrk` on the second machine is the limit with 16 queues (95–99.5%
+busy in earlier runs), which is why giong and Monoio tie at 16. From 1 to 4 workers the
+servers were 91–97% busy. Recorded in
+`bench/results/bare-metal-epyc-4345p/linux-7.0/release-0.5.0/`.
+
 **On 14 cores.** An Intel i5-13500 desktop (6 performance cores and 8 efficiency cores,
 20 threads, 64 GB) running Linux 6.18 under WSL2 on Windows 10. The server gets vCPUs 0–9,
 `wrk` gets 10–19 with ten threads, and they talk over loopback; `/json`, three rounds of
@@ -566,10 +627,9 @@ This run says nothing reliable about scaling efficiency. Going from one worker t
 gives 2.1 to 2.5 times the throughput for four of the five servers, which means the
 one-worker numbers are too low, not that two workers do more than twice the work: WSL2
 does not pin vCPUs to physical cores, and Windows 10 may run a lone busy vCPU on an
-efficiency core. Some rows also vary by up to a third between rounds. The numbers needed
-for that are from bare-metal Linux with the load generator on a second machine (see
-[What has not been measured](#what-has-not-been-measured)). Recorded output, with the
-machine details and how the run was checked: `bench/results/workers-i5-13500-wsl/`.
+efficiency core. Some rows also vary by up to a third between rounds; read the bare-metal
+run above for scaling. Recorded output, with the machine details and how the run was
+checked: `bench/results/workers-i5-13500-wsl/`.
 
 **On 4 vCPUs** (the virtual machine used for the other tables), two `wrk` threads on the
 other two vCPUs could no longer keep up once the server had two workers, so that run only
@@ -712,11 +772,10 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 ### What has not been measured
 
-- **A physical network, and scaling on bare metal.** Everything here is loopback on one
-  machine. The multi-core run is on a desktop under WSL2, where the load generator shares
-  the machine and vCPUs are not pinned to cores. `bench/workers.sh` is ready for the real
-  run: `BENCH_HOST=<server address> LOAD_HOST=<user@load machine> WORKERS="1 2 4 8 16"
-  bench/workers.sh`.
+- **More than eight cores, and the other tables on a physical network.** The bare-metal
+  run under [One worker to N](#one-worker-to-n) is one pair of 8-core machines; at 16
+  workers neither side was saturated, so a bigger server and a faster load generator are
+  still needed. The other tables are loopback on one machine.
 - **Disks.** The file benchmark measures cached data only.
 - **Newer Monoio and Glommio.** The comparison uses the latest crates.io releases
   (August and March 2024); their main branches may differ.
@@ -729,7 +788,7 @@ Recorded output is in `bench/results/`.
 
 ## Testing and safety
 
-752 tests across the nine crates and the example API (`cargo test --workspace
+869 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
 database clients, giong-web, giong-mcp, giong-compat and the example API describe theirs
@@ -739,7 +798,7 @@ in their READMEs.
 |---|---|
 | `tests/executor.rs` (14) | spawn and join, panics, abort, teardown, runtimes run back to back |
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
-| `tests/net.rs` (20) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1) |
+| `tests/net.rs` (23) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1) |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/udp.rs` (18) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop |
 | `tests/fs.rs` (20) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll) |
@@ -747,9 +806,9 @@ in their READMEs.
 | `tests/multi.rs` (14) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (10) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
-| `tests/driver.rs` (8), `tests/blocked.rs` (3) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
+| `tests/driver.rs` (9), `tests/blocked.rs` (4) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; with the locked-memory limit used up, the same with GIONG-E0010; the optional io_uring features found are the kernel's; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (8) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time; poll profiles by spawn location; sources reported until dropped |
-| `giong-http` (136) | 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 51 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 24 end-to-end tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 end-to-end tests of request and response bodies streamed both ways; 12 end-to-end HTTPS tests with a rustls client; 13 documentation examples |
+| `giong-http` (191) | HTTP/1.1: 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 24 end-to-end server tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 of bodies streamed both ways; 12 over HTTPS with a rustls client. HTTP/2: 36 unit tests of the server's streams, flow control, HPACK and frames; 15 client tests against the server and against servers that misbehave on purpose (refused and reset streams, overdrawn windows, malformed responses, over kernel TLS). 7 fuzz-style tests: 500,000 random inputs for the parser and the chunked decoder, HPACK header blocks, HTTP/2 connections from each side, compressed bodies and response heads; 48 other unit tests; 13 documentation examples |
 | `giong-tls` (64) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 27 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
@@ -814,7 +873,7 @@ Not verified, and you should know it:
 
 ## Compared with Monoio and Glommio
 
-| | giong 0.4 | Monoio 0.2.4 | Glommio 0.9.0 |
+| | giong 0.5 | Monoio 0.2.4 | Glommio 0.9.0 |
 |---|---|---|---|
 | Platforms | Linux: io_uring on ≥ 6.0, an epoll driver elsewhere | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
 | Receiving | multishot, kernel-provided buffers | one submission per read, caller's buffer | direct `recv`, io_uring to wait |
