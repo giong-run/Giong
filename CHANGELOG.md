@@ -203,6 +203,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+- **giong-http**, **Breaking**: an HTTP/1.1 request whose target is a whole URL (absolute
+  form, `GET http://host/path`, which servers must accept) was served whatever its scheme
+  (`foo://x/y` too), and its host was ignored: the handler saw `path() == "/path"` and the
+  host in `Host`, which could name another one than the URL a proxy in front routed or
+  authorised on. Such a target must now be `http` or `https` (in any case), carry no user
+  name or password, and name the host the `Host` header names (compared without regard to
+  case; a port on one side only is a difference), or the request is answered with `400`,
+  as HTTP/2 already did for a `host` that differs from `:authority`. An HTTP/1.0 request
+  in absolute form without `Host` is refused too, `*` is accepted only with `OPTIONS`, and
+  a target that is none of path, URL, `*` or (with `CONNECT`) `host:port` is refused. The
+  path of such a URL now ends where its query starts (`http://h?to=/next` had the path
+  `/next`).
+- **giong-http**: over HTTP/2, a `host` field that names the `:authority` host in another
+  case is no longer refused (host names are case-insensitive, and HTTP/1.1 now compares
+  the same way), and an `:authority` with a user name or password is (RFC 9113, section
+  8.3.1).
 
 ## [0.4.0] - 2026-11-13
 

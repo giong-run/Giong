@@ -138,19 +138,29 @@ impl Request {
     }
 
     /// The request target exactly as sent, e.g. `/search?q=rust`.
+    ///
+    /// It can also be a whole URL (absolute form, `http://host/search`),
+    /// which HTTP/1.1 servers must accept. The server refuses one whose
+    /// scheme is not `http` or `https` or whose host is not the one in the
+    /// `Host` header (`400`), so [`header("host")`](Self::header) names the
+    /// host whatever the form, as it does over HTTP/2. `*` comes only with
+    /// `OPTIONS`, and `host:port` with `CONNECT`.
     pub fn target(&self) -> &str {
         self.head_str(self.head.target.clone())
     }
 
     /// The path part of the target, without the query string. For a target in
-    /// absolute form (`http://host/path`), the scheme and host are left out.
+    /// absolute form (`http://host/path`), the scheme and host are left out,
+    /// and a URL with no path has the path `/`.
     pub fn path(&self) -> &str {
         let target = self.target();
-        let target = match target.find("://") {
-            Some(i) if !target.starts_with('/') => {
-                let rest = &target[i + 3..];
-                rest.find('/').map_or("/", |slash| &rest[slash..])
-            }
+        let target = match crate::parse::split_absolute(target.as_bytes()) {
+            // `split_absolute` cuts at ASCII bytes, so `rest` is a suffix
+            // of the target on a character boundary.
+            Some((_, _, rest)) if !target.starts_with('/') => match rest.first() {
+                Some(b'/') => &target[target.len() - rest.len()..],
+                _ => "/",
+            },
             _ => target,
         };
         target.split('?').next().unwrap_or(target)
@@ -265,13 +275,39 @@ mod tests {
     }
 
     #[test]
+    fn an_absolute_target_gives_its_path_and_its_host_is_the_host_header() {
+        let req = Request::from_bytes(
+            b"GET http://example.com/a/b?x=1 HTTP/1.1\r\nHost: Example.com\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(req.target(), "http://example.com/a/b?x=1");
+        assert_eq!((req.path(), req.query()), ("/a/b", Some("x=1")));
+        assert_eq!(req.header_str("host"), Some("Example.com"));
+        // The path ends where the query starts, even when the query has a
+        // slash in it.
+        let req = Request::from_bytes(
+            b"GET http://example.com?to=/next HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!((req.path(), req.query()), ("/", Some("to=/next")));
+        let req =
+            Request::from_bytes(b"GET HTTPS://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .unwrap();
+        assert_eq!((req.path(), req.query()), ("/", None));
+    }
+
+    #[test]
     fn from_bytes_refuses_what_the_server_refuses() {
-        let cases: [&[u8]; 5] = [
+        let cases: [&[u8]; 7] = [
             b"GET / HTTP/1.1\r\nHost: h\r\n",
             b"GET / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nabc",
             b"GET / HTTP/1.1\r\nHost: h\r\n\r\nextra",
             b"GET / HTTP/1.1\r\nHost : h\r\n\r\n",
             b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nab",
+            // The handler would see one host in Host and the front proxy
+            // another in the target.
+            b"GET http://internal.example/admin HTTP/1.1\r\nHost: public.example\r\n\r\n",
+            b"GET foo://h/x HTTP/1.1\r\nHost: h\r\n\r\n",
         ];
         for raw in cases {
             assert_eq!(

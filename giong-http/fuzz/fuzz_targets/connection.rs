@@ -62,6 +62,22 @@ fn check_request(req: &Request) {
         assert!(!value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)));
     }
     assert!(req.body().len() <= MAX_BODY);
+    // Whatever form the target takes, the path is a path, and a URL's host
+    // is the one in `Host`.
+    let target = req.target();
+    if req.method() != "CONNECT" && target != "*" {
+        assert!(req.path().starts_with('/'), "path of {target:?}");
+    }
+    if !target.starts_with('/') && req.method() != "CONNECT" && target != "*" {
+        let lower = target.to_ascii_lowercase();
+        let rest = lower
+            .strip_prefix("http://")
+            .or_else(|| lower.strip_prefix("https://"))
+            .unwrap_or_else(|| panic!("target {target:?}"));
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = req.header_str("host").map(str::to_ascii_lowercase);
+        assert_eq!(host.as_deref(), Some(authority), "{target:?}");
+    }
 }
 
 struct Fuzzed;

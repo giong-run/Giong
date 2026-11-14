@@ -24,7 +24,9 @@ const SEEDS: &[&[u8]] = &[
     b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
     b"POST /submit?a=1 HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\n",
     b"PUT /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n",
-    b"GET http://h/p HTTP/1.0\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+    b"GET http://h/p HTTP/1.0\r\nHost: h\r\nConnection: keep-alive\r\nAccept: */*\r\n\r\n",
+    b"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
+    b"GET HTTPS://Example.com:8443/a?b=/c HTTP/1.1\r\nHost: example.com:8443\r\n\r\n",
 ];
 
 const INTERESTING: &[u8] = b"\r\n\r\n: ,;\t\0\x7f\xff0123456789abcdefHTTP/1.1";
