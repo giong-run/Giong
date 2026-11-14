@@ -13,7 +13,7 @@ use giong_tls::TlsStream;
 use socket2::{SockRef, TcpKeepalive};
 
 use crate::auth::{md5_password, Scram};
-use crate::config::{Config, Host};
+use crate::config::{AuthMethod, Config, Host};
 use crate::error::{DbError, Error, ErrorKind};
 use crate::protocol::{self, frame, parse_backend, Backend};
 
@@ -232,7 +232,8 @@ pub(crate) async fn open(config: &Config) -> Result<Stream, Error> {
 }
 
 /// Turns off Nagle's algorithm (requests are written whole) and sets up
-/// keepalive, so that a server that vanished is noticed.
+/// keepalive (and, on Linux, `TCP_USER_TIMEOUT`), so that a server that
+/// vanished is noticed.
 fn tune(tcp: &TcpStream) -> io::Result<()> {
     tcp.set_nodelay(true)?;
     // SAFETY: the descriptor belongs to `tcp`, which outlives this borrow.
@@ -244,7 +245,9 @@ fn tune(tcp: &TcpStream) -> io::Result<()> {
             .with_interval(KEEPALIVE_INTERVAL)
             .with_retries(KEEPALIVE_RETRIES),
     )?;
-    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))
+    #[cfg(target_os = "linux")]
+    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))?;
+    Ok(())
 }
 
 /// Reads until a whole message is buffered; returns its tag and body range.
@@ -291,14 +294,82 @@ fn startup_error(config: &Config, body: &[u8]) -> Error {
             } else {
                 ErrorKind::Connect
             };
-            Error::with_db(
-                kind,
-                format!("the server at {} refused the connection", config.target()),
-                db,
-            )
+            // PgBouncer's answer to a startup parameter it does not track
+            // (its messages are not translated).
+            let pooler =
+                db.code() == "08P01" && db.message().contains("unsupported startup parameter");
+            let message = if pooler && db.message().contains("statement_timeout") {
+                format!(
+                    "the connection pooler at {} refused the statement_timeout that \
+                     giong-postgres sends when connecting. PgBouncer cannot pass it on to the \
+                     server (track_extra_parameters accepts it without applying it, and \
+                     ignore_startup_parameters drops it): call Config::statement_timeout(None) \
+                     and set the limit on the role instead, ALTER ROLE ... SET \
+                     statement_timeout = '30s'",
+                    config.target()
+                )
+            } else if pooler {
+                format!(
+                    "the connection pooler at {} refused a setting given with Config::param: \
+                     set it on the role instead (ALTER ROLE ... SET ...)",
+                    config.target()
+                )
+            } else {
+                format!("the server at {} refused the connection", config.target())
+            };
+            Error::with_db(kind, message, db)
         }
         Err(e) => e,
     }
+}
+
+/// Refuses an authentication method that [`Config::require_auth`] does not
+/// allow, before anything is sent for it.
+fn check_auth(config: &Config, method: AuthMethod) -> Result<(), Error> {
+    match &config.require_auth {
+        Some(allowed) if !allowed.contains(&method) => {
+            let allowed: Vec<&str> = allowed.iter().map(|m| m.name()).collect();
+            let what = match method {
+                AuthMethod::None => "let the client in without authentication".to_owned(),
+                m => format!("asked for {} authentication", m.name()),
+            };
+            Err(Error::new(
+                ErrorKind::Auth,
+                format!(
+                    "the server at {} {what}, but require_auth allows only {}; refusing to go \
+                     on, since this is not the server's configured method or not the real \
+                     server. Fix pg_hba.conf, or change require_auth",
+                    config.target(),
+                    allowed.join(", ")
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The `statement_timeout` to send when connecting, in milliseconds.
+fn statement_timeout_ms(config: &Config) -> Result<Option<String>, Error> {
+    let Some(timeout) = config.statement_timeout else {
+        return Ok(None);
+    };
+    let ms = timeout.as_micros().div_ceil(1000);
+    if ms == 0 {
+        return Err(Error::config(
+            "Config::statement_timeout(Duration::ZERO) would let no statement run (PostgreSQL \
+             reads 0 as no limit, which is not what a zero duration says); give a limit, or \
+             Config::statement_timeout(None) to leave it to the server",
+        ));
+    }
+    if ms > i32::MAX as u128 {
+        return Err(Error::config(format!(
+            "Config::statement_timeout({timeout:?}) is longer than PostgreSQL allows ({} ms, \
+             about 24.8 days); give a shorter limit, or Config::statement_timeout(None) to leave \
+             it to the server",
+            i32::MAX
+        )));
+    }
+    Ok(Some(ms.to_string()))
 }
 
 /// Sends the startup message and authenticates.
@@ -308,16 +379,11 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
             "no user to log in as; put it in the URL (postgres://USER@host/db) or call Config::user",
         )
     })?;
-    let timeout_ms = config
-        .statement_timeout
-        .as_micros()
-        .div_ceil(1000)
-        .to_string();
-    let mut params: Vec<(&str, &str)> = vec![
-        ("user", user),
-        ("client_encoding", "UTF8"),
-        ("statement_timeout", &timeout_ms),
-    ];
+    let timeout_ms = statement_timeout_ms(config)?;
+    let mut params: Vec<(&str, &str)> = vec![("user", user), ("client_encoding", "UTF8")];
+    if let Some(ms) = &timeout_ms {
+        params.push(("statement_timeout", ms));
+    }
     if let Some(db) = &config.dbname {
         params.push(("database", db));
     }
@@ -334,6 +400,7 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
     let encrypted = matches!(stream, Stream::Tls(_));
     let mut buf = ReadBuf::new();
     let mut scram: Option<Scram> = None;
+    let mut method = AuthMethod::None;
     let password = || {
         config.password.as_deref().ok_or_else(|| {
             Error::new(
@@ -349,8 +416,13 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
         let (tag, range) = next_message(&stream, &mut buf).await?;
         let mut out = Vec::new();
         match parse_backend(tag, buf.bytes(range))? {
-            Backend::AuthenticationOk => break,
+            Backend::AuthenticationOk => {
+                check_auth(config, method)?;
+                break;
+            }
             Backend::AuthenticationCleartextPassword => {
+                method = AuthMethod::Password;
+                check_auth(config, method)?;
                 if !encrypted && !config.is_local() {
                     return Err(Error::new(
                         ErrorKind::Auth,
@@ -368,6 +440,8 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
                 protocol::password(&mut out, &data)?;
             }
             Backend::AuthenticationMd5Password(salt) => {
+                method = AuthMethod::Md5;
+                check_auth(config, method)?;
                 let mut data = md5_password(user, password()?, salt).into_bytes();
                 data.push(0);
                 protocol::password(&mut out, &data)?;
@@ -382,6 +456,8 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
                         ),
                     ));
                 }
+                method = AuthMethod::ScramSha256;
+                check_auth(config, method)?;
                 let s = Scram::new(password()?)?;
                 protocol::sasl_initial_response(&mut out, "SCRAM-SHA-256", &s.client_first())?;
                 scram = Some(s);
@@ -390,7 +466,12 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
                 let s = scram.as_mut().ok_or_else(|| {
                     Error::protocol("the server continued a SASL exchange that was never started")
                 })?;
-                protocol::password(&mut out, &s.client_final(data)?)?;
+                let (salt, iterations) = s.server_first(data)?;
+                let salted = config
+                    .scram_keys
+                    .salted_password(s.password(), &salt, iterations)
+                    .await;
+                protocol::password(&mut out, &s.client_final_salted(&salted)?)?;
             }
             Backend::AuthenticationSaslFinal(data) => {
                 scram

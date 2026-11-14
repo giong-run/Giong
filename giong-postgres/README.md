@@ -49,11 +49,11 @@ fn main() -> std::io::Result<()> {
 
 ## What it does
 
-- **Pipelining across tasks.** Tasks that share a connection send their statements together, and one round trip answers all of them. A few connections serve hundreds of concurrent tasks, none of them waiting for a free connection.
-- **Prepared statements, kept.** Every statement is prepared the first time a connection runs it and kept in a bounded cache (256 per connection by default), so from then on it takes one round trip. When the schema changes under a cached statement, the cache entry is dropped and the next call prepares it again.
+- **Pipelining across tasks.** Tasks that share a connection send their statements together, and one round trip answers all of them. A few connections serve hundreds of concurrent tasks without each task waiting for a connection of its own.
+- **Prepared statements, kept.** Every statement is prepared the first time a connection runs it and kept in a bounded cache (256 per connection by default), so from then on it takes one round trip. When the schema changes under a cached statement (`ALTER TABLE`, a view replaced), the statement is prepared again and run once more, so the caller sees no error; inside a transaction the server has already aborted the transaction, so that one call fails with the server's error and the next one is prepared again. Stale statements are recognised by SQLSTATE and the server's routine name, so this works whatever language the server writes its messages in.
 - **Binary results for the common types** (`boolean`, `bytea`, the integers, `oid`, the floats, `timestamptz`), and text for the rest, so any column can still be read as a `String`.
-- **A pool per worker.** Statements that stand alone share connections; `pool.get()` takes one connection for a transaction or session settings, and rolls back a transaction left open when it comes back. Transactions never run on the shared connections: the pool's own methods refuse `BEGIN`, `COMMIT` and the like, and a batch that leaves a transaction open closes its connection rather than let the statements of other tasks run inside it. The pool steers new statements away from a connection whose oldest statement has been running for more than 5 ms, so a slow query does not hold up the fast ones behind it.
-- **TLS on by default for remote hosts, always verified.** SCRAM-SHA-256, MD5, and clear-text passwords only over TLS or to this machine.
+- **A pool per worker.** Statements that stand alone share connections; `pool.get()` takes one connection for a transaction, session settings or a slow statement. When it comes back, a transaction left open is rolled back and the session is reset (settings, temporary tables, advisory locks, `LISTEN`, cursors), so nothing one task did reaches the next. Tasks waiting in `get()` are served in the order they came, even while shared statements keep every connection busy. Transactions and session changes never run on the shared connections: the pool's own methods refuse `BEGIN`, `SET`, `LISTEN`, `PREPARE`, temporary tables and the like before sending them, and a batch that leaves a transaction open closes its connection rather than let the statements of other tasks run inside it. The pool steers new statements away from a connection whose oldest statement has been running for more than 5 ms, so a slow query does not hold up the fast ones behind it. Connections are closed after 10 minutes unused and replaced after 30 minutes, or as soon as their server turns out to be a standby after a failover.
+- **TLS on by default for remote hosts, always verified.** SCRAM-SHA-256, MD5, and clear-text passwords only over TLS or to this machine. `require_auth` limits the methods the server may ask for. SCRAM's key derivation runs on a thread of its own, once per password and salt, so connecting does not stall the other tasks of the worker.
 - **Errors that say what to do.** Every error has an `ErrorKind`; errors from the server carry the SQLSTATE code and every field the server sent (`detail`, `hint`, `constraint`...).
 - **Finite limits everywhere.** Connecting, running a statement, the size of a result, the statement cache and waiting for the pool all have a limit by default, so nothing waits forever and nothing grows without bound.
 
@@ -73,7 +73,7 @@ let same_place = Config::new()
     .statement_timeout(Duration::from_secs(5));
 ```
 
-A URL is `postgres://user:password@host:port/dbname?param=value` (`postgresql://` too). The host can be an IPv6 address in brackets, or, as with libpq, empty with the socket directory in a `host` parameter: `postgres:///shop?host=/var/run/postgresql`. The parameters understood are `sslmode`, `sslrootcert`, `host`, `port`, `user`, `password`, `dbname`, `application_name` and `connect_timeout` (seconds). Any other parameter is an error, not silently ignored.
+A URL is `postgres://user:password@host:port/dbname?param=value` (`postgresql://` too). The host can be an IPv6 address in brackets, or, as with libpq, empty with the socket directory in a `host` parameter: `postgres:///shop?host=/var/run/postgresql`. The parameters understood are `sslmode`, `sslrootcert`, `host`, `port`, `user`, `password`, `dbname`, `application_name`, `connect_timeout` (seconds) and `require_auth`. Any other parameter is an error, not silently ignored.
 
 **TLS.** Unless `Config::tls` or `sslmode` says otherwise:
 
@@ -87,6 +87,17 @@ A URL is `postgres://user:password@host:port/dbname?param=value` (`postgresql://
 
 A clear-text password is never sent over an unencrypted connection to another machine: the connection fails with `ErrorKind::Auth` instead.
 
+**Authentication.** Without TLS (a Unix socket, a loopback address, `sslmode=disable`), nothing proves the server is the real one, and an impostor could ask for MD5 instead of SCRAM or let the client in without asking. `Config::require_auth(&[AuthMethod::ScramSha256])`, or `require_auth=scram-sha-256` in the URL (libpq's names, comma-separated, without libpq's `!` negations), refuses any other method before anything is sent for the password.
+
+### Behind PgBouncer
+
+In transaction mode, PgBouncer gives each transaction any server connection, so two things need setting up:
+
+- **Prepared statements** need PgBouncer 1.21 or later with `max_prepared_statements` above 0 (it then prepares them on whichever server connection runs them). With it, the statement cache works as usual. Without it, prepared statements cannot work through PgBouncer in transaction mode, whatever `statement_cache_capacity` is.
+- **The statement timeout** cannot be sent when connecting: PgBouncer refuses the connection, and neither `track_extra_parameters` nor `ignore_startup_parameters` passes it on to the server (checked with PgBouncer 1.22). Call `Config::statement_timeout(None)` and set the limit on the role: `ALTER ROLE app SET statement_timeout = '30s'`. Connecting without `None` fails with an error that says this.
+
+Both are tested in CI against PgBouncer in transaction mode.
+
 ## API
 
 | | |
@@ -97,16 +108,18 @@ A clear-text password is never sent over an unencrypted connection to another ma
 | `client.execute(..)` | The number of rows affected. |
 | `client.batch_execute(sql)` | Several statements separated by `;`, through the simple protocol, with no parameters and no results. For migrations and setup. |
 | `client.transaction()` | Starts a transaction and borrows the client mutably until it ends. `tx.commit()` or `tx.rollback()`; dropping the transaction rolls it back. A `COMMIT` that the server turned into a rollback (because of an earlier error) is an error, not a success. |
-| `client.cancel_token()` | A `CancelToken` whose `cancel()` asks the server, over a separate connection, to stop the statement running now. |
+| `client.cancel_token()` | A `CancelToken` whose `cancel()` asks the server, over a separate connection, to stop the statement running now. A token taken from a `PooledClient` stops working when the connection goes back to the pool, so it cannot cancel another task's statement. |
 | `client.parameter(name)` | A setting the server reported, such as `server_version` or `TimeZone`. |
 | `client.is_closed()`, `client.in_flight()` | Whether the connection is closed; how many requests are waiting for their answer. |
 | `row.get::<T>(column)` | A column by position or name, converted to `T` (see [Types](#types)). Borrowed types (`&str`, `&[u8]`) borrow from the row. |
 | `row.is_null(column)`, `row.columns()`, `row.len()` | Whether a value is `NULL`; the columns' names and types; how many there are. |
 | `Pool::new(config, max_size)` | A pool for the current worker. Connections are opened when needed, up to `max_size`. Size it to the database server's cores, shared among the workers (see [Performance](#performance)). |
 | `.wait_timeout(duration)` | How long `get()` and the statement methods wait when every connection is taken, 5 s by default. |
-| `pool.query(..)` and the other statement methods | Run on the least busy connection, pipelined with other tasks' statements. |
-| `pool.get()` | A `PooledClient` for this task alone, which derefs to `Client`. For transactions, session settings and statements known to be slow. |
-| `pool.stats()` | Connections open, taken, being opened; requests in flight; tasks waiting; and counters for connections opened, connect errors and wait timeouts. |
+| `.idle_timeout(duration)`, `.max_lifetime(duration)` | Close a connection unused for this long (10 min by default); replace one older than this (30 min, less up to 10% so that connections opened together are not replaced together). |
+| `pool.query(..)` and the other statement methods | Run on the least busy connection, pipelined with other tasks' statements. They refuse transaction statements, session changes and `COPY ... FROM STDIN` before sending them (`ErrorKind::Statement`). |
+| `pool.get()` | A `PooledClient` for this task alone, which derefs to `Client`. For transactions, session settings and statements known to be slow. Served in the order asked. When it is dropped, a transaction left open is rolled back and, if anything was sent, the session is reset; settings given to `Config` survive the reset. |
+| `pool.stats()` | Connections open, taken, being opened; requests in flight; tasks waiting; and counters for connections opened, connect errors, wait timeouts and connections recycled. |
+| `Config::require_auth(&[AuthMethod::..])` | The only authentication methods the server may ask for. |
 
 A `Client` belongs to the worker that opened it (it is not `Send`, like everything in giong). Its methods take `&self`, so tasks share one by cloning an `Rc` or by holding a reference, and their statements are pipelined.
 
@@ -133,26 +146,29 @@ Integers convert between the three integer types when the value fits and fail wh
 | `Config` | [E3001](../docs/errors/E3001.md) | The configuration or URL is not valid. |
 | `Connect` | [E3002](../docs/errors/E3002.md) | Name resolution, TCP, TLS, or the connect timeout. Also an unknown database (`3D000`). |
 | `Auth` | [E3003](../docs/errors/E3003.md) | The server refused the credentials, or asked for a method this crate does not support. |
-| `Db` | [E3004](../docs/errors/E3004.md) | The server reported an error for the statement; `error.code()` is the SQLSTATE (`23505` for a unique violation...) and `error.db()` has every field. |
+| `Db` | [E3004](../docs/errors/E3004.md) | The server reported an error for the statement; `error.code()` is the SQLSTATE (`23505` for a unique violation...) and `error.db()` has every field. A `COMMIT` that the server turned into a rollback is `Db` with code `25P02` and no `db()`. |
 | `Type` | [E3005](../docs/errors/E3005.md) | A value could not be converted between Rust and PostgreSQL. The message names the parameter or column and suggests the Rust type to use. |
 | `RowCount` | [E3006](../docs/errors/E3006.md) | `query_one` found no row, or more than one. |
 | `TooLarge` | [E3007](../docs/errors/E3007.md) | The result was larger than `max_result_size`. The connection stays usable. |
-| `Closed` | [E3008](../docs/errors/E3008.md) | The connection is closed. A `Pool` replaces it by itself. |
+| `Closed` | [E3008](../docs/errors/E3008.md) | The connection is closed. A `Pool` replaces it by itself. Also a cancel token whose pooled connection went back to the pool. |
 | `PoolTimeout` | [E3009](../docs/errors/E3009.md) | No pooled connection became free within `wait_timeout`. |
 | `Protocol` | [E3010](../docs/errors/E3010.md) | The server sent something this crate cannot understand. The connection is closed. |
-| `Statement` | [E3011](../docs/errors/E3011.md) | Refused before sending: a transaction statement on the connections a `Pool` shares. Use `pool.get()` and `transaction()`. |
+| `Statement` | [E3011](../docs/errors/E3011.md) | Refused before sending, on the connections a `Pool` shares: a transaction statement, a statement that changes the session (`SET`, `LISTEN`, `PREPARE`, temporary tables...), or `COPY ... FROM STDIN`. Use `pool.get()`. |
 
-An error from the server affects only its own statement: the statements that other tasks pipelined on the same connection get their own results.
+An error from the server affects only its own statement: the statements that other tasks pipelined on the same connection get their own results. Two things close the connection instead, and every statement sent on it after them fails with `ErrorKind::Closed`: `COPY ... FROM STDIN` on a `Client` (COPY is not supported yet; the pool refuses it), and a `batch_execute` that leaves a transaction open on a pool's shared connection.
 
 ## Limits
 
 | Setting | Default | What happens at the limit |
 |---|---|---|
 | `Config::connect_timeout` | 10 s | `ErrorKind::Connect`, "connect timeout". |
-| `Config::statement_timeout` | 30 s | Sent as the session's `statement_timeout`, so the server cancels exactly the statement that ran too long (SQLSTATE `57014`). |
-| `Config::max_result_size` | 64 MiB of row data | `ErrorKind::TooLarge`; the rest of the result is read and thrown away. |
-| `Config::statement_cache_capacity` | 256 per connection | The least recently used statement is closed. 0 prepares and closes every statement each time, for poolers such as PgBouncer in transaction mode. |
-| `Pool::wait_timeout` | 5 s | `ErrorKind::PoolTimeout`. |
+| `Config::statement_timeout` | 30 s | Sent as the session's `statement_timeout`, so the server cancels exactly the statement that ran too long (SQLSTATE `57014`). From 1 ms to `i32::MAX` ms (24.8 days); outside that, connecting fails with `ErrorKind::Config`. `None` sends nothing and leaves the limit to the server or the role. |
+| `Config::max_result_size` | 64 MiB of row data | `ErrorKind::TooLarge`; the rest of the result is read and thrown away. A notice larger than this is skipped; an error message larger than this fails its statement with `TooLarge`. Either way the connection stays usable. |
+| `Config::statement_cache_capacity` | 256 per connection | The least recently used statement is closed. 0 prepares and closes every statement each time. |
+| `Pool::wait_timeout` | 5 s | `ErrorKind::PoolTimeout`. It bounds the wait for a connection; a task that opens a new connection itself waits up to `connect_timeout` instead. |
+| `Pool::idle_timeout` | 10 min | The connection is closed. |
+| `Pool::max_lifetime` | 30 min, less up to 10% | The connection is closed once no statement uses it, and a new one is opened when needed. |
+| Statements on one pooled connection at a time | 1024 | The statement methods use another connection, or wait for room. A `Client` used directly has no such bound: its callers decide how many tasks share it. |
 
 ## Performance
 
@@ -175,10 +191,10 @@ Not measured: a server on another machine (network latency, where pipelining sho
 
 ## Not there yet
 
-`COPY`, `LISTEN`/`NOTIFY`, streaming a result one row at a time (a result is collected in full, up to `max_result_size`), arrays, `numeric`, `uuid`, `date` and the other types not listed above in binary form (read them as strings), channel binding (`SCRAM-SHA-256-PLUS`), several hosts with failover, and SASLprep normalization of non-ASCII passwords. The crate has had no independent security audit.
+`COPY`, `LISTEN`/`NOTIFY`, streaming a result one row at a time (a result is collected in full, up to `max_result_size`), arrays, `numeric`, `uuid`, `date` and the other types not listed above in binary form (read them as strings), channel binding (`SCRAM-SHA-256-PLUS`), client certificates in the URL (`sslcert` and `sslkey` are refused; in code, pass a `rustls::ClientConfig` with the certificate to `TlsConnector::new`), several hosts with failover, running through PgBouncer without `max_prepared_statements`, and SASLprep normalization of non-ASCII passwords. The crate has had one independent review before 1.0, whose findings are fixed, but no security audit.
 
 ## Tests
 
-`cargo test -p giong-postgres`: 40 tests against a real PostgreSQL server that the test binary starts for itself (a throwaway cluster from `initdb`, with users for SCRAM, MD5, clear text and TLS only, listening on a Unix socket, 127.0.0.1 and 127.0.0.2): every supported type in both directions; conversion errors; server errors and their fields; pipelining across tasks, and a failing statement in the middle of a pipeline; the statement cache, its bound, and preparing again after a schema change; the result-size limit; the statement timeout; cancel requests; a query dropped mid-flight; a connection the server terminates; transactions committed, rolled back and dropped; no task or connection left behind after a client is dropped; TLS against the right and the wrong authority and host; each authentication method with the right and the wrong password; a server that answers the TLS request with extra bytes; a clear-text password never sent unencrypted; the connect timeout; and the pool (spreading statements, exclusive use and the rollback on return, even with `BEGIN` still in flight, waiting, and waking when a dropped statement frees the connection, replacing broken connections, connect errors, a slow statement not holding up the others, transaction statements refused on shared connections and a batch that leaves a transaction open). 29 unit tests: the message encoder and parser, SCRAM against the RFC 7677 example, MD5 against RFC 1321, URLs, type conversions, and 42,000 random inputs for the message parser, the URL parser and SCRAM. 7 documentation examples.
+`cargo test -p giong-postgres`: 57 tests against a real PostgreSQL server that the test binary starts for itself (a throwaway cluster from `initdb`, with users for SCRAM, MD5, clear text and TLS only, listening on a Unix socket, 127.0.0.1 and 127.0.0.2): every supported type in both directions; conversion errors; server errors and their fields; pipelining across tasks, and a failing statement in the middle of a pipeline; the statement cache, its bound, statement names an application took, and schema changes under cached statements, in and out of a transaction; notices and errors larger than the result limit; the result-size limit; the statement timeout, and leaving it to the server; cancel requests; a query dropped mid-flight; a connection the server terminates; transactions committed, rolled back and dropped, and a `COMMIT` turned into a rollback; no task or connection left behind after a client is dropped; TLS against the right and the wrong authority and host; each authentication method with the right and the wrong password, and `require_auth`; SCRAM keys derived once and off the worker; a server that answers the TLS request with extra bytes; a clear-text password never sent unencrypted; the connect timeout; and the pool (spreading statements, exclusive use and the rollback on return, even with `BEGIN` still in flight, the session reset on return and no reset for an unused connection, `get()` served in order while shared statements keep every connection busy, waiting, and waking when a dropped statement frees the connection, cancel tokens that stop working on return, idle and old connections closed, at most 1024 statements per connection at a time, replacing broken connections, connect errors, a slow statement not holding up the others, transaction and session statements refused on shared connections and a batch that leaves a transaction open). Two of them run a workload through PgBouncer in transaction mode, with the statement timeout left to the role, when PgBouncer is installed. 40 unit tests: the message encoder and parser, SCRAM against the RFC 7677 example, MD5 against RFC 1321, URLs, type conversions, the statements the pool refuses, 42,000 random inputs for the message parser, the URL parser and SCRAM, and 300 sessions against a fake server answering with mutated replies (also the `session` fuzz target). 8 documentation examples.
 
-The tests find PostgreSQL through `GIONG_PG_BIN`, `/usr/lib/postgresql/*/bin` or `PATH`, and skip when it is not installed, unless `GIONG_PG_REQUIRED=1` (CI sets it). Run as root, they start the server as the `postgres` user. They also pass under ThreadSanitizer and on the fallback io_uring setups (`scripts/check.sh tsan` and `fallback`).
+The tests find PostgreSQL through `GIONG_PG_BIN`, `/usr/lib/postgresql/*/bin` or `PATH`, and skip when it is not installed, unless `GIONG_PG_REQUIRED=1` (CI sets it); PgBouncer likewise through `GIONG_PGBOUNCER_BIN`, `PATH` or `/usr/sbin`, and `GIONG_PGBOUNCER_REQUIRED=1`. Run as root, they start the server as the `postgres` user. They also pass under ThreadSanitizer and on the fallback io_uring setups (`scripts/check.sh tsan` and `fallback`).

@@ -68,7 +68,7 @@ mod row;
 pub mod types;
 
 pub use client::{CancelToken, Client, Transaction};
-pub use config::{Config, Tls};
+pub use config::{AuthMethod, Config, Tls};
 pub use error::{DbError, Error, ErrorKind};
 pub use pool::{Pool, PoolStats, PooledClient};
 pub use row::{Column, Row, RowIndex};

@@ -52,6 +52,7 @@ jobs:
           - { crate: giong-postgres, target: messages }
           - { crate: giong-postgres, target: scram }
           - { crate: giong-postgres, target: url }
+          - { crate: giong-postgres, target: session }
           - { crate: giong-mysql, target: payload }
           - { crate: giong-mysql, target: framing }
           - { crate: giong-mysql, target: rows }

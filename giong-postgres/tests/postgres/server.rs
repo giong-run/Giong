@@ -151,7 +151,7 @@ fn find_bin() -> Option<PathBuf> {
 
 /// PostgreSQL refuses to run as root: when the tests do, the server runs as
 /// the `postgres` user.
-fn run_as() -> Option<(u32, u32)> {
+pub fn run_as() -> Option<(u32, u32)> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         return None;
@@ -163,7 +163,7 @@ fn run_as() -> Option<(u32, u32)> {
     })
 }
 
-fn chown_tree(path: &Path, owner: Option<(u32, u32)>) {
+pub fn chown_tree(path: &Path, owner: Option<(u32, u32)>) {
     let Some((uid, gid)) = owner else { return };
     std::os::unix::fs::chown(path, Some(uid), Some(gid)).unwrap();
     if path.is_dir() {
@@ -187,7 +187,7 @@ extern "C" fn stop_server() {
     }
 }
 
-fn free_port() -> u16 {
+pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
