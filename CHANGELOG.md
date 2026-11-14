@@ -211,6 +211,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   ..." or "a middleware panicked: ...", so `Logger`, `Trace` and `RequestId` see an
   ordinary error response. A header value from the request that makes
   `Response::header` panic (`%0A` in a query parameter) is one such case.
+- **giong-web**: middleware layered on a nested router never saw the requests giong-web
+  answers by itself, so `Cors` on the router nested at `/api` never answered a preflight
+  (browsers then blocked every JSON or authenticated cross-origin call to those routes),
+  and errors under the prefix had no `Access-Control-Allow-Origin`. A CORS preflight now
+  runs through the middleware of the route its `Access-Control-Request-Method` would go
+  to; another automatic `OPTIONS` or a `405`, through those of the first route at the most
+  specific path that matches; a `404`, through those of the router nested at the most
+  specific prefix of the path (the outermost router's elsewhere, as before).
+- **giong-web**: `Allow`, in a `405` and in the automatic answer to `OPTIONS`, named the
+  methods of the most specific matching path only, though the method picks among every
+  path that matches (`DELETE /users/me` goes to `DELETE /users/{id}`). It now lists every
+  method that would route to the URL. The rule is now in the README.
+- **giong-web**, **Breaking**: `Req::param` refuses with `400` (`GIONG-E1205`) a value
+  that once percent-decoded has a `.` or `..` segment (sent as is or as `%2E%2E`/`..%2F`;
+  giong-http does not remove dot segments), a NUL, a `/` in a one-segment parameter, or,
+  for a catch-all, a leading `/`. `/files/{*path}` joined to a directory was a path
+  traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
+  that wants it.
 
 ## [0.4.0] - 2026-11-13
 

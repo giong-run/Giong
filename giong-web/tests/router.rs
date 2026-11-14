@@ -85,6 +85,95 @@ fn a_known_path_with_another_method_is_405_with_allow() {
 }
 
 #[test]
+fn allow_lists_every_method_that_routes_to_the_url() {
+    async fn deleted(req: Req) -> Result<Response, Error> {
+        let id: String = req.param("id")?;
+        Ok(Response::text(format!("deleted {id}")))
+    }
+    // The method picks among the paths that match: DELETE /users/me goes to
+    // /users/{id}, so `Allow` for /users/me names it.
+    let app = Router::new()
+        .get("/users/me", me)
+        .delete("/users/{id}", deleted)
+        .route("PUT", "/{*any}", me)
+        .build(());
+    assert_eq!(body(&call(&app, "DELETE", "/users/me")), "deleted me");
+    let resp = call(&app, "OPTIONS", "/users/me");
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        resp.get_header("allow"),
+        Some("GET, DELETE, PUT, HEAD, OPTIONS")
+    );
+    let resp = call(&app, "POST", "/users/me");
+    assert_eq!(resp.status(), 405);
+    assert_eq!(
+        resp.get_header("allow"),
+        Some("GET, DELETE, PUT, HEAD, OPTIONS")
+    );
+    assert!(
+        body(&resp).contains("allowed: GET, DELETE, PUT, HEAD, OPTIONS"),
+        "{}",
+        body(&resp)
+    );
+    // Only the paths that match count: /users/7 has no GET.
+    let resp = call(&app, "OPTIONS", "/users/7");
+    assert_eq!(resp.get_header("allow"), Some("DELETE, PUT, OPTIONS"));
+}
+
+#[test]
+fn path_parameters_refuse_dot_segments_nul_and_slashes() {
+    async fn raw(req: Req) -> Result<Response, Error> {
+        Ok(Response::text(req.param_raw("name")?.to_string()))
+    }
+    let app = Router::new()
+        .get("/files/{*path}", file)
+        .get("/one/{name}", |req: Req| async move {
+            let name: String = req.param("name")?;
+            Ok(Response::text(name))
+        })
+        .get("/raw/{name}", raw)
+        .build(());
+    for (target, why) in [
+        ("/files/../../etc/passwd", "`..`"),
+        ("/files/..%2F..%2Fetc%2Fpasswd", "`..`"),
+        ("/files/a/%2E%2E/%2E%2E/etc/passwd", "`..`"),
+        ("/files/a/./b", "`.`"),
+        ("/files/x%00y", "NUL"),
+        ("/files//etc/passwd", "starts with `/`"),
+        ("/files/%2Fetc%2Fpasswd", "starts with `/`"),
+        ("/one/..%2F..%2Fsecret", "`/`"),
+        ("/one/a%2Fb", "`/`"),
+        ("/one/..", "`..`"),
+        ("/one/%2e", "`.`"),
+    ] {
+        let resp = call(&app, "GET", target);
+        let text = body(&resp);
+        assert_eq!(resp.status(), 400, "{target}: {text}");
+        assert!(
+            text.contains("\"code\":\"GIONG-E1205\""),
+            "{target}: {text}"
+        );
+        assert!(text.contains(why), "{target}: {text}");
+    }
+    for (target, value) in [
+        ("/files/a/b%20c.txt", "a/b c.txt"),
+        ("/files/.hidden/a..b", ".hidden/a..b"),
+        ("/files/dir/", "dir/"),
+        ("/one/v1.2", "v1.2"),
+        ("/one/...", "..."),
+    ] {
+        let resp = call(&app, "GET", target);
+        assert_eq!(
+            (resp.status(), body(&resp).as_str()),
+            (200, value),
+            "{target}"
+        );
+    }
+    // The value as sent, for the route that wants it.
+    assert_eq!(body(&call(&app, "GET", "/raw/..%2Fx")), "..%2Fx");
+}
+
+#[test]
 fn bad_parameters_are_400_and_name_the_parameter() {
     let app = Router::new().get("/users/{id}", user).build(());
     let resp = call(&app, "GET", "/users/abc");
@@ -235,6 +324,59 @@ fn middleware_run_in_the_order_added_and_nested_ones_only_for_their_routes() {
         .map(|(_, v)| v)
         .collect();
     assert_eq!(marks, ["inner", "outer"]);
+}
+
+#[test]
+fn nested_middleware_see_the_answers_the_router_gives_for_its_paths() {
+    let log = Rc::new(RefCell::new(Vec::new()));
+    let users = Router::new()
+        .get("/{id}", user)
+        .layer(Mark("users", log.clone()));
+    let api = Router::new()
+        .get("/x", me)
+        .nest("/teams/{team}/users", users)
+        .layer(Mark("api", log.clone()));
+    let app = Router::new()
+        .get("/top", me)
+        .nest("/api", api)
+        .layer(Mark("outer", log.clone()))
+        .build(());
+    let seen = |method: &str, target: &str| {
+        log.borrow_mut().clear();
+        let status = call(&app, method, target).status();
+        let ins: Vec<String> = log
+            .borrow()
+            .iter()
+            .filter_map(|l| l.strip_suffix(" in").map(str::to_string))
+            .collect();
+        (status, ins)
+    };
+    // The automatic OPTIONS and 405 of a nested route's path.
+    assert_eq!(
+        seen("OPTIONS", "/api/x"),
+        (204, vec!["outer".into(), "api".into()])
+    );
+    assert_eq!(
+        seen("POST", "/api/x"),
+        (405, vec!["outer".into(), "api".into()])
+    );
+    // A 404 under the prefix a router was nested at, the most specific one.
+    assert_eq!(
+        seen("GET", "/api/nothing"),
+        (404, vec!["outer".into(), "api".into()])
+    );
+    assert_eq!(
+        seen("GET", "/api"),
+        (404, vec!["outer".into(), "api".into()])
+    );
+    assert_eq!(
+        seen("GET", "/api/teams/red/users/7/more"),
+        (404, vec!["outer".into(), "api".into(), "users".into()])
+    );
+    // Elsewhere, only the outermost router's.
+    assert_eq!(seen("GET", "/nothing"), (404, vec!["outer".into()]));
+    assert_eq!(seen("GET", "/apix"), (404, vec!["outer".into()]));
+    assert_eq!(seen("POST", "/top"), (405, vec!["outer".into()]));
 }
 
 #[test]

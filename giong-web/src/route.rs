@@ -6,6 +6,10 @@
 //! catch-all at every segment, and backtracks: `/users/me` beats
 //! `/users/{id}`, and `/users/{id}/posts` still matches `/users/me/posts`
 //! when only the parameter route goes on to `posts`.
+//!
+//! The method picks among the paths that match: the most specific path
+//! with a route for it wins. So the `Allow` of a `405` or of the automatic
+//! answer to `OPTIONS` names the methods of every path that matches.
 
 use crate::percent;
 
@@ -93,10 +97,23 @@ impl Pattern {
         matches!(self.segments.as_slice(), [Segment::Static(s)] if s.is_empty())
     }
 
+    /// Whether the last segment is a catch-all.
+    pub(crate) fn ends_with_catch_all(&self) -> bool {
+        matches!(self.segments.last(), Some(Segment::CatchAll(_)))
+    }
+
     /// `inner` under the prefix `self`. `/` on either side adds nothing:
     /// `/api` with `/` is `/api`, and `/` with `/users` is `/users`.
     pub(crate) fn nest(&self, inner: &Pattern) -> Result<Pattern, String> {
-        let joined = if self.is_root() {
+        let joined = self.join(inner);
+        joined.check_names()?;
+        Ok(joined)
+    }
+
+    /// `inner` under `self`, without checking the parameter names: for the
+    /// prefixes routers are nested at, whose names are never read.
+    pub(crate) fn join(&self, inner: &Pattern) -> Pattern {
+        if self.is_root() {
             inner.clone()
         } else if inner.is_root() {
             self.clone()
@@ -104,9 +121,21 @@ impl Pattern {
             let mut segments = self.segments.clone();
             segments.extend(inner.segments.iter().cloned());
             Pattern { segments }
-        };
-        joined.check_names()?;
-        Ok(joined)
+        }
+    }
+
+    /// Every path under the prefix `self`, itself left out: `/api/{*}` for
+    /// `/api`, `/{*}` for `/`.
+    pub(crate) fn below(&self) -> Pattern {
+        let rest = Segment::CatchAll(String::new());
+        if self.is_root() {
+            return Pattern {
+                segments: vec![rest],
+            };
+        }
+        let mut segments = self.segments.clone();
+        segments.push(rest);
+        Pattern { segments }
     }
 
     /// The pattern with parameter names left out: two routes with the same
@@ -257,10 +286,6 @@ impl Methods {
         }
     }
 
-    fn has(&self, method: &Method) -> bool {
-        self.0.iter().any(|(m, _)| m == method)
-    }
-
     fn insert(&mut self, method: Method, route: usize) -> Result<(), usize> {
         if let Some(&(_, existing)) = self.0.iter().find(|(m, _)| *m == method) {
             return Err(existing);
@@ -268,15 +293,47 @@ impl Methods {
         self.0.push((method, route));
         Ok(())
     }
+}
 
-    /// The `Allow` header: the methods with a route, `HEAD` where `GET` has
-    /// one, and `OPTIONS`, which the router answers itself.
+/// Every path that matched a request no route took, most specific first,
+/// each with its routes: what `405`, the automatic answer to `OPTIONS` and
+/// their `Allow` header are made of.
+#[derive(Debug)]
+pub(crate) struct Allowed<'t>(Vec<&'t Methods>);
+
+impl Allowed<'_> {
+    /// The paths that matched, most specific first, as the routes at each.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &Methods> + '_ {
+        self.0.iter().copied()
+    }
+
+    /// The first route added at the most specific path that matched: its
+    /// middleware answer the request.
+    pub(crate) fn first_route(&self) -> usize {
+        // `lookup` only makes an `Allowed` from at least one path, and a
+        // path is only kept with at least one route.
+        self.0[0].0[0].1
+    }
+
+    /// The `Allow` header: every method that would route to the request's
+    /// path, from the most specific path to the least (the method picks
+    /// among the paths that match, so `DELETE /users/me` may go to
+    /// `/users/{id}`); `HEAD` where `GET` has a route, and `OPTIONS`, which
+    /// the router answers itself.
     pub(crate) fn allow(&self) -> String {
-        let mut out: Vec<&str> = self.0.iter().map(|(m, _)| m.as_str()).collect();
-        if self.has(&Method::Get) && !self.has(&Method::Head) {
+        let mut out: Vec<&str> = Vec::new();
+        for methods in &self.0 {
+            for (m, _) in &methods.0 {
+                if !out.contains(&m.as_str()) {
+                    out.push(m.as_str());
+                }
+            }
+        }
+        if out.contains(&"GET") && !out.contains(&"HEAD") {
             out.push("HEAD");
         }
-        if !self.has(&Method::Options) {
+        if !out.contains(&"OPTIONS") {
             out.push("OPTIONS");
         }
         out.join(", ")
@@ -352,9 +409,9 @@ pub(crate) enum Lookup<'t> {
     /// This route, with the parameters in the captures.
     Found(usize),
     /// `OPTIONS` on a path with routes but no `OPTIONS` route of its own.
-    Options(&'t Methods),
+    Options(Allowed<'t>),
     /// Routes match the path, none for the method.
-    NotAllowed(&'t Methods),
+    NotAllowed(Allowed<'t>),
     NotFound,
 }
 
@@ -387,8 +444,8 @@ impl Table {
     /// Finds the route for `method` and `path`, filling in `caps`.
     ///
     /// The most specific path with a route for the method wins; if no path
-    /// has one, the most specific path that matched decides between `405`
-    /// and the automatic answer to `OPTIONS`.
+    /// has one, the request gets `405` or the automatic answer to
+    /// `OPTIONS`, with every path that matched.
     pub(crate) fn lookup<'t>(
         &'t self,
         method: &Method,
@@ -398,14 +455,18 @@ impl Table {
         if !path.starts_with('/') {
             return Lookup::NotFound;
         }
-        let mut first = None;
-        if let Some(route) = search(&self.root, path, 0, method, caps, &mut first) {
+        // Filled only when a more specific path lacks the method, so the
+        // usual hit does not allocate.
+        let mut matched = Vec::new();
+        if let Some(route) = search(&self.root, path, 0, method, caps, &mut matched) {
             return Lookup::Found(route);
         }
-        match (first, method) {
-            (Some(methods), Method::Options) => Lookup::Options(methods),
-            (Some(methods), _) => Lookup::NotAllowed(methods),
-            (None, _) => Lookup::NotFound,
+        // Without a hit the search tried every path, so `matched` has all
+        // those that match.
+        match (matched.is_empty(), method) {
+            (true, _) => Lookup::NotFound,
+            (false, Method::Options) => Lookup::Options(Allowed(matched)),
+            (false, _) => Lookup::NotAllowed(Allowed(matched)),
         }
     }
 }
@@ -418,10 +479,10 @@ fn search<'t>(
     pos: usize,
     method: &Method,
     caps: &mut Captures,
-    first: &mut Option<&'t Methods>,
+    matched: &mut Vec<&'t Methods>,
 ) -> Option<usize> {
     if pos == path.len() {
-        return check(&node.here, method, first);
+        return check(&node.here, method, matched);
     }
     let start = pos + 1;
     let end = path[start..].find('/').map_or(path.len(), |i| start + i);
@@ -437,14 +498,14 @@ fn search<'t>(
         node.static_child(seg)
     };
     if let Some(child) = child {
-        if let Some(route) = search(child, path, end, method, caps, first) {
+        if let Some(route) = search(child, path, end, method, caps, matched) {
             return Some(route);
         }
     }
     if let Some(child) = &node.param {
         if !seg.is_empty() {
             caps.push(start, end);
-            if let Some(route) = search(child, path, end, method, caps, first) {
+            if let Some(route) = search(child, path, end, method, caps, matched) {
                 return Some(route);
             }
             caps.pop();
@@ -452,7 +513,7 @@ fn search<'t>(
     }
     if start < path.len() && !node.catch_all.is_empty() {
         caps.push(start, path.len());
-        if let Some(route) = check(&node.catch_all, method, first) {
+        if let Some(route) = check(&node.catch_all, method, matched) {
             return Some(route);
         }
         caps.pop();
@@ -460,17 +521,19 @@ fn search<'t>(
     None
 }
 
+/// The route for `method` among the routes of a path that matched, or
+/// `None`, keeping the path in `matched` for the `Allow` header.
 fn check<'t>(
     methods: &'t Methods,
     method: &Method,
-    first: &mut Option<&'t Methods>,
+    matched: &mut Vec<&'t Methods>,
 ) -> Option<usize> {
     if methods.is_empty() {
         return None;
     }
     let found = methods.find(method);
-    if found.is_none() && first.is_none() {
-        *first = Some(methods);
+    if found.is_none() {
+        matched.push(methods);
     }
     found
 }
@@ -605,6 +668,15 @@ mod tests {
         }
         match t.lookup(&Method::Options, "/items", &mut caps) {
             Lookup::Options(m) => assert_eq!(m.allow(), "GET, DELETE, HEAD, OPTIONS"),
+            other => panic!("{other:?}"),
+        }
+        // Every path that matches counts: PUT /users/me has nowhere to go,
+        // but POST /users/me goes to /users/{id}.
+        match t.lookup(&Method::Put, "/users/me", &mut caps) {
+            Lookup::NotAllowed(m) => {
+                assert_eq!(m.allow(), "GET, POST, HEAD, OPTIONS");
+                assert_eq!(m.first_route(), 0);
+            }
             other => panic!("{other:?}"),
         }
         assert!(matches!(

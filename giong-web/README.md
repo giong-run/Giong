@@ -79,7 +79,7 @@ fn main() -> std::io::Result<()> {
 - **Routing that answers what it can for you.** Patterns with parameters (`/users/{id}`) and a catch-all (`/files/{*path}`). A literal segment wins over a parameter and a parameter over a catch-all, with backtracking, so `/users/me` and `/users/{id}` live side by side. `HEAD` is answered by the `GET` route, `OPTIONS` and `405` with `Allow` for every path, and a `404` for `/users/` asks "did you mean /users?" when that route exists.
 - **Errors that explain themselves.** Every error answer is an [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem+json body with a code an agent or a client can match on, and the request id when there is one. The codes giong-web uses itself (`GIONG-E1201` to `GIONG-E1213`) each have a page with the cause and the fix in [docs/errors](../docs/errors/README.md).
 - **Mistakes in the program fail at startup, not on the first request.** Two routes that would answer the same requests, a pattern that is not valid, or middleware settings that cannot work (any origin with credentials) panic with a code and the line that added them.
-- **Middleware is one `async fn`.** They run in the order added, and those of a nested router only for its routes. Included: request ids, JSON-line logs, CORS, gzip and timeouts, and with the `tracing` feature a `tracing` span per request.
+- **Middleware is one `async fn`.** They run in the order added, and those of a nested router only for its routes and the `404`, `405` and preflight answers under its prefix. Included: request ids, JSON-line logs, CORS, gzip and timeouts, and with the `tracing` feature a `tracing` span per request.
 - **Bodies of any size.** The routes of a router with `stream_bodies(max)` read their request body as it arrives; any handler can write its response body as it is produced. See "Streaming".
 - **Tested without a socket.** `App::handle(request)` answers a `Request` built with `Request::from_bytes`, so routes and middleware are tested with plain unit tests.
 - **Per-worker and lock-free.** The app, its state and its middleware live on one worker. A worker that compresses a large body yields to the others' requests every 64 KiB.
@@ -90,14 +90,24 @@ fn main() -> std::io::Result<()> {
 let members = Router::new()
     .get("/", list_members)          // GET /teams/{team}
     .get("/members/{id}", member)    // GET /teams/{team}/members/{id}
-    .layer(RequireAuth);             // only for these two routes
+    .layer(RequireAuth);             // for these routes, and the 404s under /teams/{team}
 let app = Router::new()
     .get("/files/{*path}", file)     // path = "a/b c.txt" for /files/a/b%20c.txt
     .nest("/teams/{team}", members)
     .build(state);
+
+async fn file(req: Req<State>) -> Result<Response, Error> {
+    // Never `..`, `.`, NUL or absolute, so it stays under the root.
+    let path: String = req.param("path")?;
+    let full = req.state().root.join(&path);
+    // ...
+}
 ```
 
 - A path parameter is one segment, percent-decoded; the catch-all takes the rest of the path, at least one character. A pattern has at most 16 parameters.
+- `req.param` refuses (`400`, `GIONG-E1205`) a value that could leave a directory once decoded: a `.` or `..` segment (`/files/../x`, `%2E%2E`, `..%2F`), a NUL (`%00`), a `/` (`%2F`) in a one-segment parameter, or a catch-all value starting with `/`. A route that wants such values reads `req.param_raw(name)`, the value as sent, and checks it itself.
+- **Which route answers.** At each segment a literal beats a parameter and a parameter beats a catch-all. Among the paths that match, the most specific one *with a route for the request's method* answers: with `GET /users/me` and `DELETE /users/{id}`, `DELETE /users/me` goes to `/users/{id}` with `id = "me"`. (Routers such as axum's pick the path first and answer `405`.) So `Allow`, in a `405` and in the automatic answer to `OPTIONS`, lists every method that would route to the URL, from every path that matches. To keep a literal path to its own methods, give it routes for the others.
+- Middleware layered on a nested router run for its routes, and for what giong-web answers by itself for its paths: the automatic `OPTIONS` (CORS preflights included, through the middleware of the route the preflight asks about) and the `405` for a path of one of its routes, and the `404` for a path under its prefix. So `Cors` can be layered on the router nested at `/api`.
 - `/users` and `/users/` are different paths. giong-web does not redirect from one to the other; its `404` names the one that exists.
 - `req.route()` gives the pattern that matched (`/teams/{team}/members/{id}`), for logs and metrics.
 - `Router::route(method, pattern, handler)` takes any method; `get`, `post`, `put`, `patch` and `delete` are shortcuts.
@@ -150,7 +160,7 @@ impl<S: 'static> Middleware<S> for RequireAuth {
 |---|---|---|
 | `RequestId::new()` | gives every request an id (`req.request_id()`) and sends it back in `X-Request-Id` | ids made here; an incoming one is used only with `.trust_incoming(true)` |
 | `Logger::new(Sink::Stdout)` | one JSON line per request: time, method, path, route, status, duration, bytes, request id, peer, worker, and for errors the code, detail and cause | query strings left out (`.include_query(true)`); written by a background thread, never on the worker |
-| `Cors::new()` | answers preflights and adds `Access-Control-Allow-*` for the origins named | no origin allowed until named with `.allow_origin(..)`; methods `GET`, `HEAD`, `POST`; no extra headers |
+| `Cors::new()` | answers preflights and adds `Access-Control-Allow-*` for the origins named; on the outermost router or a nested one, before any credentials check (preflights carry none) | no origin allowed until named with `.allow_origin(..)`; methods `GET`, `HEAD`, `POST`; no extra headers |
 | `Compression::new()` | gzip for clients that accept it | level 1, bodies from 1 KiB to 16 MiB; text, JSON, JavaScript, XML (SVG too) and WebAssembly |
 | `Timeout::new(d)` | answers `503` (`GIONG-E1209`) when the handler takes longer than `d` | not for routes that stream their request body |
 | `Trace::new()` (feature `tracing`) | runs each request in a `tracing` span with OpenTelemetry's field names (`http.request.method`, `url.path`, `http.route`, `http.response.status_code`, `client.address`) plus `request_id` and `worker`, ended by one event; a `5xx` at `ERROR` with its code and cause | instead of `Logger`, or beside it |
@@ -169,12 +179,14 @@ The log thread batches lines every 10 ms. When it falls behind by more than 1 Mi
 use giong_web::{Body, Error, Req, Response, Router};
 
 async fn upload(req: Req) -> Result<Response, Error> {
+    // Checked by `param`: no `..` or `.` segment, no NUL, not absolute.
+    let name: String = req.param("path")?;
     let body = req.body_stream().expect("a streaming route");
     let mut total = 0;
     while let Some(piece) = body.chunk().await? {
-        total += piece.len(); // write it to a file, hash it, ...
+        total += piece.len(); // write it under the uploads directory, hash it, ...
     }
-    Ok(Response::text(format!("{total} bytes")))
+    Ok(Response::text(format!("{name}: {total} bytes")))
 }
 
 async fn events(_req: Req) -> Result<Response, Error> {

@@ -309,6 +309,87 @@ fn cors_marks_responses_for_allowed_origins() {
     assert!(resp.get_header("vary").is_none());
 }
 
+#[test]
+fn cors_on_a_nested_router_answers_its_preflights_and_errors() {
+    let api = Router::new()
+        .get("/items", ok)
+        .post("/items", ok)
+        .delete("/items/{id}", ok)
+        .layer(
+            Cors::new()
+                .allow_origin("https://app.example.com")
+                .allow_methods(&["GET", "POST", "DELETE"])
+                .allow_headers(&["content-type"]),
+        );
+    let app = Router::new()
+        .get("/health", ok)
+        .nest("/api", api)
+        .layer(RequestId::new())
+        .build(());
+    let origin = "Origin: https://app.example.com\r\n";
+
+    let resp = send(
+        &app,
+        &format!(
+            "OPTIONS /api/items HTTP/1.1\r\nHost: t\r\n{origin}\
+             Access-Control-Request-Method: POST\r\n\
+             Access-Control-Request-Headers: content-type\r\n\r\n"
+        ),
+    );
+    assert_eq!(resp.status(), 204);
+    assert_eq!(
+        resp.get_header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+    assert_eq!(
+        resp.get_header("access-control-allow-methods"),
+        Some("GET, POST, DELETE")
+    );
+    assert_eq!(
+        resp.get_header("access-control-allow-headers"),
+        Some("content-type")
+    );
+    assert!(resp.get_header("x-request-id").is_some());
+
+    // A preflight for a path whose route has a parameter.
+    let resp = send(
+        &app,
+        &format!(
+            "OPTIONS /api/items/7 HTTP/1.1\r\nHost: t\r\n{origin}\
+             Access-Control-Request-Method: DELETE\r\n\r\n"
+        ),
+    );
+    assert_eq!(resp.status(), 204);
+    assert!(resp.get_header("access-control-allow-methods").is_some());
+
+    // Errors under the prefix carry the header too, so the page can read them.
+    for (method, target, status) in [("GET", "/api/nothing", 404), ("PUT", "/api/items", 405)] {
+        let resp = send(
+            &app,
+            &format!("{method} {target} HTTP/1.1\r\nHost: t\r\n{origin}\r\n"),
+        );
+        assert_eq!(resp.status(), status, "{method} {target}");
+        assert_eq!(
+            resp.get_header("access-control-allow-origin"),
+            Some("https://app.example.com"),
+            "{method} {target}"
+        );
+    }
+
+    // Outside the prefix, the nested Cors does not run.
+    let resp = get(&app, "/health", origin);
+    assert!(resp.get_header("access-control-allow-origin").is_none());
+    let resp = send(
+        &app,
+        &format!(
+            "OPTIONS /health HTTP/1.1\r\nHost: t\r\n{origin}\
+             Access-Control-Request-Method: GET\r\n\r\n"
+        ),
+    );
+    assert_eq!(resp.status(), 204);
+    assert!(resp.get_header("access-control-allow-methods").is_none());
+}
+
 fn panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> String {
     let err = std::panic::catch_unwind(f).unwrap_err();
     err.downcast_ref::<String>().cloned().unwrap_or_default()
