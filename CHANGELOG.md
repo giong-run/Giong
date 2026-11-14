@@ -655,6 +655,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   is never reachable with looser permissions and never replaces a live socket. Stopping
   removes only the socket this server created, not one a later process bound at the same
   path.
+- **giong-mcp**: on Linux 6.0.19 a server asked for a TCP address that was in use started
+  anyway, on a free port of every interface: that kernel's `bind` returns 1 instead of an
+  error and leaves the socket unbound, which the standard library and socket2 both read
+  as success, and listening then picks a port on `0.0.0.0`. The server now checks that it
+  listens where it was asked and otherwise fails with `GIONG-E1303`. Found by the 6.0.19
+  job in CI; later kernels return the error.
 
 ### Security
 

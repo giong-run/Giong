@@ -497,8 +497,9 @@ impl Listen {
             Listen::Tcp(addr) => {
                 let listener =
                     TcpListener::bind(addr).map_err(|e| bind_error(e, &addr.to_string()))?;
-                let addr = listener.local_addr()?;
-                Ok((Listener::Tcp(listener), Bound::Tcp(addr)))
+                let bound = listener.local_addr()?;
+                bound_where_asked(addr, bound).map_err(|e| bind_error(e, &addr.to_string()))?;
+                Ok((Listener::Tcp(listener), Bound::Tcp(bound)))
             }
             Listen::Unix(path) => {
                 let (listener, id) = bind_unix(&path)
@@ -507,6 +508,25 @@ impl Listen {
             }
         }
     }
+}
+
+/// Refuses a listener that is not on the address it was asked for.
+///
+/// Linux 6.0.19 answers `bind` to an address in use with success and leaves
+/// the socket unbound; listening then gives it a free port on every
+/// interface. Without this check the server would start there, reachable
+/// from other machines, instead of failing.
+fn bound_where_asked(asked: SocketAddr, bound: SocketAddr) -> io::Result<()> {
+    if bound.ip() == asked.ip() && (asked.port() == 0 || bound.port() == asked.port()) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!(
+            "the kernel reported no error but left the socket on {bound}, as Linux 6.0.19 \
+             does when the address is in use"
+        ),
+    ))
 }
 
 fn bind_error(e: io::Error, addr: &str) -> io::Error {
@@ -753,6 +773,25 @@ mod tests {
             let err = check_token(bad).unwrap_err();
             assert_eq!(giong::error::code(&err), Some(Code::McpBadToken), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_listener_elsewhere_than_asked_is_refused() {
+        let asked: SocketAddr = "127.0.0.1:7777".parse().unwrap();
+        assert!(bound_where_asked(asked, asked).is_ok());
+        let any_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert!(bound_where_asked(any_port, asked).is_ok());
+        // What Linux 6.0.19 leaves after a `bind` to a busy address.
+        for bound in ["0.0.0.0:40199", "127.0.0.1:7778", "0.0.0.0:7777"] {
+            let err = bound_where_asked(asked, bound.parse().unwrap()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+            let err = bind_error(err, "127.0.0.1:7777");
+            assert_eq!(giong::error::code(&err), Some(Code::McpBind));
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+            assert!(err.to_string().contains(bound), "{err}");
+        }
+        let wildcard: SocketAddr = "0.0.0.0:41000".parse().unwrap();
+        assert!(bound_where_asked(any_port, wildcard).is_err());
     }
 
     #[test]
