@@ -265,6 +265,16 @@ codes! {
     McpNotLocal = 1301, PermissionDenied, "the MCP server listens on this machine only";
     /// The address given to the MCP server, or `GIONG_MCP`, is not one.
     McpBadAddress = 1302, InvalidInput, "invalid address for the MCP server";
+    /// The MCP server cannot listen on its address: another process holds
+    /// it, or the kernel refused it. The kernel's error kind (such as
+    /// `AddrInUse`) is kept.
+    McpBind = 1303, AddrInUse, "the MCP server cannot listen on its address";
+    /// The MCP server was asked to listen on TCP without a token, which
+    /// would let every local process read the service's internals.
+    McpNoToken = 1304, PermissionDenied, "the MCP server needs a token on TCP";
+    /// The token given to the MCP server is empty, too short, or has
+    /// characters a bearer token cannot carry.
+    McpBadToken = 1305, InvalidInput, "invalid token for the MCP server";
 
     // ------------------------------------------------------ giong-compat
     /// A write that giong-compat's `Compat` had buffered failed earlier, so

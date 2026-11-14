@@ -93,11 +93,12 @@ python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the 
 Continuous integration requires five checks on every pull request: `lint` (fmt, clippy,
 doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
 CI also runs `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
-profile (`docker`) and the database crates against other server
-versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
-`giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, each in its `fuzz/`) and runs
-the soak test every night, on the runner's kernel and on Linux 6.18 in QEMU; the 6.12 and
-6.18 `kernels` jobs soak for a minute on every pull request.
+profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
+against other server versions (`servers`) on every pull request, and fuzzes the parsers
+(`giong-http`, `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, `giong-mcp`,
+each in its `fuzz/`) and runs the soak test every night, on the runner's kernel and on
+Linux 6.18 in QEMU; the 6.12 and 6.18 `kernels` jobs soak for a minute on every pull
+request.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the

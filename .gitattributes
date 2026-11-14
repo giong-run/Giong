@@ -25,3 +25,4 @@ bench/** linguist-vendored=true
 # Fuzzing inputs are raw bytes (CRLF included).
 giong-http/fuzz/seeds/** binary
 giong-web/fuzz/seeds/** binary
+giong-mcp/fuzz/seeds/** binary

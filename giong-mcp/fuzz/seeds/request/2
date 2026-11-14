@@ -1,0 +1,8 @@
+POST /mcp HTTP/1.1
+Host: 127.0.0.1:7777
+Content-Type: application/json
+Authorization: Bearer fuzz-token-0123456789
+MCP-Protocol-Version: 2025-06-18
+Content-Length: 90
+
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"overview","arguments":{}}}
