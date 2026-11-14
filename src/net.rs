@@ -780,26 +780,39 @@ impl TcpStream {
 
     /// Reads into `buf` (from its start, up to its capacity) with a one-off
     /// receive, returning the buffer with its length set to the bytes read.
-    /// `Ok(0)` means the peer closed the connection.
+    /// `Ok(0)` means the peer closed the connection, or that `buf` has no
+    /// capacity (`Vec::new()`), as in the standard library: give it room
+    /// with `Vec::with_capacity`.
     ///
     /// Prefer [`recv`](Self::recv) for servers. The two must not be mixed on
     /// one stream: once `recv` has been used, `read` fails with `InvalidInput`.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost. [`recv`](Self::recv) is.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.read(buf).await
     }
 
     /// Writes some bytes of `buf`, returning how many were written.
+    ///
+    /// Not cancel safe: if the future is dropped, some bytes may have been
+    /// sent without the caller learning how many.
     pub async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.write(buf).await
     }
 
     /// Writes all of `buf`. The buffer is handed back so it can be reused.
+    ///
+    /// Not cancel safe: if the future is dropped, part of the data may have
+    /// been sent.
     pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
         self.inner.write_all(buf).await
     }
 
     /// Writes some bytes of `bufs`, taken as one sequence, with one system
     /// call, returning how many were written.
+    ///
+    /// Not cancel safe, like [`write`](Self::write).
     pub async fn write_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<usize>, Vec<B>) {
         self.inner.write_vectored(bufs).await
     }

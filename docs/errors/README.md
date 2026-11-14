@@ -62,6 +62,7 @@ when it is no longer raised.
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
 | [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
 | [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
+| [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
 
 ## giong-http
 

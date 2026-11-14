@@ -160,21 +160,39 @@ impl OpenOptions {
     }
 
     fn flags(&self) -> io::Result<i32> {
-        let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
         let access = match (self.read, self.write, self.append) {
             (true, false, false) => libc::O_RDONLY,
             (false, true, false) => libc::O_WRONLY,
             (true, true, false) => libc::O_RDWR,
             (false, _, true) => libc::O_WRONLY | libc::O_APPEND,
             (true, _, true) => libc::O_RDWR | libc::O_APPEND,
-            (false, false, false) => return Err(invalid()),
+            (false, false, false) => {
+                return Err(invalid_options(
+                    "the open options ask for neither read, write nor append access",
+                    "add .read(true), .write(true) or .append(true)",
+                ))
+            }
         };
         let writable = self.write || self.append;
         if !writable && (self.truncate || self.create || self.create_new) {
-            return Err(invalid());
+            let what = if self.truncate {
+                "truncate"
+            } else if self.create_new {
+                "create_new"
+            } else {
+                "create"
+            };
+            return Err(invalid_options(
+                format!("the open options ask for {what} without write access"),
+                format!("add .write(true) (or .append(true)), or remove .{what}(true)"),
+            ));
         }
         if self.append && self.truncate && !self.create_new {
-            return Err(invalid());
+            return Err(invalid_options(
+                "the open options ask for both append and truncate",
+                "to empty the file and then append, open it with .write(true).truncate(true) \
+                 and write in order; to keep what it has, remove .truncate(true)",
+            ));
         }
         let creation = match (self.create, self.truncate, self.create_new) {
             (_, _, true) => libc::O_CREAT | libc::O_EXCL,
@@ -213,6 +231,14 @@ impl Default for OpenOptions {
 /// "the file's current position", so without this check such an offset would
 /// read or write wherever the descriptor's position happens to be on
 /// io_uring, and fail with `EINVAL` on epoll.
+#[cold]
+fn invalid_options(
+    message: impl Into<std::borrow::Cow<'static, str>>,
+    fix: impl Into<std::borrow::Cow<'static, str>>,
+) -> io::Error {
+    raise(Code::InvalidOpenOptions, message, fix)
+}
+
 fn check_offset(offset: u64) -> io::Result<()> {
     if offset > i64::MAX as u64 {
         return Err(offset_out_of_range(offset));
@@ -381,9 +407,31 @@ impl File {
     /// space. A shorter file grows to `offset + len`, and the new bytes read
     /// as zeros; data already in the file is not touched.
     ///
+    /// A `len` of 0 does nothing (`fallocate` itself would refuse it). A
+    /// range that ends above `i64::MAX` is refused with
+    /// [`OffsetOutOfRange`](crate::error::Code::OffsetOutOfRange).
+    ///
     /// Fails with `Unsupported` on a filesystem without `fallocate` (some
     /// network filesystems).
     pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > i64::MAX as u64)
+        {
+            return Err(raise(
+                Code::OffsetOutOfRange,
+                format!(
+                    "the {len} bytes at file offset {offset} end above {}, the largest offset \
+                     Linux has",
+                    i64::MAX
+                ),
+                "check the arithmetic that computed the offset and the length for a \
+                 wrap-around",
+            ));
+        }
         let io = Io::Fallocate {
             fd: self.fd,
             offset,

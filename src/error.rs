@@ -171,8 +171,13 @@ codes! {
     /// A file offset above `i64::MAX`, the largest Linux has, was passed to
     /// [`File::read_at`](crate::fs::File::read_at) or
     /// [`File::write_at`](crate::fs::File::write_at) and the other methods
-    /// that take one.
+    /// that take one, or a range that ends above it to
+    /// [`File::allocate`](crate::fs::File::allocate).
     OffsetOutOfRange = 202, InvalidInput, "file offset out of range";
+    /// [`OpenOptions`](crate::fs::OpenOptions) were given a combination
+    /// `open(2)` cannot do: no access mode, `truncate` or `create` without
+    /// `write`, or `append` with `truncate`. Nothing was opened.
+    InvalidOpenOptions = 203, InvalidInput, "invalid combination of open options";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not

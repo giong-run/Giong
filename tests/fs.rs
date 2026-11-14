@@ -239,19 +239,83 @@ fn open_options_behave_like_the_standard_library() {
             .unwrap();
         assert_eq!(file.metadata().await.unwrap().mode() & 0o777, 0o600);
 
-        // Combinations that make no sense are refused before any I/O.
-        for options in [
-            OpenOptions::new(),
-            OpenOptions::new().read(true).truncate(true),
-            OpenOptions::new().read(true).create(true),
-            OpenOptions::new().append(true).truncate(true),
-        ] {
-            let err = options.open(&path).await.unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{options:?}");
-        }
         let err = File::open("nul\0byte").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
     });
+}
+
+#[test]
+fn invalid_open_options_are_coded_errors() {
+    // They used to fail with a bare EINVAL that did not say which option
+    // was wrong.
+    let dir = TempDir::new("bad-options");
+    let path = dir.path("f");
+    std::fs::write(&path, b"keep").unwrap();
+    giong::block_on(async {
+        for (options, says) in [
+            (OpenOptions::new(), "neither read, write nor append"),
+            (
+                OpenOptions::new().read(true).truncate(true),
+                "truncate without write",
+            ),
+            (
+                OpenOptions::new().read(true).create(true),
+                "create without write",
+            ),
+            (
+                OpenOptions::new().read(true).create_new(true),
+                "create_new without write",
+            ),
+            (
+                OpenOptions::new().append(true).truncate(true),
+                "both append and truncate",
+            ),
+        ] {
+            let err = options.open(&path).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput, "{options:?}");
+            assert_eq!(
+                giong::error::code(&err),
+                Some(giong::error::Code::InvalidOpenOptions),
+                "{options:?}: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(says), "{options:?}: {message}");
+            assert!(message.contains("Fix: "), "{options:?}: {message}");
+        }
+        // The same options with what they lacked are fine.
+        let file = OpenOptions::new().read(true).write(true).truncate(true);
+        drop(file.open(&path).await.unwrap());
+        let options = OpenOptions::new()
+            .append(true)
+            .truncate(true)
+            .create_new(true);
+        let err = options.open(&path).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    });
+}
+
+#[test]
+fn allocating_nothing_does_nothing() {
+    let dir = TempDir::new("allocate-nothing");
+    let path = dir.path("f");
+    std::fs::write(&path, b"0123").unwrap();
+    giong::block_on(async {
+        let file = OpenOptions::new().write(true).open(&path).await.unwrap();
+        // fallocate(2) refuses a length of 0 with a bare EINVAL.
+        file.allocate(0, 0).await.unwrap();
+        file.allocate(1 << 20, 0).await.unwrap();
+        assert_eq!(file.len().unwrap(), 4);
+        // A range that ends past the largest offset Linux has.
+        for (offset, len) in [(i64::MAX as u64, 1), (u64::MAX, 1), (1, u64::MAX)] {
+            let err = file.allocate(offset, len).await.unwrap_err();
+            assert_eq!(
+                giong::error::code(&err),
+                Some(giong::error::Code::OffsetOutOfRange),
+                "allocate({offset}, {len}): {err}"
+            );
+        }
+    });
+    assert_eq!(std::fs::read(&path).unwrap(), b"0123");
 }
 
 #[test]
@@ -832,9 +896,9 @@ fn allocate_reserves_space_without_touching_data() {
         file.allocate(2 << 20, 4096).await.unwrap();
         assert_eq!(file.len().unwrap(), (2 << 20) + 4096);
 
-        // The kernel's own errors come back as they are.
-        let err = file.allocate(0, 0).await.unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        // The kernel's own errors come back as they are. (A length of 0,
+        // which fallocate refuses with EINVAL, does nothing: see
+        // allocating_nothing_does_nothing.)
         let read_only = File::open(&path).await.unwrap();
         let err = read_only.allocate(0, 1).await.unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));

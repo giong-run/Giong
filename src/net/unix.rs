@@ -132,16 +132,25 @@ impl UnixStream {
     /// Reads into `buf` with a one-off receive; see
     /// [`TcpStream::read`](super::TcpStream::read). Must not be mixed with
     /// [`recv`](Self::recv) on one stream.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost. [`recv`](Self::recv) is.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.read(buf).await
     }
 
     /// Writes some bytes of `buf`, returning how many were written.
+    ///
+    /// Not cancel safe: if the future is dropped, some bytes may have been
+    /// sent without the caller learning how many.
     pub async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.write(buf).await
     }
 
     /// Writes all of `buf`. The buffer is handed back so it can be reused.
+    ///
+    /// Not cancel safe: if the future is dropped, part of the data may have
+    /// been sent.
     pub async fn write_all<B: IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
         self.inner.write_all(buf).await
     }
