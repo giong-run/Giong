@@ -25,6 +25,7 @@ mod epoll;
 mod uring;
 
 use std::any::Any;
+use std::cell::Cell;
 use std::io;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -141,6 +142,18 @@ pub enum IoUringFeature {
     /// descriptor, which spares the kernel looking the descriptor up on
     /// every `io_uring_enter`.
     RegisteredRing,
+    /// Large sends on TCP sockets from bytes that cannot change
+    /// (`&'static [u8]`, `Rc<[u8]>`, `Arc<[u8]>`) go out without a copy into
+    /// the kernel (`IORING_OP_SEND_ZC` and `IORING_OP_SENDMSG_ZC`, Linux
+    /// 6.2): the network card reads them, and the write returns as soon as
+    /// they are queued, as a copying send does. A vectored write may add up
+    /// to 4 KiB from other buffers (an HTTP head), which are copied aside.
+    /// Used for sends from 16 KiB on; a socket whose data the kernel copies
+    /// anyway (loopback, a card without scatter-gather) or cannot send this
+    /// way (kTLS) goes back to plain sends. Bytes that can change once the
+    /// write returns (a `Vec`) are always copied: the kernel reads
+    /// zero-copy bytes until the peer has acknowledged them.
+    ZeroCopySend,
 }
 
 impl IoUringFeature {
@@ -149,6 +162,7 @@ impl IoUringFeature {
     pub const ALL: &'static [IoUringFeature] = &[
         IoUringFeature::PackedBuffers,
         IoUringFeature::RegisteredRing,
+        IoUringFeature::ZeroCopySend,
     ];
 
     /// A stable short name, such as `"packed-buffers"`.
@@ -156,6 +170,7 @@ impl IoUringFeature {
         match self {
             IoUringFeature::PackedBuffers => "packed-buffers",
             IoUringFeature::RegisteredRing => "registered-ring",
+            IoUringFeature::ZeroCopySend => "zero-copy-send",
         }
     }
 }
@@ -178,6 +193,37 @@ pub(crate) fn feature_enabled(feature: IoUringFeature) -> bool {
             .any(|name| name == "all" || name == feature.name()),
     }
 }
+
+/// Sends of at least this many bytes go out without a copy where
+/// [`IoUringFeature::ZeroCopySend`] is in use. Below it, copying the data is
+/// cheaper than pinning its pages and waiting for the kernel to let go of
+/// them. `GIONG_ZERO_COPY_MIN` (bytes) changes it for benchmarks.
+const ZERO_COPY_MIN: usize = 16 * 1024;
+
+/// [`ZERO_COPY_MIN`], or `GIONG_ZERO_COPY_MIN` where it is set.
+pub(crate) fn zero_copy_min() -> usize {
+    std::env::var("GIONG_ZERO_COPY_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(ZERO_COPY_MIN)
+}
+
+/// What the kernel may still read after a zero-copy send has its result:
+/// owners that keep the bytes alive and unchanged, and the bytes it was
+/// cheaper to copy than to wait for. The driver keeps it until the send's
+/// notification, then sets `copied` if the kernel copied the data after all
+/// (as over loopback), so the socket stops asking.
+#[allow(dead_code)] // `owners` and `scratch` are only kept, never read.
+pub(crate) struct ZeroCopyHold {
+    pub(crate) owners: Vec<Box<dyn Any>>,
+    pub(crate) scratch: Vec<u8>,
+    pub(crate) copied: Rc<Cell<bool>>,
+}
+
+/// Set by the io_uring driver in the flags of a zero-copy send whose data
+/// the kernel copied after all (`IORING_NOTIF_USAGE_ZC_COPIED`). Bit 31 of a
+/// CQE's flags is part of the buffer id, which sends never have.
+pub(crate) const ZC_COPIED: u32 = 1 << 31;
 
 /// Which I/O driver a worker runs on, who chose it, and why io_uring is not
 /// used when giong fell back to epoll. Read it with
@@ -302,22 +348,30 @@ pub(crate) enum Io {
     },
     /// A one-off receive on a socket into the caller's buffer.
     Recv { fd: RawFd, buf: *mut u8, len: u32 },
-    /// `send(2)`.
+    /// `send(2)`. With `zero_copy` the io_uring driver sends without a copy
+    /// where it can ([`IoUringFeature::ZeroCopySend`]). The kernel then
+    /// reads the buffer until a notification that comes once the peer has
+    /// acknowledged the data: an `Op` with a [`ZeroCopyHold`] completes with
+    /// the result and leaves the hold with the driver until then; one
+    /// without completes only at the notification, with [`ZC_COPIED`] in
+    /// its flags if the kernel copied the data after all.
     Send {
         fd: RawFd,
         buf: *const u8,
         len: u32,
         flags: i32,
+        zero_copy: bool,
     },
     /// Waits until a socket can take more data (`POLLOUT`), for a caller
     /// that writes to it itself and got `EAGAIN`. Completes with a
     /// non-negative value when the caller should try again.
     Writable { fd: RawFd },
-    /// `sendmsg(2)`.
+    /// `sendmsg(2)`; `zero_copy` as for [`Io::Send`].
     SendMsg {
         fd: RawFd,
         msg: *const libc::msghdr,
         flags: u32,
+        zero_copy: bool,
     },
     /// A one-off `recvmsg(2)`.
     RecvMsg { fd: RawFd, msg: *mut libc::msghdr },
@@ -524,9 +578,16 @@ impl Driver {
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
-    pub(crate) fn poll_op(&mut self, key: usize, waker: &Waker) -> Poll<(i32, u32)> {
+    /// A zero-copy send with a `hold` ([`ZeroCopyHold`]) is done once it has
+    /// its result; the driver then takes the hold.
+    pub(crate) fn poll_op(
+        &mut self,
+        key: usize,
+        waker: &Waker,
+        hold: &mut Option<Box<dyn Any>>,
+    ) -> Poll<(i32, u32)> {
         match self {
-            Driver::Uring(d) => d.poll_op(key, waker),
+            Driver::Uring(d) => d.poll_op(key, waker, hold),
             Driver::Epoll(d) => d.poll_op(key, waker),
         }
     }
@@ -607,6 +668,16 @@ impl Driver {
         match self {
             Driver::Uring(d) => d.ensure_recv_buffer(datagram),
             Driver::Epoll(d) => d.pool().ensure_published(None),
+        }
+    }
+
+    /// The smallest send that goes out without a copy, or `None` where
+    /// sends are always copied (epoll, or io_uring without
+    /// [`IoUringFeature::ZeroCopySend`]).
+    pub(crate) fn zero_copy_min(&self) -> Option<usize> {
+        match self {
+            Driver::Uring(d) => d.zero_copy_min(),
+            Driver::Epoll(_) => None,
         }
     }
 
