@@ -107,6 +107,9 @@ when it is no longer raised.
 |---|---|---|
 | [GIONG-E1301](E1301.md) | `McpNotLocal` | the MCP server listens on this machine only |
 | [GIONG-E1302](E1302.md) | `McpBadAddress` | invalid address for the MCP server |
+| [GIONG-E1303](E1303.md) | `McpBind` | the MCP server cannot listen on its address |
+| [GIONG-E1304](E1304.md) | `McpNoToken` | the MCP server needs a token on TCP |
+| [GIONG-E1305](E1305.md) | `McpBadToken` | invalid token for the MCP server |
 
 ## giong-compat
 

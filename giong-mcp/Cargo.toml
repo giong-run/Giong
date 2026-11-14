@@ -10,6 +10,7 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong-mcp"
 keywords = ["mcp", "observability", "diagnostics", "agent", "thread-per-core"]
 categories = ["development-tools::debugging", "asynchronous", "network-programming"]
+exclude = ["fuzz/"]
 
 [dependencies]
 giong = { path = "..", version = "0.4.0" }
@@ -20,3 +21,8 @@ serde_json = "1"
 
 [dev-dependencies]
 giong-http = { path = "../giong-http", version = "0.4.0", features = ["client"] }
+
+[lints.rust]
+# `fuzzing` is set by `cargo fuzz` (see fuzz/), `giong_tsan` by the
+# ThreadSanitizer builds in `scripts/check.sh`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(giong_tsan)'] }

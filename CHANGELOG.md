@@ -10,6 +10,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **giong-mcp**: `Config::allow_unauthenticated()`, the explicit way to serve TCP without a
+  token; `McpServer::unix_path()`; the `FromEnv` that `start_from_env` returns; error codes
+  `GIONG-E1303` (`McpBind`: the address cannot be listened on, with the address and
+  `GIONG_MCP` in the message; the kernel's error kind is kept), `GIONG-E1304`
+  (`McpNoToken`) and `GIONG-E1305` (`McpBadToken`). Each tool declares the shape of its
+  answer as an `outputSchema`, and the README states that this JSON follows the crate's
+  semver from 1.0. A cargo-fuzz target, `request`, sends any bytes through the server's
+  checks and JSON-RPC dispatch, in CI with the other targets.
+
 - **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
   the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
   `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
@@ -139,6 +148,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-mcp** (breaking): a TCP server needs a token. Any local process can connect to a
+  loopback port, whichever user runs it, so `Config::tcp` without `token` fails to start
+  with `GIONG-E1304` unless the code calls `allow_unauthenticated()`; a Unix socket needs
+  none. A token must be at least 16 characters a bearer token can carry: `token("")`, or
+  `GIONG_MCP_TOKEN` set but empty, is refused with `GIONG-E1305` instead of quietly
+  turning authentication off. The `Bearer` scheme name is matched in any case
+  (RFC 9110).
+- **giong-mcp** (breaking): `start_from_env` returns `FromEnv` instead of
+  `io::Result<Option<McpServer>>`, and never stops the service: a busy port or a bad
+  `GIONG_MCP` is written to stderr and kept in the value, and the service runs without the
+  endpoint. `FromEnv` and `McpServer` are `#[must_use]`, so `start_from_env(&h);`, which
+  used to print "listening" and stop the server at once, is a warning, and
+  `start_from_env(&h)?;` no longer compiles. Remove the `?`.
+- **giong-mcp**: a tool's text copy is compact JSON instead of pretty-printed (34% fewer
+  bytes for `overview`, 42% for `workers` at four workers), and `profile` is no longer
+  annotated `readOnlyHint`, since it makes every worker time its polls while it runs.
+  `Config::snapshot_timeout` is at most 10 s.
+
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
   registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
   the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
@@ -163,6 +190,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
 
 ### Fixed
+
+- **giong-mcp**: "over the last second" figures (`busy`, `polls_per_s`, ...) covered as
+  little as 2 ms after an agent called `overview` about a dozen times in a row, since the
+  calls' samples pushed the sampler's out of a history kept by count; it is kept by time
+  now, and rates need 100 ms of history. A panicking registered source is reported as
+  such, with its message, instead of as a stopped worker. Integer arguments sent as `2.0`
+  are accepted, as JSON Schema allows. A message with a non-string `method`, or with an
+  `id` and neither `method` nor `result`/`error`, gets `-32600` instead of a silent `202`.
+- **giong-mcp**: a Unix socket is created with mode `0600` whatever the umask (it was
+  `0775` under `umask 002`), bound under a temporary name and linked into place so that it
+  is never reachable with looser permissions and never replaces a live socket. Stopping
+  removes only the socket this server created, not one a later process bound at the same
+  path.
 
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
@@ -203,6 +243,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+
+### Security
+
+- **giong-mcp**: any local client could make the service's process run out of memory: one
+  254 KiB `POST` holding a JSON-RPC batch of 3,275 `workers` calls was answered with
+  14 MB built in memory, and 24 such connections took a 4-worker service from 4 MB to
+  2 GB of resident memory (1.9 GB still held afterwards). Now the server speaks HTTP/1.1
+  only (an HTTP/2 connection could carry a hundred requests at once) on at most 16
+  connections, bodies hold at most 64 KiB, batches at most 16 messages and only for
+  clients of MCP 2025-03-26 (later versions removed them), and an answer is at most
+  4 MiB, past which the agent is told to ask for less. 64 such connections leave the
+  service under 8 MB.
 
 ## [0.4.0] - 2026-11-13
 
