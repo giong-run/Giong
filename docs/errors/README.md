@@ -38,6 +38,7 @@ when it is no longer raised.
 | [GIONG-E0007](E0007.md) | `TimedOut` | the time limit passed |
 | [GIONG-E0008](E0008.md) | `NoSuchWorker` | no such worker |
 | [GIONG-E0009](E0009.md) | `BufferRingRefused` | the kernel refused io_uring buffer rings |
+| [GIONG-E0010](E0010.md) | `LockedMemoryLimit` | the locked-memory limit is used up |
 
 ## Network and name resolution
 

@@ -433,11 +433,18 @@ pub(crate) fn kind_from_env() -> io::Result<Option<DriverKind>> {
 
 /// `true` if an io_uring setup error means "io_uring cannot be used here",
 /// rather than a mistake in the configuration: the automatic choice then
-/// falls back to epoll.
+/// falls back to epoll. That includes a used-up locked-memory limit, which
+/// the user's other processes share: a worker that would otherwise fail to
+/// start runs on epoll.
 fn io_uring_unusable(e: &io::Error) -> bool {
     matches!(
         crate::error::code(e),
-        Some(Code::IoUringUnavailable | Code::KernelTooOld | Code::BufferRingRefused)
+        Some(
+            Code::IoUringUnavailable
+                | Code::KernelTooOld
+                | Code::BufferRingRefused
+                | Code::LockedMemoryLimit
+        )
     ) || matches!(
         e.raw_os_error(),
         Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EINVAL)
