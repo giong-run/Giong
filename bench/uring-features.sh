@@ -12,9 +12,10 @@
 #   BENCH_HOST=10.0.0.2 LOAD_HOST=bench@10.0.0.3 bench/uring-features.sh 5 10
 #
 # PATHS are the requests (default: /json, bodies of 4 KiB to 1 MiB from
-# /static?size=N, and one connection fetching 64 MiB streamed in 64 KiB pieces
-# from /stream, which shows what waiting for each piece costs); "@N" after a
-# path runs it with N connections instead of CONNS. VARIANTS are
+# /static?size=N, one connection fetching a 16 MiB body, which the server
+# writes as one send after another, and one fetching 64 MiB streamed in 64 KiB
+# pieces from /stream, each sent once the one before it is written); "@N"
+# after a path runs it with N connections instead of CONNS. VARIANTS are
 # "name:VAR=value,VAR=value" (default: every feature on, then each one off,
 # then all off; GIONG_WORKERS=<n> fits there too). In each round every variant
 # runs once per path, starting from a different one each round. Recorded per
@@ -30,7 +31,7 @@ CONNS=${CONNS:-256}
 BENCH_HOST=${BENCH_HOST:-127.0.0.1}
 LOAD_HOST=${LOAD_HOST:-}
 OUT=${OUT:-results/uring-features}
-read -r -a PATHS <<<"${PATHS:-/json /static?size=4096 /static?size=16384 /static?size=65536 /static?size=262144 /static?size=1048576 /stream?size=67108864&chunk=65536@1}"
+read -r -a PATHS <<<"${PATHS:-/json /static?size=4096 /static?size=16384 /static?size=65536 /static?size=262144 /static?size=1048576 /static?size=16777216@1 /stream?size=67108864&chunk=65536@1}"
 read -r -a VARIANTS <<<"${VARIANTS:-all-on: no-zero-copy:GIONG_IO_URING_OFF=zero-copy-send no-registered-ring:GIONG_IO_URING_OFF=registered-ring no-packed-buffers:GIONG_IO_URING_OFF=packed-buffers all-off:GIONG_IO_URING_OFF=all}"
 
 ncpu=$(nproc)
@@ -56,8 +57,8 @@ cpu_ticks() { cat /proc/"$1"/task/*/stat 2>/dev/null | awk '{u+=$14; s+=$15} END
 load() { # wrk arguments...
   if [ -n "$LOAD_HOST" ]; then ssh "$LOAD_HOST" wrk "$@"; else taskset -c "$LOAD_CPUS" wrk "$@"; fi
 }
-# "1.5GB" -> bytes
-to_bytes() { awk -v v="$1" 'BEGIN{n=v+0; u=substr(v, length(n "")+1); m=1;
+# "1.50GB" -> bytes
+to_bytes() { awk -v v="$1" 'BEGIN{n=v+0; u=v; sub(/^[0-9.]+/, "", u); m=1;
   if (u ~ /^K/) m=1024; else if (u ~ /^M/) m=1048576; else if (u ~ /^G/) m=1073741824; printf "%.0f", n*m}'; }
 
 echo "path,variant,round,rps,p99,user_us,kernel_us,mib_s,features" >"$CSV"
@@ -98,16 +99,19 @@ for round in $(seq 1 "$ROUNDS"); do
   echo "round $round/$ROUNDS done" >&2
 done
 
-python3 - "$CSV" <<'PY' | tee "$OUT/summary.txt"
+python3 - "$CSV" "${VARIANTS[*]}" <<'PY' | tee "$OUT/summary.txt"
 import csv, statistics, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 paths = list(dict.fromkeys(r["path"] for r in rows))
-variants = list(dict.fromkeys(r["variant"] for r in rows))
+# In the order of VARIANTS, compared with "all-on" (or the first variant).
+order = [v.split(":")[0] for v in sys.argv[2].split()]
+variants = [v for v in order if any(r["variant"] == v for r in rows)]
+first = "all-on" if "all-on" in variants else variants[0]
 med = lambda p, v, k: statistics.median(float(r[k]) for r in rows if r["path"] == p and r["variant"] == v)
 for p in paths:
     print(p)
-    print(f"  {'variant':20} {'req/s':>10} {'vs all-on':>9} {'CPU us/req':>11} {'vs all-on':>9} {'MiB/s':>8}")
-    base = (med(p, variants[0], "rps"), med(p, variants[0], "user_us") + med(p, variants[0], "kernel_us"))
+    print(f"  {'variant':20} {'req/s':>10} {'vs ' + first:>9} {'CPU us/req':>11} {'vs ' + first:>9} {'MiB/s':>8}")
+    base = (med(p, first, "rps"), med(p, first, "user_us") + med(p, first, "kernel_us"))
     for v in variants:
         rps = med(p, v, "rps")
         cpu = med(p, v, "user_us") + med(p, v, "kernel_us")

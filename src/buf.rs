@@ -143,6 +143,47 @@ unsafe impl IoBuf for Cow<'static, [u8]> {
     }
 }
 
+/// Whether nobody can change a buffer's bytes once a write has given the
+/// buffer back: what lets a zero-copy send return before the kernel stops
+/// reading them (see `StreamSocket::zero_copy_report`).
+pub(crate) enum Sharing {
+    /// The bytes may change once the buffer is back (`Vec`, `Box`,
+    /// `String`, an owned `Cow`, any other buffer type).
+    No,
+    /// `'static` bytes, which never change.
+    Static,
+    /// Reference-counted bytes (`Rc<[u8]>`, `Arc<[u8]>`): this second owner
+    /// keeps them alive, and while it lives nobody can get them mutably.
+    Owner(Box<dyn std::any::Any>),
+}
+
+/// The [`Sharing`] of `buf`, without making an owner.
+pub(crate) fn is_shared<B: IoBuf>(buf: &B) -> bool {
+    let any: &dyn std::any::Any = buf;
+    any.is::<&'static [u8]>()
+        || any.is::<&'static str>()
+        || any.is::<Rc<[u8]>>()
+        || any.is::<Arc<[u8]>>()
+        || matches!(
+            any.downcast_ref::<Cow<'static, [u8]>>(),
+            Some(Cow::Borrowed(_))
+        )
+}
+
+/// The [`Sharing`] of `buf`.
+pub(crate) fn sharing<B: IoBuf>(buf: &B) -> Sharing {
+    let any: &dyn std::any::Any = buf;
+    if let Some(rc) = any.downcast_ref::<Rc<[u8]>>() {
+        Sharing::Owner(Box::new(Rc::clone(rc)))
+    } else if let Some(arc) = any.downcast_ref::<Arc<[u8]>>() {
+        Sharing::Owner(Box::new(Arc::clone(arc)))
+    } else if is_shared(buf) {
+        Sharing::Static
+    } else {
+        Sharing::No
+    }
+}
+
 /// An anonymous, private, zero-filled memory mapping.
 ///
 /// Page aligned (as a buffer ring must be) and lazily backed: pages only

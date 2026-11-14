@@ -270,7 +270,7 @@ run the tasks that are ready  →  io_uring_enter (submit everything, collect ev
 | **Wakers** | A waker does not own its task; it holds a slot number and a handle to the worker. Same thread: push onto the local queue. Other thread: injector plus eventfd. | Wakers must be `Send + Sync` although tasks are not. This gets there without `unsafe`. |
 | **I/O** | Everything a tick produces enters the kernel in one `io_uring_enter`, with `DEFER_TASKRUN` and `SINGLE_ISSUER`, through the thread's registered ring descriptor (5.18+). | The fewest system calls possible; completions are processed only when the worker asks. |
 | **Accept and receive** | Multishot accept; multishot receive with a provided buffer ring, for TCP, Unix sockets and UDP (`recvmsg`). On Linux 6.12+ streams fill each buffer piece by piece (`IOU_PBUF_RING_INC`). | One submission for the life of a listener, connection or socket. The kernel picks a buffer only when data arrives, so the buffer is warm in cache and idle connections hold none; connections that send a little share a buffer. |
-| **Writes and files** | Ownership passing: `write_all(buf)` returns `(result, buf)`. TCP sends of 16 KiB and more to nearby peers go out without a copy on 6.2+ (`SEND_ZC`). File operations are ordinary entries in the same ring. | The kernel keeps a pointer to the buffer until it is done; this API makes that sound in Rust. Files need no pool of blocking threads. |
+| **Writes and files** | Ownership passing: `write_all(buf)` returns `(result, buf)`. TCP sends of 16 KiB and more from bytes that cannot change (`&'static`, `Rc<[u8]>`, `Arc<[u8]>`) go out without a copy on 6.2+ (`SEND_ZC`), and the write still returns as soon as they are queued. File operations are ordinary entries in the same ring. | The kernel keeps a pointer to the buffer until it is done; this API makes that sound in Rust. Files need no pool of blocking threads. |
 | **Cancellation** | When a future is dropped mid-flight, its buffer moves to the driver, a cancel is sent, and the memory is freed only when the kernel confirms. | Avoids use-after-free, the classic bug of completion-based runtimes. |
 | **Backpressure** | A reader more than an eighth of the pool behind has its multishot receive paused (TCP then slows the sender), and its backlog copied off the pool while the pool runs low. A dry pool reclaims buffers that hold data left unread for a whole turn of the event loop. An accept backlog over 1,024 pauses the accept. | One stalled connection cannot starve the rest, and a busy one that keeps up is never copied. |
 | **Timers** | A hierarchical timing wheel in user space (six levels of 64 slots, 1 ms ticks). | Arming and cancelling are O(1) and make no system call. Nearly every timer is an I/O timeout that is cancelled before it fires. |
@@ -862,7 +862,8 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   remaining connections are dropped. Set `.shutdown_grace(..)` and use `until_shutdown` in
   the connection loop (`giong-http` does). Connections still in the kernel's accept queue
   when the listener closes are refused; have the load balancer stop sending first.
-- **Unused so far:** fixed files, zero-copy send, `SQPOLL`.
+- **Unused so far:** fixed files, `SQPOLL`. Zero-copy send covers only bytes that cannot
+  change (`&'static`, `Rc<[u8]>`, `Arc<[u8]>`); a `Vec` is copied.
 
 ## Project
 

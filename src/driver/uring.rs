@@ -31,8 +31,8 @@ use std::time::Duration;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use super::{
-    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, F_BUF_MORE,
-    ZC_COPIED,
+    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, ZeroCopyHold,
+    F_BUF_MORE, ZC_COPIED,
 };
 use crate::buf::{BufPool, Received, RecvBuf, RingId};
 use crate::error::{Code, Error};
@@ -74,7 +74,8 @@ enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
     Waiting(Waker),
     /// A zero-copy send has its result, but the kernel may still read the
-    /// buffer until its notification arrives.
+    /// buffer until its notification arrives. Its future gets the result
+    /// now if it leaves a [`ZeroCopyHold`], else at the notification.
     Sent(Waker, i32, u32),
     /// Finished; the result has not been collected yet.
     Done(i32, u32),
@@ -712,12 +713,26 @@ impl Uring {
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
-    pub(crate) fn poll_op(&mut self, key: usize, waker: &Waker) -> Poll<(i32, u32)> {
+    /// A zero-copy send that has its result is done if the caller leaves its
+    /// `hold`: the entry keeps that until the notification.
+    pub(crate) fn poll_op(
+        &mut self,
+        key: usize,
+        waker: &Waker,
+        hold: &mut Option<Box<dyn Any>>,
+    ) -> Poll<(i32, u32)> {
         match self.ops.get_mut(key) {
             Some(OpState::Single(Lifecycle::Done(res, flags))) => {
                 let out = (*res, *flags);
                 self.ops.remove(key);
                 Poll::Ready(out)
+            }
+            Some(OpState::Single(lc @ Lifecycle::Sent(..))) if hold.is_some() => {
+                let Lifecycle::Sent(_, res, flags) = *lc else {
+                    unreachable!()
+                };
+                *lc = Lifecycle::Ignored(hold.take());
+                Poll::Ready((res, flags))
             }
             Some(OpState::Single(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..))) => {
                 if !w.will_wake(waker) {
@@ -1260,7 +1275,9 @@ impl Uring {
     ///
     /// A zero-copy send completes twice: first with its result and
     /// `IORING_CQE_F_MORE`, then with a notification once the kernel no
-    /// longer reads the buffer. Its future gets the result at the second.
+    /// longer reads the buffer. A future with a [`ZeroCopyHold`] gets the
+    /// result at the first (see [`poll_op`](Self::poll_op)), any other at
+    /// the second.
     fn complete(
         lc: &mut Lifecycle,
         res: i32,
@@ -1295,6 +1312,11 @@ impl Uring {
             }
             Lifecycle::Ignored(data) => {
                 if let Some(data) = data {
+                    if flags & F_NOTIF != 0 && res as u32 & NOTIF_COPIED != 0 {
+                        if let Some(hold) = data.downcast_ref::<ZeroCopyHold>() {
+                            hold.copied.set(true);
+                        }
+                    }
                     graveyard.push(data);
                 }
                 true
