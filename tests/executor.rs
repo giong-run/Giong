@@ -193,14 +193,6 @@ fn runtimes_can_run_one_after_another_on_the_same_thread() {
 }
 
 #[test]
-#[should_panic(expected = "already running")]
-fn nested_block_on_is_rejected() {
-    giong::block_on(async {
-        giong::block_on(async {});
-    });
-}
-
-#[test]
 fn no_leaks_after_tasks_finish() {
     giong::block_on(async {
         for _ in 0..100 {
@@ -212,5 +204,81 @@ fn no_leaks_after_tasks_finish() {
         assert_eq!(stats.tasks, 0, "{stats:?}");
         assert_eq!(stats.timers, 0, "{stats:?}");
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
+fn io_completes_while_another_task_keeps_yielding() {
+    // A worker with a runnable task never sleeps in the kernel: it only
+    // exchanges work with it between batches. With io-uring 0.7.0 to 0.7.14
+    // that exchange did not collect completions on a ring that defers task
+    // work, so I/O hung for as long as any task kept yielding, and
+    // spin_before_park spun forever. The CI job that builds with the minimal
+    // versions of the dependencies runs this test.
+    for spin in [false, true] {
+        let mut builder = giong::Builder::new();
+        if spin {
+            builder = builder.spin_before_park(Duration::from_micros(200));
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).unwrap();
+            stream.write_all(&buf).unwrap();
+        });
+        builder
+            .block_on(async move {
+                let stop = Rc::new(Cell::new(false));
+                if !spin {
+                    let stop = stop.clone();
+                    giong::spawn(async move {
+                        while !stop.get() {
+                            giong::yield_now().await;
+                        }
+                    });
+                }
+                let round_trip = async {
+                    let stream = giong::net::TcpStream::connect(addr).await.unwrap();
+                    stream.write_all(b"ping".to_vec()).await.0.unwrap();
+                    let mut got = Vec::new();
+                    while got.len() < 4 {
+                        let data = stream.recv().await.unwrap();
+                        assert!(!data.is_empty(), "closed early");
+                        got.extend_from_slice(&data);
+                    }
+                    got
+                };
+                let got = giong::time::timeout(Duration::from_secs(10), round_trip).await;
+                stop.set(true);
+                assert_eq!(
+                    got.as_deref().ok(),
+                    Some(&b"ping"[..]),
+                    "spin_before_park: {spin}"
+                );
+            })
+            .unwrap();
+        echo.join().unwrap();
+    }
+}
+
+#[test]
+fn giong_calls_outside_a_runtime_panic_with_their_code() {
+    let payload = std::panic::catch_unwind(giong::handle).unwrap_err();
+    let message = payload.downcast_ref::<String>().unwrap();
+    assert!(message.starts_with("GIONG-E0011: "), "{message}");
+    assert!(message.contains("docs/errors/E0011.md"), "{message}");
+}
+
+#[test]
+fn block_on_inside_a_runtime_panics_with_its_code() {
+    giong::block_on(async {
+        let payload = std::panic::catch_unwind(|| giong::block_on(async {})).unwrap_err();
+        let message = payload.downcast_ref::<String>().unwrap();
+        assert!(message.starts_with("GIONG-E0012: "), "{message}");
+        // The runtime that was already running carries on.
+        sleep(Duration::from_millis(1)).await;
     });
 }
