@@ -431,6 +431,7 @@ impl<F: Future> Future for Timeout<F> {
         // SAFETY: `fut` is structurally pinned: it is only reached through
         // the pinned reference made here and never moved. `Sleep` is `Unpin`.
         let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `fut` is structurally pinned (see above).
         let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
         if let Poll::Ready(value) = fut.poll(cx) {
             return Poll::Ready(Ok(value));
@@ -571,6 +572,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "safe code only, and minutes long under Miri")]
     fn wheel_matches_model_short_timers() {
         for seed in 1..=40 {
             run_model(seed, 4_000, 200, 3_000);
@@ -578,6 +580,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "safe code only, and minutes long under Miri")]
     fn wheel_matches_model_mixed_timers() {
         // Delays up to 10 minutes with steps up to 5 s: exercises cascading
         // across four levels.
@@ -587,6 +590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "safe code only, and minutes long under Miri")]
     fn wheel_matches_model_long_timers() {
         // Delays up to 30 days, steps up to 2 hours.
         for seed in 200..=215 {

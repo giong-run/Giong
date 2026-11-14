@@ -106,7 +106,12 @@ enum Lifecycle {
     Waiting(Waker),
     Done(i32),
     /// The future was dropped; holds the resources until the thread is done.
-    Ignored(Option<Box<dyn Any>>),
+    /// With `closes_result`, a result that is not negative is a descriptor
+    /// nobody owns (an open), which the driver closes.
+    Ignored {
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    },
 }
 
 enum EOp {
@@ -298,7 +303,9 @@ impl Epoll {
             pwait2: true,
         };
         // The worker's eventfd is drained after every wake-up, so it must
-        // not block when another thread got there first.
+        // not block when another thread got there first. (Under Miri, which
+        // has no `fcntl` on eventfds, it is created non-blocking instead.)
+        #[cfg(not(miri))]
         set_nonblocking(wake_fd)?;
         driver.watch(wake_fd, WAKE)?;
         driver.watch(driver.completions.fd(), DONE)?;
@@ -345,8 +352,8 @@ impl Epoll {
             let e = neg_errno();
             // Only possible if the number was registered before and the
             // registration outlived our record of it: take it over.
-            // SAFETY: as above.
             if e != -libc::EEXIST
+                // SAFETY: as above.
                 || unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) } < 0
             {
                 return Err(if e == -libc::EEXIST { neg_errno() } else { e });
@@ -374,7 +381,11 @@ impl Epoll {
     /// readiness: a pipe, a FIFO or a socket. Those are made non-blocking
     /// and registered. Regular files, directories and devices (a terminal
     /// may be shared with the shell, whose mode must not change) go to the
-    /// blocking threads. Decided once per descriptor.
+    /// blocking threads, and so do pipes on standard input, output and
+    /// error: a shell pipeline shares them with the processes on either
+    /// side, and non-blocking mode is a property of the pipe, not of this
+    /// process (`cat` on the other end would fail with `EAGAIN`). Decided
+    /// once per descriptor.
     fn pollable_file(&mut self, fd: RawFd) -> bool {
         let Ok(i) = usize::try_from(fd) else {
             return false;
@@ -388,7 +399,11 @@ impl Epoll {
         let mut st: libc::stat64 = unsafe { mem::zeroed() };
         // SAFETY: a valid pointer to a `stat64`.
         let streams = unsafe { libc::fstat64(fd, &mut st) } == 0
-            && matches!(st.st_mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK);
+            && match st.st_mode & libc::S_IFMT {
+                libc::S_IFSOCK => true,
+                libc::S_IFIFO => fd > 2,
+                _ => false,
+            };
         if streams && self.register(fd).is_ok() {
             return true;
         }
@@ -471,8 +486,9 @@ impl Epoll {
         if let Err(e) = self.register(fd) {
             return Attempt::Done(e);
         }
-        // SAFETY (all calls below): the pointers come from `Op` resources,
-        // valid while the operation exists; the descriptor is non-blocking.
+        // SAFETY: for every call below, the pointers come from `Op`
+        // resources, valid while the operation exists; the descriptor is
+        // non-blocking.
         let (res, dir) = unsafe {
             match *io {
                 Io::Connect { fd, addr, len } => {
@@ -680,7 +696,12 @@ impl Epoll {
         }
     }
 
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>) {
+    pub(crate) fn cancel_op(
+        &mut self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    ) {
         match self.ops.get_mut(key) {
             Some(EOp::Blocking {
                 state: state @ Lifecycle::Waiting(_),
@@ -690,13 +711,26 @@ impl Epoll {
                 // The thread may be using the resources: keep them until it
                 // reports. A job that has not started yet skips its call.
                 cancel.cancel();
-                *state = Lifecycle::Ignored(data);
+                *state = Lifecycle::Ignored {
+                    data,
+                    closes_result,
+                };
             }
-            Some(EOp::Ready { .. })
-            | Some(EOp::Blocking {
-                state: Lifecycle::Done(_),
+            Some(&mut EOp::Blocking {
+                state: Lifecycle::Done(res),
                 ..
             }) => {
+                // Nothing is using the resources any more.
+                self.ops.remove(key);
+                if let Some(data) = data {
+                    self.graveyard.push(data);
+                }
+                // An open that finished before its future was dropped.
+                if closes_result && res >= 0 {
+                    self.close_fd(res);
+                }
+            }
+            Some(EOp::Ready { .. }) => {
                 // Nothing is using the resources any more.
                 self.ops.remove(key);
                 if let Some(data) = data {
@@ -819,7 +853,7 @@ impl Epoll {
         if len < payload_at {
             return Some(Err(-libc::ENOBUFS));
         }
-        // SAFETY (this block): every pointer stays inside the free pool
+        // SAFETY: every pointer in this block stays inside the free pool
         // buffer of `len` bytes; all-zero is a valid `msghdr`.
         unsafe {
             let mut iov = libc::iovec {
@@ -937,7 +971,7 @@ impl Epoll {
                 // A kernel older than 5.11, or a seccomp profile that does
                 // not know the call: use epoll_wait from now on.
                 Some(libc::ENOSYS | libc::EPERM) if self.pwait2 => self.pwait2 = false,
-                _ => panic!("giong: epoll_wait failed: {}", io::Error::last_os_error()),
+                _ => super::event_loop_failed("epoll_wait", io::Error::last_os_error()),
             }
         };
         // SAFETY: the kernel initialised `n <= MAX_EVENTS` events.
@@ -998,6 +1032,8 @@ impl Epoll {
         for (key, res) in done.drain(..) {
             self.blocking -= 1;
             let mut used = -1;
+            // A descriptor an ignored open produced: nobody will take it.
+            let mut orphan_fd = None;
             let remove = match self.ops.get_mut(key) {
                 Some(EOp::Blocking { state, fd, .. }) => {
                     used = *fd;
@@ -1006,9 +1042,15 @@ impl Epoll {
                             waker.wake();
                             false
                         }
-                        Lifecycle::Ignored(data) => {
+                        Lifecycle::Ignored {
+                            data,
+                            closes_result,
+                        } => {
                             if let Some(data) = data {
                                 self.graveyard.push(data);
+                            }
+                            if closes_result && res >= 0 {
+                                orphan_fd = Some(res);
                             }
                             true
                         }
@@ -1021,6 +1063,9 @@ impl Epoll {
                 self.ops.remove(key);
             }
             self.release(used);
+            if let Some(fd) = orphan_fd {
+                self.close_fd(fd);
+            }
         }
         self.done = done;
     }
@@ -1112,11 +1157,26 @@ fn pooled_flags(bid: u16) -> u32 {
 }
 
 /// Puts `fd` in non-blocking mode.
+#[cfg(not(miri))]
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let mut on: libc::c_int = 1;
     // SAFETY: FIONBIO reads an int from a valid pointer.
     if unsafe { libc::ioctl(fd, libc::FIONBIO, &mut on) } < 0 {
         return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Puts `fd` in non-blocking mode. Miri has no `ioctl(FIONBIO)`, but has
+/// `fcntl` for pipes and sockets.
+#[cfg(miri)]
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: plain syscalls on a descriptor; the results are checked.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(())
 }
