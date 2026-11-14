@@ -142,6 +142,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-compat**: the lowest dependency versions it allows are ones it builds and passes
+  its tests with (`cargo update -Z direct-minimal-versions`): tokio 1.13 (was any 1.x),
+  futures-io 0.3.31 (was any 0.3), and for the tests rustls 0.23.33, the same as
+  giong-tls, and hyper 1.6, the first whose header-read timeout reports `is_timeout()`.
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
   registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
   the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
