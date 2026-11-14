@@ -31,7 +31,8 @@ use std::time::Duration;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use super::{
-    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, F_BUF_MORE,
+    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, ZeroCopyHold,
+    F_BUF_MORE, ZC_COPIED,
 };
 use crate::buf::{BufPool, Received, RecvBuf, RingId};
 use crate::error::{Code, Error};
@@ -72,11 +73,20 @@ const ACCEPT_BACKLOG_LIMIT: usize = 1024;
 enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
     Waiting(Waker),
+    /// A zero-copy send has its result, but the kernel may still read the
+    /// buffer until its notification arrives. Its future gets the result
+    /// now if it leaves a [`ZeroCopyHold`], else at the notification.
+    Sent(Waker, i32, u32),
     /// Finished; the result has not been collected yet.
     Done(i32, u32),
     /// The future was dropped while in flight. Holds the operation's resources
-    /// until the kernel is done with them.
-    Ignored(Option<Box<dyn Any>>),
+    /// until the kernel is done with them. With `closes_result`, a result
+    /// that is not negative is a descriptor nobody owns (an open), which the
+    /// driver closes.
+    Ignored {
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    },
 }
 
 /// A multishot completion waiting to be consumed.
@@ -147,6 +157,9 @@ pub(crate) struct Uring {
     /// The ring's index in this thread's registered ring table, with
     /// [`IoUringFeature::RegisteredRing`].
     registered_ring: Option<u32>,
+    /// The smallest send that goes out without a copy, with
+    /// [`IoUringFeature::ZeroCopySend`].
+    zero_copy_min: Option<usize>,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -339,8 +352,20 @@ fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
     b.build(entries)
 }
 
-/// The SQE for a single-shot operation.
-fn sqe_for(io: &Io) -> squeue::Entry {
+/// `IORING_CQE_F_MORE`: more completions of this operation follow.
+const F_MORE: u32 = 1 << 1;
+/// `IORING_CQE_F_NOTIF`: the notification of a zero-copy send, which says
+/// the kernel no longer reads its buffer.
+const F_NOTIF: u32 = 1 << 3;
+/// `IORING_SEND_ZC_REPORT_USAGE`: the notification says whether the kernel
+/// copied the data after all, in [`NOTIF_COPIED`] (Linux 6.2).
+const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
+/// `IORING_NOTIF_USAGE_ZC_COPIED`, in the result of a notification.
+const NOTIF_COPIED: u32 = 1 << 31;
+
+/// The SQE for a single-shot operation. `zero_copy` says whether the ring
+/// uses [`IoUringFeature::ZeroCopySend`].
+fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
     let cwd = types::Fd(libc::AT_FDCWD);
     match *io {
         Io::Connect { fd, addr, len } => opcode::Connect::new(types::Fd(fd), addr, len).build(),
@@ -350,11 +375,31 @@ fn sqe_for(io: &Io) -> squeue::Entry {
             buf,
             len,
             flags,
+            zero_copy: true,
+        } if zero_copy => opcode::SendZc::new(types::Fd(fd), buf, len)
+            .flags(flags)
+            .zc_flags(SEND_ZC_REPORT_USAGE)
+            .build(),
+        Io::Send {
+            fd,
+            buf,
+            len,
+            flags,
+            ..
         } => opcode::Send::new(types::Fd(fd), buf, len)
             .flags(flags)
             .build(),
         Io::Writable { fd } => opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as u32).build(),
-        Io::SendMsg { fd, msg, flags } => opcode::SendMsg::new(types::Fd(fd), msg)
+        Io::SendMsg {
+            fd,
+            msg,
+            flags,
+            zero_copy: true,
+        } if zero_copy => opcode::SendMsgZc::new(types::Fd(fd), msg)
+            .flags(flags)
+            .ioprio(SEND_ZC_REPORT_USAGE)
+            .build(),
+        Io::SendMsg { fd, msg, flags, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),
         Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
@@ -535,6 +580,21 @@ unsafe fn register_packed_ring(
     register_pbuf(ring.as_raw_fd(), REGISTER_PBUF_RING, &reg).is_ok()
 }
 
+/// `true` if the kernel sends without a copy the way giong asks it to: with
+/// `IORING_OP_SEND_ZC` and `IORING_OP_SENDMSG_ZC`, whose notifications say
+/// whether the data was copied after all (`IORING_SEND_ZC_REPORT_USAGE`,
+/// Linux 6.2; a probe cannot see flags, hence the version).
+fn has_zero_copy_send(ring: &IoUring) -> bool {
+    if !kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 2)) {
+        return false;
+    }
+    let mut probe = io_uring::Probe::new();
+    if ring.submitter().register_probe(&mut probe).is_err() {
+        return false;
+    }
+    probe.is_supported(opcode::SendZc::CODE) && probe.is_supported(opcode::SendMsgZc::CODE)
+}
+
 /// `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS`.
 const REGISTER_RING_FDS: libc::c_uint = 20;
 const UNREGISTER_RING_FDS: libc::c_uint = 21;
@@ -672,8 +732,8 @@ impl Uring {
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
         pool.set_registered(RingId::Whole);
         let mut features = Vec::new();
-        // SAFETY: as above, for the pool's second ring.
         if super::feature_enabled(IoUringFeature::PackedBuffers)
+            // SAFETY: as above, for the pool's second ring.
             && unsafe { register_packed_ring(&ring, &pool, &workarounds) }
         {
             pool.set_registered(RingId::Packed);
@@ -685,11 +745,18 @@ impl Uring {
         if registered_ring.is_some() {
             features.push(IoUringFeature::RegisteredRing);
         }
+        let zero_copy_min = (super::feature_enabled(IoUringFeature::ZeroCopySend)
+            && has_zero_copy_send(&ring))
+        .then(super::zero_copy_min);
+        if zero_copy_min.is_some() {
+            features.push(IoUringFeature::ZeroCopySend);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
             registered_ring,
+            zero_copy_min,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -728,7 +795,7 @@ impl Uring {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
-                    _ => panic!("giong: io_uring submit failed: {e}"),
+                    _ => super::event_loop_failed("io_uring submit", e),
                 },
             }
             attempts += 1;
@@ -745,19 +812,37 @@ impl Uring {
         let key = self
             .ops
             .insert(OpState::Single(Lifecycle::Waiting(waker.clone())));
-        self.push(sqe_for(io).user_data(key as u64));
+        let sqe = sqe_for(io, self.zero_copy_min.is_some());
+        self.push(sqe.user_data(key as u64));
         key
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
-    pub(crate) fn poll_op(&mut self, key: usize, waker: &Waker) -> Poll<(i32, u32)> {
+    /// A zero-copy send that has its result is done if the caller leaves its
+    /// `hold`: the entry keeps that until the notification.
+    pub(crate) fn poll_op(
+        &mut self,
+        key: usize,
+        waker: &Waker,
+        hold: &mut Option<Box<dyn Any>>,
+    ) -> Poll<(i32, u32)> {
         match self.ops.get_mut(key) {
             Some(OpState::Single(Lifecycle::Done(res, flags))) => {
                 let out = (*res, *flags);
                 self.ops.remove(key);
                 Poll::Ready(out)
             }
-            Some(OpState::Single(Lifecycle::Waiting(w))) => {
+            Some(OpState::Single(lc @ Lifecycle::Sent(..))) if hold.is_some() => {
+                let Lifecycle::Sent(_, res, flags) = *lc else {
+                    unreachable!()
+                };
+                *lc = Lifecycle::Ignored {
+                    data: hold.take(),
+                    closes_result: false,
+                };
+                Poll::Ready((res, flags))
+            }
+            Some(OpState::Single(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..))) => {
                 if !w.will_wake(waker) {
                     *w = waker.clone();
                 }
@@ -769,21 +854,41 @@ impl Uring {
 
     /// Called when the future of a single-shot operation is dropped before its
     /// result was collected. `data` are the resources the kernel may still use.
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>) {
+    pub(crate) fn cancel_op(
+        &mut self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    ) {
         match self.ops.get_mut(key) {
             Some(OpState::Single(lc @ Lifecycle::Waiting(_))) => {
-                *lc = Lifecycle::Ignored(data);
+                *lc = Lifecycle::Ignored {
+                    data,
+                    closes_result,
+                };
                 self.push(
                     opcode::AsyncCancel::new(key as u64)
                         .build()
                         .user_data(UD_IGNORE),
                 );
             }
-            Some(OpState::Single(Lifecycle::Done(..))) => {
+            Some(OpState::Single(lc @ Lifecycle::Sent(..))) => {
+                // Sent: nothing to cancel, but the kernel may still read the
+                // buffer until the notification.
+                *lc = Lifecycle::Ignored {
+                    data,
+                    closes_result: false,
+                };
+            }
+            Some(&mut OpState::Single(Lifecycle::Done(res, _))) => {
                 self.ops.remove(key);
                 // Completed: the kernel no longer references the resources.
                 if let Some(data) = data {
                     self.graveyard.push(data);
+                }
+                // An open that finished before its future was dropped.
+                if closes_result && res >= 0 {
+                    self.close_fd(res);
                 }
             }
             _ => {
@@ -1013,7 +1118,7 @@ impl Uring {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
-                    _ => panic!("giong: io_uring submit failed: {e}"),
+                    _ => super::event_loop_failed("io_uring submit", e),
                 },
             }
             attempts += 1;
@@ -1074,7 +1179,7 @@ impl Uring {
             match e.raw_os_error() {
                 // Interrupted, timed out, or completion queue backed up (drained below).
                 Some(libc::EINTR) | Some(libc::ETIME) | Some(libc::EBUSY) | Some(libc::EAGAIN) => {}
-                _ => panic!("giong: io_uring_enter failed: {e}"),
+                _ => super::event_loop_failed("io_uring_enter", e),
             }
         }
         self.reap();
@@ -1191,22 +1296,21 @@ impl Uring {
             UD_CLOSE => self.pending_closes -= 1,
             key => {
                 let key = key as usize;
+                // A descriptor an ignored open produced: nobody will take it.
+                let mut orphan_fd = None;
                 let remove = match self.ops.get_mut(key) {
                     None => false,
                     Some(OpState::Single(lc)) => {
-                        match mem::replace(lc, Lifecycle::Done(res, flags)) {
-                            Lifecycle::Waiting(waker) => {
-                                waker.wake();
-                                false
+                        if let Lifecycle::Ignored {
+                            closes_result: true,
+                            ..
+                        } = lc
+                        {
+                            if !more && res >= 0 {
+                                orphan_fd = Some(res);
                             }
-                            Lifecycle::Ignored(data) => {
-                                if let Some(data) = data {
-                                    self.graveyard.push(data);
-                                }
-                                true
-                            }
-                            Lifecycle::Done(..) => false,
                         }
+                        Self::complete(lc, res, flags, more, &mut self.graveyard)
                     }
                     Some(OpState::Multi(m)) => {
                         if !more {
@@ -1296,7 +1400,70 @@ impl Uring {
                 if remove {
                     self.ops.remove(key);
                 }
+                if let Some(fd) = orphan_fd {
+                    self.close_fd(fd);
+                }
             }
+        }
+    }
+
+    /// Records a completion of single-shot operation `lc`. Returns `true` if
+    /// its slab entry can go.
+    ///
+    /// A zero-copy send completes twice: first with its result and
+    /// `IORING_CQE_F_MORE`, then with a notification once the kernel no
+    /// longer reads the buffer. A future with a [`ZeroCopyHold`] gets the
+    /// result at the first (see [`poll_op`](Self::poll_op)), any other at
+    /// the second.
+    fn complete(
+        lc: &mut Lifecycle,
+        res: i32,
+        flags: u32,
+        more: bool,
+        graveyard: &mut Vec<Box<dyn Any>>,
+    ) -> bool {
+        if more {
+            // The result of a zero-copy send; the notification follows. A
+            // dropped send stays `Ignored`: its buffer waits for it too.
+            // The task is woken now, so that a future with a hold collects
+            // the result here instead of at the notification, which comes
+            // only once the peer has acknowledged every byte (up to a
+            // delayed acknowledgement, 40 ms, later).
+            if let Lifecycle::Waiting(waker) = lc {
+                let waker = waker.clone();
+                waker.wake_by_ref();
+                *lc = Lifecycle::Sent(waker, res, flags & !F_MORE);
+            }
+            return false;
+        }
+        let done = match *lc {
+            Lifecycle::Sent(_, sent, sent_flags) if flags & F_NOTIF != 0 => {
+                let copied = if res as u32 & NOTIF_COPIED != 0 {
+                    ZC_COPIED
+                } else {
+                    0
+                };
+                Lifecycle::Done(sent, sent_flags | copied)
+            }
+            _ => Lifecycle::Done(res, flags),
+        };
+        match mem::replace(lc, done) {
+            Lifecycle::Waiting(waker) | Lifecycle::Sent(waker, ..) => {
+                waker.wake();
+                false
+            }
+            Lifecycle::Ignored { data, .. } => {
+                if let Some(data) = data {
+                    if flags & F_NOTIF != 0 && res as u32 & NOTIF_COPIED != 0 {
+                        if let Some(hold) = data.downcast_ref::<ZeroCopyHold>() {
+                            hold.copied.set(true);
+                        }
+                    }
+                    graveyard.push(data);
+                }
+                true
+            }
+            Lifecycle::Done(..) => false,
         }
     }
 
@@ -1317,10 +1484,14 @@ impl Uring {
                         e.raw_os_error(),
                         Some(libc::EINTR | libc::EBUSY | libc::EAGAIN)
                     ) => {}
-                Err(_) => return false,
+                Err(_) => {
+                    self.drain_multis();
+                    return false;
+                }
             }
             self.reap();
             if self.inflight == 0 {
+                self.drain_multis();
                 return true;
             }
             // A cancelled close can leave its descriptor open. Retrying a
@@ -1335,7 +1506,28 @@ impl Uring {
             let _ = self.enter(1, Some(Duration::from_millis(10)));
         }
         self.reap();
+        self.drain_multis();
         self.inflight == 0
+    }
+
+    /// Closes the accepted descriptors and gives back the pool pieces that
+    /// every multishot operation still holds. Its owner (a listener or
+    /// stream) can outlive the runtime, and on a later runtime gets a new
+    /// operation: what was queued here would never be taken.
+    fn drain_multis(&mut self) {
+        let pool = &self.pool;
+        let mut pieces = 0;
+        for op in self.ops.iter_mut() {
+            if let OpState::Multi(m) = op {
+                for item in mem::take(&mut m.queue) {
+                    if let Queued::Piece { .. } = item {
+                        pieces += 1;
+                    }
+                    Self::release(pool, m.kind, item);
+                }
+            }
+        }
+        self.pooled_queued -= pieces;
     }
 
     pub(crate) fn take_graveyard(&mut self) -> Vec<Box<dyn Any>> {
@@ -1365,6 +1557,12 @@ impl Uring {
     /// io_uring features this ring uses.
     pub(crate) fn features(&self) -> &[IoUringFeature] {
         &self.features
+    }
+
+    /// The smallest send that goes out without a copy, or `None` without
+    /// [`IoUringFeature::ZeroCopySend`].
+    pub(crate) fn zero_copy_min(&self) -> Option<usize> {
+        self.zero_copy_min
     }
 }
 
@@ -1510,6 +1708,67 @@ mod tests {
             }
         }
         drop(ring);
+    }
+
+    /// The result of a zero-copy send wakes the task that waits for it, so
+    /// that a write leaving a `ZeroCopyHold` returns then. Without the wake
+    /// it returned only at the notification, after the peer acknowledged
+    /// the data: one connection sending 16 MiB from memory that never
+    /// changes stalled for 40 ms (a delayed acknowledgement) on about one
+    /// response in five on bare metal. Loopback copies and notifies at once,
+    /// so no test over a real socket here can tell the difference.
+    #[test]
+    fn the_result_of_a_zero_copy_send_wakes_its_task() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Count(AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let woken = Arc::new(Count(AtomicUsize::new(0)));
+        let mut lc = Lifecycle::Waiting(Waker::from(woken.clone()));
+        let mut graveyard = Vec::new();
+
+        assert!(!Uring::complete(
+            &mut lc,
+            65536,
+            F_MORE,
+            true,
+            &mut graveyard
+        ));
+        assert_eq!(
+            woken.0.load(Ordering::SeqCst),
+            1,
+            "the result must wake the task"
+        );
+        assert!(matches!(lc, Lifecycle::Sent(_, 65536, 0)));
+
+        // A task that did not collect it is woken again by the notification.
+        assert!(!Uring::complete(&mut lc, 0, F_NOTIF, false, &mut graveyard));
+        assert_eq!(woken.0.load(Ordering::SeqCst), 2);
+        assert!(matches!(lc, Lifecycle::Done(65536, 0)));
+
+        // A send whose future already returned (`Ignored`) wakes nobody,
+        // and its hold goes when the notification comes.
+        let mut lc = Lifecycle::Ignored {
+            data: Some(Box::new(())),
+            closes_result: false,
+        };
+        assert!(!Uring::complete(
+            &mut lc,
+            65536,
+            F_MORE,
+            true,
+            &mut graveyard
+        ));
+        assert!(Uring::complete(&mut lc, 0, F_NOTIF, false, &mut graveyard));
+        assert_eq!(graveyard.len(), 1);
+        assert_eq!(woken.0.load(Ordering::SeqCst), 2);
     }
 
     /// Every setup tier must produce a working ring on a current kernel, so

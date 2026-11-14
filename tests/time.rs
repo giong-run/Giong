@@ -84,6 +84,7 @@ fn timeout_passes_the_value_through() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn many_timers() {
     giong::block_on(async {
         let start = Instant::now();
