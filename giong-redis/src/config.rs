@@ -61,8 +61,8 @@ pub(crate) enum Host {
 /// ```
 ///
 /// Every limit has a finite default, documented on its setter: a command
-/// never waits forever for its reply, and a reply never grows without
-/// bound.
+/// never waits forever for its reply, and a reply never takes more memory
+/// than [`max_reply_size`](Self::max_reply_size).
 ///
 /// **TLS** is used when the URL starts with `rediss://`, or when
 /// [`tls`](Self::tls) asks for it: the server's certificate is checked
@@ -197,10 +197,17 @@ impl Config {
         self
     }
 
-    /// The largest reply one command may return, in bytes as sent: 64 MiB
-    /// by default. A larger reply fails with
-    /// [`ErrorKind::TooLarge`](crate::ErrorKind::TooLarge); it is read
-    /// and thrown away as it arrives, and the connection stays usable.
+    /// The largest reply one command may return: 64 MiB by default, counted
+    /// as the memory it takes once read, which is its bytes and 48 more for
+    /// each element (each becomes a [`Value`](crate::Value)). A larger reply
+    /// fails with [`ErrorKind::TooLarge`](crate::ErrorKind::TooLarge); it
+    /// is read and thrown away as it arrives, and the connection stays
+    /// usable.
+    ///
+    /// A reply of many small elements counts for much more than its bytes:
+    /// `LRANGE` of a million 10-byte members is 17 MB as sent, and counts
+    /// for 65 MB. Bytes alone, an array of 20 million nulls (57 MiB as
+    /// sent) took 960 MB.
     pub fn max_reply_size(mut self, bytes: usize) -> Self {
         self.max_reply_size = bytes;
         self
@@ -325,6 +332,29 @@ fn seconds(value: &str, name: &str) -> Result<Duration, Error> {
 }
 
 fn parse_url(url: &str) -> Result<Config, Error> {
+    parse(url).map_err(|e| {
+        // An `@` after the first `/` or `?` is most likely the end of a
+        // password holding an unescaped `/` or `?`: the URL was cut in
+        // the wrong place, and the message would quote a piece of the
+        // password as a port, a path or a parameter. Say what to fix
+        // instead, quoting nothing.
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return e;
+        };
+        let cut = rest.find(['/', '?']);
+        if matches!(scheme, "redis" | "rediss") && cut.is_some_and(|i| rest[i..].contains('@')) {
+            Error::config(
+                "the URL could not be read, and it has an @ after a / or ?: if the password (or \
+                 the user name) holds one of them, percent-encode it (/ as %2F, ? as %3F, @ as \
+                 %40)",
+            )
+        } else {
+            e
+        }
+    })
+}
+
+fn parse(url: &str) -> Result<Config, Error> {
     let (scheme, rest) = url.split_once("://").ok_or_else(|| {
         Error::config(
             "a connection URL starts with redis://, rediss:// or redis+unix://, as in \
@@ -506,6 +536,30 @@ mod tests {
             let e = Config::from_url(bad).unwrap_err();
             assert_eq!(e.kind(), crate::ErrorKind::Config, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_password_cut_short_by_an_unescaped_character_is_not_quoted() {
+        // Before, the password's pieces were quoted as a port, a path or a
+        // parameter name: `the port "pa" in the URL is not a number`.
+        for url in [
+            "redis://:pa/ss@cache:6379",
+            "redis://app:pa?ss@cache:6379",
+            "redis://:secret/9@cache/0",
+            "rediss://app:x?y@host",
+        ] {
+            let e = Config::from_url(url).unwrap_err().to_string();
+            assert!(e.contains("percent-encode"), "{url}: {e}");
+            for piece in ["pa", "ss", "secret", "9", "y"] {
+                assert!(!e.contains(&format!("\"{piece}")), "{url}: {e}");
+            }
+        }
+        // An @ in a parameter is fine when the URL reads.
+        let c = Config::from_url("redis://host?client-name=me@here").unwrap();
+        assert_eq!(c.client_name.as_deref(), Some("me@here"));
+        // Encoded, the same passwords work.
+        let c = Config::from_url("redis://app:pa%3Fss%2F@cache:6379").unwrap();
+        assert_eq!(c.password.as_deref(), Some("pa?ss/"));
     }
 
     #[test]

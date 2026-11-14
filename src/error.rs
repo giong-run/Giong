@@ -131,6 +131,20 @@ codes! {
     /// together, unless the process has `CAP_IPC_LOCK`. The kernel's error
     /// kind (`OutOfMemory`) is kept.
     LockedMemoryLimit = 10, OutOfMemory, "the locked-memory limit is used up";
+    /// Something that needs a giong worker, such as [`spawn`](crate::spawn),
+    /// [`sleep`](crate::time::sleep) or `TcpStream::connect`, was used on a
+    /// thread where no giong runtime runs: a plain thread, or another
+    /// runtime's executor. It panics with this code, since the call site is a
+    /// bug.
+    NotInRuntime = 11, Other, "not inside a giong runtime";
+    /// [`block_on`](crate::block_on) (or
+    /// [`Builder::block_on`](crate::Builder::block_on)) was called on a thread
+    /// where a giong runtime already runs, such as from inside a task. It
+    /// panics with this code.
+    RuntimeAlreadyRunning = 12, Other, "a runtime already runs on this thread";
+    /// A future that had started an I/O operation on one giong worker was
+    /// polled on another worker or runtime. It panics with this code.
+    WrongWorker = 13, Other, "an operation was polled on another worker";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
@@ -142,7 +156,10 @@ codes! {
     HostNotFound = 102, NotFound, "host not found";
     /// A list of addresses to connect or bind to was empty.
     NoAddresses = 103, InvalidInput, "no address to use";
-    /// `/etc/resolv.conf` names no DNS server.
+    /// There is no DNS server to ask:
+    /// [`ResolverConfig::nameservers`](crate::net::ResolverConfig::nameservers)
+    /// was given none. (Without a `nameserver` line, `/etc/resolv.conf`
+    /// means `127.0.0.1:53`, as in glibc.)
     NoDnsServer = 104, NotFound, "no DNS server configured";
     /// No DNS server answered in time.
     DnsTimeout = 105, TimedOut, "DNS server did not answer";
@@ -150,6 +167,14 @@ codes! {
     DnsServerFailure = 106, Other, "DNS server failed";
     /// A DNS server sent an answer that cannot be read.
     DnsBadResponse = 107, InvalidData, "malformed DNS answer";
+    /// The query could not even reach the DNS server: nothing listens at
+    /// its address (connection refused), or the network says the server is
+    /// unreachable. The kernel's error is the `source()`.
+    DnsServerUnreachable = 108, Other, "cannot reach the DNS server";
+    /// [`UdpSocket::read_from`](crate::net::UdpSocket::read_from) was given
+    /// a buffer with no capacity, into which a datagram would be received
+    /// and lost.
+    EmptyBuffer = 109, InvalidInput, "buffer with no room";
 
     // -------------------------------------------------------------- files
     /// A path contains a NUL byte, which Linux paths cannot.
@@ -157,6 +182,16 @@ codes! {
     /// [`TcpStream::send_file`](crate::net::TcpStream::send_file) was asked
     /// for bytes past the end of the file. What the file had was sent.
     FileTooShort = 201, UnexpectedEof, "the file ended before the bytes to send";
+    /// A file offset above `i64::MAX`, the largest Linux has, was passed to
+    /// [`File::read_at`](crate::fs::File::read_at) or
+    /// [`File::write_at`](crate::fs::File::write_at) and the other methods
+    /// that take one, or a range that ends above it to
+    /// [`File::allocate`](crate::fs::File::allocate).
+    OffsetOutOfRange = 202, InvalidInput, "file offset out of range";
+    /// [`OpenOptions`](crate::fs::OpenOptions) were given a combination
+    /// `open(2)` cannot do: no access mode, `truncate` or `create` without
+    /// `write`, or `append` with `truncate`. Nothing was opened.
+    InvalidOpenOptions = 203, InvalidInput, "invalid combination of open options";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not
