@@ -139,6 +139,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-tls (breaking)**: `TlsStream::write_all` takes any buffer giong can send
+  (`B: giong::IoBuf + AsRef<[u8]>`: `Vec<u8>`, `&'static [u8]`, `String`, `Box<[u8]>`,
+  `Rc<[u8]>`, `Arc<[u8]>`, ...) and hands it back, as `write_all_vectored` already did.
+  Callers that pass a `Vec<u8>` are unchanged.
+- **giong-tls (breaking)**: `TlsAcceptor::from_pem` no longer offers ALPN `http/1.1`. A
+  server that offered it refused, with `no_application_protocol`, every client that
+  offered ALPN without `http/1.1` (an h2-only client, any other protocol). Add it with
+  `.alpn(&[b"http/1.1"])` where it is wanted; giong-http's `serve_tls` sets its own.
+- **giong-tls (breaking)**: `TlsConnector::with_roots` with an empty store fails with
+  `ErrorKind::NotFound`, as `GIONG-E2001` does everywhere else, instead of `InvalidData`.
+- **giong-tls**: `shutdown()` sends the FIN on every path: in the process after a write
+  that failed it now closes the TCP side and returns `Ok`, as kernel TLS already did,
+  instead of failing before the FIN. After `shutdown()`, a write in the process fails
+  with `GIONG-E2008` (`TlsBroken`) instead of reaching rustls.
+- **giong-tls**: connections keep their traffic secrets extractable only when they may
+  be handed to the kernel (`Ktls::Auto` or `Required` on a kernel with the `tls`
+  module), not on every connection of a `Ktls::Auto` configuration.
+
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
   registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
   the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
@@ -163,6 +181,32 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
 
 ### Fixed
+
+- **giong-tls**: in the process, a TLS 1.2 AES-GCM connection whose key had sent 2^24
+  records went on returning `Ok` from `write_all` while rustls dropped the data and sent
+  `close_notify` in its place, so the peer saw a clean close and part of the data was
+  lost. The write that meets the limit now fails with `GIONG-E2012`, as under kernel
+  TLS, and so does every later one.
+- **giong-tls**: in the process, two tasks writing at once could interleave their records
+  on the wire (2 MiB from two writers arrived in four pieces). Each write now holds the
+  send side until it is all sent, as under kernel TLS; a `flush` waiting behind a writer
+  lets that writer carry its records.
+- **giong-tls**: each stream kept its outgoing record buffer at its largest size for its
+  whole life, about 64 KiB per connection after any write of 64 KiB or more. A buffer
+  larger than 16 KiB is now dropped once sent: 50 connection pairs keep 29 KB each after
+  a 1 MiB write, against 95 KB before (`tests/memory.rs`).
+- **giong-tls**: kernel TLS fails the connection with `unexpected_message`, as rustls
+  does, when the peer sends another record in the middle of a handshake message split
+  over records (RFC 8446, 5.1), instead of accepting it.
+- **giong-tls**: the handoff to kernel TLS tracks record boundaries from the bytes as
+  they arrive, instead of reading record headers back from the buffer that rustls
+  decrypts and joins in place. A peer that cut a message after its `Finished` over
+  three or more records could make the handoff read once too often or fail with "record
+  larger than TLS allows". Tested with a peer that cuts its records to 32 bytes.
+- **giong-tls**: the docs say that `Ktls::Auto` can still fail with `GIONG-E2010` if the
+  kernel refuses keys after the handshake (rustls has handed them over by then), that
+  only one task may receive at a time, and that `tcp()` is for addresses and socket
+  options only.
 
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes

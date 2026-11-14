@@ -66,7 +66,7 @@ fn main() -> std::io::Result<()> {
 
 | | |
 |---|---|
-| `TlsAcceptor::from_pem(cert, key)` | One certificate chain and its private key in PEM form. TLS 1.2 and 1.3, the default rustls cipher suites, no client authentication, ALPN `http/1.1`. |
+| `TlsAcceptor::from_pem(cert, key)` | One certificate chain and its private key in PEM form. TLS 1.2 and 1.3, the default rustls cipher suites, no client authentication, no ALPN (add it with `.alpn(..)`). |
 | `TlsAcceptor::new(config)` | Bring your own `rustls::ServerConfig` (several certificates by SNI, client authentication, other ALPN protocols). The crate re-exports `rustls` so that you use the matching version. |
 | `.handshake_timeout(duration)` | The longest a handshake may take, 10 s by default. |
 | `.ktls(Ktls::Auto)` | Kernel TLS: after the handshake the kernel encrypts and decrypts (see [below](#kernel-tls)). `Ktls::Off` by default. Also on `TlsConnector`. |
@@ -79,22 +79,23 @@ fn main() -> std::io::Result<()> {
 | `connector.connect(name, tcp)` | Runs the handshake, checking that the certificate is valid for `name` (a DNS name, sent through SNI, or an IP address). A certificate for another name, expired, or from an unknown authority fails with `InvalidData` and a message saying which. Clones of a connector share a session cache, so reconnecting resumes the session. |
 | `tls.recv()` | Decrypted data. An empty buffer means the peer closed. |
 | `tls.received_close_notify()` | Whether the peer ended the connection with `close_notify`. Without it, the TCP connection merely closed, which anyone on the path can cause: check it before trusting data that ends where the connection ends. |
-| `tls.write_all(buf)` | Encrypts and sends all of `buf`, then hands the buffer back, like `TcpStream::write_all`. |
+| `tls.write_all(buf)` | Encrypts and sends all of `buf` (a `Vec<u8>`, `Box<[u8]>`, `&'static [u8]`, ...), then hands the buffer back, like `TcpStream::write_all`. |
 | `tls.write_all_vectored(bufs)` | The same for several buffers in order (a header and a body), without copying them into one first. |
 | `tls.send_file(&file, offset, len)` | Sends a range of a `giong::fs::File`. With kernel TLS the kernel encrypts it straight from the page cache (`sendfile`), the fastest way to serve a file over TLS; otherwise it is read and encrypted in 256 KiB pieces. |
 | `tls.shutdown()` | Sends `close_notify`, then closes the sending direction. |
-| `tls.alpn_protocol()`, `tls.tcp()` | The protocol agreed through ALPN; the TCP socket underneath. |
+| `tls.alpn_protocol()`, `tls.tcp()` | The protocol agreed through ALPN; the TCP socket underneath, for its addresses and options only (sending or receiving on it would corrupt the TLS stream). |
 | `tls.peer_certificates()`, `tls.resumed()` | The certificate chain the other side presented; whether the handshake resumed an earlier session. |
 | `tls.is_ktls()` | Whether the kernel encrypts this connection. |
 | `giong_tls::ktls_support()`, `ktls_stats()` | What the running kernel can do for kernel TLS, in one line for a log; how many connections went to the kernel, stayed in the process, and changed keys. |
 
-Four things to remember:
+Things to remember:
 
 1. `recv()` is cancel safe: wrapping it in a `timeout` loses no data.
-2. `write_all()`, `write_all_vectored()` and `send_file()` are not. If the future is dropped in the middle of a TLS record, the record stream has been cut, so every later send returns an error instead of sending corrupt data. Data the peer already sent can still be received.
-3. One task may receive while another sends on the same `TlsStream`; records are never interleaved.
+2. `write_all()`, `write_all_vectored()` and `send_file()` are not. If the future is dropped in the middle of a TLS record, the record stream has been cut, so every later send returns an error instead of sending corrupt data. Data the peer already sent can still be received, and `shutdown()` still closes the TCP side.
+3. One task may receive while others send on the same `TlsStream`. Each write goes out whole: two tasks writing at once never interleave their data, in the process or with kernel TLS. Only one task may receive at a time.
 4. Data that arrived intact is always returned before an error that happened after it.
 5. An empty `recv()` is the end of the stream, with or without `close_notify`. If the end of the stream is what marks the end of your data (an HTTP response without a length), check `received_close_notify()`: otherwise someone on the path could cut the data short.
+6. A key encrypts at most 2^24 records with AES-GCM. TLS 1.3 then changes keys; TLS 1.2 cannot, so the connection sends `close_notify` and every later write fails with `GIONG-E2012`, in the process and with kernel TLS. Small writes reach the limit after 16.7 million of them: open a new connection then.
 
 ## Kernel TLS
 
@@ -117,7 +118,7 @@ fn main() -> std::io::Result<()> {
 | Mode | What it does |
 |---|---|
 | `Ktls::Off` | The default: rustls encrypts in the process. |
-| `Ktls::Auto` | The kernel takes a connection when it can do everything rustls would have done for it; otherwise the connection stays in the process. Never fails because of kTLS. |
+| `Ktls::Auto` | The kernel takes a connection when it can do everything rustls would have done for it; otherwise the connection stays in the process. Fails because of kTLS only if the kernel then refuses keys it said it would take (`GIONG-E2010`): by then the connection cannot go back to the process. |
 | `Ktls::Required` | The kernel takes every connection. `.ktls()` fails with `GIONG-E2009` if the kernel cannot, and so does a handshake on a stream that cannot be handed over. |
 
 What the kernel needs, checked once per process on throwaway loopback sockets (`ktls_support()` says what it found):
@@ -159,8 +160,8 @@ Reloading certificates while running (you can do it yourself through `ServerConf
 
 ## Tests
 
-`cargo test -p giong-tls --all-features`: 13 server tests on real sockets with a rustls client (TLS 1.2 and 1.3, 4 MB in each direction, a vectored write of a header, a large body and a trailer, a file read and encrypted in the process, ALPN, `recv` cancelled over and over, two tasks sending at once, a write cancelled half way, broken or stalled handshakes, records arriving one byte at a time, a forged record after the handshake, random bytes instead of a handshake, `close_notify` told apart from a cut connection); 14 client tests against giong's own server and a blocking rustls server (TLS 1.2 and 1.3 with 4 MB each way, a certificate for another name, an unknown authority, an IP address as the name, ALPN, mutual TLS with and without a client certificate, session resumption, a server that never answers or hangs up mid-handshake); 6 unit tests for finding the machine's certificates and parsing server names; 4 documentation examples.
+`cargo test -p giong-tls --all-features`: 15 server tests on real sockets with a rustls client (TLS 1.2 and 1.3, 4 MB in each direction, a vectored write of a header, a large body and a trailer, a file read and encrypted in the process, ALPN and a server from PEM that offers none, `recv` cancelled over and over, two tasks sending at once, a write cancelled half way and a shutdown after it, broken or stalled handshakes, records arriving one byte at a time, a forged record after the handshake, random bytes instead of a handshake, `close_notify` told apart from a cut connection); 2 tests in `tests/writes.rs` (three tasks writing 1 MiB each at once, plain and vectored, arrive whole and in order; a TLS 1.2 write past the cipher suite's record limit fails with `GIONG-E2012` instead of vanishing) and one in `tests/memory.rs` (after a 1 MiB write, a connection pair keeps less than 48 KiB more than before it); 14 client tests against giong's own server and a blocking rustls server (TLS 1.2 and 1.3 with 4 MB each way, a certificate for another name, an unknown authority, an IP address as the name, ALPN, mutual TLS with and without a client certificate, session resumption, a server that never answers or hangs up mid-handshake); 8 unit tests for finding the machine's certificates, parsing server names, spotting application data among records and when keys are extracted; 4 documentation examples.
 
-Kernel TLS has 19 tests in `tests/ktls.rs` and 8 unit tests in `src/ktls.rs`: every cipher suite with the kernel on the server, the client or both sides, with plain and vectored writes and files sent with `sendfile` (whole, a range, and past the file's end); interoperation with blocking rustls peers; data sent in the same write as the last handshake message; ALPN, peer certificates and session resumption (TLS 1.3 tickets arrive through the kernel) after the handoff; key updates from either peer, and a key used up (new keys on TLS 1.3 with Linux 6.14+, `close_notify` and `GIONG-E2012` otherwise); the TLS 1.2 nonces read off the wire, so the kernel never reuses one rustls used; a tampered record; alerts, renegotiation requests and records of unexpected types; `recv` cancelled over and over, a cancelled write, vectored write or file send, one task receiving while another sends; a stream already read with `recv`; and what `Auto` and `Required` do on a machine without the module. Most need the `tls` module and pass without it, saying so, unless `GIONG_KTLS_REQUIRED` is set; `KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63` runs them on real kernels in QEMU, with and without key updates (CI also runs Ubuntu's 6.8).
+Kernel TLS has 20 tests in `tests/ktls.rs`, one in `tests/writes.rs` and 8 unit tests in `src/ktls.rs`: every cipher suite with the kernel on the server, the client or both sides, with plain and vectored writes and files sent with `sendfile` (whole, a range, and past the file's end); interoperation with blocking rustls peers; data sent in the same write as the last handshake message; ALPN, peer certificates and session resumption (TLS 1.3 tickets arrive through the kernel) after the handoff; key updates from either peer, and a key used up (new keys on TLS 1.3 with Linux 6.14+, `close_notify` and `GIONG-E2012` otherwise); the TLS 1.2 nonces read off the wire, so the kernel never reuses one rustls used; a tampered record; alerts, renegotiation requests and records of unexpected types, also in the middle of a handshake message split over records; a peer that cuts its records to 32 bytes, so the handoff comes in the middle of a record; `recv` cancelled over and over, a cancelled write, vectored write or file send, one task receiving while another sends, and three tasks writing at once; a stream already read with `recv`; and what `Auto` and `Required` do on a machine without the module. Most need the `tls` module and pass without it, saying so, unless `GIONG_KTLS_REQUIRED` is set; `KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63` runs them on real kernels in QEMU, with and without key updates (CI also runs Ubuntu's 6.8).
 
 Twelve end-to-end HTTPS tests live in `giong-http` (`cargo test -p giong-http --features tls`).

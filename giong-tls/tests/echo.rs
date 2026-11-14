@@ -229,12 +229,35 @@ fn alpn_is_negotiated() {
         let _ = tls.write_all(alpn).await;
         let _ = tls.shutdown().await;
     }
-    with_server(c.acceptor, report, move |addr| {
+    let acceptor = c.acceptor.alpn(&[b"http/1.1"]);
+    with_server(acceptor, report, move |addr| {
         let mut client = connect(addr, &config);
         let mut got = Vec::new();
         client.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"http/1.1");
         assert_eq!(client.conn.alpn_protocol(), Some(&b"http/1.1"[..]));
+    });
+}
+
+#[test]
+fn from_pem_offers_no_alpn_so_any_client_protocol_is_accepted() {
+    let c = certs(rustls::ALL_VERSIONS);
+    let mut config = (*c.client).clone();
+    // An h2-only client (gRPC, say): a server offering only http/1.1 would
+    // refuse it with no_application_protocol.
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    let config = Arc::new(config);
+    async fn report(tls: TlsStream) {
+        let alpn = tls.alpn_protocol().unwrap_or_else(|| b"none".to_vec());
+        let _ = tls.write_all(alpn).await;
+        let _ = tls.shutdown().await;
+    }
+    with_server(c.acceptor, report, move |addr| {
+        let mut client = connect(addr, &config);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"none");
+        assert_eq!(client.conn.alpn_protocol(), None);
     });
 }
 
@@ -433,6 +456,47 @@ fn a_cancelled_write_poisons_the_connection_instead_of_corrupting_it() {
             ),
             "{err}"
         );
+    });
+}
+
+#[test]
+fn shutdown_after_a_cancelled_write_still_closes_the_connection() {
+    let (tx, rx) = mpsc::channel();
+    let c = certs(rustls::ALL_VERSIONS);
+    let config = c.client.clone();
+    let serve = move |tls: TlsStream| {
+        let tx = tx.clone();
+        async move {
+            let _ = tls.recv().await;
+            let big = vec![7u8; 64 << 20];
+            let cancelled = timeout(Duration::from_millis(100), tls.write_all(big))
+                .await
+                .is_err();
+            // No close_notify can follow a cut record, but the TCP side
+            // closes, while the stream itself stays open here.
+            let shutdown = tls.shutdown().await;
+            let _ = tx.send((cancelled, shutdown.is_ok()));
+            let _ = tls.recv().await;
+        }
+    };
+    with_server(c.acceptor, serve, move |addr| {
+        let mut client = connect(addr, &config);
+        client.write_all(b"x").unwrap();
+        client.flush().unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            (true, true)
+        );
+        let mut sink = vec![0u8; 1 << 20];
+        let err = loop {
+            match client.read(&mut sink) {
+                Ok(0) => panic!("a cut-off stream looked like a clean close"),
+                Ok(_) => {}
+                Err(e) => break e,
+            }
+        };
+        // Not a read timeout: the server's FIN arrived.
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
     });
 }
 

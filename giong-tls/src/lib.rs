@@ -201,6 +201,46 @@ fn handshake_eof() -> io::Error {
     )
 }
 
+/// Most capacity the scratch buffer for outgoing records keeps between
+/// writes. rustls hands over up to 64 KiB of records per call; a buffer that
+/// grew to that is dropped after the write instead of being kept for the
+/// connection's whole life (about 64 KiB per idle connection otherwise).
+const WIRE_KEPT: usize = 16 * 1024;
+
+/// `true` if `records`, whole TLS records as rustls writes them, hold one
+/// of application data (content type 23; under TLS 1.3 every encrypted
+/// record says so).
+fn has_application_data(records: &[u8]) -> bool {
+    let mut at = 0;
+    while let Some(header) = records.get(at..at + 5) {
+        if header[0] == 23 {
+            return true;
+        }
+        at += 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+    }
+    false
+}
+
+/// The error a send fails with once the sending direction has ended for
+/// `code`'s reason.
+fn sending_closed(code: Code) -> io::Error {
+    match code {
+        Code::TlsKeysExhausted => coded(
+            Code::TlsKeysExhausted,
+            "this connection has sent as many TLS records as its cipher allows under one key, \
+             and cannot change keys (TLS 1.2, or TLS 1.3 on a kernel older than 6.14); \
+             close_notify was sent",
+            "open a new connection. TLS 1.3 changes keys instead (in the process, and with \
+             kernel TLS on Linux 6.14 or newer).",
+        ),
+        _ => coded(
+            Code::TlsBroken,
+            "this TLS stream has been shut down or ended with an alert; nothing more can be sent",
+            "open a new connection.",
+        ),
+    }
+}
+
 fn broken() -> io::Error {
     coded(
         Code::TlsBroken,
@@ -247,17 +287,17 @@ impl TlsAcceptor {
 
     /// An acceptor for one certificate chain and its private key, both in PEM
     /// format. TLS 1.2 and 1.3 with rustls' default cipher suites, no client
-    /// authentication, and `http/1.1` offered through ALPN.
+    /// authentication, and no protocol offered through ALPN: set them with
+    /// [`alpn`](Self::alpn). (giong-http's `Server::serve_tls` sets its own.)
     pub fn from_pem(cert_chain: &[u8], private_key: &[u8]) -> io::Result<Self> {
         let certs = pem_certs(cert_chain)?;
         let key = PrivateKeyDer::from_pem_slice(private_key).map_err(bad_key)?;
-        let mut config = ServerConfig::builder_with_provider(ring())
+        let config = ServerConfig::builder_with_provider(ring())
             .with_safe_default_protocol_versions()
             .map_err(tls_error)?
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(mismatched_key)?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self::new(Arc::new(config)))
     }
 
@@ -294,7 +334,8 @@ impl TlsAcceptor {
     /// data (`max_early_data_size` above 0) cannot use kTLS.
     ///
     /// Turns on rustls' `enable_secret_extraction`, which kTLS needs, in this
-    /// acceptor's copy of the configuration.
+    /// acceptor's copy of the configuration, when connections will try the
+    /// kernel (not when `Auto` finds the kernel unable).
     ///
     /// ```no_run
     /// use giong_tls::{Ktls, TlsAcceptor};
@@ -308,8 +349,10 @@ impl TlsAcceptor {
     pub fn ktls(mut self, mode: Ktls) -> io::Result<Self> {
         let early_data = self.config.max_early_data_size > 0;
         self.ktls = ktls::Plan::new(mode, self.config.crypto_provider(), early_data)?;
-        if mode != Ktls::Off {
-            Arc::make_mut(&mut self.config).enable_secret_extraction = true;
+        // Extractable secrets only where they will be handed to the kernel.
+        let extract = self.ktls.tries();
+        if self.config.enable_secret_extraction != extract {
+            Arc::make_mut(&mut self.config).enable_secret_extraction = extract;
         }
         Ok(self)
     }
@@ -403,13 +446,10 @@ impl TlsConnector {
     /// and 1.3 with rustls' default cipher suites.
     pub fn with_roots(roots: RootCertStore) -> io::Result<Self> {
         if roots.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                giong::error::Error::new(
-                    Code::NoTrustedRoots,
-                    "no trusted certificate authority given",
-                    "pass at least one certificate, or use TlsConnector::with_system_roots.",
-                ),
+            return Err(coded(
+                Code::NoTrustedRoots,
+                "no trusted certificate authority given",
+                "pass at least one certificate, or use TlsConnector::with_system_roots.",
             ));
         }
         let config = ClientConfig::builder_with_provider(ring())
@@ -515,8 +555,9 @@ impl TlsConnector {
     pub fn ktls(mut self, mode: Ktls) -> io::Result<Self> {
         let early_data = self.config.enable_early_data;
         self.ktls = ktls::Plan::new(mode, self.config.crypto_provider(), early_data)?;
-        if mode != Ktls::Off {
-            Arc::make_mut(&mut self.config).enable_secret_extraction = true;
+        let extract = self.ktls.tries();
+        if self.config.enable_secret_extraction != extract {
+            Arc::make_mut(&mut self.config).enable_secret_extraction = extract;
         }
         Ok(self)
     }
@@ -708,19 +749,25 @@ pub struct TlsStream {
     engine: RefCell<Engine>,
     /// Decrypted data not handed out yet.
     plain: RefCell<Vec<u8>>,
-    /// Scratch buffer for outgoing TLS records, reused between writes.
+    /// Scratch buffer for outgoing TLS records, reused between writes while
+    /// it is small (see [`WIRE_KEPT`]).
     wire: RefCell<Vec<u8>>,
     /// The peer closed the connection (with or without `close_notify`).
     eof: Cell<bool>,
     /// The peer ended its side with a `close_notify` alert, so nothing it
     /// sent was cut off.
     close_notify: Cell<bool>,
-    /// A task is writing TLS records to the socket. Records must not
-    /// interleave, so other tasks wait for it in `waiters`.
+    /// A task is writing TLS records to the socket: one `write_all` (or
+    /// vectored write, or file) at a time, so that neither records nor two
+    /// tasks' data interleave. Other tasks wait for it in `waiters`.
     sending: Cell<bool>,
     /// A write to the socket failed or was cancelled half way: the record
     /// stream is cut in the middle and nothing more can be sent.
     broken: Cell<bool>,
+    /// The sending direction ended cleanly, and why: `TlsBroken` after
+    /// `shutdown` or a fatal alert, `TlsKeysExhausted` when the key may
+    /// encrypt no more records and cannot be changed.
+    closed: Cell<Option<Code>>,
     /// A receive error held back until the data before it has been handed out.
     failed: Cell<Option<io::Error>>,
     /// Tasks waiting for `sending` to clear.
@@ -760,10 +807,7 @@ impl Drop for Sending<'_> {
             self.stream.broken.set(true);
         }
         self.stream.sending.set(false);
-        let waiters = mem::take(&mut *self.stream.waiters.borrow_mut());
-        for waker in waiters {
-            waker.wake();
-        }
+        self.stream.wake_waiters();
     }
 }
 
@@ -789,6 +833,7 @@ impl TlsStream {
             close_notify: Cell::new(peer_closed),
             sending: Cell::new(false),
             broken: Cell::new(false),
+            closed: Cell::new(None),
             failed: Cell::new(None),
             waiters: RefCell::new(Vec::new()),
         }
@@ -861,7 +906,42 @@ impl TlsStream {
         }
     }
 
-    /// Sends every TLS record rustls has queued.
+    /// Wakes the tasks waiting for the send lock, or for their records to
+    /// be sent (see [`flush_tls`](Self::flush_tls)).
+    fn wake_waiters(&self) {
+        let waiters = mem::take(&mut *self.waiters.borrow_mut());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+
+    /// Takes the scratch buffer for outgoing records.
+    fn take_wire(&self) -> Vec<u8> {
+        mem::take(&mut *self.wire.borrow_mut())
+    }
+
+    /// Keeps `wire` for the next write, unless a large write grew it: a
+    /// connection that once sent a large response should not hold that much
+    /// for the rest of its life.
+    fn keep_wire(&self, mut wire: Vec<u8>) {
+        if wire.capacity() <= WIRE_KEPT {
+            wire.clear();
+            *self.wire.borrow_mut() = wire;
+        }
+    }
+
+    /// The error a send fails with before it starts, if the stream cannot
+    /// send any more.
+    fn cannot_send(&self) -> Option<io::Error> {
+        if self.broken.get() {
+            return Some(broken());
+        }
+        self.closed.get().map(sending_closed)
+    }
+
+    /// Sends every TLS record rustls has queued: handshake messages, key
+    /// updates, alerts. A task that is writing sends them with its own data
+    /// (see [`send_plain`](Self::send_plain)); this waits for it.
     async fn flush_tls(&self) -> io::Result<()> {
         loop {
             if !self.conn().wants_write() {
@@ -871,25 +951,114 @@ impl TlsStream {
                 return Err(broken());
             }
             if self.sending.get() {
-                // Another task is sending. Wait for it, then send what is
-                // left (it may already have sent this task's records too).
+                // The writer sends these records before its next piece of
+                // data, and wakes us then; or it finishes and frees the lock.
                 self.wait_for_sender().await;
                 continue;
             }
-            let mut wire = mem::take(&mut *self.wire.borrow_mut());
+            let sending = self.lock_send().await;
+            let mut wire = self.take_wire();
+            let res = self.send_queued(&mut wire).await;
+            self.keep_wire(wire);
+            sending.done();
+            res?;
+        }
+    }
+
+    /// Moves every record rustls has queued into `wire` and sends them. The
+    /// caller holds the send lock.
+    async fn send_queued(&self, wire: &mut Vec<u8>) -> io::Result<()> {
+        loop {
             {
                 let mut conn = self.conn();
+                if !conn.wants_write() {
+                    return Ok(());
+                }
                 while conn.wants_write() {
-                    conn.write_tls(&mut wire)?;
+                    conn.write_tls(wire)?;
                 }
             }
-            let sending = self.lock_send().await;
-            let (res, mut wire) = self.tcp.write_all(wire).await;
-            res?;
-            sending.done();
-            wire.clear();
-            *self.wire.borrow_mut() = wire;
+            self.send_wire(wire).await?;
         }
+    }
+
+    /// Writes all of `wire` to the socket and empties it, keeping its
+    /// capacity for the rest of this write. A failure may have cut a record
+    /// in two, so it marks the stream broken.
+    async fn send_wire(&self, wire: &mut Vec<u8>) -> io::Result<()> {
+        let (res, mut sent) = self.tcp.write_all(mem::take(wire)).await;
+        sent.clear();
+        *wire = sent;
+        if res.is_err() {
+            self.broken.set(true);
+        }
+        res
+    }
+
+    /// Encrypts all of `data` and sends it, in the process. The caller holds
+    /// the send lock.
+    ///
+    /// rustls takes up to its buffer limit (64 KiB) per call. Records a
+    /// receive queued in the meantime (a key update, an alert) go out first.
+    async fn send_plain(&self, wire: &mut Vec<u8>, data: &[u8]) -> io::Result<()> {
+        let mut sent = 0;
+        while sent < data.len() {
+            let (carried, refused) = {
+                let mut conn = self.conn();
+                while conn.wants_write() {
+                    conn.write_tls(wire)?;
+                }
+                let carried = !wire.is_empty();
+                let start = wire.len();
+                let n = conn.writer().write(&data[sent..])?;
+                while conn.wants_write() {
+                    conn.write_tls(wire)?;
+                }
+                sent += n;
+                // rustls took the bytes and encrypted none of them: the key
+                // has encrypted as many records as its cipher allows and,
+                // on TLS 1.2, cannot be changed. rustls queued close_notify
+                // instead and drops everything it is given from then on.
+                (carried, n > 0 && !has_application_data(&wire[start..]))
+            };
+            if !wire.is_empty() {
+                self.send_wire(wire).await?;
+            }
+            if carried {
+                // Receivers waiting in `flush_tls` for these records.
+                self.wake_waiters();
+            }
+            if refused {
+                self.closed.set(Some(Code::TlsKeysExhausted));
+                return Err(sending_closed(Code::TlsKeysExhausted));
+            }
+        }
+        Ok(())
+    }
+
+    /// One write in the process: `pieces` encrypted and sent in order,
+    /// holding the send lock throughout, so that no other task's write comes
+    /// between them.
+    async fn write_in_process(&self, pieces: &[&[u8]]) -> io::Result<()> {
+        let sending = self.lock_send().await;
+        if let Some(e) = self.cannot_send() {
+            sending.done();
+            return Err(e);
+        }
+        let mut wire = self.take_wire();
+        let mut res = Ok(());
+        for piece in pieces {
+            res = self.send_plain(&mut wire, piece).await;
+            if res.is_err() {
+                break;
+            }
+        }
+        self.keep_wire(wire);
+        // A failure on the socket has marked the stream broken already; one
+        // before anything was sent (rustls refusing the data, keys used up,
+        // a file read) leaves it whole.
+        sending.done();
+        res
     }
 
     /// Receives one chunk of TLS data, decrypts it into `plain`, and sends
@@ -976,7 +1145,9 @@ impl TlsStream {
     /// the rare moment a TLS protocol message is being sent, sending fails
     /// from then on instead of continuing on a broken stream.)
     ///
-    /// One task may receive while another one sends.
+    /// One task may receive while others send. Only one task may receive at
+    /// a time: like [`TcpStream::recv`], the stream wakes only the task that
+    /// waited last, so a second receiver can wait forever.
     pub async fn recv(&self) -> io::Result<Vec<u8>> {
         if self.is_ktls() {
             return self.kernel_recv().await;
@@ -1006,27 +1177,33 @@ impl TlsStream {
 
     /// Encrypts and sends all of `buf`, then hands the buffer back.
     ///
+    /// Takes any buffer giong can send, as [`TcpStream::write_all`] does:
+    /// a `Vec<u8>`, a `Box<[u8]>`, an `Rc<[u8]>`, a `&'static [u8]`, ...
+    ///
+    /// Each write goes out whole: another task's `write_all`,
+    /// [`write_all_vectored`](Self::write_all_vectored) or
+    /// [`send_file`](Self::send_file) on the same stream waits for it, and
+    /// their data never interleave.
+    ///
+    /// Fails with `TlsKeysExhausted` (`GIONG-E2012`) once the connection has
+    /// sent as many records as its cipher allows under one key and cannot
+    /// change keys (TLS 1.2 with AES-GCM after 2^24 records: rustls sends
+    /// `close_notify`, and nothing more can be sent); with `TlsBroken`
+    /// (`GIONG-E2008`) after [`shutdown`](Self::shutdown) or a failed write.
+    ///
     /// Not cancel safe: if the future is dropped, part of `buf` may have been
     /// sent, and if that happened in the middle of a TLS record the
     /// connection cannot send any more: later writes return an error, while
     /// data the peer already sent can still be received.
-    pub async fn write_all(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+    pub async fn write_all<B>(&self, buf: B) -> (io::Result<()>, B)
+    where
+        B: giong::IoBuf + AsRef<[u8]>,
+    {
         if self.is_ktls() {
             return self.kernel_write_all(buf).await;
         }
-        let mut sent = 0;
-        while sent < buf.len() {
-            // rustls accepts a bounded amount per call; send as it fills up.
-            let accepted = self.conn().writer().write(&buf[sent..]);
-            match accepted {
-                Ok(n) => sent += n,
-                Err(e) => return (Err(e), buf),
-            }
-            if let Err(e) = self.flush_tls().await {
-                return (Err(e), buf);
-            }
-        }
-        (Ok(()), buf)
+        let res = self.write_in_process(&[buf.as_ref()]).await;
+        (res, buf)
     }
 
     /// Encrypts and sends all of `bufs`, one after the other, without
@@ -1036,7 +1213,8 @@ impl TlsStream {
     /// buffers. In the process, rustls takes the pieces one by one, so a
     /// small header goes out in the same write as the start of the body;
     /// with kernel TLS they go to the kernel in vectored writes, as with
-    /// [`TcpStream::write_all_vectored`].
+    /// [`TcpStream::write_all_vectored`]. All of them go out as one write,
+    /// as with [`write_all`](Self::write_all), which also has the errors.
     ///
     /// Not cancel safe, as [`write_all`](Self::write_all).
     pub async fn write_all_vectored<B>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>)
@@ -1046,28 +1224,10 @@ impl TlsStream {
         if self.is_ktls() {
             return self.kernel_write_all_vectored(bufs).await;
         }
-        for buf in &bufs {
-            let buf = buf.as_ref();
-            let mut sent = 0;
-            while sent < buf.len() {
-                let accepted = self.conn().writer().write(&buf[sent..]);
-                match accepted {
-                    Ok(n) => sent += n,
-                    Err(e) => return (Err(e), bufs),
-                }
-                // rustls takes a bounded amount: send what it holds once it
-                // is full, and the rest at the end.
-                if sent < buf.len() {
-                    if let Err(e) = self.flush_tls().await {
-                        return (Err(e), bufs);
-                    }
-                }
-            }
-        }
-        match self.flush_tls().await {
-            Ok(()) => (Ok(()), bufs),
-            Err(e) => (Err(e), bufs),
-        }
+        let pieces: Vec<&[u8]> = bufs.iter().map(AsRef::as_ref).collect();
+        let res = self.write_in_process(&pieces).await;
+        drop(pieces);
+        (res, bufs)
     }
 
     /// Encrypts and sends `len` bytes of `file`, starting at `offset`.
@@ -1096,6 +1256,29 @@ impl TlsStream {
         if self.is_ktls() {
             return self.kernel_send_file(file, offset, len).await;
         }
+        let sending = self.lock_send().await;
+        if let Some(e) = self.cannot_send() {
+            sending.done();
+            return Err(e);
+        }
+        let mut wire = self.take_wire();
+        let res = self
+            .send_file_in_process(&mut wire, file, offset, len)
+            .await;
+        self.keep_wire(wire);
+        sending.done();
+        res
+    }
+
+    /// `send_file` in the process: read and encrypt the file in pieces. The
+    /// caller holds the send lock.
+    async fn send_file_in_process(
+        &self,
+        wire: &mut Vec<u8>,
+        file: &giong::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
         const PIECE: u64 = 256 * 1024;
         let mut buf = Vec::with_capacity(len.min(PIECE) as usize);
         let (mut at, mut left) = (offset, len);
@@ -1103,20 +1286,12 @@ impl TlsStream {
             let (res, b) = file.read_at(buf, at).await;
             buf = b;
             let n = match res {
-                Ok(0) => {
-                    self.flush_tls().await?;
-                    return Err(file_too_short(offset, len, at));
-                }
+                Ok(0) => return Err(file_too_short(offset, len, at)),
                 Ok(n) => (n as u64).min(left) as usize,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            let mut sent = 0;
-            while sent < n {
-                let accepted = self.conn().writer().write(&buf[sent..n]);
-                sent += accepted?;
-                self.flush_tls().await?;
-            }
+            self.send_plain(wire, &buf[..n]).await?;
             at += n as u64;
             left -= n as u64;
         }
@@ -1124,12 +1299,30 @@ impl TlsStream {
     }
 
     /// Sends the TLS `close_notify` alert and closes the sending direction.
+    ///
+    /// Waits for a write in progress. After that, writes fail with
+    /// `TlsBroken` (`GIONG-E2008`). On a stream that can no longer send (a
+    /// failed or cancelled write, keys used up, a second `shutdown`), only
+    /// the TCP sending direction is closed, with no alert.
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_ktls() {
             return self.kernel_shutdown().await;
         }
-        self.conn().send_close_notify();
-        self.flush_tls().await?;
+        let sending = self.lock_send().await;
+        if self.cannot_send().is_none() {
+            self.conn().send_close_notify();
+            self.closed.set(Some(Code::TlsBroken));
+            let mut wire = self.take_wire();
+            let res = self.send_queued(&mut wire).await;
+            self.keep_wire(wire);
+            if let Err(e) = res {
+                // Close the TCP side anyway, so the peer is not left waiting.
+                sending.done();
+                let _ = self.tcp.shutdown(Shutdown::Write);
+                return Err(e);
+            }
+        }
+        sending.done();
         self.tcp.shutdown(Shutdown::Write)
     }
 
@@ -1170,7 +1363,12 @@ impl TlsStream {
         }
     }
 
-    /// The underlying TCP connection.
+    /// The underlying TCP connection, for its addresses and socket options
+    /// (`peer_addr`, `set_nodelay`, ...).
+    ///
+    /// Do not send or receive on it: in the process that corrupts the TLS
+    /// record stream, and under kernel TLS it bypasses the record limits
+    /// and the ordering of writes this type keeps.
     pub fn tcp(&self) -> &TcpStream {
         &self.tcp
     }
@@ -1287,6 +1485,47 @@ mod tests {
         assert!(err.to_string().contains("webpki-roots"), "{err}");
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(empty).unwrap();
+    }
+
+    #[test]
+    fn records_are_scanned_for_application_data() {
+        // Header: type, version, length; then that many bytes.
+        let record = |typ: u8, len: u16| {
+            let mut r = vec![typ, 3, 3];
+            r.extend_from_slice(&len.to_be_bytes());
+            r.resize(5 + len as usize, 0xAA);
+            r
+        };
+        assert!(!has_application_data(&[]));
+        assert!(!has_application_data(&record(21, 26)));
+        assert!(has_application_data(&record(23, 0)));
+        let mut alert_then_data = record(21, 26);
+        alert_then_data.extend(record(23, 300));
+        assert!(has_application_data(&alert_then_data));
+        // A data record's body never counts as a header.
+        let mut alert = record(21, 26);
+        alert[5] = 23;
+        assert!(!has_application_data(&alert));
+    }
+
+    #[test]
+    fn secrets_are_extractable_only_when_the_kernel_will_take_them() {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
+        for mode in [Ktls::Off, Ktls::Auto] {
+            let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes())
+                .unwrap()
+                .ktls(mode)
+                .unwrap();
+            let tries = acceptor.ktls.tries();
+            assert_eq!(acceptor.config.enable_secret_extraction, tries, "{mode:?}");
+            let connector = TlsConnector::with_root_pem(cert.as_bytes())
+                .unwrap()
+                .ktls(mode)
+                .unwrap();
+            let tries = connector.ktls.tries();
+            assert_eq!(connector.config.enable_secret_extraction, tries, "{mode:?}");
+        }
     }
 
     #[test]
