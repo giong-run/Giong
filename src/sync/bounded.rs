@@ -8,7 +8,7 @@ use std::future::poll_fn;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
-use super::mpsc::SendError;
+use super::mpsc::{SendError, TryRecvError};
 
 struct State<T> {
     queue: VecDeque<T>,
@@ -330,16 +330,22 @@ impl<T> BoundedReceiver<T> {
         value
     }
 
-    /// Takes a value if one is queued, without waiting.
-    pub fn try_recv(&mut self) -> Option<T> {
+    /// Takes a value if one is queued, without waiting for one. Fails with
+    /// [`TryRecvError::Empty`] if none is, and with [`TryRecvError::Closed`]
+    /// once every sender is gone and the channel is empty, when
+    /// [`recv`](Self::recv) would return `None`.
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         let mut wake = Vec::new();
         let value = {
             let mut state = self.shared.lock();
-            let value = state.queue.pop_front();
-            if value.is_some() {
-                state.grant(&mut wake);
+            match state.queue.pop_front() {
+                Some(value) => {
+                    state.grant(&mut wake);
+                    Ok(value)
+                }
+                None if state.senders == 0 => Err(TryRecvError::Closed),
+                None => Err(TryRecvError::Empty),
             }
-            value
         };
         wake_all(wake);
         value

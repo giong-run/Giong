@@ -1,0 +1,32 @@
+[package]
+name = "giong-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+giong = { path = ".." }
+
+# Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
+[workspace]
+
+[[bin]]
+name = "dns_response"
+path = "fuzz_targets/dns_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resolv_conf"
+path = "fuzz_targets/resolv_conf.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

@@ -134,6 +134,45 @@ fn reads_and_writes_name_their_offset() {
 }
 
 #[test]
+fn offsets_above_i64_max_are_refused_on_every_driver() {
+    // io_uring reads an offset of u64::MAX as "the current file position":
+    // read_at and write_at used to read and write wherever that was, on
+    // io_uring only.
+    let dir = TempDir::new("offsets");
+    let path = dir.path("digits");
+    std::fs::write(&path, b"0123456789").unwrap();
+    giong::block_on(async move {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        let is_range_error = |e: &std::io::Error| {
+            giong::error::code(e) == Some(giong::error::Code::OffsetOutOfRange)
+        };
+        for offset in [u64::MAX, i64::MAX as u64 + 1] {
+            let (res, buf) = file.read_at(Vec::with_capacity(4), offset).await;
+            assert!(is_range_error(&res.unwrap_err()), "read_at({offset})");
+            assert!(buf.is_empty());
+            let (res, _) = file.write_at(&b"XY"[..], offset).await;
+            assert!(is_range_error(&res.unwrap_err()), "write_at({offset})");
+            let (res, _) = file.write_all_at(&b"XY"[..], offset).await;
+            assert!(is_range_error(&res.unwrap_err()), "write_all_at({offset})");
+        }
+        // Nothing moved or changed: the file and its position are as they were.
+        let (res, buf) = file.read_at(Vec::with_capacity(16), 0).await;
+        assert_eq!((res.unwrap(), &buf[..]), (10, &b"0123456789"[..]));
+        // Offsets up to the largest are passed on (a read there finds the end).
+        let (res, _) = file
+            .read_at(Vec::with_capacity(4), i64::MAX as u64 - 4)
+            .await;
+        assert_eq!(res.unwrap(), 0);
+    });
+    assert_eq!(std::fs::read(dir.path("digits")).unwrap(), b"0123456789");
+}
+
+#[test]
 fn open_options_behave_like_the_standard_library() {
     let dir = TempDir::new("options");
     giong::block_on(async {

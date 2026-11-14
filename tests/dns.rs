@@ -295,6 +295,33 @@ fn a_failing_server_is_an_error_not_a_missing_name() {
 }
 
 #[test]
+fn a_server_nobody_listens_on_is_a_coded_error() {
+    // A DNS server address where nothing listens: the query's connected UDP
+    // socket gets "connection refused". That used to come back bare, so a
+    // failed connect("db.internal:5432") read as if the database refused.
+    let (_refusing, server) = common::refusing_udp_addr();
+    giong::block_on(async {
+        let r = Resolver::new(
+            ResolverConfig::parse("", "")
+                .nameservers([server])
+                .attempts(1),
+        );
+        let err = r.lookup_ip("db.internal").await.unwrap_err();
+        assert_eq!(code(&err), Some(Code::DnsServerUnreachable), "{err}");
+        let message = err.to_string();
+        assert!(message.contains(&server.to_string()), "{message}");
+        assert!(message.contains("db.internal"), "{message}");
+        assert_ne!(err.kind(), ErrorKind::ConnectionRefused);
+        // The kernel's error is kept as the source.
+        let source = std::error::Error::source(&err).expect("a source");
+        let os = source
+            .downcast_ref::<std::io::Error>()
+            .expect("an io::Error");
+        assert_eq!(os.kind(), ErrorKind::ConnectionRefused);
+    });
+}
+
+#[test]
 fn a_silent_server_is_skipped_for_the_next_one() {
     let dns = FakeDns::start(vec![(
         ("up.test", A),
@@ -437,6 +464,30 @@ fn localhost_names_never_reach_dns() {
         // A name that merely ends in "localhost" is an ordinary name.
         let err = r.lookup_ip("notlocalhost").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound, "{err}");
+    });
+}
+
+#[test]
+fn addresses_without_a_port_or_brackets_say_how_to_write_them() {
+    giong::block_on(async {
+        for (text, hint) in [
+            ("10.0.0.5", "\"10.0.0.5:8080\""),
+            ("::1", "\"[::1]:8080\""),
+            // Itself an IPv6 address: the port has to go after brackets.
+            ("2001:db8::1:8080", "\"[2001:db8::1:8080]:8080\""),
+            ("fe80::1%eth0:8080", "brackets"),
+        ] {
+            let Err(err) = TcpStream::connect(text).await else {
+                panic!("{text} connected");
+            };
+            assert_eq!(code(&err), Some(Code::InvalidAddress), "{text}: {err}");
+            assert!(err.to_string().contains(hint), "{text}: {err}");
+        }
+        // Written properly, they parse (and are refused or reached as usual).
+        assert!(TcpStream::connect("[::1]:1")
+            .await
+            .err()
+            .map_or(true, |e| code(&e).is_none()));
     });
 }
 

@@ -1,9 +1,10 @@
 name: Fuzz
 
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
-# bytes from the network: giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and
-# client, giong-web's router and request handling, and the PostgreSQL, MySQL
-# and Redis protocol readers. Every night each target runs for 10 minutes
+# bytes from the network: giong's DNS answers (and resolv.conf and hosts),
+# giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and client, giong-web's
+# router and request handling, and the PostgreSQL, MySQL and Redis protocol
+# readers. Every night each target runs for 10 minutes
 # and its corpus is kept in the Actions cache, so the corpus keeps growing; pull
 # requests that touch these crates get a short run of each target. A crash fails
 # the job and uploads the input that caused it.
@@ -19,6 +20,7 @@ on:
       - "giong-redis/**"
       - "giong-web/**"
       - "src/**"
+      - "fuzz/**"
       - ".github/workflows/fuzz.yml"
   workflow_dispatch:
     inputs:
@@ -40,6 +42,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `dir` is where the crate's fuzz/ directory is, when not in `crate/`.
+          # `flags` adds libFuzzer options: DNS answers over TCP reach 64 KiB,
+          # and one must never take long to parse (it would freeze a worker).
+          - { crate: giong, dir: ., target: dns_response, flags: "-max_len=65538 -timeout=2" }
+          - { crate: giong, dir: ., target: resolv_conf }
           - { crate: giong-http, target: head }
           - { crate: giong-http, target: chunked }
           - { crate: giong-http, target: connection }
@@ -73,31 +80,31 @@ jobs:
       - name: Restore the corpus
         uses: actions/cache/restore@v4
         with:
-          path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          path: ${{ matrix.dir || matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-
       - name: Fuzz
-        working-directory: ${{ matrix.crate }}
+        working-directory: ${{ matrix.dir || matrix.crate }}
         env:
           SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
-            -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
+            -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1 ${{ matrix.flags }}
       - name: Shrink the corpus
         if: success() && github.event_name != 'pull_request'
-        working-directory: ${{ matrix.crate }}
+        working-directory: ${{ matrix.dir || matrix.crate }}
         run: |
           cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
       - name: Save the corpus
         if: success() && github.event_name != 'pull_request'
         uses: actions/cache/save@v4
         with:
-          path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          path: ${{ matrix.dir || matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
       - name: Upload the crashing input
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts-${{ matrix.crate }}-${{ matrix.target }}
-          path: ${{ matrix.crate }}/fuzz/artifacts/${{ matrix.target }}
+          path: ${{ matrix.dir || matrix.crate }}/fuzz/artifacts/${{ matrix.target }}

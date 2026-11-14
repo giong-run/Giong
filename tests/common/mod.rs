@@ -39,3 +39,22 @@ pub fn shared_port() -> (Socket, u16) {
     let port = socket.local_addr().unwrap().as_socket().unwrap().port();
     (socket, port)
 }
+
+/// An address on 127.0.0.1 where a UDP datagram is refused (the kernel
+/// answers with "port unreachable"), for as long as the returned socket
+/// lives.
+///
+/// The socket holds the port, so no other test can bind it, and is
+/// connected elsewhere: a connected UDP socket only takes datagrams from its
+/// peer, so for anyone else nothing listens on the port.
+pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+    socket
+        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    socket
+        .connect(&SocketAddr::from(([127, 0, 0, 1], 9)).into())
+        .unwrap();
+    let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    (socket, addr)
+}

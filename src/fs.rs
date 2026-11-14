@@ -150,7 +150,10 @@ impl OpenOptions {
         self
     }
 
-    /// Extra `open(2)` flags, for example `libc::O_DIRECT`.
+    /// Extra `open(2)` flags, for example `libc::O_DIRECT`. The access mode
+    /// bits (`O_RDONLY`, `O_WRONLY`, `O_RDWR`) are ignored: they come from
+    /// [`read`](Self::read), [`write`](Self::write) and
+    /// [`append`](Self::append), as in the standard library.
     pub fn custom_flags(mut self, flags: i32) -> Self {
         self.custom_flags = flags;
         self
@@ -180,7 +183,10 @@ impl OpenOptions {
             (false, true, false) => libc::O_TRUNC,
             (true, true, false) => libc::O_CREAT | libc::O_TRUNC,
         };
-        Ok(access | creation | libc::O_CLOEXEC | self.custom_flags)
+        // The access mode comes from read/write/append alone, as in the
+        // standard library: custom flags cannot turn a read-only open into a
+        // writable one.
+        Ok(access | creation | libc::O_CLOEXEC | (self.custom_flags & !libc::O_ACCMODE))
     }
 
     /// Opens `path` with these options.
@@ -201,6 +207,30 @@ impl Default for OpenOptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Refuses an offset Linux cannot take. io_uring reads `u64::MAX` (-1) as
+/// "the file's current position", so without this check such an offset would
+/// read or write wherever the descriptor's position happens to be on
+/// io_uring, and fail with `EINVAL` on epoll.
+fn check_offset(offset: u64) -> io::Result<()> {
+    if offset > i64::MAX as u64 {
+        return Err(offset_out_of_range(offset));
+    }
+    Ok(())
+}
+
+#[cold]
+fn offset_out_of_range(offset: u64) -> io::Error {
+    raise(
+        Code::OffsetOutOfRange,
+        format!(
+            "file offset {offset} is above {}, the largest Linux has",
+            i64::MAX
+        ),
+        "check the arithmetic that computed the offset for a wrap-around. To write at the end \
+         of a file, open it with OpenOptions::append(true).",
+    )
 }
 
 /// An open file.
@@ -256,7 +286,13 @@ impl File {
     /// is a pipe or a device, a read that is dropped while in flight may
     /// still take data that arrives before the kernel has processed the
     /// cancellation, and that data is lost.
+    ///
+    /// Fails with `GIONG-E0202` if `offset` is above `i64::MAX`, the largest
+    /// file offset Linux has.
     pub async fn read_at<B: IoBufMut>(&self, mut buf: B, offset: u64) -> (io::Result<usize>, B) {
+        if let Err(e) = check_offset(offset) {
+            return (Err(e), buf);
+        }
         let len = buf.capacity().min(u32::MAX as usize) as u32;
         let io = Io::Read {
             fd: self.fd,
@@ -275,6 +311,9 @@ impl File {
 
     /// Writes some bytes of `buf` at `offset`, returning how many were
     /// written.
+    ///
+    /// Fails with `GIONG-E0202` if `offset` is above `i64::MAX`, the largest
+    /// file offset Linux has.
     pub async fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> (io::Result<usize>, B) {
         self.write_from(buf, 0, offset).await
     }
@@ -284,7 +323,10 @@ impl File {
     pub async fn write_all_at<B: IoBuf>(&self, mut buf: B, offset: u64) -> (io::Result<()>, B) {
         let mut written = 0;
         while written < buf.len() {
-            let (res, b) = self.write_from(buf, written, offset + written as u64).await;
+            let Some(at) = offset.checked_add(written as u64) else {
+                return (Err(offset_out_of_range(offset)), buf);
+            };
+            let (res, b) = self.write_from(buf, written, at).await;
             buf = b;
             match res {
                 Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
@@ -303,6 +345,9 @@ impl File {
         offset: u64,
     ) -> (io::Result<usize>, B) {
         debug_assert!(skip <= buf.len());
+        if let Err(e) = check_offset(offset) {
+            return (Err(e), buf);
+        }
         let len = (buf.len() - skip).min(u32::MAX as usize) as u32;
         // SAFETY: `skip <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(skip) };

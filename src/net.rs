@@ -15,7 +15,7 @@
 
 mod addr;
 mod balance;
-mod dns;
+pub(crate) mod dns;
 mod udp;
 mod unix;
 
