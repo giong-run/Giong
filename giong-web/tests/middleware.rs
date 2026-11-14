@@ -56,7 +56,7 @@ fn request_ids_reach_the_response_the_error_body_and_the_handler() {
         .build(());
     let resp = get(&app, "/id", "");
     let id = resp.get_header("x-request-id").unwrap().to_string();
-    assert_eq!(id.len(), 20);
+    assert_eq!(id.len(), 32);
     assert_eq!(body(&resp), id);
     let other = get(&app, "/id", "")
         .get_header("x-request-id")
@@ -150,6 +150,33 @@ fn the_logger_can_include_the_query_string() {
         .build(());
     get(&app, "/s?q=rust", "");
     assert!(lines.borrow()[0].contains("\"query\":\"q=rust\""));
+}
+
+#[test]
+fn the_logger_cuts_a_long_path_and_query_with_a_marker() {
+    let (sink, lines) = memory();
+    let app = Router::new()
+        .get("/s", ok)
+        .layer(Logger::new(sink).include_query(true))
+        .build(());
+    let path = format!("/{}", "a".repeat(20_000));
+    let query = format!("q={}", "b".repeat(10_000));
+    get(&app, &format!("{path}?{query}"), "");
+    get(&app, &format!("/s?{query}"), "");
+
+    let lines = lines.borrow();
+    let field = |line: &str, name: &str| -> String {
+        let start = line.find(&format!("\"{name}\":\"")).unwrap() + name.len() + 4;
+        let len = line[start..].find('"').unwrap();
+        line[start..start + len].to_string()
+    };
+    assert!(lines[0].contains("\"status\":404"), "{}", &lines[0][..200]);
+    let logged = field(&lines[0], "path");
+    assert_eq!(logged, format!("{}...(+15905 bytes)", &path[..4096]));
+    let logged = field(&lines[1], "query");
+    assert_eq!(logged, format!("{}...(+5906 bytes)", &query[..4096]));
+    assert_eq!(field(&lines[1], "path"), "/s");
+    assert!(lines.iter().all(|l| l.len() < 10_000));
 }
 
 #[test]
@@ -501,11 +528,17 @@ fn compression_gzips_text_for_clients_that_accept_it() {
     assert_eq!(resp.get_header("etag"), Some("\"v1\""));
     assert_eq!(body(&resp), json);
 
-    let resp = send(
+    // HEAD gets the header fields GET would get (RFC 9110, section 9.3.2):
+    // the server sends the length of the body it keeps and leaves the body out.
+    let got = get(&app, "/users", "Accept-Encoding: gzip\r\n");
+    let head = send(
         &app,
         "HEAD /users HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n",
     );
-    assert_eq!(resp.get_header("content-encoding"), None);
+    for name in ["content-encoding", "vary", "etag", "content-type"] {
+        assert_eq!(head.get_header(name), got.get_header(name), "HEAD {name}");
+    }
+    assert_eq!(head.body_bytes().len(), got.body_bytes().len());
 
     for path in ["/small", "/png", "/done", "/no-transform"] {
         let resp = get(&app, path, "Accept-Encoding: gzip\r\n");

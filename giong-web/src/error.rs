@@ -50,7 +50,7 @@ use crate::req::IdBuf;
 /// with `Content-Type: application/problem+json`:
 ///
 /// ```json
-/// {"status":404,"code":"user_not_found","title":"Not Found","detail":"no user has id 0","request_id":"5f3a9c2e01000000002a"}
+/// {"status":404,"code":"user_not_found","title":"Not Found","detail":"no user has id 0","request_id":"5f3a9c2e8b41d706000100000000002a"}
 /// ```
 ///
 /// `request_id` is there when the [`RequestId`](crate::middleware::RequestId)

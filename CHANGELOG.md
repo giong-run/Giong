@@ -176,6 +176,23 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   gives the error back without it. The docs say which form takes which values, and
   explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
   (takes JSON already written).
+- **giong-web**, **Breaking**: request ids made by `RequestId` are 32 hexadecimal digits
+  instead of 20: 64 random bits per process instead of 32, 16 bits for the worker instead
+  of 8, then a 48-bit counter. With 32 random bits, two processes of a fleet shared ids
+  with even odds after about 77,000 starts, and workers above 256 shared them within a
+  process. Code that checks an id's length, or a column sized for it, needs the new one.
+- **giong-web**: `Logger` cuts a path or query string longer than 4 KiB in its lines,
+  ending `...(+N bytes)`. Sixteen requests with a 64 KiB path filled a worker's 1 MiB
+  log buffer, and the lines after them were dropped.
+- **giong-web**: the log writer shrinks a worker's buffer back to 64 KiB once written,
+  instead of keeping the memory of a burst (up to 1 MiB per worker and stream), and
+  removes the buffer of a thread that ended, after writing its last lines, instead of
+  keeping one per thread that ever logged.
+- **giong-web**: the `Timeout` docs no longer say that every giong operation is safe to
+  cancel: dropping is memory-safe, the database and HTTP clients close a connection whose
+  request was abandoned, and some I/O (a vectored write, `send_file`) may be cut halfway.
+  They show how to limit the work a streaming route does once its body is in, which
+  `Timeout` does not cover.
 
 ### Fixed
 
@@ -256,6 +273,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   code is now looked for down the whole `source()` chain, by type for giong's own errors
   and by message only for the companion crates' error types, never in an `io::Error`'s
   text.
+- **giong-web**: `Compression` answered `HEAD` without `Content-Encoding: gzip` and with
+  the uncompressed `Content-Length`, while `GET` got the compressed ones; RFC 9110 asks
+  for the same header fields. `HEAD` is now compressed like `GET`, and the server sends
+  the compressed length without the body.
 
 ## [0.4.0] - 2026-11-13
 
