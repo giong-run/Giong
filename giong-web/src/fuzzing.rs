@@ -222,9 +222,21 @@ pub(crate) mod app {
         } else if status == 200 && method == "POST" && path == "/api/echo" {
             assert_eq!(plain, body, "{what}: the echo differs");
         } else if status == 200 && method == "POST" && path == "/api/json" {
+            // The app read the body with serde_json and answered with `json()`,
+            // so the answer is that value as serde_json writes it. The value
+            // read back from the answer is not compared with the one sent:
+            // without serde_json's `float_roundtrip` a number can come back one
+            // unit in the last place away (`2e-75` reads as
+            // 2.0000000000000002e-75, which is written that way and reads back
+            // as 2e-75).
             let sent: Value = serde_json::from_slice(&body).expect("the app accepted it");
-            let back: Value = serde_json::from_slice(&plain).expect("json() writes JSON");
-            assert_eq!(sent, back, "{what}");
+            let _: Value = serde_json::from_slice(&plain).expect("json() writes JSON");
+            let expected = serde_json::to_vec(&sent).expect("a Value can be written");
+            assert_eq!(
+                String::from_utf8_lossy(&plain),
+                String::from_utf8_lossy(&expected),
+                "{what}"
+            );
         } else if status == 201 {
             let sent: Item = serde_json::from_slice(&body).expect("the app accepted it");
             let back: Item = serde_json::from_slice(&plain).expect("json() writes JSON");
