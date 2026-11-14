@@ -784,7 +784,9 @@ Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/sysc
 `bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
 `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh` and `bench/compat.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
-Recorded output is in `bench/results/`.
+Recorded output is in `bench/results/`. A change of a percent or two per request is below
+the noise of these runs; `bench/instructions.sh` counts the server's instructions per
+request with callgrind instead, which repeats within 0.1%.
 
 ## Testing and safety
 

@@ -19,10 +19,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   zero-copy, so a write is 8 bytes larger than in 0.4 and an idle HTTP/2 connection costs
   4.33 KiB (5,000 idle connections, 1 worker, RSS, `bench/giong-http` with
   `bench/hold h2-idle`, on a 4-core VM; the bare-metal pass measured 3.99 and 4.21 KiB
-  before and after). The same change takes back 100 of the 140 instructions that
-  zero-copy send had added to each small HTTPS request (`/json` over rustls, counted
-  with callgrind: 15,575 before it, 15,715 with it, 15,613 now), the largest part of
-  the 2% fewer such requests the bare-metal pass measured.
+  before and after). The same change takes back most of the instructions zero-copy
+  send had added to each small request: over rustls 15,571 before it, 15,711 with it,
+  15,612 now; over HTTP/2 20,480, 20,741, 20,468 (`/json`, counted by the new
+  `bench/instructions.sh`, results in `bench/results/instructions/`). That was the
+  largest part of the 2% fewer small HTTPS requests the bare-metal pass measured.
 
 ## [0.5.0] - 2026-11-14
 

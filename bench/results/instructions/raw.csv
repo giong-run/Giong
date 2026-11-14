@@ -1,0 +1,10 @@
+binary,endpoint,requests,instructions_per_request
+e3e1ac5 (before zero-copy send),json-tls,20000,15571
+e3e1ac5 (before zero-copy send),json,20000,9109
+e3e1ac5 (before zero-copy send),json-h2,20000,20480
+d5a0b0c (zero-copy send; 0.5.0),json-tls,20000,15711
+d5a0b0c (zero-copy send; 0.5.0),json,20000,9201
+d5a0b0c (zero-copy send; 0.5.0),json-h2,20000,20741
+perf/write-future-size,json-tls,20000,15612
+perf/write-future-size,json,20000,9144
+perf/write-future-size,json-h2,20000,20468
