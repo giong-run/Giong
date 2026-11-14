@@ -342,6 +342,7 @@ impl UdpSocket {
             fd: self.sock.as_raw_fd(),
             msg: &msg.hdr,
             flags: libc::MSG_NOSIGNAL as u32,
+            zero_copy: false,
         };
         let (res, _, (_msg, buf)) = Op::new(io, (msg, buf)).await;
         if res < 0 {
@@ -360,6 +361,7 @@ impl UdpSocket {
             buf: buf.as_ptr(),
             len,
             flags: libc::MSG_NOSIGNAL,
+            zero_copy: false,
         };
         let (res, _, buf) = Op::new(io, buf).await;
         if res < 0 {
