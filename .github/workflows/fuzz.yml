@@ -57,6 +57,7 @@ jobs:
           - { crate: giong-mysql, target: rows }
           - { crate: giong-mysql, target: url }
           - { crate: giong-redis, target: replies }
+          - { crate: giong-redis, target: connection }
           - { crate: giong-redis, target: url }
           - { crate: giong-web, target: routes }
           - { crate: giong-web, target: request }

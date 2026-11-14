@@ -94,7 +94,7 @@ cargo +nightly fuzz run h2             # a whole HTTP/2 connection, the server's
 cargo +nightly fuzz run h2_client      # the client's side of HTTP/2
 cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
 cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
-cd ../giong-redis && cargo +nightly fuzz run replies       # also: url
+cd ../giong-redis && cargo +nightly fuzz run replies       # also: connection, url
 cd ../giong-web && cargo +nightly fuzz run request         # also: routes
 ```
 
