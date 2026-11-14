@@ -19,8 +19,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
   the buffer is full or when a read waits; a partly read chunk never holds the worker's
   receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
-  through `AsyncBufRead`), measured by `bench/compat.sh`. Errors `GIONG-E1401` (an earlier
-  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting).
+  through `AsyncBufRead`), measured by `bench/compat.sh` in four sessions (sending 10–20%
+  slower, receiving with `read` 6–13% more CPU per byte). Errors `GIONG-E1401` (an earlier
+  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting). A
+  hyper server over `Compat` needs a `hyper::rt::Timer` for its header timeout; the README
+  shows one built on giong's timers.
 - **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
   for futures written by hand and for adapters such as giong-compat.
 - **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
