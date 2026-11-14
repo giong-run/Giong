@@ -79,6 +79,28 @@ pub mod mpsc {
 
     impl<T> std::error::Error for SendError<T> {}
 
+    /// Why [`Receiver::try_recv`] or [`BoundedReceiver::try_recv`] returned
+    /// no value.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TryRecvError {
+        /// No value is waiting; a sender is still alive.
+        Empty,
+        /// Every sender is gone and every value has been received: no value
+        /// will ever come.
+        Closed,
+    }
+
+    impl fmt::Display for TryRecvError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                TryRecvError::Empty => f.write_str("no value is waiting"),
+                TryRecvError::Closed => f.write_str("the channel is closed"),
+            }
+        }
+    }
+
+    impl std::error::Error for TryRecvError {}
+
     impl<T> Sender<T> {
         /// Sends a value without blocking. Fails if the receiver was dropped.
         pub fn send(&self, value: T) -> Result<(), SendError<T>> {
@@ -145,9 +167,17 @@ pub mod mpsc {
             .await
         }
 
-        /// Takes a value if one is ready, without waiting.
-        pub fn try_recv(&mut self) -> Option<T> {
-            self.shared.lock().queue.pop_front()
+        /// Takes a value if one is waiting, without waiting for one. Fails
+        /// with [`TryRecvError::Empty`] if none is, and with
+        /// [`TryRecvError::Closed`] once every sender is gone and the channel
+        /// is empty, when [`recv`](Self::recv) would return `None`.
+        pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+            let mut state = self.shared.lock();
+            match state.queue.pop_front() {
+                Some(value) => Ok(value),
+                None if state.senders == 0 => Err(TryRecvError::Closed),
+                None => Err(TryRecvError::Empty),
+            }
         }
     }
 

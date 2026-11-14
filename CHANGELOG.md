@@ -10,6 +10,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **Verification**: fuzz targets for the core crate (`fuzz/`): `dns_response` (DNS answers,
+  up to 64 KiB, with a 2-second limit per input so that a slow answer counts as a failure)
+  and `resolv_conf` (`/etc/resolv.conf` and `/etc/hosts`), in the nightly fuzz workflow.
+
 - **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
   the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
   `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
@@ -139,6 +143,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong**, breaking: `mpsc::Receiver::try_recv` and `mpsc::BoundedReceiver::try_recv`
+  return `Result<T, mpsc::TryRecvError>` instead of `Option<T>`, like
+  `oneshot::Receiver::try_recv`: `Empty` while a sender is alive, `Closed` once every
+  sender is gone and the channel is empty. The `Option` could not tell the two apart.
+- **giong**: `OpenOptions::custom_flags` ignores the access-mode bits (`O_RDONLY`,
+  `O_WRONLY`, `O_RDWR`), as the standard library does: `custom_flags(libc::O_RDWR)` no
+  longer turns a read-only open into a writable one. Combinations `open(2)` cannot do (no
+  access mode, `truncate` or `create` without `write`, `append` with `truncate`) fail with
+  `GIONG-E0203`, which names the option and the fix, instead of a bare `EINVAL`.
+- **giong**: `File::allocate` with a length of 0 does nothing and returns `Ok` (it was the
+  kernel's `EINVAL`), and a range that ends above `i64::MAX` is refused with `GIONG-E0202`.
+- **giong**: the docs of `TcpStream` and `UnixStream` `read`, `write` and `write_all` say
+  that they are not cancel safe, and `read` that a buffer with no capacity reads `Ok(0)`.
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
   registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
   the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
@@ -164,6 +181,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**: a DNS answer with a long chain of CNAME records froze the worker. The chain was
+  followed by rescanning every record for every name found, in cubic time: one 64 KiB TCP
+  answer of 2,300 records held the worker for 18 seconds, with no timer or other task
+  running, and whoever controls DNS answers (a resolver, or anyone on the path to it) could
+  send one. The chain is now followed from the query name in linear time, and more than 16
+  CNAME links is a malformed answer (`GIONG-E0107`), as in other resolvers.
+- **giong**: `File::read_at`, `write_at` and `write_all_at` refuse an offset above
+  `i64::MAX` with `GIONG-E0202`. io_uring reads `u64::MAX` as "the current file position",
+  so such an offset read and wrote wherever that was, on io_uring only (epoll failed with
+  `EINVAL`).
+- **giong**: a DNS server address where nothing listens gave the kernel's bare "connection
+  refused", so a failed `connect("db.internal:5432")` read as if the database refused. It
+  is now `GIONG-E0108`, naming the server and the name, with the kernel's error as its
+  source. `GIONG-E0104` says when it really applies (an empty `ResolverConfig::nameservers`;
+  a `resolv.conf` without servers means `127.0.0.1:53`).
+- **giong**: `UdpSocket::read_from` refuses a buffer with no capacity (`Vec::new()`) with
+  `GIONG-E0109`, instead of receiving the datagram into it and losing it.
+- **giong**: an IP address without a port (`"10.0.0.5"`, `"::1"`) or an IPv6 address
+  without brackets (`"2001:db8::1:8080"`) passed as `"host:port"` now gets an error that
+  says so and shows the right form, instead of "not a valid host name".
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
   (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the

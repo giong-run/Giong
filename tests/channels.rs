@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use giong::sync::mpsc::TryRecvError as MpscTryRecvError;
 use giong::sync::mpsc::{self, TrySendError};
 use giong::sync::oneshot::{self, RecvError, TryRecvError};
 use giong::time::{sleep, timeout};
@@ -166,7 +167,7 @@ fn bounded_a_new_sender_does_not_jump_the_line() {
         let task = giong::spawn(async move { waiting.send(1).await.unwrap() });
         giong::yield_now().await;
         // A slot frees up and is promised to the waiting sender ...
-        assert_eq!(rx.try_recv(), Some(0));
+        assert_eq!(rx.try_recv(), Ok(0));
         // ... so a newcomer cannot take it.
         assert!(matches!(tx.try_send(2), Err(TrySendError::Full(2))));
         task.await.unwrap();
@@ -197,7 +198,7 @@ fn bounded_a_cancelled_send_gives_its_place_to_the_next() {
             giong::spawn(async move { tx.send(2).await.unwrap() })
         };
         giong::yield_now().await;
-        assert_eq!(rx.try_recv(), Some(0));
+        assert_eq!(rx.try_recv(), Ok(0));
         first.abort();
         second.await.unwrap();
         assert_eq!(rx.recv().await, Some(2));
@@ -315,4 +316,73 @@ fn bounded_works_with_values_that_are_not_send_on_one_worker() {
 #[should_panic(expected = "capacity of at least 1")]
 fn bounded_refuses_a_capacity_of_zero() {
     let _ = mpsc::bounded::<()>(0);
+}
+
+#[test]
+fn mpsc_try_recv_tells_empty_from_closed() {
+    // try_recv returned an Option, which could not tell "nothing yet" from
+    // "nothing ever again" without awaiting recv.
+    let (tx, mut rx) = mpsc::channel();
+    assert_eq!(rx.try_recv(), Err(MpscTryRecvError::Empty));
+    tx.send(1).unwrap();
+    let tx2 = tx.clone();
+    drop(tx);
+    assert_eq!(rx.try_recv(), Ok(1));
+    assert_eq!(rx.try_recv(), Err(MpscTryRecvError::Empty));
+    tx2.send(2).unwrap();
+    drop(tx2);
+    // Values sent before the last sender went are still received.
+    assert_eq!(rx.try_recv(), Ok(2));
+    assert_eq!(rx.try_recv(), Err(MpscTryRecvError::Closed));
+
+    giong::block_on(async {
+        let (tx, mut rx) = mpsc::bounded(2);
+        assert_eq!(rx.try_recv(), Err(MpscTryRecvError::Empty));
+        tx.send(1).await.unwrap();
+        drop(tx);
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Err(MpscTryRecvError::Closed));
+        assert_eq!(rx.recv().await, None);
+    });
+}
+
+#[test]
+fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_receiver() {
+    giong::block_on(async {
+        let (tx, mut rx) = mpsc::channel::<u32>();
+        let senders: Vec<_> = (0..3).map(|_| tx.clone()).collect();
+        drop(tx);
+        for (i, tx) in senders.iter().enumerate() {
+            tx.send(i as u32).unwrap();
+        }
+        drop(senders);
+        for i in 0..3 {
+            assert_eq!(rx.recv().await, Some(i));
+        }
+        assert_eq!(rx.recv().await, None);
+
+        // A receiver waiting in recv is woken when the last sender goes,
+        // also from another thread.
+        let (tx, mut rx) = mpsc::channel::<u32>();
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(tx);
+        });
+        assert!(matches!(
+            timeout(Duration::from_secs(5), rx.recv()).await,
+            Ok(None)
+        ));
+        dropper.join().unwrap();
+
+        // Values still queued are dropped with the receiver, and sends fail
+        // from then on, handing the value back.
+        let alive = Rc::new(());
+        let (tx, rx) = mpsc::channel::<Rc<()>>();
+        tx.send(alive.clone()).unwrap();
+        assert_eq!(Rc::strong_count(&alive), 2);
+        drop(rx);
+        assert_eq!(Rc::strong_count(&alive), 1);
+        let back = tx.send(alive.clone()).unwrap_err();
+        assert_eq!(Rc::strong_count(&back.0), 2);
+    });
 }

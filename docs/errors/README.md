@@ -52,6 +52,8 @@ when it is no longer raised.
 | [GIONG-E0105](E0105.md) | `DnsTimeout` | DNS server did not answer |
 | [GIONG-E0106](E0106.md) | `DnsServerFailure` | DNS server failed |
 | [GIONG-E0107](E0107.md) | `DnsBadResponse` | malformed DNS answer |
+| [GIONG-E0108](E0108.md) | `DnsServerUnreachable` | cannot reach the DNS server |
+| [GIONG-E0109](E0109.md) | `EmptyBuffer` | buffer with no room |
 
 ## Files
 
@@ -59,6 +61,8 @@ when it is no longer raised.
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
 | [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
+| [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
+| [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
 
 ## giong-http
 

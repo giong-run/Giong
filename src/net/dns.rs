@@ -131,8 +131,8 @@ impl ResolverConfig {
         cfg
     }
 
-    /// Uses these name servers instead of the configured ones. A server
-    /// without a port is reached on port 53.
+    /// Uses these name servers instead of the configured ones. DNS servers
+    /// listen on port 53, as in `SocketAddr::from(([10, 0, 0, 2], 53))`.
     pub fn nameservers(mut self, servers: impl IntoIterator<Item = SocketAddr>) -> Self {
         self.nameservers = servers.into_iter().collect();
         self
@@ -379,9 +379,9 @@ impl Resolver {
         if servers.is_empty() {
             return Err(raise(
                 Code::NoDnsServer,
-                "no DNS server is configured",
-                "add a nameserver line to /etc/resolv.conf, or use an address or a name from \
-                 /etc/hosts.",
+                "no DNS server is configured: ResolverConfig::nameservers was given none",
+                "pass at least one server to ResolverConfig::nameservers, or use an address or a \
+                 name from /etc/hosts.",
             ));
         }
         let start = if cfg.rotate {
@@ -443,6 +443,23 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
                 }
             }
             Ok(answer) if answer.rcode == RCODE_NXDOMAIN => {}
+            // The kernel's own error, such as "connection refused" when
+            // nothing listens on the server's port: say that it came from
+            // the DNS server, or a failed `connect("db.internal:5432")`
+            // would read as if the database had refused.
+            Err(e) if crate::error::code(&e).is_none() => {
+                err = Some(
+                    crate::error::Error::new(
+                        Code::DnsServerUnreachable,
+                        format!("cannot reach DNS server {server} to look up {name}: {e}"),
+                        "check that a DNS server runs at the address in /etc/resolv.conf (in a \
+                         container, the network it is attached to) and that a firewall lets \
+                         UDP and TCP port 53 through.",
+                    )
+                    .with_source(e)
+                    .into(),
+                )
+            }
             Ok(answer) => {
                 err = Some(raise(
                     Code::DnsServerFailure,
@@ -697,6 +714,10 @@ fn read_name(buf: &[u8], mut pos: usize) -> io::Result<(String, usize)> {
     }
 }
 
+/// The most CNAME records followed from one name to the next, like the
+/// limits of glibc's and other stub resolvers. Real chains have a few.
+const MAX_CNAMES: usize = 16;
+
 /// Parses the response to query `id` for `name` and `qtype`, following CNAME
 /// records inside the response.
 fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Answer> {
@@ -742,24 +763,37 @@ fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Ans
         }
     }
 
-    // The query name and every alias it leads to through CNAME records.
+    // The query name and the aliases it leads to through CNAME records,
+    // followed one link at a time from the query name: one pass over the
+    // records per link, at most MAX_CNAMES links, so a hostile answer with
+    // thousands of records costs linear time, not a frozen worker.
     let mut names = vec![wanted];
     let mut min_ttl = u32::MAX;
     loop {
-        let mut grew = false;
-        for (owner, rtype, ttl, rdata, _) in &records {
-            if *rtype == TYPE_CNAME && names.contains(owner) {
-                let (target, _) = read_name(buf, *rdata)?;
-                if !names.contains(&target) {
-                    names.push(target);
-                    min_ttl = min_ttl.min(*ttl);
-                    grew = true;
-                }
-            }
-        }
-        if !grew {
+        let current = names.last().expect("starts with the query name");
+        let Some((_, _, ttl, rdata, _)) = records
+            .iter()
+            .find(|(owner, rtype, ..)| *rtype == TYPE_CNAME && owner == current)
+        else {
+            break;
+        };
+        let (target, _) = read_name(buf, *rdata)?;
+        if names.contains(&target) {
+            // A loop: the names so far are all there is.
             break;
         }
+        if names.len() > MAX_CNAMES {
+            return Err(raise(
+                Code::DnsBadResponse,
+                format!(
+                    "the DNS answer for {name} has a chain of more than {MAX_CNAMES} CNAME records"
+                ),
+                "check the DNS server in /etc/resolv.conf and the records of the name; \
+                 resolvers stop following aliases long before this.",
+            ));
+        }
+        min_ttl = min_ttl.min(*ttl);
+        names.push(target);
     }
     let mut addrs = Vec::new();
     for (owner, rtype, ttl, rdata, rdlen) in &records {
@@ -832,6 +866,56 @@ pub(crate) fn system_resolver() -> io::Result<Resolver> {
         });
         Ok(resolver)
     })
+}
+
+/// What the fuzz targets call (see `crate::fuzzing`).
+#[cfg(fuzzing)]
+pub(crate) mod fuzzing {
+    use super::*;
+
+    /// Parses `data` as the answer to a query. The first byte chooses the
+    /// question: the one the response itself carries (so that the fuzzer
+    /// gets past the header checks and into the records and CNAME chains), or
+    /// a fixed `A` or `AAAA` question for `example.com`. Must never panic,
+    /// and must take time linear in the size of the input (the CI job runs
+    /// it with a short `-timeout`).
+    pub fn dns_response(data: &[u8]) {
+        let Some((&mode, buf)) = data.split_first() else {
+            return;
+        };
+        let id = buf.get(..2).map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
+        match mode % 3 {
+            0 => {
+                let Ok((name, pos)) = read_name(buf, 12) else {
+                    return;
+                };
+                let Ok(qtype) = read_u16(buf, pos) else {
+                    return;
+                };
+                if let Ok(answer) = parse_response(buf, id, &name, qtype) {
+                    for ip in &answer.addrs {
+                        assert_eq!(ip.is_ipv4(), qtype == TYPE_A);
+                    }
+                }
+            }
+            1 => drop(parse_response(buf, id, "example.com", TYPE_A)),
+            _ => drop(parse_response(buf, id, "example.com", TYPE_AAAA)),
+        }
+    }
+
+    /// Parses `data` as `/etc/resolv.conf`, then a NUL byte, then
+    /// `/etc/hosts`. Must never panic.
+    pub fn resolv_conf(data: &[u8]) {
+        let text = String::from_utf8_lossy(data);
+        let (resolv, hosts) = text.split_once('\0').unwrap_or((&text, ""));
+        let cfg = ResolverConfig::parse(resolv, hosts);
+        assert!(!cfg.nameservers.is_empty());
+        for name in ["localhost", "example.com", "a.b.c.d.e.f"] {
+            for candidate in cfg.candidates(name) {
+                drop(build_query(1, &candidate, TYPE_A));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +994,64 @@ mod tests {
             [IpAddr::from([192, 0, 2, 1]), IpAddr::from([192, 0, 2, 2])]
         );
         assert_eq!(a.min_ttl, 60);
+    }
+
+    /// `c{i}.example` as a wire name.
+    fn chain_name(i: usize) -> Vec<u8> {
+        let label = format!("c{i}");
+        let mut name = vec![label.len() as u8];
+        name.extend_from_slice(label.as_bytes());
+        name.extend_from_slice(b"\x07example\x00");
+        name
+    }
+
+    /// An answer for `c0.example` whose CNAME records lead from `c0` to
+    /// `c{links}`, which has an A record, listed last link first; plus
+    /// `unrelated` CNAME records of other names.
+    fn chain_response(links: usize, unrelated: usize) -> Vec<u8> {
+        let q = build_query(3, "c0.example", TYPE_A).unwrap();
+        let names: Vec<Vec<u8>> = (0..=links).map(chain_name).collect();
+        let others: Vec<(Vec<u8>, Vec<u8>)> = (0..unrelated)
+            .map(|i| (chain_name(100_000 + 2 * i), chain_name(100_001 + 2 * i)))
+            .collect();
+        let mut answers: Vec<(&[u8], u16, u32, &[u8])> =
+            vec![(&names[links], TYPE_A, 60, &[192, 0, 2, 7])];
+        for i in (0..links).rev() {
+            answers.push((&names[i], TYPE_CNAME, 300, &names[i + 1]));
+        }
+        for (owner, target) in &others {
+            answers.push((owner, TYPE_CNAME, 300, target));
+        }
+        response(&q, 0, false, &answers)
+    }
+
+    #[test]
+    fn long_cname_chains_cost_linear_time() {
+        // Following the chain used to rescan every record for every name
+        // found: about 18 s for one 64 KiB TCP answer of 2,300 records, on
+        // the worker thread, with no timer or other task running meanwhile.
+        let start = std::time::Instant::now();
+        let r = chain_response(2_300, 0);
+        let err = parse_response(&r, 3, "c0.example", TYPE_A).unwrap_err();
+        assert_eq!(crate::error::code(&err), Some(Code::DnsBadResponse));
+        assert!(err.to_string().contains("more than 16 CNAME"), "{err}");
+        // Thousands of records with a short chain among them.
+        let r = chain_response(3, 2_300);
+        let answer = parse_response(&r, 3, "c0.example", TYPE_A).unwrap();
+        assert_eq!(answer.addrs, [IpAddr::from([192, 0, 2, 7])]);
+        if !cfg!(miri) {
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "{:?}",
+                start.elapsed()
+            );
+        }
+        // Up to 16 links are followed.
+        let r = chain_response(16, 0);
+        let answer = parse_response(&r, 3, "c0.example", TYPE_A).unwrap();
+        assert_eq!(answer.addrs, [IpAddr::from([192, 0, 2, 7])]);
+        assert_eq!(answer.min_ttl, 60);
+        assert!(parse_response(&chain_response(17, 0), 3, "c0.example", TYPE_A).is_err());
     }
 
     #[test]
