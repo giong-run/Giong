@@ -137,6 +137,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
 
+- **giong-redis**: a fuzz target for the connection's reply matching (`connection`, in
+  `giong-redis/fuzz/`, and a randomised test): commands of every shape, dropped waiters
+  and passed deadlines, with push messages, attributes and replies over the limit among
+  the replies, which arrive cut anywhere; every command must get its own replies. The
+  reply reader's fuzz inputs now carry attributes, and its results are checked against a
+  reading with no limit.
+
 ### Changed
 
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
@@ -169,6 +176,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   the framing of a shared connection (see Fixed). `ArgWriter` implements
   `std::fmt::Write` too. To migrate, call `out.write(bytes)` where the old implementation
   called `f(bytes)`.
+- **giong-redis**: `Config::max_reply_size` now bounds the memory a reply takes: each
+  element counts 48 bytes (the `Value` it becomes) besides its bytes. Counting bytes only,
+  an array of 20 million nulls, 57 MiB as sent and so under the 64 MiB default, took
+  960 MB once read. A reply of millions of small elements that fit before may now fail
+  with `TooLarge` (a million 10-byte members, 17 MB as sent, count for 65 MB): raise the
+  limit for such replies.
+- **giong-redis**: when 16 MiB of commands are waiting to be written to a connection (the
+  server stopped reading, as during a long script), a new command waits for room, and
+  fails with `Timeout`, unsent, if none comes within the response timeout. Before, the
+  buffer grew without bound, and commands whose callers had given up were sent, and run,
+  whenever the server caught up.
 
 ### Fixed
 
@@ -236,6 +254,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-redis**: `PubSub::subscribe`, `psubscribe`, `unsubscribe` and `punsubscribe` took
   the first confirmation of their kind for their own, even one for another channel left
   by a call that was cancelled; they now wait for the one for their channel.
+- **giong-redis**: a push message too large to keep, behind an attribute that had not
+  arrived whole when the message went over the limit, was taken for the reply to the
+  oldest command, and every later reply went to the command after its own. Whether a
+  reply is a push message is now decided when its own type is read, behind any
+  attributes. Redis and Valkey do not put attributes in front of push messages.
+- **giong-redis**: a dropped `Client` kept its read task and its socket until the server
+  closed its side, which a proxy that does not pass a half-close on may never do. It now
+  closes once the replies to the commands already sent have come, or after the response
+  timeout.
+- **giong-redis**: a URL whose password holds an unescaped `/` or `?` failed with a
+  message quoting a piece of the password as a port, a path or a parameter (`the port
+  "pa" in the URL is not a number`); it now says to percent-encode them, and quotes
+  nothing.
 
 ## [0.4.0] - 2026-11-13
 
