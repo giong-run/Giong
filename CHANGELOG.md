@@ -251,6 +251,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   failed with `TooManyKeyUpdateRequests`; from 0.23.33 they are counted only between
   application data. Checked by building and testing with the lowest versions allowed
   (`cargo update -Z direct-minimal-versions`).
+- **giong-compat**: the lowest dependency versions it allows are ones it builds and passes
+  its tests with (`cargo update -Z direct-minimal-versions`): tokio 1.13 (was any 1.x),
+  futures-io 0.3.31 (was any 0.3), and for the tests rustls 0.23.33, the same as
+  giong-tls, and hyper 1.6, the first whose header-read timeout reports `is_timeout()`.
 
 ### Fixed
 
@@ -596,6 +600,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   kernel refuses keys after the handshake (rustls has handed them over by then), that
   only one task may receive at a time, and that `tcp()` is for addresses and socket
   options only.
+- **giong-compat**: on the epoll driver, `poll_write` with a full buffer could return
+  `Pending` after the send it waited on finished on that same poll, so no operation held
+  the task's waker (hundreds of times in 2 GiB over a Unix socket). Only the epoll
+  driver's own waker list woke the task again. A write now waits for the send in flight
+  before starting the next one, so every `Pending` leaves a send holding the waker.
+- **giong-compat**: on io_uring, an idle stream kept its last send buffer (up to the
+  64 KiB write buffer, as the 0.5.0 README warned). It now drops the buffer when a send
+  finishes, so an idle stream holds none again; `tests/memory.rs` checks that it holds
+  less than 1 KiB on both drivers.
+- **giong-compat**: a write made while a TLS shutdown is in progress fails at once with
+  `GIONG-E1402` instead of being accepted and then dropped, and a shutdown that failed
+  keeps failing (`GIONG-E1401`) instead of returning `Ok` the second time.
+- **giong-compat**: `consume` with nothing buffered is ignored, as in std's and Tokio's
+  `BufReader`, instead of panicking in debug builds.
+- **giong-compat**: tests for what the review found untested: a seeded cancellation
+  stress test (`tests/cancel.rs`), hyper's HTTP/2 client and server over `Compat` with a
+  giong executor, and `Compat` over kernel TLS. `scripts/valgrind.sh` runs the `compat`
+  and `memory` suites too.
 
 ### Security
 

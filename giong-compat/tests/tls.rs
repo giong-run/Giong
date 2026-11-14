@@ -136,6 +136,58 @@ mod tokio_traits {
             assert_eq!(tls.read_to_end(&mut rest).await.unwrap(), 0);
         });
     }
+
+    /// The same through kernel TLS on both sides, so `Compat` drives
+    /// giong-tls's kernel paths (`kernel_recv`, `kernel_write_all`, the
+    /// kernel shutdown). Without the kernel's `tls` module it says why and
+    /// passes, unless `GIONG_KTLS_REQUIRED` is set.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn a_kernel_tls_stream_through_the_tokio_traits() {
+        use giong_tls::{ktls_support, Ktls};
+        let support = ktls_support();
+        if !support.is_available() {
+            assert!(
+                std::env::var_os("GIONG_KTLS_REQUIRED").is_none(),
+                "GIONG_KTLS_REQUIRED is set, but {support}"
+            );
+            eprintln!("skipped: {support}");
+            return;
+        }
+        giong::block_on(async {
+            let pki = pki();
+            let (c, s) = pair().await;
+            let acceptor = TlsAcceptor::new(server_config(&pki, &[]))
+                .ktls(Ktls::Required)
+                .unwrap();
+            let server = giong::spawn(async move {
+                let tls = acceptor.accept(s).await.unwrap();
+                assert!(tls.is_ktls());
+                native_tls_echo(tls).await
+            });
+            let connector = TlsConnector::new(client_config(&pki, &[]))
+                .ktls(Ktls::Required)
+                .unwrap();
+            let tls = connector.connect("localhost", c).await.unwrap();
+            assert!(tls.is_ktls());
+            let mut tls = Compat::new(tls);
+            for len in [1, 1000, 16 * 1024, 1 << 20] {
+                let msg = pattern(len);
+                tls.write_all(&msg).await.unwrap();
+                tls.flush().await.unwrap();
+                let mut back = vec![0; len];
+                timeout(LIMIT, tls.read_exact(&mut back))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(back == msg, "{len} bytes came back different");
+            }
+            tls.shutdown().await.unwrap();
+            assert!(server.await.unwrap(), "no close_notify arrived");
+            let mut rest = Vec::new();
+            assert_eq!(tls.read_to_end(&mut rest).await.unwrap(), 0);
+        });
+    }
 }
 
 mod futures_traits {
