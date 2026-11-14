@@ -148,6 +148,9 @@ codes! {
     // -------------------------------------------------------------- files
     /// A path contains a NUL byte, which Linux paths cannot.
     InvalidPath = 200, InvalidInput, "invalid path";
+    /// [`TcpStream::send_file`](crate::net::TcpStream::send_file) was asked
+    /// for bytes past the end of the file. What the file had was sent.
+    FileTooShort = 201, UnexpectedEof, "the file ended before the bytes to send";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not
@@ -188,6 +191,24 @@ codes! {
     /// away, or the response is to a `HEAD` request or has a status without
     /// a body.
     HttpBodyNotSent = 1114, BrokenPipe, "response body not sent";
+    /// The other end broke the HTTP/2 protocol. The server closes the
+    /// connection with a GOAWAY frame whose debug data carries this code
+    /// and the rule that was broken.
+    Http2Protocol = 1115, InvalidData, "HTTP/2 protocol error";
+    /// An HTTP/2 client cancelled (or had refused) more streams than the
+    /// server allows in a short time, the pattern of the "rapid reset"
+    /// attack. The server closes the connection with `ENHANCE_YOUR_CALM`.
+    Http2TooManyResets = 1116, ConnectionAborted, "too many HTTP/2 streams reset";
+    /// An HTTP/2 client sent more frames that do no work (PING, SETTINGS,
+    /// PRIORITY, empty DATA or CONTINUATION frames, WINDOW_UPDATE frames
+    /// with nothing to send, frames for closed streams, unknown frame
+    /// types) than the server allows in a short time. The server closes
+    /// the connection with `ENHANCE_YOUR_CALM`.
+    Http2Flood = 1117, ConnectionAborted, "too many HTTP/2 control frames";
+    /// An HTTP/2 header block (HEADERS and its CONTINUATION frames) grew
+    /// past the limit before it ended. The server closes the connection
+    /// with `ENHANCE_YOUR_CALM`.
+    Http2HeadersTooLarge = 1118, InvalidData, "HTTP/2 header block too large";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
@@ -272,6 +293,22 @@ codes! {
     /// A TLS write failed or was cancelled, so the stream cannot send any
     /// more.
     TlsBroken = 2008, BrokenPipe, "TLS stream broken";
+    /// Kernel TLS was required (`Ktls::Required`) and cannot be used: the
+    /// kernel has no `tls` module, does not support a cipher suite the
+    /// configuration allows, the socket refused it, or `TcpStream::recv` was
+    /// already used on the stream.
+    KtlsUnavailable = 2009, Unsupported, "kernel TLS is not available";
+    /// The kernel refused a connection's TLS keys: after the handshake (the
+    /// connection was closed), or new keys for a key update (nothing more
+    /// can be sent).
+    KtlsSetup = 2010, Other, "the kernel refused the TLS keys";
+    /// The peer changed its TLS 1.3 keys and the kernel that encrypts the
+    /// connection cannot take new keys (Linux before 6.14).
+    KtlsKeyUpdate = 2011, Unsupported, "the kernel cannot change TLS keys";
+    /// The connection has sent as many TLS records as its cipher allows under
+    /// one key and cannot change keys (TLS 1.2, or TLS 1.3 on a kernel older
+    /// than 6.14), so it sent `close_notify`.
+    TlsKeysExhausted = 2012, ConnectionAborted, "TLS keys used up";
 
     // ---------------------------------------------------- giong-postgres
     /// The configuration or connection URL is not valid.

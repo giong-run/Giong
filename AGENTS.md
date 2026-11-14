@@ -14,7 +14,7 @@ workspace, nine crates and an example service:
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 server library (bodies whole or streamed both ways), HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
@@ -85,6 +85,7 @@ scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh soak        # minutes of connection churn, then checks for leaks
 scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
+KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 ```
@@ -100,6 +101,11 @@ the soak test every night.
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run, and `GIONG_DRIVER=epoll` the epoll driver; `scripts/check.sh fallback` does both for
 you.
+
+The kernel TLS tests in `giong-tls` skip themselves when the kernel has no `tls` module
+(`sudo modprobe tls` loads it; containers need it loaded on the host).
+`GIONG_KTLS_REQUIRED=1` turns those skips into failures; CI sets it wherever the module
+is loaded.
 
 ## Rules that are checked in review
 

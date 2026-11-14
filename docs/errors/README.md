@@ -57,6 +57,7 @@ when it is no longer raised.
 | Code | `Code::` | Meaning |
 |---|---|---|
 | [GIONG-E0200](E0200.md) | `InvalidPath` | invalid path |
+| [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
 
 ## giong-http
 
@@ -76,6 +77,10 @@ when it is no longer raised.
 | [GIONG-E1112](E1112.md) | `HttpBodyIncomplete` | request body cut short |
 | [GIONG-E1113](E1113.md) | `HttpBodyMalformed` | malformed request body |
 | [GIONG-E1114](E1114.md) | `HttpBodyNotSent` | response body not sent |
+| [GIONG-E1115](E1115.md) | `Http2Protocol` | HTTP/2 protocol error |
+| [GIONG-E1116](E1116.md) | `Http2TooManyResets` | too many HTTP/2 streams reset |
+| [GIONG-E1117](E1117.md) | `Http2Flood` | too many HTTP/2 control frames |
+| [GIONG-E1118](E1118.md) | `Http2HeadersTooLarge` | HTTP/2 header block too large |
 
 ## giong-web
 
@@ -122,6 +127,10 @@ when it is no longer raised.
 | [GIONG-E2006](E2006.md) | `TlsHandshakeTimeout` | TLS handshake timed out |
 | [GIONG-E2007](E2007.md) | `TlsHandshakeEof` | connection closed during the TLS handshake |
 | [GIONG-E2008](E2008.md) | `TlsBroken` | TLS stream broken |
+| [GIONG-E2009](E2009.md) | `KtlsUnavailable` | kernel TLS is not available |
+| [GIONG-E2010](E2010.md) | `KtlsSetup` | the kernel refused the TLS keys |
+| [GIONG-E2011](E2011.md) | `KtlsKeyUpdate` | the kernel cannot change TLS keys |
+| [GIONG-E2012](E2012.md) | `TlsKeysExhausted` | TLS keys used up |
 
 ## giong-postgres
 

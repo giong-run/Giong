@@ -223,7 +223,11 @@ the repository, and a benchmark of it against the same API on axum.
       load generator on a second machine over a physical network card, for scaling
       efficiency and the Monoio and Glommio comparison on a real network (two machines
       rented by the hour are enough).
-- [ ] HTTP/2 in `giong-http`, over TLS with ALPN.
+- [x] HTTP/2 in `giong-http`'s server, over TLS with ALPN and over plain TCP with prior
+      knowledge, for the same handlers (`giong-web` included). Hardened against rapid reset,
+      frame and CONTINUATION floods, HPACK bombs and readers that stall, with coded errors
+      (`GIONG-E1115` to `E1118`); `h2spec` in CI; HPACK and whole connections fuzzed.
+- [ ] HTTP/2 in `giong-http`'s client, chosen through ALPN.
 - [x] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
       over the transport can run on giong: `giong-compat`, tested with tokio-rustls,
       futures-rustls, tokio-tungstenite, h2, hyper's HTTP/1 connection API and tokio-util's
@@ -241,7 +245,9 @@ Each item lands only with a benchmark showing what it buys.
 - [ ] Receive bundles (several buffers per completion).
 - [ ] Optional `SQPOLL` mode.
 - [ ] Optional NAPI busy polling.
-- [ ] Kernel TLS (kTLS) for `giong-tls`.
+- [x] Kernel TLS (kTLS) for `giong-tls`: +36% serving 1 MiB files over HTTPS with `sendfile`
+  on bare metal; slower than rustls from memory, so off by default
+  ([numbers](giong-tls/README.md#when-it-pays-off)).
 
 **Exit criteria:** a documented, reproducible gain for every option that is merged.
 

@@ -12,6 +12,11 @@ serde_json = "1"
 # and Timeout (bench/web.sh).
 tower-http = { version = "0.6", features = ["compression-gzip", "request-id", "timeout"] }
 
+[features]
+# HTTP/2 as well (bench/h2.sh): built separately, so that the HTTP/1.1
+# numbers elsewhere stay those of an HTTP/1.1-only server.
+h2 = ["axum/http2"]
+
 [profile.release]
 opt-level = 3
 lto = true

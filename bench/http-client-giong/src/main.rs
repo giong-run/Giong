@@ -5,16 +5,17 @@
 //!
 //! One `Client` shared by every task, with at most POOL_SIZE connections to
 //! the server (16 by default, the client's own default). With CA set to a
-//! PEM file, that authority is trusted for `https` URLs.
-//! Prints `ops=<per second> p50_us=<..> p99_us=<..> cpu=<%>` for the measured
-//! part, after a warm-up of 2 seconds.
+//! PEM file, that authority is trusted for `https` URLs, and GIONG_KTLS=auto
+//! or required hands the connections to kernel TLS after the handshake.
+//! Prints `ops=<per second> p50_us=<..> p99_us=<..> cpu=<%> ktls=<connections>`
+//! for the measured part, after a warm-up of 2 seconds.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use giong_http::client::Client;
-use giong_tls::TlsConnector;
+use giong_tls::{Ktls, TlsConnector};
 
 /// CPU time this process has used, in clock ticks (user + system).
 fn cpu_ticks() -> u64 {
@@ -32,7 +33,13 @@ fn main() {
 
     let mut builder = Client::builder().max_connections_per_host(size);
     if let Ok(ca) = std::env::var("CA") {
-        builder = builder.tls(TlsConnector::with_root_pem(&std::fs::read(ca).unwrap()).unwrap());
+        let connector = TlsConnector::with_root_pem(&std::fs::read(ca).unwrap()).unwrap();
+        let mode = match std::env::var("GIONG_KTLS").as_deref() {
+            Ok("auto") => Ktls::Auto,
+            Ok("required") => Ktls::Required,
+            _ => Ktls::Off,
+        };
+        builder = builder.tls(connector.ktls(mode).unwrap());
     }
     let client = builder.build();
 
@@ -81,12 +88,13 @@ fn main() {
         s.sort_unstable();
         let pct = |p: f64| s[((s.len() as f64 * p) as usize).min(s.len() - 1)];
         println!(
-            "ops={:.0} p50_us={} p99_us={} cpu={:.0} sink={}",
+            "ops={:.0} p50_us={} p99_us={} cpu={:.0} sink={} ktls={}",
             s.len() as f64 / elapsed,
             pct(0.50),
             pct(0.99),
             cpu,
-            sink.get() % 10
+            sink.get() % 10,
+            giong_tls::ktls_stats().offloaded
         );
     });
 }

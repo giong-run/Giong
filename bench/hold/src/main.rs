@@ -11,6 +11,11 @@
 //!   connection then has a request in the middle of being handled, as when a
 //!   handler waits for a database or another API.
 //!
+//! * `h2-idle`: HTTP/2 with prior knowledge: one request answered on each
+//!   connection, then quiet.
+//! * `h2-pending:N`: HTTP/2 with prior knowledge: N requests for PATH on each
+//!   connection, on N streams, none answered yet.
+//!
 //! Prints `ready` once every connection is in place, then holds them until
 //! killed. Connections come from 127.0.0.1 to 127.0.0.250 in turn, so that
 //! the run does not depend on the local port range.
@@ -69,10 +74,80 @@ fn read_response(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<()> {
     }
 }
 
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+fn frame_head(out: &mut Vec<u8>, len: usize, kind: u8, flags: u8, stream: u32) {
+    out.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags]);
+    out.extend_from_slice(&stream.to_be_bytes());
+}
+
+/// The client preface, an empty SETTINGS, and a GET for `path` on each of
+/// `streams` streams. HPACK without the dynamic table or Huffman coding:
+/// `:method: GET` and `:scheme: http` from the static table, `:path` and
+/// `:authority` as literals.
+fn h2_requests(path: &str, streams: u32) -> Vec<u8> {
+    let mut block = vec![0x82, 0x86, 0x04, path.len() as u8];
+    block.extend_from_slice(path.as_bytes());
+    block.extend_from_slice(&[0x01, 5]);
+    block.extend_from_slice(b"bench");
+    let mut out = PREFACE.to_vec();
+    frame_head(&mut out, 0, 0x4, 0, 0);
+    for i in 0..streams {
+        // END_STREAM | END_HEADERS
+        frame_head(&mut out, block.len(), 0x1, 0x5, 1 + 2 * i);
+        out.extend_from_slice(&block);
+    }
+    out
+}
+
+/// Reads frames, acknowledging the server's SETTINGS, until the server's
+/// SETTINGS has come and, if `answer` is set, the response on stream 1 has
+/// ended.
+fn h2_read(stream: &mut TcpStream, buf: &mut Vec<u8>, answer: bool) -> io::Result<()> {
+    buf.clear();
+    let (mut settings, mut answered) = (false, !answer);
+    let mut chunk = [0u8; 16384];
+    while !(settings && answered) {
+        while buf.len() >= 9 {
+            let len = (buf[0] as usize) << 16 | (buf[1] as usize) << 8 | buf[2] as usize;
+            if buf.len() < 9 + len {
+                break;
+            }
+            let (kind, flags) = (buf[3], buf[4]);
+            let id = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) & 0x7fff_ffff;
+            match kind {
+                0x4 if flags & 1 == 0 => {
+                    settings = true;
+                    let mut ack = Vec::new();
+                    frame_head(&mut ack, 0, 0x4, 0x1, 0);
+                    stream.write_all(&ack)?;
+                }
+                0x0 | 0x1 if id == 1 && flags & 1 != 0 => answered = true,
+                0x3 | 0x7 => {
+                    return Err(io::Error::other(
+                        "the server reset the stream or the connection",
+                    ))
+                }
+                _ => {}
+            }
+            buf.drain(..9 + len);
+        }
+        if settings && answered {
+            break;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 4 {
-        eprintln!("usage: hold ADDR CONNS open|idle|pending [PATH]");
+        eprintln!("usage: hold ADDR CONNS open|idle|pending|h2-idle|h2-pending:N [PATH]");
         std::process::exit(2);
     }
     let addr: SocketAddr = args[1].parse().expect("ADDR");
@@ -103,6 +178,28 @@ fn main() {
                 }
             }
             "pending" => stream.write_all(request.as_bytes()).expect("write"),
+            "h2-idle" => {
+                // As real clients do: the SETTINGS acknowledgement must not
+                // wait for an ACK of the request (Nagle), or a server that
+                // waits for it costs 40 ms a connection.
+                stream.set_nodelay(true).expect("nodelay");
+                stream.write_all(&h2_requests(path, 1)).expect("write");
+                if let Err(e) = h2_read(&mut stream, &mut buf, true) {
+                    eprintln!("connection {i}: {e}");
+                    std::process::exit(1);
+                }
+            }
+            m if m.starts_with("h2-pending:") => {
+                let streams: u32 = m["h2-pending:".len()..].parse().expect("h2-pending:N");
+                stream.set_nodelay(true).expect("nodelay");
+                stream
+                    .write_all(&h2_requests(path, streams))
+                    .expect("write");
+                if let Err(e) = h2_read(&mut stream, &mut buf, false) {
+                    eprintln!("connection {i}: {e}");
+                    std::process::exit(1);
+                }
+            }
             _ => {
                 eprintln!("unknown mode {mode}");
                 std::process::exit(2);

@@ -11,6 +11,9 @@
 #                                      only those binaries
 #   TEST_ARGS="--test-threads=1" scripts/kernels.sh
 #                                      arguments for every test binary
+#   KTLS=1 scripts/kernels.sh 6.18.63  also load the kernel's tls module, so
+#                                      giong-tls' kernel TLS tests run (and
+#                                      must: GIONG_KTLS_REQUIRED is set)
 #
 # The guest also checks which driver giong chooses by itself: epoll on kernels
 # older than 6.0, io_uring from 6.0 on (GIONG_TEST_EXPECT_DRIVER overrides
@@ -22,7 +25,9 @@
 # a static busybox and the shared libraries they need; the guest boots that
 # kernel, runs every binary and powers off. No disk image, no network, no
 # modules: everything the tests use (io_uring, loopback, Unix sockets, tmpfs)
-# is built into Ubuntu's generic kernels.
+# is built into Ubuntu's generic kernels, except kernel TLS, a module: with
+# KTLS=1 the kernel's modules package is downloaded too, and its tls and
+# crypto modules go into a second initramfs archive for that kernel.
 #
 # Needs qemu-system-x86_64, busybox (static), cpio and curl. Uses KVM when
 # /dev/kvm is there, and is about ten times slower without it.
@@ -71,9 +76,13 @@ root="$WORK/initramfs"
 rm -rf "$root"
 mkdir -p "$root"/{bin,tests,proc,sys,dev,tmp,etc}
 cp "$busybox" "$root/bin/busybox"
-for applet in sh mount ip poweroff cat echo uname date mkdir ulimit; do
+for applet in sh mount ip poweroff cat echo uname date mkdir ulimit modprobe depmod; do
     ln -s busybox "$root/bin/$applet"
 done
+# The kernel loads modules it needs (the crypto behind kernel TLS) through
+# this path.
+mkdir -p "$root/sbin"
+ln -s ../bin/busybox "$root/sbin/modprobe"
 for bin in "${BINARIES[@]}"; do
     cp "$bin" "$root/tests/"
     # The shared libraries it links, at the same paths, plus the loader.
@@ -107,11 +116,22 @@ for arg in $(cat /proc/cmdline); do
     case "$arg" in
         giong.expect_driver=*) export GIONG_TEST_EXPECT_DRIVER="${arg#*=}" ;;
         giong.expect_workarounds=*) export GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS="${arg#*=}" ;;
+        giong.ktls=1) ktls=1 ;;
     esac
 done
 # A line of its own: the console's escape codes end up in front of the first one.
 echo
 echo "GIONG-EXPECT driver=${GIONG_TEST_EXPECT_DRIVER:-} workarounds=${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS-unchecked}"
+if [ -n "${ktls:-}" ]; then
+    # Kernel TLS: the modules came in a second archive.
+    depmod
+    if modprobe tls; then
+        echo "GIONG-KTLS tls module loaded"
+    else
+        echo "GIONG-KTLS cannot load the tls module"
+    fi
+    export GIONG_KTLS_REQUIRED=1
+fi
 # The tests open thousands of sockets; init starts with a limit of 1024.
 ulimit -n 65536
 export TMPDIR=/tmp HOME=/tmp RUST_BACKTRACE=1
@@ -168,6 +188,63 @@ fetch_kernel() {
     echo "$dir/vmlinuz"
 }
 
+# An initramfs archive with the kernel's tls module and the crypto modules
+# it may need, from Ubuntu's linux-modules package for that kernel. The
+# kernel unpacks it on top of the main one.
+fetch_ktls_modules() {
+    local version="$1" dir="$WORK/linux-$1"
+    if [ -f "$dir/ktls.cpio.gz" ]; then
+        echo "$dir/ktls.cpio.gz"
+        return
+    fi
+    local base pattern deb
+    case "$version" in
+        ubuntu-*)
+            base="https://archive.ubuntu.com/ubuntu/pool/main/l/linux/"
+            local release="${version#ubuntu-}"
+            pattern="linux-modules-${release//./\\.}-generic_[^\"]*_amd64\.deb"
+            ;;
+        *)
+            base="https://kernel.ubuntu.com/mainline/v$version/amd64/"
+            pattern='linux-modules-[^"]*-generic_[^"]*_amd64\.deb'
+            ;;
+    esac
+    deb="$(curl -fsS --retry 5 --retry-all-errors "$base" | grep -oE "$pattern" | head -n1)"
+    if [ -z "$deb" ]; then
+        echo "no modules package for $version at $base" >&2
+        return 1
+    fi
+    local tmp="$dir/modules"
+    rm -rf "$tmp"
+    mkdir -p "$tmp/root"
+    curl -fsS --retry 5 --retry-all-errors -o "$tmp/modules.deb" "$base$deb" || return 1
+    (cd "$tmp" && ar x modules.deb) || return 1
+    # Under /lib/modules, or /usr/lib/modules in newer packages. Not every
+    # kernel has all of these directories; tls.ko is checked below.
+    local prefix
+    for prefix in ./lib/modules ./usr/lib/modules; do
+        tar xf "$tmp"/data.tar* -C "$tmp/root" --wildcards \
+            "$prefix/*/kernel/net/tls" "$prefix/*/kernel/crypto" \
+            "$prefix/*/kernel/arch/x86/crypto" "$prefix/*/kernel/lib/crypto" \
+            "$prefix/*/modules.builtin*" "$prefix/*/modules.order" 2>/dev/null || true
+    done
+    if [ -d "$tmp/root/usr/lib/modules" ]; then
+        mkdir -p "$tmp/root/lib"
+        mv "$tmp/root/usr/lib/modules" "$tmp/root/lib/modules"
+        rm -rf "$tmp/root/usr"
+    fi
+    # busybox's modprobe reads neither compressed modules nor kmod's indexes.
+    find "$tmp/root" \( -name '*.ko.zst' -exec zstd -q -d --rm {} \; \) \
+        -o \( -name '*.ko.xz' -exec xz -d {} \; \)
+    if ! find "$tmp/root" -name 'tls.ko' | grep -q .; then
+        echo "no tls.ko in $deb" >&2
+        return 1
+    fi
+    (cd "$tmp/root" && find . | cpio -o -H newc --quiet | gzip -1) >"$dir/ktls.cpio.gz"
+    rm -rf "$tmp"
+    echo "$dir/ktls.cpio.gz"
+}
+
 accel=(-accel tcg)
 if [ -w /dev/kvm ]; then
     accel=(-accel kvm -cpu host)
@@ -197,11 +274,26 @@ for version in "${VERSIONS[@]}"; do
     if [ -n "${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS+set}" ]; then
         cmdline+=" giong.expect_workarounds=$GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS"
     fi
+    guest_initrd="$initrd"
+    if [ "${KTLS:-0}" = 1 ]; then
+        if ! modules="$(fetch_ktls_modules "$version")"; then
+            echo "   could not download the modules of kernel $version"
+            status=1
+            continue
+        fi
+        guest_initrd="$WORK/linux-$version/initramfs-ktls.cpio.gz"
+        cat "$initrd" "$modules" >"$guest_initrd"
+        cmdline+=" giong.ktls=1"
+    fi
     timeout "${TIMEOUT:-3600}" qemu-system-x86_64 "${accel[@]}" -smp "$CPUS" -m "$MEMORY" \
-        -kernel "$kernel" -initrd "$initrd" \
+        -kernel "$kernel" -initrd "$guest_initrd" \
         -append "$cmdline" \
         -nographic -no-reboot </dev/null | tr -d '\r' | tee "$log" |
         grep --line-buffered -E '^GIONG-|panicked|FAILED|test result: FAILED' || true
+    if [ "${KTLS:-0}" = 1 ] && ! grep -q '^GIONG-KTLS tls module loaded' "$log"; then
+        echo "   the guest could not load the tls module (see $log)"
+        status=1
+    fi
     if ! grep -q "GIONG-KERNEL $release" "$log"; then
         echo "   the guest did not report kernel $version (see $log)"
         status=1

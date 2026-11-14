@@ -19,7 +19,7 @@ load arrives.
 
 > **Status: 0.4.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
-> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 server, and a client),
+> [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server, and a client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
 > [`giong-tls`](giong-tls/README.md) (TLS 1.2/1.3 on rustls), for serving HTTPS directly and connecting to TLS services,
 > [`giong-postgres`](giong-postgres/README.md) (a pipelining PostgreSQL client and pool),
@@ -31,9 +31,9 @@ load arrives.
 > giong's streams, so crates such as h2, tokio-rustls and tokio-tungstenite run on giong).
 > The tests pass on three io_uring setups, on the epoll driver, inside Docker's default
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
-> and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser is
-> fuzzed and a soak test churns connections for two hours every night. It has **not** run
-> in production, and there is no HTTP/2 yet. See [Limitations](#limitations).
+> and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser and
+> the HTTP/2 server are fuzzed, `h2spec` passes, and a soak test churns connections for two
+> hours every night. It has **not** run in production. See [Limitations](#limitations).
 
 ## Why giong
 
@@ -594,6 +594,16 @@ rounds. The server's core was 98–101% busy in every row, so the server was the
 - One connection per request is not measured for plain HTTP: on loopback that test runs
   out of client ports (TIME_WAIT) at about 28,000 per second and measures the client.
 
+**Kernel TLS pays off for large files, not for data in memory.** On bare metal (EPYC
+4345P, Linux 7.0, the server on one core), giong-http serving a 1 MiB file with
+`Body::file` and kernel TLS reaches 6,104 req/s against 4,484 with rustls in the process
+(+36%, and 164 µs of CPU per request against 223): `sendfile` lets the kernel encrypt
+straight from the page cache. nginx with kernel TLS and `sendfile` does 6,039 on the
+same machine. With 64 KiB files, with bodies from memory and with small responses the
+kernel is 4–22% slower than rustls, so `Ktls::Off` stays the default. A client receiving
+64 KiB bodies gains 11% from letting the kernel decrypt. The whole table and a profile
+are in the [`giong-tls` README](giong-tls/README.md#when-it-pays-off).
+
 ### PostgreSQL
 
 `bench/postgres.sh`: [`giong-postgres`](giong-postgres/README.md#performance) against
@@ -720,18 +730,18 @@ in their READMEs.
 |---|---|
 | `tests/executor.rs` (14) | spawn and join, panics, abort, teardown, runtimes run back to back |
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
-| `tests/net.rs` (15) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients |
+| `tests/net.rs` (20) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1) |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/udp.rs` (18) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop |
 | `tests/fs.rs` (20) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll) |
-| `tests/cancel.rs` (11) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; teardown with everything in flight |
+| `tests/cancel.rs` (13) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; a dropped `send_file` leaves nothing behind; teardown with everything in flight |
 | `tests/multi.rs` (14) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM, a panicking worker |
 | `tests/shutdown.rs` (10) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
 | `tests/driver.rs` (8), `tests/blocked.rs` (3) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (8) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time; poll profiles by spawn location; sources reported until dropped |
-| `giong-http` (131) | 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 51 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 21 end-to-end tests on real sockets (pipelining, large bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 end-to-end tests of request and response bodies streamed both ways; 11 end-to-end HTTPS tests with a rustls client; 12 documentation examples |
-| `giong-tls` (34) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), broken or stalled handshakes |
+| `giong-http` (136) | 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 51 unit tests, among them 500,000 random inputs for the parser and the chunked decoder; 24 end-to-end tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 end-to-end tests of request and response bodies streamed both ways; 12 end-to-end HTTPS tests with a rustls client; 13 documentation examples |
+| `giong-tls` (64) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two tasks sending on one connection, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 27 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
@@ -804,11 +814,11 @@ Not verified, and you should know it:
 | Multi-core | built-in builder with graceful draining and signals | `#[monoio::main(threads = N)]` | executor pools placed by CPU topology |
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
-| Ecosystem | its own HTTP/1.1 server and client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
-| Size | ~11,400 lines, plus ~7,800 for HTTP and TLS and ~17,500 for the database clients | ~25,000 lines | ~40,500 lines |
+| Ecosystem | its own HTTP/1.1 and HTTP/2 server, HTTP/1.1 client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
+| Size | ~11,400 lines, plus ~13,200 for HTTP and TLS and ~17,500 for the database clients | ~25,000 lines | ~40,500 lines |
 
-Monoio is the mature choice and runs in production at ByteDance; if you need HTTP/2 or
-Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
+Monoio is the mature choice and runs in production at ByteDance; if you need an HTTP/2
+client or Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
 priority scheduling are its strengths, not HTTP. giong's case is narrower: the receive
 path (multishot with provided buffers, cancel safe without a second API), good defaults,
 the latency dial, a strict HTTP server on top, and code small enough to audit.
@@ -824,9 +834,9 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   operations run on a pool of blocking threads, and one that is cancelled while running
   finishes there. Also missing: Unix datagram
   sockets, multicast, `set_len`, file locks, `O_DIRECT` with registered buffers.
-- **No HTTP/2, and HTTP bodies are not streamed.** `giong-http` receives a body in full
-  before it calls the handler; one over the limit is refused.
-- **`giong-tls` has no kTLS yet,** and no independent audit (see the
+- **No HTTP/2 in the HTTP client.** `giong-http`'s server speaks HTTP/1.1 and HTTP/2; its
+  client speaks HTTP/1.1 only.
+- **`giong-tls` has had no independent audit** (see the
   [self-review](docs/reviews/2026-11-giong-tls.md)).
 - **The Tokio ecosystem only through I/O traits.** Crates that are generic over the
   stream and driven by you (h2, tokio-rustls, tokio-tungstenite, hyper's connection API,

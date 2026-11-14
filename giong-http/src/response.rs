@@ -3,7 +3,9 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::fmt;
+use std::io;
 use std::mem;
+use std::rc::Rc;
 
 use crate::body::{BodySender, StreamBody};
 use crate::parse::{is_field_value, is_token_str};
@@ -23,6 +25,41 @@ pub enum Body {
     /// A body written piece by piece as it is produced: see
     /// [`channel`](Self::channel).
     Stream(StreamBody),
+    /// A range of an open file: see [`file`](Self::file). Over plain TCP
+    /// and kernel TLS the kernel sends it straight from its page cache
+    /// (`sendfile`); elsewhere it is read and written in pieces.
+    File(FileBody),
+}
+
+/// A range of an open file as a response body: see [`Body::file`] and
+/// [`Body::file_range`].
+#[derive(Clone, Debug)]
+pub struct FileBody {
+    pub(crate) file: Rc<giong::fs::File>,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+impl FileBody {
+    /// The file.
+    pub fn file(&self) -> &giong::fs::File {
+        &self.file
+    }
+
+    /// Where the range starts in the file.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// The length of the range in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// `true` if the range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl Body {
@@ -66,18 +103,70 @@ impl Body {
         (tx, Body::Stream(body))
     }
 
-    /// The bytes of the body. Empty for a [`Stream`](Self::Stream).
+    /// The whole of an open file as the body, its length taken from the
+    /// open file. The file is shared, so one open file can serve any number
+    /// of responses at once (pass an `Rc<File>` to keep it open between
+    /// requests).
+    ///
+    /// Over plain TCP and kernel TLS the server sends the file with
+    /// `sendfile`: from the page cache, without copying it into the
+    /// program; that is the fastest way to serve files over HTTPS (see
+    /// giong-tls' kernel TLS). Over TLS in the process, it is read and
+    /// encrypted in pieces of 256 KiB.
+    ///
+    /// ```no_run
+    /// use giong_http::{Body, Request, Response};
+    ///
+    /// async fn report(_req: Request) -> Response {
+    ///     let Ok(file) = giong::fs::File::open("report.pdf").await else {
+    ///         return Response::new(404);
+    ///     };
+    ///     match Body::file(file) {
+    ///         Ok(body) => Response::new(200).header("Content-Type", "application/pdf").body(body),
+    ///         Err(_) => Response::new(500),
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// If the file is shorter than its announced length when it is sent
+    /// (truncated in between), the connection is closed after what it had,
+    /// since the client was promised more (`GIONG-E0201`). Replace files
+    /// that are served by renaming a new file over them.
+    pub fn file(file: impl Into<Rc<giong::fs::File>>) -> io::Result<Body> {
+        let file = file.into();
+        let len = file.len()?;
+        Ok(Body::file_range(file, 0, len))
+    }
+
+    /// `len` bytes of an open file from `offset`, as for a range request.
+    /// See [`file`](Self::file). Nothing is checked until the response is
+    /// sent: then, if the file ends before `offset + len`, the connection
+    /// is closed after what it had (over HTTP/2, the stream is reset).
+    pub fn file_range(file: impl Into<Rc<giong::fs::File>>, offset: u64, len: u64) -> Body {
+        Body::File(FileBody {
+            file: file.into(),
+            offset,
+            len,
+        })
+    }
+
+    /// The bytes of the body. Empty for a [`Stream`](Self::Stream) and a
+    /// [`File`](Self::File), whose bytes are not in memory.
     pub fn as_bytes(&self) -> &[u8] {
         match self {
-            Body::Empty | Body::Stream(_) => &[],
+            Body::Empty | Body::Stream(_) | Body::File(_) => &[],
             Body::Static(bytes) => bytes,
             Body::Owned(bytes) => bytes,
         }
     }
 
-    /// The length of the body in bytes; 0 for a [`Stream`](Self::Stream).
+    /// The length of the body in bytes: of its bytes, or of a file's range;
+    /// 0 for a [`Stream`](Self::Stream).
     pub fn len(&self) -> usize {
-        self.as_bytes().len()
+        match self {
+            Body::File(f) => usize::try_from(f.len).unwrap_or(usize::MAX),
+            _ => self.as_bytes().len(),
+        }
     }
 
     /// `true` if the body has no bytes. A [`Stream`](Self::Stream) is not
@@ -91,11 +180,16 @@ impl Body {
         matches!(self, Body::Stream(_))
     }
 
+    /// `true` for a range of a file.
+    pub fn is_file(&self) -> bool {
+        matches!(self, Body::File(_))
+    }
+
     /// The bytes as a buffer the kernel can send from, without a copy.
-    /// Empty for a stream, which the server writes piece by piece instead.
+    /// Empty for a stream and a file, which the server sends otherwise.
     pub(crate) fn into_cow(self) -> Cow<'static, [u8]> {
         match self {
-            Body::Empty | Body::Stream(_) => Cow::Borrowed(&[]),
+            Body::Empty | Body::Stream(_) | Body::File(_) => Cow::Borrowed(&[]),
             Body::Static(bytes) => Cow::Borrowed(bytes),
             Body::Owned(bytes) => Cow::Owned(bytes),
         }
@@ -267,7 +361,8 @@ impl Response {
     }
 
     /// The body's bytes. Empty for a body written as it is produced (see
-    /// [`is_streaming`](Self::is_streaming)).
+    /// [`is_streaming`](Self::is_streaming)) and for a file
+    /// ([`Body::file`]), whose bytes are not in memory.
     pub fn body_bytes(&self) -> &[u8] {
         self.body.as_bytes()
     }
@@ -277,6 +372,12 @@ impl Response {
     /// handler (compression, an access log) should leave it alone.
     pub fn is_streaming(&self) -> bool {
         self.body.is_stream()
+    }
+
+    /// `true` if the body is a range of a file ([`Body::file`]): its length
+    /// is known, its bytes are not in memory.
+    pub fn body_is_file(&self) -> bool {
+        self.body.is_file()
     }
 
     /// Takes the body out, leaving the response without one.
@@ -324,8 +425,10 @@ impl Response {
         matches!(self.status, 204 | 304)
     }
 
-    pub(crate) fn body_len(&self) -> usize {
-        self.body.as_bytes().len()
+    /// The length of the body in bytes, as `Content-Length` gives it: of
+    /// its bytes, or of a file's range; 0 for a streamed body.
+    pub fn body_len(&self) -> usize {
+        self.body.len()
     }
 
     /// Appends the status line and the header fields, up to and including the
