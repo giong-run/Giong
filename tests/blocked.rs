@@ -2,7 +2,8 @@
 //! default seccomp profile: each test runs itself again in a child process
 //! that installs a seccomp filter making `io_uring_setup` fail with `EPERM`
 //! (or, for a kernel that refuses buffer rings, makes registering one fail
-//! with `EINVAL`).
+//! with `EINVAL`, or sets the locked-memory limit that io_uring's memory
+//! counts against to nothing).
 //!
 //! By default giong then runs on its epoll driver, says so once on stderr
 //! and in `driver_choice`; a runtime that insists on io_uring fails with an
@@ -239,6 +240,120 @@ fn a_kernel_that_refuses_buffer_rings_is_named_not_called_old() {
     let lines = fallback_lines(&stderr);
     assert_eq!(lines.len(), 1, "{stderr}");
     assert!(lines[0].contains(number), "{}", lines[0]);
+}
+
+/// Linux 6.14 to 7.2 count every io_uring against the locked-memory limit
+/// (RLIMIT_MEMLOCK), so a service under a low limit fails to set up its
+/// rings with a bare ENOMEM. The child sets the limit to nothing and drops
+/// CAP_IPC_LOCK, which would lift it: workers then run on epoll, and the
+/// reason names the limit instead of "Cannot allocate memory" alone.
+#[test]
+fn a_used_up_locked_memory_limit_is_named_and_falls_back_to_epoll() {
+    if in_child() {
+        if !io_uring_setup_works() {
+            println!("skipped: io_uring is not available here");
+            return;
+        }
+        let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        println!("release: {}", release.trim());
+        lock_no_memory();
+        let choice = giong::Builder::new()
+            .workers(2)
+            .block_on(async { giong::driver_choice() })
+            .unwrap();
+        println!("kind: {}", choice.kind);
+        println!("code: {:?}", choice.io_uring_error_code);
+        println!("error: {}", choice.io_uring_error.unwrap_or_default());
+        match giong::Builder::new()
+            .driver(DriverKind::IoUring)
+            .block_on(async {})
+        {
+            Ok(()) => println!("named: ok"),
+            Err(err) => {
+                println!("named: {err}");
+                println!("named code: {:?}", giong::error::code(&err));
+            }
+        }
+        return;
+    }
+
+    let (stdout, stderr) = run_blocked_child_with_stderr(
+        "a_used_up_locked_memory_limit_is_named_and_falls_back_to_epoll",
+    );
+    if stdout.contains("skipped:") {
+        return;
+    }
+    if stdout.contains("kind: io_uring") {
+        // This kernel does not count the rings, and the limit does not
+        // matter: Linux before 6.14, 7.3 and newer, 6.18.58 and newer, or a
+        // distribution kernel with the change backported. Where a kernel
+        // counts them and giong did not see why, the child fails instead.
+        assert!(stdout.contains("named: ok"), "{stdout}");
+        return;
+    }
+    assert!(stdout.contains("kind: epoll"), "{stdout}");
+    assert!(stdout.contains("code: Some(LockedMemoryLimit)"), "{stdout}");
+    assert!(
+        stdout.contains("named code: Some(LockedMemoryLimit)"),
+        "{stdout}"
+    );
+    for prefix in ["error: ", "named: "] {
+        let line = stdout
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} line in {stdout}"));
+        assert!(line.contains("GIONG-E0010"), "{line}");
+        assert!(line.contains("(RLIMIT_MEMLOCK, 0 bytes)"), "{line}");
+        assert!(line.contains("Cannot allocate memory"), "{line}");
+        assert!(line.contains("LimitMEMLOCK=infinity"), "{line}");
+    }
+    // Two workers fell back; the process says so once.
+    let lines = fallback_lines(&stderr);
+    assert_eq!(lines.len(), 1, "{stderr}");
+    assert!(lines[0].contains("GIONG-E0010"), "{}", lines[0]);
+}
+
+/// Sets this process's locked-memory limit to nothing and takes
+/// `CAP_IPC_LOCK`, which lifts the limit, from this thread (and so from the
+/// threads it starts afterwards), as for a service that is not root.
+fn lock_no_memory() {
+    /// `struct __user_cap_header_struct` and `struct __user_cap_data_struct`.
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const CAP_IPC_LOCK: u32 = 14;
+
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let mut header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData::default(); 2];
+    // SAFETY: plain system calls, each given structs of the types it
+    // expects (version 3 of the capability structs takes two of data).
+    unsafe {
+        assert_eq!(libc::setrlimit(libc::RLIMIT_MEMLOCK, &none), 0);
+        let res = libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr());
+        assert_eq!(res, 0, "capget: {}", std::io::Error::last_os_error());
+        data[0].effective &= !(1 << CAP_IPC_LOCK);
+        data[0].permitted &= !(1 << CAP_IPC_LOCK);
+        data[0].inheritable &= !(1 << CAP_IPC_LOCK);
+        let res = libc::syscall(libc::SYS_capset, &mut header, data.as_ptr());
+        assert_eq!(res, 0, "capset: {}", std::io::Error::last_os_error());
+    }
 }
 
 /// `IORING_REGISTER_PBUF_RING`.

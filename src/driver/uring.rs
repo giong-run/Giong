@@ -180,7 +180,9 @@ fn first_tier() -> RingTier {
 }
 
 fn build_ring(entries: u32) -> io::Result<IoUring> {
-    build_ring_from(entries, first_tier()).map_err(explain_setup_error)
+    build_ring_from(entries, first_tier())
+        .map_err(explain_setup_error)
+        .map_err(|e| explain_out_of_memory(e, "rings"))
 }
 
 /// `io_uring_setup` fails with `EPERM` when a seccomp profile blocks it (as
@@ -204,6 +206,100 @@ fn explain_setup_error(e: io::Error) -> io::Error {
             .with_source(e),
         ),
         _ => e,
+    }
+}
+
+/// Linux 6.14 to 7.2 count the memory of every io_uring ring (the
+/// submission and completion queues, and each buffer ring) against the
+/// locked-memory limit, `RLIMIT_MEMLOCK`, summed over all of the user's
+/// processes, unless the process has `CAP_IPC_LOCK`; 7.3 stopped, and so
+/// did 6.18 from 6.18.58. Once the limit is used up, setting up a ring
+/// fails with a bare `ENOMEM`, which reads as "out of memory" on a machine
+/// with plenty of it; with a default limit of 8 MiB that happens at about
+/// fifty workers. Say what it is here.
+///
+/// `what` names the memory: "rings" or "buffer ring". Other errors, and an
+/// `ENOMEM` where no such limit applies, pass through.
+fn explain_out_of_memory(e: io::Error, what: &str) -> io::Error {
+    if e.raw_os_error() != Some(libc::ENOMEM) {
+        return e;
+    }
+    match locked_memory_limit() {
+        Some(limit) => locked_memory_error(e, what, limit),
+        None => e,
+    }
+}
+
+/// The locked-memory limit that io_uring's memory counts against, in bytes:
+/// the soft `RLIMIT_MEMLOCK`, unless it is unlimited or this thread has
+/// `CAP_IPC_LOCK`, which lifts it.
+fn locked_memory_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` fills the struct it is given, which is of its type.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut lim) } != 0
+        || lim.rlim_cur == libc::RLIM_INFINITY
+        || may_lock_any_memory()
+    {
+        return None;
+    }
+    Some(lim.rlim_cur)
+}
+
+/// `true` if this thread has `CAP_IPC_LOCK` in the initial user namespace,
+/// which is where the kernel looks: root in a user namespace of its own (a
+/// rootless container) has it only there, and is held to the limit.
+fn may_lock_any_memory() -> bool {
+    const CAP_IPC_LOCK: u32 = 14;
+    let initial_namespace = std::fs::read_to_string("/proc/self/uid_map")
+        .is_ok_and(|m| m.split_whitespace().eq(["0", "0", "4294967295"]));
+    let capable = std::fs::read_to_string("/proc/thread-self/status").is_ok_and(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("CapEff:"))
+            .and_then(|caps| u64::from_str_radix(caps.trim(), 16).ok())
+            .is_some_and(|caps| caps & (1 << CAP_IPC_LOCK) != 0)
+    });
+    initial_namespace && capable
+}
+
+/// The error for an `ENOMEM` that the locked-memory limit, `limit` bytes,
+/// is the likely cause of.
+fn locked_memory_error(e: io::Error, what: &str, limit: u64) -> io::Error {
+    io::Error::new(
+        e.kind(),
+        Error::new(
+            Code::LockedMemoryLimit,
+            format!(
+                "io_uring could not lock memory for its {what}, because the locked-memory \
+                 limit (RLIMIT_MEMLOCK, {}) is used up ({e})",
+                bytes(limit)
+            ),
+            "raise the limit for this service: LimitMEMLOCK=infinity in its systemd unit, \
+             --ulimit memlock=-1 with docker run, ulimit -l unlimited in a shell, or give it \
+             CAP_IPC_LOCK, which lifts the limit. Linux 6.14 to 7.2 count every io_uring \
+             against it, summed over all processes of the same user: a giong worker locks \
+             about 150 KiB with the default settings, more with a larger \
+             Builder::ring_entries or Builder::recv_buffers. Without \
+             .driver(DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
+             on its epoll driver instead; docs/DEPLOYMENT.md shows how to raise the limit.",
+        )
+        .with_source(e),
+    )
+}
+
+/// `n` bytes as people write them: `8 MiB`, `64 KiB`, `1000 bytes`.
+fn bytes(n: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    match n {
+        0 => "0 bytes".into(),
+        n if n % GIB == 0 => format!("{} GiB", n / GIB),
+        n if n % MIB == 0 => format!("{} MiB", n / MIB),
+        n if n % KIB == 0 => format!("{} KiB", n / KIB),
+        n => format!("{n} bytes"),
     }
 }
 
@@ -401,6 +497,10 @@ unsafe fn register_buf_ring(ring: &IoUring, pool: &BufPool) -> io::Result<Vec<Ke
         if register_pbuf(fd, REGISTER_PBUF_RING, &reg).is_ok() {
             return Ok(vec![KernelWorkaround::BufferRingReservedCheck]);
         }
+    }
+    let err = explain_out_of_memory(err, "buffer ring");
+    if crate::error::code(&err).is_some() {
+        return Err(err);
     }
     Err(buffer_ring_error(&kernel_release(), err))
 }
@@ -1300,6 +1400,44 @@ mod tests {
         }
         let e = explain_setup_error(io::Error::from_raw_os_error(libc::ENOMEM));
         assert_eq!(e.raw_os_error(), Some(libc::ENOMEM));
+    }
+
+    /// An `ENOMEM` under a locked-memory limit names the limit and how to
+    /// raise it; other errors are not touched.
+    #[test]
+    fn a_used_up_locked_memory_limit_is_named() {
+        let enomem = io::Error::from_raw_os_error(libc::ENOMEM);
+        let e = locked_memory_error(enomem, "rings", 8 << 20);
+        assert_eq!(crate::error::code(&e), Some(Code::LockedMemoryLimit));
+        assert_eq!(e.kind(), io::ErrorKind::OutOfMemory);
+        let text = e.to_string();
+        assert!(text.starts_with("GIONG-E0010: "), "{text}");
+        assert!(text.contains("memory for its rings"), "{text}");
+        assert!(text.contains("(RLIMIT_MEMLOCK, 8 MiB)"), "{text}");
+        assert!(text.contains("Cannot allocate memory"), "{text}");
+        for fix in [
+            "LimitMEMLOCK=infinity",
+            "--ulimit memlock=-1",
+            "CAP_IPC_LOCK",
+        ] {
+            assert!(text.contains(fix), "{text}");
+        }
+        let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
+        let source = source.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.raw_os_error(), Some(libc::ENOMEM));
+
+        let e = explain_out_of_memory(io::Error::from_raw_os_error(libc::EINVAL), "rings");
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn limits_are_written_in_the_largest_whole_unit() {
+        assert_eq!(bytes(0), "0 bytes");
+        assert_eq!(bytes(1000), "1000 bytes");
+        assert_eq!(bytes(64 << 10), "64 KiB");
+        assert_eq!(bytes(8 << 20), "8 MiB");
+        assert_eq!(bytes((8 << 20) + 4096), "8196 KiB");
+        assert_eq!(bytes(2 << 30), "2 GiB");
     }
 
     #[test]
