@@ -74,7 +74,12 @@ jobs:
           sudo systemctl stop redis-server
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
-      - run: scripts/check.sh test
+      # Linux 6.14 and newer count every io_uring ring against the
+      # locked-memory limit, summed over the runner user's processes, and
+      # tests run runtimes side by side: lift the limit, so that each of them
+      # gets io_uring (docs/DEPLOYMENT.md, "Locked-memory limit"). tests/
+      # blocked.rs checks what happens under a low one.
+      - run: ulimit -l && sudo prlimit --pid $$ --memlock=unlimited:unlimited && ulimit -l && scripts/check.sh test
 
   # HTTP/2 conformance: h2spec against giong-http's h2 example, over TLS
   # (HTTP/2 chosen through ALPN) with the strict cases too, and over plain TCP
@@ -183,7 +188,8 @@ jobs:
           make -C "$src/.." -j4 BUILD_TLS=yes > /dev/null
           ln -sf valkey-server "$src/redis-server"
           echo "GIONG_REDIS_BIN=$src" >> "$GITHUB_ENV"
-      - run: cargo test -p ${{ matrix.crate }} --all-features
+      # The locked-memory limit is lifted as in the test job.
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && cargo test -p ${{ matrix.crate }} --all-features
 
   # The io_uring of older kernels, forced on the runner's newer one: without
   # the optional io_uring features (GIONG_IO_URING_OFF), then also on the
@@ -206,7 +212,8 @@ jobs:
           sudo systemctl stop redis-server
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
-      - run: scripts/check.sh fallback
+      # The locked-memory limit is lifted as in the test job.
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback
 
   # The epoll driver where it is needed: a container with Docker's default
   # seccomp profile, which blocks io_uring. Nothing names a driver, so the
@@ -265,7 +272,8 @@ jobs:
           sudo systemctl stop redis-server
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
-      - run: ROUNDS=2 scripts/check.sh tsan
+      # The locked-memory limit is lifted as in the test job.
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && ROUNDS=2 scripts/check.sh tsan
       # The epoll driver hands file operations to threads of its own.
       - run: GIONG_DRIVER=epoll ROUNDS=1 scripts/check.sh tsan
 

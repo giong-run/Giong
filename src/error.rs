@@ -125,6 +125,12 @@ codes! {
     /// even with giong's workarounds for the kernel bugs it knows. The
     /// kernel's error kind is kept.
     BufferRingRefused = 9, Unsupported, "the kernel refused io_uring buffer rings";
+    /// The kernel would not give io_uring memory because the user's
+    /// locked-memory limit (`RLIMIT_MEMLOCK`) is used up: since Linux 6.14
+    /// every ring counts against it, for all of the user's processes
+    /// together, unless the process has `CAP_IPC_LOCK`. The kernel's error
+    /// kind (`OutOfMemory`) is kept.
+    LockedMemoryLimit = 10, OutOfMemory, "the locked-memory limit is used up";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.

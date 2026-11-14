@@ -7,8 +7,10 @@ and the three io_uring system calls: `io_uring_setup`, `io_uring_enter` and
 Where io_uring cannot be used, giong runs on its **epoll driver** instead, without being
 told: in a Docker container with the default seccomp profile, in Kubernetes with the
 `RuntimeDefault` profile, under gVisor, with the `kernel.io_uring_disabled` sysctl set,
-or on a kernel older than 6.0. Every API works the same way on both drivers; epoll makes
-more system calls per request, and file operations run on a pool of blocking threads.
+on a kernel older than 6.0, or on Linux 6.14 and newer when the
+[locked-memory limit](#locked-memory-limit) is used up. Every API works the same way on
+both drivers; epoll makes more system calls per request, and file operations run on a
+pool of blocking threads.
 When giong falls back by itself it says so once on stderr, with the reason (the same
 `GIONG-E…` error a runtime that insists on io_uring would get). `giong::driver_choice()`
 tells which driver a worker got, who chose it, and why io_uring is not used; log it at
@@ -39,12 +41,55 @@ when you want its speed:
 ```sh
 uname -r                              # 6.0 or newer
 cat /proc/sys/kernel/io_uring_disabled  # Linux 6.6+: 0 = allowed
+ulimit -l                             # Linux 6.14+: unlimited, or about 150 KiB per worker
 ```
 
 `kernel.io_uring_disabled` (Linux 6.6 and newer): `0` allows io_uring for every process,
 `1` only for privileged processes and members of the group in `kernel.io_uring_group`,
 `2` for nobody. Set it with `sysctl -w kernel.io_uring_disabled=0`, or put the service's
 user in that group.
+
+## Locked-memory limit
+
+Since Linux 6.14 the kernel counts the memory of every io_uring ring against the
+locked-memory limit (`RLIMIT_MEMLOCK`, `ulimit -l`) of a process that lacks
+`CAP_IPC_LOCK`. The count is kept per user ID and summed over all of that user's
+processes, and the memory of a closed ring is given back a moment after the close. A
+giong worker locks about 150 KiB with the default settings: the submission and
+completion queues take 136 KiB of it (`Builder::ring_entries`), the two rings of receive
+buffers 8 KiB each (`Builder::recv_buffers`). The usual default limit of 8 MiB holds about
+fifty workers, for all of the user's processes together; the 64 KiB of older systems
+holds none.
+
+A worker that cannot lock the memory gets `ENOMEM` from the kernel, which giong reports as
+[GIONG-E0010](errors/E0010.md), naming the limit; without an explicit driver it runs that
+worker on epoll and says so once on stderr. Root is not held to the limit, since it has
+`CAP_IPC_LOCK`, except where that capability was taken away, as in a Docker container.
+Raise the limit, or lift it, for any service that is not root:
+
+- systemd: `LimitMEMLOCK=infinity` in the `[Service]` section, or
+  `AmbientCapabilities=CAP_IPC_LOCK` to lift it for a service with a `User=`.
+- Docker: `docker run --ulimit memlock=-1:-1`, or in Docker Compose:
+
+  ```yaml
+  services:
+    api:
+      ulimits:
+        memlock:
+          soft: -1
+          hard: -1
+  ```
+
+- Kubernetes has no setting for the limit. Add the capability where the pod's security
+  policy allows it (`securityContext.capabilities.add: ["IPC_LOCK"]`; Pod Security's
+  `baseline` and `restricted` levels do not), or raise the limit the container runtime
+  starts containers with on each node (for containerd, `LimitMEMLOCK=infinity` in a
+  drop-in for its systemd unit). Containers that run as the same user ID on one node share
+  the count.
+- A shell: `ulimit -l unlimited` as root before starting the service, or an entry in
+  `/etc/security/limits.conf` for its user.
+
+Or need less: fewer workers, a smaller `Builder::ring_entries`, fewer receive buffers.
 
 ## Ubuntu 24.04
 
