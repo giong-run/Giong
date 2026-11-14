@@ -595,12 +595,14 @@ impl BufPool {
     pub(crate) fn release(&self, bid: u16) {
         let slot = self.slot(bid);
         let pieces = slot.pieces.get();
-        debug_assert!(
+        // Released more often than handed out, the buffer would go back to
+        // the kernel while pieces of it are still read: stop instead.
+        assert!(
             pieces > 0,
-            "buffer {bid} released more often than handed out"
+            "giong: buffer {bid} released more often than handed out"
         );
-        slot.pieces.set(pieces.saturating_sub(1));
-        if pieces <= 1 && slot.lent_to.get().is_none() {
+        slot.pieces.set(pieces - 1);
+        if pieces == 1 && slot.lent_to.get().is_none() {
             self.recycle(bid);
         }
     }
@@ -861,6 +863,16 @@ mod tests {
         }
         pool.release(0);
         assert_eq!(pool.free(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "released more often than handed out")]
+    fn a_buffer_released_more_often_than_handed_out_stops_the_worker() {
+        let pool = pool(2, 64);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        let a = data(pool.received(RingId::Packed, 0, 64, false));
+        pool.release(a.0);
+        pool.release(a.0);
     }
 
     #[test]
