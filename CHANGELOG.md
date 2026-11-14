@@ -19,8 +19,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
   the buffer is full or when a read waits; a partly read chunk never holds the worker's
   receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
-  through `AsyncBufRead`), measured by `bench/compat.sh`. Errors `GIONG-E1401` (an earlier
-  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting).
+  through `AsyncBufRead`), measured by `bench/compat.sh` in four sessions (sending 10–20%
+  slower, receiving with `read` 6–13% more CPU per byte). Errors `GIONG-E1401` (an earlier
+  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting). A
+  hyper server over `Compat` needs a `hyper::rt::Timer` for its header timeout; the README
+  shows one built on giong's timers.
 - **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
   for futures written by hand and for adapters such as giong-compat.
 - **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
@@ -152,6 +155,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-compat**: the lowest dependency versions it allows are ones it builds and passes
+  its tests with (`cargo update -Z direct-minimal-versions`): tokio 1.13 (was any 1.x),
+  futures-io 0.3.31 (was any 0.3), and for the tests rustls 0.23.33, the same as
+  giong-tls, and hyper 1.6, the first whose header-read timeout reports `is_timeout()`.
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
   registered ring table (`IORING_REGISTER_RING_FDS`) instead of the ring's descriptor, so
   the kernel no longer looks the descriptor up on each `io_uring_enter` (about 11 of the
@@ -176,6 +183,25 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
 
 ### Fixed
+
+- **giong-compat**: on the epoll driver, `poll_write` with a full buffer could return
+  `Pending` after the send it waited on finished on that same poll, so no operation held
+  the task's waker (hundreds of times in 2 GiB over a Unix socket). Only the epoll
+  driver's own waker list woke the task again. A write now waits for the send in flight
+  before starting the next one, so every `Pending` leaves a send holding the waker.
+- **giong-compat**: on io_uring, a stream kept its last send buffer (up to the 64 KiB
+  write buffer) while idle, though the README said an idle stream holds none. It now
+  drops the buffer when a send finishes; `tests/memory.rs` checks that an idle stream
+  holds less than 1 KiB on both drivers.
+- **giong-compat**: a write made while a TLS shutdown is in progress fails at once with
+  `GIONG-E1402` instead of being accepted and then dropped, and a shutdown that failed
+  keeps failing (`GIONG-E1401`) instead of returning `Ok` the second time.
+- **giong-compat**: `consume` with nothing buffered is ignored, as in std's and Tokio's
+  `BufReader`, instead of panicking in debug builds.
+- **giong-compat**: tests for what the review found untested: a seeded cancellation
+  stress test (`tests/cancel.rs`), hyper's HTTP/2 client and server over `Compat` with a
+  giong executor, a hyper server timeout with giong's timers, and `Compat` over kernel
+  TLS. `scripts/valgrind.sh` runs the `compat` and `memory` suites too.
 
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
