@@ -31,8 +31,8 @@ use std::time::Duration;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 use super::{
-    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, ZeroCopyHold,
-    F_BUF_MORE, ZC_COPIED,
+    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, SqPoll,
+    ZeroCopyHold, F_BUF_MORE, ZC_COPIED,
 };
 use crate::buf::{BufPool, Received, RecvBuf, RingId};
 use crate::error::{Code, Error};
@@ -155,6 +155,9 @@ pub(crate) struct Uring {
     /// The smallest send that goes out without a copy, with
     /// [`IoUringFeature::ZeroCopySend`].
     zero_copy_min: Option<usize>,
+    /// A kernel thread picks up submissions
+    /// ([`IoUringFeature::SubmissionPolling`]).
+    sq_polled: bool,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -261,6 +264,27 @@ const F_NOTIF: u32 = 1 << 3;
 const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
 /// `IORING_NOTIF_USAGE_ZC_COPIED`, in the result of a notification.
 const NOTIF_COPIED: u32 = 1 << 31;
+
+/// A ring with a kernel thread that picks up submissions
+/// (`IORING_SETUP_SQPOLL`), polling for `idle` before it sleeps; `None`
+/// where the kernel refuses it. The kernel refuses the task-run flags with
+/// it (`DEFER_TASKRUN`, `COOP_TASKRUN`, `TASKRUN_FLAG`): the polling thread
+/// runs the completion work itself and posts the completions.
+fn build_sqpoll_ring(entries: u32, sq_poll: SqPoll) -> Option<IoUring> {
+    let idle_ms = u32::try_from(sq_poll.idle.as_millis())
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let mut b = IoUring::builder();
+    b.setup_sqpoll(idle_ms)
+        .setup_single_issuer()
+        .setup_submit_all()
+        .setup_cqsize(entries.saturating_mul(4))
+        .setup_clamp();
+    if let Some(cpu) = sq_poll.cpu.and_then(|cpu| u32::try_from(cpu).ok()) {
+        b.setup_sqpoll_cpu(cpu);
+    }
+    b.build(entries).ok()
+}
 
 /// The SQE for a single-shot operation. `zero_copy` says whether the ring
 /// uses [`IoUringFeature::ZeroCopySend`].
@@ -496,6 +520,9 @@ const UNREGISTER_RING_FDS: libc::c_uint = 21;
 /// `IORING_ENTER_GETEVENTS`, `IORING_ENTER_EXT_ARG` and
 /// `IORING_ENTER_REGISTERED_RING`.
 const ENTER_GETEVENTS: u32 = 1 << 0;
+/// `IORING_ENTER_SQ_WAKEUP` and `IORING_ENTER_SQ_WAIT`, with `SQPOLL`.
+const ENTER_SQ_WAKEUP: u32 = 1 << 1;
+const ENTER_SQ_WAIT: u32 = 1 << 2;
 const ENTER_EXT_ARG: u32 = 1 << 3;
 const ENTER_REGISTERED_RING: u32 = 1 << 4;
 
@@ -620,8 +647,20 @@ fn buffer_ring_error(release: &str, e: io::Error) -> io::Error {
 }
 
 impl Uring {
-    pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
-        let ring = build_ring(entries)?;
+    pub(crate) fn new(
+        entries: u32,
+        sq_poll: Option<SqPoll>,
+        pool: Rc<BufPool>,
+        wake_fd: RawFd,
+    ) -> io::Result<Self> {
+        let sq_ring = sq_poll
+            .filter(|_| super::feature_enabled(IoUringFeature::SubmissionPolling))
+            .and_then(|sq_poll| build_sqpoll_ring(entries, sq_poll));
+        let sq_polled = sq_ring.is_some();
+        let ring = match sq_ring {
+            Some(ring) => ring,
+            None => build_ring(entries)?,
+        };
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
@@ -646,12 +685,16 @@ impl Uring {
         if zero_copy_min.is_some() {
             features.push(IoUringFeature::ZeroCopySend);
         }
+        if sq_polled {
+            features.push(IoUringFeature::SubmissionPolling);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
             registered_ring,
             zero_copy_min,
+            sq_polled,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -683,8 +726,14 @@ impl Uring {
             if unsafe { self.ring.submission().push(&sqe) }.is_ok() {
                 break;
             }
-            // Submission queue full: hand what we have to the kernel.
-            match self.enter(0, None) {
+            // Submission queue full: hand what we have to the kernel, or
+            // wait for its polling thread to take some.
+            let res = if self.sq_polled {
+                self.enter_with(0, None, ENTER_SQ_WAIT)
+            } else {
+                self.enter(0, None)
+            };
+            match res {
                 Ok(()) => {}
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EINTR) => {}
@@ -998,6 +1047,10 @@ impl Uring {
                     _ => panic!("giong: io_uring submit failed: {e}"),
                 },
             }
+            if self.sq_polled {
+                // The polling thread takes them; give it the CPU.
+                std::thread::yield_now();
+            }
             attempts += 1;
             assert!(
                 attempts < 100_000,
@@ -1071,19 +1124,39 @@ impl Uring {
     /// where there is one: the crate remembers a registration only in the
     /// short-lived `Submitter` that made it.
     fn enter(&mut self, want: u32, timeout: Option<Duration>) -> io::Result<()> {
-        let (to_submit, pending) = {
+        self.enter_with(want, timeout, 0)
+    }
+
+    /// [`enter`](Self::enter) with extra `IORING_ENTER_*` flags.
+    ///
+    /// With a polling thread (`SQPOLL`) the kernel takes submissions
+    /// without a system call while that thread is awake, so this enters
+    /// only to wake it, to wait for completions, or for `extra`.
+    fn enter_with(&mut self, want: u32, timeout: Option<Duration>, extra: u32) -> io::Result<()> {
+        let (to_submit, pending, need_wakeup) = {
             let mut sq = self.ring.submission();
             sq.sync();
-            (sq.len() as u32, sq.taskrun() || sq.cq_overflow())
+            let need_wakeup = self.sq_polled && sq.need_wakeup();
+            (
+                sq.len() as u32,
+                sq.taskrun() || sq.cq_overflow(),
+                need_wakeup,
+            )
         };
         let (fd, mut flags) = match self.registered_ring {
-            Some(index) => (index as i32, ENTER_REGISTERED_RING),
-            None => (self.ring.as_raw_fd(), 0),
+            Some(index) => (index as i32, ENTER_REGISTERED_RING | extra),
+            None => (self.ring.as_raw_fd(), extra),
         };
         // Deferred task work and overflowed completions are only processed
         // by an enter that asks for completions.
         if want > 0 || pending {
             flags |= ENTER_GETEVENTS;
+        }
+        if need_wakeup {
+            flags |= ENTER_SQ_WAKEUP;
+        } else if self.sq_polled && flags & (ENTER_GETEVENTS | ENTER_SQ_WAIT) == 0 {
+            // The polling thread is awake and takes the submissions itself.
+            return Ok(());
         }
         let ts;
         let arg;

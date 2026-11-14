@@ -147,6 +147,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   scatter-gather) or cannot send this way (kTLS); Unix sockets never use it.
   `bench/uring-features.sh` measures each optional io_uring feature against the rest, on
   one machine or two.
+- **giong**: `Builder::submission_polling(idle)` lets a kernel thread per worker pick up
+  its io_uring submissions (`IORING_SETUP_SQPOLL`, `sq-poll`), so a busy worker submits
+  without system calls; the thread sleeps after `idle` without work. Off by default: the
+  thread keeps a CPU busy while it polls, so with pinned workers each thread gets an
+  allowed CPU of its own (worker `i`'s thread on CPU `workers + i`), and the workers run
+  without it unless there are at least twice as many allowed CPUs as workers. (Left on its
+  worker's CPU, the thread kept the worker off it until the scheduler's next tick: one
+  request per connection per millisecond.) `GIONG_SQPOLL=<ms>` turns it on for a test run
+  or benchmark, and `scripts/check.sh sqpoll` (part of `fallback` and CI's `fallback`
+  job) runs the suite with it.
 
 ### Changed
 

@@ -17,7 +17,7 @@
 # pieces from /stream, each sent once the one before it is written); "@N"
 # after a path runs it with N connections instead of CONNS. VARIANTS are
 # "name:VAR=value,VAR=value" (default: every feature on, then each one off,
-# then all off; GIONG_WORKERS=<n> fits there too). In each round every variant
+# then all off; GIONG_SQPOLL=<ms> and GIONG_WORKERS=<n> fit there too). In each round every variant
 # runs once per path, starting from a different one each round. Recorded per
 # run: requests per second, p99, the server's CPU time per request (user and
 # kernel, from /proc) and the bytes per second wrk received. The summary is

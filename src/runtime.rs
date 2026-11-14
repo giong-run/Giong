@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::buf::BufPool;
-use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park};
+use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park, SqPoll};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
@@ -318,6 +318,8 @@ struct Config {
     chosen_by: ChosenBy,
     spin: Option<Duration>,
     ring_entries: u32,
+    /// io_uring's `SQPOLL`, with how long its thread polls before it sleeps.
+    sq_poll: Option<Duration>,
     buf_count: u16,
     buf_size: usize,
     shutdown_grace: Duration,
@@ -377,13 +379,21 @@ pub(crate) fn with_worker<R>(f: impl FnOnce(&Worker) -> R) -> R {
 }
 
 impl Worker {
-    fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
+    /// `sq_poll`: the worker's polling thread, if it gets one (see
+    /// [`Builder::submission_polling`]).
+    fn new(
+        index: usize,
+        rt: Arc<RuntimeShared>,
+        cfg: &Config,
+        sq_poll: Option<SqPoll>,
+    ) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
         let (driver, choice) = Driver::new(
             cfg.driver,
             cfg.chosen_by,
             cfg.ring_entries,
+            sq_poll,
             pool.clone(),
             shared.eventfd.as_raw_fd(),
         )?;
@@ -746,6 +756,7 @@ pub struct Builder {
     driver: Option<DriverKind>,
     pin_cores: bool,
     ring_entries: u32,
+    sq_poll: Option<Duration>,
     buf_count: u16,
     buf_size: usize,
     signals: bool,
@@ -768,6 +779,7 @@ impl Builder {
             driver: None,
             pin_cores: true,
             ring_entries: 1024,
+            sq_poll: None,
             buf_count: 512,
             buf_size: 8 * 1024,
             signals: false,
@@ -816,6 +828,35 @@ impl Builder {
     /// Size of each worker's io_uring submission queue (default: 1024).
     pub fn ring_entries(mut self, entries: u32) -> Self {
         self.ring_entries = entries.clamp(8, 32768).next_power_of_two();
+        self
+    }
+
+    /// Lets a kernel thread per worker pick up the worker's io_uring
+    /// submissions (`IORING_SETUP_SQPOLL`), so that a busy worker submits
+    /// I/O without system calls (default: off). After the last submission the
+    /// thread keeps polling for `idle`, then sleeps until the worker wakes it.
+    ///
+    /// While it polls, the thread keeps a CPU busy, so each needs one of its
+    /// own: with workers pinned to cores (the default), worker `i`'s thread
+    /// is pinned to the allowed CPU `workers + i`, and SQPOLL is used only
+    /// where there are at least twice as many allowed CPUs as workers (set
+    /// [`workers`](Self::workers) to half of them or fewer). With half, on
+    /// a machine that numbers a core's hyperthreads `i` and `i + cores` (as
+    /// most do), each thread shares a core with its worker. Without pinning
+    /// the threads go where the scheduler puts them. Measure before turning
+    /// it on.
+    ///
+    /// The polling thread also finishes closing sockets and files, a moment
+    /// after the close itself completes: a dropped listener's port or socket
+    /// path can stay taken for that moment.
+    ///
+    /// Where the kernel refuses it, or on epoll, workers run without it;
+    /// [`DriverChoice::io_uring_features`](crate::DriverChoice::io_uring_features)
+    /// lists [`IoUringFeature::SubmissionPolling`](crate::IoUringFeature::SubmissionPolling)
+    /// when a worker has it. `GIONG_SQPOLL=<idle in ms>` turns it on for a
+    /// whole test run or benchmark.
+    pub fn submission_polling(mut self, idle: Duration) -> Self {
+        self.sq_poll = Some(idle);
         self
     }
 
@@ -913,11 +954,19 @@ impl Builder {
                 None => (None, ChosenBy::Automatic),
             },
         };
+        // A test and benchmark hook, like GIONG_DRIVER.
+        let sq_poll = self.sq_poll.or_else(|| {
+            std::env::var("GIONG_SQPOLL")
+                .ok()
+                .and_then(|ms| ms.trim().parse().ok())
+                .map(Duration::from_millis)
+        });
         Ok(Config {
             driver,
             chosen_by,
             spin: self.spin,
             ring_entries: self.ring_entries,
+            sq_poll,
             buf_count: self.buf_count,
             buf_size: self.buf_size,
             shutdown_grace: self.shutdown_grace,
@@ -943,7 +992,8 @@ impl Builder {
         let location = panic::Location::caller();
         let cfg = self.config()?;
         let rt = RuntimeShared::new(1)?;
-        let worker = Worker::new(0, rt, &cfg)?;
+        let sq_poll = cfg.sq_poll.map(|idle| SqPoll { idle, cpu: None });
+        let worker = Worker::new(0, rt, &cfg, sq_poll)?;
         Ok(worker.run(fut, location))
     }
 }
@@ -1038,8 +1088,21 @@ impl Runtime {
         for index in 0..n {
             let (f, gate, tx, cfg) = (f.clone(), gate.clone(), tx.clone(), cfg.clone());
             let rt = self.shared.clone();
-            let cpu =
-                (self.builder.pin_cores && !cpus.is_empty()).then(|| cpus[index % cpus.len()]);
+            let pinned = self.builder.pin_cores && !cpus.is_empty();
+            let cpu = pinned.then(|| cpus[index % cpus.len()]);
+            // A polling thread spins on whatever CPU it has, and starts out
+            // with its worker's. Sharing one, the worker would run only when
+            // the scheduler takes the CPU from the thread, once per tick:
+            // pinned workers give theirs a CPU of its own, from the ones no
+            // worker runs on, or none of them gets one.
+            let sq_poll = cfg.sq_poll.and_then(|idle| match pinned {
+                false => Some(SqPoll { idle, cpu: None }),
+                true if cpus.len() >= 2 * n => Some(SqPoll {
+                    idle,
+                    cpu: Some(cpus[n + index]),
+                }),
+                true => None,
+            });
             let signal_fd = if index == 0 { signal_fd } else { None };
             let spawned = thread::Builder::new()
                 .name(format!("giong-{index}"))
@@ -1047,7 +1110,7 @@ impl Runtime {
                     if let Some(cpu) = cpu {
                         pin_to_cpu(cpu);
                     }
-                    let worker = match Worker::new(index, rt.clone(), &cfg) {
+                    let worker = match Worker::new(index, rt.clone(), &cfg, sq_poll) {
                         Ok(worker) => {
                             let _ = tx.send(Ok(()));
                             worker

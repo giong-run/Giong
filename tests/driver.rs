@@ -473,3 +473,138 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         }
     }
 }
+
+#[test]
+fn submission_polling_runs_io_and_wakes_its_thread() {
+    if !io_uring_available() {
+        return;
+    }
+    let polled = giong::Builder::new()
+        .driver(DriverKind::IoUring)
+        .submission_polling(Duration::from_millis(2))
+        .block_on(async {
+            let polled = giong::driver_choice()
+                .io_uring_features
+                .contains(&IoUringFeature::SubmissionPolling);
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let server = giong::spawn(async move {
+                let s = l.accept().await.unwrap();
+                loop {
+                    let data = s.recv().await.unwrap();
+                    if data.is_empty() {
+                        break;
+                    }
+                    s.write_all(data.to_vec()).await.0.unwrap();
+                }
+            });
+            let c = TcpStream::connect(addr).await.unwrap();
+            for round in 0..20u8 {
+                // Long enough pauses for the polling thread to go to sleep,
+                // so the worker has to wake it.
+                if round % 5 == 0 {
+                    giong::time::sleep(Duration::from_millis(10)).await;
+                }
+                let msg = vec![round; 3000 + usize::from(round) * 1000];
+                c.write_all(msg.clone()).await.0.unwrap();
+                let mut got = Vec::new();
+                while got.len() < msg.len() {
+                    got.extend_from_slice(&c.recv().await.unwrap());
+                }
+                assert_eq!(got, msg, "round {round}");
+            }
+            drop(c);
+            server.await.unwrap();
+            polled
+        })
+        .unwrap();
+    // Unprivileged SQPOLL rings since 5.11; SINGLE_ISSUER with it since 6.0.
+    if kernel_version() >= (6, 1) && std::env::var_os("GIONG_IO_URING_OFF").is_none() {
+        assert!(polled, "the kernel refused SQPOLL");
+    }
+}
+
+/// The CPUs this thread may run on, from `/proc` (`Cpus_allowed_list`).
+fn allowed_cpus(task: &str) -> Vec<usize> {
+    let status = std::fs::read_to_string(format!("/proc/self/task/{task}/status")).unwrap();
+    let list = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+        .unwrap()
+        .trim();
+    let mut cpus = Vec::new();
+    for range in list.split(',') {
+        let (a, b) = range.split_once('-').unwrap_or((range, range));
+        cpus.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap());
+    }
+    cpus
+}
+
+#[test]
+fn a_pinned_worker_gives_its_polling_thread_a_cpu_of_its_own() {
+    // A polling thread spins on its CPU: sharing its worker's, it keeps the
+    // worker off it until the scheduler's next tick (a tenth of the
+    // throughput on bare metal). So it gets a CPU no worker runs on, or the
+    // workers run without one.
+    if !io_uring_available()
+        || kernel_version() < (6, 1)
+        || std::env::var_os("GIONG_IO_URING_OFF").is_some()
+    {
+        return;
+    }
+    let cpus = allowed_cpus(&std::process::id().to_string());
+    if cpus.len() < 2 {
+        return;
+    }
+    for workers in [1, cpus.len()] {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        giong::Builder::new()
+            .driver(DriverKind::IoUring)
+            .workers(workers)
+            .submission_polling(Duration::from_millis(50))
+            .build()
+            .unwrap()
+            .run(move |_| {
+                let record = record.clone();
+                async move {
+                    let polled = giong::driver_choice()
+                        .io_uring_features
+                        .contains(&IoUringFeature::SubmissionPolling);
+                    // SAFETY: gettid has no preconditions.
+                    let tid = unsafe { libc::gettid() };
+                    // The thread names itself once it first runs.
+                    let name = format!("iou-sqp-{tid}");
+                    let mut thread = None;
+                    for _ in 0..if polled { 200 } else { 1 } {
+                        thread = std::fs::read_dir("/proc/self/task")
+                            .unwrap()
+                            .map(|t| t.unwrap().file_name().into_string().unwrap())
+                            .find(|t| {
+                                std::fs::read_to_string(format!("/proc/self/task/{t}/comm"))
+                                    .is_ok_and(|comm| comm.trim() == name)
+                            });
+                        if thread.is_some() {
+                            break;
+                        }
+                        giong::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    let worker = allowed_cpus(&tid.to_string());
+                    let thread = thread.map(|t| allowed_cpus(&t));
+                    record.lock().unwrap().push((polled, worker, thread));
+                }
+            })
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), workers);
+        for (polled, worker, thread) in seen.iter() {
+            if workers == 1 {
+                assert!(polled, "the kernel refused SQPOLL");
+                assert_eq!(worker, &[cpus[0]]);
+                assert_eq!(thread.as_deref(), Some(&[cpus[1]][..]));
+            } else {
+                assert!(!polled && thread.is_none(), "every CPU has a worker");
+            }
+        }
+    }
+}

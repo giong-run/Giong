@@ -60,8 +60,9 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 scripts/check.sh test        # the whole suite in release mode, five times over
-scripts/check.sh fallback    # the same on the io_uring setups of kernels older than 6.1,
-                             # then on the epoll driver
+scripts/check.sh fallback    # the same without optional io_uring features, on the setups
+                             # of kernels older than 6.1, on the epoll driver, then with
+                             # submission polling (SQPOLL)
 ```
 
 If you touched `unsafe` code, buffer handling, the driver or anything that crosses

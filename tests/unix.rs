@@ -4,10 +4,11 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use giong::net::{UnixListener, UnixStream};
-use giong::time::timeout;
+use giong::time::{sleep, timeout};
+use giong::IoUringFeature;
 
 /// A socket path of its own for one test, removed afterwards.
 struct SocketPath(PathBuf);
@@ -177,11 +178,27 @@ fn bind_and_connect_errors() {
         let err = UnixListener::bind(&path.0).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::AddrInUse);
 
-        // A socket file whose listener is gone refuses connections.
+        // A socket file whose listener is gone refuses connections. With
+        // submission polling the kernel's polling thread lets go of the
+        // listener a moment after its close completes.
+        let polled = giong::driver_choice()
+            .io_uring_features
+            .contains(&IoUringFeature::SubmissionPolling);
         drop(listener);
         giong::yield_now().await;
-        let err = UnixStream::connect(&path.0).await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match UnixStream::connect(&path.0).await {
+                Err(err) => {
+                    assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
+                    break;
+                }
+                Ok(_) if polled && Instant::now() < deadline => {
+                    sleep(Duration::from_millis(1)).await;
+                }
+                Ok(stream) => panic!("connected to a dropped listener: {stream:?}"),
+            }
+        }
     });
 }
 

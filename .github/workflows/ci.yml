@@ -188,7 +188,8 @@ jobs:
   # The io_uring of older kernels, forced on the runner's newer one: without
   # the optional io_uring features (GIONG_IO_URING_OFF), then also on the
   # setup tiers of kernels older than 6.1 (GIONG_RING_TIER); then the epoll
-  # driver (GIONG_DRIVER=epoll).
+  # driver (GIONG_DRIVER=epoll); then the opt-in submission polling
+  # (GIONG_SQPOLL).
   fallback:
     runs-on: ubuntu-24.04
     env:

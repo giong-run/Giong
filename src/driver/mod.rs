@@ -154,6 +154,11 @@ pub enum IoUringFeature {
     /// write returns (a `Vec`) are always copied: the kernel reads
     /// zero-copy bytes until the peer has acknowledged them.
     ZeroCopySend,
+    /// A kernel thread picks up the worker's submissions
+    /// (`IORING_SETUP_SQPOLL`), so a busy worker submits without system
+    /// calls. Only when asked for, with
+    /// [`Builder::submission_polling`](crate::Builder::submission_polling).
+    SubmissionPolling,
 }
 
 impl IoUringFeature {
@@ -163,6 +168,7 @@ impl IoUringFeature {
         IoUringFeature::PackedBuffers,
         IoUringFeature::RegisteredRing,
         IoUringFeature::ZeroCopySend,
+        IoUringFeature::SubmissionPolling,
     ];
 
     /// A stable short name, such as `"packed-buffers"`.
@@ -171,6 +177,7 @@ impl IoUringFeature {
             IoUringFeature::PackedBuffers => "packed-buffers",
             IoUringFeature::RegisteredRing => "registered-ring",
             IoUringFeature::ZeroCopySend => "zero-copy-send",
+            IoUringFeature::SubmissionPolling => "sq-poll",
         }
     }
 }
@@ -218,6 +225,15 @@ pub(crate) struct ZeroCopyHold {
     pub(crate) owners: Vec<Box<dyn Any>>,
     pub(crate) scratch: Vec<u8>,
     pub(crate) copied: Rc<Cell<bool>>,
+}
+
+/// A kernel thread that takes a ring's submissions (`IORING_SETUP_SQPOLL`):
+/// how long it keeps polling after the last one, and the CPU it is pinned
+/// to (`None`: wherever the scheduler puts it).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SqPoll {
+    pub(crate) idle: Duration,
+    pub(crate) cpu: Option<usize>,
 }
 
 /// Set by the io_uring driver in the flags of a zero-copy send whose data
@@ -519,14 +535,17 @@ impl Driver {
         choice: Option<DriverKind>,
         chosen_by: ChosenBy,
         entries: u32,
+        sq_poll: Option<SqPoll>,
         pool: Rc<BufPool>,
         wake_fd: RawFd,
     ) -> io::Result<(Self, DriverChoice)> {
         let mut io_uring_error = None;
         let driver = match choice {
-            Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool, wake_fd)?),
+            Some(DriverKind::IoUring) => {
+                Driver::Uring(uring::Uring::new(entries, sq_poll, pool, wake_fd)?)
+            }
             Some(DriverKind::Epoll) => Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?),
-            None => match uring::Uring::new(entries, pool.clone(), wake_fd) {
+            None => match uring::Uring::new(entries, sq_poll, pool.clone(), wake_fd) {
                 Ok(ring) => Driver::Uring(ring),
                 Err(e) if io_uring_unusable(&e) => {
                     let driver = Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?);
