@@ -373,14 +373,18 @@ fn a_taken_connection_comes_back_with_a_clean_session() {
         pool.execute("INSERT INTO pool_clean (x) VALUES (1)", &[])
             .await
             .unwrap();
-        // Timestamps read right: the time zone is UTC again.
-        let epoch: std::time::SystemTime = pool
-            .query_one("SELECT FROM_UNIXTIME(0)", &[])
+        // Timestamps read right: the time zone is UTC again. (Not the epoch
+        // itself, which MariaDB 11.8 has no value for: it answers NULL.)
+        let day_two: std::time::SystemTime = pool
+            .query_one("SELECT FROM_UNIXTIME(86400)", &[])
             .await
             .unwrap()
             .get(0)
             .unwrap();
-        assert_eq!(epoch, std::time::UNIX_EPOCH);
+        assert_eq!(
+            day_two,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400)
+        );
         let stats = pool.stats();
         assert_eq!((stats.opened, stats.resets), (1, 1), "{stats:?}");
     });
