@@ -59,6 +59,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-http**: `Server::http2_prior_knowledge(false)` keeps HTTP/2 to TLS connections
   that choose it through ALPN, so that a plain port behind an HTTP/1.1 proxy speaks only
   HTTP/1.1. `Server::http2(true)` used to turn on both, and still does by default.
+- **Verification**: a fuzz target for the HTTP/1.1 client reading a response on a
+  connection, `response_body` (in the nightly fuzz workflow): whatever a server sends, in
+  whatever pieces, the head and body must be what the bytes hold, the body ending exactly
+  where its length, its chunked framing or the close says (or failing with the error
+  that framing calls for), and the connection may be reused only when the bytes received
+  end exactly at the end of the body. The reading code now takes its bytes through a
+  small trait, so the target drives the code the client runs. 100,000 responses run in
+  `cargo test`.
+- **giong-http**: `Response::try_header` and `Response::try_new`, the forms of
+  `Response::header` and `Response::new` that return an error instead of panicking on a
+  header name or value that is not valid (a line break that would split the response)
+  or a status outside 200 to 599, for values that come from the request: a redirect
+  target from a decoded query parameter, a file name in `Content-Disposition`. The error
+  is a `giong::error::Error` with the code `GIONG-E1101` (`Code::HttpClientRequest`, the
+  code giong-http already gives a message that cannot be sent as written). `header` and
+  `new` are unchanged and their documentation points to the new forms.
 
 ### Changed
 
@@ -406,6 +422,31 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   curl, h2load and Node.js (nghttp2), and giong-http's own client.
 - **giong-http**: `Handler::stream_body` said that answering early closes the connection;
   over HTTP/2 only the stream ends.
+- **giong-http**, **Breaking**: an HTTP/1.1 request whose target is a whole URL (absolute
+  form, `GET http://host/path`, which servers must accept) was served whatever its scheme
+  (`foo://x/y` too), and its host was ignored: the handler saw `path() == "/path"` and the
+  host in `Host`, which could name another one than the URL a proxy in front routed or
+  authorised on. Such a target must now be `http` or `https` (in any case), carry no user
+  name or password, and name the host the `Host` header names (compared without regard to
+  case; a port on one side only is a difference), or the request is answered with `400`,
+  as HTTP/2 already did for a `host` that differs from `:authority`. An HTTP/1.0 request
+  in absolute form without `Host` is refused too, `*` is accepted only with `OPTIONS`, and
+  a target that is none of path, URL, `*` or (with `CONNECT`) `host:port` is refused. The
+  path of such a URL now ends where its query starts (`http://h?to=/next` had the path
+  `/next`).
+- **giong-http**: over HTTP/2, a `host` field that names the `:authority` host in another
+  case is no longer refused (host names are case-insensitive, and HTTP/1.1 now compares
+  the same way), and an `:authority` with a user name or password is (RFC 9113, section
+  8.3.1).
+- **giong-http**: trailer lines after a chunked body were dropped without being looked at,
+  so a line without a colon, with a bare CR in it, or with a name that is not a token
+  was accepted, which a proxy in front that ends lines at a bare CR would read
+  differently. They are now held to the rules of a header line: the server answers
+  `400` (`GIONG-E1113` for a body read as a stream), and the client, which shares the
+  decoder, fails with `GIONG-E1107` (`ErrorKind::Protocol`).
+- **giong-http**: the errors of a request body read as a stream, and of a response body
+  that can no longer be sent, ran their fix into the link after it ("... the limit
+  `Handler::stream_body` returns See https://..."): their fixes now end with a full stop.
 
 ### Security
 
