@@ -8,6 +8,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- **An idle HTTP/2 connection costs what it did before 0.5.0's zero-copy send.** That
+  change made every TCP write future 48 to 88 bytes larger (a wide pointer for the hold,
+  and the retry for sockets that refuse zero-copy kept alive across the send), and
+  `giong-http` keeps several in each connection, so an idle HTTP/2 connection went from
+  4.30 to 4.55 KiB. The hold is now a thin pointer, an operation's driver key is 32 bits,
+  and an operation sends the same bytes again with a copy itself when the socket refuses
+  zero-copy, so a write is 8 bytes larger than in 0.4 and an idle HTTP/2 connection costs
+  4.33 KiB (5,000 idle connections, 1 worker, RSS, `bench/giong-http` with
+  `bench/hold h2-idle`, on a 4-core VM; the bare-metal pass measured 3.99 and 4.21 KiB
+  before and after). The same change takes back 100 of the 140 instructions that
+  zero-copy send had added to each small HTTPS request (`/json` over rustls, counted
+  with callgrind: 15,575 before it, 15,715 with it, 15,613 now), the largest part of
+  the 2% fewer such requests the bare-metal pass measured.
+
 ## [0.5.0] - 2026-11-14
 
 HTTP/2, and less work per byte. `giong-http` speaks HTTP/2 as a server and as a client,

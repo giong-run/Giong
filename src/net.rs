@@ -27,7 +27,6 @@ pub use dns::{Resolver, ResolverConfig};
 pub use udp::{Datagram, UdpSocket};
 pub use unix::{UnixListener, UnixStream};
 
-use std::any::Any;
 use std::cell::{Cell, OnceCell};
 use std::future::poll_fn;
 use std::io;
@@ -379,55 +378,44 @@ impl StreamSocket {
     /// `offset` on.
     async fn send_vectored_from<B: IoBuf>(
         &self,
-        mut bufs: Vec<B>,
+        bufs: Vec<B>,
         offset: usize,
     ) -> (io::Result<usize>, Vec<B>) {
-        loop {
-            let mut iov: Vec<libc::iovec> = pieces_from(&bufs, offset)
-                .map(|(buf, skip)| libc::iovec {
-                    // SAFETY: `skip < len`, so the pointer stays within the
-                    // buffer.
-                    iov_base: unsafe { buf.as_ptr().add(skip) }.cast_mut().cast(),
-                    iov_len: buf.len() - skip,
-                })
-                .collect();
-            if iov.is_empty() {
-                return (Ok(0), bufs);
-            }
-            let hold = self.vectored_hold(&bufs, offset, &mut iov);
-            // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
-            // lengths).
-            let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-            msg.msg_iov = iov.as_mut_ptr();
-            msg.msg_iovlen = iov.len() as _;
-            let zero_copy = hold.is_some();
-            let io = Io::SendMsg {
-                fd: self.sock.as_raw_fd(),
-                msg: &*msg,
-                flags: libc::MSG_NOSIGNAL as u32,
-                zero_copy,
-            };
-            // The header, the iovec array (on the heap) and the buffers all
-            // stay where they are while the kernel reads them, even if this
-            // future is dropped: `Op` keeps them until the operation
-            // completes, and the driver keeps the hold of a zero-copy send
-            // until the kernel lets go of its bytes.
-            let held = (bufs, iov, msg);
-            let (res, _, held) = match hold {
-                Some(hold) => Op::with_hold(io, held, hold).await,
-                None => Op::new(io, held).await,
-            };
-            bufs = held.0;
-            if zero_copy && res == -libc::EOPNOTSUPP {
-                // Refused (kernel TLS): the same bytes again, with a copy.
-                self.zero_copy.set(false);
-                continue;
-            }
-            return if res < 0 {
-                (Err(os_err(res)), bufs)
-            } else {
-                (Ok(res as usize), bufs)
-            };
+        let mut iov: Vec<libc::iovec> = pieces_from(&bufs, offset)
+            .map(|(buf, skip)| libc::iovec {
+                // SAFETY: `skip < len`, so the pointer stays within the
+                // buffer.
+                iov_base: unsafe { buf.as_ptr().add(skip) }.cast_mut().cast(),
+                iov_len: buf.len() - skip,
+            })
+            .collect();
+        if iov.is_empty() {
+            return (Ok(0), bufs);
+        }
+        let hold = self.vectored_hold(&bufs, offset, &mut iov);
+        // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
+        // lengths).
+        let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
+        msg.msg_iov = iov.as_mut_ptr();
+        msg.msg_iovlen = iov.len() as _;
+        let io = Io::SendMsg {
+            fd: self.sock.as_raw_fd(),
+            msg: &*msg,
+            flags: libc::MSG_NOSIGNAL as u32,
+            zero_copy: hold.is_some(),
+        };
+        // The header, the iovec array (on the heap) and the buffers all stay
+        // where they are while the kernel reads them, even if this future is
+        // dropped: `Op` keeps them until the operation completes, and the
+        // driver keeps the hold of a zero-copy send until the kernel lets go
+        // of its bytes. A zero-copy send the socket refuses is sent again
+        // with a copy by `Op` itself, so that this future, which every
+        // vectored write awaits, keeps nothing else across the send.
+        let (res, _, (bufs, _, _)) = Op::with_hold(io, (bufs, iov, msg), hold).await;
+        if res < 0 {
+            (Err(os_err(res)), bufs)
+        } else {
+            (Ok(res as usize), bufs)
         }
     }
 
@@ -440,7 +428,7 @@ impl StreamSocket {
         bufs: &[B],
         offset: usize,
         iov: &mut [libc::iovec],
-    ) -> Option<Box<dyn Any>> {
+    ) -> Option<Box<ZeroCopyHold>> {
         let (mut shared, mut changing) = (0, 0);
         for ((buf, _), v) in pieces_from(bufs, offset).zip(iov.iter()) {
             if is_shared(buf) {
@@ -605,48 +593,44 @@ impl StreamSocket {
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
         let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
-        let mut hold = match sharing(&buf) {
-            Sharing::No => None,
-            owner => self.zero_copy_report(len as usize).map(|copied| {
-                let owners = match owner {
-                    Sharing::Owner(owner) => vec![owner],
-                    _ => Vec::new(),
-                };
-                Box::new(ZeroCopyHold {
-                    owners,
-                    scratch: Vec::new(),
-                    copied,
-                }) as Box<dyn Any>
-            }),
+        let hold = self.send_hold(&buf, len as usize);
+        // SAFETY: `offset <= len`, so the pointer stays within the buffer.
+        let ptr = unsafe { buf.as_ptr().add(offset) };
+        let io = Io::Send {
+            fd: self.sock.as_raw_fd(),
+            buf: ptr,
+            len,
+            flags: libc::MSG_NOSIGNAL,
+            zero_copy: hold.is_some(),
         };
-        let mut buf = buf;
-        loop {
-            // SAFETY: `offset <= len`, so the pointer stays within the buffer.
-            let ptr = unsafe { buf.as_ptr().add(offset) };
-            let zero_copy = hold.is_some();
-            let io = Io::Send {
-                fd: self.sock.as_raw_fd(),
-                buf: ptr,
-                len,
-                flags: libc::MSG_NOSIGNAL,
-                zero_copy,
-            };
-            let (res, _, b) = match hold.take() {
-                Some(hold) => Op::with_hold(io, buf, hold).await,
-                None => Op::new(io, buf).await,
-            };
-            buf = b;
-            if zero_copy && res == -libc::EOPNOTSUPP {
-                // Refused (kernel TLS): the same bytes again, with a copy.
-                self.zero_copy.set(false);
-                continue;
-            }
-            return if res < 0 {
-                (Err(os_err(res)), buf)
-            } else {
-                (Ok(res as usize), buf)
-            };
+        // The hold moves into the send, and a zero-copy send the socket
+        // refuses is sent again with a copy by `Op` itself, so that this
+        // future, which every write awaits, is the size of a plain send's.
+        let (res, _, buf) = Op::with_hold(io, buf, hold).await;
+        if res < 0 {
+            (Err(os_err(res)), buf)
+        } else {
+            (Ok(res as usize), buf)
         }
+    }
+
+    /// What a zero-copy send of `len` bytes of `buf` leaves with the driver,
+    /// or `None` for a copying send: bytes that can change, a send too small,
+    /// or a socket that cannot send without a copy.
+    fn send_hold<B: IoBuf>(&self, buf: &B, len: usize) -> Option<Box<ZeroCopyHold>> {
+        if !is_shared(buf) {
+            return None;
+        }
+        let copied = self.zero_copy_report(len)?;
+        let owners = match sharing(buf) {
+            Sharing::Owner(owner) => vec![owner],
+            _ => Vec::new(),
+        };
+        Some(Box::new(ZeroCopyHold {
+            owners,
+            scratch: Vec::new(),
+            copied,
+        }))
     }
 }
 
@@ -1099,6 +1083,9 @@ mod tests {
             let data: &'static [u8] = Box::leak(data.into_boxed_slice());
             for way in ["static", "rc", "vectored"] {
                 a.zero_copy.set(true);
+                if let Some(copied) = a.zero_copy_copied.get() {
+                    copied.set(false);
+                }
                 let reader = crate::spawn({
                     let len = data.len();
                     let b = b.socket().try_clone().unwrap();
@@ -1124,6 +1111,8 @@ mod tests {
                 }
                 assert!(reader.await.unwrap() == data, "{way}");
                 if zero_copy {
+                    // Refused once, never tried again on this socket.
+                    assert!(a.zero_copy_report(data.len()).is_none(), "{way}");
                     assert!(!a.zero_copy.get(), "{way}");
                 }
             }

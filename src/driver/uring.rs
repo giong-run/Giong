@@ -813,13 +813,13 @@ impl Uring {
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
-    /// A zero-copy send that has its result is done if the caller leaves its
-    /// `hold`: the entry keeps that until the notification.
+    /// A zero-copy send that has sent something is done if the caller leaves
+    /// its `hold`: the entry keeps that until the notification.
     pub(crate) fn poll_op(
         &mut self,
         key: usize,
         waker: &Waker,
-        hold: &mut Option<Box<dyn Any>>,
+        hold: &mut Option<Box<ZeroCopyHold>>,
     ) -> Poll<(i32, u32)> {
         match self.ops.get_mut(key) {
             Some(OpState::Single(Lifecycle::Done(res, flags))) => {
@@ -827,11 +827,16 @@ impl Uring {
                 self.ops.remove(key);
                 Poll::Ready(out)
             }
-            Some(OpState::Single(lc @ Lifecycle::Sent(..))) if hold.is_some() => {
+            // A failed send waits for its notification, which comes at once
+            // (the kernel has nothing to read), so that the caller keeps its
+            // hold and can send the same bytes again (see `Op`).
+            Some(OpState::Single(lc @ Lifecycle::Sent(..)))
+                if hold.is_some() && matches!(*lc, Lifecycle::Sent(_, res, _) if res >= 0) =>
+            {
                 let Lifecycle::Sent(_, res, flags) = *lc else {
                     unreachable!()
                 };
-                *lc = Lifecycle::Ignored(hold.take());
+                *lc = Lifecycle::Ignored(hold.take().map(|hold| hold as Box<dyn Any>));
                 Poll::Ready((res, flags))
             }
             Some(OpState::Single(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..))) => {
