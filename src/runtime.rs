@@ -99,7 +99,7 @@ pub(crate) struct WorkerShared {
 impl WorkerShared {
     fn new() -> io::Result<Arc<Self>> {
         // Under Miri, created non-blocking: the epoll driver makes it so with
-        // `ioctl(FIONBIO)`, which Miri does not have.
+        // `ioctl(FIONBIO)`, and Miri has neither that nor `fcntl` on eventfds.
         #[cfg(not(miri))]
         let flags = libc::EFD_CLOEXEC;
         #[cfg(miri)]
@@ -1753,6 +1753,7 @@ impl<F: Future> Future for UntilShutdown<F> {
         if Pin::new(&mut this.signal).poll(cx).is_ready() {
             return Poll::Ready(None);
         }
+        // SAFETY: `fut` is structurally pinned (see above).
         unsafe { Pin::new_unchecked(&mut this.fut) }
             .poll(cx)
             .map(Some)

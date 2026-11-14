@@ -187,7 +187,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Box` moved, which Rust's aliasing rules make undefined behaviour (nothing miscompiled,
   but Miri failed on every file test). It now lives in a small owner reached only through a
   raw pointer, and `IoBufMut for Vec<u8>` hands the kernel a pointer valid for the whole
-  capacity. CI runs the epoll driver's tests under Miri, so that this stays fixed.
+  capacity. So that this stays fixed, CI runs the unit tests and the tests Miri can run
+  (files, tasks, channels, timers, `observe`, several workers) under Miri on the epoll
+  driver (`scripts/check.sh miri`), and clippy checks that every `unsafe` block and impl
+  in giong says why it is sound.
+- **giong**: the buffer ring's entries are written field by field through raw pointers.
+  The setters of `io_uring`'s `BufRingEntry` take a reference to the whole entry, whose
+  last field in entry 0 is the ring tail the kernel reads at any time (nothing
+  miscompiled). The `# Safety` sections of `IoBuf` and `IoBufMut` now also say that
+  nothing else may write the bytes (for `IoBufMut`, read or write them) while giong holds
+  the buffer, which the implementations giong provides already guaranteed.
 - **giong**: `observe` grouped tasks by the address of their spawn `Location`, so one call
   site could show up as several entries; it groups by file, line and column.
 - **giong**: a stream or listener dropped by code the driver runs (a waker's `wake` or
@@ -195,6 +204,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   peer never saw it close, and the driver kept the entry. An operation's future dropped
   there leaked its buffer and its entry. Both are now finished at the next turn of the
   event loop.
+- **giong**: a `TcpListener` or `UnixListener` that outlived its runtime (returned from one
+  `block_on` and used in the next) leaked the connections io_uring had accepted for it but
+  nobody had taken: the descriptors stayed open and the clients waited. The runtime closes
+  them, and gives back the receive buffers of every live multishot queue, when it stops.
+- **giong**: a failure of `io_uring_enter`, of submitting to the ring or of `epoll_wait`
+  that the event loop cannot recover from still stops the runtime, but the panic is now
+  coded `GIONG-E0005` and says what the error means: `EBADR` and `ENOMEM` that the kernel
+  ran out of memory for completions, anything else that it is worth a report.
+- **giong**: on the epoll driver, reading or writing a pipe on standard input, output or
+  error through `fs::File` switched the pipe to non-blocking mode, which belongs to the
+  pipe and so changed it for the rest of the shell pipeline too (`cat` on the same pipe
+  failed with `EAGAIN`). Those pipes are now read and written on the blocking threads, as
+  terminals already were; pipes on other descriptors still go through epoll.
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
   (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the

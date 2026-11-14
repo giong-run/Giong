@@ -74,6 +74,8 @@
     html_logo_url = "https://raw.githubusercontent.com/giong-run/Giong/main/assets/giong-icon.svg",
     html_favicon_url = "https://raw.githubusercontent.com/giong-run/Giong/main/assets/giong-icon.svg"
 )]
+// Every `unsafe` block and impl says why it is sound (CI denies warnings).
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("giong only supports Linux: it is built on io_uring and epoll");

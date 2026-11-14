@@ -56,6 +56,7 @@ fn tasks_are_not_send_and_can_share_rc() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "minutes long under Miri")]
 fn many_tasks() {
     let n = giong::block_on(async {
         let counter = Rc::new(Cell::new(0u32));

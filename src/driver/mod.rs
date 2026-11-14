@@ -451,6 +451,35 @@ impl Io {
     }
 }
 
+/// Stops the worker on a kernel error its event loop cannot go on after
+/// (a completion the kernel dropped would leave an operation waiting for
+/// ever). The panic carries `GIONG-E0005` with the cause and what to do.
+#[cold]
+#[track_caller]
+pub(crate) fn event_loop_failed(call: &str, err: io::Error) -> ! {
+    let fix = match err.raw_os_error() {
+        Some(libc::EBADR) => {
+            "the kernel dropped completions because it could not allocate memory for them \
+             (EBADR): the machine ran out of memory. Give the process more memory, or run \
+             fewer connections per worker."
+        }
+        Some(libc::ENOMEM) => {
+            "the kernel is out of memory. Give the process more memory, or run fewer \
+             connections per worker."
+        }
+        _ => {
+            "please report it at https://github.com/giong-run/Giong/issues with this message \
+             and your kernel version (uname -r)."
+        }
+    };
+    let err = crate::error::Error::new(
+        crate::error::Code::Unexpected,
+        format!("{call} failed, so this worker cannot go on: {err}"),
+        fix,
+    );
+    panic!("{err}")
+}
+
 /// A multishot operation: it keeps producing results until it is dropped.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MultiIo {
@@ -749,5 +778,30 @@ impl Driver {
             Driver::Uring(d) => d.recv_copied(),
             Driver::Epoll(_) => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    /// The panic that stops a worker says what happened and what to do.
+    #[test]
+    fn a_fatal_event_loop_error_panics_with_its_code() {
+        let message = |errno| {
+            let err = std::panic::catch_unwind(|| {
+                super::event_loop_failed("io_uring_enter", io::Error::from_raw_os_error(errno))
+            })
+            .unwrap_err();
+            err.downcast_ref::<String>().cloned().unwrap()
+        };
+        let lost = message(libc::EBADR);
+        assert!(
+            lost.starts_with("GIONG-E0005: io_uring_enter failed"),
+            "{lost}"
+        );
+        assert!(lost.contains("ran out of memory"), "{lost}");
+        let other = message(libc::EINVAL);
+        assert!(other.contains("report it"), "{other}");
     }
 }

@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::ops::Deref;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -25,7 +25,9 @@ use crate::error::{raise, Code};
 ///
 /// `as_ptr()` must point at `len()` initialised bytes that stay valid and at the
 /// same address for as long as the value is alive, **even when the value itself
-/// is moved** (heap or static storage — not an inline array).
+/// is moved** (heap or static storage — not an inline array). While giong holds
+/// the value (from the call that takes it until the value comes back), the
+/// bytes must not be written except through it: the kernel may be reading them.
 pub unsafe trait IoBuf: 'static {
     /// Pointer to the first byte.
     fn as_ptr(&self) -> *const u8;
@@ -43,7 +45,8 @@ pub unsafe trait IoBuf: 'static {
 ///
 /// In addition to the [`IoBuf`] contract, `as_mut_ptr()` must point at
 /// `capacity()` writable bytes, and `set_init(n)` must make the first `n` bytes
-/// the initialised contents.
+/// the initialised contents. While giong holds the value, those bytes must be
+/// neither read nor written except through it: the kernel may be writing them.
 pub unsafe trait IoBufMut: IoBuf {
     /// Pointer to the start of the writable region.
     fn as_mut_ptr(&mut self) -> *mut u8;
@@ -57,10 +60,11 @@ pub unsafe trait IoBufMut: IoBuf {
     unsafe fn set_init(&mut self, n: usize);
 }
 
-// SAFETY, for this impl and the ones down to `&'static str`: the bytes are
-// on the heap (`Vec`, `String`, `Box`, `Rc`, `Arc`) or in static memory,
-// neither of which moves when the value moves, and none of these types lets
-// safe code change the bytes while the value is owned by an operation.
+// The bytes of every type below are on the heap or in static memory, neither
+// of which moves when the value moves, and none of these types lets safe code
+// change the bytes while an operation owns the value.
+
+// SAFETY: a `Vec`'s bytes are on the heap; only its owner can change them.
 unsafe impl IoBuf for Vec<u8> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -70,6 +74,8 @@ unsafe impl IoBuf for Vec<u8> {
     }
 }
 
+// SAFETY: the allocation holds `capacity` bytes on the heap; `set_init`
+// only marks bytes the kernel wrote.
 unsafe impl IoBufMut for Vec<u8> {
     fn as_mut_ptr(&mut self) -> *mut u8 {
         // The inherent method, whose pointer is valid for the whole
@@ -86,6 +92,7 @@ unsafe impl IoBufMut for Vec<u8> {
     }
 }
 
+// SAFETY: a `String`'s bytes are on the heap; only its owner can change them.
 unsafe impl IoBuf for String {
     fn as_ptr(&self) -> *const u8 {
         str::as_ptr(self)
@@ -95,6 +102,7 @@ unsafe impl IoBuf for String {
     }
 }
 
+// SAFETY: a `Box`'s bytes are on the heap; only its owner can change them.
 unsafe impl IoBuf for Box<[u8]> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -104,6 +112,8 @@ unsafe impl IoBuf for Box<[u8]> {
     }
 }
 
+// SAFETY: on the heap, and immutable while shared (`Rc::get_mut` needs the
+// only reference, and the operation holds one).
 unsafe impl IoBuf for Rc<[u8]> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -113,6 +123,8 @@ unsafe impl IoBuf for Rc<[u8]> {
     }
 }
 
+// SAFETY: on the heap, and immutable while shared (`Arc::get_mut` needs the
+// only reference, and the operation holds one).
 unsafe impl IoBuf for Arc<[u8]> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -122,6 +134,7 @@ unsafe impl IoBuf for Arc<[u8]> {
     }
 }
 
+// SAFETY: borrowed immutably for `'static`, so nothing can change the bytes.
 unsafe impl IoBuf for &'static [u8] {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -131,6 +144,7 @@ unsafe impl IoBuf for &'static [u8] {
     }
 }
 
+// SAFETY: borrowed immutably for `'static`, so nothing can change the bytes.
 unsafe impl IoBuf for &'static str {
     fn as_ptr(&self) -> *const u8 {
         str::as_ptr(self)
@@ -308,6 +322,21 @@ impl Ring {
         self.map.ptr.as_ptr() as *mut BufRingEntry
     }
 }
+
+/// The layout of the kernel's `struct io_uring_buf`, one entry of a buffer
+/// ring, for writing an entry field by field through raw pointers. `resv` of
+/// entry 0 is the ring's tail, which the kernel reads at any time, so a
+/// reference to an entry (which `BufRingEntry`'s setters take) would claim
+/// memory the kernel shares.
+#[repr(C)]
+struct RawEntry {
+    addr: u64,
+    len: u32,
+    bid: u16,
+    resv: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<RawEntry>() == std::mem::size_of::<BufRingEntry>());
 
 /// What the pool knows about one of its buffers.
 struct Slot {
@@ -695,13 +724,14 @@ impl BufPool {
         let idx = (tail & (self.count - 1)) as usize;
         // SAFETY: `idx < count`, the ring allocation holds `count` entries,
         // and the kernel only reads entries below the published tail. The
-        // setters do not touch the `resv` field, which doubles as the ring
-        // tail in entry 0.
+        // fields are written through raw pointers, never through a reference
+        // to the entry, and `resv` (the ring tail in entry 0) is not touched.
         unsafe {
-            let entry = &mut *ring.entries().add(idx);
-            entry.set_addr(self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) as u64);
-            entry.set_len(self.buf_len as u32);
-            entry.set_bid(bid);
+            let entry = ring.entries().add(idx).cast::<RawEntry>();
+            let addr = self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) as u64;
+            ptr::addr_of_mut!((*entry).addr).write(addr);
+            ptr::addr_of_mut!((*entry).len).write(self.buf_len as u32);
+            ptr::addr_of_mut!((*entry).bid).write(bid);
         }
         ring.tail.set(tail.wrapping_add(1));
         ring.published.set(ring.published.get() + 1);

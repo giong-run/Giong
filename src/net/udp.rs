@@ -429,3 +429,83 @@ impl std::fmt::Debug for UdpSocket {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::{mem, ptr};
+
+    use socket2::SockAddr;
+
+    use super::{parse_addr, Message};
+
+    /// The header of a `Message` stays valid while the message moves, as it
+    /// does into the operation and back, and the kernel's writes through it
+    /// are seen afterwards. Miri runs this one: it is how `recvmsg` and
+    /// `sendmsg` use the memory, and Miri cannot call them.
+    #[test]
+    fn a_message_header_survives_moves() {
+        // Received: the "kernel" writes the payload and the sender through
+        // the header pointer taken before the move.
+        let mut buf = vec![0u8; 8];
+        let msg = Message::new(buf.as_mut_ptr(), buf.len(), None);
+        // SAFETY: the field pointer of a live `Message`, as `read_from` takes it.
+        let hdr = unsafe { ptr::addr_of_mut!((*msg.as_ptr()).hdr) };
+        let moved = (msg, 1);
+        let from: SocketAddr = "192.0.2.7:4242".parse().unwrap();
+        let name = SockAddr::from(from);
+        // SAFETY: what the kernel does with a `msghdr`: the iovec and the
+        // name point into memory the message and `buf` own.
+        unsafe {
+            let iov = &*(*hdr).msg_iov;
+            ptr::copy_nonoverlapping(b"datagram".as_ptr(), iov.iov_base.cast::<u8>(), 8);
+            assert!(name.len() <= (*hdr).msg_namelen);
+            ptr::copy_nonoverlapping(
+                name.as_ptr().cast::<u8>(),
+                (*hdr).msg_name.cast::<u8>(),
+                name.len() as usize,
+            );
+            (*hdr).msg_namelen = name.len();
+        }
+        let msg = moved.0;
+        let msg = msg.get();
+        assert_eq!(buf, b"datagram");
+        // SAFETY: `sockaddr_storage` is plain data of exactly this size.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&msg.addr as *const libc::sockaddr_storage).cast::<u8>(),
+                mem::size_of::<libc::sockaddr_storage>(),
+            )
+        };
+        assert_eq!(
+            parse_addr(&bytes[..msg.hdr.msg_namelen as usize]),
+            Some(from)
+        );
+
+        // Sent: the "kernel" reads the payload and the address.
+        let to: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let payload = *b"query";
+        let msg = Message::new(
+            payload.as_ptr().cast_mut(),
+            payload.len(),
+            Some(&SockAddr::from(to)),
+        );
+        // SAFETY: as `send_to` takes it.
+        let hdr = unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) };
+        let moved = (msg, 1);
+        // SAFETY: the header and what it points at are alive in `moved`.
+        let (sent, addr) = unsafe {
+            let iov = &*(*hdr).msg_iov;
+            (
+                std::slice::from_raw_parts(iov.iov_base.cast::<u8>(), iov.iov_len),
+                std::slice::from_raw_parts(
+                    (*hdr).msg_name.cast::<u8>(),
+                    (*hdr).msg_namelen as usize,
+                ),
+            )
+        };
+        assert_eq!(sent, b"query");
+        assert_eq!(parse_addr(addr), Some(to));
+        drop(moved);
+    }
+}

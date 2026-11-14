@@ -427,7 +427,9 @@ impl StreamSocket {
             // moves with `held`. The hold owns what a zero-copy send reads
             // after its result.
             let (res, _, held) = match hold {
+                // SAFETY: as above.
                 Some(hold) => unsafe { Op::with_hold(io, held, hold) }.await,
+                // SAFETY: as above.
                 None => unsafe { Op::new(io, held) }.await,
             };
             bufs = held.0;
@@ -656,7 +658,9 @@ impl StreamSocket {
             // put when it moves. The hold owns what a zero-copy send reads
             // after its result.
             let (res, _, b) = match hold.take() {
+                // SAFETY: as above.
                 Some(hold) => unsafe { Op::with_hold(io, buf, hold) }.await,
+                // SAFETY: as above.
                 None => unsafe { Op::new(io, buf) }.await,
             };
             buf = b;
@@ -1114,6 +1118,7 @@ mod tests {
     /// with `EOPNOTSUPP`, gets the same bytes sent again with a copy and
     /// stops trying. A Unix socket refuses them the same way.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call sendmsg")]
     fn a_refused_zero_copy_send_is_sent_again_with_a_copy() {
         crate::block_on(async {
             let (a, b) = Socket::pair(Domain::UNIX, Type::STREAM, None).unwrap();

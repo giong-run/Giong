@@ -691,3 +691,47 @@ fn an_operation_dropped_inside_the_driver_is_still_cancelled() {
         assert_eq!(giong::stats().tracked_ops, 0);
     });
 }
+
+#[test]
+fn connections_accepted_for_a_listener_that_outlives_its_runtime_are_closed() {
+    // io_uring accepts ahead of `accept` calls. A listener that outlived its
+    // runtime left those connections open and unanswered: their descriptors
+    // were never closed, so the clients waited for ever.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut clients = Vec::new();
+    let uring = giong::block_on(async {
+        let mut accept = Box::pin(listener.accept());
+        let noop = waker_running(|| {});
+        assert!(accept
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&noop))
+            .is_pending());
+        drop(accept);
+        for _ in 0..3 {
+            clients.push(std::net::TcpStream::connect(addr).unwrap());
+        }
+        // Let the driver take the accepted connections in.
+        sleep(Duration::from_millis(50)).await;
+        giong::driver_kind() == giong::DriverKind::IoUring
+    });
+    if !uring {
+        // The epoll driver accepts only when asked: the connections wait in
+        // the kernel's backlog, which closing the listener ends.
+        return;
+    }
+    for mut client in clients {
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let n = loop {
+            match std::io::Read::read(&mut client, &mut byte) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                res => break res.expect("the connection was left open"),
+            }
+        };
+        assert_eq!(n, 0);
+    }
+    drop(listener);
+}

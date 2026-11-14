@@ -732,8 +732,8 @@ impl Uring {
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
         pool.set_registered(RingId::Whole);
         let mut features = Vec::new();
-        // SAFETY: as above, for the pool's second ring.
         if super::feature_enabled(IoUringFeature::PackedBuffers)
+            // SAFETY: as above, for the pool's second ring.
             && unsafe { register_packed_ring(&ring, &pool, &workarounds) }
         {
             pool.set_registered(RingId::Packed);
@@ -795,7 +795,7 @@ impl Uring {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
-                    _ => panic!("giong: io_uring submit failed: {e}"),
+                    _ => super::event_loop_failed("io_uring submit", e),
                 },
             }
             attempts += 1;
@@ -1118,7 +1118,7 @@ impl Uring {
                     Some(libc::EINTR) => {}
                     // Completion queue backed up: make room, then retry.
                     Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
-                    _ => panic!("giong: io_uring submit failed: {e}"),
+                    _ => super::event_loop_failed("io_uring submit", e),
                 },
             }
             attempts += 1;
@@ -1179,7 +1179,7 @@ impl Uring {
             match e.raw_os_error() {
                 // Interrupted, timed out, or completion queue backed up (drained below).
                 Some(libc::EINTR) | Some(libc::ETIME) | Some(libc::EBUSY) | Some(libc::EAGAIN) => {}
-                _ => panic!("giong: io_uring_enter failed: {e}"),
+                _ => super::event_loop_failed("io_uring_enter", e),
             }
         }
         self.reap();
@@ -1484,10 +1484,14 @@ impl Uring {
                         e.raw_os_error(),
                         Some(libc::EINTR | libc::EBUSY | libc::EAGAIN)
                     ) => {}
-                Err(_) => return false,
+                Err(_) => {
+                    self.drain_multis();
+                    return false;
+                }
             }
             self.reap();
             if self.inflight == 0 {
+                self.drain_multis();
                 return true;
             }
             // A cancelled close can leave its descriptor open. Retrying a
@@ -1502,7 +1506,28 @@ impl Uring {
             let _ = self.enter(1, Some(Duration::from_millis(10)));
         }
         self.reap();
+        self.drain_multis();
         self.inflight == 0
+    }
+
+    /// Closes the accepted descriptors and gives back the pool pieces that
+    /// every multishot operation still holds. Its owner (a listener or
+    /// stream) can outlive the runtime, and on a later runtime gets a new
+    /// operation: what was queued here would never be taken.
+    fn drain_multis(&mut self) {
+        let pool = &self.pool;
+        let mut pieces = 0;
+        for op in self.ops.iter_mut() {
+            if let OpState::Multi(m) = op {
+                for item in mem::take(&mut m.queue) {
+                    if let Queued::Piece { .. } = item {
+                        pieces += 1;
+                    }
+                    Self::release(pool, m.kind, item);
+                }
+            }
+        }
+        self.pooled_queued -= pieces;
     }
 
     pub(crate) fn take_graveyard(&mut self) -> Vec<Box<dyn Any>> {

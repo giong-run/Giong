@@ -291,6 +291,19 @@ jobs:
       # The epoll driver hands file operations to threads of its own.
       - run: GIONG_DRIVER=epoll ROUNDS=1 scripts/check.sh tsan
 
+  # The unsafe code under Miri, which checks every access against Rust's
+  # memory and aliasing rules: the unit tests and the tests it can run, on the
+  # epoll driver (scripts/check.sh says which).
+  miri:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+      - run: scripts/check.sh miri
+
   # Model-check the wake-up handshakes in src/notify.rs with loom, then run the
   # same race on the runner's real CPUs.
   loom:
