@@ -22,6 +22,17 @@ enum State {
     Trailers,
 }
 
+/// A header line, its CRLF taken off, as the request parser accepts one: a
+/// token, a colon, and a value of visible characters, spaces and tabs (no
+/// CR, LF or other controls), without folding.
+fn is_header_line(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    crate::parse::is_token_str(&line[..colon])
+        && crate::parse::is_field_value(crate::parse::trim(&line[colon + 1..]))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Progress {
     /// The body is complete; the encoded form took this many bytes in total.
@@ -146,6 +157,7 @@ impl Decoder {
                     if nl == 0 || rest[nl - 1] != b'\r' {
                         return Err(400);
                     }
+                    let line = &rest[..nl - 1];
                     self.pos += nl + 1;
                     if nl == 1 {
                         return Ok(Progress::Done(self.pos));
@@ -153,6 +165,13 @@ impl Decoder {
                     // Trailer fields are read and dropped, within a budget.
                     self.trailer_bytes += nl + 1;
                     if nl > MAX_LINE || self.trailer_bytes > 4 * MAX_LINE {
+                        return Err(400);
+                    }
+                    // Dropped, but held to the rules of a header line all
+                    // the same: a proxy in front that ends lines at a bare
+                    // CR, or reads a line without a colon some other way,
+                    // would see a different message.
+                    if !is_header_line(line) {
                         return Err(400);
                     }
                 }
@@ -236,6 +255,30 @@ mod tests {
             trailers.extend_from_slice(b"X-Trailer: aaaaaaaaaaaaaaaa\r\n");
         }
         assert_eq!(decode(&trailers, 1 << 20), Err(400));
+    }
+
+    #[test]
+    fn trailer_lines_follow_the_rules_of_header_lines() {
+        let input = b"0\r\nX-Trailer: 1\r\nEmpty:\r\nObs-Text: caf\xe9\r\n\r\n";
+        assert_eq!(decode(input, 0).unwrap(), (vec![], input.len()));
+        for bad in [
+            &b"0\r\nno colon\r\n\r\n"[..],
+            b"0\r\nno colon\rbare CR\r\n\r\n",
+            b"0\r\nX-Trailer: a\rb\r\n\r\n",
+            b"0\r\nX-Trailer: a\0b\r\n\r\n",
+            b"0\r\nBad Name: 1\r\n\r\n",
+            b"0\r\nX-Trailer : 1\r\n\r\n",
+            b"0\r\n: no name\r\n\r\n",
+            b"0\r\n folded: 1\r\n\r\n",
+            b"0\r\nX-Trailer: 1\r\n continued\r\n\r\n",
+        ] {
+            assert_eq!(
+                decode(bad, 1024),
+                Err(400),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

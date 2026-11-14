@@ -19,6 +19,8 @@ use crate::Error;
 pub(crate) struct RouteInfo {
     pub(crate) pattern: Box<str>,
     pub(crate) names: Box<[Box<str>]>,
+    /// The last name is a catch-all, whose value may span segments.
+    pub(crate) catch_all: bool,
 }
 
 /// Longest request id kept.
@@ -119,10 +121,45 @@ impl<S> Req<S> {
     /// `req.param::<u64>("id")` is `Ok(42)`. `T` is any [`FromStr`] type:
     /// `String`, the integers, `bool`, `Uuid` from the `uuid` crate...
     ///
+    /// # Values that could leave a directory
+    ///
+    /// The value is refused, with a `400`, when once decoded it could name
+    /// a file outside the directory a handler joins it to, or end a C
+    /// string early:
+    ///
+    /// * a `.` or `..` segment, whether sent as is (`/files/../x`, which
+    ///   giong-http passes on unchanged) or encoded (`%2E%2E`, `..%2F`);
+    /// * a NUL character (`%00`);
+    /// * a `/` (`%2F`) in a one-segment parameter (`{name}`), which would
+    ///   make it several segments;
+    /// * a catch-all (`{*path}`) value that starts with `/` (`/files//etc`),
+    ///   which `Path::join` would take as an absolute path.
+    ///
+    /// So a catch-all can be joined to a directory as it is:
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use giong_web::{Error, Req, Response};
+    ///
+    /// // GET /files/{*path}
+    /// async fn file(req: Req) -> Result<Response, Error> {
+    ///     // Never `..`, `.`, NUL or absolute: it stays under /srv/files
+    ///     // (unless a symbolic link in there leads out).
+    ///     let path: String = req.param("path")?;
+    ///     let full = Path::new("/srv/files").join(&path);
+    ///     # let _ = full;
+    ///     # Ok(Response::new(204))
+    /// }
+    /// ```
+    ///
+    /// A route that wants such values reads [`param_raw`](Self::param_raw)
+    /// instead and decodes and checks them itself.
+    ///
     /// # Errors
     ///
-    /// * `400` (`GIONG-E1205`) when the value is not a valid `T` or is not
-    ///   valid percent-encoded UTF-8. The detail names the parameter.
+    /// * `400` (`GIONG-E1205`) when the value is not a valid `T`, is not
+    ///   valid percent-encoded UTF-8, or is one of the values above. The
+    ///   detail names the parameter.
     /// * `500` (`GIONG-E1206`) when the route has no parameter `name`: a bug
     ///   in the handler, such as a misspelt name.
     pub fn param<T>(&self, name: &str) -> Result<T, Error>
@@ -130,14 +167,16 @@ impl<S> Req<S> {
         T: FromStr,
         T::Err: fmt::Display,
     {
-        let raw = self.raw_param(name)?;
-        let text = percent::decode(raw).map_err(|e| {
+        let (raw, catch_all) = self.raw_param(name)?;
+        let bad = |why: &str| {
             Error::coded(
                 400,
                 Code::WebBadParameter,
-                format!("path parameter `{name}`: {}", e.describe()),
+                format!("path parameter `{name}`: {why}"),
             )
-        })?;
+        };
+        let text = percent::decode(raw).map_err(|e| bad(e.describe()))?;
+        check_path_value(&text, catch_all).map_err(bad)?;
         parse_value(&text).map_err(|why| {
             Error::coded(
                 400,
@@ -150,15 +189,34 @@ impl<S> Req<S> {
         })
     }
 
-    /// The path parameter `name` as it appears in the path, still
-    /// percent-encoded.
-    fn raw_param(&self, name: &str) -> Result<&str, Error> {
+    /// The path parameter `name` exactly as it appears in the path: still
+    /// percent-encoded, and without the checks of [`param`](Self::param),
+    /// so it may decode to `..`, a NUL, or a `/` in a one-segment parameter.
+    ///
+    /// For the rare route that wants such values, such as one that passes
+    /// a key on to a store where `/` and `..` mean nothing special. Decode
+    /// it with a percent-decoding crate, and never join it to a path.
+    ///
+    /// # Errors
+    ///
+    /// `500` (`GIONG-E1206`) when the route has no parameter `name`, as for
+    /// [`param`](Self::param).
+    pub fn param_raw(&self, name: &str) -> Result<&str, Error> {
+        self.raw_param(name).map(|(raw, _)| raw)
+    }
+
+    /// The path parameter `name` as it appears in the path, and whether it
+    /// is a catch-all.
+    fn raw_param(&self, name: &str) -> Result<(&str, bool), Error> {
         let route = self.route.as_deref();
         let index = route.and_then(|r| r.names.iter().position(|n| &**n == name));
         let span = index.and_then(|i| self.caps.get(i));
-        match span {
-            Some((start, end)) => Ok(&self.http.path()[start..end]),
-            None => {
+        match (span, route, index) {
+            (Some((start, end)), Some(r), Some(i)) => {
+                let catch_all = r.catch_all && i + 1 == r.names.len();
+                Ok((&self.http.path()[start..end], catch_all))
+            }
+            _ => {
                 let pattern = route.map_or("(no route)", |r| &r.pattern);
                 Err(Error::coded(
                     500,
@@ -186,38 +244,49 @@ impl<S> Req<S> {
     /// }
     /// ```
     ///
-    /// When the key appears more than once, the first value counts.
+    /// This and `Req::query` (feature `serde`) follow one strict rule, so
+    /// that a middleware and a handler reading the same query string never
+    /// see different values: the whole query string must be valid
+    /// percent-encoded UTF-8, and the key asked for must appear at most
+    /// once. Other keys may repeat.
     ///
     /// # Errors
     ///
-    /// `400` (`GIONG-E1205`) when the value is not a valid `T` or the query
-    /// string is not valid percent-encoded UTF-8 where the key or value is.
+    /// `400` (`GIONG-E1205`) when the value is not a valid `T`, the key
+    /// appears more than once, or the query string is not valid
+    /// percent-encoded UTF-8 anywhere.
     pub fn query_param<T>(&self, name: &str) -> Result<Option<T>, Error>
     where
         T: FromStr,
         T::Err: fmt::Display,
     {
-        let bad = |why: String| {
-            Error::coded(
-                400,
-                Code::WebBadParameter,
-                format!("query parameter `{name}`: {why}"),
-            )
+        let bad = |why: String| Error::coded(400, Code::WebBadParameter, why);
+        let decode = |s| {
+            percent::decode_query(s)
+                .map_err(|e| bad(format!("query string: {:?}: {}", Shown(s), e.describe())))
         };
+        let mut found = None;
         for (key, value) in percent::query_pairs(self.http.query().unwrap_or("")) {
-            let key = match percent::decode_query(key) {
-                Ok(key) => key,
-                Err(_) => continue,
-            };
+            let (key, value) = (decode(key)?, decode(value)?);
             if key != name {
                 continue;
             }
-            let value = percent::decode_query(value).map_err(|e| bad(e.describe().into()))?;
-            return parse_value(&value)
-                .map(Some)
-                .map_err(|why| bad(format!("{why}; expected {}", friendly_type::<T>())));
+            if found.is_some() {
+                return Err(bad(format!(
+                    "query parameter `{name}` appears more than once; send one value per key"
+                )));
+            }
+            found = Some(value);
         }
-        Ok(None)
+        let Some(value) = found else {
+            return Ok(None);
+        };
+        parse_value(&value).map(Some).map_err(|why| {
+            bad(format!(
+                "query parameter `{name}`: {why}; expected {}",
+                friendly_type::<T>()
+            ))
+        })
     }
 
     /// The pattern of the route that matched, such as `/users/{id}`. `None`
@@ -327,6 +396,33 @@ impl<S> Req<S> {
     pub fn into_http(self) -> Request {
         self.http
     }
+}
+
+/// Why a percent-decoded path parameter is refused, if it is: a value that
+/// a handler joining it to a directory would take outside that directory.
+/// See [`Req::param`].
+fn check_path_value(text: &str, catch_all: bool) -> Result<(), &'static str> {
+    // Most values have none of these: one scan, and done.
+    if !text.bytes().any(|b| matches!(b, b'.' | b'/' | 0)) {
+        return Ok(());
+    }
+    if text.contains('\0') {
+        return Err("a NUL character (%00) is not allowed");
+    }
+    if !catch_all && text.contains('/') {
+        return Err("a `/` (%2F) is not allowed in a parameter of one segment");
+    }
+    if text.starts_with('/') {
+        return Err("the value starts with `/`, which would make it an absolute path");
+    }
+    for segment in text.split('/') {
+        match segment {
+            "." => return Err("a `.` segment is not allowed"),
+            ".." => return Err("a `..` segment is not allowed"),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Parses a parameter value, with the parser's own words for the failure.

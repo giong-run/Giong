@@ -12,16 +12,38 @@ use giong_tls::TlsConnector;
 use crate::error::{Error, ErrorKind};
 
 /// How the connection is encrypted.
+///
+/// More ways may be added (pinning a certificate, a client certificate), so
+/// a `match` on it needs a `_` arm.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Tls {
     /// No TLS. Use it only on a network you trust: anyone on the path can
     /// read and change what is sent, though not the password, which is
     /// always scrambled or encrypted.
     Disable,
-    /// TLS, checking the server's certificate with this connector: against
-    /// its trusted authorities, and against the host name the client connects
-    /// to. The connection fails if the server does not support TLS.
+    /// TLS, checking the server's certificate with this connector. The
+    /// connectors `TlsConnector`'s constructors make check it against their
+    /// trusted authorities and against the host name the client connects to
+    /// (`ssl-mode=VERIFY_IDENTITY`); [`Tls::verify_ca`] makes one that checks
+    /// the authority only. The connection fails if the server does not
+    /// support TLS.
     Verify(TlsConnector),
+}
+
+impl Tls {
+    /// TLS that checks the server's certificate against the authorities in
+    /// `pem`, but not against the host name: `ssl-mode=VERIFY_CA`.
+    ///
+    /// This is for the certificates MySQL generates when it is installed,
+    /// which name no host: pass the server's own `ca.pem` (from its data
+    /// directory). Use it only with an authority that signs for this server
+    /// alone; with a public one, a certificate it issued for any name would
+    /// pass. Where the certificate names the host, use `Tls::Verify` with
+    /// [`TlsConnector::with_root_pem`], which checks both.
+    pub fn verify_ca(pem: &[u8]) -> Result<Tls, Error> {
+        crate::tls::chain_only(pem).map(Tls::Verify)
+    }
 }
 
 impl fmt::Debug for Tls {
@@ -61,8 +83,11 @@ pub(crate) enum Host {
 /// # Ok::<_, giong_mysql::Error>(())
 /// ```
 ///
-/// Every limit has a finite default, documented on its setter: a connection
-/// never waits forever, and a result never grows without bound.
+/// Every limit has a finite default, documented on its setter: opening a
+/// connection, a `SELECT`, a wait for a lock and a result all have a bound.
+/// What a write does once it holds its locks is bounded on MariaDB (by the
+/// statement timeout) but not on MySQL, which has no limit on it; see
+/// [`statement_timeout`](Self::statement_timeout).
 ///
 /// **TLS.** Unless [`tls`](Self::tls) or `ssl-mode` says otherwise, a TCP
 /// connection to anything but a loopback address uses TLS and checks the
@@ -93,6 +118,9 @@ pub struct Config {
     pub(crate) statement_timeout: Duration,
     pub(crate) max_result_size: usize,
     pub(crate) statement_cache: usize,
+    /// The name to check the server's certificate against, when the host is
+    /// an address the connection was resolved to (a cancel request).
+    pub(crate) tls_name: Option<String>,
 }
 
 impl Default for Config {
@@ -133,7 +161,8 @@ impl Config {
             connect_timeout: Duration::from_secs(10),
             statement_timeout: Duration::from_secs(30),
             max_result_size: 64 << 20,
-            statement_cache: 256,
+            statement_cache: 64,
+            tls_name: None,
         }
     }
 
@@ -189,9 +218,18 @@ impl Config {
     /// `value` is SQL, so a string needs quotes:
     /// `.session_variable("sql_mode", "'STRICT_ALL_TABLES'")` or
     /// `.session_variable("transaction_isolation", "'READ-COMMITTED'")`. The
-    /// name must be a plain identifier. Do not set `time_zone` (see
-    /// [`types`](crate::types)) or `max_execution_time` (see
-    /// [`statement_timeout`](Self::statement_timeout)).
+    /// name must be a plain identifier. They are set again whenever a pooled
+    /// connection's session is reset.
+    ///
+    /// The variables giong-mysql sets itself are refused: the character set
+    /// (`character_set_*`, `collation_connection`, always `utf8mb4`),
+    /// `time_zone` (UTC, see [`types`](crate::types)), `max_execution_time`
+    /// and `max_statement_time` (see
+    /// [`statement_timeout`](Self::statement_timeout)), `autocommit` (on;
+    /// transactions are [`Client::transaction`](crate::Client::transaction))
+    /// and the `session_track_*` variables the pool relies on.
+    /// `lock_wait_timeout` may be set, and then replaces the one taken from
+    /// the statement timeout.
     pub fn session_variable(mut self, name: &str, value: &str) -> Self {
         self.session.push((name.to_owned(), value.to_owned()));
         self
@@ -220,14 +258,23 @@ impl Config {
         self
     }
 
-    /// The longest a `SELECT` may run on the server before the server stops
+    /// The longest a statement may run on the server before the server stops
     /// it: 30 seconds by default.
     ///
-    /// It is set as the session's `max_execution_time` when connecting, which
-    /// MySQL applies to read-only `SELECT` statements only. Statements that
-    /// write are bounded by how long they may wait for a lock
-    /// (`innodb_lock_wait_timeout`, 50 seconds unless the server sets
-    /// otherwise), not by this. It is rounded up to whole milliseconds.
+    /// On MySQL it is set as the session's `max_execution_time`, which MySQL
+    /// applies to read-only `SELECT` statements only (error 3024), rounded up
+    /// to whole milliseconds; and, rounded up to whole seconds, as its
+    /// `lock_wait_timeout`, so that a statement waiting for a table or
+    /// metadata lock (`LOCK TABLES` elsewhere, an `ALTER TABLE` running) gives
+    /// up after it too (error 1205). A write waiting for a row lock gives up
+    /// after `innodb_lock_wait_timeout` (50 seconds unless the server sets
+    /// otherwise); a write that holds its locks and runs long is not stopped
+    /// by MySQL. Run migrations that take longer with a configuration of
+    /// their own.
+    ///
+    /// On MariaDB it is set as `max_statement_time`, which stops every
+    /// statement, writes and DDL included (error 1969), and as
+    /// `lock_wait_timeout` too.
     pub fn statement_timeout(mut self, timeout: Duration) -> Self {
         self.statement_timeout = timeout.max(Duration::from_millis(1));
         self
@@ -242,14 +289,20 @@ impl Config {
         self
     }
 
-    /// How many prepared statements each connection keeps, 256 by default.
+    /// How many prepared statements each connection keeps, 64 by default.
     ///
     /// Every statement is prepared on the server the first time a connection
     /// runs it, and kept, so running it again takes one round trip instead
     /// of two. The least recently used statement is closed when the cache is
-    /// full. 0 prepares and closes every statement each time it runs. The
-    /// server's `max_prepared_stmt_count` (16,382 by default) bounds the
-    /// total over all connections.
+    /// full. 0 prepares and closes every statement each time it runs.
+    ///
+    /// The server's `max_prepared_stmt_count` (16,382 by default) bounds the
+    /// statements of all its clients together, so size this from the number
+    /// of connections: processes × workers × pool size × this capacity must
+    /// stay below it, with room for the other applications on the server.
+    /// 64 allows 255 connections. When the server's limit is reached anyway
+    /// (error 1461), the connection closes its statements that are not in
+    /// use and prepares again, once.
     pub fn statement_cache_capacity(mut self, statements: usize) -> Self {
         self.statement_cache = statements;
         self
@@ -268,11 +321,20 @@ impl Config {
     /// The parameters understood are `ssl-mode`, `ssl-ca`, `socket`,
     /// `server-public-key-path`, `connect-timeout` (seconds) and
     /// `application-name`; any other is an error rather than being ignored.
-    /// `ssl-mode` is `DISABLED`, or `REQUIRED`, `VERIFY_CA` or
-    /// `VERIFY_IDENTITY`, which all check the certificate and the host name
-    /// (stricter than MySQL's own client, which checks nothing for
-    /// `REQUIRED`). `ssl-ca` is a PEM file of authorities to trust instead of
-    /// the machine's.
+    /// `ssl-ca` is a PEM file of authorities to trust instead of the
+    /// machine's. `ssl-mode` is one of:
+    ///
+    /// * `DISABLED`: no TLS.
+    /// * `VERIFY_IDENTITY`: the certificate is checked against the
+    ///   authorities and the host name.
+    /// * `VERIFY_CA`: the certificate is checked against the authorities in
+    ///   `ssl-ca`, which it needs, and not against the host name; for the
+    ///   certificates MySQL generates itself (see [`Tls::verify_ca`]).
+    /// * `REQUIRED`: like `VERIFY_CA` when `ssl-ca` is given, as in MySQL's
+    ///   own client; without it, like `VERIFY_IDENTITY` against the machine's
+    ///   authorities, which is stricter than MySQL's client (it checks
+    ///   nothing then, so anyone on the path could pose as the server).
+    /// * `PREFERRED` is refused: it falls back to no TLS without a word.
     pub fn from_url(url: &str) -> Result<Self, Error> {
         parse_url(url)
     }
@@ -329,10 +391,34 @@ impl Config {
         }
     }
 
-    /// The `SET` statement run after logging in.
-    pub(crate) fn session_sql(&self) -> Result<String, Error> {
-        let ms = self.statement_timeout.as_micros().div_ceil(1000);
-        let mut sql = format!("SET time_zone = '+00:00', max_execution_time = {ms}");
+    /// The `SET` statement run after logging in, and again after each reset
+    /// of the session.
+    ///
+    /// * The character set is set here as well as in the handshake: servers
+    ///   that do not know the handshake's collation, or ignore it on purpose
+    ///   (`skip-character-set-client-handshake`), fall back to their own
+    ///   default without a word, and UTF-8 would then be stored as latin1.
+    /// * `autocommit` is on whatever the server's default: the pool's shared
+    ///   connections must not leave a transaction open.
+    /// * The session trackers tell the pool when a statement changed the
+    ///   session.
+    pub(crate) fn session_sql(&self, server: crate::connect::Server) -> Result<String, Error> {
+        let micros = self.statement_timeout.as_micros();
+        let lock_secs = micros.div_ceil(1_000_000).clamp(1, 31_536_000);
+        let mut sql = match server {
+            crate::connect::Server::MySql => format!(
+                "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci, time_zone = '+00:00', \
+                 max_execution_time = {}, lock_wait_timeout = {lock_secs}",
+                micros.div_ceil(1000)
+            ),
+            crate::connect::Server::MariaDb => format!(
+                "SET NAMES utf8mb4, time_zone = '+00:00', max_statement_time = {}.{:06}, \
+                 lock_wait_timeout = {lock_secs}",
+                micros / 1_000_000,
+                micros % 1_000_000
+            ),
+        };
+        sql.push_str(", autocommit = 1, session_track_state_change = ON");
         for (name, value) in &self.session {
             let plain =
                 !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
@@ -342,13 +428,23 @@ impl Config {
                      digits and _)"
                 )));
             }
-            if name.eq_ignore_ascii_case("time_zone")
-                || name.eq_ignore_ascii_case("max_execution_time")
-            {
+            let lower = name.to_ascii_lowercase();
+            let reserved = matches!(
+                lower.as_str(),
+                "time_zone"
+                    | "max_execution_time"
+                    | "max_statement_time"
+                    | "autocommit"
+                    | "collation_connection"
+                    | "names"
+            ) || lower.starts_with("character_set_")
+                || lower.starts_with("session_track_");
+            if reserved {
                 return Err(Error::config(format!(
-                    "the session variable {name} is set by giong-mysql itself; use \
-                     Config::statement_timeout for max_execution_time, and keep the time zone \
-                     UTC"
+                    "the session variable {name} is set by giong-mysql itself: the time zone is \
+                     UTC, the character set utf8mb4 and autocommit on, the statement time limit \
+                     comes from Config::statement_timeout, and the session trackers tell the \
+                     pool when a session changed. Leave it out"
                 )));
             }
             sql.push_str(&format!(", SESSION {name} = {value}"));
@@ -524,6 +620,19 @@ fn parse_url(url: &str) -> Result<Config, Error> {
         }
     }
 
+    let chain_only = |mode: &str| -> Result<Tls, Error> {
+        let Some(path) = ssl_ca.as_deref() else {
+            return Err(Error::config(format!(
+                "ssl-mode={mode} checks the server's certificate against the authority in ssl-ca \
+                 and not against the host name, so it needs ssl-ca=/path/ca.pem (the server's own \
+                 ca.pem for the certificates MySQL generates); use ssl-mode=VERIFY_IDENTITY to \
+                 check the certificate against the machine's authorities and the host name"
+            )));
+        };
+        let pem = std::fs::read(path)
+            .map_err(|e| Error::io(ErrorKind::Config, format!("cannot read ssl-ca {path:?}"), e))?;
+        Tls::verify_ca(&pem)
+    };
     let verify = || -> Result<Tls, Error> {
         match ssl_ca.as_deref() {
             None => Ok(Tls::Verify(TlsConnector::with_system_roots().map_err(
@@ -554,7 +663,13 @@ fn parse_url(url: &str) -> Result<Config, Error> {
         None if ssl_ca.is_some() => config.tls = Some(verify()?),
         None => {}
         Some("DISABLED") => config.tls = Some(Tls::Disable),
-        Some("REQUIRED" | "VERIFY_CA" | "VERIFY_IDENTITY") => config.tls = Some(verify()?),
+        Some("VERIFY_IDENTITY") => config.tls = Some(verify()?),
+        Some("VERIFY_CA") => config.tls = Some(chain_only("VERIFY_CA")?),
+        // As in MySQL's own client, a given authority makes REQUIRED check
+        // the chain; without one, checking nothing would let anyone on the
+        // path pose as the server, so the certificate is checked in full.
+        Some("REQUIRED") if ssl_ca.is_some() => config.tls = Some(chain_only("REQUIRED")?),
+        Some("REQUIRED") => config.tls = Some(verify()?),
         Some("PREFERRED") => {
             return Err(Error::config(
                 "ssl-mode=PREFERRED would silently connect without encryption when TLS fails; \
@@ -583,6 +698,7 @@ fn parse_port(port: &str) -> Result<u16, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connect::Server;
 
     #[test]
     fn a_full_url_is_read() {
@@ -665,18 +781,39 @@ mod tests {
             .statement_timeout(Duration::from_micros(2500))
             .session_variable("sql_mode", "'STRICT_ALL_TABLES'");
         assert_eq!(
-            c.session_sql().unwrap(),
-            "SET time_zone = '+00:00', max_execution_time = 3, SESSION sql_mode = \
-             'STRICT_ALL_TABLES'"
+            c.session_sql(Server::MySql).unwrap(),
+            "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci, time_zone = '+00:00', \
+             max_execution_time = 3, lock_wait_timeout = 1, autocommit = 1, \
+             session_track_state_change = ON, SESSION sql_mode = 'STRICT_ALL_TABLES'"
+        );
+        let c = c.statement_timeout(Duration::from_millis(2500));
+        assert_eq!(
+            c.session_sql(Server::MariaDb).unwrap(),
+            "SET NAMES utf8mb4, time_zone = '+00:00', max_statement_time = 2.500000, \
+             lock_wait_timeout = 3, autocommit = 1, session_track_state_change = ON, SESSION \
+             sql_mode = 'STRICT_ALL_TABLES'"
         );
         let bad = Config::new().session_variable("a; DROP TABLE x", "1");
         assert!(bad
-            .session_sql()
+            .session_sql(Server::MySql)
             .unwrap_err()
             .to_string()
             .contains("identifier"));
-        let tz = Config::new().session_variable("time_zone", "'+07:00'");
-        assert!(tz.session_sql().unwrap_err().to_string().contains("UTC"));
+        for name in [
+            "time_zone",
+            "MAX_EXECUTION_TIME",
+            "max_statement_time",
+            "autocommit",
+            "character_set_results",
+            "collation_connection",
+            "session_track_state_change",
+        ] {
+            let c = Config::new().session_variable(name, "1");
+            let e = c.session_sql(Server::MySql).unwrap_err().to_string();
+            assert!(e.contains("Leave it out"), "{name}: {e}");
+        }
+        let lock = Config::new().session_variable("lock_wait_timeout", "5");
+        assert!(lock.session_sql(Server::MySql).is_ok());
         assert_eq!(
             Config::new()
                 .statement_timeout(Duration::ZERO)
