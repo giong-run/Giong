@@ -10,7 +10,7 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", ".github/", "scripts/", "assets/", "site/", "docs/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/"]
 
 [workspace]
 members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "examples/rest-api"]
@@ -24,7 +24,8 @@ socket2 = { version = "0.6", features = ["all"] }
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(loom)'] }
+# `fuzzing` is set by cargo fuzz for the targets in fuzz/.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(loom)', 'cfg(fuzzing)'] }
 
 [profile.release]
 opt-level = 3

@@ -8,6 +8,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **Verification**: fuzz targets for the core crate (`fuzz/`): `dns_response` (DNS answers,
+  up to 64 KiB, with a 2-second limit per input so that a slow answer counts as a failure)
+  and `resolv_conf` (`/etc/resolv.conf` and `/etc/hosts`), in the nightly fuzz workflow.
+
 ### Changed
 
 - **giong**: the default number of workers follows the CPU quota. It was the number of CPUs
@@ -23,6 +29,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   the fix, like giong's errors: `GIONG-E0011` (a giong function called outside a giong
   runtime, for example on Tokio's executor), `GIONG-E0012` (`block_on` inside a runtime)
   and `GIONG-E0013` (a giong future polled on another worker).
+- **giong**, breaking: `mpsc::Receiver::try_recv` and `mpsc::BoundedReceiver::try_recv`
+  return `Result<T, mpsc::TryRecvError>` instead of `Option<T>`, like
+  `oneshot::Receiver::try_recv`: `Empty` while a sender is alive, `Closed` once every
+  sender is gone and the channel is empty. The `Option` could not tell the two apart.
+- **giong**: `OpenOptions::custom_flags` ignores the access-mode bits (`O_RDONLY`,
+  `O_WRONLY`, `O_RDWR`), as the standard library does: `custom_flags(libc::O_RDWR)` no
+  longer turns a read-only open into a writable one. Combinations `open(2)` cannot do (no
+  access mode, `truncate` or `create` without `write`, `append` with `truncate`) fail with
+  `GIONG-E0203`, which names the option and the fix, instead of a bare `EINVAL`.
+- **giong**: `File::allocate` with a length of 0 does nothing and returns `Ok` (it was the
+  kernel's `EINVAL`), and a range that ends above `i64::MAX` is refused with `GIONG-E0202`.
+- **giong**: the docs of `TcpStream` and `UnixStream` `read`, `write` and `write_all` say
+  that they are not cancel safe, and `read` that a buffer with no capacity reads `Ok(0)`.
 
 ### Fixed
 
@@ -46,6 +65,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong**: a balanced listener could leave a connection in the mailbox of a worker whose
   last balanced listener closed at the same moment, open and unanswered. The hand-over now
   checks under the mailbox's lock and keeps the connection, or gives it to another member.
+- **giong**: a DNS answer with a long chain of CNAME records froze the worker. The chain was
+  followed by rescanning every record for every name found, in cubic time: one 64 KiB TCP
+  answer of 2,300 records held the worker for 18 seconds, with no timer or other task
+  running, and whoever controls DNS answers (a resolver, or anyone on the path to it) could
+  send one. The chain is now followed from the query name in linear time, and more than 16
+  CNAME links is a malformed answer (`GIONG-E0107`), as in other resolvers.
+- **giong**: `File::read_at`, `write_at` and `write_all_at` refuse an offset above
+  `i64::MAX` with `GIONG-E0202`. io_uring reads `u64::MAX` as "the current file position",
+  so such an offset read and wrote wherever that was, on io_uring only (epoll failed with
+  `EINVAL`).
+- **giong**: a DNS server address where nothing listens gave the kernel's bare "connection
+  refused", so a failed `connect("db.internal:5432")` read as if the database refused. It
+  is now `GIONG-E0108`, naming the server and the name, with the kernel's error as its
+  source. `GIONG-E0104` says when it really applies (an empty `ResolverConfig::nameservers`;
+  a `resolv.conf` without servers means `127.0.0.1:53`).
+- **giong**: `UdpSocket::read_from` refuses a buffer with no capacity (`Vec::new()`) with
+  `GIONG-E0109`, instead of receiving the datagram into it and losing it.
+- **giong**: an IP address without a port (`"10.0.0.5"`, `"::1"`) or an IPv6 address
+  without brackets (`"2001:db8::1:8080"`) passed as `"host:port"` now gets an error that
+  says so and shows the right form, instead of "not a valid host name".
 
 ## [0.5.0] - 2026-11-14
 

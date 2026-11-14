@@ -103,3 +103,11 @@ pub use runtime::{
 
 #[doc(hidden)]
 pub use runtime::{stats, Stats};
+
+/// Entry points for the fuzz targets in `fuzz/`, built only by `cargo fuzz`
+/// (`--cfg fuzzing`). Not part of the API.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    pub use crate::net::dns::fuzzing::{dns_response, resolv_conf};
+}

@@ -1,15 +1,15 @@
 name: Fuzz
 
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
-# bytes from the network: giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and
-# client, giong-web's router and request handling, and the PostgreSQL, MySQL
-# and Redis protocol readers. Every night each target runs for 10 minutes and
-# its corpus is kept in the Actions cache, so the corpus keeps growing. A pull
-# request gets a one-minute run of the targets of the crates it changes (one
-# target of each crate when it changes this file), and a push to main a
-# one-minute run of every target, which catches a change in one crate that
-# breaks another's target. A crash fails the job and uploads the input that
-# caused it.
+# bytes from the network: giong's DNS answers (and resolv.conf and hosts),
+# giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and client, giong-web's
+# router and request handling, and the PostgreSQL, MySQL and Redis protocol
+# readers. Every night each target runs for 10 minutes and its corpus is kept in
+# the Actions cache, so the corpus keeps growing. A pull request gets a
+# one-minute run of the targets of the crates it changes (one target of each
+# crate when it changes this file), and a push to main a one-minute run of every
+# target, which catches a change in one crate that breaks another's target. A
+# crash fails the job and uploads the input that caused it.
 
 on:
   schedule:
@@ -65,9 +65,13 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         # Every target. `dir` is where the crate's fuzz/ directory is, when
-        # not in `crate/`; `flags` adds libFuzzer options for one target.
+        # not in `crate/`. `flags` adds libFuzzer options: DNS answers over
+        # TCP reach 64 KiB, and one must never take long to parse (it would
+        # freeze a worker).
         run: |
           all=$(jq -c -s . <<'EOF'
+          { "crate": "giong", "dir": ".", "target": "dns_response", "flags": "-max_len=65538 -timeout=2" }
+          { "crate": "giong", "dir": ".", "target": "resolv_conf" }
           { "crate": "giong-http", "target": "head" }
           { "crate": "giong-http", "target": "chunked" }
           { "crate": "giong-http", "target": "connection" }

@@ -275,7 +275,20 @@ impl UdpSocket {
     /// that arrives while the future is being dropped is lost), and the two
     /// must not be mixed on one socket: once `recv_from` has been used,
     /// `read_from` fails with `InvalidInput`.
+    ///
+    /// A buffer with no capacity (such as `Vec::new()`) is refused with
+    /// `GIONG-E0109`: the kernel would take the datagram and keep none of it.
     pub async fn read_from<B: IoBufMut>(&self, mut buf: B) -> (io::Result<(usize, SocketAddr)>, B) {
+        if buf.capacity() == 0 {
+            let err = raise(
+                Code::EmptyBuffer,
+                "read_from was given a buffer with no room, and a datagram received into it \
+                 would be lost",
+                "pass a buffer with room for the largest datagram expected, such as \
+                 Vec::with_capacity(65_536); Vec::new() has none.",
+            );
+            return (Err(err), buf);
+        }
         if runtime::with_worker(|w| self.recv.is_active(w)) {
             let err = raise(
                 Code::MixedReads,
