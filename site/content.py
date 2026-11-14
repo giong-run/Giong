@@ -490,7 +490,7 @@ EXAMPLES = [
 
 LIMITS = [
     ("Linux only", "io_uring on 6.0 or newer, epoll elsewhere. On epoll giong is as fast as other "
-                   "epoll runtimes, not faster. There will be no kqueue or IOCP in production."),
+                   "epoll runtimes, not faster. macOS and Windows are planned for after 1.0."),
     ("Not Tokio's ecosystem", "Crates that need the Tokio runtime (hyper, sqlx, reqwest) do not run "
                               "on giong. Crates that only use `std::future` do."),
     ("No HTTP/2", "`giong-http` speaks HTTP/1.1. A request body over the limit is refused."),
@@ -513,7 +513,8 @@ FAQ = [
      "Not yet. It is complete enough to write real services and is tested hard, but it has not run "
      "in production. 1.0 waits for, among other things, at least one production user reporting back."),
     ("Does it run on macOS or Windows?",
-     "No. io_uring is a Linux interface. On Windows use WSL2 with a 6.x kernel (`uname -r`; "
+     "Not yet: both are planned for after 1.0, macOS for development and Windows for services "
+     "that have to run there. Today, on Windows use WSL2 with a 6.x kernel (`uname -r`; "
      "`wsl --update` if it is older); on macOS a Linux virtual machine or Docker. In Docker giong "
      "runs on epoll; allow io_uring as [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows to get its "
      "full speed."),
