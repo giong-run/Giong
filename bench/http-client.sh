@@ -12,6 +12,10 @@
 #   * Workloads: `json` is a 27-byte JSON answer, `users` an 8.5 KiB one,
 #     `bytes64k` and `bytes1m` 64 KiB and 1 MiB of bytes (giong-http's
 #     /bytes); each client reads the whole body of every response.
+#   * Schemes: `http` and `https` are HTTP/1.1 (both clients told to speak
+#     it alone); `h2` is HTTP/2 over TLS, chosen through ALPN; `h2c` is
+#     HTTP/2 over plain TCP with prior knowledge. Over HTTP/2 every client
+#     sends all its requests on one connection, so `giong-64` is not run.
 #   * Clients: `giong` is one giong_http::client::Client shared by every
 #     task, with its default of at most 16 connections to a host;
 #     `giong-64` allows 64 (one per task). `reqwest` is one reqwest::Client
@@ -38,7 +42,7 @@ CLIENT_CPU=${CLIENT_CPU:-3}
 SERVER_CPUS=${SERVER_CPUS:-0,1,2}
 TASKS=${TASKS:-64}
 WORKLOADS=${WORKLOADS:-json users}
-SCHEMES=${SCHEMES:-http https}
+SCHEMES=${SCHEMES:-http https h2 h2c}
 CLIENTS=${CLIENTS:-giong giong-64 reqwest}
 OUT=${OUT:-results/http-client}
 mkdir -p "$OUT"
@@ -77,20 +81,23 @@ server_ticks() {
     busy += $2 + $3 + $4 + $7 + $8 } END { print busy }' /proc/stat
 }
 
-echo "client,scheme,workload,round,ops,p50,p99,cpu,srv,ktls" > "$CSV"
+echo "client,scheme,workload,round,ops,p50,p99,cpu,srv,ktls,version" > "$CSV"
 for round in $(seq 1 "$ROUNDS"); do
   for scheme in $SCHEMES; do
     case $scheme in
-      http) url_base="http://127.0.0.1:3009" ;;
-      https) url_base="https://localhost:3010" ;;
+      http) url_base="http://127.0.0.1:3009" http=1 ;;
+      https) url_base="https://localhost:3010" http=1 ;;
+      h2) url_base="https://localhost:3010" http=2 ;;
+      h2c) url_base="http://127.0.0.1:3009" http=h2c ;;
     esac
     for workload in $WORKLOADS; do
       for client in $CLIENTS; do
+        if [[ $client == giong-64 && $http != 1 ]]; then continue; fi
         case $client in
           giong) cmd=(env POOL_SIZE=16 http-client-giong/target/release/bench-http-client-giong) ;;
           giong-64) cmd=(env POOL_SIZE=64 http-client-giong/target/release/bench-http-client-giong) ;;
           giong-ktls)
-            [ "$scheme" = https ] || continue
+            [ "$scheme" = https ] || [ "$scheme" = h2 ] || continue
             cmd=(env POOL_SIZE=16 GIONG_KTLS=required http-client-giong/target/release/bench-http-client-giong) ;;
           reqwest) cmd=(http-client-tokio/target/release/bench-http-client-tokio) ;;
         esac
@@ -100,7 +107,7 @@ for round in $(seq 1 "$ROUNDS"); do
           bytes1m) path="bytes?n=1048576" ;;
           *) path=$workload ;;
         esac
-        CA="$TMP/ca.pem" taskset -c "$CLIENT_CPU" "${cmd[@]}" "$url_base/$path" "$TASKS" "$SECS" >"$out_file" &
+        CA="$TMP/ca.pem" HTTP=$http taskset -c "$CLIENT_CPU" "${cmd[@]}" "$url_base/$path" "$TASKS" "$SECS" >"$out_file" &
         cpid=$!
         sleep 2.2
         before=$(server_ticks)
@@ -110,7 +117,8 @@ for round in $(seq 1 "$ROUNDS"); do
         out=$(cat "$out_file")
         srv=$(( (after - before) * 100 / (CLK_TCK * SECS) ))
         get() { sed -n "s/.*$1=\([0-9.]*\).*/\1/p" <<<"$out"; }
-        echo "$client,$scheme,$workload,$round,$(get ops),$(get p50_us),$(get p99_us),$(get cpu),$srv,$(get ktls)" >> "$CSV"
+        version=$(sed -n 's/.*version=\([^ ]*\).*/\1/p' <<<"$out")
+        echo "$client,$scheme,$workload,$round,$(get ops),$(get p50_us),$(get p99_us),$(get cpu),$srv,$(get ktls),$version" >> "$CSV"
       done
     done
   done
@@ -122,7 +130,7 @@ import csv, statistics, sys
 rows = list(csv.DictReader(open(sys.argv[1])))
 med = statistics.median
 print(f"{sys.argv[2]} tasks, {sys.argv[3]} rounds of {sys.argv[4]} s; median, min and max of the rounds")
-print(f"{'scheme':<7}{'workload':<9}{'client':<11}{'req/s median':>13}{'min':>9}{'max':>9}{'p50 us':>8}{'p99 us':>8}{'cpu%':>6}{'srv%':>6}{'us/req':>8}")
+print(f"{'scheme':<7}{'workload':<9}{'client':<11}{'req/s median':>13}{'min':>9}{'max':>9}{'p50 us':>8}{'p99 us':>8}{'cpu%':>6}{'srv%':>6}{'us/req':>8}  version")
 def seen(key):
     out = []
     for r in rows:
@@ -138,6 +146,7 @@ for s in seen("scheme"):
             us = med(float(r["cpu"]) * 1e4 / float(r["ops"]) for r in sel)
             print(f"{s:<7}{w:<9}{c:<11}{med(ops):13.0f}{min(ops):9.0f}{max(ops):9.0f}"
                   f"{med(float(r['p50']) for r in sel):8.0f}{med(float(r['p99']) for r in sel):8.0f}"
-                  f"{med(float(r['cpu']) for r in sel):6.0f}{med(float(r['srv']) for r in sel):6.0f}{us:8.2f}")
+                  f"{med(float(r['cpu']) for r in sel):6.0f}{med(float(r['srv']) for r in sel):6.0f}{us:8.2f}"
+                  f"  {'/'.join(sorted({r['version'] for r in sel}))}")
         print()
 PY

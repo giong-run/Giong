@@ -1,10 +1,11 @@
 //! An app served by giong-http over real sockets, called with giong-http's
-//! client.
+//! client, over HTTP/1.1 and over HTTP/2.
 
 use std::time::Duration;
 
 use giong::net::TcpListener;
 use giong_http::client::Client;
+use giong_http::Version;
 use giong_web::middleware::{Compression, Cors, RequestId, Timeout};
 use giong_web::{App, Error, Req, Response, Router, Server};
 
@@ -41,60 +42,68 @@ fn serve() -> String {
     format!("http://{addr}")
 }
 
+async fn requests_over_one_connection(version: Version) {
+    let base = serve();
+    let builder = || Client::builder().http2_prior_knowledge(version == Version::Http2);
+    let client = builder().build();
+    // gzip on the wire...
+    let raw = builder().decompress(false).build();
+    let resp = raw
+        .get(&format!("{base}/users"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.header("content-encoding"), Some("gzip"));
+    assert_eq!(&resp.body()[..2], &[0x1f, 0x8b]);
+    // ...which the client decompresses.
+    let resp = client.get(&format!("{base}/users")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.version(), version);
+    assert!(resp.text().unwrap().starts_with("[{\"id\":0,"));
+    assert_eq!(resp.header("x-request-id").map(str::len), Some(20));
+
+    let resp = client
+        .post(&format!("{base}/echo/9"))
+        .header("Origin", "https://app.example.com")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.text().unwrap(), "9:hello");
+    assert_eq!(
+        resp.header("access-control-allow-origin"),
+        Some("https://app.example.com")
+    );
+
+    let resp = client.get(&format!("{base}/echo/9")).send().await.unwrap();
+    assert_eq!(resp.status(), 405);
+    assert_eq!(resp.header("allow"), Some("POST, OPTIONS"));
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/problem+json")
+    );
+
+    for i in 0..50 {
+        let resp = client
+            .post(&format!("{base}/echo/{i}"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.text().unwrap(), format!("{i}:x"));
+    }
+    let (open, idle) = client.connections(&base);
+    assert_eq!((open, idle), (1, 1), "every request reused one connection");
+}
+
 #[test]
 fn requests_over_a_kept_alive_connection() {
-    giong::block_on(async {
-        let base = serve();
-        let client = Client::new();
+    giong::block_on(requests_over_one_connection(Version::Http11));
+}
 
-        // gzip on the wire...
-        let raw = Client::builder().decompress(false).build();
-        let resp = raw
-            .get(&format!("{base}/users"))
-            .header("Accept-Encoding", "gzip")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.header("content-encoding"), Some("gzip"));
-        assert_eq!(&resp.body()[..2], &[0x1f, 0x8b]);
-        // ...which the client decompresses.
-        let resp = client.get(&format!("{base}/users")).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert!(resp.text().unwrap().starts_with("[{\"id\":0,"));
-        assert_eq!(resp.header("x-request-id").map(str::len), Some(20));
-
-        let resp = client
-            .post(&format!("{base}/echo/9"))
-            .header("Origin", "https://app.example.com")
-            .body("hello")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 201);
-        assert_eq!(resp.text().unwrap(), "9:hello");
-        assert_eq!(
-            resp.header("access-control-allow-origin"),
-            Some("https://app.example.com")
-        );
-
-        let resp = client.get(&format!("{base}/echo/9")).send().await.unwrap();
-        assert_eq!(resp.status(), 405);
-        assert_eq!(resp.header("allow"), Some("POST, OPTIONS"));
-        assert_eq!(
-            resp.header("content-type"),
-            Some("application/problem+json")
-        );
-
-        for i in 0..50 {
-            let resp = client
-                .post(&format!("{base}/echo/{i}"))
-                .body("x")
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.text().unwrap(), format!("{i}:x"));
-        }
-        let (open, idle) = client.connections(&base);
-        assert_eq!((open, idle), (1, 1), "every request reused one connection");
-    });
+#[test]
+fn requests_over_http2_with_the_same_app() {
+    giong::block_on(requests_over_one_connection(Version::Http2));
 }

@@ -1,18 +1,30 @@
 64 tasks, 5 rounds of 5 s; median, min and max of the rounds
-scheme workload client     req/s median      min      max  p50 us  p99 us  cpu%  srv%
-http   json     giong             89937    69151    93489     672    1167    99    67
-http   json     giong-64         113696   108773   122614     575    1113    98    79
-http   json     reqwest           61833    59053    70865     940    2221    99    54
+scheme workload client     req/s median      min      max  p50 us  p99 us  cpu%  srv%  version
+http   json     giong            113815    84222   125584     542     768   100    68  HTTP/1.1
+http   json     giong-64         150107   119541   167076     459     698   100    84  HTTP/1.1
+http   json     reqwest           84741    66090    87099     724    1196   100    50  HTTP/1.1
 
-http   users    giong             72366    67236    78744     839    1394    98   190
-http   users    giong-64          95579    78908    96901     658    1179    98   220
-http   users    reqwest           56771    47329    59905    1055    2418    99   155
+http   users    giong             82272    78033   100373     764    1142   100   150  HTTP/1.1
+http   users    giong-64          91679    87825   135864     805    1214   100   159  HTTP/1.1
+http   users    reqwest           58135    55672    80607    1102    1452   100   106  HTTP/1.1
 
-https  json     giong             78048    74363    78875     784    1355    99    76
-https  json     giong-64         105537    91248   107068     632    1227    99    95
-https  json     reqwest           60646    57758    69201     976    1920    99    70
+https  json     giong             99875    79744   110079     632     880   100    78  HTTP/1.1
+https  json     giong-64         145291   117667   155569     512     657   100    86  HTTP/1.1
+https  json     reqwest           84632    61664    88255     727    1149   100    56  HTTP/1.1
 
-https  users    giong             59737    53088    64152     987    1661    98   169
-https  users    giong-64          71009    62015    74888     862    1794    98   194
-https  users    reqwest           45393    41143    51776    1330    2221    99   135
+https  users    giong             84236    65143    90434     758     883   100   148  HTTP/1.1
+https  users    giong-64          81159    75968    93123     805    1511    99   153  HTTP/1.1
+https  users    reqwest           48785    39814    56423    1280    2023   100    95  HTTP/1.1
+
+h2     json     giong            250739   242205   263853     241     414    63    34  HTTP/2
+h2     json     reqwest          122861   115634   134751     489     839    87    21  HTTP/2.0
+
+h2     users    giong             64245    55351    65530     975    1522    57    94  HTTP/2
+h2     users    reqwest           48255    43433    51002    1327    2437    65    74  HTTP/2.0
+
+h2c    json     giong            265714   251191   272632     229     361    62    37  HTTP/2
+h2c    json     reqwest          123088   119171   124380     505     803    88    19  HTTP/2.0
+
+h2c    users    giong             68445    67676    70824     845    1617    51    86  HTTP/2
+h2c    users    reqwest           55966    42875    65441    1136    2000    60    64  HTTP/2.0
 
