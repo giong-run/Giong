@@ -163,6 +163,9 @@ jobs:
   servers:
     name: servers (${{ matrix.server }})
     runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
+    # These take a few minutes. A server that does not start, or a test that
+    # waits for one for ever, must not hold a runner for six hours.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

@@ -16,7 +16,8 @@
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, MutexGuard, Once, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use giong_mysql::{Config, Tls, TlsConnector};
@@ -53,6 +54,9 @@ struct Bins {
     /// `mariadb-install-db`, for MariaDB, which has no
     /// `--initialize-insecure`.
     install_db: Option<PathBuf>,
+    /// The server listens on one address only: MariaDB before 10.11, whose
+    /// `bind-address` takes no list.
+    one_address: bool,
 }
 
 /// How a server is set up.
@@ -78,8 +82,8 @@ pub const SHA256_USER: (&str, &str) = ("sha256_user", "sha256-secret");
 /// The database the tests work in.
 pub const DATABASE: &str = "giong";
 
-static SERVER: OnceLock<Option<Server>> = OnceLock::new();
-static ODD: OnceLock<Server> = OnceLock::new();
+static SERVER: OnceLock<Result<Option<Server>, String>> = OnceLock::new();
+static ODD: OnceLock<Result<Server, String>> = OnceLock::new();
 static ODD_TURN: Mutex<()> = Mutex::new(());
 /// The servers started, and their directories, for [`stop_servers`].
 static STARTED: Mutex<Vec<(i32, PathBuf)>> = Mutex::new(Vec::new());
@@ -87,21 +91,40 @@ static AT_EXIT: Once = Once::new();
 
 /// The server, or `None` (after saying why) when MySQL is not installed.
 pub fn server() -> Option<&'static Server> {
-    SERVER
-        .get_or_init(|| {
-            let Some(bins) = find_bins() else {
-                if std::env::var_os("GIONG_MYSQL_REQUIRED").is_some_and(|v| v == "1") {
-                    panic!(
-                        "GIONG_MYSQL_REQUIRED=1 but mysqld and mysql were not found; set \
-                         GIONG_MYSQL_BIN"
-                    );
-                }
-                eprintln!("skipping: mysqld and mysql not found (set GIONG_MYSQL_BIN)");
-                return None;
-            };
-            Some(start(bins, Role::Main))
-        })
-        .as_ref()
+    let server = SERVER.get_or_init(|| {
+        let Some(bins) = find_bins() else {
+            if std::env::var_os("GIONG_MYSQL_REQUIRED").is_some_and(|v| v == "1") {
+                panic!(
+                    "GIONG_MYSQL_REQUIRED=1 but mysqld and mysql were not found; set \
+                     GIONG_MYSQL_BIN"
+                );
+            }
+            eprintln!("skipping: mysqld and mysql not found (set GIONG_MYSQL_BIN)");
+            return Ok(None);
+        };
+        start_once(bins, Role::Main).map(Some)
+    });
+    match server {
+        Ok(server) => server.as_ref(),
+        Err(why) => panic!("{why}"),
+    }
+}
+
+/// Starts a server, once: if it does not start, the test that asked first
+/// says why with the server's log, and every later test fails at once with
+/// the first line of it. Each would otherwise try in turn, a minute a test.
+fn start_once(bins: Bins, role: Role) -> Result<Server, String> {
+    std::panic::catch_unwind(|| start(bins, role)).map_err(|panic| {
+        let why = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("it panicked");
+        format!(
+            "the test server did not start (the first test to fail has its log): {}",
+            why.lines().next().unwrap_or_default()
+        )
+    })
 }
 
 /// A second server, started the first time it is asked for, with settings
@@ -117,10 +140,10 @@ pub fn server() -> Option<&'static Server> {
 /// take turns (the guard), as some change its global settings.
 pub fn odd(main: &Server) -> (&'static Server, MutexGuard<'static, ()>) {
     let turn = ODD_TURN.lock().unwrap_or_else(|e| e.into_inner());
-    (
-        ODD.get_or_init(|| start(main.bins.clone(), Role::Odd)),
-        turn,
-    )
+    match ODD.get_or_init(|| start_once(main.bins.clone(), Role::Odd)) {
+        Ok(server) => (server, turn),
+        Err(why) => panic!("{why}"),
+    }
 }
 
 impl Server {
@@ -250,7 +273,9 @@ fn find_bins() -> Option<Bins> {
     };
     let mysql = find(&["mysql", "mariadb"])?;
     let version = Command::new(&mysqld).arg("--version").output().ok()?;
-    let install_db = if String::from_utf8_lossy(&version.stdout).contains("MariaDB") {
+    let version = String::from_utf8_lossy(&version.stdout).into_owned();
+    let mariadb = version.contains("MariaDB");
+    let install_db = if mariadb {
         Some(find(&["mariadb-install-db", "mysql_install_db"])?)
     } else {
         None
@@ -259,7 +284,20 @@ fn find_bins() -> Option<Bins> {
         mysqld,
         mysql,
         install_db,
+        one_address: mariadb && version_number(&version) < (10, 11),
     })
+}
+
+/// The major and minor number in what `mysqld --version` prints
+/// ("... Ver 10.6.23-MariaDB ..."), or `(0, 0)`.
+fn version_number(version: &str) -> (u32, u32) {
+    let mut numbers = version
+        .split("Ver ")
+        .nth(1)
+        .unwrap_or_default()
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|n| n.parse().unwrap_or(0));
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
 }
 
 fn is_root() -> bool {
@@ -289,6 +327,37 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// For a server that listens on one address only: a port free on 127.0.0.1
+/// for it, with connections to the same port of 127.0.0.2 passed on to it,
+/// so that the tests reach every server at both addresses.
+fn free_port_with_second_address() -> u16 {
+    let (port, listener) = (0..100)
+        .find_map(|_| {
+            let port = free_port();
+            let listener = std::net::TcpListener::bind(("127.0.0.2", port)).ok()?;
+            Some((port, listener))
+        })
+        .expect("a port free on 127.0.0.1 and 127.0.0.2");
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+                continue;
+            };
+            let _ = (client.set_nodelay(true), server.set_nodelay(true));
+            let (Ok(client_too), Ok(server_too)) = (client.try_clone(), server.try_clone()) else {
+                continue;
+            };
+            for (mut from, to) in [(client, server_too), (server, client_too)] {
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut from, &mut &to);
+                    let _ = to.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        }
+    });
+    port
 }
 
 fn mysqld(bins: &Bins) -> Command {
@@ -396,17 +465,26 @@ fn start(bins: Bins, role: Role) -> Server {
     std::fs::write(dir.join("server-cert.pem"), server_cert.pem()).unwrap();
     std::fs::write(dir.join("server-key.pem"), server_key.serialize_pem()).unwrap();
 
-    let port = free_port();
+    let port = if bins.one_address {
+        free_port_with_second_address()
+    } else {
+        free_port()
+    };
     let socket = dir.join("mysqld.sock");
 
     // The server is started from a thread that never ends, with SIGKILL as
     // its parent-death signal: if this process dies without running its exit
     // handlers, the server goes too.
     let (tx, rx) = std::sync::mpsc::channel();
+    let gone = Arc::new(AtomicBool::new(false));
     let mut cmd = mysqld(&bins);
     cmd.arg(format!("--datadir={}", data.display()))
         .arg(format!("--port={port}"))
-        .arg("--bind-address=127.0.0.1,127.0.0.2")
+        .arg(if bins.one_address {
+            "--bind-address=127.0.0.1"
+        } else {
+            "--bind-address=127.0.0.1,127.0.0.2"
+        })
         .arg(format!("--socket={}", socket.display()))
         .arg(format!("--pid-file={}", dir.join("mysqld.pid").display()))
         .arg(format!("--log-error={}", dir.join("server.log").display()))
@@ -450,6 +528,7 @@ fn start(bins: Bins, role: Role) -> Server {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    let server_gone = gone.clone();
     std::thread::spawn(move || {
         // SAFETY: prctl is async-signal-safe and touches only this process.
         unsafe {
@@ -463,6 +542,7 @@ fn start(bins: Bins, role: Role) -> Server {
         // Blocks until the server is gone, keeping this thread (its parent)
         // alive until then.
         let _ = child.wait();
+        server_gone.store(true, Ordering::Release);
     });
     let pid = rx.recv().unwrap();
     STARTED
@@ -490,6 +570,12 @@ fn start(bins: Bins, role: Role) -> Server {
     };
     let started = Instant::now();
     while !server.socket.exists() || !server.try_sql("SELECT 1") {
+        if gone.load(Ordering::Acquire) {
+            panic!(
+                "The server stopped while it was starting. Its log:\n{}",
+                server.log()
+            );
+        }
         if started.elapsed() > Duration::from_secs(60) {
             // Say which side failed: the server, or the client that sets it
             // up (which cannot run when a shared library is missing, say).
