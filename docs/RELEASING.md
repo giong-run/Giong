@@ -156,3 +156,9 @@ Lessons from 0.2.0 and 0.2.1, now enforced by the tooling:
   `Cargo.toml`, `CHANGELOG.md` and `ROADMAP.md`; CI fails if the site does not build or
   has a broken link, and the release deploys it.
 - **Nothing names the crates by hand,** so a new crate cannot be left out of a release.
+- **The publish job runs only pinned code.** Every action in every workflow is pinned to a
+  full commit SHA (its version in a comment; Dependabot proposes updates once a month),
+  because any step of the `publish` job could ask for the OIDC token and publish. Its
+  checkouts keep no credentials, and it runs `cargo publish --no-verify`: the `verify` job
+  has already built every crate from its package without any secret, so no dependency's
+  build script or proc macro runs while the publish token exists.

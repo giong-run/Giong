@@ -31,9 +31,10 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       # Crate versions agree, README images use absolute URLs that resolve on
@@ -47,8 +48,10 @@ jobs:
   msrv:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.80.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.80.0
       # Libraries only: the tests generate certificates with rcgen, whose
       # dependencies need a newer compiler.
       - run: cargo check --workspace --all-features
@@ -62,8 +65,10 @@ jobs:
       # The kernel TLS tests fail instead of skipping without the module.
       GIONG_KTLS_REQUIRED: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - run: uname -r
       - name: Install redis-server
         # Ubuntu's Redis 7.0. The tests start their own server; the
@@ -90,9 +95,11 @@ jobs:
   h2spec:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: stable
           cache: false
@@ -126,8 +133,10 @@ jobs:
           - { server: redis 7.4, crate: giong-redis, redis: "7.4.1" }
           - { server: valkey 8.0, crate: giong-redis, valkey: "8.0.1" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: Install PostgreSQL ${{ matrix.postgres }}
         if: matrix.postgres
         # From the PostgreSQL project's apt repository; the cluster apt
@@ -201,8 +210,10 @@ jobs:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: Install redis-server
         # Ubuntu's Redis 7.0. The tests start their own server; the
         # service apt starts is stopped.
@@ -222,8 +233,10 @@ jobs:
   docker:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: Build the test binaries
         run: |
           mkdir -p target
@@ -256,9 +269,10 @@ jobs:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: nightly
           components: rust-src
       # ThreadSanitizer cannot map its shadow memory with the runner's default
       # address-space randomisation.
@@ -282,8 +296,10 @@ jobs:
   loom:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - run: scripts/check.sh loom
 
   # The whole suite on real 6.0 and 6.1 kernels, each booted in QEMU (KVM),
@@ -311,8 +327,10 @@ jobs:
           - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "registered-ring,zero-copy-send", ktls: "1" }
           - { kernel: "6.18.63", workarounds: "", features: "packed-buffers,registered-ring,zero-copy-send", ktls: "1", soak: "60" }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - name: Install QEMU and a static busybox
         run: |
           sudo apt-get update -q
@@ -323,7 +341,7 @@ jobs:
             sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/kernels/linux-${{ matrix.kernel }}
           key: kernel-${{ matrix.kernel }}${{ matrix.ktls && '-ktls' || '' }}
@@ -335,7 +353,7 @@ jobs:
           SOAK_SECS: ${{ matrix.soak || '' }}
       - name: Keep the guest's log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ matrix.kernel }}-log
           path: target/kernels/linux-${{ matrix.kernel }}.log
