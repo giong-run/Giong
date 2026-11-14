@@ -81,7 +81,7 @@ pub use config::{Config, Tls};
 pub use error::{Error, ErrorKind, ServerError};
 pub use pool::{Pool, PoolStats, PooledClient};
 pub use pubsub::{Message, PubSub};
-pub use value::{FromValue, ToArg, Value};
+pub use value::{ArgWriter, FromValue, ToArg, Value};
 
 /// The TLS connector type, re-exported so that [`Tls::Verify`] can be built
 /// without depending on `giong-tls` directly.

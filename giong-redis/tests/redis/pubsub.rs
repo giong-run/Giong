@@ -88,3 +88,54 @@ fn a_subscriber_whose_connection_closed_is_told() {
         assert_eq!(e.kind(), ErrorKind::Closed);
     });
 }
+
+#[test]
+fn a_late_confirmation_for_another_channel_is_not_taken_for_this_one() {
+    // A server that does not confirm SUBSCRIBE a until SUBSCRIBE b comes,
+    // and confirms b 300 ms later. Before confirmations were matched by
+    // channel, subscribe("b") returned at a's confirmation, before the
+    // server had subscribed b.
+    run(|_server| async move {
+        use std::io::{Read, Write};
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let script = std::thread::spawn(move || {
+            let (mut s, _) = fake.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            let mut wait_for = |s: &mut std::net::TcpStream, what: &[u8]| {
+                while !seen.windows(what.len()).any(|w| w == what) {
+                    let n = s.read(&mut buf).unwrap();
+                    assert!(n > 0, "closed early");
+                    seen.extend_from_slice(&buf[..n]);
+                }
+            };
+            wait_for(&mut s, b"HELLO");
+            s.write_all(b"%1\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n")
+                .unwrap();
+            wait_for(&mut s, b"$1\r\nb\r\n");
+            s.write_all(b">3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            s.write_all(b">3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n")
+                .unwrap();
+            let _ = s.read(&mut buf);
+        });
+        let config = giong_redis::Config::new().host("127.0.0.1").port(port);
+        let mut sub = PubSub::connect(&config).await.unwrap();
+        let cut = giong::time::timeout(Duration::from_millis(50), sub.subscribe("a")).await;
+        assert!(cut.is_err());
+        let start = std::time::Instant::now();
+        sub.subscribe("b").await.unwrap();
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250),
+            "returned after {waited:?}"
+        );
+        drop(sub);
+        while !script.is_finished() {
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        script.join().unwrap();
+    });
+}

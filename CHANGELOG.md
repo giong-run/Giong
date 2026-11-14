@@ -161,6 +161,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (no `DEFER_TASKRUN`), where one fast stream can fill the whole pool in a single turn,
   the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
+- **giong-redis** (breaking): `ToArg` writes through an `ArgWriter`:
+  `fn write_arg(&self, out: &mut ArgWriter<'_>)` replaces
+  `fn with_bytes(&self, f: &mut dyn FnMut(&[u8]))`. Everything an implementation writes,
+  in any number of pieces, is one argument (`out.write(b"session:")` then
+  `self.0.write_arg(out)` sends `session:42`), so an implementation can no longer break
+  the framing of a shared connection (see Fixed). `ArgWriter` implements
+  `std::fmt::Write` too. To migrate, call `out.write(bytes)` where the old implementation
+  called `f(bytes)`.
 
 ### Fixed
 
@@ -203,6 +211,31 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+- **giong-redis**: a `ToArg` that called its callback twice (a typed key written as a
+  prefix, then an id) or not at all made the command methods (`get`, `set`, `hget`...)
+  send one argument more or fewer than the count in front of them. Redis ran the extra
+  one as a command of its own, and from then on every task sharing the connection got the
+  reply of the command before its own (`GET` of one key returned another key's value)
+  until the connection failed. With the new `ToArg` this cannot happen. A `ToArg` that
+  panics no longer leaves half a command in the connection's buffer, where the next task's
+  command was appended to it.
+- **giong-redis**: `Pool::take` failed with `PoolTimeout` whenever the pool was full and
+  shared commands kept every connection busy: with 32 tasks sending `GET`s and `max_size`
+  1 or 2, after the whole wait, every time. Tasks waiting in `take` are now served in
+  order, and a connection is set aside for the first of them: shared commands go to the
+  others, and it is handed over once the commands already on it are answered (in
+  milliseconds in the same test). Shared commands keep at least one connection unless
+  `max_size` is 1.
+- **giong-redis**: a pool kept its connections to a server that had become a replica (the
+  old primary after a failover keeps them open and answers every write with `READONLY`)
+  until they dropped for some other reason. A connection whose server answers `READONLY`
+  is now left behind, and closes once the commands on it are answered, so the next
+  command opens a new one; `Error::is_transient` is true for `READONLY`.
+- **giong-redis**: `Pool::wait_timeout(Duration::MAX)` made every command panic (an
+  overflow adding it to the clock); it now waits as long as it takes.
+- **giong-redis**: `PubSub::subscribe`, `psubscribe`, `unsubscribe` and `punsubscribe` took
+  the first confirmation of their kind for their own, even one for another channel left
+  by a call that was cancelled; they now wait for the one for their channel.
 
 ## [0.4.0] - 2026-11-13
 

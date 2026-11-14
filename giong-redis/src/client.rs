@@ -68,6 +68,9 @@ struct Conn {
     /// How many slots at the front of the queue are known not to be
     /// waiting for their deadline any more: timed out, or without one.
     expired: Cell<usize>,
+    /// The server answered `READONLY`: it is a replica now, as the old
+    /// primary becomes after a failover. A pool replaces the connection.
+    readonly: Cell<bool>,
     config: Config,
     server: Server,
 }
@@ -204,6 +207,7 @@ impl Client {
             stream,
             head_since: Cell::new(None),
             expired: Cell::new(0),
+            readonly: Cell::new(false),
             config,
             server,
             state: RefCell::new(State {
@@ -414,6 +418,12 @@ impl Client {
         self.conn.state.borrow().queue.iter().any(|s| s.blocking)
     }
 
+    /// Whether the connection should be replaced rather than used again:
+    /// the server answered `READONLY` (it became a replica).
+    pub(crate) fn is_stale(&self) -> bool {
+        self.conn.readonly.get()
+    }
+
     /// When the oldest command in flight became the oldest, if there is one.
     pub(crate) fn head_since(&self) -> Option<Instant> {
         self.conn.head_since.get()
@@ -484,7 +494,17 @@ impl Conn {
                 e
             )));
         }
-        encode(&mut st.out);
+        // A panic while encoding (in a `ToArg`, which is user code) must
+        // not leave half a command in the buffer: the next task's command
+        // would be appended to it, and its reply go to the wrong command.
+        let start = st.out.len();
+        let mut unwind = Rewind {
+            out: &mut st.out,
+            start,
+        };
+        encode(unwind.out);
+        unwind.start = usize::MAX;
+        drop(unwind);
         let now = Instant::now();
         let discard = matches!(shape, Shape::Discard(_));
         // An absurd timeout that overflows the clock means none.
@@ -636,6 +656,11 @@ impl Conn {
                     Next::Ready(n) if inner.abandoned => buf.skip(n),
                     Next::Ready(n) => {
                         let v = buf.take(n)?;
+                        if let Value::Error(e) = &v {
+                            if e.code() == "READONLY" {
+                                self.readonly.set(true);
+                            }
+                        }
                         match slot.shape {
                             Shape::One => inner.one = Some(v),
                             shape => {
@@ -696,6 +721,19 @@ impl Conn {
     }
 }
 
+/// Cuts the output buffer back to `start` when dropped, unless `start` was
+/// set to `usize::MAX` because the command was written whole.
+struct Rewind<'a> {
+    out: &'a mut Vec<u8>,
+    start: usize,
+}
+
+impl Drop for Rewind<'_> {
+    fn drop(&mut self) {
+        self.out.truncate(self.start);
+    }
+}
+
 /// An error reply as an error, with a hint for those that need one.
 pub(crate) fn server_error(e: ServerError) -> Error {
     let hint = match e.code() {
@@ -703,7 +741,11 @@ pub(crate) fn server_error(e: ServerError) -> Error {
             "the key is served by another node of a Redis Cluster, which giong-redis does not \
              support yet; connect to a server that is not part of a cluster"
         }
-        "READONLY" => "the server is a replica; connect to the primary to write",
+        "READONLY" => {
+            "the server is a replica, as the old primary becomes after a failover; a Pool \
+             replaces the connection by itself (the next command opens a new one), a Client of \
+             your own has to connect again, to the primary"
+        }
         "NOSCRIPT" => "load the script with SCRIPT LOAD, or send it with EVAL",
         _ => "",
     };

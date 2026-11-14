@@ -194,3 +194,220 @@ fn a_pool_that_cannot_connect_says_why() {
         assert_eq!(pool.stats().connections, 0);
     });
 }
+
+#[test]
+fn take_gets_a_connection_while_shared_commands_keep_the_pool_full() {
+    // Before connections were set aside for waiting takers, take() waited
+    // for a moment with no shared command in flight, which never came
+    // under load: PoolTimeout after the whole wait with max_size 1 and 2,
+    // while about a million shared GETs ran.
+    run(|server| async move {
+        for max in [1usize, 2, 3] {
+            let pool = Pool::new(server.tcp(), max).wait_timeout(Duration::from_secs(10));
+            let k = key("busy");
+            pool.set(&k, "x").await.unwrap();
+            let stop = Rc::new(std::cell::Cell::new(false));
+            let done = Rc::new(std::cell::Cell::new(0u64));
+            let mut load = Vec::new();
+            for _ in 0..32 {
+                let (pool, stop, done, k) = (pool.clone(), stop.clone(), done.clone(), k.clone());
+                load.push(giong::spawn(async move {
+                    while !stop.get() {
+                        let v: String = pool.get(&k).await.unwrap();
+                        assert_eq!(v, "x");
+                        done.set(done.get() + 1);
+                    }
+                }));
+            }
+            giong::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(pool.stats().connections, max);
+            // Three takers at once, served in the order they came.
+            let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut takers = Vec::new();
+            for t in 0..3 {
+                let (pool, order) = (pool.clone(), order.clone());
+                takers.push(giong::spawn(async move {
+                    let start = std::time::Instant::now();
+                    let mut conn = pool.take().await.unwrap();
+                    let waited = start.elapsed();
+                    order.borrow_mut().push(t);
+                    let none: Option<Value> = conn
+                        .query_blocking(&cmd("BLPOP").arg(key("never")).arg(0.02))
+                        .await
+                        .unwrap();
+                    assert_eq!(none, None);
+                    waited
+                }));
+                // Each waits in take() before the next comes.
+                giong::time::sleep(Duration::from_millis(5)).await;
+            }
+            let before = done.get();
+            for t in takers {
+                let waited = t.await.unwrap();
+                assert!(
+                    waited < Duration::from_secs(5),
+                    "max_size {max}: {waited:?}"
+                );
+            }
+            assert_eq!(*order.borrow(), [0, 1, 2], "max_size {max}");
+            if max > 1 {
+                // Shared commands kept a connection meanwhile.
+                assert!(
+                    done.get() > before,
+                    "max_size {max}: shared commands stalled"
+                );
+            }
+            stop.set(true);
+            for t in load {
+                t.await.unwrap();
+            }
+            let stats = pool.stats();
+            assert_eq!(stats.taken, 0, "{stats:?}");
+            assert_eq!(stats.connections, max, "{stats:?}");
+            assert_eq!(stats.timeouts, 0, "{stats:?}");
+            // Nothing is left set aside: every connection carries shared
+            // commands again.
+            let mut ids = std::collections::HashSet::new();
+            for _ in 0..200 {
+                let tasks: Vec<_> = (0..8)
+                    .map(|_| {
+                        let pool = pool.clone();
+                        giong::spawn(async move {
+                            pool.query::<i64>(&cmd("CLIENT").arg("ID")).await.unwrap()
+                        })
+                    })
+                    .collect();
+                for t in tasks {
+                    ids.insert(t.await.unwrap());
+                }
+            }
+            assert_eq!(ids.len(), max, "max_size {max}");
+        }
+    });
+}
+
+#[test]
+fn a_taker_that_gives_up_leaves_no_connection_set_aside() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 1).wait_timeout(Duration::from_secs(5));
+        pool.ping().await.unwrap();
+        // A shared command holds the only connection while a task waits to
+        // take it, then the waiting task gives up.
+        let blocker = giong::spawn({
+            let pool = pool.clone();
+            async move {
+                let _: Value = pool
+                    .query(&cmd("DEBUG").arg("SLEEP").arg(0.3))
+                    .await
+                    .unwrap();
+            }
+        });
+        giong::time::sleep(Duration::from_millis(20)).await;
+        let gave_up = giong::time::timeout(Duration::from_millis(50), pool.take()).await;
+        assert!(gave_up.is_err());
+        // Shared commands are not held up behind a connection set aside for
+        // nobody.
+        let start = std::time::Instant::now();
+        pool.ping().await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        blocker.await.unwrap();
+        assert_eq!(pool.stats().waiting, 0);
+        assert_eq!(pool.stats().opened, 1);
+    });
+}
+
+#[test]
+fn a_wait_timeout_too_long_for_the_clock_means_no_limit() {
+    // `Instant::now() + Duration::MAX` panicked on every command.
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 1).wait_timeout(Duration::MAX);
+        pool.ping().await.unwrap();
+        let conn = pool.take().await.unwrap();
+        let waiter = giong::spawn({
+            let pool = pool.clone();
+            async move { pool.ping().await }
+        });
+        giong::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(pool.stats().waiting, 1);
+        drop(conn);
+        waiter.await.unwrap().unwrap();
+    });
+}
+
+#[test]
+fn a_connection_to_a_server_that_became_a_replica_is_replaced() {
+    // After a failover the old primary keeps its connections open and
+    // answers every write with READONLY; before, the pool kept using them
+    // until they dropped for some other reason.
+    run(|_server| async move {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        {
+            let (accepted, closed) = (accepted.clone(), closed.clone());
+            std::thread::spawn(move || {
+                for s in fake.incoming() {
+                    let mut s = s.unwrap();
+                    let n = accepted.fetch_add(1, Ordering::SeqCst);
+                    let closed = closed.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        let mut seen = Vec::new();
+                        let mut answered = 0;
+                        loop {
+                            let got = s.read(&mut buf).unwrap_or(0);
+                            if got == 0 {
+                                closed.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                            seen.extend_from_slice(&buf[..got]);
+                            // One command per `*`, as the client sends them.
+                            let cmds: Vec<&[u8]> = seen.split(|&b| b == b'*').skip(1).collect();
+                            for c in &cmds[answered..] {
+                                if !c.ends_with(b"\r\n") || c.split(|&b| b == b'\n').count() < 3 {
+                                    break;
+                                }
+                                let reply: &[u8] = if c.windows(5).any(|w| w == b"HELLO") {
+                                    b"%1\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n"
+                                } else if c.windows(3).any(|w| w == b"SET") && n == 0 {
+                                    b"-READONLY You can't write against a read only replica.\r\n"
+                                } else if c.windows(3).any(|w| w == b"SET") {
+                                    b"+OK\r\n"
+                                } else {
+                                    b"+PONG\r\n"
+                                };
+                                s.write_all(reply).unwrap();
+                                answered += 1;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        let pool = Pool::new(giong_redis::Config::new().host("127.0.0.1").port(port), 1);
+        pool.ping().await.unwrap();
+        let e = pool.set("k", "v").await.unwrap_err();
+        assert_eq!(e.server_code(), Some("READONLY"));
+        assert!(e.is_transient());
+        assert!(e.to_string().contains("failover"), "{e}");
+        // The next command goes to a new connection, which accepts writes.
+        pool.set("k", "v").await.unwrap();
+        assert_eq!(pool.stats().opened, 2);
+        assert_eq!(pool.stats().connections, 1);
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        // The old one is closed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while closed.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the old connection stayed open"
+            );
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+}
