@@ -172,9 +172,10 @@ impl PubSub {
         }
         self.broken = None;
         let timeout = self.config.response_timeout;
+        let channel = command.rest().next().unwrap_or_default().to_vec();
         let wait = async {
             loop {
-                if let Some(confirmed) = self.read_confirmation(kind)? {
+                if let Some(confirmed) = self.read_confirmation(kind, &channel)? {
                     return confirmed;
                 }
                 self.receive().await?;
@@ -200,12 +201,17 @@ impl PubSub {
         }
     }
 
-    /// Reads replies until the confirmation of `kind` (or an error reply);
-    /// messages on the way are kept for [`next_message`](Self::next_message).
-    fn read_confirmation(&mut self, kind: &str) -> Result<Option<Result<(), Error>>, Error> {
+    /// Reads replies until the confirmation of `kind` for `channel` (or an
+    /// error reply); messages on the way are kept for
+    /// [`next_message`](Self::next_message).
+    fn read_confirmation(
+        &mut self,
+        kind: &str,
+        channel: &[u8],
+    ) -> Result<Option<Result<(), Error>>, Error> {
         loop {
             let mut confirmed = None;
-            let message = self.read_one(Some((kind, &mut confirmed)))?;
+            let message = self.read_one(Some((kind, channel, &mut confirmed)))?;
             if let Some(m) = message {
                 self.pending.push_back(m);
                 continue;
@@ -215,13 +221,11 @@ impl PubSub {
     }
 
     /// Reads the next whole reply in the buffer: a message is returned; a
-    /// confirmation of `kind` or an error reply is put in `confirmed` (when
-    /// asked for); anything else is passed over. `None` when nothing whole
-    /// is left, or a confirmation was found.
-    fn read_one(
-        &mut self,
-        mut confirm: Option<(&str, &mut Option<Result<(), Error>>)>,
-    ) -> Result<Option<Message>, Error> {
+    /// confirmation of `kind` for the channel, or an error reply, is put in
+    /// `confirmed` (when asked for); anything else is passed over, such as
+    /// the late confirmation of a call that was cancelled. `None` when
+    /// nothing whole is left, or a confirmation was found.
+    fn read_one(&mut self, mut confirm: Option<Confirm<'_>>) -> Result<Option<Message>, Error> {
         loop {
             let value = match self.buf.next(self.config.max_reply_size) {
                 Err(e) => {
@@ -250,8 +254,9 @@ impl PubSub {
                         ("message", 3) => return Ok(Some(message(items, false))),
                         ("pmessage", 4) => return Ok(Some(message(items, true))),
                         (k, _) => {
-                            if let Some((want, slot)) = confirm.as_mut() {
-                                if k == *want {
+                            if let Some((want, channel, slot)) = confirm.as_mut() {
+                                let about = items.get(1).and_then(Value::as_bytes);
+                                if k == *want && about == Some(*channel) {
                                     **slot = Some(Ok(()));
                                     return Ok(None);
                                 }
@@ -260,7 +265,7 @@ impl PubSub {
                     }
                 }
                 Value::Error(e) => {
-                    if let Some((_, slot)) = confirm.as_mut() {
+                    if let Some((_, _, slot)) = confirm.as_mut() {
                         **slot = Some(Err(crate::client::server_error(e)));
                         return Ok(None);
                     }
@@ -293,6 +298,10 @@ impl PubSub {
         Err(err)
     }
 }
+
+/// What a subscription call waits for: the confirmation's kind and
+/// channel, and where to put it (or the error that came instead).
+type Confirm<'a> = (&'a str, &'a [u8], &'a mut Option<Result<(), Error>>);
 
 fn bytes(v: Value) -> Vec<u8> {
     match v {

@@ -2,7 +2,7 @@
 //! built.
 
 use crate::error::Error;
-use crate::value::ToArg;
+use crate::value::{write_bulk, ToArg};
 
 /// A command and its arguments, ready to send.
 ///
@@ -76,6 +76,11 @@ fn bulk(out: &mut Vec<u8>, b: &[u8]) {
 
 /// Writes a command the crate builds itself (the command methods), straight
 /// into the connection's buffer, with nothing allocated on the way.
+///
+/// Each argument is written as exactly one bulk string whatever its
+/// `ToArg` does ([`write_bulk`]), so the count written first is right. A
+/// panic in a `ToArg` leaves half a command behind: the caller undoes it
+/// (`Conn::enqueue`).
 pub(crate) fn encode_raw(out: &mut Vec<u8>, name: &str, args: &[&dyn ToArg]) {
     out.push(b'*');
     let mut digits = [0u8; 20];
@@ -86,7 +91,7 @@ pub(crate) fn encode_raw(out: &mut Vec<u8>, name: &str, args: &[&dyn ToArg]) {
     out.extend_from_slice(b"\r\n");
     bulk(out, name.as_bytes());
     for a in args {
-        a.with_bytes(&mut |b| bulk(out, b));
+        write_bulk(out, a);
     }
 }
 
@@ -109,7 +114,8 @@ impl Cmd {
 
     /// Adds an argument.
     pub fn arg(mut self, arg: impl ToArg) -> Self {
-        arg.with_bytes(&mut |b| self.push(b));
+        write_bulk(&mut self.body, &arg);
+        self.count += 1;
         self
     }
 
@@ -120,7 +126,8 @@ impl Cmd {
         I::Item: ToArg,
     {
         for a in args {
-            a.with_bytes(&mut |b| self.push(b));
+            write_bulk(&mut self.body, &a);
+            self.count += 1;
         }
         self
     }
@@ -145,7 +152,7 @@ impl Cmd {
     }
 
     /// The arguments after the name.
-    fn rest(&self) -> impl Iterator<Item = &[u8]> {
+    pub(crate) fn rest(&self) -> impl Iterator<Item = &[u8]> {
         let mut pos = 0;
         let body = &self.body;
         std::iter::from_fn(move || {
@@ -361,6 +368,59 @@ mod tests {
         assert_eq!(cmd("get").name(), "GET");
         let long = "x".repeat(1000);
         assert!(wire(&cmd("SET").arg("k").arg(&long)).contains("$1000\r\n"));
+    }
+
+    /// A key written in pieces, as a typed key would be.
+    struct Pieces(&'static [&'static str]);
+
+    impl ToArg for Pieces {
+        fn write_arg(&self, out: &mut crate::ArgWriter<'_>) {
+            for p in self.0 {
+                out.write(p.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn an_argument_written_in_pieces_or_not_at_all_is_one_argument() {
+        // Before ToArg wrote through an ArgWriter, a second piece became a
+        // second bulk string after an array count that did not include it,
+        // and the server's extra reply went to the next task's command.
+        assert_eq!(
+            wire(&cmd("GET").arg(Pieces(&["session:", "42"]))),
+            "*2\r\n$3\r\nGET\r\n$10\r\nsession:42\r\n"
+        );
+        assert_eq!(
+            wire(&cmd("SET").arg(Pieces(&[])).arg("v")),
+            "*3\r\n$3\r\nSET\r\n$0\r\n\r\n$1\r\nv\r\n"
+        );
+        // The length grows from one digit to three: the bytes move along.
+        let long = "y".repeat(120);
+        let long: &'static str = Box::leak(long.into_boxed_str());
+        let pieces: &'static [&'static str] = Box::leak(Box::new(["x", "", long]));
+        assert_eq!(
+            wire(&cmd("GET").arg(Pieces(pieces))),
+            format!("*2\r\n$3\r\nGET\r\n$121\r\nx{long}\r\n")
+        );
+        let mut out = b"*9\r\n".to_vec();
+        encode_raw(&mut out, "HSET", &[&Pieces(&["a", "b"]), &"", &7u8]);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "*9\r\n*4\r\n$4\r\nHSET\r\n$2\r\nab\r\n$0\r\n\r\n$1\r\n7\r\n"
+        );
+        // Formatting works too, in as many pieces as it takes.
+        struct User(u32);
+        impl ToArg for User {
+            fn write_arg(&self, out: &mut crate::ArgWriter<'_>) {
+                use std::fmt::Write;
+                let field = "name";
+                write!(out, "user:{}:{field}", self.0).unwrap();
+            }
+        }
+        assert_eq!(
+            wire(&cmd("GET").arg(User(7))),
+            "*2\r\n$3\r\nGET\r\n$11\r\nuser:7:name\r\n"
+        );
     }
 
     #[test]
