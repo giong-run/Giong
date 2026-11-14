@@ -760,3 +760,128 @@ fn a_connection_the_server_closed_fails_its_commands() {
         assert!(e.is_transient());
     });
 }
+
+#[test]
+fn a_dropped_client_closes_even_if_the_server_keeps_its_side_open() {
+    // A peer that answers the handshake and PING, and keeps its socket open
+    // after reading the client's half-close, as some proxies do. Before,
+    // the read task and the socket stayed until the peer closed.
+    run(|_server| async move {
+        use std::io::{Read, Write};
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        let (looked_tx, looked_rx) = std::sync::mpsc::channel::<()>();
+        let script = std::thread::spawn(move || {
+            let (mut s, _) = fake.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(4).any(|w| w == b"PING") {
+                let n = s.read(&mut buf).unwrap();
+                assert!(n > 0);
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(5).any(|w| w == b"HELLO") && !seen.starts_with(b"done") {
+                    s.write_all(b"%1\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n")
+                        .unwrap();
+                    seen.splice(0..0, *b"done");
+                }
+            }
+            s.write_all(b"+PONG\r\n").unwrap();
+            while s.read(&mut buf).unwrap_or(0) > 0 {}
+            eof_tx.send(()).unwrap();
+            // Holds the socket open after the client's FIN until the test
+            // has looked.
+            let _ = looked_rx.recv_timeout(Duration::from_secs(30));
+            drop(s);
+        });
+        let tasks = giong::stats().tasks;
+        let c = Client::connect(&giong_redis::Config::new().host("127.0.0.1").port(port))
+            .await
+            .unwrap();
+        c.ping().await.unwrap();
+        assert_eq!(giong::stats().tasks, tasks + 2);
+        drop(c);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while giong::stats().tasks > tasks {
+            assert!(
+                Instant::now() < deadline,
+                "the connection's tasks are still running"
+            );
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The peer saw the half-close, and still holds its side open.
+        eof_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        looked_tx.send(()).unwrap();
+        while !script.is_finished() {
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        script.join().unwrap();
+    });
+}
+
+#[test]
+fn commands_wait_rather_than_pile_up_when_the_server_stops_reading() {
+    // A server that answers the handshake, then reads nothing. Before, every
+    // command was added to the connection's buffer however large it grew,
+    // and sent, and run, whenever the server caught up, long after its
+    // caller had timed out.
+    run(|_server| async move {
+        use std::io::{Read, Write};
+        let fake = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let script = std::thread::spawn(move || {
+            let (mut s, _) = fake.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let mut seen = Vec::new();
+            while !seen.windows(5).any(|w| w == b"HELLO") {
+                let n = s.read(&mut buf).unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+            s.write_all(b"%1\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n")
+                .unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(60));
+        });
+        let config = giong_redis::Config::new()
+            .host("127.0.0.1")
+            .port(port)
+            .response_timeout(Duration::from_millis(500));
+        let c = Rc::new(Client::connect(&config).await.unwrap());
+        let value = Rc::new(vec![b'v'; 1 << 20]);
+        let mut tasks = Vec::new();
+        for i in 0..100 {
+            let (c, value) = (c.clone(), value.clone());
+            tasks.push(giong::spawn(async move {
+                c.set(format!("k{i}"), &*value).await.unwrap_err()
+            }));
+        }
+        let mut not_sent = 0;
+        let mut most = 0;
+        while tasks.iter().any(|t| !t.is_finished()) {
+            most = most.max(c.in_flight());
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        for t in tasks {
+            let e = t.await.unwrap();
+            assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+            assert!(e.is_transient());
+            if e.to_string().contains("It was not sent") {
+                not_sent += 1;
+            }
+        }
+        println!("{not_sent} refused, at most {most} queued");
+        // 100 MiB of commands; at most 16 MiB wait in the buffer, besides
+        // what the kernel took and one batch being written.
+        assert!(
+            not_sent >= 20,
+            "{not_sent} were refused, {most} were queued at most"
+        );
+        assert!(most <= 80, "{most} were queued");
+        drop(c);
+        done_tx.send(()).unwrap();
+        while !script.is_finished() {
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        script.join().unwrap();
+    });
+}

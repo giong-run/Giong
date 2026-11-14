@@ -19,6 +19,12 @@ use crate::error::{Error, ErrorKind, ServerError};
 use crate::resp::{Next, ReadBuf};
 use crate::value::{FromValue, ToArg, Value};
 
+/// Bytes of commands waiting to be written past which a new command waits
+/// for the write loop to catch up, as when the server stops reading (a long
+/// script): the buffer does not grow without bound, and a command that
+/// cannot be queued within the response timeout fails without being sent.
+const MAX_UNWRITTEN: usize = 16 << 20;
+
 /// A connection to a Redis server.
 ///
 /// ```no_run
@@ -88,6 +94,8 @@ struct State {
     /// The read loop, parked with no deadline to watch: woken when a command
     /// with one is queued.
     reader: Option<Waker>,
+    /// Tasks waiting for `out` to fall below [`MAX_UNWRITTEN`].
+    room: Vec<Waker>,
 }
 
 /// What a slot waits for.
@@ -217,6 +225,7 @@ impl Client {
                 broken: None,
                 closing: false,
                 reader: None,
+                room: Vec::new(),
             }),
         });
         giong::spawn(read_loop(conn.clone(), buf));
@@ -464,6 +473,9 @@ impl Conn {
         timed: bool,
         encode: impl FnOnce(&mut Vec<u8>),
     ) -> Result<Value, Error> {
+        if self.state.borrow().out.len() >= MAX_UNWRITTEN {
+            self.wait_for_room(what).await?;
+        }
         let slot = self.enqueue(shape, !timed, encode)?;
         match (Wait { slot }).await {
             Some(outcome) => outcome,
@@ -478,6 +490,35 @@ impl Conn {
                 ),
             )),
         }
+    }
+
+    /// Waits, within the response timeout, until the commands waiting to be
+    /// written fall below [`MAX_UNWRITTEN`] or the connection breaks.
+    async fn wait_for_room(&self, what: &str) -> Result<(), Error> {
+        let room = poll_fn(|cx| {
+            let mut st = self.state.borrow_mut();
+            if st.out.len() < MAX_UNWRITTEN || st.broken.is_some() {
+                return Poll::Ready(());
+            }
+            st.room.push(cx.waker().clone());
+            Poll::Pending
+        });
+        giong::time::timeout(self.config.response_timeout, room)
+            .await
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::Timeout,
+                    format!(
+                        "{what} could not be sent to {} within the response timeout of {:?}: {} \
+                         MiB of commands are waiting to be written, so the server is not reading \
+                         them (a long script, or it is stuck). It was not sent, so trying again is \
+                         safe; SLOWLOG GET and CLIENT LIST show what the server is doing",
+                        self.config.target(),
+                        self.config.response_timeout,
+                        MAX_UNWRITTEN >> 20
+                    ),
+                )
+            })
     }
 
     fn enqueue(
@@ -546,6 +587,9 @@ impl Conn {
             }
             st.broken = Some(err.clone());
             if let Some(w) = st.writer.take() {
+                w.wake();
+            }
+            for w in st.room.drain(..) {
                 w.wake();
             }
             std::mem::take(&mut st.queue)
@@ -703,6 +747,13 @@ impl Conn {
             self.expired.set(self.expired.get().saturating_sub(1));
             self.head_since
                 .set((!st.queue.is_empty()).then(|| *now.get_or_insert_with(Instant::now)));
+            if st.closing && st.queue.is_empty() {
+                // The client is gone and the last reply came: the write
+                // loop closes the connection.
+                if let Some(w) = st.writer.take() {
+                    w.wake();
+                }
+            }
         }
         let mut inner = slot.inner.borrow_mut();
         if inner.abandoned {
@@ -841,6 +892,9 @@ async fn write_loop(conn: Rc<Conn>) {
                 return Poll::Ready(None);
             }
             if !st.out.is_empty() {
+                for w in st.room.drain(..) {
+                    w.wake();
+                }
                 return Poll::Ready(Some(std::mem::replace(
                     &mut st.out,
                     std::mem::take(&mut spare),
@@ -868,6 +922,22 @@ async fn write_loop(conn: Rc<Conn>) {
     }
     if conn.state.borrow().closing {
         conn.stream.shutdown(Shutdown::Write);
+        // The client was dropped, so nobody waits for a reply, but the
+        // commands already sent still run (those whose callers gave up
+        // too): wait for their replies, or for the server to close, then
+        // close, within the response timeout. Waiting for the server alone
+        // left the read task and the socket open for as long as a peer
+        // kept its side open after the client's half-close.
+        let drained = poll_fn(|cx| {
+            let mut st = conn.state.borrow_mut();
+            if st.broken.is_some() || st.queue.is_empty() {
+                return Poll::Ready(());
+            }
+            st.writer = Some(cx.waker().clone());
+            Poll::Pending
+        });
+        let _ = giong::time::timeout(conn.config.response_timeout, drained).await;
+        conn.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -928,4 +998,286 @@ impl std::fmt::Debug for Watch<'_> {
             .field("client", &self.client)
             .finish()
     }
+}
+
+/// Drives a connection's reply matching with no socket, from a script read
+/// out of `data`: commands of every shape are queued, their waiters dropped
+/// or their deadlines passed at random points, and the replies a server
+/// would send arrive cut anywhere, with push messages, attributes and
+/// replies over the size limit among them. Every command must get its own
+/// replies, each tagged with the command's number, or the error that is
+/// due; and the connection must end with nothing in flight.
+///
+/// The `connection` fuzz target and a randomised test run it.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn check_matching(data: &[u8]) {
+    use std::time::Duration;
+
+    use crate::fuzzing::cost;
+
+    struct Script<'a>(&'a [u8], usize);
+
+    impl Script<'_> {
+        fn byte(&mut self) -> u8 {
+            let b = self.0.get(self.1).copied().unwrap_or(0);
+            self.1 += 1;
+            b
+        }
+
+        fn below(&mut self, n: u8) -> u8 {
+            self.byte() % n
+        }
+
+        fn done(&self) -> bool {
+            self.1 >= self.0.len()
+        }
+    }
+
+    /// What one reply is expected to become.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Expect {
+        Int(i64),
+        Error(i64),
+        TooLarge,
+    }
+
+    /// Writes push messages and an attribute (maybe too large) in front of
+    /// `body`, then `body`; returns whether the reply is over the limit.
+    fn reply(s: &mut Script, out: &mut Vec<u8>, limit: usize, body: &[u8]) -> bool {
+        for n in 0..s.below(4) {
+            let mut push = Vec::new();
+            if s.below(3) == 0 {
+                attribute(s, &mut push, limit);
+            }
+            let size = if s.below(3) == 0 { limit } else { 3 };
+            push.extend_from_slice(
+                format!(">2\r\n+invalidate\r\n${size}\r\n{}\r\n", "k".repeat(size)).as_bytes(),
+            );
+            let _ = n;
+            out.extend_from_slice(&push);
+        }
+        let start = out.len();
+        if s.below(4) == 0 {
+            attribute(s, out, limit);
+        }
+        out.extend_from_slice(body);
+        cost(&out[start..]) > limit
+    }
+
+    fn attribute(s: &mut Script, out: &mut Vec<u8>, limit: usize) {
+        let size = if s.below(2) == 0 { limit } else { 2 };
+        out.extend_from_slice(
+            format!("|1\r\n+ttl\r\n${size}\r\n{}\r\n", "a".repeat(size)).as_bytes(),
+        );
+    }
+
+    struct Sent {
+        shape: Shape,
+        slot: Rc<Slot>,
+        wait: Option<Wait>,
+        expect: Vec<Expect>,
+        timed: bool,
+        timed_out: bool,
+    }
+
+    let mut s = Script(data, 0);
+    let limit = 100 + usize::from(s.byte()) * 8;
+    let config = Config::new()
+        .max_reply_size(limit)
+        .response_timeout(Duration::from_secs(1));
+    let conn = Conn {
+        stream: Stream::Detached,
+        head_since: Cell::new(None),
+        expired: Cell::new(0),
+        readonly: Cell::new(false),
+        config,
+        server: Server::default(),
+        state: RefCell::new(State {
+            out: Vec::new(),
+            writer: None,
+            queue: VecDeque::new(),
+            broken: None,
+            closing: false,
+            reader: None,
+            room: Vec::new(),
+        }),
+    };
+    let mut buf = ReadBuf::new();
+    let mut stream = Vec::new();
+    let mut fed = 0;
+    let mut sent: Vec<Sent> = Vec::new();
+    let in_flight = |conn: &Conn, slot: &Rc<Slot>| {
+        conn.state
+            .borrow()
+            .queue
+            .iter()
+            .any(|q| Rc::ptr_eq(q, slot))
+    };
+    while !s.done() && sent.len() < 64 {
+        match s.below(8) {
+            0..=2 => {
+                let n = usize::from(s.below(4));
+                let (shape, blocking) = match s.below(6) {
+                    0 => (Shape::Pipeline(n + 1), false),
+                    1 => (Shape::Atomic(n), false),
+                    2 => (Shape::Discard(n + 1), false),
+                    3 => (Shape::One, true),
+                    _ => (Shape::One, false),
+                };
+                let i = sent.len() as i64;
+                let mut expect = Vec::new();
+                let tag = |j: usize| i * 100 + j as i64;
+                match shape {
+                    Shape::Atomic(n) => {
+                        let over = reply(&mut s, &mut stream, limit, b"+OK\r\n");
+                        expect.push(if over {
+                            Expect::TooLarge
+                        } else {
+                            Expect::Int(-1)
+                        });
+                        for _ in 0..n {
+                            let over = reply(&mut s, &mut stream, limit, b"+QUEUED\r\n");
+                            expect.push(if over {
+                                Expect::TooLarge
+                            } else {
+                                Expect::Int(-1)
+                            });
+                        }
+                        let mut exec = format!("*{n}\r\n").into_bytes();
+                        for j in 0..n {
+                            exec.extend_from_slice(format!(":{}\r\n", tag(j)).as_bytes());
+                        }
+                        let over = reply(&mut s, &mut stream, limit, &exec);
+                        expect.push(if over {
+                            Expect::TooLarge
+                        } else {
+                            Expect::Int(-1)
+                        });
+                    }
+                    _ => {
+                        for j in 0..shape.replies() {
+                            let t = tag(j);
+                            let (body, e) = match s.below(5) {
+                                0 => (format!("-ERR t{t}\r\n"), Expect::Error(t)),
+                                1 => (
+                                    format!("${limit}\r\n{}\r\n", "v".repeat(limit)),
+                                    Expect::TooLarge,
+                                ),
+                                _ => (format!(":{t}\r\n"), Expect::Int(t)),
+                            };
+                            let over = reply(&mut s, &mut stream, limit, body.as_bytes());
+                            expect.push(if over { Expect::TooLarge } else { e });
+                        }
+                    }
+                }
+                let slot = conn
+                    .enqueue(shape, blocking, |out| {
+                        out.extend_from_slice(b"*1\r\n$4\r\nPING\r\n")
+                    })
+                    .expect("open");
+                let discard = matches!(shape, Shape::Discard(_));
+                sent.push(Sent {
+                    shape,
+                    wait: (!discard).then(|| Wait { slot: slot.clone() }),
+                    slot,
+                    expect,
+                    timed: !blocking && !discard,
+                    timed_out: false,
+                });
+            }
+            3 => {
+                if !sent.is_empty() {
+                    let i = usize::from(s.byte()) % sent.len();
+                    sent[i].wait = None;
+                }
+            }
+            4 => {
+                // Every deadline so far passes; none of those to come.
+                conn.expire(Instant::now() + Duration::from_secs(5));
+                for c in &mut sent {
+                    if c.timed && c.wait.is_some() && in_flight(&conn, &c.slot) {
+                        c.timed_out = true;
+                    }
+                }
+            }
+            _ => {
+                let n = (usize::from(s.byte()) * 7 + 1).min(stream.len() - fed);
+                buf.extend(&stream[fed..fed + n]);
+                fed += n;
+                conn.process(&mut buf).expect("well-formed replies");
+            }
+        }
+    }
+    buf.extend(&stream[fed..]);
+    conn.process(&mut buf).expect("well-formed replies");
+    assert!(conn.state.borrow().queue.is_empty(), "replies went missing");
+    assert!(buf.is_empty(), "replies were left over");
+    assert_eq!(conn.head_since.get(), None);
+
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for (i, c) in sent.iter_mut().enumerate() {
+        let Some(wait) = c.wait.as_mut() else {
+            continue;
+        };
+        let got = match Pin::new(wait).poll(&mut cx) {
+            Poll::Ready(got) => got,
+            Poll::Pending => panic!("command {i} got no outcome"),
+        };
+        let Some(got) = got else {
+            assert!(c.timed_out, "command {i} timed out, but no deadline passed");
+            continue;
+        };
+        assert!(!c.timed_out, "command {i} got {got:?} after its deadline");
+        if c.expect.contains(&Expect::TooLarge) {
+            let e = got.expect_err("too large");
+            assert_eq!(e.kind(), ErrorKind::TooLarge, "command {i}: {e}");
+            continue;
+        }
+        match c.shape {
+            Shape::One => match (c.expect[0], got) {
+                (Expect::Int(t), Ok(v)) => assert_eq!(v, Value::Int(t), "command {i}"),
+                (Expect::Error(t), Err(e)) => {
+                    assert_eq!(e.kind(), ErrorKind::Server);
+                    assert!(e.to_string().contains(&format!("t{t}")), "command {i}: {e}");
+                }
+                (want, got) => panic!("command {i}: {got:?}, not {want:?}"),
+            },
+            Shape::Pipeline(_) => {
+                let Ok(Value::Array(items)) = got else {
+                    panic!("command {i}: {got:?}")
+                };
+                assert_eq!(items.len(), c.expect.len(), "command {i}");
+                for (item, want) in items.iter().zip(&c.expect) {
+                    match (want, item) {
+                        (Expect::Int(t), Value::Int(v)) => assert_eq!(t, v, "command {i}"),
+                        (Expect::Error(t), Value::Error(e)) => {
+                            assert_eq!(e.to_string(), format!("ERR t{t}"), "command {i}")
+                        }
+                        (want, item) => panic!("command {i}: {item:?}, not {want:?}"),
+                    }
+                }
+            }
+            Shape::Atomic(n) => {
+                let Ok(Value::Array(items)) = got else {
+                    panic!("command {i}: {got:?}")
+                };
+                let want: Vec<Value> = (0..n)
+                    .map(|j| Value::Int(i as i64 * 100 + j as i64))
+                    .collect();
+                assert_eq!(items, want, "command {i}");
+            }
+            Shape::Discard(_) => unreachable!("nobody waits"),
+        }
+    }
+}
+
+/// A waker that does nothing, for polling a future once.
+#[cfg(any(test, fuzzing))]
+fn noop_waker() -> Waker {
+    struct Noop;
+    impl std::task::Wake for Noop {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+    Waker::from(std::sync::Arc::new(Noop))
 }
