@@ -1,16 +1,30 @@
 name: Fuzz
 
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
-# bytes from the network: giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and
-# client, giong-web's router and request handling, and the PostgreSQL, MySQL
-# and Redis protocol readers. Every night each target runs for 10 minutes
-# and its corpus is kept in the Actions cache, so the corpus keeps growing; pull
-# requests that touch these crates get a short run of each target. A crash fails
-# the job and uploads the input that caused it.
+# bytes from the network: giong's DNS answers (and resolv.conf and hosts),
+# giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and client, giong-web's
+# router and request handling, and the PostgreSQL, MySQL and Redis protocol
+# readers. Every night each target runs for 10 minutes and its corpus is kept in
+# the Actions cache, so the corpus keeps growing. A pull request gets a
+# one-minute run of the targets of the crates it changes (one target of each
+# crate when it changes this file), and a push to main a one-minute run of every
+# target, which catches a change in one crate that breaks another's target. A
+# crash fails the job and uploads the input that caused it.
 
 on:
   schedule:
     - cron: "17 3 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "giong-http/**"
+      - "giong-postgres/**"
+      - "giong-mysql/**"
+      - "giong-redis/**"
+      - "giong-web/**"
+      - "src/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
   pull_request:
     paths:
       - "giong-http/**"
@@ -19,6 +33,7 @@ on:
       - "giong-redis/**"
       - "giong-web/**"
       - "src/**"
+      - "fuzz/**"
       - ".github/workflows/fuzz.yml"
   workflow_dispatch:
     inputs:
@@ -34,33 +49,79 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which targets to run: all of them, except on a pull request.
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      # A pull request is checked out as its merge commit, whose first parent
+      # is the base branch: the diff between the two is what the PR changes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 2
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+        # Every target. `dir` is where the crate's fuzz/ directory is, when
+        # not in `crate/`. `flags` adds libFuzzer options: DNS answers over
+        # TCP reach 64 KiB, and one must never take long to parse (it would
+        # freeze a worker).
+        run: |
+          all=$(jq -c -s . <<'EOF'
+          { "crate": "giong", "dir": ".", "target": "dns_response", "flags": "-max_len=65538 -timeout=2" }
+          { "crate": "giong", "dir": ".", "target": "resolv_conf" }
+          { "crate": "giong-http", "target": "head" }
+          { "crate": "giong-http", "target": "chunked" }
+          { "crate": "giong-http", "target": "connection" }
+          { "crate": "giong-http", "target": "response_head" }
+          { "crate": "giong-http", "target": "url" }
+          { "crate": "giong-http", "target": "inflate" }
+          { "crate": "giong-http", "target": "hpack" }
+          { "crate": "giong-http", "target": "h2" }
+          { "crate": "giong-http", "target": "h2_client" }
+          { "crate": "giong-postgres", "target": "messages" }
+          { "crate": "giong-postgres", "target": "scram" }
+          { "crate": "giong-postgres", "target": "url" }
+          { "crate": "giong-postgres", "target": "session" }
+          { "crate": "giong-mysql", "target": "payload" }
+          { "crate": "giong-mysql", "target": "framing" }
+          { "crate": "giong-mysql", "target": "rows" }
+          { "crate": "giong-mysql", "target": "url" }
+          { "crate": "giong-redis", "target": "connection" }
+          { "crate": "giong-redis", "target": "replies" }
+          { "crate": "giong-redis", "target": "url" }
+          { "crate": "giong-web", "target": "routes" }
+          { "crate": "giong-web", "target": "request" }
+          EOF
+          )
+          if [ "$EVENT" = pull_request ]; then
+            changed=$(git diff --name-only HEAD^1 HEAD)
+            if grep -qx '.github/workflows/fuzz.yml' <<<"$changed"; then
+              # A change to this file: one target of each crate, enough to
+              # see that every crate's fuzz job still runs.
+              all=$(jq -c 'group_by(.crate) | map(.[0])' <<<"$all")
+              crates=$(jq -c '[.[].crate]' <<<"$all")
+            else
+              # The crate of each changed file: its top directory, or the
+              # core crate for src/ and fuzz/.
+              crates=$(sed -n -e 's#^\(src\|fuzz\)/.*#giong#p' -e 's#^\(giong-[a-z0-9-]*\)/.*#\1#p' <<<"$changed" \
+                | sort -u | jq -R . | jq -c -s .)
+            fi
+            all=$(jq -c --argjson crates "$crates" '[.[] | select(.crate as $c | $crates | index($c))]' <<<"$all")
+          fi
+          echo "Targets: $(jq -r 'map(.crate + " " + .target) | join(", ")' <<<"$all")"
+          echo "matrix={\"include\":$all}" >> "$GITHUB_OUTPUT"
+          echo "any=$(jq 'length > 0' <<<"$all")" >> "$GITHUB_OUTPUT"
+
   fuzz:
+    needs: plan
+    if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { crate: giong-http, target: head }
-          - { crate: giong-http, target: chunked }
-          - { crate: giong-http, target: connection }
-          - { crate: giong-http, target: response_head }
-          - { crate: giong-http, target: url }
-          - { crate: giong-http, target: inflate }
-          - { crate: giong-http, target: hpack }
-          - { crate: giong-http, target: h2 }
-          - { crate: giong-http, target: h2_client }
-          - { crate: giong-postgres, target: messages }
-          - { crate: giong-postgres, target: scram }
-          - { crate: giong-postgres, target: url }
-          - { crate: giong-postgres, target: session }
-          - { crate: giong-mysql, target: payload }
-          - { crate: giong-mysql, target: framing }
-          - { crate: giong-mysql, target: rows }
-          - { crate: giong-mysql, target: url }
-          - { crate: giong-redis, target: replies }
-          - { crate: giong-redis, target: url }
-          - { crate: giong-web, target: routes }
-          - { crate: giong-web, target: request }
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -76,31 +137,32 @@ jobs:
       - name: Restore the corpus
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          path: ${{ matrix.dir || matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-
       - name: Fuzz
-        working-directory: ${{ matrix.crate }}
+        working-directory: ${{ matrix.dir || matrix.crate }}
         env:
-          SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
+          SECONDS_PER_TARGET: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && '60' || inputs.seconds || '600' }}
         run: |
           mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
-            -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1
+            -max_total_time="$SECONDS_PER_TARGET" -timeout=10 -rss_limit_mb=4096 -print_final_stats=1 ${{ matrix.flags }}
+      # Only the long runs keep their corpus.
       - name: Shrink the corpus
-        if: success() && github.event_name != 'pull_request'
-        working-directory: ${{ matrix.crate }}
+        if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        working-directory: ${{ matrix.dir || matrix.crate }}
         run: |
           cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
       - name: Save the corpus
-        if: success() && github.event_name != 'pull_request'
+        if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ matrix.crate }}/fuzz/corpus/${{ matrix.target }}
+          path: ${{ matrix.dir || matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
       - name: Upload the crashing input
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-artifacts-${{ matrix.crate }}-${{ matrix.target }}
-          path: ${{ matrix.crate }}/fuzz/artifacts/${{ matrix.target }}
+          path: ${{ matrix.dir || matrix.crate }}/fuzz/artifacts/${{ matrix.target }}

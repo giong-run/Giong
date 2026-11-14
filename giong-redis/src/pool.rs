@@ -1,6 +1,7 @@
 //! A pool of connections for one worker thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::future::poll_fn;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
@@ -58,11 +59,17 @@ const STALLED: Duration = Duration::from_millis(5);
 /// ([`Client::watch`]). While it is out, no shared command runs on it. It
 /// comes back when the [`PooledClient`] is dropped, unless a blocking
 /// command was cancelled and is still in flight, in which case it is
-/// closed.
+/// closed. When the pool is full, tasks waiting in `take` are served in
+/// order: a connection is set aside for the first of them, shared commands
+/// go elsewhere, and it is handed over as soon as the shared commands
+/// already on it are answered. Shared commands keep at least one
+/// connection unless `max_size` is 1.
 ///
 /// Connections the server closed, or that broke, are left behind as soon
 /// as that is noticed, which is when it happens: each connection is read
-/// continuously.
+/// continuously. So is a connection whose server answers `READONLY`: it
+/// became a replica, as the old primary does after a failover, and a new
+/// connection (with the name resolved again) reaches the new primary.
 #[derive(Clone)]
 pub struct Pool {
     inner: Rc<Inner>,
@@ -114,10 +121,10 @@ impl giong::observe::Source for Observed {
 
 fn stats_of(st: &State) -> PoolStats {
     PoolStats {
-        connections: st.shared.len() + st.taken,
+        connections: st.shared.len() + st.draining.len() + st.taken,
         taken: st.taken,
         connecting: st.connecting,
-        in_flight: st.shared.iter().map(|c| c.in_flight()).sum(),
+        in_flight: st.untaken().map(|c| c.in_flight()).sum(),
         waiting: st.waiting,
         opened: st.opened,
         connect_errors: st.connect_errors,
@@ -127,8 +134,16 @@ fn stats_of(st: &State) -> PoolStats {
 
 #[derive(Default)]
 struct State {
-    /// Open connections that are not taken.
+    /// Open connections that are not taken, lent to shared commands.
     shared: Vec<Rc<Client>>,
+    /// Open connections set aside for the tasks waiting in `take`: no new
+    /// shared command is sent on them, so they become free as soon as the
+    /// commands already sent are answered.
+    draining: Vec<Rc<Client>>,
+    /// The tasks waiting in `take` with the pool full, by ticket, oldest
+    /// first. Only the first may take a connection.
+    takers: VecDeque<u64>,
+    next_ticket: u64,
     taken: usize,
     connecting: usize,
     waiting: usize,
@@ -158,6 +173,74 @@ pub struct PoolStats {
     pub connect_errors: u64,
     /// Waits that ended with [`ErrorKind::PoolTimeout`].
     pub timeouts: u64,
+}
+
+impl State {
+    /// The connections that are not taken.
+    fn untaken(&self) -> impl Iterator<Item = &Rc<Client>> {
+        self.shared.iter().chain(&self.draining)
+    }
+
+    /// Sets aside one connection for each task waiting in `take`, but
+    /// leaves shared commands at least one unless the pool holds only one.
+    /// Returns whether a connection went back to shared commands.
+    fn balance(&mut self, max_size: usize) -> bool {
+        let untaken = self.shared.len() + self.draining.len();
+        let keep = if max_size == 1 { 0 } else { 1 };
+        let want = self.takers.len().min(untaken.saturating_sub(keep));
+        while self.draining.len() < want {
+            // The least busy one is free soonest.
+            let Some(i) = (0..self.shared.len()).min_by_key(|&i| Rc::strong_count(&self.shared[i]))
+            else {
+                break;
+            };
+            let c = self.shared.swap_remove(i);
+            self.draining.push(c);
+        }
+        let mut returned = false;
+        while self.draining.len() > want {
+            let c = self.draining.pop().expect("more than wanted");
+            self.shared.push(c);
+            returned = true;
+        }
+        returned
+    }
+
+    /// Hands a connection no command is using to the task taking it.
+    fn take_idle(&mut self) -> Option<Client> {
+        let idle = |v: &Vec<Rc<Client>>| v.iter().position(|c| Rc::strong_count(c) == 1);
+        let c = if let Some(i) = idle(&self.draining) {
+            self.draining.swap_remove(i)
+        } else {
+            let i = idle(&self.shared)?;
+            self.shared.swap_remove(i)
+        };
+        self.taken += 1;
+        match Rc::try_unwrap(c) {
+            Ok(client) => Some(client),
+            Err(_) => unreachable!("checked: nobody else holds it"),
+        }
+    }
+}
+
+/// A task's place in the queue of `take`, given up however the wait ends.
+struct Ticket<'a> {
+    pool: &'a Pool,
+    number: Cell<Option<u64>>,
+}
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        let Some(n) = self.number.get() else { return };
+        {
+            let mut st = self.pool.inner.state.borrow_mut();
+            st.takers.retain(|&t| t != n);
+            st.balance(self.pool.inner.max_size);
+        }
+        // The next taker may go, and a connection set aside for this one
+        // may be back with shared commands.
+        self.pool.notify();
+    }
 }
 
 enum Decision<T> {
@@ -217,7 +300,8 @@ impl Pool {
 
     /// The longest a task waits for a connection when all `max_size` are
     /// taken: 5 seconds by default. A longer wait fails with
-    /// [`ErrorKind::PoolTimeout`].
+    /// [`ErrorKind::PoolTimeout`]. `Duration::MAX` waits as long as it
+    /// takes.
     ///
     /// # Panics
     ///
@@ -269,25 +353,33 @@ impl Pool {
     /// Waits up to the [wait timeout](Self::wait_timeout) when every
     /// connection is taken or busy and the pool is full.
     pub async fn take(&self) -> Result<PooledClient, Error> {
+        let ticket = Ticket {
+            pool: self,
+            number: Cell::new(None),
+        };
         let client = self
             .acquire(|st, max| {
-                let idle = st.shared.iter().position(|c| Rc::strong_count(c) == 1);
-                if let Some(i) = idle {
-                    let c = st.shared.swap_remove(i);
-                    st.taken += 1;
-                    return match Rc::try_unwrap(c) {
-                        Ok(client) => Decision::Ready(client),
-                        Err(_) => unreachable!("checked: nobody else holds it"),
-                    };
+                // Tasks that came first go first.
+                if st.takers.front().copied() == ticket.number.get() || st.takers.is_empty() {
+                    if let Some(client) = st.take_idle() {
+                        return Decision::Ready(client);
+                    }
+                    if st.shared.len() + st.draining.len() + st.taken + st.connecting < max {
+                        st.connecting += 1;
+                        return Decision::Connect;
+                    }
                 }
-                if st.shared.len() + st.taken + st.connecting < max {
-                    st.connecting += 1;
-                    Decision::Connect
-                } else {
-                    Decision::Wait
+                if ticket.number.get().is_none() {
+                    let n = st.next_ticket;
+                    st.next_ticket += 1;
+                    st.takers.push_back(n);
+                    ticket.number.set(Some(n));
+                    st.balance(max);
                 }
+                Decision::Wait
             })
             .await?;
+        drop(ticket);
         let client = match client {
             Ok(c) => c,
             Err(new) => {
@@ -316,7 +408,7 @@ impl Pool {
     async fn shared(&self) -> Result<Lent<'_>, Error> {
         let client = self
             .acquire(|st, max| {
-                let room = st.shared.len() + st.taken + st.connecting < max;
+                let room = st.shared.len() + st.draining.len() + st.taken + st.connecting < max;
                 // The clock is read only if a connection is busy.
                 let mut now = None;
                 let mut stalled = |c: &Client| match c.head_since() {
@@ -377,13 +469,22 @@ impl Pool {
         &self,
         mut decide: impl FnMut(&mut State, usize) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
-        let deadline = Instant::now() + self.inner.wait_timeout;
+        // A timeout too long for the clock (`Duration::MAX`) means none.
+        let deadline = Instant::now().checked_add(self.inner.wait_timeout);
         loop {
-            let decision = {
+            let (decision, returned) = {
                 let mut st = self.inner.state.borrow_mut();
-                st.shared.retain(|c| !c.is_closed());
-                decide(&mut st, self.inner.max_size)
+                // Connections that broke, or whose server became a replica
+                // (`READONLY`, after a failover), are left behind; they
+                // close once the commands on them are answered.
+                st.shared.retain(|c| !c.is_closed() && !c.is_stale());
+                st.draining.retain(|c| !c.is_closed() && !c.is_stale());
+                let returned = st.balance(self.inner.max_size);
+                (decide(&mut st, self.inner.max_size), returned)
             };
+            if returned {
+                self.notify();
+            }
             match decision {
                 Decision::Ready(c) => return Ok(Ok(c)),
                 Decision::Connect => {
@@ -417,8 +518,17 @@ impl Pool {
                             .push(cx.waker().clone());
                         Poll::Pending
                     });
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    if giong::time::timeout(left, woken).await.is_err() {
+                    let timed_out = match deadline {
+                        Some(deadline) => {
+                            let left = deadline.saturating_duration_since(Instant::now());
+                            giong::time::timeout(left, woken).await.is_err()
+                        }
+                        None => {
+                            woken.await;
+                            false
+                        }
+                    };
+                    if timed_out {
                         let mut st = self.inner.state.borrow_mut();
                         st.timeouts += 1;
                         return Err(Error::new(
@@ -501,7 +611,7 @@ impl Drop for PooledClient {
             st.taken -= 1;
             // A blocking command still in flight was cancelled: it would
             // hold up the commands of other tasks until it returns.
-            if !client.is_closed() && !client.is_blocked() {
+            if !client.is_closed() && !client.is_blocked() && !client.is_stale() {
                 st.shared.push(Rc::new(client));
             }
         }

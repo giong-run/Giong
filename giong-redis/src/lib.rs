@@ -51,9 +51,10 @@
 //!
 //! ## What it does not do (yet)
 //!
-//! Redis Cluster and Sentinel, client-side caching (`CLIENT TRACKING`),
-//! sharded Pub/Sub (`SSUBSCRIBE`), RESP2-only servers (Redis 5 and older),
-//! and streaming a large reply in pieces.
+//! Redis Cluster and Sentinel, client-side caching (`CLIENT TRACKING` can be
+//! turned on with [`Client::query`], but a client passes over the
+//! invalidations it brings), sharded Pub/Sub (`SSUBSCRIBE`), RESP2-only
+//! servers (Redis 5 and older), and streaming a large reply in pieces.
 
 #![warn(missing_docs)]
 
@@ -81,7 +82,7 @@ pub use config::{Config, Tls};
 pub use error::{Error, ErrorKind, ServerError};
 pub use pool::{Pool, PoolStats, PooledClient};
 pub use pubsub::{Message, PubSub};
-pub use value::{FromValue, ToArg, Value};
+pub use value::{ArgWriter, FromValue, ToArg, Value};
 
 /// The TLS connector type, re-exported so that [`Tls::Verify`] can be built
 /// without depending on `giong-tls` directly.

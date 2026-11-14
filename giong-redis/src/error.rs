@@ -178,8 +178,10 @@ impl Error {
     }
 
     /// Whether trying again later may succeed: the connection failed or
-    /// closed, a timeout passed, or the server is busy or not ready
-    /// (`LOADING`, `BUSY`, `TRYAGAIN`, `MASTERDOWN`, `CLUSTERDOWN`).
+    /// closed, a timeout passed, the server is busy or not ready
+    /// (`LOADING`, `BUSY`, `TRYAGAIN`, `MASTERDOWN`, `CLUSTERDOWN`), or it
+    /// became a replica (`READONLY`, after a failover: a
+    /// [`Pool`](crate::Pool) opens a new connection for the next try).
     ///
     /// A command that is not idempotent (`INCR`, `LPUSH`) may have run
     /// before a [`Closed`](ErrorKind::Closed) or
@@ -192,7 +194,7 @@ impl Error {
             | ErrorKind::PoolTimeout => true,
             ErrorKind::Server => matches!(
                 self.server_code(),
-                Some("LOADING" | "BUSY" | "TRYAGAIN" | "MASTERDOWN" | "CLUSTERDOWN")
+                Some("LOADING" | "BUSY" | "TRYAGAIN" | "MASTERDOWN" | "CLUSTERDOWN" | "READONLY")
             ),
             _ => false,
         }

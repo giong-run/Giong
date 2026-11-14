@@ -10,6 +10,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **Verification**: fuzz targets for the core crate (`fuzz/`): `dns_response` (DNS answers,
+  up to 64 KiB, with a 2-second limit per input so that a slow answer counts as a failure)
+  and `resolv_conf` (`/etc/resolv.conf` and `/etc/hosts`), in the nightly fuzz workflow.
+- **giong-redis**: a fuzz target for the connection's reply matching (`connection`, in
+  `giong-redis/fuzz/`, and a randomised test): commands of every shape, dropped waiters
+  and passed deadlines, with push messages, attributes and replies over the limit among
+  the replies, which arrive cut anywhere; every command must get its own replies. The
+  reply reader's fuzz inputs now carry attributes, and its results are checked against a
+  reading with no limit.
 - **giong-postgres**: `Pool::idle_timeout` (10 minutes by default) closes connections
   left unused, and `Pool::max_lifetime` (30 minutes, less up to 10% so that connections
   opened together are not replaced together) replaces old ones once no statement uses
@@ -24,6 +33,51 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong**: the default number of workers follows the CPU quota. It was the number of CPUs
+  in the process's affinity mask, which in a container with a CPU limit is every CPU of the
+  machine: a Kubernetes pod with `limits.cpu: 2` on a 64-core node ran 64 pinned workers
+  that the quota throttled. It is now the smaller of the affinity mask and the quota
+  (`std::thread::available_parallelism`), so 2 there. Under such a quota workers are no
+  longer pinned by default, since the CPUs are shared with other processes and pinning
+  stacked the workers on CPUs 0 and 1; `Builder::pin_cores(true)` pins them anyway.
+- **giong**, breaking: `JoinError` is `#[non_exhaustive]`, so that a reason can be added
+  without breaking code; a `match` on it needs a `_` arm.
+- **giong**: the panics an agent or a person meets first now carry a code, the cause and
+  the fix, like giong's errors: `GIONG-E0011` (a giong function called outside a giong
+  runtime, for example on Tokio's executor), `GIONG-E0012` (`block_on` inside a runtime)
+  and `GIONG-E0013` (a giong future polled on another worker).
+- **giong**, breaking: `mpsc::Receiver::try_recv` and `mpsc::BoundedReceiver::try_recv`
+  return `Result<T, mpsc::TryRecvError>` instead of `Option<T>`, like
+  `oneshot::Receiver::try_recv`: `Empty` while a sender is alive, `Closed` once every
+  sender is gone and the channel is empty. The `Option` could not tell the two apart.
+- **giong**: `OpenOptions::custom_flags` ignores the access-mode bits (`O_RDONLY`,
+  `O_WRONLY`, `O_RDWR`), as the standard library does: `custom_flags(libc::O_RDWR)` no
+  longer turns a read-only open into a writable one. Combinations `open(2)` cannot do (no
+  access mode, `truncate` or `create` without `write`, `append` with `truncate`) fail with
+  `GIONG-E0203`, which names the option and the fix, instead of a bare `EINVAL`.
+- **giong**: `File::allocate` with a length of 0 does nothing and returns `Ok` (it was the
+  kernel's `EINVAL`), and a range that ends above `i64::MAX` is refused with `GIONG-E0202`.
+- **giong**: the docs of `TcpStream` and `UnixStream` `read`, `write` and `write_all` say
+  that they are not cancel safe, and `read` that a buffer with no capacity reads `Ok(0)`.
+- **giong-redis** (breaking): `ToArg` writes through an `ArgWriter`:
+  `fn write_arg(&self, out: &mut ArgWriter<'_>)` replaces
+  `fn with_bytes(&self, f: &mut dyn FnMut(&[u8]))`. Everything an implementation writes,
+  in any number of pieces, is one argument (`out.write(b"session:")` then
+  `self.0.write_arg(out)` sends `session:42`), so an implementation can no longer break
+  the framing of a shared connection (see Fixed). `ArgWriter` implements
+  `std::fmt::Write` too. To migrate, call `out.write(bytes)` where the old implementation
+  called `f(bytes)`.
+- **giong-redis**: `Config::max_reply_size` now bounds the memory a reply takes: each
+  element counts 48 bytes (the `Value` it becomes) besides its bytes. Counting bytes only,
+  an array of 20 million nulls, 57 MiB as sent and so under the 64 MiB default, took
+  960 MB once read. A reply of millions of small elements that fit before may now fail
+  with `TooLarge` (a million 10-byte members, 17 MB as sent, count for 65 MB): raise the
+  limit for such replies.
+- **giong-redis**: when 16 MiB of commands are waiting to be written to a connection (the
+  server stopped reading, as during a long script), a new command waits for room, and
+  fails with `Timeout`, unsent, if none comes within the response timeout. Before, the
+  buffer grew without bound, and commands whose callers had given up were sent, and run,
+  whenever the server caught up.
 - **giong-postgres** (breaking): `Config::statement_timeout` takes
   `impl Into<Option<Duration>>`. `None` sends nothing, leaving the limit to the server or
   the role, which is what PgBouncer needs. `Duration::ZERO` and values above `i32::MAX`
@@ -51,6 +105,124 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**, epoll driver: file operations no longer queue behind one that blocks. A burst
+  of file operations started while one blocking thread was idle all went to that thread, so
+  one open of a FIFO without a writer (or a read from a hung network filesystem) stalled
+  every file operation of the process. A thread now starts whenever more jobs wait than idle
+  threads can take.
+- **giong**: work sent through a `Handle` to a runtime that has stopped, or was dropped
+  without running, is cancelled instead of waiting forever: `spawn_balanced` after `run`
+  returned, jobs still queued when the last worker stopped, and `spawn_on` to a runtime that
+  never ran now resolve to `JoinError::Cancelled`, as documented.
+- **giong**: with `shutdown_on_signals`, SIGINT and SIGTERM are seen as long as any worker
+  runs. Only worker 0 watched for them, so once its main future had returned the signals
+  did nothing and the process had to be killed.
+- **giong**: `Cargo.toml` asked for `libc` 0.2, but giong needs 0.2.172 (what socket2 0.6
+  needs), so a lockfile holding an older `libc` failed to build. CI now builds and tests the
+  core crate with every direct dependency at the lowest version its `Cargo.toml` allows
+  (`minimal-versions` job), and a test checks that I/O completes while another task on the
+  worker keeps yielding, which io-uring 0.7.0 to 0.7.14 broke before 0.5.0.
+- **giong**: a balanced listener could leave a connection in the mailbox of a worker whose
+  last balanced listener closed at the same moment, open and unanswered. The hand-over now
+  checks under the mailbox's lock and keeps the connection, or gives it to another member.
+- **giong**: a DNS answer with a long chain of CNAME records froze the worker. The chain was
+  followed by rescanning every record for every name found, in cubic time: one 64 KiB TCP
+  answer of 2,300 records held the worker for 18 seconds, with no timer or other task
+  running, and whoever controls DNS answers (a resolver, or anyone on the path to it) could
+  send one. The chain is now followed from the query name in linear time, and more than 16
+  CNAME links is a malformed answer (`GIONG-E0107`), as in other resolvers.
+- **giong**: `File::read_at`, `write_at` and `write_all_at` refuse an offset above
+  `i64::MAX` with `GIONG-E0202`. io_uring reads `u64::MAX` as "the current file position",
+  so such an offset read and wrote wherever that was, on io_uring only (epoll failed with
+  `EINVAL`).
+- **giong**: a DNS server address where nothing listens gave the kernel's bare "connection
+  refused", so a failed `connect("db.internal:5432")` read as if the database refused. It
+  is now `GIONG-E0108`, naming the server and the name, with the kernel's error as its
+  source. `GIONG-E0104` says when it really applies (an empty `ResolverConfig::nameservers`;
+  a `resolv.conf` without servers means `127.0.0.1:53`).
+- **giong**: `UdpSocket::read_from` refuses a buffer with no capacity (`Vec::new()`) with
+  `GIONG-E0109`, instead of receiving the datagram into it and losing it.
+- **giong**: an IP address without a port (`"10.0.0.5"`, `"::1"`) or an IPv6 address
+  without brackets (`"2001:db8::1:8080"`) passed as `"host:port"` now gets an error that
+  says so and shows the right form, instead of "not a valid host name".
+- **giong**: a `File::open`, `File::create` or `OpenOptions::open` whose future was dropped
+  after the open started (a timeout, a cancelled request) leaked the descriptor the open
+  produced: on io_uring every one (200 of 200 in the new test), on epoll those already
+  running. The driver now closes the result of an open nobody collects, on both drivers.
+- **giong**: memory the kernel writes into during an operation (the `statx` result, the
+  `msghdr` of `UdpSocket::read_from` and `send_to`, the headers of vectored and control
+  sends, the address of `connect`, and paths) was reached through a pointer taken before its
+  `Box` moved, which Rust's aliasing rules make undefined behaviour (nothing miscompiled,
+  but Miri failed on every file test). It now lives in a small owner reached only through a
+  raw pointer, and `IoBufMut for Vec<u8>` hands the kernel a pointer valid for the whole
+  capacity. So that this stays fixed, CI runs the unit tests and the tests Miri can run
+  (files, tasks, channels, timers, `observe`, several workers) under Miri on the epoll
+  driver (`scripts/check.sh miri`), and clippy checks that every `unsafe` block and impl
+  in giong says why it is sound.
+- **giong**: the buffer ring's entries are written field by field through raw pointers.
+  The setters of `io_uring`'s `BufRingEntry` take a reference to the whole entry, whose
+  last field in entry 0 is the ring tail the kernel reads at any time (nothing
+  miscompiled). The `# Safety` sections of `IoBuf` and `IoBufMut` now also say that
+  nothing else may write the bytes (for `IoBufMut`, read or write them) while giong holds
+  the buffer, which the implementations giong provides already guaranteed.
+- **giong**: `observe` grouped tasks by the address of their spawn `Location`, so one call
+  site could show up as several entries; it groups by file, line and column.
+- **giong**: a stream or listener dropped by code the driver runs (a waker's `wake` or
+  `drop`) kept its multishot receive or accept: the kernel kept the socket open, so the
+  peer never saw it close, and the driver kept the entry. An operation's future dropped
+  there leaked its buffer and its entry. Both are now finished at the next turn of the
+  event loop.
+- **giong**: a `TcpListener` or `UnixListener` that outlived its runtime (returned from one
+  `block_on` and used in the next) leaked the connections io_uring had accepted for it but
+  nobody had taken: the descriptors stayed open and the clients waited. The runtime closes
+  them, and gives back the receive buffers of every live multishot queue, when it stops.
+- **giong**: a failure of `io_uring_enter`, of submitting to the ring or of `epoll_wait`
+  that the event loop cannot recover from still stops the runtime, but the panic is now
+  coded `GIONG-E0005` and says what the error means: `EBADR` and `ENOMEM` that the kernel
+  ran out of memory for completions, anything else that it is worth a report.
+- **giong**: on the epoll driver, reading or writing a pipe on standard input, output or
+  error through `fs::File` switched the pipe to non-blocking mode, which belongs to the
+  pipe and so changed it for the rest of the shell pipeline too (`cat` on the same pipe
+  failed with `EAGAIN`). Those pipes are now read and written on the blocking threads, as
+  terminals already were; pipes on other descriptors still go through epoll.
+- **giong-redis**: a `ToArg` that called its callback twice (a typed key written as a
+  prefix, then an id) or not at all made the command methods (`get`, `set`, `hget`...)
+  send one argument more or fewer than the count in front of them. Redis ran the extra
+  one as a command of its own, and from then on every task sharing the connection got the
+  reply of the command before its own (`GET` of one key returned another key's value)
+  until the connection failed. With the new `ToArg` this cannot happen. A `ToArg` that
+  panics no longer leaves half a command in the connection's buffer, where the next task's
+  command was appended to it.
+- **giong-redis**: `Pool::take` failed with `PoolTimeout` whenever the pool was full and
+  shared commands kept every connection busy: with 32 tasks sending `GET`s and `max_size`
+  1 or 2, after the whole wait, every time. Tasks waiting in `take` are now served in
+  order, and a connection is set aside for the first of them: shared commands go to the
+  others, and it is handed over once the commands already on it are answered (in
+  milliseconds in the same test). Shared commands keep at least one connection unless
+  `max_size` is 1.
+- **giong-redis**: a pool kept its connections to a server that had become a replica (the
+  old primary after a failover keeps them open and answers every write with `READONLY`)
+  until they dropped for some other reason. A connection whose server answers `READONLY`
+  is now left behind, and closes once the commands on it are answered, so the next
+  command opens a new one; `Error::is_transient` is true for `READONLY`.
+- **giong-redis**: `Pool::wait_timeout(Duration::MAX)` made every command panic (an
+  overflow adding it to the clock); it now waits as long as it takes.
+- **giong-redis**: `PubSub::subscribe`, `psubscribe`, `unsubscribe` and `punsubscribe` took
+  the first confirmation of their kind for their own, even one for another channel left
+  by a call that was cancelled; they now wait for the one for their channel.
+- **giong-redis**: a push message too large to keep, behind an attribute that had not
+  arrived whole when the message went over the limit, was taken for the reply to the
+  oldest command, and every later reply went to the command after its own. Whether a
+  reply is a push message is now decided when its own type is read, behind any
+  attributes. Redis and Valkey do not put attributes in front of push messages.
+- **giong-redis**: a dropped `Client` kept its read task and its socket until the server
+  closed its side, which a proxy that does not pass a half-close on may never do. It now
+  closes once the replies to the commands already sent have come, or after the response
+  timeout.
+- **giong-redis**: a URL whose password holds an unescaped `/` or `?` failed with a
+  message quoting a piece of the password as a port, a path or a parameter (`the port
+  "pa" in the URL is not a number`); it now says to percent-encode them, and quotes
+  nothing.
 - **giong-postgres**: session state made on a connection from `Pool::get` (`SET`,
   `SET ROLE`, temporary tables, advisory locks, `LISTEN`, open cursors, an SQL-level
   `PREPARE`) stayed on it when it went back to the pool, and reached the statements of
