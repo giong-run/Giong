@@ -163,31 +163,35 @@ fn recv_from_is_cancel_safe_and_loses_no_datagram() {
 
 #[test]
 fn a_burst_arrives_complete_and_in_order() {
-    // More datagrams than the receive backlog holds in pool buffers (8), sent
-    // before the receiver looks: the rest wait on the heap or in the kernel.
-    giong::block_on(async {
-        let (a, _) = socket();
-        let (b, b_addr) = socket();
-        // Arm the receive first, so the datagrams reach user space.
-        assert!(timeout(Duration::from_millis(1), b.recv()).await.is_err());
-        const COUNT: u32 = 64;
-        for i in 0..COUNT {
-            let mut data = payload(600, u64::from(i));
-            data[..4].copy_from_slice(&i.to_be_bytes());
-            a.send_to(data, b_addr).await.0.unwrap();
-        }
-        sleep(Duration::from_millis(30)).await;
-        for i in 0..COUNT {
-            let got = timeout(Duration::from_secs(5), b.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            let mut expected = payload(600, u64::from(i));
-            expected[..4].copy_from_slice(&i.to_be_bytes());
-            assert!(*got == expected[..], "datagram {i}");
-        }
-        assert!(timeout(Duration::from_millis(20), b.recv()).await.is_err());
-    });
+    // More datagrams than the receive backlog holds in pool buffers (an
+    // eighth of a pool of 64, so 8), sent before the receiver looks, with the
+    // pool running low: the rest wait on the heap or in the kernel.
+    giong::Builder::new()
+        .recv_buffers(64, 8192)
+        .block_on(async {
+            let (a, _) = socket();
+            let (b, b_addr) = socket();
+            // Arm the receive first, so the datagrams reach user space.
+            assert!(timeout(Duration::from_millis(1), b.recv()).await.is_err());
+            const COUNT: u32 = 64;
+            for i in 0..COUNT {
+                let mut data = payload(600, u64::from(i));
+                data[..4].copy_from_slice(&i.to_be_bytes());
+                a.send_to(data, b_addr).await.0.unwrap();
+            }
+            sleep(Duration::from_millis(30)).await;
+            for i in 0..COUNT {
+                let got = timeout(Duration::from_secs(5), b.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut expected = payload(600, u64::from(i));
+                expected[..4].copy_from_slice(&i.to_be_bytes());
+                assert!(*got == expected[..], "datagram {i}");
+            }
+            assert!(timeout(Duration::from_millis(20), b.recv()).await.is_err());
+        })
+        .unwrap();
 }
 
 #[test]

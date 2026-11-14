@@ -146,6 +146,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   requests per second did not change. Datagrams still take whole buffers. A stream's data
   can now be cut where a buffer fills, so one write by the peer may come back from `recv`
   in two pieces; streams never promised otherwise.
+- **giong**: a stream that receives a lot at once (a bulk transfer, a large upload) is no
+  longer copied out of the pool on io_uring. More than 8 receives for one stream between
+  two turns of the event loop used to count as a reader falling behind: the rest was
+  copied to the heap and the receive paused, which on a 256 KiB-at-a-time transfer copied
+  9 bytes in 10. The limit is now an eighth of the pool (64 receives by default), and
+  only data its reader left unread for a whole turn is copied, while the pool runs low or
+  is empty. Receiving such a transfer on loopback now costs the worker 167 instead of
+  565 ns of CPU per KiB (epoll: 169), at 3.0 instead of 1.6 GiB/s. On kernels before 6.1
+  (no `DEFER_TASKRUN`), where one fast stream can fill the whole pool in a single turn,
+  the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
+  on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
 
 ### Fixed
 
