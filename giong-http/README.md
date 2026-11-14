@@ -46,7 +46,7 @@ fn main() -> std::io::Result<()> {
 - Graceful shutdown: a request in progress is answered with `Connection: close`, an idle connection is closed at once.
 - HTTPS through the `tls` feature (see below).
 - Serving over a Unix socket with `Server::serve_unix`, the usual setup behind a reverse proxy on the same machine.
-- `Date` and `Content-Length` are added for you. A header value with control characters is refused (against response splitting).
+- `Date` and `Content-Length` are added for you. A header value with control characters is refused (against response splitting): `Response::header` panics, and `Response::try_header` (with `Response::try_new` for the status) returns an error instead, for values that come from the request.
 
 ## Streaming
 
@@ -98,6 +98,8 @@ Any request that a proxy in front could read differently is answered with `400`,
 - two different `Content-Length` headers, or `Content-Length` together with `Transfer-Encoding`
 - whitespace before the colon, folded header lines, line endings that are a bare LF
 - control characters in a header name or value, a missing or repeated `Host` in HTTP/1.1
+- a trailer line after a chunked body that would not pass as a header line
+- a target that is a whole URL (`GET http://host/path`, which servers must accept) unless it is `http` or `https`, has no user name or password, and names the host the `Host` header names (compared without regard to case, ports included): a handler reads `Host`, and a proxy that routes on the URL must not see another host. So `Host` names the host of every request, as `:authority` does over HTTP/2. `*` is accepted only with `OPTIONS`, and `host:port` only with `CONNECT`.
 
 Other status codes: `408` the request was too slow, `413` the body is too large, `417` an unknown `Expect`, `431` the head is too large, `501` a transfer-encoding other than chunked, `505` not HTTP/1.x.
 

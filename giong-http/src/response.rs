@@ -238,6 +238,15 @@ pub struct Response {
     extensions: Extensions,
 }
 
+/// The error of [`Response::try_new`] and [`Response::try_header`].
+///
+/// giong has no code for a response a handler built wrong;
+/// `HttpClientRequest` is the code giong-http gives a message (so far, a
+/// request) that cannot be sent as written, which is what this is.
+fn invalid(message: String, fix: &'static str) -> giong::error::Error {
+    giong::error::Error::new(giong::error::Code::HttpClientRequest, message, fix)
+}
+
 /// Values attached to a response for the code around the handler; never
 /// sent.
 #[derive(Default)]
@@ -255,12 +264,45 @@ impl Response {
     /// # Panics
     ///
     /// Panics if `status` is not in `200..=599`. Interim (1xx) responses are
-    /// sent by the server itself.
+    /// sent by the server itself. For a status that comes from outside the
+    /// program (a backend's answer, a setting), use
+    /// [`try_new`](Self::try_new), which returns an error instead.
     pub fn new(status: u16) -> Self {
         assert!(
             (200..=599).contains(&status),
             "giong-http: invalid status code {status}"
         );
+        Self::with_status(status)
+    }
+
+    /// Like [`new`](Self::new), but a status outside `200..=599` is an
+    /// error instead of a panic.
+    ///
+    /// ```
+    /// use giong_http::Response;
+    ///
+    /// assert_eq!(Response::try_new(404).unwrap().status(), 404);
+    /// assert!(Response::try_new(103).is_err());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// An error with the code `GIONG-E1101`
+    /// ([`Code::HttpClientRequest`](giong::error::Code::HttpClientRequest),
+    /// the code giong-http gives a message that cannot be sent as written)
+    /// if `status` is not in `200..=599`.
+    pub fn try_new(status: u16) -> Result<Self, giong::error::Error> {
+        if !(200..=599).contains(&status) {
+            return Err(invalid(
+                format!("{status} is not a status a handler can answer with"),
+                "answer with a status from 200 to 599; interim (1xx) responses are sent by \
+                 the server itself",
+            ));
+        }
+        Ok(Self::with_status(status))
+    }
+
+    fn with_status(status: u16) -> Self {
         Self {
             status,
             headers: Vec::new(),
@@ -292,7 +334,11 @@ impl Response {
     ///
     /// Panics if `name` is not a valid header name or `value` contains control
     /// characters. Building headers from untrusted input without checking it
-    /// would otherwise allow response splitting.
+    /// would otherwise allow response splitting. For a value that comes from
+    /// the request or from anywhere else outside the program (a redirect
+    /// target from a decoded query parameter, a file name in
+    /// `Content-Disposition`), use [`try_header`](Self::try_header), which
+    /// returns an error to answer instead of panicking in the handler.
     pub fn header(mut self, name: &str, value: &str) -> Self {
         assert!(
             is_token_str(name.as_bytes()),
@@ -302,6 +348,66 @@ impl Response {
             is_field_value(value.as_bytes()),
             "giong-http: invalid value for header {name}: {value:?}"
         );
+        self.push_header(name, value);
+        self
+    }
+
+    /// Like [`header`](Self::header), but an invalid name or value is an
+    /// error instead of a panic: for values that come from the request or
+    /// from anywhere else outside the program.
+    ///
+    /// ```
+    /// use giong_http::Response;
+    ///
+    /// // A file name from a decoded query parameter, say, with a line break
+    /// // in it that would start a header of its own.
+    /// let name = "report.pdf\r\nSet-Cookie: session=stolen";
+    /// let disposition = format!("attachment; filename=\"{name}\"");
+    /// let response = match Response::new(200).try_header("Content-Disposition", &disposition) {
+    ///     Ok(response) => response.body("..."),
+    ///     Err(_) => Response::new(400).body("invalid file name"),
+    /// };
+    /// assert_eq!(response.status(), 400);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// An error with the code `GIONG-E1101`
+    /// ([`Code::HttpClientRequest`](giong::error::Code::HttpClientRequest),
+    /// the code giong-http gives a message that cannot be sent as written)
+    /// if `name` is not a token or `value` has a control character other
+    /// than a tab (CR and LF included). The message names the header and
+    /// where the bad byte is, without repeating the value.
+    pub fn try_header(mut self, name: &str, value: &str) -> Result<Self, giong::error::Error> {
+        if !is_token_str(name.as_bytes()) {
+            return Err(invalid(
+                format!("{name:?} is not a valid header name"),
+                "a header name is a token: letters, digits and !#$%&'*+-.^_`|~, without \
+                 spaces or a colon",
+            ));
+        }
+        if let Some(at) = value
+            .bytes()
+            .position(|b| b != b'\t' && (b < 0x20 || b == 0x7f))
+        {
+            return Err(invalid(
+                format!(
+                    "the value for the header {name} has the control character {:#04x} at \
+                     byte {at}",
+                    value.as_bytes()[at]
+                ),
+                "check values that come from the request or from outside the program before \
+                 putting them in a header (a line break would start a header of its own), \
+                 and answer 400 when they are not valid",
+            ));
+        }
+        debug_assert!(is_field_value(value.as_bytes()));
+        self.push_header(name, value);
+        Ok(self)
+    }
+
+    /// Adds a header that has been checked, unless the server manages it.
+    fn push_header(&mut self, name: &str, value: &str) {
         let managed = ["content-length", "transfer-encoding", "connection", "date"];
         if !managed.iter().any(|m| name.eq_ignore_ascii_case(m)) {
             self.headers.extend_from_slice(name.as_bytes());
@@ -309,7 +415,6 @@ impl Response {
             self.headers.extend_from_slice(value.trim().as_bytes());
             self.headers.extend_from_slice(b"\r\n");
         }
-        self
     }
 
     /// Sets the body.
@@ -684,5 +789,50 @@ mod tests {
     #[should_panic(expected = "invalid status code")]
     fn interim_status_codes_are_rejected() {
         let _ = Response::new(100);
+    }
+
+    #[test]
+    fn the_fallible_builders_return_errors_where_the_others_panic() {
+        use giong::error::Code;
+
+        let resp = Response::try_new(302)
+            .unwrap()
+            .try_header("Location", " /next ")
+            .unwrap()
+            .try_header("Content-Length", "99")
+            .unwrap();
+        assert_eq!(resp.status(), 302);
+        // Trimmed, and the managed header ignored, as `header` does.
+        assert_eq!(resp.headers().collect::<Vec<_>>(), [("Location", "/next")]);
+
+        for status in [0, 100, 101, 199, 600, 1000] {
+            let e = Response::try_new(status).unwrap_err();
+            assert_eq!(e.code(), Code::HttpClientRequest);
+            assert!(e.message().contains(&status.to_string()), "{e}");
+        }
+        for (name, value, says) in [
+            ("Location", "/a\r\nSet-Cookie: x=1", "0x0d at byte 2"),
+            ("X-Name", "a\nb", "0x0a at byte 1"),
+            ("X-Name", "a\0b", "0x00 at byte 1"),
+            ("X-Name", "a\x7fb", "0x7f at byte 1"),
+            ("Bad Name", "1", "\"Bad Name\" is not a valid header name"),
+            ("", "1", "\"\" is not a valid header name"),
+            ("X:Y", "1", "is not a valid header name"),
+        ] {
+            let e = Response::new(200).try_header(name, value).unwrap_err();
+            assert_eq!(e.code(), Code::HttpClientRequest, "{name:?}");
+            assert!(e.message().contains(says), "{e}");
+            assert!(!e.message().contains("Set-Cookie"), "{e}");
+            let io: std::io::Error = e.into();
+            assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(giong::error::code(&io), Some(Code::HttpClientRequest));
+        }
+        // What `header` accepts, `try_header` accepts.
+        let resp = Response::new(200)
+            .try_header("X-Tab", "a\tb")
+            .unwrap()
+            .try_header("X-Text", "café")
+            .unwrap();
+        assert_eq!(resp.get_header("x-text"), Some("café"));
     }
 }

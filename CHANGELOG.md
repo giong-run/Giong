@@ -136,6 +136,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong-http**: `Response::try_header` and `Response::try_new`, the forms of
+  `Response::header` and `Response::new` that return an error instead of panicking on a
+  header name or value that is not valid (a line break that would split the response)
+  or a status outside 200 to 599, for values that come from the request: a redirect
+  target from a decoded query parameter, a file name in `Content-Disposition`. The error
+  is a `giong::error::Error` with the code `GIONG-E1101` (`Code::HttpClientRequest`, the
+  code giong-http already gives a message that cannot be sent as written). `header` and
+  `new` are unchanged and their documentation points to the new forms.
 
 ### Changed
 
@@ -225,6 +233,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   differently. They are now held to the rules of a header line: the server answers
   `400` (`GIONG-E1113` for a body read as a stream), and the client, which shares the
   decoder, fails with `GIONG-E1107` (`ErrorKind::Protocol`).
+- **giong-http**: the package description on crates.io and the crate's documentation said
+  the client speaks HTTP/1.1 only (and the description, the server too); both speak
+  HTTP/1.1 and HTTP/2.
 
 ## [0.4.0] - 2026-11-13
 
