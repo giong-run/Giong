@@ -1,10 +1,18 @@
 //! Randomised robustness tests: whatever a server (or a URL, or a key file)
 //! sends, the parsers return a verdict without panicking.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::auth::{self, RsaPublicKey};
+use crate::client::Client;
 use crate::config::Config;
-use crate::fuzzing::{all_columns, check_payload, framing, rows};
+use crate::error::ErrorKind;
+use crate::fuzzing::{
+    all_columns, as_reads, check_payload, framing, pieces, reads, rows, server, session, Memory,
+};
 use crate::protocol;
+use crate::protocol::status;
 use crate::row::Column;
 
 /// xorshift64*: deterministic, so a failure can be reproduced from its seed.
@@ -159,6 +167,156 @@ fn urls_and_key_files_never_panic() {
         mutate(&mut rng, &mut input);
         if RsaPublicKey::from_pem(&input).is_ok() {
             let _ = auth::rsa_encrypt_password("secret", b"0123456789abcdefghij", &input);
+        }
+    }
+}
+
+/// Scripts a real server could send, named, with the two bytes that choose
+/// what the client asks: the seeds of the `session` fuzz target.
+fn session_scripts() -> Vec<(&'static str, [u8; 2], Vec<u8>)> {
+    let ac = status::AUTOCOMMIT;
+    let in_tx = status::AUTOCOMMIT | status::IN_TRANS;
+    let more = status::AUTOCOMMIT | status::MORE_RESULTS_EXISTS;
+    let mut out = Vec::new();
+
+    let mut prepare = Vec::new();
+    server::prepared(&mut prepare, 1, 1);
+    let mut result = Vec::new();
+    server::result(&mut result, &[1], 42);
+    out.push((
+        "query",
+        [0x01, 0],
+        as_reads(&[prepare.clone(), result.clone()]),
+    ));
+
+    let mut batch = Vec::new();
+    server::packet(&mut batch, 1, &server::ok(more));
+    server::text_result(&mut batch, 2, "1", ac);
+    out.push(("batch", [0x04, 0], as_reads(&[batch.clone()])));
+    // On a shared connection, a reset follows the batch.
+    out.push((
+        "batch shared",
+        [0x14, 0],
+        as_reads(&[
+            batch,
+            server::single(&server::ok(ac)),
+            server::single(&server::ok(ac)),
+        ]),
+    ));
+
+    let mut delete = Vec::new();
+    server::prepared(&mut delete, 2, 1);
+    out.push((
+        "transaction",
+        [0x00, 0x01],
+        as_reads(&[
+            server::single(&server::ok(in_tx)),
+            delete.clone(),
+            server::single(&server::ok(in_tx)),
+            server::single(&server::ok(ac)),
+        ]),
+    ));
+    out.push((
+        "deadlock",
+        [0x80, 0x01],
+        as_reads(&[
+            server::single(&server::ok(in_tx)),
+            delete,
+            server::single(&server::error(1213, "Deadlock found")),
+        ]),
+    ));
+
+    let mut wide = Vec::new();
+    server::result(&mut wide, &[0xFD, 0x70, 0x11, 0x01], 1);
+    out.push((
+        "70000 columns",
+        [0x01, 0],
+        as_reads(&[prepare.clone(), wide]),
+    ));
+    out.push((
+        "everything",
+        [0xFF, 0x07],
+        as_reads(&[prepare, result, server::single(&server::ok(ac))]),
+    ));
+    out
+}
+
+#[test]
+fn a_scripted_server_is_read_like_a_real_one() {
+    giong::block_on(async {
+        let (_, _, script) = &session_scripts()[0];
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let memory = Memory::new(reads(script), output.clone());
+        let client = Client::over_memory(memory, Config::new().host("m").user("u"), false);
+        let rows = client.query("SELECT ?", &[&1i64]).await.unwrap();
+        assert_eq!(rows[0].get::<i64>(0).unwrap(), 42);
+        // A prepare, then an execute.
+        let written = output.borrow();
+        assert_eq!(written[4], 0x16);
+        assert_eq!(written[4 + 4 + "SELECT ?".len() + 1], 0x17);
+    });
+}
+
+#[test]
+fn a_result_with_more_columns_than_mysql_allows_is_refused() {
+    // MySQL allows 4,096 columns; a count above 65,535 would make the
+    // client keep definitions for as long as the server sends them.
+    for count in [
+        &[0xFD, 0x70, 0x11, 0x01][..],
+        &[0xFE, 0, 0, 0, 0, 1, 0, 0, 0],
+    ] {
+        giong::block_on(async {
+            let mut prepare = Vec::new();
+            server::prepared(&mut prepare, 1, 0);
+            let mut wide = Vec::new();
+            server::result(&mut wide, count, 1);
+            let memory = Memory::new(
+                reads(&as_reads(&[prepare, wide])),
+                Rc::new(RefCell::new(Vec::new())),
+            );
+            let client = Client::over_memory(memory, Config::new().host("m").user("u"), false);
+            let e = client.query("SELECT 1", &[]).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Protocol, "{e}");
+            assert!(e.to_string().contains("columns"), "{e}");
+        });
+    }
+}
+
+#[test]
+fn sessions_with_a_hostile_server_end_every_request() {
+    let scripts = session_scripts();
+    giong::block_on(async {
+        // As written: the scripts are what a server would send.
+        for (_, ops, script) in &scripts {
+            session(*ops, reads(script)).await;
+        }
+        // Mutated, cut anywhere, with any requests.
+        let mut rng = Rng(0xA076_1D64_78BD_642F);
+        for _ in 0..3_000 {
+            let (_, ops, script) = &scripts[rng.below(scripts.len())];
+            let mut bytes = reads(script).into_iter().flatten().collect::<Vec<u8>>();
+            mutate(&mut rng, &mut bytes);
+            let ops = if rng.below(4) == 0 {
+                [rng.next() as u8, rng.next() as u8]
+            } else {
+                *ops
+            };
+            let seed = if rng.below(3) == 0 {
+                0
+            } else {
+                rng.next() as u8 | 1
+            };
+            session(ops, pieces(seed, &bytes)).await;
+        }
+    });
+    // The seeds of the fuzz target are these scripts.
+    if let Some(dir) = std::env::var_os("GIONG_WRITE_SEEDS") {
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        for (name, ops, script) in &scripts {
+            let mut seed = ops.to_vec();
+            seed.extend_from_slice(script);
+            std::fs::write(dir.join(name.replace(' ', "-")), seed).unwrap();
         }
     }
 }

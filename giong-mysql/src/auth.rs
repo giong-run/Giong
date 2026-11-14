@@ -117,7 +117,11 @@ impl RsaPublicKey {
                 n.len() * 8
             )));
         }
-        if e.is_empty() || e.len() > 4 || n[n.len() - 1] & 1 == 0 {
+        // An even modulus is not RSA; an exponent of 1 would leave the
+        // password readable, and even ones cannot be inverted.
+        let tiny = e.len() == 1 && e[0] < 3;
+        if e.is_empty() || e.len() > 4 || tiny || e[e.len() - 1] & 1 == 0 || n[n.len() - 1] & 1 == 0
+        {
             return Err(key_error("the exponent or the modulus is not valid"));
         }
         Ok(Self { n, e })
@@ -526,6 +530,50 @@ fTch7m+1IYlE
             *b ^= nonce[i % nonce.len()];
         }
         assert_eq!(plain, "päss wörd\0".as_bytes());
+    }
+
+    /// `-----BEGIN RSA PUBLIC KEY-----` for a modulus and an exponent.
+    fn pkcs1_pem(n: &[u8], e: &[u8]) -> Vec<u8> {
+        fn der(tag: u8, body: &[u8]) -> Vec<u8> {
+            let mut out = vec![tag];
+            match body.len() {
+                l @ 0..=127 => out.push(l as u8),
+                l @ 128..=255 => out.extend([0x81, l as u8]),
+                l => out.extend([0x82, (l >> 8) as u8, l as u8]),
+            }
+            out.extend_from_slice(body);
+            out
+        }
+        let mut n0 = vec![0];
+        n0.extend_from_slice(n);
+        let mut seq = der(0x02, &n0);
+        seq.extend(der(0x02, e));
+        let body = der(0x30, &seq);
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in body.chunks(3) {
+            let v =
+                chunk.iter().fold(0u32, |a, &b| a << 8 | u32::from(b)) << (8 * (3 - chunk.len()));
+            for i in 0..=chunk.len() {
+                b64.push(ALPHABET[(v >> (18 - 6 * i) & 63) as usize] as char);
+            }
+            for _ in chunk.len()..3 {
+                b64.push('=');
+            }
+        }
+        format!("-----BEGIN RSA PUBLIC KEY-----\n{b64}\n-----END RSA PUBLIC KEY-----\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn keys_that_would_not_hide_the_password_are_refused() {
+        let n = vec![0xC3; 256];
+        assert!(RsaPublicKey::from_pem(&pkcs1_pem(&n, &[1, 0, 1])).is_ok());
+        assert!(RsaPublicKey::from_pem(&pkcs1_pem(&n, &[3])).is_ok());
+        for e in [&[1u8][..], &[2], &[1, 0, 0]] {
+            let err = RsaPublicKey::from_pem(&pkcs1_pem(&n, e)).err().unwrap();
+            assert!(err.to_string().contains("exponent"), "{e:?}: {err}");
+        }
     }
 
     #[test]

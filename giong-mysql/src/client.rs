@@ -9,17 +9,27 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use crate::config::Config;
-use crate::connect::{self, Message, ReadBuf, Startup, Stream};
+use crate::connect::{self, Identity, Message, ReadBuf, Startup, Stream};
 use crate::error::{DbError, Error, ErrorKind};
 use crate::protocol::{self, com, status, ColumnDef, Reader};
 use crate::row::{Column, ResultSet, Row, RowsBuilder};
+use crate::session;
 use crate::types::{ColumnType, ToSql};
 
 /// The most parameters a statement can have.
 const MAX_PARAMS: usize = 65_535;
+
+/// The most columns a result can have: a prepared statement's are counted
+/// in two bytes.
+const MAX_COLUMNS: u64 = 65_535;
+
+/// Buffers grown past this by one large message are given back once idle.
+pub(crate) const KEEP_CAPACITY: usize = 1 << 20;
 
 /// MySQL error numbers this crate reacts to.
 mod code {
@@ -29,8 +39,20 @@ mod code {
     pub const NEED_REPREPARE: u16 = 1615;
     /// `ER_LOCK_DEADLOCK`: the transaction was rolled back.
     pub const DEADLOCK: u16 = 1213;
+    /// `ER_LOCK_WAIT_TIMEOUT`: the statement was rolled back, or the whole
+    /// transaction with `innodb_rollback_on_timeout`.
+    pub const LOCK_WAIT_TIMEOUT: u16 = 1205;
+    /// `ER_LOCK_TABLE_FULL`: the transaction was rolled back.
+    pub const LOCK_TABLE_FULL: u16 = 1206;
+    /// `ER_MAX_PREPARED_STMT_COUNT_REACHED`: the server holds as many
+    /// prepared statements as `max_prepared_stmt_count` allows, counting
+    /// those of every client.
+    pub const PREPARED_LIMIT: u16 = 1461;
     /// `ER_QUERY_TIMEOUT`: `max_execution_time` stopped a `SELECT`.
     pub const QUERY_TIMEOUT: u16 = 3024;
+    /// `ER_STATEMENT_TIMEOUT` (MariaDB): `max_statement_time` stopped a
+    /// statement.
+    pub const STATEMENT_TIMEOUT: u16 = 1969;
 }
 
 /// A connection to a MySQL server.
@@ -63,6 +85,9 @@ pub(crate) struct Statement {
     /// Set for a statement that is not cached: the connection, so that the
     /// statement can be closed when it is dropped.
     conn: Option<Weak<Conn>>,
+    /// The session it was prepared in: a reset of the session frees it on
+    /// the server, and its id may be given to another statement.
+    generation: u64,
 }
 
 impl Drop for Statement {
@@ -70,6 +95,9 @@ impl Drop for Statement {
         let Some(conn) = self.conn.as_ref().and_then(Weak::upgrade) else {
             return;
         };
+        if conn.generation.get() != self.generation {
+            return;
+        }
         if let Ok(mut st) = conn.state.try_borrow_mut() {
             if st.broken.is_none() {
                 // No answer comes for a close.
@@ -87,10 +115,19 @@ impl Drop for Statement {
 enum Tx {
     None,
     Open,
-    /// The server ended it before `COMMIT`: a deadlock rolled it back, or a
-    /// statement (such as DDL) committed it.
+    /// A statement in it failed with an error that may or may not have
+    /// rolled the whole transaction back: before anything else is sent, a
+    /// ping asks the server whether it is still open.
+    Uncertain,
+    /// The server rolled it back before `COMMIT` (a deadlock, say).
     RolledBack,
-    Committed,
+    /// The server ended it before `COMMIT`, and cannot say how: a statement
+    /// (such as DDL) committed it, or an error rolled it back.
+    Ended,
+    /// A statement in it was given up before its answer came (its future
+    /// was dropped): it may have run, so committing would commit work the
+    /// application believes undone.
+    Abandoned,
 }
 
 /// Why a shared connection was closed under its statements.
@@ -99,6 +136,15 @@ const LEFT_OPEN: &str = "a statement sent through the pool's shared methods (Poo
      connection was closed and the transaction rolled back, with every statement sent on it \
      since, this one included. Run transactions on a connection of the task's own: \
      pool.get().await?.transaction()";
+
+/// What a pool counts on its connections.
+#[derive(Default)]
+pub(crate) struct Counters {
+    /// Prepares refused for the server's `max_prepared_stmt_count`.
+    pub statement_limit_errors: Cell<u64>,
+    /// Sessions reset.
+    pub resets: Cell<u64>,
+}
 
 /// The state shared by a client and its two tasks.
 struct Conn {
@@ -111,6 +157,24 @@ struct Conn {
     config: Config,
     connection_id: u32,
     server_version: String,
+    /// The `SET` that sets the session up, run again after each reset.
+    session_sql: Rc<str>,
+    identity: Identity,
+    rollback_on_timeout: bool,
+    /// Counts resets of the session: statements prepared before one are gone
+    /// from the server.
+    generation: Cell<u64>,
+    /// While the connection is one task's own: something it sent may have
+    /// changed the session, which must then be reset before other tasks use
+    /// the connection.
+    dirty: Cell<bool>,
+    /// Set once the connection has failed, for [`CancelToken`]s on other
+    /// threads.
+    closed: Arc<AtomicBool>,
+    /// The default database changed since the session was last set up.
+    schema_changed: Cell<bool>,
+    /// Where the pool counts what happens on its connections.
+    counters: RefCell<Option<Rc<Counters>>>,
     tx: Cell<Tx>,
     /// Several tasks send statements on this connection at once (it is among
     /// a pool's shared connections): none of them may leave a transaction
@@ -147,6 +211,11 @@ struct Slot {
     kind: Kind,
     /// Sent while the connection was shared.
     shared: bool,
+    /// The session it was sent in.
+    generation: u64,
+    /// A statement of an open transaction: giving it up before its answer
+    /// marks the transaction [`Tx::Abandoned`].
+    in_tx: Option<Weak<Conn>>,
     inner: RefCell<SlotInner>,
 }
 
@@ -160,6 +229,10 @@ enum Kind {
         keep_rows: bool,
     },
     Simple,
+    /// The pool's own: a reset of the session, or setting it up again. It
+    /// changes the session on purpose, and if it fails, the connection is
+    /// closed rather than used in a state nobody chose.
+    Setup,
 }
 
 /// Where the answer to a request has got to.
@@ -194,6 +267,10 @@ struct SlotInner {
     /// The first result set has ended: later ones (from a stored
     /// procedure) are read and thrown away.
     first_done: bool,
+    /// The server said the statement changed the session.
+    session_changed: bool,
+    /// Bytes of column definitions received, bounded like rows.
+    meta_bytes: usize,
     ok: protocol::Ok,
     outcome: Option<Result<Response, Error>>,
 }
@@ -205,10 +282,18 @@ enum Response {
 }
 
 impl Slot {
-    fn new(kind: Kind, seq: u8, shared: bool) -> Rc<Self> {
+    fn new(
+        kind: Kind,
+        seq: u8,
+        shared: bool,
+        generation: u64,
+        in_tx: Option<Weak<Conn>>,
+    ) -> Rc<Self> {
         Rc::new(Slot {
             kind,
             shared,
+            generation,
+            in_tx,
             inner: RefCell::new(SlotInner {
                 seq,
                 ..SlotInner::default()
@@ -221,21 +306,34 @@ impl Slot {
 /// away; the statement still runs.
 struct Wait {
     slot: Rc<Slot>,
+    /// The outcome was handed over.
+    done: bool,
+}
+
+impl Wait {
+    fn new(slot: Rc<Slot>) -> Self {
+        Wait { slot, done: false }
+    }
 }
 
 impl Future for Wait {
     type Output = Result<Response, Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.slot.inner.borrow_mut();
-        let shared = matches!(self.slot.kind, Kind::Prepare { .. });
-        match &inner.outcome {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let slot = self.slot.clone();
+        let mut inner = slot.inner.borrow_mut();
+        let shared = matches!(slot.kind, Kind::Prepare { .. });
+        let ready = match &inner.outcome {
             Some(Ok(Response::Statement(stmt))) if shared => {
-                return Poll::Ready(Ok(Response::Statement(stmt.clone())))
+                Some(Ok(Response::Statement(stmt.clone())))
             }
-            Some(Err(e)) if shared => return Poll::Ready(Err(e.clone())),
-            Some(_) => return Poll::Ready(inner.outcome.take().expect("checked")),
-            None => {}
+            Some(Err(e)) if shared => Some(Err(e.clone())),
+            Some(_) => inner.outcome.take(),
+            None => None,
+        };
+        if let Some(outcome) = ready {
+            self.done = true;
+            return Poll::Ready(outcome);
         }
         if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
             inner.wakers.push(cx.waker().clone());
@@ -246,10 +344,20 @@ impl Future for Wait {
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        if !matches!(self.slot.kind, Kind::Prepare { .. }) {
+        if self.done || matches!(self.slot.kind, Kind::Prepare { .. }) {
+            return;
+        }
+        {
             let mut inner = self.slot.inner.borrow_mut();
             inner.abandoned = true;
             inner.rows = RowsBuilder::default();
+        }
+        // The application gave up on a statement of its transaction, which
+        // may run all the same: the transaction must not commit it unseen.
+        if let Some(conn) = self.slot.in_tx.as_ref().and_then(Weak::upgrade) {
+            if matches!(conn.tx.get(), Tx::Open | Tx::Uncertain) {
+                conn.tx.set(Tx::Abandoned);
+            }
         }
     }
 }
@@ -270,6 +378,32 @@ impl Client {
         Ok(Self::start(startup, config.clone()))
     }
 
+    /// A client of a server played from bytes (see [`crate::fuzzing`]), as
+    /// if it had just connected to MySQL 8.0.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn over_memory(
+        memory: crate::fuzzing::Memory,
+        config: Config,
+        rollback_on_timeout: bool,
+    ) -> Client {
+        Self::start(
+            Startup {
+                stream: Stream::Memory(memory),
+                buf: ReadBuf::new(),
+                connection_id: 1,
+                server_version: "8.0.46".to_owned(),
+                status: status::AUTOCOMMIT,
+                session_sql: "SET time_zone = '+00:00'".into(),
+                identity: Identity {
+                    peer: None,
+                    server_id: "memory".to_owned(),
+                },
+                rollback_on_timeout,
+            },
+            config,
+        )
+    }
+
     fn start(startup: Startup, config: Config) -> Client {
         let Startup {
             stream,
@@ -277,6 +411,9 @@ impl Client {
             connection_id,
             server_version,
             status,
+            session_sql,
+            identity,
+            rollback_on_timeout,
         } = startup;
         let conn = Rc::new_cyclic(|weak| Conn {
             weak: weak.clone(),
@@ -285,6 +422,14 @@ impl Client {
             config,
             connection_id,
             server_version,
+            session_sql,
+            identity,
+            rollback_on_timeout,
+            generation: Cell::new(0),
+            dirty: Cell::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
+            schema_changed: Cell::new(false),
+            counters: RefCell::new(None),
             tx: Cell::new(Tx::None),
             shared: Cell::new(false),
             idle_wakers: RefCell::new(Vec::new()),
@@ -378,14 +523,20 @@ impl Client {
     ///
     /// Fails with [`ErrorKind::RowCount`] when the statement generated no id;
     /// use [`execute`](Self::execute) for those.
+    ///
+    /// That error comes after the statement has run: its rows are written,
+    /// and under autocommit committed. Do not retry on it, or the rows are
+    /// written twice. `INSERT ... ON DUPLICATE KEY UPDATE` that updates a row
+    /// without changing its id also ends this way; use `execute` for it.
     pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let (_, ok, _) = self.run(sql, params, false).await?;
         if ok.last_insert_id == 0 {
             return Err(Error::new(
                 ErrorKind::RowCount,
                 format!(
-                    "the statement generated no AUTO_INCREMENT id ({} rows affected); use \
-                     execute for statements on tables without one",
+                    "the statement ran ({} rows affected, and committed under autocommit) but \
+                     generated no AUTO_INCREMENT id, so do not run it again; use execute for \
+                     statements on tables without one, and for ON DUPLICATE KEY UPDATE",
                     ok.affected_rows
                 ),
             ));
@@ -402,11 +553,30 @@ impl Client {
     /// `ALTER`, `DROP`) as it runs, so wrapping them in a transaction does not
     /// make them all-or-nothing.
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
-        self.conn.check_tx()?;
+        self.conn.check_tx().await?;
+        let may_change = sql.split(';').any(session::may_change);
+        if may_change && !self.conn.shared.get() {
+            self.conn.dirty.set(true);
+        }
         let slot = self.conn.enqueue(Kind::Simple, |out| {
             Ok(protocol::command_text(out, com::QUERY, sql))
         })?;
-        Wait { slot }.await.map(|_| ())
+        // On a connection other tasks share, the statements they send next
+        // would run in whatever session the batch leaves: a reset follows it
+        // at once.
+        if may_change && self.conn.shared.get() {
+            self.conn.queue_reset();
+        }
+        Wait::new(slot).await.map(|_| ())
+    }
+
+    /// Runs one statement of the client's own (`BEGIN`, `ROLLBACK`) and
+    /// waits for it.
+    async fn text(&self, sql: &str) -> Result<(), Error> {
+        let slot = self.conn.enqueue(Kind::Simple, |out| {
+            Ok(protocol::command_text(out, com::QUERY, sql))
+        })?;
+        Wait::new(slot).await.map(|_| ())
     }
 
     /// Starts a transaction.
@@ -429,16 +599,44 @@ impl Client {
     /// `CREATE TABLE` committed it, the statements that follow fail instead
     /// of running outside any transaction, and `commit` fails.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
-        self.conn.check_tx()?;
+        self.conn.check_tx().await?;
         // The guard exists before BEGIN is sent: if this future is dropped
         // while waiting, the guard's drop rolls the transaction back.
         let tx = Transaction {
             client: self,
             done: false,
         };
-        tx.client.batch_execute("BEGIN").await?;
+        tx.client.text("BEGIN").await?;
         tx.client.conn.tx.set(Tx::Open);
         Ok(tx)
+    }
+
+    /// Resets the session to what it was right after connecting, and waits
+    /// for the server to confirm.
+    ///
+    /// The server (`COM_RESET_CONNECTION`) rolls back an open transaction,
+    /// releases table locks and named locks (`GET_LOCK`), drops temporary
+    /// tables, forgets user variables and SQL prepared statements, and sets
+    /// every session variable back to the server's default; then the
+    /// session is set up again as when connecting (character set, time
+    /// zone, time limits and [`Config::session_variable`](crate::Config::session_variable)s).
+    /// The server also frees the statements this client prepared, so the
+    /// statement cache starts empty.
+    ///
+    /// A [`Pool`](crate::Pool) does this by itself when a connection taken
+    /// with [`Pool::get`](crate::Pool::get) comes back and may have changed
+    /// its session. Call it before giving a connection back when a stored
+    /// function or trigger took a named lock or set a user variable with
+    /// `SELECT ... INTO`, which the server does not report.
+    ///
+    /// Fails with [`ErrorKind::Closed`] if the server refused the reset: the
+    /// connection is then closed rather than left in a state nobody chose.
+    pub async fn reset_session(&self) -> Result<(), Error> {
+        let slots = self.conn.queue_reset_slots()?;
+        for slot in slots {
+            Wait::new(slot).await?;
+        }
+        Ok(())
     }
 
     /// A handle that asks the server to stop whatever this connection is
@@ -447,6 +645,8 @@ impl Client {
         CancelToken {
             config: self.conn.config.clone(),
             connection_id: self.conn.connection_id,
+            identity: self.conn.identity.clone(),
+            closed: self.conn.closed.clone(),
         }
     }
 
@@ -497,20 +697,27 @@ impl Client {
         }
     }
 
-    /// Rolls back whatever transaction is open, and forgets any
-    /// [`Transaction`] that ended early. A statement still on its way (its
-    /// future was dropped, by a timeout say) may be a `BEGIN`, which the last
-    /// answer cannot tell, so then `ROLLBACK` is sent anyway.
-    pub(crate) fn reset_transaction(&self) {
-        if self.in_flight() > 0 || self.in_transaction() {
-            self.send_and_forget("ROLLBACK");
-        }
-        self.conn.tx.set(Tx::None);
+    /// Whether the connection must be reset before other tasks use it:
+    /// something sent on it may have changed the session, a transaction
+    /// may be open (a statement still on its way may be a `BEGIN`, which
+    /// the last answer cannot tell), or autocommit is off.
+    pub(crate) fn needs_reset(&self) -> bool {
+        let status = self.conn.state.borrow().status;
+        self.conn.dirty.get()
+            || self.in_flight() > 0
+            || self.in_transaction()
+            || status & status::AUTOCOMMIT == 0
     }
 
-    /// Whether the last answer from the server said autocommit was on.
-    pub(crate) fn autocommit(&self) -> bool {
-        self.conn.state.borrow().status & status::AUTOCOMMIT != 0
+    /// Queues a reset of the session, ahead of anything sent after it,
+    /// without waiting for it; see [`reset_session`](Self::reset_session).
+    pub(crate) fn queue_reset(&self) {
+        self.conn.queue_reset();
+    }
+
+    /// Where the pool counts what happens on this connection.
+    pub(crate) fn count_into(&self, counters: Rc<Counters>) {
+        *self.conn.counters.borrow_mut() = Some(counters);
     }
 
     /// Marks the connection as shared between tasks, or as one task's own.
@@ -536,14 +743,22 @@ impl Client {
         params: &[&dyn ToSql],
         keep_rows: bool,
     ) -> Result<(ResultSet, protocol::Ok, u64), Error> {
-        self.conn.check_tx()?;
+        self.conn.check_tx().await?;
         if params.len() > MAX_PARAMS {
             return Err(Error::conversion(format!(
                 "{} parameters were given; a statement can have at most {MAX_PARAMS}",
                 params.len()
             )));
         }
-        let stmt = self.conn.statement(sql).await?;
+        if !self.conn.shared.get() && session::may_change(sql) {
+            self.conn.dirty.set(true);
+        }
+        let mut stmt = self.conn.statement(sql).await?;
+        // Prepared before a reset of the session that was queued while this
+        // task waited: the server forgets it at the reset, so prepare again.
+        while stmt.generation != self.conn.generation.get() {
+            stmt = self.conn.statement(sql).await?;
+        }
         if stmt.params != params.len() {
             return Err(Error::conversion(format!(
                 "the statement has {} parameters (?) but {} values were given",
@@ -559,7 +774,7 @@ impl Client {
             |out| encode_execute(out, stmt.id, params),
         )?;
         drop(stmt);
-        match (Wait { slot }).await? {
+        match Wait::new(slot).await? {
             Response::Rows(set, ok, rows) => Ok((set, ok, rows)),
             _ => unreachable!("an execute slot ends with rows"),
         }
@@ -619,6 +834,56 @@ impl std::fmt::Debug for Client {
 }
 
 impl Conn {
+    /// Queues `COM_RESET_CONNECTION`, the session's `SET` and the default
+    /// database (which the reset keeps), which run before anything sent
+    /// after them, and forgets the prepared statements the reset frees;
+    /// returns their slots.
+    ///
+    /// Without a database in the configuration, a connection whose `USE`
+    /// changed it cannot be put back: it is closed instead.
+    fn queue_reset_slots(&self) -> Result<Vec<Rc<Slot>>, Error> {
+        if self.config.database.is_none() && self.schema_changed.get() {
+            let e = Error::closed(
+                "a statement changed the connection's default database (USE), which resetting \
+                 the session cannot undo when the configuration names none, so the connection \
+                 was closed rather than shared; set Config::database",
+            );
+            self.fail(e.clone());
+            return Err(e);
+        }
+        let mut slots = vec![self.enqueue(Kind::Setup, |out| {
+            Ok(protocol::command(out, com::RESET_CONNECTION))
+        })?];
+        let sql = self.session_sql.clone();
+        slots.push(self.enqueue(Kind::Setup, |out| {
+            Ok(protocol::command_text(out, com::QUERY, &sql))
+        })?);
+        if let Some(database) = &self.config.database {
+            slots.push(self.enqueue(Kind::Setup, |out| {
+                Ok(protocol::command_text(out, com::INIT_DB, database))
+            })?);
+        }
+        self.generation.set(self.generation.get() + 1);
+        // Their ids mean nothing once the reset has run: nothing is closed.
+        self.state.borrow_mut().cache.clear();
+        self.dirty.set(false);
+        self.schema_changed.set(false);
+        self.tx.set(Tx::None);
+        if let Some(counters) = &*self.counters.borrow() {
+            counters.resets.set(counters.resets.get() + 1);
+        }
+        Ok(slots)
+    }
+
+    /// [`queue_reset_slots`](Self::queue_reset_slots), not waited for.
+    fn queue_reset(&self) {
+        if let Ok(slots) = self.queue_reset_slots() {
+            for slot in slots {
+                slot.inner.borrow_mut().abandoned = true;
+            }
+        }
+    }
+
     /// Appends a request and queues its slot, or fails without sending
     /// anything. `encode` returns the sequence number the answer starts
     /// with.
@@ -639,7 +904,10 @@ impl Conn {
                 return Err(e);
             }
         };
-        let slot = Slot::new(kind, seq, self.shared.get());
+        let in_tx = (matches!(kind, Kind::Execute { .. } | Kind::Simple)
+            && matches!(self.tx.get(), Tx::Open | Tx::Uncertain))
+        .then(|| self.weak.clone());
+        let slot = Slot::new(kind, seq, self.shared.get(), self.generation.get(), in_tx);
         if st.queue.is_empty() {
             self.head_since.set(Some(giong::time::Instant::now()));
         }
@@ -650,28 +918,110 @@ impl Conn {
         Ok(slot)
     }
 
-    /// Refuses statements in a transaction the server already ended.
-    fn check_tx(&self) -> Result<(), Error> {
-        match self.tx.get() {
-            Tx::RolledBack => Err(Error::new(
-                ErrorKind::Db,
-                "the transaction was rolled back by the server (a deadlock); this statement \
-                 would run outside any transaction, so it was not sent. Drop the transaction \
-                 and run it again from the start",
-            )),
-            Tx::Committed => Err(Error::new(
-                ErrorKind::Db,
-                "a statement in this transaction (such as CREATE, ALTER or DROP) made MySQL \
-                 commit it; this statement would run outside any transaction, so it was not \
-                 sent. Keep DDL out of transactions",
-            )),
-            Tx::None | Tx::Open => Ok(()),
+    /// Refuses statements in a transaction the server already ended, or
+    /// that gave up a statement. After an error whose effect on the
+    /// transaction is unknown, first asks the server whether it is still
+    /// open (one round trip, only then).
+    async fn check_tx(&self) -> Result<(), Error> {
+        if self.tx.get() == Tx::Uncertain {
+            // A ping's OK carries the server's status: whether a
+            // transaction is open. `record_ok` takes it in.
+            let slot = self.enqueue(Kind::Simple, |out| Ok(protocol::command(out, com::PING)))?;
+            Wait::new(slot).await?;
         }
+        self.tx_error().map_or(Ok(()), Err)
+    }
+
+    /// Why no statement may be sent in the current transaction, if so.
+    fn tx_error(&self) -> Option<Error> {
+        let message = match self.tx.get() {
+            Tx::None | Tx::Open | Tx::Uncertain => return None,
+            Tx::RolledBack => {
+                "the server rolled this transaction back (a deadlock, a lock wait timeout with \
+                 innodb_rollback_on_timeout on, or a full lock table); this statement would run \
+                 outside any transaction, so it was not sent. Drop the transaction and run it \
+                 again from the start"
+            }
+            Tx::Ended => {
+                "the server ended this transaction before COMMIT: a statement in it (such as \
+                 CREATE, ALTER or DROP) made it commit, or an error rolled it back. This \
+                 statement would run outside any transaction, so it was not sent; statements \
+                 sent before this one became known ran outside it. Keep DDL out of \
+                 transactions, and run the transaction again from the start"
+            }
+            Tx::Abandoned => {
+                "a statement of this transaction was given up before its answer came (its \
+                 future was dropped, by a timeout say), and it may have run, so the transaction \
+                 cannot be committed; this statement was not sent. Drop the transaction (which \
+                 rolls it back) and run it again from the start"
+            }
+        };
+        Some(Error::new(ErrorKind::Db, message))
     }
 
     /// The prepared statement for `sql`: from the cache, from a prepare
     /// already in flight, or prepared now.
+    ///
+    /// When the server holds as many prepared statements as it allows, for
+    /// all its clients together, the statements this connection is not using
+    /// are closed and the prepare tried once more.
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
+        let e = match self.statement_once(sql).await {
+            Err(e) if e.code() == Some(code::PREPARED_LIMIT) => e,
+            other => return other,
+        };
+        if let Some(counters) = &*self.counters.borrow() {
+            counters
+                .statement_limit_errors
+                .set(counters.statement_limit_errors.get() + 1);
+        }
+        let closed = self.close_unused();
+        self.statement_once(sql).await.map_err(|again| {
+            let Some(db) = again.db().cloned() else {
+                return again;
+            };
+            if db.code() != code::PREPARED_LIMIT {
+                return again;
+            }
+            Error::with_db(
+                ErrorKind::Db,
+                format!(
+                    "the server holds as many prepared statements as its max_prepared_stmt_count \
+                     allows, counting those of every client (this connection closed the {closed} \
+                     it was not using and tried again). Lower Config::statement_cache_capacity or \
+                     the number of connections, or raise max_prepared_stmt_count on the server \
+                     (first error: {e})"
+                ),
+                db,
+            )
+        })
+    }
+
+    /// Closes the cached statements no task is about to use; returns how
+    /// many.
+    fn close_unused(&self) -> usize {
+        let mut st = self.state.borrow_mut();
+        let unused: Vec<Rc<str>> = st
+            .cache
+            .iter()
+            .filter_map(|(k, e)| match e {
+                Entry::Ready { stmt, .. } if Rc::strong_count(stmt) == 1 => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        for key in &unused {
+            if let Some(Entry::Ready { stmt, .. }) = st.cache.remove(key) {
+                // No answer comes for a close.
+                protocol::command_stmt(&mut st.out, com::STMT_CLOSE, stmt.id);
+            }
+        }
+        if let Some(w) = st.writer.take() {
+            w.wake();
+        }
+        unused.len()
+    }
+
+    async fn statement_once(&self, sql: &str) -> Result<Rc<Statement>, Error> {
         let pending = {
             let mut st = self.state.borrow_mut();
             st.clock += 1;
@@ -688,7 +1038,7 @@ impl Conn {
         let Some(slot) = pending else {
             return self.prepare(sql).await;
         };
-        match (Wait { slot }).await? {
+        match Wait::new(slot).await? {
             Response::Statement(stmt) => Ok(stmt),
             _ => unreachable!("a prepare slot ends with a statement"),
         }
@@ -710,7 +1060,7 @@ impl Conn {
                 .cache
                 .insert(key, Entry::Preparing(slot.clone()));
         }
-        match (Wait { slot }).await? {
+        match Wait::new(slot).await? {
             Response::Statement(stmt) => Ok(stmt),
             _ => unreachable!("a prepare slot ends with a statement"),
         }
@@ -724,6 +1074,7 @@ impl Conn {
             if st.broken.is_none() {
                 st.broken = Some(err.clone());
             }
+            self.closed.store(true, Ordering::Release);
             st.cache.clear();
             st.out.clear();
             self.head_since.set(None);
@@ -804,8 +1155,20 @@ impl Conn {
                 "the server sent a message larger than max_result_size that is not a row",
             ));
         }
-        inner.rows.set_overflow();
-        inner.row_count += 1;
+        // Only a result that is kept can be too large: `execute` counts the
+        // rows and throws them away.
+        if matches!(
+            slot.kind,
+            Kind::Execute {
+                keep_rows: true,
+                ..
+            }
+        ) {
+            inner.rows.set_overflow();
+        }
+        if !inner.first_done {
+            inner.row_count += 1;
+        }
         Ok(())
     }
 
@@ -841,7 +1204,7 @@ impl Conn {
                 }
             },
             Phase::Start => match first {
-                0x00 => self.record_ok(&mut inner, payload)?,
+                0x00 => self.record_ok(&slot.kind, &mut inner, payload)?,
                 0xFF => {
                     self.record_error(&mut inner, payload)?;
                     true
@@ -854,6 +1217,11 @@ impl Conn {
                 }
                 _ => {
                     let count = Reader::new(payload).lenenc("a column count")?;
+                    if count == 0 || count > MAX_COLUMNS {
+                        return Err(Error::protocol(format!(
+                            "the server announced a result of {count} columns"
+                        )));
+                    }
                     inner.columns.clear();
                     inner.phase = Phase::Columns { left: count };
                     false
@@ -870,6 +1238,14 @@ impl Conn {
                 }
             }
             Phase::Columns { left } => {
+                // Bounded like the rows, so that a server cannot grow the
+                // client without end with column definitions.
+                inner.meta_bytes += payload.len();
+                if inner.meta_bytes > self.config.max_result_size.max(1 << 20) {
+                    return Err(Error::protocol(
+                        "the server sent column definitions larger than max_result_size",
+                    ));
+                }
                 let def: ColumnDef = protocol::column_def(payload)?;
                 inner.columns.push(Column::from_def(def));
                 if left > 1 {
@@ -889,7 +1265,7 @@ impl Conn {
                     true
                 } else if protocol::is_end_of_rows(payload) {
                     inner.first_done = true;
-                    self.record_ok(&mut inner, payload)?
+                    self.record_ok(&slot.kind, &mut inner, payload)?
                 } else {
                     inner.phase = Phase::Rows;
                     let keep = matches!(
@@ -917,13 +1293,30 @@ impl Conn {
             // A statement sent on a shared connection opened a transaction,
             // or turned autocommit off: the statements other tasks send next
             // would run inside it, and be lost with it.
-            let left_open = slot.shared && {
+            let left_open = slot.shared && !matches!(slot.kind, Kind::Setup) && {
                 let status = self.state.borrow().status;
                 status & status::IN_TRANS != 0 || status & status::AUTOCOMMIT == 0
             };
             if left_open {
                 inner.error = Some(Error::closed(LEFT_OPEN));
             }
+            // The pool's own reset failed: nobody chose the state the
+            // session is in now.
+            let setup_failed = matches!(slot.kind, Kind::Setup) && inner.error.is_some();
+            // A statement on a shared connection changed its session in a
+            // way only the server saw (a trigger, a stored routine): reset
+            // it before more statements of other tasks run in it.
+            let reset = slot.shared
+                && inner.session_changed
+                && !matches!(slot.kind, Kind::Setup)
+                && slot.generation == self.generation.get();
+            let setup_error = setup_failed.then(|| {
+                let e = inner.error.clone().expect("checked");
+                Error::closed(format!(
+                    "resetting the session of a pooled connection failed ({e}), so the \
+                     connection was closed"
+                ))
+            });
             drop(inner);
             let idle = {
                 let mut st = self.state.borrow_mut();
@@ -937,7 +1330,12 @@ impl Conn {
                 // Closing the connection makes the server roll back.
                 return Err(Error::closed(LEFT_OPEN));
             }
-            if idle {
+            if let Some(e) = setup_error {
+                return Err(e);
+            }
+            if reset {
+                self.queue_reset();
+            } else if idle {
                 self.wake_idle();
             }
         }
@@ -958,11 +1356,24 @@ impl Conn {
     }
 
     /// Takes in an OK packet; returns whether the answer is complete.
-    fn record_ok(&self, inner: &mut SlotInner, payload: &[u8]) -> Result<bool, Error> {
+    fn record_ok(&self, kind: &Kind, inner: &mut SlotInner, payload: &[u8]) -> Result<bool, Error> {
         let ok = protocol::ok(payload)?;
         self.state.borrow_mut().status = ok.status;
-        if self.tx.get() == Tx::Open && ok.status & status::IN_TRANS == 0 {
-            self.tx.set(Tx::Committed);
+        let open = ok.status & status::IN_TRANS != 0;
+        match self.tx.get() {
+            // DDL committed it, or an error rolled it back.
+            Tx::Open if !open => self.tx.set(Tx::Ended),
+            // After an error: the answer says whether the transaction lived.
+            Tx::Uncertain if open => self.tx.set(Tx::Open),
+            Tx::Uncertain => self.tx.set(Tx::RolledBack),
+            _ => {}
+        }
+        if ok.session_changed && !matches!(kind, Kind::Setup) {
+            inner.session_changed = true;
+            self.dirty.set(true);
+            if ok.schema_changed {
+                self.schema_changed.set(true);
+            }
         }
         // The first OK of the answer counts (for a stored procedure, the
         // statement's own result).
@@ -979,17 +1390,38 @@ impl Conn {
 
     fn record_error(&self, inner: &mut SlotInner, payload: &[u8]) -> Result<(), Error> {
         let db = DbError::parse(payload)?;
-        if db.code() == code::DEADLOCK && self.tx.get() == Tx::Open {
-            self.tx.set(Tx::RolledBack);
+        if matches!(self.tx.get(), Tx::Open | Tx::Uncertain) {
+            let rolled_back = match db.code() {
+                code::DEADLOCK | code::LOCK_TABLE_FULL => true,
+                code::LOCK_WAIT_TIMEOUT => self.rollback_on_timeout,
+                _ => false,
+            };
+            // Any other error usually ends only its statement, but not
+            // always (Galera conflicts, errors MySQL adds later): the next
+            // statement first makes sure the transaction is still open.
+            self.tx.set(if rolled_back {
+                Tx::RolledBack
+            } else {
+                Tx::Uncertain
+            });
         }
+        // A statement that failed half way may have changed the session
+        // (a trigger that set a variable) without the server saying so.
+        self.dirty.set(true);
         if inner.error.is_none() {
-            let note = (db.code() == code::QUERY_TIMEOUT).then(|| {
-                format!(
+            let note = match db.code() {
+                code::QUERY_TIMEOUT => Some(format!(
                     "the SELECT ran longer than the statement timeout ({:?}; \
                      Config::statement_timeout)",
                     self.config.statement_timeout
-                )
-            });
+                )),
+                code::STATEMENT_TIMEOUT => Some(format!(
+                    "the statement ran longer than the statement timeout ({:?}; \
+                     Config::statement_timeout)",
+                    self.config.statement_timeout
+                )),
+                _ => None,
+            };
             inner.error = Some(Error::from_db(db, note));
         }
         Ok(())
@@ -1009,6 +1441,7 @@ impl Conn {
                         params: usize::from(ok.params),
                         columns: RefCell::new(Rc::from(Vec::new())),
                         conn: (!*cached).then(|| self.weak.clone()),
+                        generation: slot.generation,
                     })),
                     (None, None) => {
                         Err(Error::protocol("the server did not describe the statement"))
@@ -1045,7 +1478,7 @@ impl Conn {
                     ))
                 }
             },
-            Kind::Simple => match error {
+            Kind::Simple | Kind::Setup => match error {
                 Some(e) => Err(e),
                 None => Ok(Response::Done),
             },
@@ -1057,15 +1490,25 @@ impl Conn {
     }
 
     /// Takes a cached statement out of the cache when the server no longer
-    /// knows it. The next run prepares it afresh.
+    /// knows it (1243), or it no longer fits the schema (1615). The next run
+    /// prepares it afresh.
     fn forget_if_stale(&self, stmt: &Statement, e: &Error) {
-        if !matches!(e.code(), Some(code::UNKNOWN_STMT | code::NEED_REPREPARE)) {
+        let code = e.code();
+        if !matches!(code, Some(code::UNKNOWN_STMT | code::NEED_REPREPARE)) {
             return;
         }
         let mut st = self.state.borrow_mut();
         if matches!(st.cache.get(&stmt.sql), Some(Entry::Ready { stmt: s, .. }) if s.id == stmt.id)
         {
             st.cache.remove(&stmt.sql);
+            // The server still holds a statement that needs preparing again,
+            // and counts it against max_prepared_stmt_count until closed.
+            if code == Some(code::NEED_REPREPARE) && stmt.generation == self.generation.get() {
+                protocol::command_stmt(&mut st.out, com::STMT_CLOSE, stmt.id);
+                if let Some(w) = st.writer.take() {
+                    w.wake();
+                }
+            }
         }
     }
 
@@ -1075,9 +1518,13 @@ impl Conn {
         let mut st = self.state.borrow_mut();
         let ours = matches!(st.cache.get(sql), Some(Entry::Preparing(s)) if Rc::ptr_eq(s, slot));
         if !ours {
-            // A statement prepared for a cache that was cleared: close it.
+            // A statement prepared for a cache that was cleared: close it,
+            // unless a reset of the session freed it already (its id may be
+            // another statement's by now).
             if let Ok(stmt) = result {
-                protocol::command_stmt(&mut st.out, com::STMT_CLOSE, stmt.id);
+                if slot.generation == self.generation.get() {
+                    protocol::command_stmt(&mut st.out, com::STMT_CLOSE, stmt.id);
+                }
             }
             return;
         }
@@ -1171,7 +1618,11 @@ async fn write_loop(conn: Rc<Conn>) {
             return;
         }
         data.clear();
-        spare = data;
+        // One large statement must not leave every pooled connection holding
+        // a buffer its size.
+        if data.capacity() <= KEEP_CAPACITY {
+            spare = data;
+        }
     }
     if conn.state.borrow().closing {
         conn.stream.shutdown(Shutdown::Write);
@@ -1195,30 +1646,30 @@ impl Transaction<'_> {
     /// When the server ended the transaction early (a deadlock rolled it
     /// back, or DDL committed it), this is reported as an error, never as a
     /// successful commit.
+    ///
+    /// After a statement in it failed, this first asks the server whether
+    /// the error ended the transaction (one round trip).
     pub async fn commit(mut self) -> Result<(), Error> {
-        self.done = true;
         let conn = self.client.conn.clone();
-        let state = conn.tx.replace(Tx::None);
-        if state != Tx::Open {
-            conn.tx.set(state);
-            let err = conn.check_tx().err();
-            conn.tx.set(Tx::None);
-            if let Some(e) = err {
-                self.client.send_and_forget("ROLLBACK");
-                return Err(e);
-            }
+        // If this future is dropped while asking, the guard rolls back.
+        let checked = conn.check_tx().await;
+        self.done = true;
+        conn.tx.set(Tx::None);
+        if let Err(e) = checked {
+            self.client.send_and_forget("ROLLBACK");
+            return Err(e);
         }
         let slot = conn.enqueue(Kind::Simple, |out| {
             Ok(protocol::command_text(out, com::QUERY, "COMMIT"))
         })?;
-        (Wait { slot }).await.map(|_| ())
+        Wait::new(slot).await.map(|_| ())
     }
 
     /// Rolls the transaction back and waits for the server to confirm.
     pub async fn rollback(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.conn.tx.set(Tx::None);
-        self.client.batch_execute("ROLLBACK").await
+        self.client.text("ROLLBACK").await
     }
 }
 
@@ -1252,20 +1703,37 @@ impl std::fmt::Debug for Transaction<'_> {
 /// It can be sent to another thread. The request is `KILL QUERY` over a new
 /// connection with the same settings, so the user needs the right to kill
 /// its own statements (every user has it) or others' (`CONNECTION_ADMIN`).
-/// The statement that is stopped fails with error 1317 (query interrupted);
-/// the connection stays usable. With several tasks sharing the connection,
-/// the statement running when the request arrives is the one stopped.
+/// The statement that is stopped fails with error 1317 (query interrupted)
+/// on MySQL, 1927 on MariaDB; the connection stays usable.
+///
+/// What is stopped is whatever the connection runs when the request
+/// arrives: with several tasks sharing the connection, or when the
+/// statement meant has just finished, that is the next statement in line.
+///
+/// Connection ids are unique only within one server, so the request goes to
+/// the address the connection reached (not to the host name again, which
+/// behind DNS round robin or a load balancer may lead to another server),
+/// and `KILL QUERY` is sent only if the server there is the same one
+/// (`@@server_uuid`; on MariaDB, its host name, port and server id). A
+/// balancer between the two can still lead elsewhere; then
+/// [`cancel`](Self::cancel) fails and kills nothing.
 #[derive(Clone)]
 pub struct CancelToken {
     config: Config,
     connection_id: u32,
+    identity: Identity,
+    closed: Arc<AtomicBool>,
 }
 
 impl CancelToken {
     /// Sends the request. Success means the server received it, not that
-    /// something was stopped: the statement may have finished first.
+    /// something was stopped: the statement may have finished first. Once
+    /// the connection is closed, it does nothing: its id may be reused.
     pub async fn cancel(&self) -> Result<(), Error> {
-        connect::kill_query(&self.config, self.connection_id).await
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        connect::kill_query(&self.config, &self.identity, self.connection_id).await
     }
 }
 
