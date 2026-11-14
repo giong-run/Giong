@@ -51,6 +51,7 @@ use std::time::{Duration, SystemTime};
 use crate::buf::{IoBuf, IoBufMut};
 use crate::driver::Io;
 use crate::error::{raise, Code};
+use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime;
 
@@ -58,19 +59,25 @@ fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
 }
 
-fn c_path(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        raise(
-            Code::InvalidPath,
-            format!("the path {path:?} contains a NUL byte"),
-            "remove the NUL byte; Linux paths cannot contain one.",
-        )
-    })
+/// `path` as a C string for the kernel, in a [`KernelBox`] so that the
+/// pointer to it stays valid while the operation's resources move.
+fn c_path(path: &Path) -> io::Result<KernelBox<CString>> {
+    CString::new(path.as_os_str().as_bytes())
+        .map(KernelBox::path)
+        .map_err(|_| {
+            raise(
+                Code::InvalidPath,
+                format!("the path {path:?} contains a NUL byte"),
+                "remove the NUL byte; Linux paths cannot contain one.",
+            )
+        })
 }
 
 /// Runs an operation whose only resource is one path.
-async fn path_op(path: CString, io: Io) -> io::Result<i32> {
-    let (res, _, _path) = Op::new(io, path).await;
+async fn path_op(path: KernelBox<CString>, io: Io) -> io::Result<i32> {
+    // SAFETY: the operation's only pointer is to the path in its
+    // `KernelBox`.
+    let (res, _, _path) = unsafe { Op::new(io, path) }.await;
     if res < 0 {
         Err(os_err(res))
     } else {
@@ -150,28 +157,49 @@ impl OpenOptions {
         self
     }
 
-    /// Extra `open(2)` flags, for example `libc::O_DIRECT`.
+    /// Extra `open(2)` flags, for example `libc::O_DIRECT`. The access mode
+    /// bits (`O_RDONLY`, `O_WRONLY`, `O_RDWR`) are ignored: they come from
+    /// [`read`](Self::read), [`write`](Self::write) and
+    /// [`append`](Self::append), as in the standard library.
     pub fn custom_flags(mut self, flags: i32) -> Self {
         self.custom_flags = flags;
         self
     }
 
     fn flags(&self) -> io::Result<i32> {
-        let invalid = || io::Error::from_raw_os_error(libc::EINVAL);
         let access = match (self.read, self.write, self.append) {
             (true, false, false) => libc::O_RDONLY,
             (false, true, false) => libc::O_WRONLY,
             (true, true, false) => libc::O_RDWR,
             (false, _, true) => libc::O_WRONLY | libc::O_APPEND,
             (true, _, true) => libc::O_RDWR | libc::O_APPEND,
-            (false, false, false) => return Err(invalid()),
+            (false, false, false) => {
+                return Err(invalid_options(
+                    "the open options ask for neither read, write nor append access",
+                    "add .read(true), .write(true) or .append(true)",
+                ))
+            }
         };
         let writable = self.write || self.append;
         if !writable && (self.truncate || self.create || self.create_new) {
-            return Err(invalid());
+            let what = if self.truncate {
+                "truncate"
+            } else if self.create_new {
+                "create_new"
+            } else {
+                "create"
+            };
+            return Err(invalid_options(
+                format!("the open options ask for {what} without write access"),
+                format!("add .write(true) (or .append(true)), or remove .{what}(true)"),
+            ));
         }
         if self.append && self.truncate && !self.create_new {
-            return Err(invalid());
+            return Err(invalid_options(
+                "the open options ask for both append and truncate",
+                "to empty the file and then append, open it with .write(true).truncate(true) \
+                 and write in order; to keep what it has, remove .truncate(true)",
+            ));
         }
         let creation = match (self.create, self.truncate, self.create_new) {
             (_, _, true) => libc::O_CREAT | libc::O_EXCL,
@@ -180,15 +208,23 @@ impl OpenOptions {
             (false, true, false) => libc::O_TRUNC,
             (true, true, false) => libc::O_CREAT | libc::O_TRUNC,
         };
-        Ok(access | creation | libc::O_CLOEXEC | self.custom_flags)
+        // The access mode comes from read/write/append alone, as in the
+        // standard library: custom flags cannot turn a read-only open into a
+        // writable one.
+        Ok(access | creation | libc::O_CLOEXEC | (self.custom_flags & !libc::O_ACCMODE))
     }
 
     /// Opens `path` with these options.
+    ///
+    /// If the future is dropped once the open has started, the descriptor
+    /// it may still produce is closed. What the open did to the file stays
+    /// done: a dropped `create` or `truncate` may have created or emptied
+    /// the file, in any runtime.
     pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         let flags = self.flags()?;
         let path = c_path(path.as_ref())?;
         let io = Io::OpenAt {
-            path: path.as_ptr(),
+            path: path.c_ptr(),
             flags,
             mode: self.mode,
         };
@@ -201,6 +237,38 @@ impl Default for OpenOptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Refuses an offset Linux cannot take. io_uring reads `u64::MAX` (-1) as
+/// "the file's current position", so without this check such an offset would
+/// read or write wherever the descriptor's position happens to be on
+/// io_uring, and fail with `EINVAL` on epoll.
+#[cold]
+fn invalid_options(
+    message: impl Into<std::borrow::Cow<'static, str>>,
+    fix: impl Into<std::borrow::Cow<'static, str>>,
+) -> io::Error {
+    raise(Code::InvalidOpenOptions, message, fix)
+}
+
+fn check_offset(offset: u64) -> io::Result<()> {
+    if offset > i64::MAX as u64 {
+        return Err(offset_out_of_range(offset));
+    }
+    Ok(())
+}
+
+#[cold]
+fn offset_out_of_range(offset: u64) -> io::Error {
+    raise(
+        Code::OffsetOutOfRange,
+        format!(
+            "file offset {offset} is above {}, the largest Linux has",
+            i64::MAX
+        ),
+        "check the arithmetic that computed the offset for a wrap-around. To write at the end \
+         of a file, open it with OpenOptions::append(true).",
+    )
 }
 
 /// An open file.
@@ -256,7 +324,13 @@ impl File {
     /// is a pipe or a device, a read that is dropped while in flight may
     /// still take data that arrives before the kernel has processed the
     /// cancellation, and that data is lost.
+    ///
+    /// Fails with `GIONG-E0202` if `offset` is above `i64::MAX`, the largest
+    /// file offset Linux has.
     pub async fn read_at<B: IoBufMut>(&self, mut buf: B, offset: u64) -> (io::Result<usize>, B) {
+        if let Err(e) = check_offset(offset) {
+            return (Err(e), buf);
+        }
         let len = buf.capacity().min(u32::MAX as usize) as u32;
         let io = Io::Read {
             fd: self.fd,
@@ -264,7 +338,8 @@ impl File {
             len,
             offset,
         };
-        let (res, _, mut buf) = Op::new(io, buf).await;
+        // SAFETY: an `IoBufMut`'s bytes stay put when it moves.
+        let (res, _, mut buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
@@ -275,6 +350,9 @@ impl File {
 
     /// Writes some bytes of `buf` at `offset`, returning how many were
     /// written.
+    ///
+    /// Fails with `GIONG-E0202` if `offset` is above `i64::MAX`, the largest
+    /// file offset Linux has.
     pub async fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> (io::Result<usize>, B) {
         self.write_from(buf, 0, offset).await
     }
@@ -284,7 +362,10 @@ impl File {
     pub async fn write_all_at<B: IoBuf>(&self, mut buf: B, offset: u64) -> (io::Result<()>, B) {
         let mut written = 0;
         while written < buf.len() {
-            let (res, b) = self.write_from(buf, written, offset + written as u64).await;
+            let Some(at) = offset.checked_add(written as u64) else {
+                return (Err(offset_out_of_range(offset)), buf);
+            };
+            let (res, b) = self.write_from(buf, written, at).await;
             buf = b;
             match res {
                 Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
@@ -303,6 +384,9 @@ impl File {
         offset: u64,
     ) -> (io::Result<usize>, B) {
         debug_assert!(skip <= buf.len());
+        if let Err(e) = check_offset(offset) {
+            return (Err(e), buf);
+        }
         let len = (buf.len() - skip).min(u32::MAX as usize) as u32;
         // SAFETY: `skip <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(skip) };
@@ -312,7 +396,9 @@ impl File {
             len,
             offset,
         };
-        let (res, _, buf) = Op::new(io, buf).await;
+        // SAFETY: `ptr` points into `buf`, an `IoBuf`, whose bytes stay put
+        // when it moves.
+        let (res, _, buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -336,15 +422,38 @@ impl File {
     /// space. A shorter file grows to `offset + len`, and the new bytes read
     /// as zeros; data already in the file is not touched.
     ///
+    /// A `len` of 0 does nothing (`fallocate` itself would refuse it). A
+    /// range that ends above `i64::MAX` is refused with
+    /// [`OffsetOutOfRange`](crate::error::Code::OffsetOutOfRange).
+    ///
     /// Fails with `Unsupported` on a filesystem without `fallocate` (some
     /// network filesystems).
     pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > i64::MAX as u64)
+        {
+            return Err(raise(
+                Code::OffsetOutOfRange,
+                format!(
+                    "the {len} bytes at file offset {offset} end above {}, the largest offset \
+                     Linux has",
+                    i64::MAX
+                ),
+                "check the arithmetic that computed the offset and the length for a \
+                 wrap-around",
+            ));
+        }
         let io = Io::Fallocate {
             fd: self.fd,
             offset,
             len,
         };
-        let (res, _, ()) = Op::new(io, ()).await;
+        // SAFETY: the operation has no pointers.
+        let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
         match res {
             0.. => Ok(()),
             // The kind is set here, as older standard libraries leave
@@ -361,7 +470,8 @@ impl File {
             fd: self.fd,
             datasync,
         };
-        let (res, _, ()) = Op::new(io, ()).await;
+        // SAFETY: the operation has no pointers.
+        let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
         if res < 0 {
             Err(os_err(res))
         } else {
@@ -372,7 +482,12 @@ impl File {
     /// Size, type and modification time of the file.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         // An empty path with AT_EMPTY_PATH means "the descriptor itself".
-        statx(self.fd, CString::default(), libc::AT_EMPTY_PATH).await
+        statx(
+            self.fd,
+            KernelBox::path(CString::default()),
+            libc::AT_EMPTY_PATH,
+        )
+        .await
     }
 
     /// The size of the file in bytes, read with a plain `fstat` (a system
@@ -444,7 +559,8 @@ async fn close(fd: RawFd) -> io::Result<()> {
             Ok(())
         };
     }
-    let (res, _, ()) = Op::new(Io::Close { fd }, ()).await;
+    // SAFETY: the operation has no pointers.
+    let (res, _, ()) = unsafe { Op::new(Io::Close { fd }, ()) }.await;
     if res < 0 {
         Err(os_err(res))
     } else {
@@ -502,22 +618,23 @@ impl Metadata {
     }
 }
 
-async fn statx(dir: RawFd, path: CString, flags: i32) -> io::Result<Metadata> {
+async fn statx(dir: RawFd, path: KernelBox<CString>, flags: i32) -> io::Result<Metadata> {
     // SAFETY: all-zero is a valid `statx` (plain integers).
-    let out: Box<libc::statx> = Box::new(unsafe { mem::zeroed() });
+    let out: KernelBox<libc::statx> = KernelBox::new(unsafe { mem::zeroed() });
     let mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_SIZE | libc::STATX_MTIME;
-    let mut resources = (path, out);
     let io = Io::Statx {
         dir,
-        path: resources.0.as_ptr(),
+        path: path.c_ptr(),
         flags,
         mask,
-        out: &mut *resources.1,
+        out: out.as_ptr(),
     };
-    let (res, _, (_path, out)) = Op::new(io, resources).await;
+    // SAFETY: the path and the output are in `KernelBox`es.
+    let (res, _, (_path, out)) = unsafe { Op::new(io, (path, out)) }.await;
     if res < 0 {
         return Err(os_err(res));
     }
+    let out = out.get();
     let since_epoch = Duration::new(out.stx_mtime.tv_sec.unsigned_abs(), out.stx_mtime.tv_nsec);
     let modified = if out.stx_mtime.tv_sec >= 0 {
         SystemTime::UNIX_EPOCH + since_epoch
@@ -596,7 +713,7 @@ pub async fn write<P: AsRef<Path>, B: IoBuf>(path: P, data: B) -> io::Result<()>
 pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::UnlinkAt {
-        path: path.as_ptr(),
+        path: path.c_ptr(),
         flags: 0,
     };
     path_op(path, io).await.map(drop)
@@ -606,7 +723,7 @@ pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::UnlinkAt {
-        path: path.as_ptr(),
+        path: path.c_ptr(),
         flags: libc::AT_REMOVEDIR,
     };
     path_op(path, io).await.map(drop)
@@ -616,7 +733,7 @@ pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::MkDirAt {
-        path: path.as_ptr(),
+        path: path.c_ptr(),
         mode: 0o777,
     };
     path_op(path, io).await.map(drop)
@@ -626,10 +743,11 @@ pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     let paths = (c_path(from.as_ref())?, c_path(to.as_ref())?);
     let io = Io::RenameAt {
-        from: paths.0.as_ptr(),
-        to: paths.1.as_ptr(),
+        from: paths.0.c_ptr(),
+        to: paths.1.c_ptr(),
     };
-    let (res, _, _paths) = Op::new(io, paths).await;
+    // SAFETY: both paths are in `KernelBox`es.
+    let (res, _, _paths) = unsafe { Op::new(io, paths) }.await;
     if res < 0 {
         Err(os_err(res))
     } else {

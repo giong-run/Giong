@@ -1,8 +1,8 @@
 //! # giong-http
 //!
 //! A small, strict HTTP/1.1 and HTTP/2 server for the [giong]
-//! thread-per-core runtime, and (with the `client` feature) an HTTP/1.1
-//! client: see `giong_http::client`.
+//! thread-per-core runtime, and (with the `client` feature) an HTTP/1.1 and
+//! HTTP/2 client: see `giong_http::client`.
 //!
 //! ```no_run
 //! use giong::net::TcpListener;
@@ -53,7 +53,11 @@
 //!   close.
 //! * Strict parsing. Requests that a proxy in front might read differently
 //!   (two lengths, a length plus chunked encoding, whitespace before a colon,
-//!   bare line feeds, folded headers) are rejected with `400`.
+//!   bare line feeds, folded headers or trailers, a URL as the target whose
+//!   host is not the `Host` header's) are rejected with `400`.
+//! * Responses that cannot be split: a header value with a line break is
+//!   refused, by [`Response::header`] with a panic and by
+//!   [`Response::try_header`] with an error, for values from the request.
 //!
 //! ## What it does not do (yet)
 //!
@@ -69,7 +73,9 @@
 //! ## Client
 //!
 //! With the `client` feature, `giong_http::client::Client` sends requests,
-//! over HTTP or HTTPS, with a pool of kept-alive connections for each origin.
+//! over HTTP or HTTPS, with a pool of kept-alive connections for each origin,
+//! and over HTTP/2 when the server picks it through ALPN (or, when asked,
+//! with prior knowledge).
 
 #![warn(missing_docs)]
 
@@ -101,7 +107,7 @@ pub use server::{Handler, Server, Transport};
 pub mod fuzzing {
     #[cfg(feature = "client")]
     pub use crate::client::fuzzing::{
-        check_h2_client, check_inflate, check_response_head, check_url,
+        check_h2_client, check_inflate, check_response_body, check_response_head, check_url,
     };
     pub use crate::invariants::{
         check_chunked, check_h2_output, check_head, check_hpack, check_huffman, h2_connection,

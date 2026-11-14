@@ -12,9 +12,14 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// header, so that a client can quote it and an operator can find the
 /// request in the log.
 ///
-/// Ids are 20 hexadecimal digits: 8 chosen at random when the process
-/// starts, 2 for the worker and 10 counting that worker's requests. Making
-/// one takes no lock and no system call.
+/// Ids are 32 lowercase hexadecimal digits, 128 bits like a UUID: 16 chosen
+/// at random when the process starts, 4 for the worker (`ffff` off a giong
+/// worker) and 12 counting that worker's requests. Two processes share the
+/// random part with even odds only after some five billion starts, and a
+/// worker's counter takes years to wrap. Making one takes no lock and no
+/// system call. The length and the digits are part of the format, changed
+/// only in a breaking release; what the parts mean is for reading a log,
+/// not for parsing.
 ///
 /// An id the client sent is ignored unless
 /// [`trust_incoming`](Self::trust_incoming) says otherwise, because clients
@@ -92,27 +97,33 @@ thread_local! {
 
 /// A new id: process prefix, worker, counter.
 pub(crate) fn generate() -> IdBuf {
-    static PREFIX: OnceLock<u32> = OnceLock::new();
-    let prefix = *PREFIX.get_or_init(|| {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u32(std::process::id());
-        if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            h.write_u128(t.as_nanos());
-        }
-        h.finish() as u32
-    });
-    let worker = giong::try_worker_id().unwrap_or(0xff) as u64 & 0xff;
+    static PREFIX: OnceLock<u64> = OnceLock::new();
+    let prefix = *PREFIX.get_or_init(prefix);
+    let worker = giong::try_worker_id().map_or(0xffff, |w| w as u64 & 0xffff);
     let count = COUNTER.with(|c| {
         let n = c.get().wrapping_add(1);
         c.set(n);
         n
     });
-    let mut digits = [0u8; 20];
-    hex(&mut digits[..8], u64::from(prefix));
-    hex(&mut digits[8..10], worker);
-    hex(&mut digits[10..], count);
+    let mut digits = [0u8; 32];
+    hex(&mut digits[..16], prefix);
+    hex(&mut digits[16..20], worker);
+    hex(&mut digits[20..], count);
     // Hexadecimal digits are always a valid id.
     IdBuf::new(std::str::from_utf8(&digits).unwrap_or("0")).expect("hex digits")
+}
+
+/// 64 random bits: the process id and the time, hashed with SipHash under
+/// the random key the standard library draws from the operating system.
+/// Two processes share a prefix with even odds only after some five
+/// billion starts.
+fn prefix() -> u64 {
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        h.write_u128(t.as_nanos());
+    }
+    h.finish()
 }
 
 /// Writes the low `out.len()` hex digits of `n` into `out`.
@@ -131,9 +142,22 @@ mod tests {
     fn ids_are_unique_hex_with_a_shared_prefix() {
         let a = generate();
         let b = generate();
-        assert_eq!(a.as_str().len(), 20);
-        assert!(a.as_str().bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(a.as_str().len(), 32);
+        assert!(a
+            .as_str()
+            .bytes()
+            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
         assert_ne!(a.as_str(), b.as_str());
-        assert_eq!(a.as_str()[..10], b.as_str()[..10]);
+        // The same process and thread: the same 64 random bits and worker.
+        assert_eq!(a.as_str()[..20], b.as_str()[..20]);
+        assert_eq!(&a.as_str()[16..20], "ffff", "not on a giong worker");
+    }
+
+    #[test]
+    fn the_prefix_has_64_bits_that_differ_from_process_to_process() {
+        // Two processes are two seeds: what `prefix` makes of each.
+        let (a, b) = (prefix(), prefix());
+        assert_ne!(a, b);
+        assert!(a >> 32 != 0 || b >> 32 != 0, "{a:x} {b:x}: 64 bits");
     }
 }

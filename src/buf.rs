@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::ops::Deref;
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -25,7 +25,9 @@ use crate::error::{raise, Code};
 ///
 /// `as_ptr()` must point at `len()` initialised bytes that stay valid and at the
 /// same address for as long as the value is alive, **even when the value itself
-/// is moved** (heap or static storage — not an inline array).
+/// is moved** (heap or static storage — not an inline array). While giong holds
+/// the value (from the call that takes it until the value comes back), the
+/// bytes must not be written except through it: the kernel may be reading them.
 pub unsafe trait IoBuf: 'static {
     /// Pointer to the first byte.
     fn as_ptr(&self) -> *const u8;
@@ -43,7 +45,8 @@ pub unsafe trait IoBuf: 'static {
 ///
 /// In addition to the [`IoBuf`] contract, `as_mut_ptr()` must point at
 /// `capacity()` writable bytes, and `set_init(n)` must make the first `n` bytes
-/// the initialised contents.
+/// the initialised contents. While giong holds the value, those bytes must be
+/// neither read nor written except through it: the kernel may be writing them.
 pub unsafe trait IoBufMut: IoBuf {
     /// Pointer to the start of the writable region.
     fn as_mut_ptr(&mut self) -> *mut u8;
@@ -57,6 +60,11 @@ pub unsafe trait IoBufMut: IoBuf {
     unsafe fn set_init(&mut self, n: usize);
 }
 
+// The bytes of every type below are on the heap or in static memory, neither
+// of which moves when the value moves, and none of these types lets safe code
+// change the bytes while an operation owns the value.
+
+// SAFETY: a `Vec`'s bytes are on the heap; only its owner can change them.
 unsafe impl IoBuf for Vec<u8> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -66,9 +74,15 @@ unsafe impl IoBuf for Vec<u8> {
     }
 }
 
+// SAFETY: the allocation holds `capacity` bytes on the heap; `set_init`
+// only marks bytes the kernel wrote.
 unsafe impl IoBufMut for Vec<u8> {
     fn as_mut_ptr(&mut self) -> *mut u8 {
-        <[u8]>::as_mut_ptr(self)
+        // The inherent method, whose pointer is valid for the whole
+        // allocation: the kernel writes up to `capacity`, past `len`. (A
+        // pointer from the slice, `<[u8]>::as_mut_ptr`, covers only `len`
+        // bytes, usually none.)
+        Vec::as_mut_ptr(self)
     }
     fn capacity(&self) -> usize {
         Vec::capacity(self)
@@ -78,6 +92,7 @@ unsafe impl IoBufMut for Vec<u8> {
     }
 }
 
+// SAFETY: a `String`'s bytes are on the heap; only its owner can change them.
 unsafe impl IoBuf for String {
     fn as_ptr(&self) -> *const u8 {
         str::as_ptr(self)
@@ -87,6 +102,7 @@ unsafe impl IoBuf for String {
     }
 }
 
+// SAFETY: a `Box`'s bytes are on the heap; only its owner can change them.
 unsafe impl IoBuf for Box<[u8]> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -96,6 +112,8 @@ unsafe impl IoBuf for Box<[u8]> {
     }
 }
 
+// SAFETY: on the heap, and immutable while shared (`Rc::get_mut` needs the
+// only reference, and the operation holds one).
 unsafe impl IoBuf for Rc<[u8]> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -105,6 +123,8 @@ unsafe impl IoBuf for Rc<[u8]> {
     }
 }
 
+// SAFETY: on the heap, and immutable while shared (`Arc::get_mut` needs the
+// only reference, and the operation holds one).
 unsafe impl IoBuf for Arc<[u8]> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -114,6 +134,7 @@ unsafe impl IoBuf for Arc<[u8]> {
     }
 }
 
+// SAFETY: borrowed immutably for `'static`, so nothing can change the bytes.
 unsafe impl IoBuf for &'static [u8] {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -123,6 +144,7 @@ unsafe impl IoBuf for &'static [u8] {
     }
 }
 
+// SAFETY: borrowed immutably for `'static`, so nothing can change the bytes.
 unsafe impl IoBuf for &'static str {
     fn as_ptr(&self) -> *const u8 {
         str::as_ptr(self)
@@ -140,6 +162,47 @@ unsafe impl IoBuf for Cow<'static, [u8]> {
     }
     fn len(&self) -> usize {
         <[u8]>::len(self)
+    }
+}
+
+/// Whether nobody can change a buffer's bytes once a write has given the
+/// buffer back: what lets a zero-copy send return before the kernel stops
+/// reading them (see `StreamSocket::zero_copy_report`).
+pub(crate) enum Sharing {
+    /// The bytes may change once the buffer is back (`Vec`, `Box`,
+    /// `String`, an owned `Cow`, any other buffer type).
+    No,
+    /// `'static` bytes, which never change.
+    Static,
+    /// Reference-counted bytes (`Rc<[u8]>`, `Arc<[u8]>`): this second owner
+    /// keeps them alive, and while it lives nobody can get them mutably.
+    Owner(Box<dyn std::any::Any>),
+}
+
+/// The [`Sharing`] of `buf`, without making an owner.
+pub(crate) fn is_shared<B: IoBuf>(buf: &B) -> bool {
+    let any: &dyn std::any::Any = buf;
+    any.is::<&'static [u8]>()
+        || any.is::<&'static str>()
+        || any.is::<Rc<[u8]>>()
+        || any.is::<Arc<[u8]>>()
+        || matches!(
+            any.downcast_ref::<Cow<'static, [u8]>>(),
+            Some(Cow::Borrowed(_))
+        )
+}
+
+/// The [`Sharing`] of `buf`.
+pub(crate) fn sharing<B: IoBuf>(buf: &B) -> Sharing {
+    let any: &dyn std::any::Any = buf;
+    if let Some(rc) = any.downcast_ref::<Rc<[u8]>>() {
+        Sharing::Owner(Box::new(Rc::clone(rc)))
+    } else if let Some(arc) = any.downcast_ref::<Arc<[u8]>>() {
+        Sharing::Owner(Box::new(Arc::clone(arc)))
+    } else if is_shared(buf) {
+        Sharing::Static
+    } else {
+        Sharing::No
     }
 }
 
@@ -260,14 +323,33 @@ impl Ring {
     }
 }
 
+/// The layout of the kernel's `struct io_uring_buf`, one entry of a buffer
+/// ring, for writing an entry field by field through raw pointers. `resv` of
+/// entry 0 is the ring's tail, which the kernel reads at any time, so a
+/// reference to an entry (which `BufRingEntry`'s setters take) would claim
+/// memory the kernel shares.
+#[repr(C)]
+struct RawEntry {
+    addr: u64,
+    len: u32,
+    bid: u16,
+    resv: u16,
+}
+
+const _: () = assert!(std::mem::size_of::<RawEntry>() == std::mem::size_of::<BufRingEntry>());
+
 /// What the pool knows about one of its buffers.
 struct Slot {
     /// Bytes the kernel has put into the buffer since it was last lent to
     /// the packed ring: where the next piece starts.
     filled: Cell<u32>,
     /// Pieces of the buffer that user space holds: [`RecvBuf`]s, and
-    /// completions the driver has queued but nobody has read yet.
-    pieces: Cell<u16>,
+    /// completions the driver has queued but nobody has read yet. Every
+    /// piece of a packed buffer holds at least one byte, so there are at
+    /// most `buf_len` (below 4 GiB) of them: a `u16` wrapped once 65,536
+    /// one-byte pieces of a buffer over 64 KiB were held, and the buffer
+    /// went back to the kernel under them.
+    pieces: Cell<u32>,
     /// The ring the buffer is lent to, if any: the kernel may write to it.
     lent_to: Cell<Option<RingId>>,
     /// The ring it was last lent to, where it goes back first.
@@ -544,7 +626,11 @@ impl BufPool {
                     "kernel returned more data than a buffer holds"
                 );
                 slot.filled.set(off + len);
-                slot.pieces.set(slot.pieces.get() + 1);
+                // Cannot overflow (see `Slot::pieces`); checked anyway,
+                // because a wrapped count frees a buffer still in use.
+                let pieces = slot.pieces.get().checked_add(1);
+                slot.pieces
+                    .set(pieces.expect("giong: pieces of a receive buffer overflowed"));
                 if !more {
                     // Full: the kernel has moved on to the next buffer.
                     self.taken(id, slot);
@@ -587,12 +673,14 @@ impl BufPool {
     pub(crate) fn release(&self, bid: u16) {
         let slot = self.slot(bid);
         let pieces = slot.pieces.get();
-        debug_assert!(
+        // Released more often than handed out, the buffer would go back to
+        // the kernel while pieces of it are still read: stop instead.
+        assert!(
             pieces > 0,
-            "buffer {bid} released more often than handed out"
+            "giong: buffer {bid} released more often than handed out"
         );
-        slot.pieces.set(pieces.saturating_sub(1));
-        if pieces <= 1 && slot.lent_to.get().is_none() {
+        slot.pieces.set(pieces - 1);
+        if pieces == 1 && slot.lent_to.get().is_none() {
             self.recycle(bid);
         }
     }
@@ -636,13 +724,14 @@ impl BufPool {
         let idx = (tail & (self.count - 1)) as usize;
         // SAFETY: `idx < count`, the ring allocation holds `count` entries,
         // and the kernel only reads entries below the published tail. The
-        // setters do not touch the `resv` field, which doubles as the ring
-        // tail in entry 0.
+        // fields are written through raw pointers, never through a reference
+        // to the entry, and `resv` (the ring tail in entry 0) is not touched.
         unsafe {
-            let entry = &mut *ring.entries().add(idx);
-            entry.set_addr(self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) as u64);
-            entry.set_len(self.buf_len as u32);
-            entry.set_bid(bid);
+            let entry = ring.entries().add(idx).cast::<RawEntry>();
+            let addr = self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) as u64;
+            ptr::addr_of_mut!((*entry).addr).write(addr);
+            ptr::addr_of_mut!((*entry).len).write(self.buf_len as u32);
+            ptr::addr_of_mut!((*entry).bid).write(bid);
         }
         ring.tail.set(tail.wrapping_add(1));
         ring.published.set(ring.published.get() + 1);
@@ -826,6 +915,43 @@ mod tests {
         assert_eq!(d, (1, 0, 10));
         pool.release(1);
         assert_eq!(pool.free(), 4, "a part-filled buffer stays with the kernel");
+    }
+
+    /// A buffer over 64 KiB can be cut into more than 65,535 one-byte
+    /// pieces. Their count used to be a `u16`: at 65,536 held pieces it
+    /// wrapped to 0, the buffer went back to the kernel while every piece
+    /// still pointed into it, and the next receive overwrote them.
+    #[test]
+    fn a_buffer_cut_into_more_than_65535_pieces_is_freed_with_the_last() {
+        const LEN: usize = 128 * 1024;
+        const PIECES: u32 = 70_000;
+        let pool = pool(2, LEN);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        for i in 0..PIECES {
+            assert_eq!(data(pool.received(RingId::Packed, 0, 1, true)), (0, i, 1));
+        }
+        let rest = (LEN as u32 - PIECES) as i32;
+        assert_eq!(
+            data(pool.received(RingId::Packed, 0, rest, false)),
+            (0, PIECES, rest as u32)
+        );
+        assert_eq!(pool.free(), 1, "full: the kernel moved on");
+        for _ in 0..PIECES {
+            pool.release(0);
+            assert_eq!(pool.free(), 1, "freed while pieces are held");
+        }
+        pool.release(0);
+        assert_eq!(pool.free(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "released more often than handed out")]
+    fn a_buffer_released_more_often_than_handed_out_stops_the_worker() {
+        let pool = pool(2, 64);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        let a = data(pool.received(RingId::Packed, 0, 64, false));
+        pool.release(a.0);
+        pool.release(a.0);
     }
 
     #[test]

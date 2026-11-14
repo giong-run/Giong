@@ -2,6 +2,7 @@
 //! structs.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 
 use giong::error::Code;
@@ -15,14 +16,14 @@ use crate::{Error, Req};
 impl<S> Req<S> {
     /// The body, parsed as JSON into `T`.
     ///
-    /// `T` may borrow from the request (`&str` fields), or own its data.
-    ///
     /// ```
+    /// use std::borrow::Cow;
     /// use giong_web::{json, Error, Req, Response};
     ///
     /// #[derive(serde::Deserialize)]
     /// struct NewUser<'a> {
-    ///     name: &'a str,
+    ///     #[serde(borrow)]
+    ///     name: Cow<'a, str>,
     ///     email: String,
     /// }
     ///
@@ -32,6 +33,24 @@ impl<S> Req<S> {
     /// }
     /// ```
     ///
+    /// # Strings: `String` or `Cow<str>`, not `&str`
+    ///
+    /// A field that is a `String` owns its text. A `Cow<'a, str>` field
+    /// marked `#[serde(borrow)]` borrows it from the body when the JSON
+    /// string has no escape and owns it when it has one (`\"`, `\n`,
+    /// `\u00e9`), which saves a copy for most strings. A `&str` field can
+    /// only borrow, so it fails on any escaped string: that is the
+    /// program's mistake, not the client's, and is answered `500` with a
+    /// logged cause that says to use one of the two, never a `4xx` that
+    /// would blame valid JSON.
+    ///
+    /// Numbers are read by serde_json with its default settings, which may
+    /// put an `f64` one unit in the last place off the nearest value. An
+    /// application that needs every float exact turns on serde_json's
+    /// `float_roundtrip` feature in its own `Cargo.toml` (it then applies
+    /// here too), at some cost in parsing speed; amounts of money are best
+    /// sent as integers or strings anyway.
+    ///
     /// # Errors
     ///
     /// * `415` (`GIONG-E1208`) unless the `Content-Type` is
@@ -40,6 +59,9 @@ impl<S> Req<S> {
     ///   (`GIONG-E1207`) when it is JSON of the wrong shape: a missing field,
     ///   a string where a number belongs. The detail quotes serde_json,
     ///   with the line and column.
+    /// * `500` (`GIONG-E1210`) when `T` has a `&str` field and the string
+    ///   has an escape (see above), or the route reads its body as a
+    ///   stream; the logged cause says what to change.
     pub fn json<'a, T: Deserialize<'a>>(&'a self) -> Result<T, Error> {
         let content_type = self.header_str("content-type");
         if !content_type.is_some_and(is_json) {
@@ -63,11 +85,15 @@ impl<S> Req<S> {
             )));
         }
         serde_json::from_slice(self.body()).map_err(|e| {
+            let shown = e.to_string();
+            if cannot_borrow(&shown) {
+                return borrow_bug("Req::json", "a JSON string with an escape", &shown);
+            }
             let status = match e.classify() {
                 serde_json::error::Category::Data => 422,
                 _ => 400,
             };
-            Error::coded(status, Code::WebBadBody, format!("request body: {e}"))
+            Error::coded(status, Code::WebBadBody, format!("request body: {shown}"))
         })
     }
 
@@ -96,19 +122,50 @@ impl<S> Req<S> {
     /// Values are percent-decoded (`+` is a space) and read with the
     /// field's type: numbers, `bool` (`true`/`false`), `char`, strings,
     /// enums of unit variants. An `Option` field is `None` when the key is
-    /// absent or its value empty. A key given twice is an error, as are
-    /// sequences: one value per key. Unknown keys are ignored unless `T`
-    /// says `#[serde(deny_unknown_fields)]`.
+    /// absent or its value empty. Unknown keys are ignored unless `T` says
+    /// `#[serde(deny_unknown_fields)]`. String fields are `String`, or
+    /// `Cow<'a, str>` with `#[serde(borrow)]`, as for [`json`](Self::json):
+    /// a `&str` field cannot hold a value with `+` or `%XX`, and fails with
+    /// a `500` whose logged cause says so.
+    ///
+    /// This and [`query_param`](Self::query_param) follow one strict rule:
+    /// the whole query string must be valid percent-encoded UTF-8, and a
+    /// key that is read (a field of `T`, every key of a map) must appear
+    /// once. Sequences are refused too: one value per key.
     ///
     /// # Errors
     ///
     /// `400` (`GIONG-E1205`) when a value does not parse, a required field
-    /// is missing, or the query string is not valid percent-encoding. The
-    /// detail names the parameter.
+    /// is missing, a key appears twice, or the query string is not valid
+    /// percent-encoding. The detail names the parameter.
     pub fn query<'a, T: Deserialize<'a>>(&'a self) -> Result<T, Error> {
-        from_query(self.query_string().unwrap_or(""))
-            .map_err(|e| Error::coded(400, Code::WebBadParameter, format!("query string: {}", e.0)))
+        from_query(self.query_string().unwrap_or("")).map_err(|e| {
+            if cannot_borrow(&e.0) {
+                return borrow_bug("Req::query", "a value with `+` or `%XX`", &e.0);
+            }
+            Error::coded(400, Code::WebBadParameter, format!("query string: {}", e.0))
+        })
     }
+}
+
+/// serde's words when a `&str` (or `&[u8]`) field is given a string it
+/// cannot lend, because it had to be unescaped.
+fn cannot_borrow(message: &str) -> bool {
+    message.contains("expected a borrowed string") || message.contains("expected a borrowed byte")
+}
+
+/// The `500` for a `&str` field given a value it cannot borrow: a mistake
+/// in the program, which valid input from the client brings out.
+fn borrow_bug(what: &str, value: &str, serde_says: &str) -> Error {
+    Error::internal(giong::error::Error::new(
+        Code::WebConfig,
+        format!(
+            "{what}: a `&str` field cannot hold {value}, which has to be decoded into a new \
+             string ({serde_says})"
+        ),
+        "make the field a String, or a Cow<'a, str> marked #[serde(borrow)], which borrows \
+         when it can and owns the string otherwise.",
+    ))
 }
 
 fn is_json(content_type: &str) -> bool {
@@ -151,6 +208,7 @@ pub(crate) fn from_query<'de, T: Deserialize<'de>>(query: &'de str) -> Result<T,
         pairs: Box::new(percent::query_pairs(query)),
         key: Cow::Borrowed(""),
         value: None,
+        seen: None,
     })
 }
 
@@ -159,6 +217,10 @@ struct Query<'de> {
     pairs: Box<dyn Iterator<Item = (&'de str, &'de str)> + 'de>,
     key: Cow<'de, str>,
     value: Option<Cow<'de, str>>,
+    /// The keys so far, when every key is read (a map): a key given twice
+    /// is refused, as serde refuses a struct's field given twice. A struct
+    /// ignores the keys it does not know, repeated or not.
+    seen: Option<HashSet<Cow<'de, str>>>,
 }
 
 fn decoded(s: &str) -> Result<Cow<'_, str>, DeError> {
@@ -168,14 +230,29 @@ fn decoded(s: &str) -> Result<Cow<'_, str>, DeError> {
 impl<'de> de::Deserializer<'de> for Query<'de> {
     type Error = DeError;
 
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+    /// A map, `serde_json::Value` and the like: every key is read.
+    fn deserialize_any<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, DeError> {
+        self.seen = Some(HashSet::new());
+        visitor.visit_map(self)
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+        self.deserialize_any(visitor)
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, DeError> {
         visitor.visit_map(self)
     }
 
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
         bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct map struct enum identifier ignored_any
+        tuple_struct enum identifier ignored_any
     }
 }
 
@@ -191,6 +268,14 @@ impl<'de> MapAccess<'de> for Query<'de> {
         };
         self.key = decoded(key)?;
         self.value = Some(decoded(value)?);
+        if let Some(seen) = &mut self.seen {
+            if !seen.insert(self.key.clone()) {
+                return Err(DeError(format!(
+                    "parameter `{}` appears more than once; send one value per key",
+                    cut(&self.key)
+                )));
+            }
+        }
         seed.deserialize(Part(self.key.clone())).map(Some)
     }
 
@@ -314,7 +399,8 @@ mod tests {
         page: u32,
         per_page: Option<u32>,
         q: Option<String>,
-        tag: Option<&'a str>,
+        #[serde(borrow)]
+        tag: Option<Cow<'a, str>>,
         sort: Option<Sort>,
         active: Option<bool>,
         min: Option<f64>,
@@ -332,12 +418,16 @@ mod tests {
                 page: 2,
                 per_page: None,
                 q: Some("café au lait".into()),
-                tag: Some("rust"),
+                tag: Some("rust".into()),
                 sort: Some(Sort::Age),
                 active: Some(true),
                 min: Some(1.5),
             }
         );
+        // An encoded value is decoded into a new string, which a `&str`
+        // field could not hold.
+        let f: Filter = from_query("page=1&tag=rust+lang").unwrap();
+        assert_eq!(f.tag.as_deref(), Some("rust lang"));
     }
 
     #[test]

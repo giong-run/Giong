@@ -277,7 +277,7 @@ impl DbError {
     /// Reads an `ERR_Packet`.
     pub(crate) fn parse(payload: &[u8]) -> Result<Self, Error> {
         let e = crate::protocol::err(payload)?;
-        Ok(Self::new(e.code, e.sqlstate, e.message))
+        Ok(Self::new(e.code, e.sqlstate, &e.message))
     }
 
     /// MySQL's error number, such as 1062 (`ER_DUP_ENTRY`) or 1213

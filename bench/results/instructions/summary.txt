@@ -1,0 +1,23 @@
+binary                             endpoint   requests  instructions_per_request
+e3e1ac5 (before zero-copy send)    json-tls      20000                     15571
+e3e1ac5 (before zero-copy send)    json          20000                      9109
+e3e1ac5 (before zero-copy send)    json-h2       20000                     20480
+d237145 (main before this change)  json-tls      20000                     15715
+d237145 (main before this change)  json          20000                      9242
+d237145 (main before this change)  json-h2       20000                     20634
+this change                        json-tls      20000                     15618
+this change                        json          20000                      9130
+this change                        json-h2       20000                     20533
+
+bench/instructions.sh 20000, 1 worker, 4-core VM (Linux 6.18), rustc 1.97.0. Each
+binary is bench/giong-http built at that commit; e3e1ac5 is the last commit before
+zero-copy send. The same counts for json-tls at earlier commits: 0de7a22 (kernel TLS)
+15,421, 6e6b7fb (HTTP/2 server) 15,527, d5a0b0c (zero-copy send, 0.5.0) 15,711.
+
+Idle HTTP/2 connections on the same machine (5,000 from `bench/hold <addr> 5000 h2-idle
+/json`, 1 worker, server RSS growth / 5,000, 3 rounds, all within 0.01): e3e1ac5 4.30 KiB,
+d237145 4.55 KiB, this change 4.33 KiB.
+
+Future sizes in bytes (e3e1ac5, d237145, this change): `write_all` of a `Vec<u8>`
+272, 360, 280; of a `&'static [u8]` 224, 304, 232; `write_vectored` 288, 344, 304;
+`write_all_vectored` 336, 392, 352; `read` 184, 200, 184.

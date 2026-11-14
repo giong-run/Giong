@@ -7,6 +7,7 @@ use std::mem::{self, ManuallyDrop};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::ptr;
 use std::task::{Context, Poll};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -15,6 +16,7 @@ use super::{close_socket, inet_addr, no_addresses, os_err, unexpected, wait_for_
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
 use crate::driver::{Io, MultiIo, MultiKind, MultiPoll};
 use crate::error::{raise, Code};
+use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime;
 
@@ -42,8 +44,9 @@ static RECV_HEADER: RecvHeader = {
     RecvHeader(hdr)
 };
 
-/// Everything a one-off `sendmsg` / `recvmsg` points at, boxed so that the
-/// addresses stay put while the kernel uses them.
+/// Everything a one-off `sendmsg` / `recvmsg` points at, in a [`KernelBox`]
+/// so that the addresses stay put, and stay valid, while the kernel uses
+/// them.
 struct Message {
     hdr: libc::msghdr,
     iov: libc::iovec,
@@ -51,14 +54,35 @@ struct Message {
 }
 
 impl Message {
-    fn new(base: *mut u8, len: usize) -> Box<Self> {
+    /// A message for `len` bytes at `base`, sent to `addr`, or (with `None`)
+    /// with room for the sender's address of a received one.
+    fn new(base: *mut u8, len: usize, addr: Option<&SockAddr>) -> KernelBox<Self> {
         // SAFETY: all-zero is valid for these plain C structs.
-        let mut msg: Box<Self> = Box::new(unsafe { mem::zeroed() });
-        msg.iov.iov_base = base.cast();
-        msg.iov.iov_len = len;
-        msg.hdr.msg_iov = &mut msg.iov;
-        msg.hdr.msg_iovlen = 1;
-        msg.hdr.msg_name = (&mut msg.addr as *mut libc::sockaddr_storage).cast();
+        let msg: KernelBox<Self> = KernelBox::from_box(Box::new(unsafe { mem::zeroed() }));
+        let m = msg.as_ptr();
+        // SAFETY: `m` points at the live, initialised `Message` that `msg`
+        // owns; nothing else uses it yet. The pointers stored in it are taken
+        // through `m`, so they stay valid when `msg` moves.
+        unsafe {
+            (*m).iov.iov_base = base.cast();
+            (*m).iov.iov_len = len;
+            (*m).hdr.msg_iov = ptr::addr_of_mut!((*m).iov);
+            (*m).hdr.msg_iovlen = 1;
+            (*m).hdr.msg_name = ptr::addr_of_mut!((*m).addr).cast();
+            (*m).hdr.msg_namelen = match addr {
+                Some(addr) => {
+                    // A `SockAddr` holds `len()` valid bytes, which fit in
+                    // `sockaddr_storage`.
+                    ptr::copy_nonoverlapping(
+                        addr.as_ptr().cast::<u8>(),
+                        ptr::addr_of_mut!((*m).addr).cast::<u8>(),
+                        addr.len() as usize,
+                    );
+                    addr.len()
+                }
+                None => mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+            };
+        }
         msg
     }
 }
@@ -275,7 +299,20 @@ impl UdpSocket {
     /// that arrives while the future is being dropped is lost), and the two
     /// must not be mixed on one socket: once `recv_from` has been used,
     /// `read_from` fails with `InvalidInput`.
+    ///
+    /// A buffer with no capacity (such as `Vec::new()`) is refused with
+    /// `GIONG-E0109`: the kernel would take the datagram and keep none of it.
     pub async fn read_from<B: IoBufMut>(&self, mut buf: B) -> (io::Result<(usize, SocketAddr)>, B) {
+        if buf.capacity() == 0 {
+            let err = raise(
+                Code::EmptyBuffer,
+                "read_from was given a buffer with no room, and a datagram received into it \
+                 would be lost",
+                "pass a buffer with room for the largest datagram expected, such as \
+                 Vec::with_capacity(65_536); Vec::new() has none.",
+            );
+            return (Err(err), buf);
+        }
         if runtime::with_worker(|w| self.recv.is_active(w)) {
             let err = raise(
                 Code::MixedReads,
@@ -285,16 +322,20 @@ impl UdpSocket {
             );
             return (Err(err), buf);
         }
-        let mut msg = Message::new(buf.as_mut_ptr(), buf.capacity());
-        msg.hdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        let msg = Message::new(buf.as_mut_ptr(), buf.capacity(), None);
         let io = Io::RecvMsg {
             fd: self.sock.as_raw_fd(),
-            msg: &mut msg.hdr,
+            // SAFETY: `msg` owns a live `Message`; the field pointer is taken
+            // without making a reference.
+            msg: unsafe { ptr::addr_of_mut!((*msg.as_ptr()).hdr) },
         };
-        let (res, _, (msg, mut buf)) = Op::new(io, (msg, buf)).await;
+        // SAFETY: the header is in a `KernelBox` and points at its own fields
+        // and at `buf`'s bytes; an `IoBufMut`'s bytes stay put when it moves.
+        let (res, _, (msg, mut buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
+        let msg = msg.get();
         // SAFETY: the kernel wrote `res` bytes at the start of the buffer.
         unsafe { buf.set_init(res as usize) };
         // SAFETY: `sockaddr_storage` is plain data of exactly this size.
@@ -326,24 +367,19 @@ impl UdpSocket {
     /// Sends `buf` as one datagram to `addr`, returning the number of bytes
     /// sent. The buffer is handed back so it can be reused.
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
-        let mut msg = Message::new(buf.as_ptr().cast_mut(), buf.len());
         let addr = SockAddr::from(addr);
-        // SAFETY: a `SockAddr` holds `len()` valid bytes, which fit in
-        // `sockaddr_storage`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                addr.as_ptr().cast::<u8>(),
-                (&mut msg.addr as *mut libc::sockaddr_storage).cast::<u8>(),
-                addr.len() as usize,
-            );
-        }
-        msg.hdr.msg_namelen = addr.len();
+        let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&addr));
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
-            msg: &msg.hdr,
+            // SAFETY: `msg` owns a live `Message`; the field pointer is taken
+            // without making a reference.
+            msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
             flags: libc::MSG_NOSIGNAL as u32,
+            zero_copy: false,
         };
-        let (res, _, (_msg, buf)) = Op::new(io, (msg, buf)).await;
+        // SAFETY: the header is in a `KernelBox` and points at its own fields
+        // and at `buf`'s bytes; an `IoBuf`'s bytes stay put when it moves.
+        let (res, _, (_msg, buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -360,8 +396,10 @@ impl UdpSocket {
             buf: buf.as_ptr(),
             len,
             flags: libc::MSG_NOSIGNAL,
+            zero_copy: false,
         };
-        let (res, _, buf) = Op::new(io, buf).await;
+        // SAFETY: an `IoBuf`'s bytes stay put when it moves.
+        let (res, _, buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -402,5 +440,85 @@ impl std::fmt::Debug for UdpSocket {
         f.debug_struct("UdpSocket")
             .field("fd", &self.as_raw_fd())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::{mem, ptr};
+
+    use socket2::SockAddr;
+
+    use super::{parse_addr, Message};
+
+    /// The header of a `Message` stays valid while the message moves, as it
+    /// does into the operation and back, and the kernel's writes through it
+    /// are seen afterwards. Miri runs this one: it is how `recvmsg` and
+    /// `sendmsg` use the memory, and Miri cannot call them.
+    #[test]
+    fn a_message_header_survives_moves() {
+        // Received: the "kernel" writes the payload and the sender through
+        // the header pointer taken before the move.
+        let mut buf = vec![0u8; 8];
+        let msg = Message::new(buf.as_mut_ptr(), buf.len(), None);
+        // SAFETY: the field pointer of a live `Message`, as `read_from` takes it.
+        let hdr = unsafe { ptr::addr_of_mut!((*msg.as_ptr()).hdr) };
+        let moved = (msg, 1);
+        let from: SocketAddr = "192.0.2.7:4242".parse().unwrap();
+        let name = SockAddr::from(from);
+        // SAFETY: what the kernel does with a `msghdr`: the iovec and the
+        // name point into memory the message and `buf` own.
+        unsafe {
+            let iov = &*(*hdr).msg_iov;
+            ptr::copy_nonoverlapping(b"datagram".as_ptr(), iov.iov_base.cast::<u8>(), 8);
+            assert!(name.len() <= (*hdr).msg_namelen);
+            ptr::copy_nonoverlapping(
+                name.as_ptr().cast::<u8>(),
+                (*hdr).msg_name.cast::<u8>(),
+                name.len() as usize,
+            );
+            (*hdr).msg_namelen = name.len();
+        }
+        let msg = moved.0;
+        let msg = msg.get();
+        assert_eq!(buf, b"datagram");
+        // SAFETY: `sockaddr_storage` is plain data of exactly this size.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&msg.addr as *const libc::sockaddr_storage).cast::<u8>(),
+                mem::size_of::<libc::sockaddr_storage>(),
+            )
+        };
+        assert_eq!(
+            parse_addr(&bytes[..msg.hdr.msg_namelen as usize]),
+            Some(from)
+        );
+
+        // Sent: the "kernel" reads the payload and the address.
+        let to: SocketAddr = "[2001:db8::1]:53".parse().unwrap();
+        let payload = *b"query";
+        let msg = Message::new(
+            payload.as_ptr().cast_mut(),
+            payload.len(),
+            Some(&SockAddr::from(to)),
+        );
+        // SAFETY: as `send_to` takes it.
+        let hdr = unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) };
+        let moved = (msg, 1);
+        // SAFETY: the header and what it points at are alive in `moved`.
+        let (sent, addr) = unsafe {
+            let iov = &*(*hdr).msg_iov;
+            (
+                std::slice::from_raw_parts(iov.iov_base.cast::<u8>(), iov.iov_len),
+                std::slice::from_raw_parts(
+                    (*hdr).msg_name.cast::<u8>(),
+                    (*hdr).msg_namelen as usize,
+                ),
+            )
+        };
+        assert_eq!(sent, b"query");
+        assert_eq!(parse_addr(addr), Some(to));
+        drop(moved);
     }
 }
