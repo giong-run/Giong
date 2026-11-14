@@ -56,12 +56,23 @@ async fn requests_over_one_connection(version: Version) {
         .unwrap();
     assert_eq!(resp.header("content-encoding"), Some("gzip"));
     assert_eq!(&resp.body()[..2], &[0x1f, 0x8b]);
+    let gz_len = resp.body().len().to_string();
+    // ...with the same header fields for HEAD...
+    let resp = raw
+        .head(&format!("{base}/users"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.header("content-encoding"), Some("gzip"));
+    assert_eq!(resp.header("content-length"), Some(gz_len.as_str()));
+    assert!(resp.body().is_empty());
     // ...which the client decompresses.
     let resp = client.get(&format!("{base}/users")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.version(), version);
     assert!(resp.text().unwrap().starts_with("[{\"id\":0,"));
-    assert_eq!(resp.header("x-request-id").map(str::len), Some(20));
+    assert_eq!(resp.header("x-request-id").map(str::len), Some(32));
 
     let resp = client
         .post(&format!("{base}/echo/9"))

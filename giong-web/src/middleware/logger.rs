@@ -5,13 +5,13 @@ use std::time::{Instant, SystemTime};
 
 use crate::error::Rendered;
 use crate::json::JsonWriter;
-use crate::log::{error_fields, timestamp, worker, Sink};
+use crate::log::{clip, error_fields, timestamp, worker, Sink};
 use crate::{Error, Middleware, Next, Req, Response};
 
 /// Writes one JSON line per request, after the response is ready:
 ///
 /// ```json
-/// {"ts":"2026-11-13T08:40:01.123456Z","level":"info","event":"request","method":"GET","path":"/users/7","route":"/users/{id}","status":200,"duration_us":153,"bytes":512,"request_id":"5f3a9c2e01000000002a","peer":"10.0.0.7:51234","worker":1}
+/// {"ts":"2026-11-13T08:40:01.123456Z","level":"info","event":"request","method":"GET","path":"/users/7","route":"/users/{id}","status":200,"duration_us":153,"bytes":512,"request_id":"5f3a9c2e8b41d706000100000000002a","peer":"10.0.0.7:51234","worker":1}
 /// ```
 ///
 /// | Field | Value |
@@ -19,8 +19,8 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// | `ts` | when the request reached the logger: RFC 3339, UTC, microseconds |
 /// | `level` | `error` for a `5xx` status, `info` otherwise |
 /// | `event` | always `request` |
-/// | `method`, `path` | as sent; the path still percent-encoded |
-/// | `query` | the query string, only with [`include_query`](Self::include_query) |
+/// | `method`, `path` | as sent; the path still percent-encoded, and cut to 4 KiB when longer (ending `...(+N bytes)`) |
+/// | `query` | the query string, only with [`include_query`](Self::include_query); cut like the path |
 /// | `route` | the pattern that matched, or `null` |
 /// | `status` | the response status |
 /// | `duration_us` | microseconds until the response was ready (sending it is not counted) |
@@ -58,9 +58,9 @@ impl<S: 'static> Middleware<S> for Logger {
         let start = Instant::now();
         let ts = SystemTime::now();
         let method = req.method().to_owned();
-        let path = req.path().to_owned();
+        let path = clip(req.path()).into_owned();
         let query = if self.query {
-            req.query_string().map(str::to_owned)
+            req.query_string().map(|q| clip(q).into_owned())
         } else {
             None
         };

@@ -25,6 +25,13 @@ struct RouteDef<S> {
     added_at: &'static Location<'static>,
 }
 
+/// A prefix a router was nested at, and the middleware of the routers from
+/// there in: those that run for a `404` under the prefix.
+struct Scope<S> {
+    prefix: Pattern,
+    middleware: Vec<Rc<dyn DynMiddleware<S>>>,
+}
+
 /// The routes of a service and the middleware around them. Build one on
 /// each worker, then [`build`](Router::build) it into an [`App`] to serve.
 ///
@@ -75,12 +82,23 @@ struct RouteDef<S> {
 /// (parameter names aside), panics where it is added: `GIONG-E1201` and
 /// `GIONG-E1202`.
 ///
+/// [`Req::param`] refuses a value that could leave a directory once
+/// decoded (a `.` or `..` segment, a NUL, a `/` in a one-segment
+/// parameter, a catch-all starting with `/`), so a catch-all can be joined
+/// to a directory.
+///
 /// ## Methods
+///
+/// The method picks among the paths that match: the most specific path
+/// with a route for the request's method answers. With `GET /users/me` and
+/// `DELETE /users/{id}`, `DELETE /users/me` goes to `/users/{id}`; to keep
+/// `/users/me` to its own methods, give it routes for the others.
 ///
 /// `HEAD` is answered by the `GET` route when there is no `HEAD` route.
 /// `OPTIONS` is answered with `204` and an `Allow` header when there is no
 /// `OPTIONS` route. A path whose routes have another method gets `405` with
-/// `Allow`; a path no route matches gets `404`.
+/// `Allow`; a path no route matches gets `404`. `Allow` lists every method
+/// that would route to the path, from every route that matches it.
 ///
 /// ## State
 ///
@@ -100,6 +118,8 @@ pub struct Router<S = ()> {
     routes: Vec<RouteDef<S>>,
     middleware: Vec<Rc<dyn DynMiddleware<S>>>,
     stream: Option<u64>,
+    /// The routers nested in this one, at any depth.
+    scopes: Vec<Scope<S>>,
 }
 
 impl<S: 'static> Default for Router<S> {
@@ -115,6 +135,7 @@ impl<S: 'static> Router<S> {
             routes: Vec::new(),
             middleware: Vec::new(),
             stream: None,
+            scopes: Vec::new(),
         }
     }
 
@@ -241,8 +262,20 @@ impl<S: 'static> Router<S> {
     }
 
     /// Adds `middleware` around every route of this router, wherever the
-    /// router ends up nested. On the outermost router it also runs for the
-    /// requests answered with `404`, `405` or the automatic `OPTIONS`.
+    /// router ends up nested.
+    ///
+    /// It also runs for the answers the router gives by itself for its
+    /// paths, so that [`Cors`](crate::middleware::Cors) or an access check
+    /// layered here covers them too:
+    ///
+    /// * the automatic answer to `OPTIONS` and the `405` for a path one of
+    ///   its routes matches (with the middleware of the first route added at
+    ///   the most specific such path). A CORS preflight, an `OPTIONS` with
+    ///   `Access-Control-Request-Method`, gets the middleware of the route
+    ///   that method would go to, as the request that follows will;
+    /// * the `404` for a path under the prefix the router was
+    ///   [nested](Self::nest) at (the most specific prefix wins), and on
+    ///   the outermost router for every other path.
     ///
     /// Middleware run in the order they were added: the first one added
     /// sees the request first.
@@ -260,12 +293,14 @@ impl<S: 'static> Router<S> {
     /// use giong_web::{Error, Req, Response, Router};
     ///
     /// async fn upload(req: Req) -> Result<Response, Error> {
+    ///     // Checked by `param`: no `..` or `.` segment, no NUL, not absolute.
+    ///     let name: String = req.param("path")?;
     ///     let body = req.body_stream().expect("a streaming route");
     ///     let mut total = 0;
     ///     while let Some(piece) = body.chunk().await? {
-    ///         total += piece.len(); // write it to a file, hash it, ...
+    ///         total += piece.len(); // write it under the uploads directory, hash it, ...
     ///     }
-    ///     Ok(Response::text(format!("{total} bytes")))
+    ///     Ok(Response::text(format!("{name}: {total} bytes")))
     /// }
     ///
     /// let uploads = Router::new().put("/files/{*path}", upload).stream_bodies(10 << 30);
@@ -325,6 +360,18 @@ impl<S: 'static> Router<S> {
                 ..def
             });
         }
+        for scope in router.scopes {
+            let mut middleware = router.middleware.clone();
+            middleware.extend(scope.middleware);
+            self.scopes.push(Scope {
+                prefix: prefix_pattern.join(&scope.prefix),
+                middleware,
+            });
+        }
+        self.scopes.push(Scope {
+            prefix: prefix_pattern,
+            middleware: router.middleware,
+        });
         self
     }
 
@@ -345,17 +392,31 @@ impl<S: 'static> Router<S> {
                 info: Rc::new(RouteInfo {
                     pattern: def.pattern.to_string().into(),
                     names: def.pattern.names().into(),
+                    catch_all: def.pattern.ends_with_catch_all(),
                 }),
                 chain,
                 handler: def.handler,
                 stream,
             });
         }
+        // Each nested router's prefix, and every path below it, for a `404`.
+        // The table picks the most specific; of two routers nested at the
+        // same prefix, the first one's middleware answer.
+        let mut scopes = Table::default();
+        let mut scope_chains = Vec::with_capacity(self.scopes.len());
+        for (i, scope) in self.scopes.into_iter().enumerate() {
+            let _ = scopes.insert(&scope.prefix, Method::Get, i);
+            let _ = scopes.insert(&scope.prefix.below(), Method::Get, i);
+            let chain: Box<Chain<S>> = top.iter().cloned().chain(scope.middleware).collect();
+            scope_chains.push(chain);
+        }
         App {
             state: Rc::new(state),
             table,
             routes: routes.into(),
             top,
+            scopes,
+            scope_chains: scope_chains.into(),
             streams,
         }
     }
@@ -402,8 +463,13 @@ pub struct App<S = ()> {
     state: Rc<S>,
     table: Table,
     routes: Box<[Route<S>]>,
-    /// The outermost router's middleware, for `404`, `405` and `OPTIONS`.
+    /// The outermost router's middleware, for a `404` outside every nested
+    /// router's prefix.
     top: Box<Chain<S>>,
+    /// The prefixes routers were nested at, and every path below each.
+    scopes: Table,
+    /// The chain for a `404` in each scope.
+    scope_chains: Box<[Box<Chain<S>>]>,
     /// Some route reads its body as a stream.
     streams: bool,
 }
@@ -431,16 +497,35 @@ impl<S: 'static> App<S> {
     pub async fn handle(&self, http: Request) -> Response {
         let method = Method::parse(http.method());
         let mut caps = Captures::new();
-        let (route, endpoint) = match self.table.lookup(&method, http.path(), &mut caps) {
+        // Answers the router gives by itself run through the middleware of
+        // the routes or the nested router the path belongs to (see
+        // `Router::layer`), so that a `Cors` nested at `/api` sees them.
+        let (route, chain, endpoint) = match self.table.lookup(&method, http.path(), &mut caps) {
             Lookup::Found(i) => {
                 let route = &self.routes[i];
-                (Some(route), Endpoint::Handler(&route.handler))
+                (
+                    Some(route),
+                    &*route.chain,
+                    Endpoint::Handler(&route.handler),
+                )
             }
-            Lookup::NotAllowed(methods) => (None, Endpoint::NotAllowed(methods.allow())),
-            Lookup::Options(methods) => (None, Endpoint::Options(methods.allow())),
-            Lookup::NotFound => (None, Endpoint::NotFound(self.hint(http.path()))),
+            Lookup::NotAllowed(allowed) => (
+                None,
+                self.chain_at(allowed.first_route()),
+                Endpoint::NotAllowed(allowed.allow()),
+            ),
+            Lookup::Options(allowed) => {
+                let chain = self
+                    .preflight_chain(&http)
+                    .unwrap_or_else(|| self.chain_at(allowed.first_route()));
+                (None, chain, Endpoint::Options(allowed.allow()))
+            }
+            Lookup::NotFound => (
+                None,
+                self.scope_chain(http.path()),
+                Endpoint::NotFound(self.hint(http.path())),
+            ),
         };
-        let chain = route.map_or(&*self.top, |r| &*r.chain);
         let info = route.map(|r| r.info.clone());
         let req = Req::new(http, self.state.clone(), info.clone(), caps);
         let resp = Next { chain, endpoint }.run(req).await;
@@ -451,6 +536,37 @@ impl<S: 'static> App<S> {
             }
         }
         resp
+    }
+
+    /// The middleware of route `i`.
+    fn chain_at(&self, i: usize) -> &Chain<S> {
+        &self.routes[i].chain
+    }
+
+    /// For a CORS preflight (an `OPTIONS` with
+    /// `Access-Control-Request-Method`) no route answers: the middleware of
+    /// the route the method it asks about would go to, which are those that
+    /// will see the request it announces.
+    fn preflight_chain(&self, http: &Request) -> Option<&Chain<S>> {
+        let asked = http.header_str("access-control-request-method")?.trim();
+        let mut caps = Captures::new();
+        match self
+            .table
+            .lookup(&Method::parse(asked), http.path(), &mut caps)
+        {
+            Lookup::Found(i) => Some(self.chain_at(i)),
+            _ => None,
+        }
+    }
+
+    /// For a `404`: the middleware of the router nested at the most
+    /// specific prefix of `path`, or the outermost router's.
+    fn scope_chain(&self, path: &str) -> &Chain<S> {
+        let mut caps = Captures::new();
+        match self.scopes.lookup(&Method::Get, path, &mut caps) {
+            Lookup::Found(i) => &self.scope_chains[i],
+            _ => &self.top,
+        }
     }
 
     /// The body limit of the route `req` goes to, if that route reads its

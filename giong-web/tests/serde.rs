@@ -1,5 +1,7 @@
 //! JSON bodies, JSON responses and typed query strings (feature `serde`).
 
+use std::borrow::Cow;
+
 use giong_web::{json, App, Error, Req, Request, Response, Router};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +27,10 @@ fn text(resp: &Response) -> String {
 
 #[derive(Deserialize)]
 struct NewUser<'a> {
-    name: &'a str,
+    // Borrowed from the body when the string has no escape, owned when it
+    // has one: a `&str` field would fail on `"Ad\"a"`.
+    #[serde(borrow)]
+    name: Cow<'a, str>,
     age: u8,
 }
 
@@ -45,7 +50,7 @@ async fn create(req: Req) -> Result<Response, Error> {
         201,
         &User {
             id: 7,
-            name: new.name,
+            name: &new.name,
             age: new.age,
         },
     )
@@ -96,6 +101,15 @@ fn a_json_body_in_a_json_response_out() {
     assert_eq!(resp.status(), 201);
     assert_eq!(resp.get_header("content-type"), Some("application/json"));
     assert_eq!(text(&resp), r#"{"id":7,"name":"Ada","age":36}"#);
+
+    // Escapes need an owned string, which `Cow` turns into.
+    let resp = post(
+        &app,
+        Some("application/json"),
+        r#"{"name":"Ad\"a \u00e9","age":36}"#,
+    );
+    assert_eq!(resp.status(), 201);
+    assert_eq!(text(&resp), r#"{"id":7,"name":"Ad\"a é","age":36}"#);
 }
 
 #[test]
@@ -165,6 +179,90 @@ fn query_strings_become_structs() {
         let resp = get(target);
         assert_eq!(resp.status(), 400, "{target}");
         let body = text(&resp);
+        assert!(body.contains("\"code\":\"GIONG-E1205\""), "{body}");
+        assert!(body.contains(why), "{target}: {body}");
+    }
+}
+
+/// A body or query string that serde cannot lend to a `&str` field is the
+/// program's mistake, not the client's: a `500` whose cause says what to
+/// use instead.
+#[test]
+fn a_str_field_that_cannot_borrow_is_a_500_that_says_what_to_use() {
+    #[derive(Deserialize)]
+    struct Borrowed<'a> {
+        name: &'a str,
+    }
+    #[derive(Deserialize)]
+    struct Tagged<'a> {
+        tag: Option<&'a str>,
+    }
+    async fn body(req: Req) -> Result<Response, Error> {
+        let b: Borrowed = req.json()?;
+        Ok(Response::text(b.name.to_string()))
+    }
+    async fn query(req: Req) -> Result<Response, Error> {
+        let t: Tagged = req.query()?;
+        Ok(Response::text(t.tag.unwrap_or("").to_string()))
+    }
+    let app = Router::new()
+        .post("/users", body)
+        .get("/tags", query)
+        .build(());
+    let get = |target: &str| send(&app, &format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+    // Plain values borrow, so the mistake hides in tests with plain values.
+    let resp = post(&app, Some("application/json"), r#"{"name":"Ada"}"#);
+    assert_eq!(text(&resp), "Ada");
+    assert_eq!(text(&get("/tags?tag=rust")), "rust");
+
+    for resp in [
+        post(&app, Some("application/json"), r#"{"name":"Ad\"a"}"#),
+        post(&app, Some("application/json"), r#"{"name":"caf\u00e9"}"#),
+        get("/tags?tag=rust+lang"),
+        get("/tags?tag=caf%C3%A9"),
+    ] {
+        assert_eq!(resp.status(), 500);
+        let err = Error::of(&resp).unwrap();
+        assert_eq!(err.code(), "GIONG-E1210");
+        let cause = err.source().unwrap().to_string();
+        assert!(cause.contains("GIONG-E1213"), "{cause}");
+        assert!(cause.contains("Cow<'a, str>"), "{cause}");
+        assert!(cause.contains("#[serde(borrow)]"), "{cause}");
+        assert!(!text(&resp).contains("borrowed"), "{}", text(&resp));
+    }
+}
+
+#[test]
+fn both_query_apis_refuse_a_repeated_key_and_a_bad_escape() {
+    use std::collections::HashMap;
+    async fn one(req: Req) -> Result<Response, Error> {
+        let page: Option<u32> = req.query_param("page")?;
+        Ok(Response::text(format!("{page:?}")))
+    }
+    async fn map(req: Req) -> Result<Response, Error> {
+        let all: HashMap<String, String> = req.query()?;
+        Ok(Response::text(all.len().to_string()))
+    }
+    let app = Router::new().get("/one", one).get("/map", map).build(());
+    let get = |target: &str| send(&app, &format!("GET {target} HTTP/1.1\r\nHost: t\r\n\r\n"));
+
+    // Only a key that is read must be there once.
+    assert_eq!(text(&get("/one?page=2&q=a&q=b")), "Some(2)");
+    assert_eq!(text(&get("/map?a=1&b=2")), "2");
+    for (target, why) in [
+        ("/one?page=1&page=2", "`page` appears more than once"),
+        ("/map?a=1&a=2", "`a` appears more than once"),
+        (
+            "/one?%zz=1&page=2",
+            "not followed by two hexadecimal digits",
+        ),
+        ("/one?page=2&q=%ff", "not UTF-8"),
+        ("/map?a=%zz", "not followed by two hexadecimal digits"),
+    ] {
+        let resp = get(target);
+        let body = text(&resp);
+        assert_eq!(resp.status(), 400, "{target}: {body}");
         assert!(body.contains("\"code\":\"GIONG-E1205\""), "{body}");
         assert!(body.contains(why), "{target}: {body}");
     }

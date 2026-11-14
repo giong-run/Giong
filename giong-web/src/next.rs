@@ -1,9 +1,12 @@
 //! The [`Middleware`] trait and [`Next`], the rest of the chain.
 
+use std::any::Any;
 use std::fmt;
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll};
 
 use giong::error::Code;
 use giong_http::Response;
@@ -45,7 +48,12 @@ pub(crate) type BoxHandler<S> = Rc<dyn Fn(Req<S>) -> BoxFuture<'static, Result<R
 ///
 /// What [`Next::run`] returns is always a [`Response`]: an error returned
 /// further in has already become one (see [`Error::of`] to read it back).
-/// An error the middleware itself returns becomes a response the same way.
+/// An error the middleware itself returns becomes a response the same way,
+/// and so does a panic, in a middleware or in the handler: a `500` with
+/// code `GIONG-E1210`, whose logged cause is "the handler panicked: ..." or
+/// "a middleware panicked: ...". The middleware further out run as for any
+/// other error, so the panic gets its log line and its request id, and the
+/// connection carries on with its other requests.
 pub trait Middleware<S = ()>: 'static {
     /// Handles one request.
     fn call(&self, req: Req<S>, next: Next<'_, S>)
@@ -87,7 +95,7 @@ pub(crate) enum Endpoint<'a, S> {
 impl<S> Endpoint<'_, S> {
     async fn call(self, req: Req<S>) -> Result<Response, Error> {
         match self {
-            Endpoint::Handler(handler) => handler(req).await,
+            Endpoint::Handler(handler) => guarded(Who::Handler, || handler(req)).await,
             Endpoint::NotFound(hint) => {
                 let mut detail = format!("no route for {} {}", req.method(), cut(req.path()));
                 if let Some(hint) = hint {
@@ -139,7 +147,7 @@ impl<S: 'static> Next<'_, S> {
                     chain: rest,
                     endpoint: self.endpoint,
                 };
-                first.call_dyn(req, next).await
+                guarded(Who::Middleware, || first.call_dyn(req, next)).await
             }
             None => self.endpoint.call(req).await,
         };
@@ -148,6 +156,78 @@ impl<S: 'static> Next<'_, S> {
             Err(err) => err.into_response(id),
         }
     }
+}
+
+/// Whose code panicked, for the cause of the `500`.
+#[derive(Clone, Copy)]
+enum Who {
+    Handler,
+    Middleware,
+}
+
+/// Starts a handler or a middleware with `start` and runs the future it
+/// returns, turning a panic in either into a `500` (`GIONG-E1210`).
+///
+/// A panic would otherwise unwind through giong-http's connection task and
+/// drop the connection with every request on it (over HTTP/2, those of the
+/// other streams too), with no response, no log line and no request id.
+/// Catching it at every step of the chain lets the middleware further out
+/// (`Logger`, `RequestId`) see an ordinary error response, wherever the
+/// panic happened.
+///
+/// `AssertUnwindSafe`: what the code that panicked shared with others, such
+/// as the router's state behind a `RefCell` or a `Mutex`, may be left half
+/// updated, the same risk as with any server that keeps running after a
+/// panic. A `RefCell` borrow ends as the panic unwinds; a `Mutex` is
+/// poisoned, as it would be on a thread.
+async fn guarded<'a>(
+    who: Who,
+    start: impl FnOnce() -> BoxFuture<'a, Result<Response, Error>>,
+) -> Result<Response, Error> {
+    // A closure may run code of its own before it returns its future.
+    match catch_unwind(AssertUnwindSafe(start)) {
+        Ok(fut) => Caught { fut, who }.await,
+        Err(payload) => Err(panicked(who, &*payload)),
+    }
+}
+
+/// Polls `fut`, catching a panic in the poll.
+struct Caught<'a> {
+    fut: BoxFuture<'a, Result<Response, Error>>,
+    who: Who,
+}
+
+impl Future for Caught<'_> {
+    type Output = Result<Response, Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let who = self.who;
+        let fut = &mut self.fut;
+        match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(poll) => poll,
+            // `guarded` awaits this once, so the future that panicked is not
+            // polled again; it is dropped with `Caught`.
+            Err(payload) => Poll::Ready(Err(panicked(who, &*payload))),
+        }
+    }
+}
+
+/// The `500` for a panic, with its message as the logged cause. The panic
+/// hook has already printed the message and where it happened to stderr.
+fn panicked(who: Who, payload: &(dyn Any + Send)) -> Error {
+    let what = match who {
+        Who::Handler => "the handler panicked",
+        Who::Middleware => "a middleware panicked",
+    };
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    let cause = match message {
+        Some(message) => format!("{what}: {message}"),
+        None => format!("{what} (with a payload that is not a string)"),
+    };
+    Error::internal(cause)
 }
 
 impl<S> fmt::Debug for Next<'_, S> {

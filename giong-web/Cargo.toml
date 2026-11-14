@@ -26,14 +26,14 @@ giong-http = { path = "../giong-http", version = "0.4.0" }
 # gzip for the Compression middleware. Already a dependency of giong-http's
 # client: the deflate implementation flate2 uses, in pure Rust.
 miniz_oxide = "0.9"
-serde = { version = "1", optional = true }
-serde_json = { version = "1", optional = true }
+serde = { version = "1.0.200", optional = true }
+serde_json = { version = "1.0.100", optional = true }
 tracing = { version = "0.1.40", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
 giong-http = { path = "../giong-http", version = "0.4.0", features = ["client"] }
 miniz_oxide = "0.9"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.200", features = ["derive"] }
 
 [[test]]
 name = "serde"

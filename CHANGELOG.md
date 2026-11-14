@@ -136,6 +136,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
+- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
+  forms of `Error::new` and `with_header` that never panic, for a status or a header
+  value that comes from an upstream service or the request: a status outside
+  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
+  gives the error back without it. The docs say which form takes which values, and
+  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
+  (takes JSON already written).
 
 ### Changed
 
@@ -161,6 +168,31 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (no `DEFER_TASKRUN`), where one fast stream can fill the whole pool in a single turn,
   the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
+- **giong-web**, **Breaking**: `Req::query_param` and `Req::query` follow one strict rule.
+  `query_param` used to take the first of a repeated key and skip a key that did not
+  decode; it now answers `400` (`GIONG-E1205`) for a repeated key it is asked for and
+  for a bad escape anywhere in the query string, as `query` did. `query` into a map
+  (`HashMap`, `serde_json::Value`) refuses a repeated key instead of keeping the last
+  value; a struct still ignores the keys it does not know.
+- **giong-web**, **Breaking**: `Sink` is `#[non_exhaustive]`, so that sinks can be added
+  without breaking a `match`.
+- **giong-web**, **Breaking**: request ids made by `RequestId` are 32 hexadecimal digits
+  instead of 20: 64 random bits per process instead of 32, 16 bits for the worker instead
+  of 8, then a 48-bit counter. With 32 random bits, two processes of a fleet shared ids
+  with even odds after about 77,000 starts, and workers above 256 shared them within a
+  process. Code that checks an id's length, or a column sized for it, needs the new one.
+- **giong-web**: `Logger` cuts a path or query string longer than 4 KiB in its lines,
+  ending `...(+N bytes)`. Sixteen requests with a 64 KiB path filled a worker's 1 MiB
+  log buffer, and the lines after them were dropped.
+- **giong-web**: the log writer shrinks a worker's buffer back to 64 KiB once written,
+  instead of keeping the memory of a burst (up to 1 MiB per worker and stream), and
+  removes the buffer of a thread that ended, after writing its last lines, instead of
+  keeping one per thread that ever logged.
+- **giong-web**: the `Timeout` docs no longer say that every giong operation is safe to
+  cancel: dropping is memory-safe, the database and HTTP clients close a connection whose
+  request was abandoned, and some I/O (a vectored write, `send_file`) may be cut halfway.
+  They show how to limit the work a streaming route does once its body is in, which
+  `Timeout` does not cover.
 
 ### Fixed
 
@@ -203,6 +235,48 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+- **giong-web**: a handler or middleware that panicked took its connection down with no
+  response, no log line and no request id, and over HTTP/2 every other request on that
+  connection with it. A panic, in the handler, in a closure before it returns its future
+  or in a middleware, is now caught where it happens and answered like any other failure:
+  `500` problem+json with `GIONG-E1210`, whose logged cause is "the handler panicked:
+  ..." or "a middleware panicked: ...", so `Logger`, `Trace` and `RequestId` see an
+  ordinary error response. A header value from the request that makes
+  `Response::header` panic (`%0A` in a query parameter) is one such case.
+- **giong-web**: middleware layered on a nested router never saw the requests giong-web
+  answers by itself, so `Cors` on the router nested at `/api` never answered a preflight
+  (browsers then blocked every JSON or authenticated cross-origin call to those routes),
+  and errors under the prefix had no `Access-Control-Allow-Origin`. A CORS preflight now
+  runs through the middleware of the route its `Access-Control-Request-Method` would go
+  to; another automatic `OPTIONS` or a `405`, through those of the first route at the most
+  specific path that matches; a `404`, through those of the router nested at the most
+  specific prefix of the path (the outermost router's elsewhere, as before).
+- **giong-web**: `Allow`, in a `405` and in the automatic answer to `OPTIONS`, named the
+  methods of the most specific matching path only, though the method picks among every
+  path that matches (`DELETE /users/me` goes to `DELETE /users/{id}`). It now lists every
+  method that would route to the URL. The rule is now in the README.
+- **giong-web**, **Breaking**: `Req::param` refuses with `400` (`GIONG-E1205`) a value
+  that once percent-decoded has a `.` or `..` segment (sent as is or as `%2E%2E`/`..%2F`;
+  giong-http does not remove dot segments), a NUL, a `/` in a one-segment parameter, or,
+  for a catch-all, a leading `/`. `/files/{*path}` joined to a directory was a path
+  traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
+  that wants it.
+- **giong-web**: the docs of `Req::json` showed a `&str` field, which serde can only lend
+  when the string needs no unescaping, so valid JSON with `\"` or `\u00e9` (and a query
+  value with `+` or `%XX`) was answered `422`/`400`, blaming the client. The examples now
+  use `String` or `#[serde(borrow)] Cow<'a, str>`, and such a failure is a `500` whose
+  logged cause (`GIONG-E1213`) says to use one of them.
+- **giong-web**: `?` looked for a giong code in the top error only, and read it from the
+  message of any error, `io::Error` included. A giong error wrapped in an application's
+  error type (a pool timeout inside a `RepoError`) was a `500` instead of a `503`, and an
+  upstream's message relayed in `io::Error::other("GIONG-E1111: ...")` was a `413`. The
+  code is now looked for down the whole `source()` chain, by type for giong's own errors
+  and by message only for the companion crates' error types, never in an `io::Error`'s
+  text.
+- **giong-web**: `Compression` answered `HEAD` without `Content-Encoding: gzip` and with
+  the uncompressed `Content-Length`, while `GET` got the compressed ones; RFC 9110 asks
+  for the same header fields. `HEAD` is now compressed like `GET`, and the server sends
+  the compressed length without the body.
 
 ## [0.4.0] - 2026-11-13
 
