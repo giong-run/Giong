@@ -175,6 +175,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
+  (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
+  (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the
+  common 8 MiB limit holds about fifty workers. Past it, a worker whose rings did not fit
+  failed with a bare `Cannot allocate memory`, which stopped the runtime, and one whose
+  buffer ring did not fit fell back to epoll blaming the kernel (`GIONG-E0009`, "may be a
+  kernel bug"). Such a worker now runs on epoll, unless io_uring was asked for, and the
+  error is the new `GIONG-E0010` (`Code::LockedMemoryLimit`), which names the limit and
+  how to raise it; [DEPLOYMENT.md](docs/DEPLOYMENT.md#locked-memory-limit) has the
+  settings for systemd, Docker and Kubernetes. CI's runners have 7.0 kernels and a limit,
+  which a test running several runtimes at once went past; CI now lifts the limit there,
+  so that the suite runs on io_uring every time, and a test sets it to nothing to check
+  the fallback.
 - **giong**: on Linux 6.0 and 6.1, io_uring gives up waiting on a non-blocking socket
   when a woken `sendmsg` or `recvmsg` still cannot proceed (it retries on a kernel
   thread, which then sees `O_NONBLOCK`) and completes with `EAGAIN`. giong now submits

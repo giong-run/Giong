@@ -96,7 +96,8 @@ CI also runs `loom`, the `kernels` jobs, the tests inside Docker's default secco
 profile (`docker`) and the database crates against other server
 versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
 `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, each in its `fuzz/`) and runs
-the soak test every night.
+the soak test every night, on the runner's kernel and on Linux 6.18 in QEMU; the 6.12 and
+6.18 `kernels` jobs soak for a minute on every pull request.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
@@ -163,6 +164,11 @@ is loaded.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps
+
+- **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
+  packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that
+  takes one `recv()` for one message passes on older kernels and fails there. Read by
+  length (`recv_exact` in the tests) or by a delimiter.
 
 - **Several worktrees, one target directory.** ThreadSanitizer builds share
   `$CARGO_TARGET_DIR/tsan`; two worktrees using the same one give stale, misleading
