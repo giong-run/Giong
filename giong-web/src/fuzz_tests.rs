@@ -63,6 +63,23 @@ fn every_request_gets_a_well_formed_answer() {
     }
 }
 
+/// Found by the fuzzer: serde_json reads `2e-75` one unit in the last place
+/// off, and what `json()` writes for that reads back as `2e-75`.
+#[cfg(feature = "serde")]
+#[test]
+fn a_number_that_does_not_read_back_the_same_is_echoed_as_read() {
+    let body = br#"{"a":[2e-75,{"b":null}],"c":"x\fe\r\\\rtu"}"#;
+    let mut raw = format!(
+        "POST /api/json HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+         Accept-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body);
+    let req = giong_http::Request::from_bytes(&raw).expect("the request parses");
+    assert_eq!(crate::fuzzing::app::check(req).status(), 200);
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn large_bodies_are_compressed_in_slices_and_decode_to_the_original() {
