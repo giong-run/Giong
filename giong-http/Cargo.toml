@@ -3,7 +3,7 @@ name = "giong-http"
 version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
-description = "A small, strict HTTP/1.1 server and client for the giong thread-per-core runtime"
+description = "A small, strict HTTP/1.1 and HTTP/2 server and client for the giong thread-per-core runtime"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 exclude = ["fuzz/"]
@@ -15,20 +15,20 @@ categories = ["web-programming::http-server", "web-programming::http-client", "n
 [features]
 # HTTPS through `Server::serve_tls`, using giong-tls (rustls).
 tls = ["dep:giong-tls"]
-# The HTTP/1.1 client in `giong_http::client`, with HTTPS through giong-tls
+# The HTTP/1.1 and HTTP/2 client in `giong_http::client`, with HTTPS through giong-tls
 # and gzip/deflate bodies decoded with miniz_oxide.
 client = ["dep:giong-tls", "dep:libc", "dep:miniz_oxide"]
 
 [dependencies]
 giong = { path = "..", version = "0.4.0" }
 giong-tls = { path = "../giong-tls", version = "0.4.0", optional = true }
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.172", optional = true }
 miniz_oxide = { version = "0.9", optional = true }
 
 [dev-dependencies]
 miniz_oxide = "0.9"
 rcgen = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.27", default-features = false, features = ["ring", "std", "tls12"] }
 # A TCP socket that is bound but does not listen. Already a dependency of giong.
 socket2 = "0.6"
 

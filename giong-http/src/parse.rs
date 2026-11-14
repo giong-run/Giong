@@ -65,6 +65,36 @@ pub(crate) fn trim(mut s: &[u8]) -> &[u8] {
     s
 }
 
+/// Splits a request target in absolute form, `scheme://authority[rest]`,
+/// into its scheme, its authority (up to the first `/`, `?` or `#`) and the
+/// rest, which may be empty. `None` if the target does not start with a
+/// scheme (RFC 3986, section 3.1) and `://`.
+pub(crate) fn split_absolute(target: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+    let colon = target.iter().position(|&b| b == b':')?;
+    let scheme = &target[..colon];
+    if !scheme.first()?.is_ascii_alphabetic()
+        || !scheme
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let rest = target[colon + 1..].strip_prefix(b"//")?;
+    let end = rest
+        .iter()
+        .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+    Some((scheme, &rest[..end], &rest[end..]))
+}
+
+/// Whether a `Host` header and the authority of a request (an absolute
+/// target's over HTTP/1.1, `:authority` over HTTP/2) name the same host.
+/// Host names are case-insensitive, and nothing else is normalised: a port
+/// given on one side only, even the default one, is a difference.
+pub(crate) fn same_authority(host: &[u8], authority: &[u8]) -> bool {
+    host.eq_ignore_ascii_case(authority)
+}
+
 /// Splits a block of header lines into `(name, value)` pairs. The block must
 /// have passed [`parse_head`].
 pub(crate) fn header_lines(block: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
@@ -105,6 +135,9 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     if target.is_empty() || !target.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
         return Err(400);
     }
+    // The version first: the rules below are HTTP/1.x's, and another
+    // version (`PRI * HTTP/2.0`, the HTTP/2 preface) is answered with 505
+    // whatever its target.
     let minor = match version {
         b"HTTP/1.1" => 1,
         b"HTTP/1.0" => 0,
@@ -114,6 +147,28 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
             return Err(505)
         }
         _ => return Err(400),
+    };
+    // The target is a path (origin form), `*` for OPTIONS, `host:port` for
+    // CONNECT, or a whole URL (absolute form, RFC 9112 section 3.2.2), as
+    // a client sends to a proxy. A server must take the host from such a
+    // URL and ignore `Host`, but handlers read `Host`: a proxy in front
+    // that routes on the URL while the handler picks the site from `Host`
+    // could be made to disagree. So the URL must be `http` or `https` and
+    // name the same host as `Host`, as `:authority` must over HTTP/2.
+    let authority = match target {
+        [b'/', ..] => None,
+        b"*" if method == b"OPTIONS" => None,
+        _ if method == b"CONNECT" => None,
+        _ => {
+            let (scheme, authority, _) = split_absolute(target).ok_or(400u16)?;
+            let http =
+                scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https");
+            // No user name or password either (RFC 9110, section 4.2.4).
+            if !http || authority.is_empty() || authority.contains(&b'@') {
+                return Err(400);
+            }
+            Some(authority)
+        }
     };
 
     let headers = line_end + 1..head.len() - 2;
@@ -131,6 +186,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
         h2: false,
     };
     let mut hosts = 0;
+    let mut host: Option<&[u8]> = None;
     let mut transfer_encoding = false;
 
     let mut rest = &head[headers];
@@ -185,6 +241,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
             parsed.expect_continue = true;
         } else if name.eq_ignore_ascii_case(b"host") {
             hosts += 1;
+            host = Some(value);
         }
     }
 
@@ -194,6 +251,13 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     }
     if hosts > 1 || (minor == 1 && hosts == 0) {
         return Err(400);
+    }
+    // An HTTP/1.0 request in absolute form without `Host` is refused too:
+    // the handler would see no host where the proxy saw one.
+    if let Some(authority) = authority {
+        if !host.is_some_and(|host| same_authority(host, authority)) {
+            return Err(400);
+        }
     }
     Ok(parsed)
 }
@@ -255,6 +319,7 @@ mod tests {
             ("GET  / HTTP/1.1\r\nHost: x\r\n\r\n", 400),
             ("GET / HTTP/1.1 \r\nHost: x\r\n\r\n", 400),
             ("GET / HTTP/2.0\r\nHost: x\r\n\r\n", 505),
+            ("PRI * HTTP/2.0\r\n\r\n", 505),
             ("GET / FTP/1.1\r\nHost: x\r\n\r\n", 400),
             ("G@T / HTTP/1.1\r\nHost: x\r\n\r\n", 400),
             ("GET /a\tb HTTP/1.1\r\nHost: x\r\n\r\n", 400),
@@ -286,6 +351,56 @@ mod tests {
         ];
         for (input, status) in cases {
             assert_eq!(parse(input), Err(*status), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn an_absolute_target_must_name_the_host_of_the_host_header() {
+        let accepted = [
+            "GET http://example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            // Schemes and host names are case-insensitive.
+            "GET HTTPS://Example.COM/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET Http://example.com/ HTTP/1.1\r\nHost: EXAMPLE.com\r\n\r\n",
+            // A port is part of the authority, on both sides.
+            "GET http://example.com:8080/a HTTP/1.1\r\nHost: example.com:8080\r\n\r\n",
+            "GET http://[::1]:8080/a HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
+            // No path, or a query straight after the authority.
+            "GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET http://example.com?q=/x HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET http://example.com/ HTTP/1.0\r\nHost: example.com\r\n\r\n",
+            // The other forms of target, for the methods that use them.
+            "OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n",
+            "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        ];
+        for input in accepted {
+            assert!(parse(input).is_ok(), "{input:?} was refused");
+        }
+        let refused = [
+            // RFC 9112, section 3.2.2: the target's authority is the host,
+            // so a Host that names another one is a disagreement.
+            "GET http://internal.example/admin HTTP/1.1\r\nHost: public.example\r\n\r\n",
+            "GET http://example.com:8080/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com:80\r\n\r\n",
+            "GET http://example.com/ HTTP/1.0\r\n\r\n",
+            // Only http and https.
+            "GET foo://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET ftp://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET httpx://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET ws://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            // No user name or password (RFC 9110, section 4.2.4), even
+            // when Host repeats them.
+            "GET http://user@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "GET http://u:p@example.com/ HTTP/1.1\r\nHost: u:p@example.com\r\n\r\n",
+            // No authority, or not a target at all.
+            "GET http:///a HTTP/1.1\r\nHost: \r\n\r\n",
+            "GET http:/a HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET a/b HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET ?q HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            "GET * HTTP/1.1\r\nHost: x\r\n\r\n",
+        ];
+        for input in refused {
+            assert_eq!(parse(input), Err(400), "{input:?}");
         }
     }
 }

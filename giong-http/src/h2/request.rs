@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
 
-use crate::parse::{is_field_value, is_token_str, Head};
+use crate::parse::{is_field_value, is_token_str, same_authority, Head};
 use crate::request::{BodyBytes, Request};
 
 /// Per-field overhead counted against the header list size (RFC 9113,
@@ -167,7 +167,8 @@ impl Builder {
                     b'p'
                 }
                 b"authority" => {
-                    if !value.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+                    // No user name or password (RFC 9113, section 8.3.1).
+                    if !value.iter().all(|&b| (0x21..=0x7e).contains(&b)) || value.contains(&b'@') {
                         return self.fail("an invalid :authority");
                     }
                     b'a'
@@ -259,8 +260,10 @@ impl Builder {
             }
             path
         };
+        // RFC 9113, section 8.3.1. HTTP/1.1 holds an absolute target's
+        // authority to the same rule (see `parse_head`).
         if let (Some(authority), Some(host)) = (&self.authority, &self.host) {
-            if self.pseudo[authority.clone()] != self.lines[host.clone()] {
+            if !same_authority(&self.lines[host.clone()], &self.pseudo[authority.clone()]) {
                 return Built::Malformed("a host header field that differs from :authority");
             }
         }
@@ -502,6 +505,25 @@ mod tests {
         let mut te = BASE.to_vec();
         te.push(("te", "trailers"));
         request(&te);
+    }
+
+    #[test]
+    fn host_and_authority_are_compared_as_http_1_1_compares_them() {
+        // Host names are case-insensitive: the same host in another case
+        // is no disagreement (and HTTP/1.1 compares an absolute target's
+        // authority with Host the same way).
+        let mut fields = BASE.to_vec();
+        fields.push(("host", "Example.COM"));
+        assert_eq!(request(&fields).header_str("host"), Some("Example.COM"));
+        // RFC 9113, section 8.3.1: no user name or password in :authority.
+        for authority in ["user@example.com", "u:p@example.com"] {
+            let mut fields = BASE.to_vec();
+            fields[3] = (":authority", authority);
+            assert!(
+                matches!(build(&fields), Built::Malformed(_)),
+                "{authority} was accepted"
+            );
+        }
     }
 
     #[test]

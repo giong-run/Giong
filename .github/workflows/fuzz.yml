@@ -44,6 +44,7 @@ jobs:
           - { crate: giong-http, target: chunked }
           - { crate: giong-http, target: connection }
           - { crate: giong-http, target: response_head }
+          - { crate: giong-http, target: response_body }
           - { crate: giong-http, target: url }
           - { crate: giong-http, target: inflate }
           - { crate: giong-http, target: hpack }
