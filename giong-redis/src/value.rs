@@ -441,53 +441,169 @@ tuples! {
 /// Implemented for strings (`&str`, `String`), bytes (`&[u8]`, `Vec<u8>`,
 /// `[u8; N]`), the integer types, `f64` and `f32`, and references to any
 /// of these. Numbers are sent in decimal, as Redis expects.
+///
+/// Implement it for your own types, such as typed keys. Whatever
+/// [`write_arg`](Self::write_arg) writes, in as many pieces as it likes,
+/// is sent as one argument:
+///
+/// ```
+/// use giong_redis::{cmd, ArgWriter, ToArg};
+///
+/// struct SessionKey(u64);
+///
+/// impl ToArg for SessionKey {
+///     fn write_arg(&self, out: &mut ArgWriter<'_>) {
+///         out.write(b"session:");
+///         self.0.write_arg(out);
+///     }
+/// }
+///
+/// let get = cmd("GET").arg(SessionKey(42)); // GET session:42
+/// ```
 pub trait ToArg {
-    /// Calls `f` once with the argument's bytes.
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8]));
+    /// Writes the argument's bytes to `out`. Everything written, nothing
+    /// included, is one argument.
+    fn write_arg(&self, out: &mut ArgWriter<'_>);
+}
+
+/// Where [`ToArg::write_arg`] writes one argument of a command.
+///
+/// The pieces written are joined into that one argument: an argument
+/// cannot end early, or spill into the next one, whatever an
+/// implementation does. It also implements [`std::fmt::Write`], so
+/// `write!(out, "user:{id}")` works.
+pub struct ArgWriter<'a> {
+    out: &'a mut Vec<u8>,
+    /// Where the argument's `$` is.
+    start: usize,
+    /// Where its bytes begin, once something was written.
+    body: Option<usize>,
+    /// More than one piece was written: the length in the header written
+    /// with the first is too short.
+    grown: bool,
+}
+
+impl ArgWriter<'_> {
+    /// Adds bytes to the argument.
+    pub fn write(&mut self, bytes: &[u8]) {
+        match self.body {
+            // The header is written with the first piece's length, which is
+            // the argument's whole length almost always: one piece.
+            None => {
+                self.out.push(b'$');
+                let mut digits = [0u8; 20];
+                self.out
+                    .extend_from_slice(decimal_u64(&mut digits, bytes.len() as u64));
+                self.out.extend_from_slice(b"\r\n");
+                self.body = Some(self.out.len());
+                self.out.extend_from_slice(bytes);
+            }
+            Some(_) => {
+                self.grown |= !bytes.is_empty();
+                self.out.extend_from_slice(bytes);
+            }
+        }
+    }
+
+    /// How many bytes the argument has so far.
+    pub fn len(&self) -> usize {
+        self.body.map_or(0, |body| self.out.len() - body)
+    }
+
+    /// Whether nothing was written to the argument yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Ends the argument: fixes the length in its header if it grew, or
+    /// writes an empty argument if nothing was written.
+    fn finish(self) {
+        let Some(body) = self.body else {
+            self.out.extend_from_slice(b"$0\r\n\r\n");
+            return;
+        };
+        if self.grown {
+            let len = self.out.len() - body;
+            let mut digits = [0u8; 20];
+            let digits = decimal_u64(&mut digits, len as u64);
+            let header = 1 + digits.len() + 2;
+            // The length only grew, so the header can only have become
+            // longer: move the bytes along to make room.
+            let extra = header - (body - self.start);
+            if extra > 0 {
+                let end = self.out.len();
+                self.out.resize(end + extra, 0);
+                self.out.copy_within(body..end, body + extra);
+            }
+            let at = self.start + 1;
+            self.out[at..at + digits.len()].copy_from_slice(digits);
+            self.out[at + digits.len()..at + digits.len() + 2].copy_from_slice(b"\r\n");
+        }
+        self.out.extend_from_slice(b"\r\n");
+    }
+}
+
+impl std::fmt::Write for ArgWriter<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Writes `arg` as one RESP bulk string at the end of `out`.
+pub(crate) fn write_bulk(out: &mut Vec<u8>, arg: &(impl ToArg + ?Sized)) {
+    let mut w = ArgWriter {
+        start: out.len(),
+        out,
+        body: None,
+        grown: false,
+    };
+    arg.write_arg(&mut w);
+    w.finish();
 }
 
 impl<T: ToArg + ?Sized> ToArg for &T {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        (**self).with_bytes(f)
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        (**self).write_arg(out)
     }
 }
 
 impl ToArg for str {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        f(self.as_bytes())
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(self.as_bytes())
     }
 }
 
 impl ToArg for String {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        f(self.as_bytes())
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(self.as_bytes())
     }
 }
 
 impl ToArg for [u8] {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        f(self)
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(self)
     }
 }
 
 impl ToArg for Vec<u8> {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        f(self)
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(self)
     }
 }
 
 impl<const N: usize> ToArg for [u8; N] {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        f(self)
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        out.write(self)
     }
 }
 
 macro_rules! int_args {
     ($($t:ty),*) => {$(
         impl ToArg for $t {
-            fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
+            fn write_arg(&self, out: &mut ArgWriter<'_>) {
                 let mut buf = [0u8; 40];
-                f(decimal(&mut buf, i128::from(*self)))
+                out.write(decimal(&mut buf, i128::from(*self)))
             }
         }
     )*};
@@ -495,16 +611,16 @@ macro_rules! int_args {
 int_args!(i8, i16, i32, i64, u8, u16, u32, u64);
 
 impl ToArg for isize {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
         let mut buf = [0u8; 40];
-        f(decimal(&mut buf, *self as i128))
+        out.write(decimal(&mut buf, *self as i128))
     }
 }
 
 impl ToArg for usize {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
         let mut buf = [0u8; 40];
-        f(decimal(&mut buf, *self as i128))
+        out.write(decimal(&mut buf, *self as i128))
     }
 }
 
@@ -551,18 +667,19 @@ pub(crate) fn decimal_u64(buf: &mut [u8; 20], mut n: u64) -> &[u8] {
 impl ToArg for f64 {
     /// The shortest decimal that reads back as the same number; `inf` and
     /// `-inf` for the infinities, which Redis accepts as scores.
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
         if self.is_infinite() {
-            f(if *self > 0.0 { b"inf" } else { b"-inf" })
+            out.write(if *self > 0.0 { b"inf" } else { b"-inf" })
         } else {
-            f(self.to_string().as_bytes())
+            use std::fmt::Write;
+            let _ = write!(out, "{self}");
         }
     }
 }
 
 impl ToArg for f32 {
-    fn with_bytes(&self, f: &mut dyn FnMut(&[u8])) {
-        f64::from(*self).with_bytes(f)
+    fn write_arg(&self, out: &mut ArgWriter<'_>) {
+        f64::from(*self).write_arg(out)
     }
 }
 
@@ -574,10 +691,18 @@ mod tests {
         Value::Bulk(s.as_bytes().to_vec())
     }
 
+    /// The bytes of the argument, without the bulk string around them.
     fn arg(a: impl ToArg) -> Vec<u8> {
         let mut out = Vec::new();
-        a.with_bytes(&mut |b| out.extend_from_slice(b));
-        out
+        write_bulk(&mut out, &a);
+        let body = out.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let len: usize = std::str::from_utf8(&out[1..body - 2])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(out.len(), body + len + 2, "{out:?}");
+        assert!(out.ends_with(b"\r\n"));
+        out[body..body + len].to_vec()
     }
 
     #[test]

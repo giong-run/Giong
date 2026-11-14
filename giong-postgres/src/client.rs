@@ -9,6 +9,8 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use crate::config::Config;
@@ -71,6 +73,19 @@ const LEFT_OPEN: &str = "a statement sent through the pool's shared methods (Poo
      the transaction rolled back, with every statement sent on it since BEGIN, this one included. \
      Run transactions on a connection of the task's own: pool.get().await?.transaction()";
 
+/// What a pool sends when a connection taken with `get()` comes back, so
+/// that the next task finds a clean session: `DISCARD ALL` without
+/// `DEALLOCATE ALL` (which would also drop the statement cache) and without
+/// `DISCARD PLANS` (plans are not session state). `RESET ALL` returns the
+/// settings sent when connecting (`statement_timeout`, `Config::param`) to
+/// those values, not to the server's defaults.
+const RESET: &str = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN *; \
+     SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
+
+/// The prefix of the names of the statements this crate prepares, chosen to
+/// stay clear of names an application would give its own.
+const NAME_PREFIX: &str = "__giong_";
+
 /// The state shared by a client and its two tasks.
 struct Conn {
     weak: Weak<Conn>,
@@ -87,6 +102,19 @@ struct Conn {
     shared: Cell<bool>,
     /// Woken when nothing is in flight any more, or the connection fails.
     idle_wakers: RefCell<Vec<Waker>>,
+    /// Requests sent since the connection opened: a pool compares the count
+    /// before and after lending it, to know whether it was used.
+    requests: Cell<u64>,
+    /// While a pool lends the connection to one task: the flag its cancel
+    /// tokens check, cleared when the connection goes back.
+    lease: RefCell<Option<Arc<AtomicBool>>>,
+    /// The server refused a write because it is a standby (it was a primary
+    /// once, or DNS still points at it): a pool closes the connection rather
+    /// than keep sending writes there.
+    retire: Cell<bool>,
+    /// A statement ran SQL-level `PREPARE`, whose prepared statement outlives
+    /// the task that made it.
+    user_prepared: Cell<bool>,
 }
 
 struct State {
@@ -117,6 +145,9 @@ struct Slot {
     kind: Kind,
     /// Sent while the connection was shared.
     shared: bool,
+    /// The pool's session reset: if it fails, the session is in an unknown
+    /// state, so the connection is closed rather than reused.
+    close_on_error: bool,
     inner: RefCell<SlotInner>,
 }
 
@@ -142,6 +173,13 @@ struct SlotInner {
     columns: Option<Vec<Column>>,
     rows: RowsBuilder,
     tag: Option<String>,
+    /// The server confirmed the Bind: the statement started running.
+    bound: bool,
+    /// The transaction status in the `ReadyForQuery` that ended the request.
+    status: u8,
+    /// The request failed on a stale cached statement before running, outside
+    /// a transaction: running it again is safe.
+    retry: bool,
     outcome: Option<Result<Response, Error>>,
 }
 
@@ -152,10 +190,11 @@ enum Response {
 }
 
 impl Slot {
-    fn new(kind: Kind, shared: bool) -> Rc<Self> {
+    fn new(kind: Kind, shared: bool, close_on_error: bool) -> Rc<Self> {
         Rc::new(Slot {
             kind,
             shared,
+            close_on_error,
             inner: RefCell::default(),
         })
     }
@@ -198,6 +237,22 @@ impl Drop for Wait {
     }
 }
 
+/// Whether the server's error says a prepared statement no longer fits: the
+/// schema changed under its cached plan (`0A000` from
+/// `RevalidateCachedQuery`; the message is matched too, for servers that send
+/// no routine, but it is translated when `lc_messages` is not English), or it
+/// does not exist any more (`26000`, after `DEALLOCATE` or `DISCARD ALL`).
+fn is_stale(db: &DbError) -> bool {
+    match db.code() {
+        "26000" => true,
+        "0A000" => {
+            db.routine() == Some("RevalidateCachedQuery")
+                || db.message().contains("cached plan must not change")
+        }
+        _ => false,
+    }
+}
+
 /// The number of rows a command tag reports: `INSERT 0 5`, `UPDATE 3`,
 /// `SELECT 7`.
 fn rows_affected(tag: Option<&str>) -> u64 {
@@ -222,7 +277,7 @@ impl Client {
         Ok(Self::start(startup, config.clone()))
     }
 
-    fn start(startup: Startup, config: Config) -> Client {
+    pub(crate) fn start(startup: Startup, config: Config) -> Client {
         let Startup {
             stream,
             buf,
@@ -238,6 +293,10 @@ impl Client {
             key,
             shared: Cell::new(false),
             idle_wakers: RefCell::new(Vec::new()),
+            requests: Cell::new(0),
+            lease: RefCell::new(None),
+            retire: Cell::new(false),
+            user_prepared: Cell::new(false),
             state: RefCell::new(State {
                 out: Vec::new(),
                 writer: None,
@@ -364,10 +423,15 @@ impl Client {
 
     /// A handle that asks the server to cancel whatever this connection is
     /// running, from any thread.
+    ///
+    /// A token taken from a [`PooledClient`](crate::PooledClient) stops
+    /// working when the connection goes back to the pool, so that it cannot
+    /// cancel the statements of the tasks that use the connection next.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
-            config: self.conn.config.clone(),
+            config: self.conn.config.without_password(),
             key: self.conn.key,
+            lease: self.conn.lease.borrow().clone(),
         }
     }
 
@@ -424,6 +488,50 @@ impl Client {
         }
     }
 
+    /// How many requests have been sent on the connection since it opened.
+    pub(crate) fn requests(&self) -> u64 {
+        self.conn.requests.get()
+    }
+
+    /// Starts lending the connection to one task: cancel tokens taken from
+    /// now on work until [`end_lease`](Self::end_lease).
+    pub(crate) fn begin_lease(&self) {
+        *self.conn.lease.borrow_mut() = Some(Arc::new(AtomicBool::new(true)));
+    }
+
+    /// Ends the lease: the cancel tokens taken during it stop working.
+    pub(crate) fn end_lease(&self) {
+        if let Some(lease) = self.conn.lease.borrow_mut().take() {
+            lease.store(false, Ordering::Release);
+        }
+    }
+
+    /// Whether the connection should not be used any more although it works:
+    /// the server refused a write because it is a standby.
+    pub(crate) fn should_retire(&self) -> bool {
+        self.conn.retire.get()
+    }
+
+    /// Queues the pool's session reset ([`RESET`]), and `DEALLOCATE ALL` if a
+    /// statement ran SQL-level `PREPARE` (the statement cache is emptied with
+    /// it). Nobody waits for the result; if it fails, the connection is
+    /// closed.
+    pub(crate) fn reset_session(&self) {
+        let deallocate = self.conn.user_prepared.replace(false);
+        let sql = if deallocate {
+            self.conn.state.borrow_mut().cache.clear();
+            format!("{RESET}; DEALLOCATE ALL")
+        } else {
+            RESET.to_owned()
+        };
+        if let Ok(slot) = self
+            .conn
+            .enqueue_with(Kind::Simple, true, |out| protocol::query(out, &sql))
+        {
+            slot.inner.borrow_mut().abandoned = true;
+        }
+    }
+
     /// Queues a statement whose result nobody waits for.
     pub(crate) fn send_and_forget(&self, sql: &str) {
         if let Ok(slot) = self
@@ -445,6 +553,27 @@ impl Client {
                 params.len()
             )));
         }
+        // A cached statement the schema changed under fails before running
+        // and is dropped from the cache: it is prepared again and run once
+        // more, unless that happened inside a transaction, which the error
+        // aborted.
+        let mut retried = false;
+        loop {
+            let slot = self.send(sql, params).await?;
+            let result = Wait { slot: slot.clone() }.await;
+            if result.is_err() && !retried && slot.inner.borrow().retry {
+                retried = true;
+                continue;
+            }
+            return match result? {
+                Response::Rows(set, tag) => Ok((set, tag)),
+                _ => unreachable!("an execute slot ends with rows"),
+            };
+        }
+    }
+
+    /// Prepares the statement if needed and sends a Bind and Execute for it.
+    async fn send(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Rc<Slot>, Error> {
         let stmt = self.conn.statement(sql).await?;
         if stmt.params.len() != params.len() {
             return Err(Error::conversion(format!(
@@ -485,11 +614,7 @@ impl Client {
                 stmt.closed.set(true);
             }
         }
-        drop(stmt);
-        match (Wait { slot }).await? {
-            Response::Rows(set, tag) => Ok((set, tag)),
-            _ => unreachable!("an execute slot ends with rows"),
-        }
+        Ok(slot)
     }
 }
 
@@ -524,6 +649,15 @@ impl Conn {
         kind: Kind,
         encode: impl FnOnce(&mut Vec<u8>) -> Result<(), Error>,
     ) -> Result<Rc<Slot>, Error> {
+        self.enqueue_with(kind, false, encode)
+    }
+
+    fn enqueue_with(
+        &self,
+        kind: Kind,
+        close_on_error: bool,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<Rc<Slot>, Error> {
         let mut st = self.state.borrow_mut();
         if let Some(e) = &st.broken {
             return Err(e.clone());
@@ -533,7 +667,8 @@ impl Conn {
             st.out.truncate(start);
             return Err(e);
         }
-        let slot = Slot::new(kind, self.shared.get());
+        let slot = Slot::new(kind, self.shared.get(), close_on_error);
+        self.requests.set(self.requests.get() + 1);
         if st.queue.is_empty() {
             self.head_since.set(Some(giong::time::Instant::now()));
         }
@@ -547,34 +682,54 @@ impl Conn {
     /// The prepared statement for `sql`: from the cache, from a prepare
     /// already in flight, or prepared now.
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
-        let pending = {
-            let mut st = self.state.borrow_mut();
-            st.clock += 1;
-            let now = st.clock;
-            match st.cache.get_mut(sql) {
-                Some(Entry::Ready { stmt, used }) => {
-                    *used = now;
-                    return Ok(stmt.clone());
+        let mut again = true;
+        loop {
+            let pending = {
+                let mut st = self.state.borrow_mut();
+                st.clock += 1;
+                let now = st.clock;
+                match st.cache.get_mut(sql) {
+                    Some(Entry::Ready { stmt, used }) => {
+                        *used = now;
+                        return Ok(stmt.clone());
+                    }
+                    Some(Entry::Preparing(slot)) => Some(slot.clone()),
+                    None => None,
                 }
-                Some(Entry::Preparing(slot)) => Some(slot.clone()),
-                None => None,
+            };
+            let Some(slot) = pending else {
+                return self.prepare(sql).await;
+            };
+            match (Wait { slot }).await {
+                Ok(Response::Statement(stmt)) => return Ok(stmt),
+                Ok(_) => unreachable!("a prepare slot ends with a statement"),
+                // The task that sent this prepare tries another name (see
+                // `prepare`); look in the cache again.
+                Err(e) if again && e.code() == Some("42P05") => again = false,
+                Err(e) => return Err(e),
             }
-        };
-        let Some(slot) = pending else {
-            return self.prepare(sql).await;
-        };
-        match (Wait { slot }).await? {
-            Response::Statement(stmt) => Ok(stmt),
-            _ => unreachable!("a prepare slot ends with a statement"),
         }
     }
 
     async fn prepare(&self, sql: &str) -> Result<Rc<Statement>, Error> {
+        match self.prepare_once(sql).await {
+            // A statement of that name exists already: prepared by the
+            // application with SQL-level PREPARE, or by another client behind
+            // a connection pooler. The next name will do.
+            Err(e) if e.code() == Some("42P05") => self.prepare_once(sql).await,
+            result => result,
+        }
+    }
+
+    async fn prepare_once(&self, sql: &str) -> Result<Rc<Statement>, Error> {
         let cached = self.config.statement_cache > 0;
         let (name, key) = {
             let mut st = self.state.borrow_mut();
             st.next_name += 1;
-            (format!("g{}", st.next_name), Rc::<str>::from(sql))
+            (
+                format!("{NAME_PREFIX}{}", st.next_name),
+                Rc::<str>::from(sql),
+            )
         };
         let slot = self.enqueue(
             Kind::Prepare {
@@ -641,16 +796,42 @@ impl Conn {
         let limit = self.config.max_result_size.max(1 << 20);
         while let Some((tag, len)) = buf.peek()? {
             if len > limit {
-                if tag != b'D' {
-                    return Err(Error::protocol(format!(
-                        "the server sent a {:?} message of {len} bytes, more than \
-                         max_result_size allows",
-                        tag as char
-                    )));
+                match tag {
+                    // One row larger than the limit: skip it as it arrives,
+                    // and fail the statement once it completes.
+                    b'D' => self.front()?.inner.borrow_mut().rows.set_overflow(),
+                    // A notice or a notification (nobody reads them), or
+                    // COPY TO STDOUT output (thrown away, and the statement
+                    // fails anyway).
+                    b'N' | b'A' | b'd' => {}
+                    // The statement's error: it fails with this one instead,
+                    // and the connection stays usable.
+                    b'E' => {
+                        let slot = self.front()?;
+                        let mut inner = slot.inner.borrow_mut();
+                        if inner.error.is_none() {
+                            inner.error = Some(Error::new(
+                                ErrorKind::TooLarge,
+                                format!(
+                                    "the server's error for this statement was a {len}-byte \
+                                     message, more than max_result_size allows, so it was \
+                                     thrown away; raise Config::max_result_size to read it"
+                                ),
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::Protocol,
+                            format!(
+                                "the server sent a {:?} message of {len} bytes, more than \
+                                 max_result_size allows, so the connection was closed; raise \
+                                 Config::max_result_size if the server's messages are this large",
+                                tag as char
+                            ),
+                        ))
+                    }
                 }
-                // One row larger than the limit: skip it as it arrives, and
-                // fail the statement once it completes.
-                self.front()?.inner.borrow_mut().rows.set_overflow();
                 buf.skip(len);
                 continue;
             }
@@ -702,8 +883,8 @@ impl Conn {
         let slot = self.front()?;
         let mut inner = slot.inner.borrow_mut();
         match msg {
+            Backend::BindComplete => inner.bound = true,
             Backend::ParseComplete
-            | Backend::BindComplete
             | Backend::CloseComplete
             | Backend::NoData
             | Backend::PortalSuspended
@@ -726,17 +907,28 @@ impl Conn {
                 }
                 _ => {}
             },
-            Backend::CommandComplete(tag) => inner.tag = Some(tag.to_owned()),
+            Backend::CommandComplete(tag) => {
+                if tag == "PREPARE" {
+                    self.user_prepared.set(true);
+                }
+                inner.tag = Some(tag.to_owned());
+            }
             Backend::ErrorResponse(fields) => {
                 if inner.error.is_none() {
                     let db = DbError::parse(fields)?;
+                    if db.code() == "25006" && self.on_standby() {
+                        self.retire.set(true);
+                    }
+                    // Only a note: the message is translated on servers whose
+                    // lc_messages is not English, and then there is none.
                     let note = (db.code() == "57014" && db.message().contains("statement timeout"))
-                        .then(|| {
-                            format!(
-                                "the statement ran longer than the statement timeout ({:?}; \
-                                 Config::statement_timeout)",
-                                self.config.statement_timeout
-                            )
+                        .then(|| match self.config.statement_timeout {
+                            Some(limit) => format!(
+                                "the statement ran longer than the statement timeout ({limit:?}; \
+                                 Config::statement_timeout)"
+                            ),
+                            None => "the statement ran longer than the server's statement_timeout"
+                                .to_owned(),
                         });
                     inner.error = Some(Error::from_db(db, note));
                 }
@@ -763,6 +955,14 @@ impl Conn {
                 if left_open {
                     inner.error = Some(Error::closed(LEFT_OPEN));
                 }
+                let reset_failed = match &inner.error {
+                    Some(e) if slot.close_on_error => Some(Error::closed(format!(
+                        "resetting the session of a connection that went back to the pool \
+                         failed, so it was closed rather than reused: {e}"
+                    ))),
+                    _ => None,
+                };
+                inner.status = status;
                 drop(inner);
                 let idle = {
                     let mut st = self.state.borrow_mut();
@@ -776,6 +976,9 @@ impl Conn {
                 if left_open {
                     // Closing the connection makes the server roll back.
                     return Err(Error::closed(LEFT_OPEN));
+                }
+                if let Some(e) = reset_failed {
+                    return Err(e);
                 }
                 if idle {
                     self.wake_idle();
@@ -818,7 +1021,10 @@ impl Conn {
             }
             Kind::Execute { stmt } => match error {
                 Some(e) => {
-                    self.forget_if_stale(stmt, &e);
+                    let stale = self.forget_if_stale(stmt, &e);
+                    // Failed in Bind (nothing ran) and outside a transaction
+                    // (none was aborted): safe to run again.
+                    inner.retry = stale && !inner.bound && inner.status == b'I';
                     Err(e)
                 }
                 None if inner.rows.overflow => Err(Error::new(
@@ -850,23 +1056,28 @@ impl Conn {
 
     /// Takes a cached statement out of the cache when the server says it no
     /// longer fits: the schema changed under it, or something deallocated it.
-    /// The next run prepares it afresh.
-    fn forget_if_stale(&self, stmt: &Statement, e: &Error) {
-        let stale = match e.db() {
-            Some(db) => {
-                (db.code() == "0A000" && db.message().contains("cached plan must not change"))
-                    || db.code() == "26000"
-            }
-            None => false,
-        };
-        if !stale {
-            return;
+    /// The next run prepares it afresh. Returns whether the error was one of
+    /// those.
+    fn forget_if_stale(&self, stmt: &Statement, e: &Error) -> bool {
+        if !e.db().is_some_and(is_stale) {
+            return false;
         }
         let mut st = self.state.borrow_mut();
         if matches!(st.cache.get(&stmt.sql), Some(Entry::Ready { stmt: s, .. }) if s.name == stmt.name)
         {
             st.cache.remove(&stmt.sql);
         }
+        true
+    }
+
+    /// Whether the server says it is a standby, or does not say (servers
+    /// before PostgreSQL 14 do not report `in_hot_standby`).
+    fn on_standby(&self) -> bool {
+        let st = self.state.borrow();
+        st.server_params
+            .iter()
+            .find(|(n, _)| n == "in_hot_standby")
+            .map_or(true, |(_, v)| v != "off")
     }
 
     /// Puts a prepared statement in the cache (or takes out a failed one),
@@ -996,8 +1207,8 @@ impl Transaction<'_> {
             .conn
             .enqueue(Kind::Simple, |out| protocol::query(out, "COMMIT"))?;
         match (Wait { slot }).await? {
-            Response::Done(Some(tag)) if tag == "ROLLBACK" => Err(Error::new(
-                ErrorKind::Db,
+            Response::Done(Some(tag)) if tag == "ROLLBACK" => Err(Error::with_sqlstate(
+                "25P02",
                 "the transaction was rolled back instead of committed, because a statement in \
                  it failed earlier",
             )),
@@ -1044,14 +1255,34 @@ impl std::fmt::Debug for Transaction<'_> {
 /// when the request arrives is the one cancelled.
 #[derive(Clone)]
 pub struct CancelToken {
+    /// Where to send the request; without the password, which it does not
+    /// need.
     config: Config,
     key: Option<(i32, i32)>,
+    /// Set for a token taken from a pooled connection: cleared when the
+    /// connection goes back to the pool.
+    lease: Option<Arc<AtomicBool>>,
 }
 
 impl CancelToken {
     /// Sends the cancel request. Success means the server received it, not
     /// that something was cancelled: the statement may have finished first.
+    ///
+    /// Fails with [`ErrorKind::Closed`], sending nothing, when the token was
+    /// taken from a [`PooledClient`](crate::PooledClient) that has gone back
+    /// to its pool since.
     pub async fn cancel(&self) -> Result<(), Error> {
+        if self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| !lease.load(Ordering::Acquire))
+        {
+            return Err(Error::closed(
+                "the connection this cancel token was taken from has gone back to its pool, \
+                 where other tasks use it, so nothing was sent; take a new token from the next \
+                 connection",
+            ));
+        }
         let key = self.key.ok_or_else(|| {
             Error::new(
                 ErrorKind::Connect,
@@ -1073,7 +1304,46 @@ impl std::fmt::Debug for CancelToken {
 
 #[cfg(test)]
 mod tests {
-    use super::rows_affected;
+    use super::{is_stale, rows_affected};
+    use crate::error::DbError;
+
+    fn db_error(fields: &[(u8, &str)]) -> DbError {
+        let mut body = Vec::new();
+        for (field, value) in fields {
+            body.push(*field);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        DbError::parse(&body).unwrap()
+    }
+
+    #[test]
+    fn a_stale_plan_is_recognised_in_any_language() {
+        let german = db_error(&[
+            (b'S', "FEHLER"),
+            (b'V', "ERROR"),
+            (b'C', "0A000"),
+            (b'M', "gecachter Plan darf den Ergebnistyp nicht ändern"),
+            (b'R', "RevalidateCachedQuery"),
+        ]);
+        assert!(is_stale(&german));
+        assert_eq!(german.severity(), "ERROR");
+        // A server that sends no routine, in English.
+        let english = db_error(&[
+            (b'C', "0A000"),
+            (b'M', "cached plan must not change result type"),
+        ]);
+        assert!(is_stale(&english));
+        // Another "feature not supported" error.
+        let other = db_error(&[
+            (b'C', "0A000"),
+            (b'M', "nicht unterstützt"),
+            (b'R', "transformSelectStmt"),
+        ]);
+        assert!(!is_stale(&other));
+        assert!(is_stale(&db_error(&[(b'C', "26000"), (b'M', "x")])));
+    }
 
     #[test]
     fn command_tags_give_row_counts() {

@@ -434,6 +434,13 @@ impl Io {
     /// that `EAGAIN` from them is never an answer: io_uring returns it when
     /// the socket is non-blocking and it stopped waiting (see
     /// [`Op`](crate::op::Op)), and the epoll driver never does.
+    /// `true` for operations whose result, when not negative, is a new
+    /// descriptor that whoever collects the result must close. When nobody
+    /// does (the future was dropped), the driver closes it.
+    pub(crate) fn result_is_fd(&self) -> bool {
+        matches!(self, Io::OpenAt { .. })
+    }
+
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
@@ -475,6 +482,35 @@ impl Io {
             _ => None,
         }
     }
+}
+
+/// Stops the worker on a kernel error its event loop cannot go on after
+/// (a completion the kernel dropped would leave an operation waiting for
+/// ever). The panic carries `GIONG-E0005` with the cause and what to do.
+#[cold]
+#[track_caller]
+pub(crate) fn event_loop_failed(call: &str, err: io::Error) -> ! {
+    let fix = match err.raw_os_error() {
+        Some(libc::EBADR) => {
+            "the kernel dropped completions because it could not allocate memory for them \
+             (EBADR): the machine ran out of memory. Give the process more memory, or run \
+             fewer connections per worker."
+        }
+        Some(libc::ENOMEM) => {
+            "the kernel is out of memory. Give the process more memory, or run fewer \
+             connections per worker."
+        }
+        _ => {
+            "please report it at https://github.com/giong-run/Giong/issues with this message \
+             and your kernel version (uname -r)."
+        }
+    };
+    let err = crate::error::Error::new(
+        crate::error::Code::Unexpected,
+        format!("{call} failed, so this worker cannot go on: {err}"),
+        fix,
+    );
+    panic!("{err}")
 }
 
 /// A multishot operation: it keeps producing results until it is dropped.
@@ -627,10 +663,14 @@ impl Driver {
 
     /// The future of a single-shot operation was dropped before its result
     /// was collected. `data` are the resources the operation may still use.
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>) {
+    /// The future of a single-shot operation was dropped before its result
+    /// was collected. `data` are the resources the kernel may still use;
+    /// `result_is_fd` says the result will be a descriptor nobody owns (see
+    /// [`Io::result_is_fd`]), which the driver then closes.
+    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
         match self {
-            Driver::Uring(d) => d.cancel_op(key, data),
-            Driver::Epoll(d) => d.cancel_op(key, data),
+            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd),
+            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd),
         }
     }
 
@@ -771,5 +811,30 @@ impl Driver {
             Driver::Uring(d) => d.recv_copied(),
             Driver::Epoll(_) => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    /// The panic that stops a worker says what happened and what to do.
+    #[test]
+    fn a_fatal_event_loop_error_panics_with_its_code() {
+        let message = |errno| {
+            let err = std::panic::catch_unwind(|| {
+                super::event_loop_failed("io_uring_enter", io::Error::from_raw_os_error(errno))
+            })
+            .unwrap_err();
+            err.downcast_ref::<String>().cloned().unwrap()
+        };
+        let lost = message(libc::EBADR);
+        assert!(
+            lost.starts_with("GIONG-E0005: io_uring_enter failed"),
+            "{lost}"
+        );
+        assert!(lost.contains("ran out of memory"), "{lost}");
+        let other = message(libc::EINVAL);
+        assert!(other.contains("report it"), "{other}");
     }
 }

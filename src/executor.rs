@@ -87,6 +87,11 @@ impl Wake for TaskWaker {
 }
 
 /// Why a task did not produce a value.
+///
+/// More reasons may be added, so a `match` needs a `_` arm; the
+/// [`is_cancelled`](Self::is_cancelled) and [`is_panic`](Self::is_panic)
+/// checks keep working.
+#[non_exhaustive]
 pub enum JoinError {
     /// The task was aborted, or the runtime shut down before it finished.
     Cancelled,
@@ -425,6 +430,7 @@ impl<F: Future> Future for LocalTask<F> {
         if this.guard.is_none() {
             return Poll::Ready(());
         }
+        // SAFETY: `fut` is structurally pinned (see above).
         let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
         let result = match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
             Ok(Poll::Pending) => return Poll::Pending,
@@ -480,6 +486,8 @@ impl<Fut: Future> Future for RemoteTask<Fut> {
         let result = if aborted {
             Err(JoinError::Cancelled)
         } else {
+            // SAFETY: `fut` is structurally pinned and not yet dropped (the
+            // guard is still here).
             let fut = unsafe { Pin::new_unchecked(&mut *this.fut) };
             match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
                 Ok(Poll::Pending) => return Poll::Pending,

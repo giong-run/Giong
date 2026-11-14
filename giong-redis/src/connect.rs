@@ -33,6 +33,10 @@ pub(crate) enum Stream {
     Tcp(TcpStream),
     Unix(UnixStream),
     Tls(Box<TlsStream>),
+    /// No socket: for driving a connection's reply matching from the fuzz
+    /// target and the tests, without a runtime.
+    #[cfg(any(test, fuzzing))]
+    Detached,
 }
 
 /// Received bytes, from whichever socket.
@@ -58,6 +62,8 @@ impl Stream {
             Stream::Tcp(s) => s.recv().await.map(Chunk::Pooled),
             Stream::Unix(s) => s.recv().await.map(Chunk::Pooled),
             Stream::Tls(s) => s.recv().await.map(Chunk::Owned),
+            #[cfg(any(test, fuzzing))]
+            Stream::Detached => std::future::pending().await,
         }
     }
 
@@ -66,6 +72,8 @@ impl Stream {
             Stream::Tcp(s) => s.write_all(buf).await,
             Stream::Unix(s) => s.write_all(buf).await,
             Stream::Tls(s) => s.write_all(buf).await,
+            #[cfg(any(test, fuzzing))]
+            Stream::Detached => (Ok(()), buf),
         }
     }
 
@@ -76,6 +84,8 @@ impl Stream {
             Stream::Tcp(s) => s.shutdown(how),
             Stream::Unix(s) => s.shutdown(how),
             Stream::Tls(s) => s.tcp().shutdown(how),
+            #[cfg(any(test, fuzzing))]
+            Stream::Detached => Ok(()),
         };
     }
 }
