@@ -1,0 +1,240 @@
+2026-11-14T11:09:51.050Z,0.840,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:10:01.324Z,0.811,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:10:05.525Z,0.842,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:10:15.805Z,0.849,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:10:19.894Z,0.837,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:10:30.172Z,0.837,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:10:34.262Z,0.841,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:10:44.541Z,0.843,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:10:48.628Z,0.841,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:10:58.908Z,0.834,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:11:03.003Z,0.351,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:13.279Z,0.340,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:17.495Z,0.329,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:27.770Z,0.334,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:31.866Z,0.353,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:42.143Z,0.333,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:46.235Z,0.350,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:11:56.511Z,0.347,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:12:00.599Z,0.337,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:12:10.877Z,0.332,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:12:14.971Z,0.145,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:12:25.248Z,0.142,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:12:29.456Z,0.149,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:12:39.736Z,0.146,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:12:43.825Z,0.143,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:12:54.107Z,0.141,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:12:58.199Z,0.148,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:13:08.475Z,0.144,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:13:12.564Z,0.147,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:13:22.842Z,0.144,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:13:26.932Z,0.174,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:13:37.216Z,0.173,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:13:41.436Z,0.174,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:13:51.712Z,0.171,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:13:55.801Z,0.174,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:14:06.077Z,0.173,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:14:10.171Z,0.175,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:14:20.447Z,0.173,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:14:24.536Z,0.174,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:14:34.814Z,0.177,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:14:38.906Z,0.175,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:14:49.183Z,0.172,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:14:53.398Z,0.170,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:03.676Z,0.170,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:07.764Z,0.166,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:18.045Z,0.168,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:22.137Z,0.165,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:32.414Z,0.168,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:36.504Z,0.170,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:46.787Z,0.173,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:15:50.881Z,0.170,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:01.159Z,0.159,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:05.359Z,0.168,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:15.639Z,0.164,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:19.736Z,0.158,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:30.014Z,0.164,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:34.107Z,0.161,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:44.394Z,0.160,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:48.484Z,0.169,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:16:58.766Z,0.164,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:17:02.854Z,0.031,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:13.130Z,0.041,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:17.349Z,0.034,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:27.622Z,0.037,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:31.708Z,0.042,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:41.980Z,0.040,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:46.069Z,0.045,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:17:56.348Z,0.047,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:18:00.436Z,0.044,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:18:10.707Z,0.033,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:18:14.790Z,0.029,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:18:25.066Z,0.031,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:18:29.280Z,0.037,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:18:39.470Z,0.072,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:18:43.558Z,0.044,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:18:53.833Z,0.037,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:18:57.915Z,0.049,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:19:08.189Z,0.031,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:19:12.273Z,0.040,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:19:22.465Z,0.073,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:19:26.556Z,0.832,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:19:36.834Z,0.845,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:19:41.047Z,0.833,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:19:51.321Z,0.843,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:19:55.408Z,0.841,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:20:05.690Z,0.828,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:20:09.783Z,0.842,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:20:20.067Z,0.837,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:20:24.153Z,0.841,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:20:34.431Z,0.844,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:20:38.519Z,0.339,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:20:48.795Z,0.341,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:20:53.011Z,0.342,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:03.294Z,0.346,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:07.383Z,0.332,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:17.661Z,0.341,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:21.751Z,0.342,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:32.033Z,0.350,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:36.123Z,0.336,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:46.404Z,0.339,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:21:50.494Z,0.149,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:00.770Z,0.147,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:04.973Z,0.149,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:15.250Z,0.145,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:19.335Z,0.148,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:29.611Z,0.145,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:33.696Z,0.145,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:43.973Z,0.145,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:48.070Z,0.139,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:22:58.345Z,0.149,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:23:02.437Z,0.180,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:12.710Z,0.172,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:16.929Z,0.177,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:27.205Z,0.175,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:31.295Z,0.169,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:41.572Z,0.176,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:45.663Z,0.183,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:23:55.938Z,0.176,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:24:00.026Z,0.177,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:24:10.302Z,0.177,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:24:14.393Z,0.168,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:24:24.672Z,0.171,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:24:28.879Z,0.174,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:24:39.154Z,0.170,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:24:43.244Z,0.169,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:24:53.523Z,0.167,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:24:57.611Z,0.163,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:25:07.891Z,0.168,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:25:11.985Z,0.167,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:25:22.259Z,0.166,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:25:26.352Z,0.167,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:25:36.632Z,0.163,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:25:40.836Z,0.158,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:25:51.121Z,0.164,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:25:55.213Z,0.161,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:26:05.494Z,0.160,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:26:09.587Z,0.168,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:26:19.865Z,0.162,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:26:23.952Z,0.166,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:26:34.231Z,0.161,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:26:38.319Z,0.069,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:26:48.596Z,0.035,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:26:52.797Z,0.038,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:03.073Z,0.045,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:07.059Z,0.037,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:17.334Z,0.039,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:21.421Z,0.033,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:31.696Z,0.044,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:35.786Z,0.061,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:46.058Z,0.043,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:27:50.147Z,0.048,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:00.421Z,0.072,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:04.632Z,0.038,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:14.907Z,0.040,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:18.995Z,0.032,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:29.269Z,0.040,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:33.362Z,0.038,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:43.639Z,0.045,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:47.724Z,0.040,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:28:58.005Z,0.029,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:29:02.094Z,0.829,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:29:12.372Z,0.809,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:29:16.585Z,0.791,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:29:26.858Z,0.841,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:29:30.946Z,0.816,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:29:41.223Z,0.841,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:29:45.307Z,0.833,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:29:55.583Z,0.843,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:29:59.674Z,0.840,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/json
+2026-11-14T11:30:09.952Z,0.850,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/json
+2026-11-14T11:30:14.040Z,0.332,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:30:24.320Z,0.350,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:30:28.526Z,0.317,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:30:38.804Z,0.334,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:30:42.895Z,0.334,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:30:53.173Z,0.345,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:30:57.269Z,0.342,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:31:07.547Z,0.338,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:31:11.636Z,0.342,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:31:21.919Z,0.343,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=4096
+2026-11-14T11:31:26.008Z,0.157,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:31:36.287Z,0.144,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:31:40.487Z,0.156,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:31:50.764Z,0.143,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:31:54.851Z,0.147,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:32:05.125Z,0.144,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:32:09.220Z,0.147,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:32:19.495Z,0.147,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:32:23.585Z,0.151,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:32:33.862Z,0.148,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16384
+2026-11-14T11:32:37.954Z,0.173,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:32:48.232Z,0.179,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:32:52.447Z,0.169,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:02.723Z,0.174,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:06.815Z,0.182,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:17.089Z,0.171,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:21.184Z,0.170,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:31.462Z,0.173,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:35.557Z,0.175,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:45.835Z,0.174,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=65536
+2026-11-14T11:33:49.927Z,0.169,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:00.207Z,0.170,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:04.415Z,0.166,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:14.697Z,0.171,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:18.787Z,0.174,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:29.070Z,0.170,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:33.161Z,0.166,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:43.441Z,0.166,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:47.530Z,0.167,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:34:57.805Z,0.170,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=262144
+2026-11-14T11:35:01.899Z,0.159,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:12.177Z,0.160,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:16.388Z,0.175,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:26.671Z,0.164,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:30.759Z,0.165,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:41.039Z,0.164,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:45.133Z,0.163,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:55.412Z,0.162,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:35:59.506Z,0.166,-t16 -c256 -d2s --timeout 5s http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:36:09.785Z,0.162,-t16 -c256 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=1048576
+2026-11-14T11:36:13.874Z,0.040,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:36:24.152Z,0.035,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:36:28.362Z,0.046,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:36:38.634Z,0.040,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:36:42.719Z,0.039,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:36:52.992Z,0.036,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:36:57.073Z,0.044,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:37:07.347Z,0.029,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:37:11.436Z,0.070,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:37:21.708Z,0.041,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/static?size=16777216
+2026-11-14T11:37:25.791Z,0.029,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:37:36.067Z,0.038,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:37:40.183Z,0.043,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:37:50.457Z,0.038,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:37:54.449Z,0.072,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:38:04.724Z,0.073,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:38:08.811Z,0.075,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:38:19.083Z,0.031,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:38:23.170Z,0.042,-t1 -c1 -d2s --timeout 5s http://10.40.96.3:3009/stream?size=67108864
+2026-11-14T11:38:33.423Z,0.076,-t1 -c1 -d10s --timeout 5s --latency http://10.40.96.3:3009/stream?size=67108864
