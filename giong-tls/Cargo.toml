@@ -18,12 +18,16 @@ webpki-roots = ["dep:webpki-roots"]
 
 [dependencies]
 giong = { path = "..", version = "0.4.0" }
-libc = "0.2"
-rustls = { version = "0.23.27", default-features = false, features = ["ring", "std", "tls12"] }
+libc = "0.2.172"
+rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
 rcgen = "0.13"
+
+[lints.rust]
+# Set by `cargo fuzz` (see fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [package.metadata.docs.rs]
 all-features = true

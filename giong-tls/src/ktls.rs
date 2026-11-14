@@ -64,7 +64,9 @@ pub enum Ktls {
     Off,
     /// The kernel takes a connection when it can do everything rustls would
     /// have done for it; otherwise the connection stays in the process.
-    /// Never fails because of kTLS.
+    /// Fails because of kTLS only if the kernel then refuses keys it said it
+    /// would take (`GIONG-E2010`): by then rustls has handed the connection
+    /// over, and it cannot go back to the process.
     ///
     /// "Everything" means: the kernel has the `tls` module, encrypts and
     /// decrypts every cipher suite the configuration allows, and, when TLS
@@ -73,6 +75,12 @@ pub enum Ktls {
     /// a peer's `KeyUpdate`, so on older kernels connections stay in the
     /// process. A stream on which `TcpStream::recv` was already used (a
     /// database client's plaintext greeting) also stays in the process.
+    ///
+    /// The check covers every cipher suite of the configuration's crypto
+    /// provider, for TLS 1.2 and 1.3 alike, even if the configuration
+    /// allows only one of the versions (rustls does not say which it
+    /// allows). For a TLS 1.2-only configuration on a kernel before 6.14,
+    /// give it a provider with only the TLS 1.2 suites.
     Auto,
     /// The kernel takes every connection, or the handshake fails with
     /// `GIONG-E2009`. Also allows TLS 1.3 on kernels older than 6.14, where
@@ -850,6 +858,11 @@ impl Plan {
         }
     }
 
+    /// `true` if connections try the kernel.
+    pub(crate) fn tries(&self) -> bool {
+        matches!(self, Plan::Try { .. })
+    }
+
     /// Counts a connection that stays in the process although kTLS was
     /// asked for.
     pub(crate) fn stayed(&self) {
@@ -999,8 +1012,6 @@ pub(crate) struct Kernel {
     key_update_owed: bool,
     /// What ended receiving, for every later `recv`.
     recv_failed: Option<String>,
-    /// Sending is over: `close_notify` went out, or the keys are used up.
-    sending_closed: Option<Code>,
 }
 
 /// Records of slack before the confidentiality limit, so that one write
@@ -1145,6 +1156,8 @@ struct Handshake<'a> {
     tcp: &'a TcpStream,
     /// Received bytes rustls has not used up yet.
     incoming: Vec<u8>,
+    /// Where the bytes received so far end in the peer's record stream.
+    framing: Framing,
     /// Encoded records waiting to be sent.
     out: Vec<u8>,
     /// Application data that arrived before the keys went to the kernel.
@@ -1172,6 +1185,7 @@ impl<'a> Handshake<'a> {
         Self {
             tcp,
             incoming: Vec::new(),
+            framing: Framing::default(),
             out: Vec::new(),
             plain: Vec::new(),
             peer_closed: false,
@@ -1193,13 +1207,16 @@ impl<'a> Handshake<'a> {
                 Step::Read => self.read(MAX_RECORD).await?,
                 Step::Finished => {
                     // The handshake is over. Bytes left over are the start
-                    // of a record the handshake did not need (or a handshake
-                    // message spread over records): read exactly up to its
-                    // end, so that the kernel starts at a record boundary.
-                    let need = record_boundary(&self.incoming)?;
-                    if need == 0 {
-                        break;
-                    }
+                    // of a record the handshake did not need, or of a
+                    // handshake message spread over records whose next
+                    // record has not arrived: read exactly up to the end of
+                    // that record (or the next one's header), so that the
+                    // kernel starts at a record boundary.
+                    let need = match self.framing.to_boundary() {
+                        _ if self.incoming.is_empty() => break,
+                        0 => 5,
+                        n => n,
+                    };
                     self.read(need).await?;
                 }
             }
@@ -1295,6 +1312,7 @@ impl<'a> Handshake<'a> {
         if res? == 0 {
             return Err(crate::handshake_eof());
         }
+        self.framing.feed(&window.buf)?;
         self.incoming.extend_from_slice(&window.buf);
         Ok(())
     }
@@ -1365,7 +1383,6 @@ impl<'a> Handshake<'a> {
                 key_update_requests_left: KEY_UPDATE_REQUESTS,
                 key_update_owed: false,
                 recv_failed: None,
-                sending_closed: None,
             },
             plain: self.plain,
             peer_closed: self.peer_closed,
@@ -1373,31 +1390,212 @@ impl<'a> Handshake<'a> {
     }
 }
 
-/// How many more bytes to read so that `buf`, which starts at a record
-/// boundary, ends at one: the rest of a record cut short, or the header of
-/// the next one when every record in it is whole (a handshake message spread
-/// over records). 0 when it is empty.
-fn record_boundary(buf: &[u8]) -> io::Result<usize> {
-    let mut at = 0;
-    while at < buf.len() {
-        let rest = &buf[at..];
-        if rest.len() < 5 {
-            return Ok(5 - rest.len());
+/// Where the bytes read so far end in the peer's record stream, worked out
+/// from the bytes as they arrive. rustls decrypts records in place and
+/// moves the fragments of a handshake message together, so the bytes it
+/// leaves in `incoming` no longer show the record headers.
+#[derive(Debug, Default)]
+struct Framing {
+    /// The header of the next record, as far as it has arrived.
+    header: [u8; 5],
+    /// How many bytes of `header` have arrived.
+    have: usize,
+    /// Bytes of the current record's body still to come.
+    left: usize,
+}
+
+impl Framing {
+    /// Follows `bytes`, the next ones received, through the record headers.
+    fn feed(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if self.left > 0 {
+                let n = self.left.min(bytes.len());
+                self.left -= n;
+                bytes = &bytes[n..];
+                continue;
+            }
+            let n = (5 - self.have).min(bytes.len());
+            self.header[self.have..self.have + n].copy_from_slice(&bytes[..n]);
+            self.have += n;
+            bytes = &bytes[n..];
+            if self.have == 5 {
+                let len = 5 + usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                if len > MAX_RECORD {
+                    return Err(coded(
+                        Code::TlsProtocol,
+                        format!("the peer sent a TLS record of {len} bytes, more than TLS allows"),
+                        "check that the other side speaks TLS on this port.",
+                    ));
+                }
+                self.have = 0;
+                self.left = len - 5;
+            }
         }
-        let len = 5 + u16::from_be_bytes([rest[3], rest[4]]) as usize;
-        if len > MAX_RECORD {
-            return Err(coded(
-                Code::TlsProtocol,
-                format!("the peer sent a TLS record of {len} bytes, more than TLS allows"),
-                "check that the other side speaks TLS on this port.",
-            ));
-        }
-        if rest.len() < len {
-            return Ok(len - rest.len());
-        }
-        at += len;
+        Ok(())
     }
-    Ok(if buf.is_empty() { 0 } else { 5 })
+
+    /// How many more bytes end the record in progress (its header, then its
+    /// body); 0 at a record boundary.
+    fn to_boundary(&self) -> usize {
+        if self.have > 0 {
+            5 - self.have
+        } else {
+            self.left
+        }
+    }
+}
+
+/// The complete handshake messages at the start of `buf`, each as its type
+/// and body. It stops at a message that has not all arrived (it starts at
+/// `at`), and fails with the length of a message longer than giong-tls
+/// accepts.
+struct HandshakeMessages<'a> {
+    buf: &'a [u8],
+    /// Where the next message starts.
+    at: usize,
+}
+
+impl<'a> HandshakeMessages<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        HandshakeMessages { buf, at: 0 }
+    }
+}
+
+impl<'a> Iterator for HandshakeMessages<'a> {
+    type Item = Result<(u8, &'a [u8]), usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let &[typ, a, b, c, ..] = &self.buf[self.at..] else {
+            return None;
+        };
+        let len = u32::from_be_bytes([0, a, b, c]) as usize;
+        if len > MAX_HANDSHAKE_MESSAGE {
+            return Some(Err(len));
+        }
+        let body = self.buf.get(self.at + 4..self.at + 4 + len)?;
+        self.at += 4 + len;
+        Some(Ok((typ, body)))
+    }
+}
+
+/// For the fuzz target and the randomised tests: [`Framing`], fed `stream`
+/// in pieces of the sizes `piece` picks, agrees after every piece with a
+/// plain walk over the whole stream, and fails exactly when a record header
+/// announces more than TLS allows.
+#[cfg(any(test, fuzzing))]
+pub fn check_record_framing(stream: &[u8], mut piece: impl FnMut() -> usize) {
+    // The records as (start, end), end unknown for a header cut short; and
+    // where the header of a record too large ends.
+    let mut records = Vec::new();
+    let mut too_large = None;
+    let mut start = 0;
+    while start < stream.len() {
+        let Some(header) = stream.get(start..start + 5) else {
+            records.push((start, None));
+            break;
+        };
+        let end = start + 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if end - start > MAX_RECORD {
+            too_large = Some(start + 5);
+            records.push((start, None));
+            break;
+        }
+        records.push((start, Some(end)));
+        start = end;
+    }
+    let expected = |fed: usize| -> usize {
+        for &(start, end) in &records {
+            if fed == start {
+                return 0;
+            }
+            if fed < start + 5 {
+                return start + 5 - fed;
+            }
+            if let Some(end) = end {
+                if fed < end {
+                    return end - fed;
+                }
+            }
+        }
+        0
+    };
+    let mut framing = Framing::default();
+    let mut fed = 0;
+    while fed < stream.len() {
+        let n = (1 + piece() % 300).min(stream.len() - fed);
+        let result = framing.feed(&stream[fed..fed + n]);
+        fed += n;
+        if too_large.is_some_and(|at| fed >= at) {
+            assert!(
+                result.is_err(),
+                "a record too large was taken, {fed} bytes in"
+            );
+            return;
+        }
+        assert!(result.is_ok(), "{result:?} {fed} bytes in");
+        assert_eq!(framing.to_boundary(), expected(fed), "{fed} bytes in");
+    }
+}
+
+/// For the fuzz target and the randomised tests: handshake messages that
+/// arrive in records of the sizes `piece` picks, kept between records as
+/// [`TlsStream`]'s receive path keeps them, come out the same as from the
+/// whole stream at once, and a message too long fails at the same place.
+#[cfg(any(test, fuzzing))]
+pub fn check_handshake_messages(stream: &[u8], mut piece: impl FnMut() -> usize) {
+    // A plain walk over the whole stream.
+    let mut whole = Vec::new();
+    let mut too_long = None;
+    let mut at = 0;
+    while let Some(&[typ, a, b, c]) = stream.get(at..at + 4) {
+        let len = u32::from_be_bytes([0, a, b, c]) as usize;
+        if len > MAX_HANDSHAKE_MESSAGE {
+            too_long = Some((at + 4, len));
+            break;
+        }
+        let Some(body) = stream.get(at + 4..at + 4 + len) else {
+            break;
+        };
+        whole.push((typ, body.to_vec()));
+        at += 4 + len;
+    }
+    // The same in pieces.
+    let mut pieces = Vec::new();
+    let mut kept = Vec::new();
+    let mut fed = 0;
+    while fed < stream.len() {
+        let n = (1 + piece() % 300).min(stream.len() - fed);
+        kept.extend_from_slice(&stream[fed..fed + n]);
+        fed += n;
+        let mut parsed = HandshakeMessages::new(&kept);
+        for message in &mut parsed {
+            match message {
+                Ok((typ, body)) => pieces.push((typ, body.to_vec())),
+                Err(len) => {
+                    let (end, expected) = too_long.expect("only a message too long fails");
+                    assert_eq!(len, expected);
+                    assert!(fed >= end, "failed before the length arrived");
+                    assert_eq!(pieces, whole[..pieces.len()], "before the failure");
+                    assert_eq!(pieces.len(), whole.len());
+                    return;
+                }
+            }
+        }
+        let at = parsed.at;
+        kept.drain(..at);
+        assert!(
+            kept.len() < 4 + MAX_HANDSHAKE_MESSAGE,
+            "{} bytes kept",
+            kept.len()
+        );
+    }
+    assert!(too_long.is_none(), "a message too long was taken");
+    assert_eq!(pieces, whole);
+    assert_eq!(
+        kept,
+        stream[at..],
+        "what is left is the message still to come"
+    );
 }
 
 // ---------------------------------------------------- the kernel's stream
@@ -1477,10 +1675,13 @@ impl TlsStream {
                     self.eof.set(true);
                     return Ok(Vec::new());
                 }
-                Ok(data) => {
-                    self.kernel_mut().key_update_requests_left = KEY_UPDATE_REQUESTS;
-                    return Ok(data.to_vec());
-                }
+                Ok(data) => match self.interleaved() {
+                    Some(fail) => fail,
+                    None => {
+                        self.kernel_mut().key_update_requests_left = KEY_UPDATE_REQUESTS;
+                        return Ok(data.to_vec());
+                    }
+                },
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                     // A record that is not application data, which the
                     // kernel only hands to a receive with room for its type.
@@ -1532,8 +1733,31 @@ impl TlsStream {
         })
     }
 
+    /// Fails the stream if part of a handshake message is waiting for the
+    /// rest: "if a handshake message is split over two or more records,
+    /// there MUST NOT be any other records between them" (RFC 8446, 5.1;
+    /// rustls applies it to TLS 1.2 too).
+    fn interleaved(&self) -> Option<Control> {
+        if self.kernel_mut().handshake.is_empty() {
+            return None;
+        }
+        Some(Control::Fail(
+            peer_misbehaved(
+                "the peer sent another record type in the middle of a handshake message split \
+                 over records"
+                    .into(),
+            ),
+            Some(UNEXPECTED_MESSAGE),
+        ))
+    }
+
     /// A record the kernel returned with a type other than application data.
     fn control_record(&self, (record_type, data): (u8, Vec<u8>)) -> Control {
+        if record_type != HANDSHAKE {
+            if let Some(fail) = self.interleaved() {
+                return fail;
+            }
+        }
         match record_type {
             APPLICATION_DATA => {
                 self.plain.borrow_mut().extend_from_slice(&data);
@@ -1607,29 +1831,27 @@ impl TlsStream {
             mem::take(&mut k.handshake)
         };
         let mut result = Control::Done;
-        let mut at = 0;
-        while messages.len() - at >= 4 {
-            let typ = messages[at];
-            let len = u32::from_be_bytes([0, messages[at + 1], messages[at + 2], messages[at + 3]])
-                as usize;
-            if len > MAX_HANDSHAKE_MESSAGE {
-                return Control::Fail(
-                    peer_misbehaved(format!("the peer sent a handshake message of {len} bytes")),
-                    Some(DECODE_ERROR),
-                );
-            }
-            if messages.len() - at - 4 < len {
-                break;
-            }
-            let body = &messages[at + 4..at + 4 + len];
-            at += 4 + len;
-            let last_in_record = at == messages.len();
+        let mut parsed = HandshakeMessages::new(&messages);
+        while let Some(message) = parsed.next() {
+            let (typ, body) = match message {
+                Ok(message) => message,
+                Err(len) => {
+                    return Control::Fail(
+                        peer_misbehaved(format!(
+                            "the peer sent a handshake message of {len} bytes"
+                        )),
+                        Some(DECODE_ERROR),
+                    )
+                }
+            };
+            let last_in_record = parsed.at == messages.len();
             match self.post_handshake(typ, body, last_in_record) {
                 Control::Done => {}
                 fail @ Control::Fail(..) => return fail,
                 other => result = other,
             }
         }
+        let at = parsed.at;
         messages.drain(..at);
         if messages.len() > MAX_HANDSHAKE_MESSAGE + 4 {
             return Control::Fail(
@@ -1756,11 +1978,8 @@ impl TlsStream {
     /// Sends the `KeyUpdate` the peer asked for, if it is still owed and
     /// the stream can still send. The caller holds the send lock.
     async fn pay_key_update(&self) -> io::Result<()> {
-        let owed = {
-            let k = self.kernel_mut();
-            k.key_update_owed && k.sending_closed.is_none()
-        };
-        if owed && !self.broken.get() {
+        let owed = self.kernel_mut().key_update_owed;
+        if owed && self.cannot_send().is_none() {
             self.update_sending_keys().await?;
         }
         Ok(())
@@ -1824,7 +2043,7 @@ impl TlsStream {
     /// usually ending.
     async fn send_alert(&self, level: u8, description: u8) {
         let sending = self.lock_send().await;
-        if self.broken.get() || self.kernel_mut().sending_closed.is_some() {
+        if self.cannot_send().is_some() {
             sending.done();
             return;
         }
@@ -1833,13 +2052,13 @@ impl TlsStream {
             .send_with_control(vec![level, description], record_type_cmsg(ALERT))
             .await;
         if res.is_err() || level == ALERT_FATAL {
-            self.kernel_mut().sending_closed = Some(Code::TlsBroken);
+            self.closed.set(Some(Code::TlsBroken));
         }
         sending.done();
     }
 
     /// `write_all` once the kernel encrypts.
-    pub(crate) async fn kernel_write_all(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
+    pub(crate) async fn kernel_write_all<B: giong::IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
         let sending = self.lock_send().await;
         if let Err(e) = self.before_kernel_send(buf.len()).await {
             // Nothing of `buf` was sent; a failed key update has already
@@ -1915,11 +2134,8 @@ impl TlsStream {
     /// `close_notify` and an error elsewhere (as rustls does for TLS 1.2).
     /// The caller holds the send lock.
     async fn before_kernel_send(&self, len: usize) -> io::Result<()> {
-        if self.broken.get() {
-            return Err(crate::broken());
-        }
-        if let Some(code) = self.kernel_mut().sending_closed {
-            return Err(sending_closed(code));
+        if let Some(e) = self.cannot_send() {
+            return Err(e);
         }
         self.pay_key_update().await?;
         let add = records_for(len);
@@ -1956,44 +2172,28 @@ impl TlsStream {
             .await;
         // The connection ends either way; the error below says why.
         drop(res);
-        self.kernel_mut().sending_closed = Some(Code::TlsKeysExhausted);
-        Err(sending_closed(Code::TlsKeysExhausted))
+        self.closed.set(Some(Code::TlsKeysExhausted));
+        Err(crate::sending_closed(Code::TlsKeysExhausted))
     }
 
     /// `shutdown` once the kernel encrypts: `close_notify`, then FIN.
     pub(crate) async fn kernel_shutdown(&self) -> io::Result<()> {
         let sending = self.lock_send().await;
-        let open = !self.broken.get() && self.kernel_mut().sending_closed.is_none();
-        if open {
+        if self.cannot_send().is_none() {
             let (res, _, _) = self
                 .tcp
                 .send_with_control(vec![ALERT_WARNING, CLOSE_NOTIFY], record_type_cmsg(ALERT))
                 .await;
-            self.kernel_mut().sending_closed = Some(Code::TlsBroken);
+            self.closed.set(Some(Code::TlsBroken));
             if let Err(e) = res {
+                // Close the TCP side anyway, so the peer is not left waiting.
                 sending.done();
+                let _ = self.tcp.shutdown(std::net::Shutdown::Write);
                 return Err(kernel_error(e));
             }
         }
         sending.done();
         self.tcp.shutdown(std::net::Shutdown::Write)
-    }
-}
-
-fn sending_closed(code: Code) -> io::Error {
-    match code {
-        Code::TlsKeysExhausted => coded(
-            Code::TlsKeysExhausted,
-            "this connection has sent as many TLS records as its cipher allows under one key, \
-             and cannot change keys (TLS 1.2, or TLS 1.3 on a kernel older than 6.14); \
-             close_notify was sent",
-            "open a new connection. TLS 1.3 on Linux 6.14 or newer changes keys instead.",
-        ),
-        _ => coded(
-            Code::TlsBroken,
-            "this TLS stream has been shut down or ended with an alert; nothing more can be sent",
-            "open a new connection.",
-        ),
     }
 }
 
@@ -2121,19 +2321,67 @@ mod tests {
             r.extend(std::iter::repeat(0).take(len as usize));
             r
         };
-        assert_eq!(record_boundary(&[]).unwrap(), 0);
-        assert_eq!(
-            record_boundary(&[23, 3]).unwrap(),
-            3,
-            "the rest of the header"
-        );
-        let mut two = record(10);
-        assert_eq!(record_boundary(&two).unwrap(), 5, "whole: the next header");
-        two.extend_from_slice(&record(100)[..20]);
-        assert_eq!(record_boundary(&two).unwrap(), 85, "the rest of the second");
+        let mut framing = Framing::default();
+        assert_eq!(framing.to_boundary(), 0);
+        framing.feed(&[23, 3]).unwrap();
+        assert_eq!(framing.to_boundary(), 3, "the rest of the header");
+        framing.feed(&record(10)[2..]).unwrap();
+        assert_eq!(framing.to_boundary(), 0, "whole");
+        framing.feed(&record(100)[..20]).unwrap();
+        assert_eq!(framing.to_boundary(), 85, "the rest of the second");
+        // Byte by byte, as reads may split them.
+        for b in &record(100)[20..] {
+            framing.feed(&[*b]).unwrap();
+        }
+        assert_eq!(framing.to_boundary(), 0);
+        framing.feed(&record(0)).unwrap();
+        assert_eq!(framing.to_boundary(), 0, "an empty record");
         let mut huge = vec![23, 3, 3];
         huge.extend_from_slice(&u16::MAX.to_be_bytes());
-        assert!(record_boundary(&huge).is_err());
+        assert!(Framing::default().feed(&huge).is_err());
+    }
+
+    /// What the fuzz target `ktls_records` checks, on streams built from
+    /// records and handshake messages of random sizes, cut at random places
+    /// and sometimes damaged. xorshift, so a failure can be replayed.
+    #[test]
+    fn records_and_handshake_messages_agree_however_they_are_split() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for round in 0..3000 {
+            let mut stream = Vec::new();
+            for _ in 0..1 + next() % 6 {
+                // Lengths around the limits, and small ones.
+                let len = match next() % 4 {
+                    0 => next() % 40,
+                    1 => MAX_RECORD - 5 - 2 + next() % 4,
+                    2 => MAX_HANDSHAKE_MESSAGE - 1 + next() % 3,
+                    _ => next() % 2000,
+                };
+                if round % 2 == 0 {
+                    stream.extend_from_slice(&[23, 3, 3]);
+                    stream.extend_from_slice(&(len.min(0xffff) as u16).to_be_bytes());
+                } else {
+                    stream.push(NEW_SESSION_TICKET);
+                    stream.extend_from_slice(&(len as u32).to_be_bytes()[1..]);
+                }
+                stream.extend((0..len.min(5000)).map(|_| next() as u8));
+            }
+            if next() % 3 == 0 {
+                let at = next() % stream.len();
+                stream[at] = next() as u8;
+            }
+            if next() % 3 == 0 {
+                stream.truncate(next() % stream.len());
+            }
+            check_record_framing(&stream, &mut next);
+            check_handshake_messages(&stream, &mut next);
+        }
     }
 
     #[test]
