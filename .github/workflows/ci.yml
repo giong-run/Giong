@@ -185,9 +185,10 @@ jobs:
           echo "GIONG_REDIS_BIN=$src" >> "$GITHUB_ENV"
       - run: cargo test -p ${{ matrix.crate }} --all-features
 
-  # The io_uring setup tiers used by kernels older than 6.1, forced on the
-  # runner's newer kernel with GIONG_RING_TIER, then the epoll driver
-  # (GIONG_DRIVER=epoll).
+  # The io_uring of older kernels, forced on the runner's newer one: without
+  # the optional io_uring features (GIONG_IO_URING_OFF), then also on the
+  # setup tiers of kernels older than 6.1 (GIONG_RING_TIER); then the epoll
+  # driver (GIONG_DRIVER=epoll).
   fallback:
     runs-on: ubuntu-24.04
     env:
@@ -291,12 +292,14 @@ jobs:
           # ktls: the guest loads the tls module and the kernel TLS tests
           # must run (5.15 on epoll, 6.1 and 6.8 without key updates, 6.18
           # with them). 6.0 is left out: giong-tls refuses its kernel TLS,
-          # which can crash the kernel when a connection closes.
-          - { kernel: "5.15.225", workarounds: "", ktls: "1" }
-          - { kernel: "6.0.19", workarounds: "" }
-          - { kernel: "6.1.155", workarounds: "", ktls: "1" }
-          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", ktls: "1" }
-          - { kernel: "6.18.63", workarounds: "", ktls: "1" }
+          # which can crash the kernel when a connection closes. features:
+          # the optional io_uring features giong must find.
+          - { kernel: "5.15.225", workarounds: "", features: "", ktls: "1" }
+          - { kernel: "6.0.19", workarounds: "", features: "" }
+          - { kernel: "6.1.155", workarounds: "", features: "", ktls: "1" }
+          - { kernel: "6.12.117", workarounds: "", features: "packed-buffers" }
+          - { kernel: "ubuntu-6.8.0-147", workarounds: "buffer-ring-reserved-check", features: "", ktls: "1" }
+          - { kernel: "6.18.63", workarounds: "", features: "packed-buffers", ktls: "1" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -317,6 +320,7 @@ jobs:
       - run: scripts/kernels.sh ${{ matrix.kernel }}
         env:
           GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS: ${{ matrix.workarounds }}
+          GIONG_TEST_EXPECT_IO_URING_FEATURES: ${{ matrix.features }}
           KTLS: ${{ matrix.ktls || '0' }}
       - name: Keep the guest's log
         if: always()

@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
-use crate::buf::BufPool;
+use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 
 pub(crate) use epoll::refill_budget;
@@ -125,6 +125,51 @@ impl std::fmt::Display for KernelWorkaround {
     }
 }
 
+/// An io_uring feature that giong uses where the kernel has it: see
+/// [`DriverChoice::io_uring_features`]. Each one is probed when a worker
+/// starts; without it giong does the same work the older way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum IoUringFeature {
+    /// Stream receives fill pool buffers piece by piece instead of taking a
+    /// whole buffer each (a buffer ring with `IOU_PBUF_RING_INC`, Linux
+    /// 6.12). Many connections that each send a little then share a few
+    /// buffers, which keeps the memory a busy worker touches small.
+    PackedBuffers,
+}
+
+impl IoUringFeature {
+    /// Every feature, in the order [`DriverChoice::io_uring_features`] lists
+    /// them.
+    pub const ALL: &'static [IoUringFeature] = &[IoUringFeature::PackedBuffers];
+
+    /// A stable short name, such as `"packed-buffers"`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            IoUringFeature::PackedBuffers => "packed-buffers",
+        }
+    }
+}
+
+impl std::fmt::Display for IoUringFeature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// `false` if `GIONG_IO_URING_OFF` turns `feature` off. A test and benchmark
+/// hook, like `GIONG_RING_TIER`: a comma-separated list of feature names
+/// ([`IoUringFeature::name`]), or `all`. Unknown names are ignored.
+pub(crate) fn feature_enabled(feature: IoUringFeature) -> bool {
+    match std::env::var("GIONG_IO_URING_OFF") {
+        Err(_) => true,
+        Ok(off) => !off
+            .split(',')
+            .map(str::trim)
+            .any(|name| name == "all" || name == feature.name()),
+    }
+}
+
 /// Which I/O driver a worker runs on, who chose it, and why io_uring is not
 /// used when giong fell back to epoll. Read it with
 /// [`driver_choice`](crate::driver_choice) on the worker, or
@@ -134,7 +179,7 @@ impl std::fmt::Display for KernelWorkaround {
 /// Its [`Display`](std::fmt::Display) form is one line for a log:
 ///
 /// ```text
-/// io_uring (chosen automatically)
+/// io_uring (chosen automatically), using packed-buffers
 /// epoll (chosen automatically): io_uring cannot be used here: GIONG-E0001: giong needs io_uring, …
 /// io_uring (chosen automatically), working around a kernel bug: this kernel refuses …
 /// ```
@@ -153,6 +198,9 @@ pub struct DriverChoice {
     pub io_uring_error_code: Option<Code>,
     /// Bugs of this kernel that giong works around to run io_uring.
     pub kernel_workarounds: Vec<KernelWorkaround>,
+    /// The io_uring features the worker uses (empty on epoll): those the
+    /// kernel has, less any that `GIONG_IO_URING_OFF` turns off.
+    pub io_uring_features: Vec<IoUringFeature>,
 }
 
 impl std::fmt::Display for DriverChoice {
@@ -163,6 +211,10 @@ impl std::fmt::Display for DriverChoice {
             ChosenBy::Automatic => "chosen automatically",
         };
         write!(f, "{} ({by})", self.kind)?;
+        for (i, feature) in self.io_uring_features.iter().enumerate() {
+            let sep = if i == 0 { ", using " } else { ", " };
+            write!(f, "{sep}{feature}")?;
+        }
         if let Some(e) = &self.io_uring_error {
             write!(f, ": io_uring cannot be used here: {e}")?;
         }
@@ -194,9 +246,11 @@ pub(crate) enum MultiKind {
 
 /// Result of polling a multishot operation.
 pub(crate) enum MultiPoll {
-    Item(i32, u32),
-    /// Received data that lives on the heap rather than in a pool buffer.
-    Heap(Vec<u8>),
+    /// A result without data: an accepted descriptor, or a receive that
+    /// ended (0: end of stream; negative: an error).
+    Item(i32),
+    /// Received bytes, in a pool buffer or on the heap.
+    Data(RecvBuf),
     /// Nothing queued and nothing in flight: the caller must arm it.
     NeedArm,
     Pending,
@@ -216,6 +270,10 @@ const F_BUFFER: u32 = 1;
 /// More completions will follow for this operation (`IORING_CQE_F_MORE`).
 const F_MORE: u32 = 2;
 const BUFFER_SHIFT: u32 = 16;
+
+/// The packed buffer ring keeps the rest of the buffer this completion
+/// names for the next receive (`IORING_CQE_F_BUF_MORE`, Linux 6.12).
+const F_BUF_MORE: u32 = 1 << 4;
 
 /// The pool buffer a receive completion names, if any.
 pub(crate) fn buffer_id(flags: u32) -> Option<u16> {
@@ -425,6 +483,10 @@ impl Driver {
                 Driver::Uring(d) => d.workarounds().to_vec(),
                 Driver::Epoll(_) => Vec::new(),
             },
+            io_uring_features: match &driver {
+                Driver::Uring(d) => d.features().to_vec(),
+                Driver::Epoll(_) => Vec::new(),
+            },
         };
         Ok((driver, choice))
     }
@@ -520,6 +582,15 @@ impl Driver {
         match self {
             Driver::Uring(d) => d.pool(),
             Driver::Epoll(d) => d.pool(),
+        }
+    }
+
+    /// Makes sure a receive of this kind can get a pool buffer before it is
+    /// armed (a datagram receive, or a stream one). `false` if none is free.
+    pub(crate) fn ensure_recv_buffer(&self, datagram: bool) -> bool {
+        match self {
+            Driver::Uring(d) => d.ensure_recv_buffer(datagram),
+            Driver::Epoll(d) => d.pool().ensure_published(None),
         }
     }
 

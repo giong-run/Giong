@@ -98,7 +98,9 @@ versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`
 the soak test every night.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
-run, and `GIONG_DRIVER=epoll` the epoll driver; `scripts/check.sh fallback` does both for
+run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
+optional io_uring features that newer kernels have (`giong::IoUringFeature`), and
+`GIONG_DRIVER=epoll` picks the epoll driver; `scripts/check.sh fallback` does all three for
 you.
 
 The kernel TLS tests in `giong-tls` skip themselves when the kernel has no `tls` module

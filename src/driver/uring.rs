@@ -30,13 +30,12 @@ use std::time::Duration;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
-use super::{Io, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park};
-use crate::buf::BufPool;
+use super::{
+    Io, IoUringFeature, KernelWorkaround, MultiIo, MultiKind, MultiPoll, Park, F_BUF_MORE,
+};
+use crate::buf::{BufPool, Received, RecvBuf, RingId};
 use crate::error::{Code, Error};
 use crate::slab::Slab;
-
-/// Buffer group id of the worker's receive pool.
-pub(crate) const BGID: u16 = 0;
 
 /// `user_data` of operations whose completion nobody waits for, such as cancels.
 const UD_IGNORE: u64 = u64::MAX;
@@ -69,11 +68,6 @@ fn backlog_limit(kind: MultiKind) -> usize {
     }
 }
 
-/// `true` if a queued receive completion holds a pool buffer with data.
-fn holds_pool_buffer(kind: MultiKind, res: i32, flags: u32) -> bool {
-    kind == MultiKind::Recv && res > 0 && cqueue::buffer_select(flags).is_some()
-}
-
 enum Lifecycle {
     /// In flight; the waker of the task awaiting it.
     Waiting(Waker),
@@ -86,15 +80,20 @@ enum Lifecycle {
 
 /// A multishot completion waiting to be consumed.
 enum Queued {
-    /// `(result, flags)` exactly as the kernel reported it. For a receive
-    /// with data, the flags name the pool buffer that holds it.
-    Raw(i32, u32),
+    /// The result as the kernel reported it, for completions without data:
+    /// an accepted descriptor, the end of a stream, an error.
+    Raw(i32),
+    /// Received data in a pool buffer, held as one piece (see
+    /// [`BufPool::received`]).
+    Piece { bid: u16, off: u32, len: u32 },
     /// Received data that was moved out of the pool.
     Heap(Vec<u8>),
 }
 
 struct Multi {
     kind: MultiKind,
+    /// The buffer ring a receive takes its buffers from.
+    ring: RingId,
     /// Completions not yet consumed.
     queue: VecDeque<Queued>,
     waker: Option<Waker>,
@@ -127,8 +126,10 @@ pub(crate) struct Uring {
     to_pause: Vec<usize>,
     /// A receive ran out of pool buffers during the current batch.
     starved: bool,
-    /// Queued receive completions that still hold a pool buffer.
+    /// Queued receive completions that hold a piece of a pool buffer.
     pooled_queued: usize,
+    /// io_uring features this ring uses.
+    features: Vec<IoUringFeature>,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -344,8 +345,8 @@ fn register_pbuf(ring_fd: RawFd, opcode: libc::c_uint, reg: &BufReg) -> io::Resu
 fn registers_with_reserved_bits(ring_fd: RawFd) -> bool {
     let probe = |resv: u64| {
         let reg = BufReg {
-            // Not registered: registering BGID has just failed, and giong
-            // uses no other group.
+            // Not registered: giong uses groups 0 and 1 only, and
+            // registering group 0 has just failed.
             bgid: u16::MAX,
             resv: [resv, 0, 0],
             ..BufReg::default()
@@ -357,8 +358,8 @@ fn registers_with_reserved_bits(ring_fd: RawFd) -> bool {
     probe(0) == Some(libc::EINVAL) && probe(1) == Some(libc::ENOENT)
 }
 
-/// Registers `pool` as the ring's buffer group [`BGID`], working around the
-/// kernel bugs that stand in the way. Returns the workarounds it needed.
+/// Registers the pool's whole-buffer ring as buffer group 0, working around
+/// the kernel bugs that stand in the way. Returns the workarounds it needed.
 ///
 /// # Safety
 ///
@@ -367,9 +368,9 @@ fn registers_with_reserved_bits(ring_fd: RawFd) -> bool {
 unsafe fn register_buf_ring(ring: &IoUring, pool: &BufPool) -> io::Result<Vec<KernelWorkaround>> {
     let fd = ring.as_raw_fd();
     let mut reg = BufReg {
-        ring_addr: pool.ring_addr(),
+        ring_addr: pool.ring_addr(RingId::Whole),
         ring_entries: u32::from(pool.count()),
-        bgid: BGID,
+        bgid: RingId::Whole.group(),
         ..BufReg::default()
     };
     let err = match register_pbuf(fd, REGISTER_PBUF_RING, &reg) {
@@ -385,6 +386,36 @@ unsafe fn register_buf_ring(ring: &IoUring, pool: &BufPool) -> io::Result<Vec<Ke
         }
     }
     Err(buffer_ring_error(&kernel_release(), err))
+}
+
+/// `IOU_PBUF_RING_INC`: the kernel fills ring buffers piece by piece
+/// (Linux 6.12).
+const PBUF_RING_INC: u16 = 2;
+
+/// Registers the pool's packed ring as buffer group 1 if the kernel can fill
+/// buffers piece by piece (Linux 6.12 and newer). `false` if it cannot, and
+/// streams then share the whole-buffer ring with datagrams.
+///
+/// # Safety
+///
+/// As for [`register_buf_ring`].
+unsafe fn register_packed_ring(
+    ring: &IoUring,
+    pool: &BufPool,
+    workarounds: &[KernelWorkaround],
+) -> bool {
+    let mut reg = BufReg {
+        ring_addr: pool.ring_addr(RingId::Packed),
+        ring_entries: u32::from(pool.count()),
+        bgid: RingId::Packed.group(),
+        flags: PBUF_RING_INC,
+        ..BufReg::default()
+    };
+    if workarounds.contains(&KernelWorkaround::BufferRingReservedCheck) {
+        reg.resv[0] = 1;
+    }
+    // Older kernels refuse the flag with EINVAL.
+    register_pbuf(ring.as_raw_fd(), REGISTER_PBUF_RING, &reg).is_ok()
 }
 
 /// The running kernel's release (`uname -r`), or `"unknown"`.
@@ -443,9 +474,18 @@ impl Uring {
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
-        pool.start_ring();
+        pool.set_registered(RingId::Whole);
+        let mut features = Vec::new();
+        // SAFETY: as above, for the pool's second ring.
+        if super::feature_enabled(IoUringFeature::PackedBuffers)
+            && unsafe { register_packed_ring(&ring, &pool, &workarounds) }
+        {
+            pool.set_registered(RingId::Packed);
+            features.push(IoUringFeature::PackedBuffers);
+        }
         Ok(Self {
             workarounds,
+            features,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -551,6 +591,7 @@ impl Uring {
     pub(crate) fn new_multi(&mut self, kind: MultiKind) -> usize {
         self.ops.insert(OpState::Multi(Multi {
             kind,
+            ring: RingId::Whole,
             queue: VecDeque::new(),
             waker: None,
             armed: false,
@@ -559,18 +600,50 @@ impl Uring {
         }))
     }
 
+    /// The ring a stream receive takes buffers from: the packed one where
+    /// the kernel has it. Datagrams always take whole buffers.
+    fn stream_ring(&self) -> RingId {
+        if self.pool.is_registered(RingId::Packed) {
+            RingId::Packed
+        } else {
+            RingId::Whole
+        }
+    }
+
+    /// Makes sure the ring a receive of this kind takes buffers from holds
+    /// one. `false` if no buffer is free for it.
+    pub(crate) fn ensure_recv_buffer(&self, datagram: bool) -> bool {
+        let ring = if datagram {
+            RingId::Whole
+        } else {
+            self.stream_ring()
+        };
+        self.pool.ensure_published(Some(ring))
+    }
+
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
-        let sqe = match io {
-            MultiIo::Accept { fd } => opcode::AcceptMulti::new(types::Fd(fd))
-                .flags(libc::SOCK_CLOEXEC)
-                .build(),
-            MultiIo::Recv { fd } => opcode::RecvMulti::new(types::Fd(fd), BGID).build(),
-            MultiIo::RecvMsg { fd, hdr } => {
-                opcode::RecvMsgMulti::new(types::Fd(fd), hdr, BGID).build()
-            }
+        let stream_ring = self.stream_ring();
+        let (sqe, ring) = match io {
+            MultiIo::Accept { fd } => (
+                opcode::AcceptMulti::new(types::Fd(fd))
+                    .flags(libc::SOCK_CLOEXEC)
+                    .build(),
+                RingId::Whole,
+            ),
+            MultiIo::Recv { fd } => (
+                opcode::RecvMulti::new(types::Fd(fd), stream_ring.group()).build(),
+                stream_ring,
+            ),
+            MultiIo::RecvMsg { fd, hdr } => (
+                opcode::RecvMsgMulti::new(types::Fd(fd), hdr, RingId::Whole.group()).build(),
+                RingId::Whole,
+            ),
         };
         match self.ops.get_mut(key) {
-            Some(OpState::Multi(m)) if !m.armed => m.armed = true,
+            Some(OpState::Multi(m)) if !m.armed => {
+                m.armed = true;
+                m.ring = ring;
+            }
             _ => panic!("giong: arming an invalid multishot operation"),
         }
         self.push(sqe.user_data(key as u64));
@@ -581,13 +654,13 @@ impl Uring {
             panic!("giong: polling an invalid multishot operation");
         };
         match m.queue.pop_front() {
-            Some(Queued::Raw(res, flags)) => {
-                if holds_pool_buffer(m.kind, res, flags) {
-                    self.pooled_queued -= 1;
-                }
-                return MultiPoll::Item(res, flags);
+            Some(Queued::Raw(res)) => return MultiPoll::Item(res),
+            Some(Queued::Piece { bid, off, len }) => {
+                self.pooled_queued -= 1;
+                let pool = self.pool.clone();
+                return MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len));
             }
-            Some(Queued::Heap(data)) => return MultiPoll::Heap(data),
+            Some(Queued::Heap(data)) => return MultiPoll::Data(RecvBuf::heap(data)),
             None => {}
         }
         if !m.armed {
@@ -611,12 +684,10 @@ impl Uring {
         m.waker = None;
         m.orphan = true;
         for item in queued {
-            if let Queued::Raw(res, flags) = item {
-                if holds_pool_buffer(kind, res, flags) {
-                    self.pooled_queued -= 1;
-                }
-                Self::release(&self.pool, kind, res, flags);
+            if let Queued::Piece { .. } = item {
+                self.pooled_queued -= 1;
             }
+            Self::release(&self.pool, kind, item);
         }
         if !armed {
             self.ops.remove(key);
@@ -633,20 +704,16 @@ impl Uring {
         }
     }
 
-    /// Releases what an unconsumed multishot completion carries.
-    fn release(pool: &BufPool, kind: MultiKind, res: i32, flags: u32) {
-        match kind {
-            MultiKind::Accept => {
-                if res >= 0 {
-                    // SAFETY: an accepted descriptor nobody else knows about.
-                    unsafe { libc::close(res) };
-                }
+    /// Releases what an unconsumed multishot completion carries: an
+    /// accepted descriptor, or a piece of a pool buffer.
+    fn release(pool: &BufPool, kind: MultiKind, item: Queued) {
+        match item {
+            Queued::Raw(res) if kind == MultiKind::Accept && res >= 0 => {
+                // SAFETY: an accepted descriptor nobody else knows about.
+                unsafe { libc::close(res) };
             }
-            MultiKind::Recv => {
-                if let Some(bid) = cqueue::buffer_select(flags) {
-                    pool.recycle(bid);
-                }
-            }
+            Queued::Piece { bid, .. } => pool.release(bid),
+            Queued::Raw(..) | Queued::Heap(_) => {}
         }
     }
 
@@ -669,11 +736,9 @@ impl Uring {
                 continue;
             }
             for item in m.queue.iter_mut() {
-                if let Queued::Raw(res, flags) = *item {
-                    if let (true, Some(bid)) = (res > 0, cqueue::buffer_select(flags)) {
-                        *item = Queued::Heap(pool.copy_out(bid, res as usize));
-                        pool.recycle(bid);
-                    }
+                if let Queued::Piece { bid, off, len } = *item {
+                    *item = Queued::Heap(pool.copy_out(bid, off, len));
+                    pool.release(bid);
                 }
             }
         }
@@ -861,14 +926,25 @@ impl Uring {
                         }
                     }
                     Some(OpState::Multi(m)) => {
-                        if m.kind == MultiKind::Recv && cqueue::buffer_select(flags).is_some() {
-                            self.pool.taken();
-                        }
                         if !more {
                             m.armed = false;
                         }
+                        // What a receive brought: account for its buffer
+                        // first, in the order the kernel posted completions.
+                        let item = match cqueue::buffer_select(flags) {
+                            Some(bid) if m.kind == MultiKind::Recv => {
+                                let more_in_buf = flags & F_BUF_MORE != 0;
+                                match self.pool.received(m.ring, bid, res, more_in_buf) {
+                                    Received::Data { bid, off, len } => {
+                                        Queued::Piece { bid, off, len }
+                                    }
+                                    Received::Nothing => Queued::Raw(res),
+                                }
+                            }
+                            _ => Queued::Raw(res),
+                        };
                         if m.orphan {
-                            Self::release(&self.pool, m.kind, res, flags);
+                            Self::release(&self.pool, m.kind, item);
                             !more
                         } else {
                             let paused = !more && mem::replace(&mut m.pausing, false);
@@ -877,28 +953,28 @@ impl Uring {
                                 // The ring ran dry. Not an error for the reader (its
                                 // next poll re-arms); keep more buffers in the ring,
                                 // and free up buffers after this batch.
-                                self.pool.ran_dry();
+                                self.pool.ran_dry(m.ring);
                                 self.starved = true;
-                                Self::release(&self.pool, m.kind, res, flags);
+                                Self::release(&self.pool, m.kind, item);
                             } else if paused && res == -libc::ECANCELED {
                                 // The cancellation we asked for when pausing.
-                                Self::release(&self.pool, m.kind, res, flags);
+                                Self::release(&self.pool, m.kind, item);
                             } else {
                                 let limit = backlog_limit(m.kind);
-                                match cqueue::buffer_select(flags) {
-                                    Some(bid) if recv && res > 0 && m.queue.len() >= limit => {
+                                match item {
+                                    Queued::Piece { bid, off, len } if m.queue.len() >= limit => {
                                         // Nobody is keeping up with this stream: do not
                                         // let it sit on pool buffers.
                                         m.queue.push_back(Queued::Heap(
-                                            self.pool.copy_out(bid, res as usize),
+                                            self.pool.copy_out(bid, off, len),
                                         ));
-                                        self.pool.recycle(bid);
+                                        self.pool.release(bid);
                                     }
-                                    _ => {
-                                        if holds_pool_buffer(m.kind, res, flags) {
+                                    item => {
+                                        if let Queued::Piece { .. } = item {
                                             self.pooled_queued += 1;
                                         }
-                                        m.queue.push_back(Queued::Raw(res, flags));
+                                        m.queue.push_back(item);
                                     }
                                 }
                                 // Pause when the backlog reaches the limit — and ask again
@@ -980,6 +1056,11 @@ impl Uring {
     /// Kernel bugs worked around while setting the ring up.
     pub(crate) fn workarounds(&self) -> &[KernelWorkaround] {
         &self.workarounds
+    }
+
+    /// io_uring features this ring uses.
+    pub(crate) fn features(&self) -> &[IoUringFeature] {
+        &self.features
     }
 }
 

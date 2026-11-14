@@ -115,6 +115,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   server might send, fed in pieces while requests come and go, with checks that the
   client holds no more than the windows it grants and writes only well-formed frames
   within the server's windows. 3,000 such connections run in `cargo test`.
+- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
+  worker uses (`giong::IoUringFeature`), and its one-line form names them
+  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
+  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
+  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
+- **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
+  suite with the optional features off, and the QEMU kernels include 6.12, the first with
+  packed buffer rings; every QEMU run checks which features giong found.
+
+### Changed
+
+- **giong**: on Linux 6.12 and newer, stream receives fill the worker's pool buffers piece
+  by piece (a buffer ring with `IOU_PBUF_RING_INC`) instead of taking a whole 8 KiB buffer
+  each, so connections that each send a little share a few buffers. With 20 workers and
+  5,000 busy connections, giong-http's peak memory fell from 50 to 23 MiB (epoll: 15 MiB);
+  requests per second did not change. Datagrams still take whole buffers. A stream's data
+  can now be cut where a buffer fills, so one write by the peer may come back from `recv`
+  in two pieces; streams never promised otherwise.
 
 ### Fixed
 

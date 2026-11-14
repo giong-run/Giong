@@ -2,9 +2,12 @@
 # Verification beyond a plain `cargo test`.
 #
 #   scripts/check.sh test       release tests, repeated (default 5 rounds)
-#   scripts/check.sh fallback   the same tests on the io_uring setup tiers used
-#                               by kernels older than 6.1 (COOP_TASKRUN, no flags),
-#                               then on the epoll driver (GIONG_DRIVER=epoll)
+#   scripts/check.sh fallback   the same tests on the io_uring of older kernels:
+#                               without the optional io_uring features
+#                               (GIONG_IO_URING_OFF=all, as on 6.1 to 6.11), then
+#                               also on the setup tiers of kernels older than 6.1
+#                               (COOP_TASKRUN, no flags), then on the epoll driver
+#                               (GIONG_DRIVER=epoll)
 #   scripts/check.sh epoll      the tests on the epoll driver only
 #   scripts/check.sh seccomp    the tests with io_uring blocked as in Docker's
 #                               default seccomp profile (scripts/no-io-uring.py),
@@ -38,8 +41,9 @@ run_test() {
 }
 
 run_fallback() {
+    GIONG_IO_URING_OFF=all repeat_tests "io_uring without optional features"
     for tier in coop basic; do
-        GIONG_RING_TIER="$tier" repeat_tests "ring tier '$tier'"
+        GIONG_IO_URING_OFF=all GIONG_RING_TIER="$tier" repeat_tests "ring tier '$tier'"
     done
     run_epoll
 }
