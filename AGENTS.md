@@ -148,9 +148,11 @@ is loaded.
   protected.
 - Commits follow Conventional Commits: `<type>(<scope>): <imperative summary, lower case,
   no full stop>`. Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`,
-  `ci`, `chore`. Scopes: `runtime`, `executor`, `driver`, `net`, `fs`, `time`, `sync`,
-  `buf`, `http`, `tls`, `examples`, `bench`. A breaking change takes `!` after the scope
-  and a `BREAKING CHANGE:` footer. The body says why.
+  `ci`, `chore`. Scopes: the runtime's parts (`runtime`, `executor`, `driver`, `net`,
+  `fs`, `time`, `sync`, `buf`), a companion crate by its name without `giong-` (`http`,
+  `tls`, `web`, `postgres`, `mysql`, `redis`, `mcp`, `compat`), and `examples`, `bench`,
+  `site`, `release`. Leave the scope out when a change spans several. A breaking change
+  takes `!` after the scope and a `BREAKING CHANGE:` footer. The body says why.
 - Pull requests are squash-merged, so the title must be a valid commit summary. Fill in
   `.github/PULL_REQUEST_TEMPLATE.md`, including how the change was tested.
 - Anything a user would notice gets a line under `## [Unreleased]` in `CHANGELOG.md`

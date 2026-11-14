@@ -162,6 +162,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
 
+- **Docs**: `llms.txt` on giong.run links the documentation of the release it names
+  (`blob/vX.Y.Z/`, and docs.rs at that version) instead of `main`, which already described
+  features no published crate had, so an agent following it wrote code that did not
+  compile against what `cargo add` installs. It lists every released crate's README and
+  says how to turn giong-mcp on. `llms-full.txt` is new: every crate's README, the
+  deployment notes and every error page of the release in one file, read from the tag.
+  The commit scopes in AGENTS.md and CONTRIBUTING.md cover every crate.
+
 ### Fixed
 
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
