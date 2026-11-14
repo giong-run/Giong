@@ -1,0 +1,8 @@
+2026-11-14T10:58:45Z at d5a0b0c perf(net): send 16 KiB and more over TCP without a copy on Linux 6.2+ (#71), tree 3c23b194e1c5206d233a64e1f3341b4175887c3c
+2026-11-14T11:09:47Z workers exit 0
+2026-11-14T11:38:34Z uring-features exit 0
+2026-11-14T11:38:42Z br-2 soak started
+2026-11-14T11:45:21Z h2 exit 0
+2026-11-14T11:50:29Z tls exit 0
+2026-11-14T12:05:40Z br-1 soak exit 0
+2026-11-14T12:05:40Z all done

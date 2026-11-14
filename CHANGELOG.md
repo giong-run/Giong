@@ -12,19 +12,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 HTTP/2, and less work per byte. `giong-http` speaks HTTP/2 as a server and as a client,
 through ALPN or with prior knowledge, with the same handlers; it is hardened against rapid
-reset, floods and HPACK bombs, `h2spec` passes all 147 cases, and on one core the server
-answers 3.8 to 4.4 times as many small HTTP/2 requests as axum. `giong-tls` can hand a
-connection to the kernel's TLS after the handshake, and files go out with `sendfile`: on
-bare metal a 1 MiB file over HTTPS is served 36% faster than with rustls, level with
-nginx. On io_uring, large static bodies leave without a copy on Linux 6.2 and newer (up to
-85% less CPU per request), connections share receive buffers piece by piece on 6.12 and
-newer (less than half the memory under load), and bulk receives are no longer copied out
-of the pool. `SQPOLL` was tried and left out: on bare metal it served fewer requests with
-73% more CPU per request. The new `giong-compat` gives giong's streams the Tokio and
-futures-io I/O traits, so crates such as h2, tokio-rustls and tokio-tungstenite run on
-giong. On Linux 6.14 to 7.2, a worker past the locked-memory limit now runs on epoll and
-says why (`GIONG-E0010`) instead of stopping the runtime. No change breaks code written
-for 0.4, but a stream's `recv` may now return one write of the peer in two pieces.
+reset, floods and HPACK bombs, `h2spec` passes all 147 cases, and on one core of a
+bare-metal server it answers 2.3 to 4.3 times as many HTTP/2 requests as axum. `giong-tls`
+can hand a connection to the kernel's TLS after the handshake, and files go out with
+`sendfile`: on bare metal a 1 MiB file over HTTPS is served 36% faster than with rustls,
+level with nginx. On io_uring, large static bodies leave without a copy on Linux 6.2 and
+newer (up to 85% less CPU per request), connections share receive buffers piece by piece
+on 6.12 and newer (less than half the memory under load), and bulk receives are no longer
+copied out of the pool. `SQPOLL` was tried and left out: on bare metal it served fewer
+requests with 73% more CPU per request. The new `giong-compat` gives giong's streams the
+Tokio and futures-io I/O traits, so crates such as h2, tokio-rustls and tokio-tungstenite
+run on giong. On Linux 6.14 to 7.2, a worker past the locked-memory limit now runs on
+epoll and says why (`GIONG-E0010`) instead of stopping the runtime. No change breaks code
+written for 0.4, but a stream's `recv` may now return one write of the peer in two pieces.
+
+The release candidate was measured again on the two bare-metal machines
+(`bench/results/bare-metal-epyc-4345p/linux-7.0/release-0.5.0/`): on 4 workers giong
+served 1.75M requests/s against 1.69M for tuned Monoio and 1.59M for raw Tokio, two
+15-minute soaks passed, and nothing moved beyond the 2% noise between runs except two
+small losses not explained yet: an idle HTTP/2 connection costs 4.21 KiB where an earlier
+build measured 3.99, and giong-http over TLS answers about 2% fewer small requests.
 
 ### Added
 
@@ -120,7 +127,7 @@ for 0.4, but a stream's `recv` may now return one write of the peer in two piece
   when the kernel reports that it copied the data anyway (loopback, a card without
   scatter-gather) or cannot send this way (kTLS); Unix sockets never use it. On bare metal
   (Linux 7.0, 25 GbE) it cuts the CPU time per request by 16% at 64 KiB, 62% at 256 KiB,
-  72% at 1 MiB and 85% at 16 MiB, at the same request rate.
+  68 to 72% at 1 MiB and 85 to 86% at 16 MiB across runs, at the same request rate.
   `bench/uring-features.sh` measures each optional io_uring feature against the rest, on
   one machine or two.
 - **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a

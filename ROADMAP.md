@@ -258,8 +258,8 @@ below shipped early, in 0.5.0.
   Fixed files (direct descriptors) are not done: they would save about 11.5 ns per send,
   0.6% of a request, less than keeping the descriptor table costs.
 - [x] Zero-copy send for large responses: on bare metal, CPU time per request falls by 16%
-  at 64 KiB, 62% at 256 KiB, 72% at 1 MiB and 85% at 16 MiB, at the same request rate (the
-  link is full); bytes that cannot change only.
+  at 64 KiB, 62% at 256 KiB, 68 to 72% at 1 MiB and 85 to 86% at 16 MiB, at the same
+  request rate (the link is full); bytes that cannot change only.
 - [x] Receive buffers filled piece by piece (Linux 6.12): memory at 20 workers 49.9 → 23.4
   MiB, requests per second unchanged.
 - [ ] Receive bundles (several buffers per completion).

@@ -1,0 +1,19 @@
+endpoint     server            req/s median       min       max   p50 ms   p99 ms  cpu%   us/req  errors
+json         axum-tls                308635    307732    309717     0.16     0.17   102     3.24       0
+json         giong-http-tls          400466    395743    401021     0.10     0.21   101     2.49       0
+json         giong-http-ktls         334086    332138    334184     0.12     0.24   102     3.00       0
+
+users        axum-tls                 49920     49882     50634     1.00     1.01   102    20.01       0
+users        giong-http-tls          100570     99663    100764     0.40     0.80   100     9.92       0
+users        giong-http-ktls          95360     95208     95735     0.42     0.85   102    10.49       0
+
+handshake    axum-tls                 14439     14417     14493     1.56     2.65   102    69.25       0
+handshake    giong-http-tls           14228     14119     14238     1.26     2.25   102    70.23       0
+handshake    giong-http-ktls          13158     13075     13164     1.41     2.29   102    76.00       0
+
+bytes1m      giong-http-tls            5044      5027      5050     9.47    10.08   102   198.25       0
+bytes1m      giong-http-ktls           4191      4184      4201     9.82    19.87   101   238.00       0
+
+file1m       giong-http-tls            4502      4483      4502    10.62    11.20   102   222.56       0
+file1m       giong-http-ktls           6073      6058      6080     7.90     7.99   102   164.68       0
+

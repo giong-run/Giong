@@ -571,6 +571,21 @@ side saturated, and the median p99 goes above 100 ms for four of the five (raw T
 Recorded output, with the machines, the method and what limited each row:
 `bench/results/bare-metal-epyc-4345p/`.
 
+The 0.5.0 release candidate (d5a0b0c) on the same machines, with 16 queues on the card,
+three rounds; requests per second, median:
+
+| Server | 1 worker | 2 | 4 | 8 ³ | 16 ³ |
+|---|---|---|---|---|---|
+| giong | **560k** | **1.06M** | **1.75M** | **2.94M** | 3.24M |
+| giong-http | 458k | 858k | 1.49M | 2.60M | 3.12M |
+| Monoio (tuned) | 524k | 997k | 1.69M | 2.87M | 3.24M |
+| Raw Tokio | 556k | 962k | 1.59M | 2.54M | 2.82M |
+
+³ From 8 workers on, `wrk` on the second machine is the limit with 16 queues (95–99.5%
+busy in earlier runs), which is why giong and Monoio tie at 16. From 1 to 4 workers the
+servers were 91–97% busy. Recorded in
+`bench/results/bare-metal-epyc-4345p/linux-7.0/release-0.5.0/`.
+
 **On 14 cores.** An Intel i5-13500 desktop (6 performance cores and 8 efficiency cores,
 20 threads, 64 GB) running Linux 6.18 under WSL2 on Windows 10. The server gets vCPUs 0–9,
 `wrk` gets 10–19 with ten threads, and they talk over loopback; `/json`, three rounds of
