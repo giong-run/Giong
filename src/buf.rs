@@ -266,8 +266,12 @@ struct Slot {
     /// the packed ring: where the next piece starts.
     filled: Cell<u32>,
     /// Pieces of the buffer that user space holds: [`RecvBuf`]s, and
-    /// completions the driver has queued but nobody has read yet.
-    pieces: Cell<u16>,
+    /// completions the driver has queued but nobody has read yet. Every
+    /// piece of a packed buffer holds at least one byte, so there are at
+    /// most `buf_len` (below 4 GiB) of them: a `u16` wrapped once 65,536
+    /// one-byte pieces of a buffer over 64 KiB were held, and the buffer
+    /// went back to the kernel under them.
+    pieces: Cell<u32>,
     /// The ring the buffer is lent to, if any: the kernel may write to it.
     lent_to: Cell<Option<RingId>>,
     /// The ring it was last lent to, where it goes back first.
@@ -544,7 +548,11 @@ impl BufPool {
                     "kernel returned more data than a buffer holds"
                 );
                 slot.filled.set(off + len);
-                slot.pieces.set(slot.pieces.get() + 1);
+                // Cannot overflow (see `Slot::pieces`); checked anyway,
+                // because a wrapped count frees a buffer still in use.
+                let pieces = slot.pieces.get().checked_add(1);
+                slot.pieces
+                    .set(pieces.expect("giong: pieces of a receive buffer overflowed"));
                 if !more {
                     // Full: the kernel has moved on to the next buffer.
                     self.taken(id, slot);
@@ -826,6 +834,33 @@ mod tests {
         assert_eq!(d, (1, 0, 10));
         pool.release(1);
         assert_eq!(pool.free(), 4, "a part-filled buffer stays with the kernel");
+    }
+
+    /// A buffer over 64 KiB can be cut into more than 65,535 one-byte
+    /// pieces. Their count used to be a `u16`: at 65,536 held pieces it
+    /// wrapped to 0, the buffer went back to the kernel while every piece
+    /// still pointed into it, and the next receive overwrote them.
+    #[test]
+    fn a_buffer_cut_into_more_than_65535_pieces_is_freed_with_the_last() {
+        const LEN: usize = 128 * 1024;
+        const PIECES: u32 = 70_000;
+        let pool = pool(2, LEN);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        for i in 0..PIECES {
+            assert_eq!(data(pool.received(RingId::Packed, 0, 1, true)), (0, i, 1));
+        }
+        let rest = (LEN as u32 - PIECES) as i32;
+        assert_eq!(
+            data(pool.received(RingId::Packed, 0, rest, false)),
+            (0, PIECES, rest as u32)
+        );
+        assert_eq!(pool.free(), 1, "full: the kernel moved on");
+        for _ in 0..PIECES {
+            pool.release(0);
+            assert_eq!(pool.free(), 1, "freed while pieces are held");
+        }
+        pool.release(0);
+        assert_eq!(pool.free(), 2);
     }
 
     #[test]
