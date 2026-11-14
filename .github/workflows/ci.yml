@@ -56,7 +56,35 @@ jobs:
       # dependencies need a newer compiler.
       - run: cargo check --workspace --all-features
 
+  # The release build of every test binary, once for the whole run: fat LTO
+  # makes it the slowest step by far, and the jobs `test`, `fallback`, `docker`
+  # and `kernels` all run these binaries. They take this job's target/release
+  # and then run the same cargo commands as before, which find it up to date
+  # (scripts/shared-build.sh says how, and what makes that safe).
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: scripts/shared-build.sh pack "$RUNNER_TEMP/release-build.tar.zst"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-build
+          path: ${{ runner.temp }}/release-build.tar.zst
+          if-no-files-found: error
+          # Packed with zstd already.
+          compression-level: 0
+          retention-days: 1
+          # A run started again uploads it again.
+          overwrite: true
+
   test:
+    needs: build
+    # A required check that is skipped counts as passed, and a job is skipped
+    # when one it needs fails: this one always runs, and fails by itself.
+    if: always()
     runs-on: ubuntu-24.04
     env:
       # giong must choose io_uring by itself on the runner: if a runner kernel
@@ -72,7 +100,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
+      - name: The build must have succeeded
+        run: test "${{ needs.build.result }}" = success
       - run: uname -r
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
       - name: Install redis-server and pgbouncer
         # Ubuntu's Redis 7.0 and PgBouncer 1.22. The tests start their own
         # servers; the services apt starts are stopped.
@@ -270,10 +310,17 @@ jobs:
 
   # The io_uring of older kernels, forced on the runner's newer one: without
   # the optional io_uring features (GIONG_IO_URING_OFF), then also on the
-  # setup tiers of kernels older than 6.1 (GIONG_RING_TIER); then the epoll
-  # driver (GIONG_DRIVER=epoll).
-  fallback:
+  # setup tiers of kernels older than 6.1 (GIONG_RING_TIER); and the epoll
+  # driver (GIONG_DRIVER=epoll). What `scripts/check.sh fallback` runs one
+  # after the other, as four jobs side by side.
+  fallback-tiers:
+    name: fallback (${{ matrix.tier }})
+    needs: build
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [no-features, coop, basic, epoll]
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
@@ -282,6 +329,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
       - name: Install redis-server
         # Ubuntu's Redis 7.0. The tests start their own server; the
         # service apt starts is stopped.
@@ -292,20 +349,40 @@ jobs:
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # The locked-memory limit is lifted as in the test job.
-      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback ${{ matrix.tier }}
+
+  # The required check: every tier above passed. It always runs, because a
+  # skipped required check counts as passed.
+  fallback:
+    needs: fallback-tiers
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.fallback-tiers.result }}" = success
 
   # The epoll driver where it is needed: a container with Docker's default
   # seccomp profile, which blocks io_uring. Nothing names a driver, so the
   # tests also show that giong falls back to epoll by itself. The database
   # crates' tests skip here (no servers in the image).
   docker:
+    needs: build
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - name: Build the test binaries
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      - name: List the test binaries
         run: |
           mkdir -p target
           cargo test --release --workspace --all-features --no-run --message-format=json |
@@ -331,8 +408,19 @@ jobs:
                 "$t" -q
               done'
 
-  tsan:
+  # ThreadSanitizer over every test: twice on io_uring and once on the epoll
+  # driver, which hands file operations to threads of its own. Three jobs side
+  # by side, each with its own build (the standard library included).
+  tsan-runs:
+    name: tsan (${{ matrix.driver }}, run ${{ matrix.run }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { driver: io_uring, run: 1 }
+          - { driver: io_uring, run: 2 }
+          - { driver: epoll, run: 1 }
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
@@ -355,9 +443,19 @@ jobs:
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # The locked-memory limit is lifted as in the test job.
-      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && ROUNDS=2 scripts/check.sh tsan
-      # The epoll driver hands file operations to threads of its own.
-      - run: GIONG_DRIVER=epoll ROUNDS=1 scripts/check.sh tsan
+      - name: ThreadSanitizer on ${{ matrix.driver }}
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          if [ "${{ matrix.driver }}" = epoll ]; then export GIONG_DRIVER=epoll; fi
+          ROUNDS=1 scripts/check.sh tsan
+
+  # The required check: every ThreadSanitizer job above passed.
+  tsan:
+    needs: tsan-runs
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.tsan-runs.result }}" = success
 
   # The unsafe code under Miri, which checks every access against Rust's
   # memory and aliasing rules: the unit tests and the tests it can run, on the
@@ -414,6 +512,7 @@ jobs:
   # later) giong works around to stay on io_uring. Each run checks the driver
   # giong chose by itself and the kernel bugs it had to work around.
   kernels:
+    needs: build
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -437,6 +536,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
+      # The release build of the `build` job. If it cannot be had (it is kept
+      # for a day, so a job run again later finds none), this job builds the
+      # test binaries itself, as scripts/shared-build.sh says in a warning.
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
       - name: Install QEMU and a static busybox
         run: |
           sudo apt-get update -q

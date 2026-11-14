@@ -8,6 +8,9 @@
 #                               also on the setup tiers of kernels older than 6.1
 #                               (COOP_TASKRUN, no flags), then on the epoll driver
 #                               (GIONG_DRIVER=epoll)
+#   scripts/check.sh fallback <tier>
+#                               one of those four only: no-features, coop, basic
+#                               or epoll (CI runs them side by side)
 #   scripts/check.sh epoll      the tests on the epoll driver only
 #   scripts/check.sh seccomp    the tests with io_uring blocked as in Docker's
 #                               default seccomp profile (scripts/no-io-uring.py),
@@ -45,11 +48,17 @@ run_test() {
 }
 
 run_fallback() {
-    GIONG_IO_URING_OFF=all repeat_tests "io_uring without optional features"
-    for tier in coop basic; do
-        GIONG_IO_URING_OFF=all GIONG_RING_TIER="$tier" repeat_tests "ring tier '$tier'"
-    done
-    run_epoll
+    case "$1" in
+        no-features) GIONG_IO_URING_OFF=all repeat_tests "io_uring without optional features" ;;
+        coop | basic) GIONG_IO_URING_OFF=all GIONG_RING_TIER="$1" repeat_tests "ring tier '$1'" ;;
+        epoll) run_epoll ;;
+        all)
+            for tier in no-features coop basic epoll; do
+                run_fallback "$tier"
+            done
+            ;;
+        *) echo "usage: $0 fallback [no-features|coop|basic|epoll]" >&2; exit 2 ;;
+    esac
 }
 
 run_epoll() {
@@ -124,14 +133,14 @@ run_miri() {
 
 case "${1:-all}" in
     test) run_test ;;
-    fallback) run_fallback ;;
+    fallback) run_fallback "${2:-all}" ;;
     epoll) run_epoll ;;
     seccomp) run_seccomp ;;
     tsan) run_tsan ;;
     loom) run_loom ;;
     soak) run_soak ;;
     miri) run_miri ;;
-    all) run_test; run_fallback; run_tsan; run_loom ;;
+    all) run_test; run_fallback all; run_tsan; run_loom ;;
     *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|all]" >&2; exit 2 ;;
 esac
 echo "ok"

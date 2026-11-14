@@ -92,7 +92,12 @@ python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the 
 
 Continuous integration requires five checks on every pull request: `lint` (fmt, clippy,
 doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
-CI also runs `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+The release test binaries are built once per run (the `build` job, with
+`scripts/shared-build.sh`) for `test`, `docker`, the `kernels` jobs and the four
+`fallback (…)` jobs, which run the tiers of `scripts/check.sh fallback` side by side, as
+the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
+of theirs did.
+CI also runs `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`) and the database crates against other server
 versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
 `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, each in its `fuzz/`) and runs
