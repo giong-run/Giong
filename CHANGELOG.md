@@ -10,67 +10,114 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
-- **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
-  the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
-  `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
-  their transport run on giong with no Tokio runtime: tested with tokio-rustls,
-  futures-rustls, tokio-tungstenite, h2 (also over giong-tls with ALPN), hyper's HTTP/1
-  connection API (against giong-http both ways) and tokio-util's codecs, on io_uring and
-  epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
-  the buffer is full or when a read waits; a partly read chunk never holds the worker's
-  receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
-  through `AsyncBufRead`), measured by `bench/compat.sh`. Errors `GIONG-E1401` (an earlier
-  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting).
-- **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
-  for futures written by hand and for adapters such as giong-compat.
-- **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
-  hand a connection's keys to the kernel once rustls has done the handshake, and the
-  kernel encrypts and decrypts from then on; the `TlsStream` API stays the same.
-  `Ktls::Off` is the default; `Ktls::Auto` uses the kernel where it can do everything
-  rustls would have done (the `tls` module, every cipher suite the configuration
-  allows in both directions, and new TLS 1.3 keys on a live connection, Linux 6.14+)
-  and keeps the connection in the process otherwise; `Ktls::Required` fails with
-  `GIONG-E2009` instead. What the kernel can do is probed once per process
-  (`giong_tls::ktls_support()`, one line for a log); `TlsStream::is_ktls()`,
-  `ktls_unavailable()` and `giong_tls::ktls_stats()` say which way connections went.
-  Session tickets, key updates from either side, alerts, refused renegotiation and
-  `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
-  the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
-  the kernel would repeat the nonce of the `Finished` message under the same key. New
-  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
-  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
-  are tested.
-- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
-  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
-  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
-  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
-  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
-  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
-  Unix sockets read and write). A file that turns out shorter than announced is the new
-  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
-  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
-  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
-  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
-  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
-  `giong-tls` README has the table and when to turn it on. Recorded in
-  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
-- **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
-  data, on both drivers (giong-tls sends TLS alerts and key updates through it).
-- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
-  and a body for example, without copying them into one first. `giong-http` uses it for
-  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
-- **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
-  module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
-  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
-  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
-  `fallback`, `tsan` and `docker` jobs.
-- **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
-  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
-  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
-  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
-  adds a giong client with kernel TLS and the same body sizes.
-- **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
-  (`docs/reviews/2026-11-giong-tls.md`).
+- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
+  forms of `Error::new` and `with_header` that never panic, for a status or a header
+  value that comes from an upstream service or the request: a status outside
+  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
+  gives the error back without it. The docs say which form takes which values, and
+  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
+  (takes JSON already written).
+
+### Changed
+
+- **giong-web**, **Breaking**: `Req::query_param` and `Req::query` follow one strict rule.
+  `query_param` used to take the first of a repeated key and skip a key that did not
+  decode; it now answers `400` (`GIONG-E1205`) for a repeated key it is asked for and
+  for a bad escape anywhere in the query string, as `query` did. `query` into a map
+  (`HashMap`, `serde_json::Value`) refuses a repeated key instead of keeping the last
+  value; a struct still ignores the keys it does not know.
+- **giong-web**, **Breaking**: `Sink` is `#[non_exhaustive]`, so that sinks can be added
+  without breaking a `match`.
+- **giong-web**, **Breaking**: request ids made by `RequestId` are 32 hexadecimal digits
+  instead of 20: 64 random bits per process instead of 32, 16 bits for the worker instead
+  of 8, then a 48-bit counter. With 32 random bits, two processes of a fleet shared ids
+  with even odds after about 77,000 starts, and workers above 256 shared them within a
+  process. Code that checks an id's length, or a column sized for it, needs the new one.
+- **giong-web**: `Logger` cuts a path or query string longer than 4 KiB in its lines,
+  ending `...(+N bytes)`. Sixteen requests with a 64 KiB path filled a worker's 1 MiB
+  log buffer, and the lines after them were dropped.
+- **giong-web**: the log writer shrinks a worker's buffer back to 64 KiB once written,
+  instead of keeping the memory of a burst (up to 1 MiB per worker and stream), and
+  removes the buffer of a thread that ended, after writing its last lines, instead of
+  keeping one per thread that ever logged.
+- **giong-web**: the `Timeout` docs no longer say that every giong operation is safe to
+  cancel: dropping is memory-safe, the database and HTTP clients close a connection whose
+  request was abandoned, and some I/O (a vectored write, `send_file`) may be cut halfway.
+  They show how to limit the work a streaming route does once its body is in, which
+  `Timeout` does not cover.
+
+### Fixed
+
+- **giong-web**: a handler or middleware that panicked took its connection down with no
+  response, no log line and no request id, and over HTTP/2 every other request on that
+  connection with it. A panic, in the handler, in a closure before it returns its future
+  or in a middleware, is now caught where it happens and answered like any other failure:
+  `500` problem+json with `GIONG-E1210`, whose logged cause is "the handler panicked:
+  ..." or "a middleware panicked: ...", so `Logger`, `Trace` and `RequestId` see an
+  ordinary error response. A header value from the request that makes
+  `Response::header` panic (`%0A` in a query parameter) is one such case.
+- **giong-web**: middleware layered on a nested router never saw the requests giong-web
+  answers by itself, so `Cors` on the router nested at `/api` never answered a preflight
+  (browsers then blocked every JSON or authenticated cross-origin call to those routes),
+  and errors under the prefix had no `Access-Control-Allow-Origin`. A CORS preflight now
+  runs through the middleware of the route its `Access-Control-Request-Method` would go
+  to; another automatic `OPTIONS` or a `405`, through those of the first route at the most
+  specific path that matches; a `404`, through those of the router nested at the most
+  specific prefix of the path (the outermost router's elsewhere, as before).
+- **giong-web**: `Allow`, in a `405` and in the automatic answer to `OPTIONS`, named the
+  methods of the most specific matching path only, though the method picks among every
+  path that matches (`DELETE /users/me` goes to `DELETE /users/{id}`). It now lists every
+  method that would route to the URL. The rule is now in the README.
+- **giong-web**, **Breaking**: `Req::param` refuses with `400` (`GIONG-E1205`) a value
+  that once percent-decoded has a `.` or `..` segment (sent as is or as `%2E%2E`/`..%2F`;
+  giong-http does not remove dot segments), a NUL, a `/` in a one-segment parameter, or,
+  for a catch-all, a leading `/`. `/files/{*path}` joined to a directory was a path
+  traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
+  that wants it.
+- **giong-web**: the docs of `Req::json` showed a `&str` field, which serde can only lend
+  when the string needs no unescaping, so valid JSON with `\"` or `\u00e9` (and a query
+  value with `+` or `%XX`) was answered `422`/`400`, blaming the client. The examples now
+  use `String` or `#[serde(borrow)] Cow<'a, str>`, and such a failure is a `500` whose
+  logged cause (`GIONG-E1213`) says to use one of them.
+- **giong-web**: `?` looked for a giong code in the top error only, and read it from the
+  message of any error, `io::Error` included. A giong error wrapped in an application's
+  error type (a pool timeout inside a `RepoError`) was a `500` instead of a `503`, and an
+  upstream's message relayed in `io::Error::other("GIONG-E1111: ...")` was a `413`. The
+  code is now looked for down the whole `source()` chain, by type for giong's own errors
+  and by message only for the companion crates' error types, never in an `io::Error`'s
+  text.
+- **giong-web**: `Compression` answered `HEAD` without `Content-Encoding: gzip` and with
+  the uncompressed `Content-Length`, while `GET` got the compressed ones; RFC 9110 asks
+  for the same header fields. `HEAD` is now compressed like `GET`, and the server sends
+  the compressed length without the body.
+
+## [0.5.0] - 2026-11-14
+
+HTTP/2, and less work per byte. `giong-http` speaks HTTP/2 as a server and as a client,
+through ALPN or with prior knowledge, with the same handlers; it is hardened against rapid
+reset, floods and HPACK bombs, `h2spec` passes all 147 cases, and on one core of a
+bare-metal server it answers 2.3 to 4.3 times as many HTTP/2 requests as axum. `giong-tls`
+can hand a connection to the kernel's TLS after the handshake, and files go out with
+`sendfile`: on bare metal a 1 MiB file over HTTPS is served 36% faster than with rustls,
+level with nginx. On io_uring, large static bodies leave without a copy on Linux 6.2 and
+newer (up to 85% less CPU per request), connections share receive buffers piece by piece
+on 6.12 and newer (less than half the memory under load), and bulk receives are no longer
+copied out of the pool. `SQPOLL` was tried and left out: on bare metal it served fewer
+requests with 73% more CPU per request. The new `giong-compat` gives giong's streams the
+Tokio and futures-io I/O traits, so crates such as h2, tokio-rustls and tokio-tungstenite
+run on giong. On Linux 6.14 to 7.2, a worker past the locked-memory limit now runs on
+epoll and says why (`GIONG-E0010`) instead of stopping the runtime. No change breaks code
+written for 0.4, but a stream's `recv` may now return one write of the peer in two pieces.
+
+The release candidate was measured again on the two bare-metal machines
+(`bench/results/bare-metal-epyc-4345p/linux-7.0/release-0.5.0/`): on 4 workers giong
+served 1.75M requests/s against 1.69M for tuned Monoio and 1.59M for raw Tokio, two
+15-minute soaks passed, and nothing moved beyond the 2% noise between runs except two
+small losses not explained yet: an idle HTTP/2 connection costs 4.21 KiB where an earlier
+build measured 3.99, and giong-http over TLS answers about 2% fewer small requests.
+
+### Added
+
 - **`giong-http`: HTTP/2** (RFC 9113) for the same handlers. Over TLS, `serve_tls` offers
   `h2` and `http/1.1` through ALPN, so browsers get HTTP/2; without TLS, a connection that
   opens with the HTTP/2 preface is served over HTTP/2 ("prior knowledge"), on the same
@@ -119,6 +166,76 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   and 1.2 to 1.3 times on 8.5 KiB ones. `bench/http-client.sh` measures HTTP/2 over TLS
   and with prior knowledge (`h2`, `h2c`), and tells both clients to speak HTTP/1.1 for
   `http` and `https`.
+- **Kernel TLS in `giong-tls`**: `TlsAcceptor::ktls(mode)` and `TlsConnector::ktls(mode)`
+  hand a connection's keys to the kernel once rustls has done the handshake, and the
+  kernel encrypts and decrypts from then on; the `TlsStream` API stays the same.
+  `Ktls::Off` is the default; `Ktls::Auto` uses the kernel where it can do everything
+  rustls would have done (the `tls` module, every cipher suite the configuration
+  allows in both directions, and new TLS 1.3 keys on a live connection, Linux 6.14+)
+  and keeps the connection in the process otherwise; `Ktls::Required` fails with
+  `GIONG-E2009` instead. What the kernel can do is probed once per process
+  (`giong_tls::ktls_support()`, one line for a log); `TlsStream::is_ktls()`,
+  `ktls_unavailable()` and `giong_tls::ktls_stats()` say which way connections went.
+  Session tickets, key updates from either side, alerts, refused renegotiation and
+  `close_notify` work as with rustls in the process. The TLS 1.2 AES-GCM handoff starts
+  the kernel's explicit nonces past every nonce rustls used: handed rustls' IV as it is,
+  the kernel would repeat the nonce of the `Finished` message under the same key. New
+  error codes `GIONG-E2009` to `GIONG-E2012` explain each failure. Linux 6.0's kernel
+  TLS is refused (it can crash the kernel when a connection closes); 5.15 and 6.1 on
+  are tested.
+- **Files over TLS without copying them**: `giong::net::TcpStream::send_file(&file,
+  offset, len)` sends a range of a file with `sendfile(2)`, straight from the page cache,
+  on both drivers; with kernel TLS the kernel encrypts the file as it sends it.
+  `giong_tls::TlsStream::send_file` does that under kernel TLS and reads and encrypts in
+  256 KiB pieces in the process otherwise. `giong-http` sends the new `Body::file(file)`
+  and `Body::file_range(file, offset, len)` that way (`Transport::write_all_with_file`;
+  Unix sockets read and write). A file that turns out shorter than announced is the new
+  error `GIONG-E0201` (`Code::FileTooShort`), after what it had was sent. On bare metal
+  (EPYC 4345P, Linux 7.0, one server core) giong-http serves a 1 MiB file over HTTPS at
+  6,104 req/s with kernel TLS and `sendfile` against 4,484 with rustls (+36%; nginx with
+  kernel TLS and `sendfile`: 6,039). With 64 KiB files, from memory and for small
+  responses kernel TLS is 4–22% slower than rustls, so `Ktls::Off` stays the default; the
+  `giong-tls` README has the table and when to turn it on. Recorded in
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/ktls/`.
+- **`giong-tls`**: `TlsStream::write_all_vectored(bufs)` sends several buffers, a header
+  and a body for example, without copying them into one first. `giong-http` uses it for
+  bodies of 32 KiB or more over HTTPS, which it used to copy after the head.
+- **giong**: on Linux 6.2 and newer, TCP sends of 16 KiB and more from bytes that cannot
+  change (`&'static [u8]`, `Rc<[u8]>`, `Arc<[u8]>`, so `giong-http`'s static bodies) go
+  out without a copy into the kernel (`IORING_OP_SEND_ZC`, `zero-copy-send`): the network
+  card reads them, and the write still returns as soon as they are queued, so a writer is
+  never held to the peer's acknowledgements. A vectored write may add up to 4 KiB from
+  other buffers (an HTTP head), which are copied aside. Bytes that can change once the
+  write returns (a `Vec`) are copied as before. A socket goes back to plain sends for good
+  when the kernel reports that it copied the data anyway (loopback, a card without
+  scatter-gather) or cannot send this way (kTLS); Unix sockets never use it. On bare metal
+  (Linux 7.0, 25 GbE) it cuts the CPU time per request by 16% at 64 KiB, 62% at 256 KiB,
+  68 to 72% at 1 MiB and 85 to 86% at 16 MiB across runs, at the same request rate.
+  `bench/uring-features.sh` measures each optional io_uring feature against the rest, on
+  one machine or two.
+- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
+  worker uses (`giong::IoUringFeature`), and its one-line form names them
+  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
+  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
+  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
+- **giong**: `TcpStream::poll_recv` and `UnixStream::poll_recv`, the poll form of `recv`,
+  for futures written by hand and for adapters such as giong-compat.
+- **giong**: `TcpStream::send_with_control(buf, control)`, one `sendmsg` with ancillary
+  data, on both drivers (giong-tls sends TLS alerts and key updates through it).
+- **giong-compat**, a new crate: `Compat` gives giong's `TcpStream`, `UnixStream` and (with
+  the `tls` feature) giong-tls's `TlsStream` the `AsyncRead`, `AsyncWrite` and
+  `AsyncBufRead` traits of `tokio::io` and of `futures_io`, so that crates generic over
+  their transport run on giong with no Tokio runtime: tested with tokio-rustls,
+  futures-rustls, tokio-tungstenite, h2 (also over giong-tls with ALPN), hyper's HTTP/1
+  connection API (against giong-http both ways) and tokio-util's codecs, on io_uring and
+  epoll. Writes are buffered like `BufWriter` (64 KiB by default) and sent on `flush`, when
+  the buffer is full or when a read waits; a partly read chunk never holds the worker's
+  receive pool; `TCP_NODELAY` is turned on. It costs a copy each way (none for reads
+  through `AsyncBufRead`), measured by `bench/compat.sh` in four sessions (sending 10–20%
+  slower, receiving with `read` 6–13% more CPU per byte). Errors `GIONG-E1401` (an earlier
+  buffered write failed), `E1402` (write after shutdown) and `E1403` (invalid setting). A
+  hyper server over `Compat` needs a `hyper::rt::Timer` for its header timeout; the README
+  shows one built on giong's timers.
 - **Verification**: two new fuzz targets in the nightly fuzz workflow, `hpack` (header
   blocks decoded, encoded again and compared; Huffman both ways) and `h2` (whole
   connections from a client that follows the protocol mostly, every frame the server
@@ -128,21 +245,21 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   server might send, fed in pieces while requests come and go, with checks that the
   client holds no more than the windows it grants and writes only well-formed frames
   within the server's windows. 3,000 such connections run in `cargo test`.
-- **giong**: `DriverChoice::io_uring_features` lists the optional io_uring features a
-  worker uses (`giong::IoUringFeature`), and its one-line form names them
-  (`io_uring (chosen automatically), using packed-buffers`). Each is probed when a worker
-  starts and skipped where the kernel lacks it. `GIONG_IO_URING_OFF` (names, or `all`)
-  turns them off for tests and benchmarks, as `GIONG_RING_TIER` does for the ring setup.
+- **Verification**: `KTLS=1 scripts/kernels.sh 6.1.155 6.18.63` loads the kernel's `tls`
+  module in the QEMU guest (from Ubuntu's modules package) and requires the kernel TLS
+  tests to run there (`GIONG_KTLS_REQUIRED=1`); CI does this on 5.15 (epoll), 6.1,
+  Ubuntu's 6.8 and 6.18, and loads the module on its runners for the `test`,
+  `fallback`, `tsan` and `docker` jobs.
 - **Verification**: `scripts/check.sh fallback` (and CI's `fallback` job) also runs the
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
-- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
-  forms of `Error::new` and `with_header` that never panic, for a status or a header
-  value that comes from an upstream service or the request: a status outside
-  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
-  gives the error back without it. The docs say which form takes which values, and
-  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
-  (takes JSON already written).
+- **Benchmarks**: `bench/tls.sh` adds `giong-http-ktls` (giong-http with
+  `Ktls::Required`), 64 KiB and 1 MiB responses from memory (`bytes64k`, `bytes1m`) and
+  from a file (`file64k`, `file1m`, `file64k-open`), the server's CPU time per request
+  and an error count; `SERVERS` and `ENDPOINTS` pick a subset. `bench/http-client.sh`
+  adds a giong client with kernel TLS and the same body sizes.
+- **Docs**: an addendum to the `giong-tls` security review covers kernel TLS
+  (`docs/reviews/2026-11-giong-tls.md`).
 
 ### Changed
 
@@ -168,31 +285,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (no `DEFER_TASKRUN`), where one fast stream can fill the whole pool in a single turn,
   the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
-- **giong-web**, **Breaking**: `Req::query_param` and `Req::query` follow one strict rule.
-  `query_param` used to take the first of a repeated key and skip a key that did not
-  decode; it now answers `400` (`GIONG-E1205`) for a repeated key it is asked for and
-  for a bad escape anywhere in the query string, as `query` did. `query` into a map
-  (`HashMap`, `serde_json::Value`) refuses a repeated key instead of keeping the last
-  value; a struct still ignores the keys it does not know.
-- **giong-web**, **Breaking**: `Sink` is `#[non_exhaustive]`, so that sinks can be added
-  without breaking a `match`.
-- **giong-web**, **Breaking**: request ids made by `RequestId` are 32 hexadecimal digits
-  instead of 20: 64 random bits per process instead of 32, 16 bits for the worker instead
-  of 8, then a 48-bit counter. With 32 random bits, two processes of a fleet shared ids
-  with even odds after about 77,000 starts, and workers above 256 shared them within a
-  process. Code that checks an id's length, or a column sized for it, needs the new one.
-- **giong-web**: `Logger` cuts a path or query string longer than 4 KiB in its lines,
-  ending `...(+N bytes)`. Sixteen requests with a 64 KiB path filled a worker's 1 MiB
-  log buffer, and the lines after them were dropped.
-- **giong-web**: the log writer shrinks a worker's buffer back to 64 KiB once written,
-  instead of keeping the memory of a burst (up to 1 MiB per worker and stream), and
-  removes the buffer of a thread that ended, after writing its last lines, instead of
-  keeping one per thread that ever logged.
-- **giong-web**: the `Timeout` docs no longer say that every giong operation is safe to
-  cancel: dropping is memory-safe, the database and HTTP clients close a connection whose
-  request was abandoned, and some I/O (a vectored write, `send_file`) may be cut halfway.
-  They show how to limit the work a streaming route does once its body is in, which
-  `Timeout` does not cover.
 
 ### Fixed
 
@@ -235,48 +327,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
-- **giong-web**: a handler or middleware that panicked took its connection down with no
-  response, no log line and no request id, and over HTTP/2 every other request on that
-  connection with it. A panic, in the handler, in a closure before it returns its future
-  or in a middleware, is now caught where it happens and answered like any other failure:
-  `500` problem+json with `GIONG-E1210`, whose logged cause is "the handler panicked:
-  ..." or "a middleware panicked: ...", so `Logger`, `Trace` and `RequestId` see an
-  ordinary error response. A header value from the request that makes
-  `Response::header` panic (`%0A` in a query parameter) is one such case.
-- **giong-web**: middleware layered on a nested router never saw the requests giong-web
-  answers by itself, so `Cors` on the router nested at `/api` never answered a preflight
-  (browsers then blocked every JSON or authenticated cross-origin call to those routes),
-  and errors under the prefix had no `Access-Control-Allow-Origin`. A CORS preflight now
-  runs through the middleware of the route its `Access-Control-Request-Method` would go
-  to; another automatic `OPTIONS` or a `405`, through those of the first route at the most
-  specific path that matches; a `404`, through those of the router nested at the most
-  specific prefix of the path (the outermost router's elsewhere, as before).
-- **giong-web**: `Allow`, in a `405` and in the automatic answer to `OPTIONS`, named the
-  methods of the most specific matching path only, though the method picks among every
-  path that matches (`DELETE /users/me` goes to `DELETE /users/{id}`). It now lists every
-  method that would route to the URL. The rule is now in the README.
-- **giong-web**, **Breaking**: `Req::param` refuses with `400` (`GIONG-E1205`) a value
-  that once percent-decoded has a `.` or `..` segment (sent as is or as `%2E%2E`/`..%2F`;
-  giong-http does not remove dot segments), a NUL, a `/` in a one-segment parameter, or,
-  for a catch-all, a leading `/`. `/files/{*path}` joined to a directory was a path
-  traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
-  that wants it.
-- **giong-web**: the docs of `Req::json` showed a `&str` field, which serde can only lend
-  when the string needs no unescaping, so valid JSON with `\"` or `\u00e9` (and a query
-  value with `+` or `%XX`) was answered `422`/`400`, blaming the client. The examples now
-  use `String` or `#[serde(borrow)] Cow<'a, str>`, and such a failure is a `500` whose
-  logged cause (`GIONG-E1213`) says to use one of them.
-- **giong-web**: `?` looked for a giong code in the top error only, and read it from the
-  message of any error, `io::Error` included. A giong error wrapped in an application's
-  error type (a pool timeout inside a `RepoError`) was a `500` instead of a `503`, and an
-  upstream's message relayed in `io::Error::other("GIONG-E1111: ...")` was a `413`. The
-  code is now looked for down the whole `source()` chain, by type for giong's own errors
-  and by message only for the companion crates' error types, never in an `io::Error`'s
-  text.
-- **giong-web**: `Compression` answered `HEAD` without `Content-Encoding: gzip` and with
-  the uncompressed `Content-Length`, while `GET` got the compressed ones; RFC 9110 asks
-  for the same header fields. `HEAD` is now compressed like `GET`, and the server sends
-  the compressed length without the body.
 
 ## [0.4.0] - 2026-11-13
 
@@ -1051,7 +1101,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/giong-run/Giong/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/giong-run/Giong/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/giong-run/Giong/compare/v0.2.0...v0.2.1
