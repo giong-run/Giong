@@ -1,5 +1,6 @@
 //! Runtime construction, the per-worker event loop, and cross-thread plumbing.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -97,8 +98,14 @@ pub(crate) struct WorkerShared {
 
 impl WorkerShared {
     fn new() -> io::Result<Arc<Self>> {
+        // Under Miri, created non-blocking: the epoll driver makes it so with
+        // `ioctl(FIONBIO)`, which Miri does not have.
+        #[cfg(not(miri))]
+        let flags = libc::EFD_CLOEXEC;
+        #[cfg(miri)]
+        let flags = libc::EFD_CLOEXEC | libc::EFD_NONBLOCK;
         // SAFETY: plain syscall; the result is checked.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        let fd = unsafe { libc::eventfd(0, flags) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -324,6 +331,27 @@ struct Config {
 }
 
 /// Everything a worker thread owns. Reached through a thread-local.
+/// A single-shot operation whose future was dropped: its key, its
+/// resources, and whether its result is a descriptor to close.
+type DeferredCancel = (usize, Option<Box<dyn Any>>, bool);
+
+/// See [`Worker::deferred`].
+#[derive(Default)]
+struct Deferred {
+    /// Multishot operations whose owner went away.
+    multis: Vec<usize>,
+    /// Single-shot operations whose future was dropped.
+    cancels: Vec<DeferredCancel>,
+    /// Descriptors given up.
+    closes: Vec<RawFd>,
+}
+
+impl Deferred {
+    fn is_empty(&self) -> bool {
+        self.multis.is_empty() && self.cancels.is_empty() && self.closes.is_empty()
+    }
+}
+
 pub(crate) struct Worker {
     pub(crate) index: usize,
     pub(crate) shared: Arc<WorkerShared>,
@@ -331,9 +359,10 @@ pub(crate) struct Worker {
     pub(crate) driver: RefCell<Driver>,
     /// Which driver `driver` is, readable without borrowing it.
     driver_kind: DriverKind,
-    /// Descriptors given up while the driver was borrowed; closed through it
-    /// at the next turn of the event loop.
-    deferred_closes: RefCell<Vec<RawFd>>,
+    /// Driver work that came up while the driver was borrowed (code a
+    /// waker's `wake` or `drop` runs is inside the borrow); done at the next
+    /// turn of the event loop.
+    deferred: RefCell<Deferred>,
     pub(crate) tasks: RefCell<Slab<TaskSlot>>,
     pub(crate) queue: RefCell<VecDeque<usize>>,
     pub(crate) timers: RefCell<Timers>,
@@ -396,7 +425,7 @@ impl Worker {
             rt,
             driver_kind: driver.kind(),
             driver: RefCell::new(driver),
-            deferred_closes: RefCell::new(Vec::new()),
+            deferred: RefCell::new(Deferred::default()),
             tasks: RefCell::new(Slab::new()),
             queue: RefCell::new(VecDeque::with_capacity(256)),
             timers: RefCell::new(Timers::new()),
@@ -577,7 +606,24 @@ impl Worker {
     /// forget a descriptor before its number can be reused, so it is never
     /// closed behind the driver's back.
     pub(crate) fn defer_close(&self, fd: RawFd) {
-        self.deferred_closes.borrow_mut().push(fd);
+        self.deferred.borrow_mut().closes.push(fd);
+    }
+
+    /// Drops the multishot operation `key`, whose owner went away while the
+    /// driver was borrowed, at the next turn of the event loop. Before the
+    /// deferred closes, since the operation holds a reference to its socket.
+    pub(crate) fn defer_drop_multi(&self, key: usize) {
+        self.deferred.borrow_mut().multis.push(key);
+    }
+
+    /// Cancels the single-shot operation `key`, whose future was dropped
+    /// while the driver was borrowed, at the next turn of the event loop;
+    /// see [`Driver::cancel_op`].
+    pub(crate) fn defer_cancel(&self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
+        self.deferred
+            .borrow_mut()
+            .cancels
+            .push((key, data, result_is_fd));
     }
 
     /// Where the main future was started.
@@ -604,12 +650,18 @@ impl Worker {
     }
 
     fn close_deferred(&self) {
-        if self.deferred_closes.borrow().is_empty() {
+        if self.deferred.borrow().is_empty() {
             return;
         }
-        let fds = mem::take(&mut *self.deferred_closes.borrow_mut());
+        let deferred = mem::take(&mut *self.deferred.borrow_mut());
         let mut driver = self.driver.borrow_mut();
-        for fd in fds {
+        for key in deferred.multis {
+            driver.drop_multi(key);
+        }
+        for (key, data, result_is_fd) in deferred.cancels {
+            driver.cancel_op(key, data, result_is_fd);
+        }
+        for fd in deferred.closes {
             driver.close_fd(fd);
         }
     }
@@ -1231,7 +1283,9 @@ async fn watch_signals(fd: RawFd) {
                 buf: buf.as_mut_ptr(),
                 len: 8,
             };
-            let (res, _, b) = Op::new(io, buf).await;
+            // SAFETY: `buf` points at the `Vec`'s heap buffer, which stays
+            // put when the `Vec` moves.
+            let (res, _, b) = unsafe { Op::new(io, buf) }.await;
             buf = b;
             if res > 0 {
                 handle().shutdown();

@@ -177,6 +177,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**: a `File::open`, `File::create` or `OpenOptions::open` whose future was dropped
+  after the open started (a timeout, a cancelled request) leaked the descriptor the open
+  produced: on io_uring every one (200 of 200 in the new test), on epoll those already
+  running. The driver now closes the result of an open nobody collects, on both drivers.
+- **giong**: memory the kernel writes into during an operation (the `statx` result, the
+  `msghdr` of `UdpSocket::read_from` and `send_to`, the headers of vectored and control
+  sends, the address of `connect`, and paths) was reached through a pointer taken before its
+  `Box` moved, which Rust's aliasing rules make undefined behaviour (nothing miscompiled,
+  but Miri failed on every file test). It now lives in a small owner reached only through a
+  raw pointer, and `IoBufMut for Vec<u8>` hands the kernel a pointer valid for the whole
+  capacity. CI runs the epoll driver's tests under Miri, so that this stays fixed.
+- **giong**: `observe` grouped tasks by the address of their spawn `Location`, so one call
+  site could show up as several entries; it groups by file, line and column.
+- **giong**: a stream or listener dropped by code the driver runs (a waker's `wake` or
+  `drop`) kept its multishot receive or accept: the kernel kept the socket open, so the
+  peer never saw it close, and the driver kept the entry. An operation's future dropped
+  there leaked its buffer and its entry. Both are now finished at the next turn of the
+  event loop.
 - **giong**: Linux 6.14 to 7.2 count every io_uring ring against the locked-memory limit
   (`RLIMIT_MEMLOCK`) of a process without `CAP_IPC_LOCK`, summed over the user's processes
   (7.3 stopped, and so did 6.18 from 6.18.58): about 150 KiB per giong worker, so the

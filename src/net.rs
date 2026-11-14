@@ -43,6 +43,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use crate::buf::{is_shared, sharing, IoBuf, IoBufMut, RecvBuf, Sharing};
 use crate::driver::{Driver, Io, MultiIo, MultiKind, MultiPoll, ZeroCopyHold};
 use crate::error::{raise, Code};
+use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime::{self, Worker};
 
@@ -93,17 +94,16 @@ impl MultiSlot {
         matches!(self.key.get(), Some((_, uid)) if uid == w.shared.uid)
     }
 
-    /// Releases the slot. Returns `false` if the driver could not be reached.
-    fn release(&self, w: &Worker) -> bool {
-        match self.key.take() {
-            Some((key, uid)) if uid == w.shared.uid => match w.driver.try_borrow_mut() {
-                Ok(mut driver) => {
-                    driver.drop_multi(key);
-                    true
+    /// Releases the slot: drops its multishot operation now, or at the next
+    /// turn if the driver is borrowed.
+    fn release(&self, w: &Worker) {
+        if let Some((key, uid)) = self.key.take() {
+            if uid == w.shared.uid {
+                match w.driver.try_borrow_mut() {
+                    Ok(mut driver) => driver.drop_multi(key),
+                    Err(_) => w.defer_drop_multi(key),
                 }
-                Err(_) => false,
-            },
-            _ => true,
+            }
         }
     }
 }
@@ -113,7 +113,8 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
     let fd = sock.as_raw_fd();
     let closed = runtime::try_with_worker(|w| {
         // Cancel the multishot operation first: it holds a reference to the
-        // socket, which would otherwise stay open after the close.
+        // socket, which would otherwise stay open after the close. (If the
+        // driver is borrowed, both are deferred, in this order.)
         slot.release(w);
         match w.driver.try_borrow_mut() {
             Ok(mut driver) => driver.close_fd(fd),
@@ -249,13 +250,13 @@ impl StreamSocket {
 
     /// Connects `sock` to `addr` through the driver.
     pub(crate) async fn connect(sock: Socket, addr: SockAddr) -> io::Result<Self> {
-        // Boxed so the address the operation points at does not move with
-        // the future.
-        let addr: Box<SockAddr> = Box::new(addr);
+        // On the heap so the address the operation points at does not move
+        // with the future.
+        let addr = KernelBox::new(addr);
         let io = Io::Connect {
             fd: sock.as_raw_fd(),
-            addr: addr.as_ptr() as *const libc::sockaddr,
-            len: addr.len(),
+            addr: addr.get().as_ptr() as *const libc::sockaddr,
+            len: addr.get().len(),
         };
         // Owned as a stream from here on, so that a connect that fails, or
         // whose future is dropped, still closes the socket through the
@@ -263,7 +264,9 @@ impl StreamSocket {
         // attempt; closed behind its back, the number would stay marked as
         // registered, and the next socket to get it would never be woken.
         let stream = Self::new(sock);
-        let (res, _, _addr) = Op::new(io, addr).await;
+        // SAFETY: the operation's only pointer is to the address in its
+        // `KernelBox`.
+        let (res, _, _addr) = unsafe { Op::new(io, addr) }.await;
         if res < 0 {
             return Err(os_err(res));
         }
@@ -321,7 +324,8 @@ impl StreamSocket {
             buf: buf.as_mut_ptr(),
             len,
         };
-        let (res, _, mut buf) = Op::new(io, buf).await;
+        // SAFETY: an `IoBufMut`'s bytes stay put when it moves.
+        let (res, _, mut buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
@@ -397,13 +401,18 @@ impl StreamSocket {
             let hold = self.vectored_hold(&bufs, offset, &mut iov);
             // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
             // lengths).
-            let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-            msg.msg_iov = iov.as_mut_ptr();
-            msg.msg_iovlen = iov.len() as _;
+            let msg: KernelBox<libc::msghdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+            // SAFETY: `msg` owns a live `msghdr` nothing else uses yet. The
+            // iovec array is a `Vec`'s heap buffer, which moving the `Vec`
+            // does not move or reborrow.
+            unsafe {
+                (*msg.as_ptr()).msg_iov = iov.as_mut_ptr();
+                (*msg.as_ptr()).msg_iovlen = iov.len() as _;
+            }
             let zero_copy = hold.is_some();
             let io = Io::SendMsg {
                 fd: self.sock.as_raw_fd(),
-                msg: &*msg,
+                msg: msg.as_ptr(),
                 flags: libc::MSG_NOSIGNAL as u32,
                 zero_copy,
             };
@@ -413,9 +422,13 @@ impl StreamSocket {
             // completes, and the driver keeps the hold of a zero-copy send
             // until the kernel lets go of its bytes.
             let held = (bufs, iov, msg);
+            // SAFETY: the header is in a `KernelBox`, the iovec array is a
+            // `Vec`'s heap buffer, and the bytes are `IoBuf`s: none of them
+            // moves with `held`. The hold owns what a zero-copy send reads
+            // after its result.
             let (res, _, held) = match hold {
-                Some(hold) => Op::with_hold(io, held, hold).await,
-                None => Op::new(io, held).await,
+                Some(hold) => unsafe { Op::with_hold(io, held, hold) }.await,
+                None => unsafe { Op::new(io, held) }.await,
             };
             bufs = held.0;
             if zero_copy && res == -libc::EOPNOTSUPP {
@@ -489,30 +502,37 @@ impl StreamSocket {
         buf: B,
         control: C,
     ) -> (io::Result<usize>, B, C) {
-        let mut iov = Box::new(libc::iovec {
+        let iov = KernelBox::new(libc::iovec {
             iov_base: buf.as_ptr().cast_mut().cast(),
             iov_len: buf.len(),
         });
         // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
-        let mut msg: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-        msg.msg_iov = &mut *iov;
-        msg.msg_iovlen = 1;
-        if !control.is_empty() {
-            msg.msg_control = control.as_ptr().cast_mut().cast();
-            msg.msg_controllen = control.len() as _;
+        let msg: KernelBox<libc::msghdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+        // SAFETY: `msg` owns a live `msghdr` nothing else uses yet.
+        unsafe {
+            let m = msg.as_ptr();
+            (*m).msg_iov = iov.as_ptr();
+            (*m).msg_iovlen = 1;
+            if !control.is_empty() {
+                (*m).msg_control = control.as_ptr().cast_mut().cast();
+                (*m).msg_controllen = control.len() as _;
+            }
         }
         // Control messages go to kernel TLS, which cannot send without a
         // copy.
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
-            msg: &*msg,
+            msg: msg.as_ptr(),
             flags: libc::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
         // The header, the iovec and both buffers stay where they are until the
         // kernel is done with them, even if this future is dropped: `Op`
         // keeps them until the operation completes.
-        let (res, _, (buf, control, _iov, _msg)) = Op::new(io, (buf, control, iov, msg)).await;
+        // SAFETY: the iovec and the header are in `KernelBox`es, and both
+        // buffers are `IoBuf`s, whose bytes stay put when they move.
+        let (res, _, (buf, control, _iov, _msg)) =
+            unsafe { Op::new(io, (buf, control, iov, msg)) }.await;
         if res < 0 {
             (Err(os_err(res)), buf, control)
         } else {
@@ -579,7 +599,8 @@ impl StreamSocket {
                     match err.raw_os_error() {
                         Some(libc::EINTR) => {}
                         Some(libc::EAGAIN) => {
-                            let (res, _, ()) = Op::new(Io::Writable { fd }, ()).await;
+                            // SAFETY: the operation has no pointers.
+                            let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
                             if res < 0 {
                                 return Err(os_err(res));
                             }
@@ -631,9 +652,12 @@ impl StreamSocket {
                 flags: libc::MSG_NOSIGNAL,
                 zero_copy,
             };
+            // SAFETY: `ptr` points into `buf`, an `IoBuf`, whose bytes stay
+            // put when it moves. The hold owns what a zero-copy send reads
+            // after its result.
             let (res, _, b) = match hold.take() {
-                Some(hold) => Op::with_hold(io, buf, hold).await,
-                None => Op::new(io, buf).await,
+                Some(hold) => unsafe { Op::with_hold(io, buf, hold) }.await,
+                None => unsafe { Op::new(io, buf) }.await,
             };
             buf = b;
             if zero_copy && res == -libc::EOPNOTSUPP {

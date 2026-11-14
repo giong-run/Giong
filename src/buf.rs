@@ -57,6 +57,10 @@ pub unsafe trait IoBufMut: IoBuf {
     unsafe fn set_init(&mut self, n: usize);
 }
 
+// SAFETY, for this impl and the ones down to `&'static str`: the bytes are
+// on the heap (`Vec`, `String`, `Box`, `Rc`, `Arc`) or in static memory,
+// neither of which moves when the value moves, and none of these types lets
+// safe code change the bytes while the value is owned by an operation.
 unsafe impl IoBuf for Vec<u8> {
     fn as_ptr(&self) -> *const u8 {
         <[u8]>::as_ptr(self)
@@ -68,7 +72,11 @@ unsafe impl IoBuf for Vec<u8> {
 
 unsafe impl IoBufMut for Vec<u8> {
     fn as_mut_ptr(&mut self) -> *mut u8 {
-        <[u8]>::as_mut_ptr(self)
+        // The inherent method, whose pointer is valid for the whole
+        // allocation: the kernel writes up to `capacity`, past `len`. (A
+        // pointer from the slice, `<[u8]>::as_mut_ptr`, covers only `len`
+        // bytes, usually none.)
+        Vec::as_mut_ptr(self)
     }
     fn capacity(&self) -> usize {
         Vec::capacity(self)

@@ -51,6 +51,7 @@ use std::time::{Duration, SystemTime};
 use crate::buf::{IoBuf, IoBufMut};
 use crate::driver::Io;
 use crate::error::{raise, Code};
+use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime;
 
@@ -58,19 +59,25 @@ fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
 }
 
-fn c_path(path: &Path) -> io::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-        raise(
-            Code::InvalidPath,
-            format!("the path {path:?} contains a NUL byte"),
-            "remove the NUL byte; Linux paths cannot contain one.",
-        )
-    })
+/// `path` as a C string for the kernel, in a [`KernelBox`] so that the
+/// pointer to it stays valid while the operation's resources move.
+fn c_path(path: &Path) -> io::Result<KernelBox<CString>> {
+    CString::new(path.as_os_str().as_bytes())
+        .map(KernelBox::path)
+        .map_err(|_| {
+            raise(
+                Code::InvalidPath,
+                format!("the path {path:?} contains a NUL byte"),
+                "remove the NUL byte; Linux paths cannot contain one.",
+            )
+        })
 }
 
 /// Runs an operation whose only resource is one path.
-async fn path_op(path: CString, io: Io) -> io::Result<i32> {
-    let (res, _, _path) = Op::new(io, path).await;
+async fn path_op(path: KernelBox<CString>, io: Io) -> io::Result<i32> {
+    // SAFETY: the operation's only pointer is to the path in its
+    // `KernelBox`.
+    let (res, _, _path) = unsafe { Op::new(io, path) }.await;
     if res < 0 {
         Err(os_err(res))
     } else {
@@ -184,11 +191,16 @@ impl OpenOptions {
     }
 
     /// Opens `path` with these options.
+    ///
+    /// If the future is dropped once the open has started, the descriptor
+    /// it may still produce is closed. What the open did to the file stays
+    /// done: a dropped `create` or `truncate` may have created or emptied
+    /// the file, in any runtime.
     pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         let flags = self.flags()?;
         let path = c_path(path.as_ref())?;
         let io = Io::OpenAt {
-            path: path.as_ptr(),
+            path: path.c_ptr(),
             flags,
             mode: self.mode,
         };
@@ -264,7 +276,8 @@ impl File {
             len,
             offset,
         };
-        let (res, _, mut buf) = Op::new(io, buf).await;
+        // SAFETY: an `IoBufMut`'s bytes stay put when it moves.
+        let (res, _, mut buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
             return (Err(os_err(res)), buf);
         }
@@ -312,7 +325,9 @@ impl File {
             len,
             offset,
         };
-        let (res, _, buf) = Op::new(io, buf).await;
+        // SAFETY: `ptr` points into `buf`, an `IoBuf`, whose bytes stay put
+        // when it moves.
+        let (res, _, buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -344,7 +359,8 @@ impl File {
             offset,
             len,
         };
-        let (res, _, ()) = Op::new(io, ()).await;
+        // SAFETY: the operation has no pointers.
+        let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
         match res {
             0.. => Ok(()),
             // The kind is set here, as older standard libraries leave
@@ -361,7 +377,8 @@ impl File {
             fd: self.fd,
             datasync,
         };
-        let (res, _, ()) = Op::new(io, ()).await;
+        // SAFETY: the operation has no pointers.
+        let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
         if res < 0 {
             Err(os_err(res))
         } else {
@@ -372,7 +389,12 @@ impl File {
     /// Size, type and modification time of the file.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         // An empty path with AT_EMPTY_PATH means "the descriptor itself".
-        statx(self.fd, CString::default(), libc::AT_EMPTY_PATH).await
+        statx(
+            self.fd,
+            KernelBox::path(CString::default()),
+            libc::AT_EMPTY_PATH,
+        )
+        .await
     }
 
     /// The size of the file in bytes, read with a plain `fstat` (a system
@@ -444,7 +466,8 @@ async fn close(fd: RawFd) -> io::Result<()> {
             Ok(())
         };
     }
-    let (res, _, ()) = Op::new(Io::Close { fd }, ()).await;
+    // SAFETY: the operation has no pointers.
+    let (res, _, ()) = unsafe { Op::new(Io::Close { fd }, ()) }.await;
     if res < 0 {
         Err(os_err(res))
     } else {
@@ -502,22 +525,23 @@ impl Metadata {
     }
 }
 
-async fn statx(dir: RawFd, path: CString, flags: i32) -> io::Result<Metadata> {
+async fn statx(dir: RawFd, path: KernelBox<CString>, flags: i32) -> io::Result<Metadata> {
     // SAFETY: all-zero is a valid `statx` (plain integers).
-    let out: Box<libc::statx> = Box::new(unsafe { mem::zeroed() });
+    let out: KernelBox<libc::statx> = KernelBox::new(unsafe { mem::zeroed() });
     let mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_SIZE | libc::STATX_MTIME;
-    let mut resources = (path, out);
     let io = Io::Statx {
         dir,
-        path: resources.0.as_ptr(),
+        path: path.c_ptr(),
         flags,
         mask,
-        out: &mut *resources.1,
+        out: out.as_ptr(),
     };
-    let (res, _, (_path, out)) = Op::new(io, resources).await;
+    // SAFETY: the path and the output are in `KernelBox`es.
+    let (res, _, (_path, out)) = unsafe { Op::new(io, (path, out)) }.await;
     if res < 0 {
         return Err(os_err(res));
     }
+    let out = out.get();
     let since_epoch = Duration::new(out.stx_mtime.tv_sec.unsigned_abs(), out.stx_mtime.tv_nsec);
     let modified = if out.stx_mtime.tv_sec >= 0 {
         SystemTime::UNIX_EPOCH + since_epoch
@@ -596,7 +620,7 @@ pub async fn write<P: AsRef<Path>, B: IoBuf>(path: P, data: B) -> io::Result<()>
 pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::UnlinkAt {
-        path: path.as_ptr(),
+        path: path.c_ptr(),
         flags: 0,
     };
     path_op(path, io).await.map(drop)
@@ -606,7 +630,7 @@ pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::UnlinkAt {
-        path: path.as_ptr(),
+        path: path.c_ptr(),
         flags: libc::AT_REMOVEDIR,
     };
     path_op(path, io).await.map(drop)
@@ -616,7 +640,7 @@ pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::MkDirAt {
-        path: path.as_ptr(),
+        path: path.c_ptr(),
         mode: 0o777,
     };
     path_op(path, io).await.map(drop)
@@ -626,10 +650,11 @@ pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     let paths = (c_path(from.as_ref())?, c_path(to.as_ref())?);
     let io = Io::RenameAt {
-        from: paths.0.as_ptr(),
-        to: paths.1.as_ptr(),
+        from: paths.0.c_ptr(),
+        to: paths.1.c_ptr(),
     };
-    let (res, _, _paths) = Op::new(io, paths).await;
+    // SAFETY: both paths are in `KernelBox`es.
+    let (res, _, _paths) = unsafe { Op::new(io, paths) }.await;
     if res < 0 {
         Err(os_err(res))
     } else {

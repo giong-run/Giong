@@ -434,6 +434,13 @@ impl Io {
     /// that `EAGAIN` from them is never an answer: io_uring returns it when
     /// the socket is non-blocking and it stopped waiting (see
     /// [`Op`](crate::op::Op)), and the epoll driver never does.
+    /// `true` for operations whose result, when not negative, is a new
+    /// descriptor that whoever collects the result must close. When nobody
+    /// does (the future was dropped), the driver closes it.
+    pub(crate) fn result_is_fd(&self) -> bool {
+        matches!(self, Io::OpenAt { .. })
+    }
+
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
@@ -594,10 +601,14 @@ impl Driver {
 
     /// The future of a single-shot operation was dropped before its result
     /// was collected. `data` are the resources the operation may still use.
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>) {
+    /// The future of a single-shot operation was dropped before its result
+    /// was collected. `data` are the resources the kernel may still use;
+    /// `result_is_fd` says the result will be a descriptor nobody owns (see
+    /// [`Io::result_is_fd`]), which the driver then closes.
+    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
         match self {
-            Driver::Uring(d) => d.cancel_op(key, data),
-            Driver::Epoll(d) => d.cancel_op(key, data),
+            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd),
+            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd),
         }
     }
 

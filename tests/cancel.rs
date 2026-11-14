@@ -4,6 +4,7 @@
 //! futures dropped while the kernel still owns their buffers, and the shared
 //! receive pool running dry.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -514,6 +515,179 @@ fn a_completed_but_uncollected_operation_releases_its_buffer() {
         sleep(Duration::from_millis(5)).await;
 
         assert!(freed.get());
+        assert_eq!(giong::stats().tracked_ops, 0);
+    });
+}
+
+/// How many descriptors of this process refer to `path`. (Counting all
+/// descriptors would see those of tests running in parallel.)
+fn open_fds(path: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target == path)
+        .count()
+}
+
+#[test]
+fn a_dropped_open_closes_the_descriptor_it_produced() {
+    // The result of an open is a new descriptor. When the future was
+    // dropped after the open was submitted, nobody took it and it stayed
+    // open: one descriptor per cancelled open, until EMFILE.
+    let path = std::env::temp_dir().join(format!("giong-cancel-open-{}", std::process::id()));
+    std::fs::write(&path, b"x").unwrap();
+    let path = path.canonicalize().unwrap();
+    giong::block_on(async {
+        // io_uring closes a dropped file through the ring, a turn later.
+        drop(giong::fs::File::open(&path).await.unwrap());
+        sleep(Duration::from_millis(5)).await;
+        assert_eq!(open_fds(&path), 0);
+        for round in 0..200 {
+            let mut open = Box::pin(giong::fs::File::open(&path));
+            // Submitted, then dropped: in flight, as when a timeout fires.
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    open.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+            if round % 2 == 1 {
+                // Completed but never collected.
+                sleep(Duration::from_millis(2)).await;
+            }
+            drop(open);
+        }
+        // Let every open finish and its descriptor be closed.
+        for _ in 0..100 {
+            if open_fds(&path) == 0 && giong::stats().tracked_ops == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(open_fds(&path), 0, "descriptors left open");
+        assert_eq!(giong::stats().tracked_ops, 0);
+    });
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// A waker that runs `f` the first time it is woken. The driver wakes tasks
+/// while it is borrowed, so `f` runs inside the driver, as code in a
+/// waker's `wake` or `drop` can.
+fn waker_running(f: impl FnOnce() + 'static) -> std::task::Waker {
+    use std::cell::RefCell;
+    use std::task::{RawWaker, RawWakerVTable, Waker};
+
+    type Slot = RefCell<Option<Box<dyn FnOnce()>>>;
+    fn run(data: *const ()) {
+        // SAFETY: `data` is an `Rc<Slot>` pointer this vtable created.
+        let slot = unsafe { &*(data as *const Slot) };
+        let f = slot.borrow_mut().take();
+        if let Some(f) = f {
+            f();
+        }
+    }
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        // SAFETY (all four): `data` came from `Rc::into_raw` of an
+        // `Rc<Slot>`, and the test runs on one thread.
+        |data| unsafe {
+            Rc::increment_strong_count(data as *const Slot);
+            RawWaker::new(data, &VTABLE)
+        },
+        |data| {
+            run(data);
+            drop(unsafe { Rc::from_raw(data as *const Slot) });
+        },
+        run,
+        |data| drop(unsafe { Rc::from_raw(data as *const Slot) }),
+    );
+    let slot: Rc<Slot> = Rc::new(RefCell::new(Some(Box::new(f))));
+    let raw = RawWaker::new(Rc::into_raw(slot) as *const (), &VTABLE);
+    // SAFETY: the vtable upholds the `RawWaker` contract on one thread.
+    unsafe { Waker::from_raw(raw) }
+}
+
+/// Arms `stream`'s multishot receive with `waker`, which the driver wakes
+/// when data arrives.
+fn arm_recv(stream: &TcpStream, waker: &std::task::Waker) {
+    let mut recv = std::pin::pin!(stream.recv());
+    let mut cx = std::task::Context::from_waker(waker);
+    assert!(recv.as_mut().poll(&mut cx).is_pending());
+}
+
+#[test]
+fn a_stream_dropped_inside_the_driver_still_closes() {
+    // The stream's multishot receive used to stay armed: its key was lost
+    // when the driver was borrowed, so the kernel kept the socket open (the
+    // peer never saw it close) and the driver kept the entry.
+    giong::block_on(async {
+        let (c, s) = pair().await;
+        let (c2, s2) = pair().await;
+        // `s` has its multishot receive armed.
+        arm_recv(&s, &waker_running(|| {}));
+        let s = Rc::new(std::cell::RefCell::new(Some(s)));
+        let dropper = {
+            let s = s.clone();
+            waker_running(move || drop(s.borrow_mut().take()))
+        };
+        // Data for `s2` makes the driver wake `dropper`, which drops `s`.
+        arm_recv(&s2, &dropper);
+        drop(dropper);
+        c2.write_all(&b"go"[..]).await.0.unwrap();
+        for _ in 0..100 {
+            if s.borrow().is_none() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(s.borrow().is_none(), "the waker did not run");
+        let (res, _) = timeout(Duration::from_secs(2), c.read(Vec::with_capacity(8)))
+            .await
+            .expect("the peer never saw the stream close");
+        assert_eq!(res.unwrap(), 0);
+        drop((c, c2, s2));
+        sleep(Duration::from_millis(20)).await;
+        assert_eq!(giong::stats().tracked_ops, 0, "entries left");
+    });
+}
+
+#[test]
+fn an_operation_dropped_inside_the_driver_is_still_cancelled() {
+    // The future of an in-flight read, dropped by code the driver runs: its
+    // buffer used to be leaked and its entry kept for good.
+    giong::block_on(async {
+        let (_c, s) = pair().await;
+        let (c2, s2) = pair().await;
+        let freed = Rc::new(std::cell::Cell::new(false));
+        let buf = Tracked {
+            data: Vec::with_capacity(64),
+            freed: freed.clone(),
+        };
+        let s = Rc::new(s);
+        let mut read: std::pin::Pin<Box<dyn Future<Output = _>>> = {
+            let s = s.clone();
+            Box::pin(async move { s.read(buf).await })
+        };
+        let noop = waker_running(|| {});
+        let mut cx = std::task::Context::from_waker(&noop);
+        assert!(read.as_mut().poll(&mut cx).is_pending());
+        let read = Rc::new(std::cell::RefCell::new(Some(read)));
+        let dropper = {
+            let read = read.clone();
+            waker_running(move || drop(read.borrow_mut().take()))
+        };
+        arm_recv(&s2, &dropper);
+        drop(dropper);
+        c2.write_all(&b"go"[..]).await.0.unwrap();
+        for _ in 0..200 {
+            if freed.get() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(read.borrow().is_none(), "the waker did not run");
+        assert!(freed.get(), "the read's buffer was never released");
+        drop((c2, s2, s));
+        sleep(Duration::from_millis(20)).await;
         assert_eq!(giong::stats().tracked_ops, 0);
     });
 }

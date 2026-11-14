@@ -81,6 +81,7 @@ compile_error!("giong only supports Linux: it is built on io_uring and epoll");
 mod buf;
 mod driver;
 mod executor;
+mod kbox;
 mod notify;
 mod op;
 mod runtime;

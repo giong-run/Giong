@@ -106,7 +106,12 @@ enum Lifecycle {
     Waiting(Waker),
     Done(i32),
     /// The future was dropped; holds the resources until the thread is done.
-    Ignored(Option<Box<dyn Any>>),
+    /// With `closes_result`, a result that is not negative is a descriptor
+    /// nobody owns (an open), which the driver closes.
+    Ignored {
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    },
 }
 
 enum EOp {
@@ -680,7 +685,12 @@ impl Epoll {
         }
     }
 
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>) {
+    pub(crate) fn cancel_op(
+        &mut self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        closes_result: bool,
+    ) {
         match self.ops.get_mut(key) {
             Some(EOp::Blocking {
                 state: state @ Lifecycle::Waiting(_),
@@ -690,13 +700,26 @@ impl Epoll {
                 // The thread may be using the resources: keep them until it
                 // reports. A job that has not started yet skips its call.
                 cancel.cancel();
-                *state = Lifecycle::Ignored(data);
+                *state = Lifecycle::Ignored {
+                    data,
+                    closes_result,
+                };
             }
-            Some(EOp::Ready { .. })
-            | Some(EOp::Blocking {
-                state: Lifecycle::Done(_),
+            Some(&mut EOp::Blocking {
+                state: Lifecycle::Done(res),
                 ..
             }) => {
+                // Nothing is using the resources any more.
+                self.ops.remove(key);
+                if let Some(data) = data {
+                    self.graveyard.push(data);
+                }
+                // An open that finished before its future was dropped.
+                if closes_result && res >= 0 {
+                    self.close_fd(res);
+                }
+            }
+            Some(EOp::Ready { .. }) => {
                 // Nothing is using the resources any more.
                 self.ops.remove(key);
                 if let Some(data) = data {
@@ -998,6 +1021,8 @@ impl Epoll {
         for (key, res) in done.drain(..) {
             self.blocking -= 1;
             let mut used = -1;
+            // A descriptor an ignored open produced: nobody will take it.
+            let mut orphan_fd = None;
             let remove = match self.ops.get_mut(key) {
                 Some(EOp::Blocking { state, fd, .. }) => {
                     used = *fd;
@@ -1006,9 +1031,15 @@ impl Epoll {
                             waker.wake();
                             false
                         }
-                        Lifecycle::Ignored(data) => {
+                        Lifecycle::Ignored {
+                            data,
+                            closes_result,
+                        } => {
                             if let Some(data) = data {
                                 self.graveyard.push(data);
+                            }
+                            if closes_result && res >= 0 {
+                                orphan_fd = Some(res);
                             }
                             true
                         }
@@ -1021,6 +1052,9 @@ impl Epoll {
                 self.ops.remove(key);
             }
             self.release(used);
+            if let Some(fd) = orphan_fd {
+                self.close_fd(fd);
+            }
         }
         self.done = done;
     }
@@ -1112,11 +1146,22 @@ fn pooled_flags(bid: u16) -> u32 {
 }
 
 /// Puts `fd` in non-blocking mode.
+#[cfg(not(miri))]
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let mut on: libc::c_int = 1;
     // SAFETY: FIONBIO reads an int from a valid pointer.
     if unsafe { libc::ioctl(fd, libc::FIONBIO, &mut on) } < 0 {
         return Err(io::Error::last_os_error());
     }
+    Ok(())
+}
+
+/// Under Miri, which has neither `ioctl(FIONBIO)` nor `fcntl` on eventfds,
+/// and stops at either: nothing. The descriptors giong creates itself are
+/// created non-blocking under Miri (see `WorkerShared::new`), so only
+/// descriptors a test hands in (pipes) stay blocking, and those tests are
+/// not run under Miri.
+#[cfg(miri)]
+fn set_nonblocking(_fd: RawFd) -> io::Result<()> {
     Ok(())
 }
