@@ -244,38 +244,49 @@ impl<S> Req<S> {
     /// }
     /// ```
     ///
-    /// When the key appears more than once, the first value counts.
+    /// This and `Req::query` (feature `serde`) follow one strict rule, so
+    /// that a middleware and a handler reading the same query string never
+    /// see different values: the whole query string must be valid
+    /// percent-encoded UTF-8, and the key asked for must appear at most
+    /// once. Other keys may repeat.
     ///
     /// # Errors
     ///
-    /// `400` (`GIONG-E1205`) when the value is not a valid `T` or the query
-    /// string is not valid percent-encoded UTF-8 where the key or value is.
+    /// `400` (`GIONG-E1205`) when the value is not a valid `T`, the key
+    /// appears more than once, or the query string is not valid
+    /// percent-encoded UTF-8 anywhere.
     pub fn query_param<T>(&self, name: &str) -> Result<Option<T>, Error>
     where
         T: FromStr,
         T::Err: fmt::Display,
     {
-        let bad = |why: String| {
-            Error::coded(
-                400,
-                Code::WebBadParameter,
-                format!("query parameter `{name}`: {why}"),
-            )
+        let bad = |why: String| Error::coded(400, Code::WebBadParameter, why);
+        let decode = |s| {
+            percent::decode_query(s)
+                .map_err(|e| bad(format!("query string: {:?}: {}", Shown(s), e.describe())))
         };
+        let mut found = None;
         for (key, value) in percent::query_pairs(self.http.query().unwrap_or("")) {
-            let key = match percent::decode_query(key) {
-                Ok(key) => key,
-                Err(_) => continue,
-            };
+            let (key, value) = (decode(key)?, decode(value)?);
             if key != name {
                 continue;
             }
-            let value = percent::decode_query(value).map_err(|e| bad(e.describe().into()))?;
-            return parse_value(&value)
-                .map(Some)
-                .map_err(|why| bad(format!("{why}; expected {}", friendly_type::<T>())));
+            if found.is_some() {
+                return Err(bad(format!(
+                    "query parameter `{name}` appears more than once; send one value per key"
+                )));
+            }
+            found = Some(value);
         }
-        Ok(None)
+        let Some(value) = found else {
+            return Ok(None);
+        };
+        parse_value(&value).map(Some).map_err(|why| {
+            bad(format!(
+                "query parameter `{name}`: {why}; expected {}",
+                friendly_type::<T>()
+            ))
+        })
     }
 
     /// The pattern of the route that matched, such as `/users/{id}`. `None`

@@ -34,7 +34,21 @@ pub(crate) const MAX_PENDING: usize = 1024 * 1024;
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
 /// Where a [`Logger`](crate::middleware::Logger) writes its JSON lines.
+///
+/// More sinks may come (a file, any writer), so a `match` on a `Sink` needs
+/// a `_` arm:
+///
+/// ```compile_fail,E0004
+/// fn name(sink: &giong_web::Sink) -> &'static str {
+///     match sink {
+///         giong_web::Sink::Stdout => "stdout",
+///         giong_web::Sink::Stderr => "stderr",
+///         giong_web::Sink::Custom(_) => "custom",
+///     }
+/// }
+/// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Sink {
     /// Standard output, through the background writer.
     Stdout,

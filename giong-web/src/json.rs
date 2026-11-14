@@ -117,9 +117,20 @@ pub(crate) fn escape_into(out: &mut String, s: &str) {
 /// A value that cannot be serialised (a map with keys that are not strings,
 /// say) is an [`Error::internal`].
 ///
+/// # `json` and `Response::json`
+///
+/// This function serializes a value. [`Response::json`], which comes from
+/// giong-http, does not: it takes a body that is JSON already (bytes or a
+/// string, say from a cache or another service) and only sets the
+/// `Content-Type`, with status `200`. Use this one for values, so that
+/// strings are escaped by serde_json rather than by hand, and
+/// `Response::json` only to pass on JSON made elsewhere.
+///
 /// # Panics
 ///
-/// Panics if `status` is not in `200..=599`, as [`Response::new`] does.
+/// Panics if `status` is not in `200..=599`, as [`Response::new`] does. The
+/// status is meant to be a literal; for an error status that comes from
+/// elsewhere, see [`Error::from_status`].
 #[cfg(feature = "serde")]
 pub fn json<T: serde::Serialize + ?Sized>(status: u16, value: &T) -> Result<Response, Error> {
     let body = serde_json::to_vec(value).map_err(Error::internal)?;

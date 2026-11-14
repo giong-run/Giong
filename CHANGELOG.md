@@ -161,6 +161,21 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (no `DEFER_TASKRUN`), where one fast stream can fill the whole pool in a single turn,
   the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
+- **giong-web**, **Breaking**: `Req::query_param` and `Req::query` follow one strict rule.
+  `query_param` used to take the first of a repeated key and skip a key that did not
+  decode; it now answers `400` (`GIONG-E1205`) for a repeated key it is asked for and
+  for a bad escape anywhere in the query string, as `query` did. `query` into a map
+  (`HashMap`, `serde_json::Value`) refuses a repeated key instead of keeping the last
+  value; a struct still ignores the keys it does not know.
+- **giong-web**, **Breaking**: `Sink` is `#[non_exhaustive]`, so that sinks can be added
+  without breaking a `match`.
+- **giong-web**: `Error::from_status(status, code, detail)` and `Error::try_with_header`,
+  forms of `Error::new` and `with_header` that never panic, for a status or a header
+  value that comes from an upstream service or the request: a status outside
+  `400..=599` becomes `502` with the one given in the logged cause, and an invalid header
+  gives the error back without it. The docs say which form takes which values, and
+  explain `giong_web::json` (serializes a value) against giong-http's `Response::json`
+  (takes JSON already written).
 
 ### Fixed
 
@@ -229,6 +244,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   for a catch-all, a leading `/`. `/files/{*path}` joined to a directory was a path
   traversal. The new `Req::param_raw` gives the value as sent, unchecked, for the route
   that wants it.
+- **giong-web**: the docs of `Req::json` showed a `&str` field, which serde can only lend
+  when the string needs no unescaping, so valid JSON with `\"` or `é` (and a query
+  value with `+` or `%XX`) was answered `422`/`400`, blaming the client. The examples now
+  use `String` or `#[serde(borrow)] Cow<'a, str>`, and such a failure is a `500` whose
+  logged cause (`GIONG-E1213`) says to use one of them.
+- **giong-web**: `?` looked for a giong code in the top error only, and read it from the
+  message of any error, `io::Error` included. A giong error wrapped in an application's
+  error type (a pool timeout inside a `RepoError`) was a `500` instead of a `503`, and an
+  upstream's message relayed in `io::Error::other("GIONG-E1111: ...")` was a `413`. The
+  code is now looked for down the whole `source()` chain, by type for giong's own errors
+  and by message only for the companion crates' error types, never in an `io::Error`'s
+  text.
 
 ## [0.4.0] - 2026-11-13
 
