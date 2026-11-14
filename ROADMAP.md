@@ -222,12 +222,12 @@ a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
 **Exit criteria:** a complete example REST API (CRUD on Postgres, a Redis cache, HTTPS) in
 the repository, and a benchmark of it against the same API on axum.
 
-## 0.5 — HTTP/2 and adapters
+## 0.5 — HTTP/2 and adapters (done)
 
-- [ ] Carried over from 0.3 and 0.4: run `bench/workers.sh` on bare-metal Linux with the
-      load generator on a second machine over a physical network card, for scaling
-      efficiency and the Monoio and Glommio comparison on a real network (two machines
-      rented by the hour are enough).
+- [x] Carried over from 0.3 and 0.4: `bench/workers.sh` on bare-metal Linux with the
+      load generator on a second machine: two EPYC 4345P (8 cores) over 25 GbE, 1 to 16
+      workers, with Monoio, Glommio and Tokio
+      ([results](bench/results/bare-metal-epyc-4345p/); see the README).
 - [x] HTTP/2 in `giong-http`'s server, over TLS with ALPN and over plain TCP with prior
       knowledge, for the same handlers (`giong-web` included). Hardened against rapid reset,
       frame and CONTINUATION floods, HPACK bombs and readers that stall, with coded errors
@@ -240,13 +240,18 @@ the repository, and a benchmark of it against the same API on axum.
       over the transport can run on giong: `giong-compat`, tested with tokio-rustls,
       futures-rustls, tokio-tungstenite, h2, hyper's HTTP/1 connection API and tokio-util's
       codecs, and measured against giong's own API and Tokio (`bench/compat.sh`).
-- [ ] Decide, based on demand, whether a hyper integration is worth maintaining.
+- [ ] Decide, based on demand, whether a hyper integration is worth maintaining. Not
+      decided: no one has asked yet, and hyper's connection API already runs through
+      `giong-compat`. Revisited when someone needs more of hyper.
 
 **Exit criteria:** an HTTPS server serving real browsers over HTTP/2, and `h2spec` passing.
+Met: Chromium 153 loads the page of `giong-http`'s `h2` example and eight downloads beside
+it over HTTP/2, chosen through ALPN, and `h2spec` passes all 147 cases in CI.
 
 ## 0.6 — Speed
 
-Each item lands only with a benchmark showing what it buys.
+Each item lands only with a benchmark showing what it buys. The items checked
+below shipped early, in 0.5.0.
 
 - [x] Registered ring fd: about 11 ns saved of ~130 per `io_uring_enter`, which no
   benchmark of a whole server can see (neutral on bare metal); on by default from 5.18.

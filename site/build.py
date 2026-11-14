@@ -1025,6 +1025,14 @@ Facts that are easy to get wrong:
 - giong-web: build the `Router` inside each worker's future (`run(|_| async {{ .. }})`), since
   an `App` is not `Send`. A handler is `async fn(Req<S>) -> Result<Response, Error>`; `?` on
   any other error answers `500` and logs the cause, never sending it.
+- Crates that need the Tokio runtime (sqlx, reqwest, tonic's transport) do not run on giong.
+  Crates generic over a Tokio or futures-io stream (h2, tokio-rustls, tokio-tungstenite) do,
+  through `giong_compat::Compat::new(stream)`.
+- `giong-http` serves HTTP/2 by itself, through ALPN over TLS or with prior knowledge on the
+  same port; handlers do not change. `Server::http2(false)` turns it off.
+- On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
+  (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
+  why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
 - Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs

@@ -106,8 +106,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "0.4", features = ["tls"] }
-giong-tls = "0.4"
+giong-http = { version = "0.5", features = ["tls"] }
+giong-tls = "0.5"
 ```
 
 ```rust
@@ -197,7 +197,7 @@ An idle connection gives its buffers back, so what it keeps is its task, its HPA
 The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "0.4", features = ["client"] }
+giong-http = { version = "0.5", features = ["client"] }
 ```
 
 ```rust
