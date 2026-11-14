@@ -1,7 +1,7 @@
 //! # giong-mysql
 //!
-//! A MySQL client and connection pool for the [giong] thread-per-core
-//! runtime.
+//! A MySQL and MariaDB client and connection pool for the [giong]
+//! thread-per-core runtime. MySQL 8.0 and later, MariaDB 10.6 and later.
 //!
 //! ```no_run
 //! use giong_mysql::{Client, Config};
@@ -32,26 +32,29 @@
 //!   round trip from then on; parameters and results travel in MySQL's
 //!   binary format.
 //! * **A pool per worker** ([`Pool`]): no locks, no threads in between;
-//!   statements that stand alone share connections, transactions take one.
+//!   statements that stand alone share connections, transactions take one,
+//!   and a connection's session is reset before it is shared again.
 //! * **TLS** through `giong-tls` (rustls), on by default for remote hosts and
 //!   always checking the certificate. **`caching_sha2_password`** (MySQL's
 //!   default) with its fast path, and its full path over TLS, a Unix socket,
 //!   or RSA with the server's public key; `mysql_native_password` too.
 //! * **Transactions that cannot end silently.** When the server ends one
-//!   early (a deadlock rolls it back, DDL commits it), later statements and
+//!   early (a deadlock or a lock wait timeout rolls it back, DDL commits
+//!   it), or a statement in it was given up, later statements and
 //!   [`Transaction::commit`] fail instead of running outside it.
 //! * **Errors that say what to do**, with the server's error number and
 //!   SQLSTATE in [`DbError`].
 //! * **Limits everywhere**, all finite and documented on [`Config`]: connect
-//!   timeout, statement timeout, result size, statement cache, pool wait.
+//!   timeout, statement timeout, lock waits, result size, statement cache,
+//!   pool wait.
 //!
 //! ## What it does not do (yet)
 //!
 //! `LOAD DATA LOCAL INFILE` (refused, so the server cannot read client
 //! files), cursors and streaming rows one at a time, result sets after the
-//! first from a `CALL`, compression, MariaDB's own extensions, several hosts
-//! with failover, and authentication plugins other than those above (LDAP,
-//! Kerberos, PAM).
+//! first from a `CALL`, compression, MariaDB's own extensions (its
+//! `client_ed25519` login among them), several hosts with failover, and
+//! authentication plugins other than those above (LDAP, Kerberos, PAM).
 
 #![warn(missing_docs)]
 
@@ -70,6 +73,8 @@ pub mod fuzzing;
 mod pool;
 mod protocol;
 mod row;
+mod session;
+mod tls;
 pub mod types;
 
 pub use client::{CancelToken, Client, Transaction};

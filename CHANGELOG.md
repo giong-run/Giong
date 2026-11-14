@@ -30,6 +30,32 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   with libpq's method names, accept only the authentication methods listed, so that
   without TLS an impostor cannot ask for MD5 instead of SCRAM or let the client in without
   asking. `DbError::routine` gives the server's routine field.
+- **giong-mysql**: MariaDB 10.6 and later. Every connection to MariaDB used to fail with
+  `GIONG-E3101`, on the session's `max_execution_time`, which MariaDB does not have.
+  MariaDB is told apart by its version string (`5.5.5-10.11.14-MariaDB`, `11.4.4-MariaDB`);
+  the handshake asks for `utf8mb4_general_ci`, since MariaDB has no `utf8mb4_0900_ai_ci`,
+  and the statement timeout is set as `max_statement_time`, which MariaDB applies to every
+  statement, writes and DDL included. MySQL before 8.0 and MariaDB before 10.6 are
+  refused before logging in, naming the versions supported (`ErrorKind::Connect`). The
+  integration tests run on MySQL 8.0.46 and MariaDB 10.11 locally, and CI adds MariaDB
+  10.6, 10.11, 11.4 and 11.8 to MySQL 8.0, 8.4 and 9.1. MariaDB's `client_ed25519` login
+  is not supported.
+- **giong-mysql**: `Tls::verify_ca(pem)` checks the server's certificate against the given
+  authorities but not against the host name, for the certificates MySQL generates when
+  it is installed, which name no host
+  (`MySQL_Server_<version>_Auto_Generated_Server_Certificate`) and so could not be used
+  with any mode before. The chain, the validity period and the key usage are still
+  checked: a certificate of another authority, an expired one, or the authority's own
+  certificate offered as the server's are refused.
+- **giong-mysql**: `Client::reset_session`, which resets the session the way the pool does
+  when a connection comes back, and three `PoolStats` fields: `draining` (connections set
+  aside for tasks waiting in `get`), `resets` and `statement_limit_errors` (prepares the
+  server refused for `max_prepared_stmt_count`).
+- **giong-mysql**: a fuzz target, `session`, that runs a client with queued statements,
+  batches, transactions, dropped futures and a pool's sharing rules against a server
+  made of the fuzzer's bytes, in memory, and checks that every request ends, that nothing
+  is left in flight, and that what the client wrote is whole packets of known commands.
+  590,000 runs in 5 minutes found no crash. CI fuzzes it with the other targets.
 - **giong-http**: `Server::http2_prior_knowledge(false)` keeps HTTP/2 to TLS connections
   that choose it through ALPN, so that a plain port behind an HTTP/1.1 proxy speaks only
   HTTP/1.1. `Server::http2(true)` used to turn on both, and still does by default.
@@ -105,6 +131,51 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   default, more if the server asks) runs on a thread of its own instead of the worker,
   whose other tasks it stalled, and its result is kept for the next connection with the
   same password, salt and round count.
+- **giong-mysql**, **breaking**: `Tls` is `#[non_exhaustive]`, so that ways to check a
+  server (pinning, a client certificate) can be added later; a `match` on it needs a `_`
+  arm.
+- **giong-mysql**, **breaking**: `ssl-mode=VERIFY_CA` in a URL now checks the certificate
+  against `ssl-ca` and not against the host name, as in MySQL's own client, and needs
+  `ssl-ca`; without it, it is an error. `ssl-mode=REQUIRED` with `ssl-ca` does the same.
+  `REQUIRED` without `ssl-ca` still checks the certificate and the host name against the
+  machine's authorities, which is stricter than MySQL's client (it checks nothing then).
+  Both modes used to check the host name, so they could not be used with MySQL's own
+  certificates.
+- **giong-mysql**, **breaking**: the pool's shared methods (`Pool::query`, `execute`,
+  `insert`...) now also refuse statements that change the session before sending them:
+  `SET` (but `SET GLOBAL`), `USE`, temporary tables, `GET_LOCK` and assignments to user
+  variables (`ErrorKind::Statement`, `GIONG-E3111`). Other tasks' statements would have
+  run in the changed session. A `Pool::batch_execute` that may change the session, and
+  any shared statement the server reports changed it (through a trigger or a stored
+  procedure), are followed by a reset at once.
+- **giong-mysql**, **breaking**: `Config::session_variable` refuses the variables
+  giong-mysql now sets itself: `character_set_*`, `collation_connection`, `names`,
+  `autocommit`, `max_statement_time` and `session_track_*`, besides `time_zone` and
+  `max_execution_time` as before. `lock_wait_timeout` may be set, and replaces the one
+  taken from the statement timeout.
+- **giong-mysql**: the statement cache keeps 64 statements per connection by default,
+  down from 256. The server's `max_prepared_stmt_count` (16,382 by default) bounds the
+  statements of all its clients together: at 256, 64 connections (2 processes × 8
+  workers × a pool of 4) filled it, and from then on every prepare on the server failed
+  with error 1461, for every application using it. 64 allows 255 connections. When the
+  limit is reached anyway, the connection closes its statements that are not in use and
+  prepares again, once, and `PoolStats::statement_limit_errors` counts it. Error
+  1615 (`NEED_REPREPARE`) now closes the stale statement on the server too, instead of
+  only forgetting it.
+- **giong-mysql**: a connection taken with `Pool::get()` and given back with `autocommit`
+  off is reset, like any other whose session changed, instead of being closed.
+- **giong-mysql**: `Pool::get()` sets a connection aside for each waiting task (no new
+  shared statement goes on it) and hands it over as soon as the statements already on it
+  are answered; tasks are served in order, and when the pool may open more than one
+  connection, one is always left to the shared statements. A task in `get` used to wait
+  for a connection with nothing in flight, which shared statements could keep from ever
+  happening, until the wait timeout.
+- **giong-mysql**: the statement timeout also bounds waiting for a table or metadata lock
+  (`LOCK TABLES` elsewhere, a running `ALTER TABLE`): it is set as the session's
+  `lock_wait_timeout`, rounded up to whole seconds, on MySQL and MariaDB. Such a write
+  used to wait as long as the server's default allows: a year on MySQL. On MySQL a
+  write that holds its locks and runs long is still not stopped; on MariaDB,
+  `max_statement_time` stops it.
 
 ### Fixed
 
@@ -261,6 +332,40 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   Linux only), ahead of the macOS milestone.
 - **giong-postgres**: CI also runs the tests against PostgreSQL 18, and a new fuzz target,
   `session`, plays a server that answers a connection's requests with arbitrary bytes.
+- **giong-mysql**: text could be stored in the wrong character set without an error. The
+  character set was asked for only by the handshake's collation id (255,
+  `utf8mb4_0900_ai_ci`), which a server that does not know it (MariaDB up to 11.4.4) or
+  ignores it on purpose (MySQL with `skip-character-set-client-handshake`) replaces with
+  its own default. With a latin1 default, UTF-8 was stored double-encoded: giong-mysql
+  read its own text back unchanged, while every other client, `CHAR_LENGTH`, `LIKE` and
+  sorting saw it corrupt. The session now runs `SET NAMES utf8mb4` and checks the
+  character sets in the same round trip, refusing to connect when something such as a
+  proxy has undone it (`ErrorKind::Connect`).
+- **giong-mysql**: a transaction could commit part of its work. With
+  `innodb_rollback_on_timeout` on, a lock wait timeout (error 1205) rolls the whole
+  transaction back, and so does a full lock table (1206), but the client treated only a
+  deadlock (1213) that way: the statements after it ran under autocommit, and `commit()`
+  succeeded. The client now reads `innodb_rollback_on_timeout` when connecting and treats
+  1205 like 1213 when it is on, and 1206 always. After any other error in a transaction
+  (a Galera conflict, say), it asks the server whether the transaction is still open (a
+  `COM_PING`, whose answer carries the status flags) before sending anything else. A
+  transaction the server ended refuses its next statements and its `commit()`.
+- **giong-mysql**: a statement given up inside a transaction (its future dropped, by a
+  timeout say) still ran before `COMMIT`, so `commit()` committed work the application
+  believed undone. The transaction is now marked, and its next statements and `commit()`
+  fail; dropping it rolls it back.
+- **giong-mysql**: a result announcing more columns than a statement can have (65,535) is
+  refused (`ErrorKind::Protocol`); a hostile server could make the client keep column
+  definitions without end. One large row or statement no longer leaves the
+  connection holding buffers its size: past 1 MiB they are given back once idle.
+- **giong-mysql**: a server error message that is not UTF-8 is read with replacement
+  characters instead of closing the connection. `execute()` on a `SELECT` with a row
+  over `max_result_size` no longer fails with `TooLarge`, since it keeps no rows.
+- **giong-mysql**: an RSA public key with an exponent below 3 is refused. The
+  `TCP_USER_TIMEOUT` setting is compiled on Linux and Android only, and the `_os`
+  connection attribute names the system it runs on.
+- **giong-mysql**: `insert()`'s error when no id was generated says that the statement ran
+  and must not be run again, and its documentation says so.
 - **giong-http**: an HTTP/2 client could make the server hold a whole answer for each of
   its streams. Handlers ran as soon as their requests arrived, and their response bodies
   waited in memory for the client's flow control, with no limit: a client that set its
@@ -290,6 +395,34 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   being cut without an answer. The same holds for a panic in `Handler::stream_body`.
 - **giong-http**: `Handler::stream_body` said that answering early closes the connection;
   over HTTP/2 only the stream ends.
+
+### Security
+
+- **giong-mysql**: a connection taken with `Pool::get()` came back to the shared set with
+  its session as the task left it, and every task then ran in that session: a `SET`
+  (`sql_mode`, the isolation level, `foreign_key_checks = 0`), a temporary table that
+  hid a real one, user variables, `autocommit = 0`, and locks (`LOCK TABLES`,
+  `GET_LOCK`) that stayed held until the connection closed. Such a connection is now
+  reset when it comes back: `COM_RESET_CONNECTION`, the session settings of `Config`
+  again and, when `Config::database` is set, `COM_INIT_DB`, all queued at once with no
+  round trip waited for. The reset frees the connection's prepared statements, so it is
+  skipped when the connection ran only plain statements (`SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`... with no user variable or named lock) and the server's session tracker
+  reported no change. Without `Config::database`, a connection whose default database a
+  `USE` changed is closed instead, since the reset cannot undo it. A reset that fails
+  closes the connection. The server does not report a named lock or a user variable set
+  inside a stored function or trigger; the new `Client::reset_session` resets by hand.
+  Found in the pre-1.0 review.
+- **giong-mysql**: a `CancelToken` opened a new connection to the configured host name,
+  which behind DNS round robin or a load balancer could reach another server, and sent
+  `KILL QUERY` with a connection id that there belongs to some other session: a
+  round-robin proxy in the test stopped another client's statement. The cancel request
+  now connects to the address the connection reached (checking the certificate against
+  the configured name) and sends `KILL QUERY` only if the server there is the same one
+  (`@@server_uuid` on MySQL; host name, port and `server_id` on MariaDB); otherwise it
+  fails with `ErrorKind::Connect` and kills nothing. As before, what is stopped is
+  whatever the connection runs when the request arrives, which may be the next statement
+  in line; the documentation says so.
 
 ## [0.5.0] - 2026-11-14
 
