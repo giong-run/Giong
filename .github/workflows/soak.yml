@@ -3,6 +3,9 @@ name: Soak
 # Two hours of connection churn, UDP, file and cross-worker traffic every night
 # (tests/soak.rs), then checks that no descriptor, memory or driver state was
 # left behind. Run it by hand with another duration from the Actions tab.
+# Twice: on the runner's kernel, and on Linux 6.18 booted in QEMU, where
+# streams receive through packed buffer rings (6.12 and newer), which cut a
+# receive wherever a shared buffer fills up.
 
 on:
   schedule:
@@ -26,3 +29,38 @@ jobs:
       - run: uname -r && nproc
       - name: Soak
         run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak
+
+  soak-packed-buffers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install QEMU and a static busybox
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 busybox-static cpio
+      - name: Let QEMU use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: actions/cache@v4
+        with:
+          path: target/kernels/linux-6.18.63
+          key: kernel-6.18.63
+      - name: Soak on Linux 6.18
+        run: |
+          secs=$(( ${{ inputs.minutes || '120' }} * 60 ))
+          bin=$(cargo test --release --test soak --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and .target.name == "soak") | .executable')
+          TEST_BINARIES="$bin" SOAK_SECS=$secs TIMEOUT=$(( secs + 1800 )) scripts/kernels.sh 6.18.63
+      - name: Check that receives were cut, so packed buffer rings were in use
+        run: grep -E ', [1-9][0-9]* messages received in pieces' target/kernels/linux-6.18.63.log
+      - name: Keep the guest's log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-linux-6.18.63-log
+          path: target/kernels/linux-6.18.63.log

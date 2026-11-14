@@ -85,22 +85,22 @@ giong reads into buffers from the worker's pool and writes buffers it owns until
 - **Reading:** each byte once more than giong's own `recv`, from the pool buffer into the caller's buffer. Through `AsyncBufRead` (`fill_buf`, then `consume` of the whole chunk) there is no extra copy. When a caller takes only part of a chunk, the rest moves to a heap buffer at once, so that a slow reader never holds on to the worker's pool.
 - **Writing:** each byte once, into the write buffer, which giong's `write_all` then sends. One small allocation per send (the future that sends it).
 
-Measured with [`bench/compat.sh`](../bench/compat.sh): one TCP stream over loopback, the measured side on one pinned core and the other end on another, the same peer for every variant, 9 runs interleaved. Median, with the range of the 9 runs in brackets. The machine is a 4-vCPU cloud VM (Xeon at 2.3 GHz, Linux 6.18), where bulk transfers over loopback vary a lot from run to run: read the medians, and the spread.
+Measured with [`bench/compat.sh`](../bench/compat.sh): one TCP stream over loopback, the measured side on one pinned core and the other end on another, the same peer for every variant, 9 runs interleaved. Median, with the range of the 9 runs in brackets. The machine is a 4-vCPU cloud VM (Xeon at 2.1 GHz, Linux 6.18), where bulk transfers over loopback vary from run to run: read the medians, and the spread.
 
 | Workload | giong's own API | `Compat` | `Compat`, `AsyncBufRead` | Tokio |
 |---|---|---|---|---|
-| Receive 2 GiB (peer writes 256 KiB at a time), MiB/s | 2215 [1390–3059] | 2353 [1451–2661] | 2071 [1424–3120] | 3131 [2395–4388] |
-| CPU per KiB received | 376 ns | 331 ns | 411 ns | 145 ns |
-| Send 2 GiB from a 64 KiB buffer, MiB/s | 3148 [2116–4340] | 2707 [2386–2878] | | 3097 [2405–4331] |
-| CPU per KiB sent | 309 ns | 360 ns | | 314 ns |
-| 64-byte request and reply, round trips/s | 33,008 [28,013–38,662] | 32,273 [27,118–38,079] | | 32,213 [28,904–36,759] |
-| CPU per round trip | 14.4 µs | 15.0 µs | | 14.8 µs |
+| Receive 2 GiB (peer writes 256 KiB at a time), MiB/s | 3064 [2706–3259] | 3082 [2728–3183] | 3093 [2962–3369] | 2853 [2758–3156] |
+| CPU per KiB received | 188 ns | 199 ns | 184 ns | 158 ns |
+| Send 2 GiB from a 64 KiB buffer, MiB/s | 2629 [2409–2995] | 2300 [2209–2428] | | 2616 [2283–3146] |
+| CPU per KiB sent | 370 ns | 421 ns | | 363 ns |
+| 64-byte request and reply, round trips/s | 28,375 [26,318–28,923] | 27,593 [27,341–28,879] | | 28,446 [25,645–29,588] |
+| CPU per round trip | 17.0 µs | 17.8 µs | | 16.8 µs |
 
 CPU is the measured thread's own (user and system, `CLOCK_THREAD_CPUTIME_ID`). What the numbers say:
 
-- **Sending** through `Compat` gives up about 14% of throughput and spends about 17% more CPU per byte than passing an owned buffer to giong's `write_all`. That is the copy: under callgrind, `memcpy` is 96% of the user-space instructions `Compat` runs on this workload. Tokio, which writes straight from the caller's memory, is level with giong here.
-- **Request and reply** differ by less than the noise; the CPU per round trip is about 4% higher. Callgrind counts about 1,000 more user-space instructions per round trip (the boxed send, the flush, one more poll), against roughly 14 µs spent mostly in the kernel.
-- **Receiving**, `Compat` and giong's own `recv` are within the noise of each other, and both spend more CPU per KiB than Tokio's 64 KiB reads. The reason is in giong 0.4, not in the adapter: when more than eight receives for one stream complete at once, giong copies the rest out of its buffer pool to keep a slow reader from holding it, and a bulk transfer like this one hits that most of the time (1.6 to 1.8 GiB of the 2 GiB, counted with a probe). `Compat`'s own copy disappears in that cost. This table will change when giong's receive path does; run the script again.
+- **Sending** through `Compat` gives up about 13% of throughput and spends about 14% more CPU per byte than passing an owned buffer to giong's `write_all`. That is the copy: under callgrind, `memcpy` is 96% of the user-space instructions `Compat` runs on this workload. Tokio, which writes straight from the caller's memory, is level with giong here.
+- **Receiving** through `read` costs about 6% more CPU per byte than giong's own `recv`, for the copy into the caller's buffer, at the same throughput. Through `AsyncBufRead` (`fill_buf`, then `consume`) there is no copy, and the cost is giong's own.
+- **Request and reply** differ by less than the noise in throughput; the CPU per round trip is about 5% higher. Callgrind counts about 1,000 more user-space instructions per round trip (the boxed send, the flush, one more poll), against roughly 17 µs spent mostly in the kernel.
 
 Run it with `bench/compat.sh` (the method is at the top of the script, and in [`bench/compat/src/main.rs`](../bench/compat/src/main.rs)); the raw numbers are in [`bench/results/compat/`](../bench/results/compat/).
 

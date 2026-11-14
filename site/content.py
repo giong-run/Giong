@@ -110,7 +110,7 @@ CRATES = {
                "tokio-util's codecs",
                "Buffered writes like `BufWriter`; reads lose nothing when cancelled",
                "Says plainly which crates cannot work: those that need Tokio's reactor, timers or `spawn`"],
-        fact="one copy per byte; sending costs 14% of throughput"),
+        fact="one copy per byte; sending costs 13% of throughput"),
 }
 
 # Crates on the roadmap that do not exist yet. Each disappears from this list on its
