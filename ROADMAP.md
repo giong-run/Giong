@@ -222,12 +222,12 @@ a real Redis 7 in CI, and benchmarks compare them with reqwest and redis-rs.
 **Exit criteria:** a complete example REST API (CRUD on Postgres, a Redis cache, HTTPS) in
 the repository, and a benchmark of it against the same API on axum.
 
-## 0.5 — HTTP/2 and adapters
+## 0.5 — HTTP/2 and adapters (done)
 
-- [ ] Carried over from 0.3 and 0.4: run `bench/workers.sh` on bare-metal Linux with the
-      load generator on a second machine over a physical network card, for scaling
-      efficiency and the Monoio and Glommio comparison on a real network (two machines
-      rented by the hour are enough).
+- [x] Carried over from 0.3 and 0.4: `bench/workers.sh` on bare-metal Linux with the
+      load generator on a second machine: two EPYC 4345P (8 cores) over 25 GbE, 1 to 16
+      workers, with Monoio, Glommio and Tokio
+      ([results](bench/results/bare-metal-epyc-4345p/); see the README).
 - [x] HTTP/2 in `giong-http`'s server, over TLS with ALPN and over plain TCP with prior
       knowledge, for the same handlers (`giong-web` included). Hardened against rapid reset,
       frame and CONTINUATION floods, HPACK bombs and readers that stall, with coded errors
@@ -240,18 +240,32 @@ the repository, and a benchmark of it against the same API on axum.
       over the transport can run on giong: `giong-compat`, tested with tokio-rustls,
       futures-rustls, tokio-tungstenite, h2, hyper's HTTP/1 connection API and tokio-util's
       codecs, and measured against giong's own API and Tokio (`bench/compat.sh`).
-- [ ] Decide, based on demand, whether a hyper integration is worth maintaining.
+- [ ] Decide, based on demand, whether a hyper integration is worth maintaining. Not
+      decided: no one has asked yet, and hyper's connection API already runs through
+      `giong-compat`. Revisited when someone needs more of hyper.
 
 **Exit criteria:** an HTTPS server serving real browsers over HTTP/2, and `h2spec` passing.
+Met: Chromium 153 loads the page of `giong-http`'s `h2` example and eight downloads beside
+it over HTTP/2, chosen through ALPN, and `h2spec` passes all 147 cases in CI.
 
 ## 0.6 — Speed
 
-Each item lands only with a benchmark showing what it buys.
+Each item lands only with a benchmark showing what it buys. The items checked
+below shipped early, in 0.5.0.
 
-- [ ] Registered ring fd and fixed files (direct descriptors) to skip fd lookups.
-- [ ] Zero-copy send for large responses.
+- [x] Registered ring fd: about 11 ns saved of ~130 per `io_uring_enter`, which no
+  benchmark of a whole server can see (neutral on bare metal); on by default from 5.18.
+  Fixed files (direct descriptors) are not done: they would save about 11.5 ns per send,
+  0.6% of a request, less than keeping the descriptor table costs.
+- [x] Zero-copy send for large responses: on bare metal, CPU time per request falls by 16%
+  at 64 KiB, 62% at 256 KiB, 68 to 72% at 1 MiB and 85 to 86% at 16 MiB, at the same
+  request rate (the link is full); bytes that cannot change only.
+- [x] Receive buffers filled piece by piece (Linux 6.12): memory at 20 workers 49.9 → 23.4
+  MiB, requests per second unchanged.
 - [ ] Receive bundles (several buffers per completion).
-- [ ] Optional `SQPOLL` mode.
+- [x] Optional `SQPOLL` mode: tried and not merged. With its threads on CPUs of their own it
+  lost on bare metal (8 workers and 8 kernel threads: 2.32M req/s against 2.41M for 8
+  workers alone, 73% more CPU per request, since the threads spin).
 - [ ] Optional NAPI busy polling.
 - [x] Kernel TLS (kTLS) for `giong-tls`: +36% serving 1 MiB files over HTTPS with `sendfile`
   on bare metal; slower than rustls from memory, so off by default
