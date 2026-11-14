@@ -449,6 +449,39 @@ impl Io {
             _ => false,
         }
     }
+
+    /// For a zero-copy send, the same send with a copy, which is what to
+    /// submit when the kernel refuses to send without one (`EOPNOTSUPP`, as
+    /// kernel TLS does). `None` for every other operation.
+    pub(crate) fn copying(&self) -> Option<Io> {
+        match *self {
+            Io::Send {
+                fd,
+                buf,
+                len,
+                flags,
+                zero_copy: true,
+            } => Some(Io::Send {
+                fd,
+                buf,
+                len,
+                flags,
+                zero_copy: false,
+            }),
+            Io::SendMsg {
+                fd,
+                msg,
+                flags,
+                zero_copy: true,
+            } => Some(Io::SendMsg {
+                fd,
+                msg,
+                flags,
+                zero_copy: false,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// Stops the worker on a kernel error its event loop cannot go on after
@@ -620,7 +653,7 @@ impl Driver {
         &mut self,
         key: usize,
         waker: &Waker,
-        hold: &mut Option<Box<dyn Any>>,
+        hold: &mut Option<Box<ZeroCopyHold>>,
     ) -> Poll<(i32, u32)> {
         match self {
             Driver::Uring(d) => d.poll_op(key, waker, hold),

@@ -7,7 +7,7 @@ use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::driver::{Io, Start};
+use crate::driver::{Io, Start, ZeroCopyHold};
 use crate::runtime;
 
 /// One operation → one result.
@@ -19,12 +19,13 @@ use crate::runtime;
 /// the `driver` module docs).
 pub(crate) struct Op<T: 'static> {
     io: Option<Io>,
-    /// Driver key while in flight.
-    key: Option<usize>,
+    /// Driver key while in flight (32 bits, so that an operation, which
+    /// every I/O future holds, stays small).
+    key: Option<u32>,
     data: Option<T>,
     /// What a zero-copy send leaves with the driver when it returns at its
     /// result (a [`ZeroCopyHold`](crate::driver::ZeroCopyHold)).
-    hold: Option<Box<dyn Any>>,
+    hold: Option<Box<ZeroCopyHold>>,
     /// The worker whose driver owns `key`.
     worker_uid: usize,
     /// Operations are tied to one worker thread.
@@ -62,10 +63,10 @@ impl<T: 'static> Op<T> {
     ///
     /// As for [`new`](Self::new), and what the kernel still reads after the
     /// result must be owned by `hold`.
-    pub(crate) unsafe fn with_hold(io: Io, data: T, hold: Box<dyn Any>) -> Self {
+    pub(crate) unsafe fn with_hold(io: Io, data: T, hold: Option<Box<ZeroCopyHold>>) -> Self {
         // SAFETY: the caller upholds `new`'s contract.
         let mut op = unsafe { Self::new(io, data) };
-        op.hold = Some(hold);
+        op.hold = hold;
         op
     }
 }
@@ -85,7 +86,9 @@ impl<T: 'static> Future for Op<T> {
                         match driver.start(&io, cx.waker()) {
                             Start::Done(res, flags) => (res, flags),
                             Start::Submitted(key) => {
-                                this.key = Some(key);
+                                this.key = Some(
+                                    u32::try_from(key).expect("giong: 2^32 operations in flight"),
+                                );
                                 this.worker_uid = w.shared.uid;
                                 return Poll::Pending;
                             }
@@ -96,7 +99,7 @@ impl<T: 'static> Future for Op<T> {
                             drop(driver);
                             wrong_worker();
                         }
-                        match driver.poll_op(key, cx.waker(), &mut this.hold) {
+                        match driver.poll_op(key as usize, cx.waker(), &mut this.hold) {
                             Poll::Ready(done) => {
                                 this.key = None;
                                 done
@@ -110,6 +113,20 @@ impl<T: 'static> Future for Op<T> {
                     // (Linux 6.0 and 6.1 do after a second `EAGAIN`). Nothing
                     // was transferred; submitting again waits afresh.
                     continue;
+                }
+                if res == -libc::EOPNOTSUPP {
+                    if let Some(copying) = this.io.and_then(|io| io.copying()) {
+                        // A zero-copy send the socket refuses (kernel TLS):
+                        // nothing was sent, so the same bytes go again with
+                        // a copy. The hold stays here, still keeping alive
+                        // what the send points at, and its report turns
+                        // zero-copy off for the socket's later sends.
+                        if let Some(hold) = &this.hold {
+                            hold.copied.set(true);
+                        }
+                        this.io = Some(copying);
+                        continue;
+                    }
                 }
                 this.io = None;
                 let data = this.data.take().expect("operation resources");
@@ -131,10 +148,10 @@ impl<T: 'static> Drop for Op<T> {
             }
             let data = data.take().map(|d| Box::new(d) as Box<dyn Any>);
             match w.driver.try_borrow_mut() {
-                Ok(mut driver) => driver.cancel_op(key, data, result_is_fd),
+                Ok(mut driver) => driver.cancel_op(key as usize, data, result_is_fd),
                 // Dropped by code the driver runs (a waker's `wake` or
                 // `drop`): cancelled at the next turn, still on this worker.
-                Err(_) => w.defer_cancel(key, data, result_is_fd),
+                Err(_) => w.defer_cancel(key as usize, data, result_is_fd),
             }
             true
         })
