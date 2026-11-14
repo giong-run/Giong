@@ -157,6 +157,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   that failed it now closes the TCP side and returns `Ok`, as kernel TLS already did,
   instead of failing before the FIN. After `shutdown()`, a write in the process fails
   with `GIONG-E2008` (`TlsBroken`) instead of reaching rustls.
+- **giong-tls**: needs rustls 0.23.33 or newer (was 0.23.27) and libc 0.2.172 (was any
+  0.2). Before 0.23.33, rustls allowed a peer 32 `KeyUpdate` messages for the whole life
+  of a connection, so a long-lived TLS 1.3 connection whose peer changes keys regularly
+  failed with `TooManyKeyUpdateRequests`; from 0.23.33 they are counted only between
+  application data. Checked by building and testing with the lowest versions allowed
+  (`cargo update -Z direct-minimal-versions`).
 - **giong-tls**: connections keep their traffic secrets extractable only when they may
   be handed to the kernel (`Ktls::Auto` or `Required` on a kernel with the `tls`
   module), not on every connection of a `Ktls::Auto` configuration.
