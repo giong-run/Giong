@@ -3,6 +3,7 @@
 
 mod auth;
 mod client;
+mod pgbouncer;
 mod pool;
 mod server;
 

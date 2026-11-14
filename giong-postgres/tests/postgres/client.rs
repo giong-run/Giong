@@ -398,12 +398,110 @@ fn a_cached_statement_is_prepared_again_after_the_schema_changes() {
             .batch_execute("ALTER TABLE schema_change ADD COLUMN b text")
             .await
             .unwrap();
-        // The first run may fail with "cached plan must not change result
-        // type"; it takes the statement out of the cache, so the next works.
-        if let Err(e) = client.query_one(sql, &[]).await {
-            assert_eq!(e.code(), Some("0A000"), "{e}");
-        }
+        // The cached plan fails in Bind ("cached plan must not change result
+        // type"), before anything ran: the statement is prepared again and
+        // run once more, so the caller sees no error.
         assert_eq!(client.query_one(sql, &[]).await.unwrap().len(), 2);
+        assert_eq!(client.query_one(sql, &[]).await.unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn a_schema_change_inside_a_transaction_fails_once_and_is_not_retried() {
+    run(|s| async move {
+        let mut client = connect(s).await;
+        table(&client, "schema_change_tx", "a int").await;
+        let sql = "SELECT * FROM schema_change_tx";
+        client.query(sql, &[]).await.unwrap();
+        client
+            .batch_execute("ALTER TABLE schema_change_tx ADD COLUMN b text")
+            .await
+            .unwrap();
+        // The error aborted the transaction, so running the statement again
+        // would only fail with 25P02: the caller gets the error, and the
+        // stale statement is gone from the cache.
+        let tx = client.transaction().await.unwrap();
+        let e = tx.query(sql, &[]).await.unwrap_err();
+        assert_eq!(e.code(), Some("0A000"), "{e}");
+        assert_eq!(
+            e.db().unwrap().routine(),
+            Some("RevalidateCachedQuery"),
+            "{e}"
+        );
+        tx.rollback().await.unwrap();
+        // Prepared afresh, with both columns.
+        client
+            .execute("INSERT INTO schema_change_tx VALUES (1, 'x')", &[])
+            .await
+            .unwrap();
+        assert_eq!(client.query_one(sql, &[]).await.unwrap().len(), 2);
+    });
+}
+
+#[test]
+fn a_statement_name_the_application_took_is_skipped() {
+    run(|s| async move {
+        let client = connect(s).await;
+        // The name the client's first statement would get.
+        client
+            .batch_execute("PREPARE __giong_1 AS SELECT 'mine'")
+            .await
+            .unwrap();
+        let row = client.query_one("SELECT 2 + 2", &[]).await.unwrap();
+        assert_eq!(row.get::<i32>(0).unwrap(), 4);
+        let row = client.query_one("EXECUTE __giong_1", &[]).await.unwrap();
+        assert_eq!(row.get::<&str>(0).unwrap(), "mine");
+    });
+}
+
+#[test]
+fn large_notices_are_skipped_and_large_errors_fail_only_their_statement() {
+    run(|s| async move {
+        let client = Client::connect(&s.local().max_result_size(1024))
+            .await
+            .unwrap();
+        // Messages up to 1 MiB are read whatever max_result_size says; these
+        // are 2 MB.
+        client
+            .batch_execute("DO $$ BEGIN RAISE NOTICE '%', repeat('x', 2000000); END $$")
+            .await
+            .unwrap();
+        let e = client
+            .batch_execute("DO $$ BEGIN RAISE EXCEPTION '%', repeat('x', 2000000); END $$")
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::TooLarge, "{e}");
+        assert!(!e.to_string().contains("really a PostgreSQL"), "{e}");
+        assert!(!client.is_closed());
+        let row = client.query_one("SELECT 1", &[]).await.unwrap();
+        assert_eq!(row.get::<i32>(0).unwrap(), 1);
+    });
+}
+
+#[test]
+fn the_statement_timeout_can_be_left_to_the_server() {
+    run(|s| async move {
+        let show = |config: giong_postgres::Config| async move {
+            let client = Client::connect(&config).await?;
+            let row = client.query_one("SHOW statement_timeout", &[]).await?;
+            row.get::<String>(0)
+        };
+        assert_eq!(show(s.local()).await.unwrap(), "30s");
+        assert_eq!(
+            show(s.local().statement_timeout(Duration::from_millis(1500)))
+                .await
+                .unwrap(),
+            "1500ms"
+        );
+        // Nothing sent: the server's own setting, here its default.
+        assert_eq!(show(s.local().statement_timeout(None)).await.unwrap(), "0");
+        // Zero is not "no limit", and PostgreSQL takes at most i32::MAX ms:
+        // both are refused before connecting.
+        for bad in [Duration::ZERO, Duration::from_secs(40 * 24 * 3600)] {
+            let e = show(s.local().statement_timeout(bad)).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Config, "{e}");
+            assert!(e.to_string().contains("statement_timeout(None)"), "{e}");
+        }
     });
 }
 
@@ -608,6 +706,10 @@ fn transactions_commit_roll_back_and_roll_back_when_dropped() {
             e.to_string().contains("rolled back instead of committed"),
             "{e}"
         );
+        // Code that branches on the SQLSTATE sees one.
+        assert_eq!(e.kind(), ErrorKind::Db);
+        assert_eq!(e.code(), Some("25P02"));
+        assert!(e.db().is_none());
 
         // A transaction() future dropped while BEGIN is in flight.
         drop(client.transaction());

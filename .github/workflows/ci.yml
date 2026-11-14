@@ -61,17 +61,20 @@ jobs:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       # The kernel TLS tests fail instead of skipping without the module.
       GIONG_KTLS_REQUIRED: 1
+      # giong-postgres's tests through PgBouncer fail instead of skipping
+      # without it.
+      GIONG_PGBOUNCER_REQUIRED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: uname -r
-      - name: Install redis-server
-        # Ubuntu's Redis 7.0. The tests start their own server; the
-        # service apt starts is stopped.
+      - name: Install redis-server and pgbouncer
+        # Ubuntu's Redis 7.0 and PgBouncer 1.22. The tests start their own
+        # servers; the services apt starts are stopped.
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
-          sudo systemctl stop redis-server
+          sudo apt-get install -y -q redis-server pgbouncer
+          sudo systemctl stop redis-server pgbouncer
       - name: Load the kernel's tls module, so the kernel TLS tests run
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # Linux 6.14 to 7.2 count every io_uring ring against the
@@ -120,6 +123,7 @@ jobs:
           - { server: postgres 14, crate: giong-postgres, postgres: "14" }
           - { server: postgres 15, crate: giong-postgres, postgres: "15" }
           - { server: postgres 17, crate: giong-postgres, postgres: "17" }
+          - { server: postgres 18, crate: giong-postgres, postgres: "18" }
           - { server: mysql 8.4, crate: giong-mysql, mysql: "8.4.3" }
           - { server: mysql 9.1, crate: giong-mysql, mysql: "9.1.0" }
           - { server: redis 6.2, crate: giong-redis, redis: "6.2.16" }

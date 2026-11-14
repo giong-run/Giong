@@ -9,7 +9,37 @@ use std::time::Duration;
 
 use giong_tls::TlsConnector;
 
+use crate::auth::KeyCache;
 use crate::error::{Error, ErrorKind};
+
+/// A way for the server to check who connects, for
+/// [`Config::require_auth`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AuthMethod {
+    /// No check at all: the server lets the connection in without asking
+    /// for anything (`trust` in `pg_hba.conf`, or peer authentication on a
+    /// Unix socket).
+    None,
+    /// The password in clear text (`password`).
+    Password,
+    /// The MD5 challenge (`md5`), which an eavesdropper can attack offline.
+    Md5,
+    /// SCRAM-SHA-256 (`scram-sha-256`).
+    ScramSha256,
+}
+
+impl AuthMethod {
+    /// The method's name in libpq's `require_auth` and in `pg_hba.conf`.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            AuthMethod::None => "none",
+            AuthMethod::Password => "password",
+            AuthMethod::Md5 => "md5",
+            AuthMethod::ScramSha256 => "scram-sha-256",
+        }
+    }
+}
 
 /// How the connection is encrypted.
 #[derive(Clone)]
@@ -79,8 +109,12 @@ pub struct Config {
     pub(crate) params: Vec<(String, String)>,
     tls: Option<Tls>,
     system_roots: Arc<OnceLock<Result<TlsConnector, String>>>,
+    /// The authentication methods the server may use; any when `None`.
+    pub(crate) require_auth: Option<Vec<AuthMethod>>,
+    /// SCRAM keys derived for this config's password, shared by its clones.
+    pub(crate) scram_keys: Arc<KeyCache>,
     pub(crate) connect_timeout: Duration,
-    pub(crate) statement_timeout: Duration,
+    pub(crate) statement_timeout: Option<Duration>,
     pub(crate) max_result_size: usize,
     pub(crate) statement_cache: usize,
 }
@@ -119,8 +153,10 @@ impl Config {
             params: Vec::new(),
             tls: None,
             system_roots: Arc::new(OnceLock::new()),
+            require_auth: None,
+            scram_keys: Arc::default(),
             connect_timeout: Duration::from_secs(10),
-            statement_timeout: Duration::from_secs(30),
+            statement_timeout: Some(Duration::from_secs(30)),
             max_result_size: 64 << 20,
             statement_cache: 256,
         }
@@ -158,6 +194,7 @@ impl Config {
     /// The password, if the server asks for one.
     pub fn password(mut self, password: &str) -> Self {
         self.password = Some(password.to_owned());
+        self.scram_keys = Arc::default();
         self
     }
 
@@ -188,6 +225,25 @@ impl Config {
         self
     }
 
+    /// The only authentication methods the server may use; by default, any
+    /// this crate supports. Connecting fails with
+    /// [`ErrorKind::Auth`](crate::ErrorKind::Auth), before anything is sent
+    /// for the password, when the server asks for another method or lets the
+    /// connection in without one.
+    ///
+    /// Without TLS (over a Unix socket, to a loopback address, or with
+    /// `sslmode=disable`), nothing proves that the server is the real one: an
+    /// impostor can ask for MD5 instead of SCRAM and attack the answer
+    /// offline, or let the client in without asking anything.
+    /// `require_auth(&[AuthMethod::ScramSha256])` rules that out, since SCRAM
+    /// makes the server prove that it knows the password too. In a URL:
+    /// `require_auth=scram-sha-256` (a comma-separated list, as in libpq,
+    /// without libpq's `!` negations).
+    pub fn require_auth(mut self, methods: &[AuthMethod]) -> Self {
+        self.require_auth = Some(methods.to_vec());
+        self
+    }
+
     /// The longest that opening a connection may take, from name resolution
     /// to the end of authentication: 10 seconds by default.
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
@@ -200,11 +256,21 @@ impl Config {
     ///
     /// It is sent as the session's `statement_timeout` when connecting, so the
     /// server enforces it exactly, and only on the statement that runs too
-    /// long. It is rounded up to whole milliseconds. Raise it for the
-    /// connections that run migrations or reports, rather than turning it
-    /// off with `SET`.
-    pub fn statement_timeout(mut self, timeout: Duration) -> Self {
-        self.statement_timeout = timeout.max(Duration::from_millis(1));
+    /// long (SQLSTATE `57014`). It is rounded up to whole milliseconds and
+    /// must be from 1 ms to `i32::MAX` milliseconds (24.8 days): connecting
+    /// fails with [`ErrorKind::Config`](crate::ErrorKind::Config) otherwise.
+    /// Raise it for the connections that run migrations or reports, rather
+    /// than turning it off with `SET`.
+    ///
+    /// `None` sends nothing, leaving the limit to the server's own setting,
+    /// which is no limit unless someone set one. Through a connection pooler
+    /// such as PgBouncer, give `None` and set the limit on the role
+    /// (`ALTER ROLE app SET statement_timeout = '30s'`): PgBouncer refuses a
+    /// connection that sends `statement_timeout`, and its settings that
+    /// accept it (`track_extra_parameters`, `ignore_startup_parameters`)
+    /// do not pass it on to the server (checked with PgBouncer 1.22).
+    pub fn statement_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.statement_timeout = timeout.into();
         self
     }
 
@@ -222,8 +288,12 @@ impl Config {
     /// Every statement is prepared on the server the first time a connection
     /// runs it, and kept, so running it again takes one round trip instead
     /// of two. The least recently used statement is closed when the cache is
-    /// full. 0 prepares and closes every statement each time it runs (for
-    /// connection poolers that cannot keep prepared statements).
+    /// full. 0 prepares and closes every statement each time it runs, which
+    /// takes two round trips; the statement is still a named one, prepared
+    /// in one request and run in the next, so 0 does not make a connection
+    /// pooler in transaction mode work: that needs PgBouncer 1.21 or newer
+    /// with `max_prepared_statements` above 0, which supports any cache
+    /// size.
     pub fn statement_cache_capacity(mut self, statements: usize) -> Self {
         self.statement_cache = statements;
         self
@@ -241,9 +311,10 @@ impl Config {
     /// `postgres:///shop?host=/var/run/postgresql`.
     ///
     /// The parameters understood are `sslmode`, `sslrootcert`, `host`,
-    /// `port`, `user`, `password`, `dbname`, `application_name` and
-    /// `connect_timeout` (seconds); any other is an error rather than being
-    /// ignored. `sslmode` is `disable`, or `require`, `verify-ca` or
+    /// `port`, `user`, `password`, `dbname`, `application_name`,
+    /// `connect_timeout` (seconds) and `require_auth` (see
+    /// [`require_auth`](Self::require_auth)); any other is an error rather
+    /// than being ignored. `sslmode` is `disable`, or `require`, `verify-ca` or
     /// `verify-full`, which all check the certificate and the host name
     /// (stricter than libpq, which checks nothing for `require`).
     /// `sslrootcert` is a PEM file of authorities to trust instead of the
@@ -264,6 +335,17 @@ impl Config {
 
     pub(crate) fn socket_path(&self, dir: &Path) -> PathBuf {
         dir.join(format!(".s.PGSQL.{}", self.port))
+    }
+
+    /// The same settings without the password, for cancel requests, which
+    /// do not authenticate.
+    pub(crate) fn without_password(&self) -> Config {
+        Config {
+            password: None,
+            // The cached SCRAM keys would log in as well as the password.
+            scram_keys: Arc::default(),
+            ..self.clone()
+        }
     }
 
     /// Whether the host is this machine: a Unix socket or a loopback address.
@@ -321,6 +403,7 @@ impl fmt::Debug for Config {
             .field("application_name", &self.application_name)
             .field("params", &self.params)
             .field("tls", &self.tls)
+            .field("require_auth", &self.require_auth)
             .field("connect_timeout", &self.connect_timeout)
             .field("statement_timeout", &self.statement_timeout)
             .field("max_result_size", &self.max_result_size)
@@ -447,6 +530,7 @@ fn parse_url(url: &str) -> Result<Config, Error> {
             "port" => config.port = parse_port(&value)?,
             "user" => config.user = Some(value),
             "password" => config.password = Some(value),
+            "require_auth" => config.require_auth = Some(parse_auth_methods(&value)?),
             "dbname" => config.dbname = Some(value),
             "application_name" => config.application_name = Some(value),
             "connect_timeout" => {
@@ -461,7 +545,7 @@ fn parse_url(url: &str) -> Result<Config, Error> {
                 return Err(Error::config(format!(
                     "the URL parameter {other:?} is not supported; the supported ones are \
                      sslmode, sslrootcert, host, port, user, password, dbname, \
-                     application_name and connect_timeout"
+                     application_name, connect_timeout and require_auth"
                 )))
             }
         }
@@ -517,6 +601,32 @@ fn parse_url(url: &str) -> Result<Config, Error> {
     Ok(config)
 }
 
+fn parse_auth_methods(list: &str) -> Result<Vec<AuthMethod>, Error> {
+    let all = [
+        AuthMethod::None,
+        AuthMethod::Password,
+        AuthMethod::Md5,
+        AuthMethod::ScramSha256,
+    ];
+    list.split(',')
+        .map(|name| {
+            if name.starts_with('!') {
+                return Err(Error::config(format!(
+                    "require_auth={list}: giong-postgres takes the methods to allow, not the ones \
+                     to refuse (libpq's {name:?}); list the allowed ones, such as \
+                     require_auth=scram-sha-256"
+                )));
+            }
+            all.into_iter().find(|m| m.name() == name).ok_or_else(|| {
+                Error::config(format!(
+                    "require_auth={list}: {name:?} is not a method giong-postgres knows; use \
+                     scram-sha-256, md5, password or none, separated by commas"
+                ))
+            })
+        })
+        .collect()
+}
+
 fn parse_port(port: &str) -> Result<u16, Error> {
     port.parse().ok().filter(|&p| p != 0).ok_or_else(|| {
         Error::config(format!(
@@ -528,6 +638,19 @@ fn parse_port(port: &str) -> Result<u16, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_without_its_password_keeps_everything_else() {
+        let c = Config::from_url("postgres://app:secret@db.internal:6543/shop?sslmode=disable")
+            .unwrap();
+        let bare = c.without_password();
+        assert_eq!(bare.password, None);
+        assert!(!Arc::ptr_eq(&bare.scram_keys, &c.scram_keys));
+        assert_eq!(c.password.as_deref(), Some("secret"));
+        assert_eq!((&bare.host, bare.port), (&c.host, c.port));
+        assert_eq!(bare.user, c.user);
+        assert!(bare.tls_connector().unwrap().is_none());
+    }
 
     #[test]
     fn a_full_url_is_read() {
@@ -611,12 +734,23 @@ mod tests {
     }
 
     #[test]
-    fn statement_timeout_has_a_floor() {
+    fn statement_timeout_can_be_left_to_the_server() {
+        let c = Config::new();
+        assert_eq!(c.statement_timeout, Some(Duration::from_secs(30)));
+        let c = c.statement_timeout(Duration::from_secs(5));
+        assert_eq!(c.statement_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(c.statement_timeout(None).statement_timeout, None);
+    }
+
+    #[test]
+    fn require_auth_reads_libpq_names() {
+        let c = Config::from_url("postgres://u@h/db?require_auth=scram-sha-256,md5").unwrap();
         assert_eq!(
-            Config::new()
-                .statement_timeout(Duration::ZERO)
-                .statement_timeout,
-            Duration::from_millis(1)
+            c.require_auth,
+            Some(vec![AuthMethod::ScramSha256, AuthMethod::Md5])
         );
+        let err = |url: &str| Config::from_url(url).unwrap_err().to_string();
+        assert!(err("postgres://u@h/db?require_auth=!md5").contains("not the ones"));
+        assert!(err("postgres://u@h/db?require_auth=gss").contains("not a method"));
     }
 }

@@ -27,6 +27,9 @@ struct Inner {
     kind: ErrorKind,
     message: String,
     db: Option<DbError>,
+    /// A SQLSTATE for an error the server did not send as such (a `COMMIT`
+    /// it turned into a rollback).
+    sqlstate: Option<&'static str>,
     source: Option<io::Error>,
 }
 
@@ -42,8 +45,10 @@ pub enum ErrorKind {
     /// The server refused the credentials, or asked for an authentication
     /// method this crate does not support.
     Auth,
-    /// The server reported an error for the statement. [`Error::db`] has the
-    /// details.
+    /// The server reported an error for the statement ([`Error::db`] has
+    /// the details), or turned a `COMMIT` into a rollback because a statement
+    /// in the transaction failed earlier ([`Error::code`] is `25P02` and
+    /// [`Error::db`] is `None`).
     Db,
     /// A value could not be converted between Rust and PostgreSQL: a
     /// parameter, or a column read with [`Row::get`](crate::Row::get).
@@ -63,9 +68,11 @@ pub enum ErrorKind {
     /// The server sent something this crate cannot understand. The connection
     /// is closed.
     Protocol,
-    /// The statement cannot be sent this way, and was not: a transaction
-    /// statement on the connections a [`Pool`](crate::Pool) shares between
-    /// tasks. The message says what to use instead.
+    /// The statement cannot be sent this way, and was not: a statement that
+    /// controls a transaction or changes the session (`SET`, `LISTEN`,
+    /// `COPY ... FROM STDIN` and the like) on the connections a
+    /// [`Pool`](crate::Pool) shares between tasks. The message says what to
+    /// use instead.
     Statement,
 }
 
@@ -95,6 +102,19 @@ impl Error {
             kind,
             message: message.into(),
             db: None,
+            sqlstate: None,
+            source: None,
+        }))
+    }
+
+    /// An error of kind [`ErrorKind::Db`] that the server did not report as
+    /// an error, with the SQLSTATE that describes it.
+    pub(crate) fn with_sqlstate(sqlstate: &'static str, message: impl Into<String>) -> Self {
+        Self(Arc::new(Inner {
+            kind: ErrorKind::Db,
+            message: message.into(),
+            db: None,
+            sqlstate: Some(sqlstate),
             source: None,
         }))
     }
@@ -104,6 +124,7 @@ impl Error {
             kind,
             message: message.into(),
             db: None,
+            sqlstate: None,
             source: Some(source),
         }))
     }
@@ -113,6 +134,7 @@ impl Error {
             kind: ErrorKind::Db,
             message: note.unwrap_or_default(),
             db: Some(db),
+            sqlstate: None,
             source: None,
         }))
     }
@@ -122,6 +144,7 @@ impl Error {
             kind,
             message: message.into(),
             db: Some(db),
+            sqlstate: None,
             source: None,
         }))
     }
@@ -161,6 +184,7 @@ impl Error {
                 format!("{context}: {}", self.0.message)
             },
             db: self.0.db.clone(),
+            sqlstate: self.0.sqlstate,
             source: self
                 .0
                 .source
@@ -189,9 +213,13 @@ impl Error {
 
     /// The SQLSTATE code of the server's error, such as `"23505"` for a
     /// unique violation. The codes are listed in the PostgreSQL manual,
-    /// appendix A.
+    /// appendix A. A `COMMIT` that the server turned into a rollback has
+    /// `"25P02"` (in failed SQL transaction), with no [`db`](Self::db).
     pub fn code(&self) -> Option<&str> {
-        self.0.db.as_ref().map(|db| db.code())
+        match &self.0.db {
+            Some(db) => Some(db.code()),
+            None => self.0.sqlstate,
+        }
     }
 }
 
@@ -270,6 +298,7 @@ pub struct DbError {
     table: Option<String>,
     column: Option<String>,
     constraint: Option<String>,
+    routine: Option<String>,
 }
 
 impl DbError {
@@ -287,6 +316,7 @@ impl DbError {
             table: None,
             column: None,
             constraint: None,
+            routine: None,
         };
         let mut rest = body;
         loop {
@@ -315,6 +345,7 @@ impl DbError {
                 b't' => e.table = Some(value),
                 b'c' => e.column = Some(value),
                 b'n' => e.constraint = Some(value),
+                b'R' => e.routine = Some(value),
                 _ => {}
             }
         }
@@ -375,6 +406,14 @@ impl DbError {
     /// The constraint that was violated.
     pub fn constraint(&self) -> Option<&str> {
         self.constraint.as_deref()
+    }
+
+    /// The name of the server's source-code routine that reported the error,
+    /// such as `RevalidateCachedQuery`. Unlike the message, it is never
+    /// translated, so it tells errors with the same SQLSTATE apart whatever
+    /// the server's `lc_messages`.
+    pub fn routine(&self) -> Option<&str> {
+        self.routine.as_deref()
     }
 }
 

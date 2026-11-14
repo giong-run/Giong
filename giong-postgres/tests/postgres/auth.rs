@@ -1,10 +1,12 @@
 //! Connecting: sockets, TLS, authentication methods, and the errors when any
 //! of it goes wrong.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use giong::net::TcpListener;
-use giong_postgres::{Client, Config, ErrorKind, Tls, TlsConnector};
+use giong_postgres::{AuthMethod, Client, Config, ErrorKind, Tls, TlsConnector};
 
 use crate::run;
 use crate::server::{CLEAR_USER, MD5_USER, SCRAM_USER, TLS_USER};
@@ -286,5 +288,101 @@ fn a_clear_text_password_is_never_sent_unencrypted_over_the_network() {
         assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
         assert!(e.to_string().contains("clear text"), "{e}");
         server.await.unwrap();
+    });
+}
+
+#[test]
+fn require_auth_refuses_any_other_method() {
+    run(|s| async move {
+        let scram_only = [AuthMethod::ScramSha256];
+        let client = Client::connect(&s.tcp(SCRAM_USER).require_auth(&scram_only))
+            .await
+            .unwrap();
+        assert_eq!(one(&client).await, 1);
+        // Refused before anything is sent for the password.
+        for user in [MD5_USER, CLEAR_USER] {
+            let e = Client::connect(&s.tcp(user).require_auth(&scram_only))
+                .await
+                .unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
+            assert!(e.to_string().contains("allows only scram-sha-256"), "{e}");
+        }
+        // A server (or an impostor) that lets the client in without asking.
+        let e = Client::connect(&s.local().require_auth(&scram_only))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
+        assert!(e.to_string().contains("without authentication"), "{e}");
+        Client::connect(&s.local().require_auth(&[AuthMethod::None]))
+            .await
+            .unwrap();
+        // The URL parameter, as in libpq.
+        let url = format!(
+            "postgres://{}:{}@127.0.0.1:{}/postgres?require_auth=scram-sha-256",
+            MD5_USER.0, MD5_USER.1, s.port
+        );
+        let e = Client::connect(&Config::from_url(&url).unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
+    });
+}
+
+#[test]
+fn scram_keys_are_derived_once_and_off_the_worker() {
+    run(|s| async move {
+        let version: u32 = s.psql("SHOW server_version_num").trim().parse().unwrap();
+        if version < 160000 {
+            eprintln!("skipping: scram_iterations needs PostgreSQL 16");
+            return;
+        }
+        // About 50 ms of PBKDF2 in a release build; ThreadSanitizer makes it
+        // a hundred times slower.
+        let iterations = if cfg!(giong_tsan) { 20_000 } else { 300_000 };
+        s.psql(&format!(
+            "DROP ROLE IF EXISTS scram_slow; SET scram_iterations = {iterations}; \
+             CREATE ROLE scram_slow LOGIN PASSWORD 'slow-secret'"
+        ));
+        let config = s
+            .tcp(("scram_slow", "slow-secret"))
+            .connect_timeout(Duration::from_secs(60));
+        // A task on the same worker that notices when it stops being run.
+        let stop = Rc::new(Cell::new(false));
+        let longest = Rc::new(Cell::new(Duration::ZERO));
+        let ticker = giong::spawn({
+            let (stop, longest) = (stop.clone(), longest.clone());
+            async move {
+                while !stop.get() {
+                    let t = Instant::now();
+                    giong::time::sleep(Duration::from_millis(1)).await;
+                    longest.set(longest.get().max(t.elapsed()));
+                }
+            }
+        });
+        giong::time::sleep(Duration::from_millis(5)).await;
+        let started = Instant::now();
+        let client = Client::connect(&config).await.unwrap();
+        let first = started.elapsed();
+        assert_eq!(one(&client).await, 1);
+        stop.set(true);
+        ticker.await.unwrap();
+        // The derivation ran on another thread: the worker kept running its
+        // tasks meanwhile.
+        assert!(
+            longest.get() < first / 2,
+            "the worker stalled for {:?} of a {first:?} connect",
+            longest.get()
+        );
+        // The key is kept: the next connections skip the derivation, also
+        // through a clone of the config.
+        let started = Instant::now();
+        Client::connect(&config.clone()).await.unwrap();
+        let second = started.elapsed();
+        assert!(second < first / 3, "{first:?}, then {second:?}");
+        // A different password is not served from the cache.
+        let e = Client::connect(&config.clone().password("wrong"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
     });
 }

@@ -137,6 +137,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   suite with the optional features off, and the QEMU kernels include 6.12, the first with
   packed buffer rings; every QEMU run checks which features giong found.
 
+- **giong-postgres**: `Pool::idle_timeout` (10 minutes by default) closes connections
+  left unused, and `Pool::max_lifetime` (30 minutes, less up to 10% so that connections
+  opened together are not replaced together) replaces old ones once no statement uses
+  them. A connection whose server refused a write because it is a standby (`25006` while
+  `in_hot_standby` is on, as after a failover that kept the old primary up) is replaced
+  too. `PoolStats::recycled` counts them. Connections used to live until the server or
+  the network closed them.
+- **giong-postgres**: `Config::require_auth(&[AuthMethod])`, and `require_auth` in a URL
+  with libpq's method names, accept only the authentication methods listed, so that
+  without TLS an impostor cannot ask for MD5 instead of SCRAM or let the client in without
+  asking. `DbError::routine` gives the server's routine field.
+
 ### Changed
 
 - **giong**: on Linux 5.18 and newer, a worker enters io_uring through its thread's
@@ -161,6 +173,31 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (no `DEFER_TASKRUN`), where one fast stream can fill the whole pool in a single turn,
   the cost falls by a third to a half (measured on 6.18 with the ring setups giong uses
   on 5.19 and 6.0, then on 5.15: 171 instead of 253 ns per KiB, 184 instead of 338).
+
+- **giong-postgres** (breaking): `Config::statement_timeout` takes
+  `impl Into<Option<Duration>>`. `None` sends nothing, leaving the limit to the server or
+  the role, which is what PgBouncer needs. `Duration::ZERO` and values above `i32::MAX`
+  milliseconds are a `Config` error when connecting; zero used to become 1 ms, and the
+  server refused the larger ones.
+- **giong-postgres** (breaking): the pool's statement methods refuse statements that
+  change the session (`SET` without `LOCAL`, `RESET`, `DISCARD`, `LISTEN`, `UNLISTEN`,
+  `PREPARE`, `DEALLOCATE`, `DECLARE`, `LOAD`, `CREATE TEMP ...`) and `COPY ... FROM STDIN`
+  before sending them, with `ErrorKind::Statement` (`GIONG-E3011`); `batch_execute` too,
+  which still accepts transactions. They belong on a connection from `Pool::get`, or in
+  `Config::param`.
+- **giong-postgres** (breaking): a `CancelToken` taken from a `PooledClient` stops working
+  when the connection goes back to the pool: `cancel()` sends nothing and fails with
+  `ErrorKind::Closed`. It used to cancel whatever another task ran on the connection by
+  then. Tokens no longer carry the password or the SCRAM keys.
+- **giong-postgres**: a `COMMIT` that the server turned into a rollback is still
+  `ErrorKind::Db`, now with `code()` `25P02`; it had no code.
+- **giong-postgres**: prepared statements are named `__giong_1`, `__giong_2`... instead of
+  `g1`, `g2`..., which an application's own `PREPARE` could take; on a name taken all the
+  same (`42P05`), the next name is used.
+- **giong-postgres**: SCRAM-SHA-256's key derivation (4,096 rounds of HMAC-SHA-256 by
+  default, more if the server asks) runs on a thread of its own instead of the worker,
+  whose other tasks it stalled, and its result is kept for the next connection with the
+  same password, salt and round count.
 
 ### Fixed
 
@@ -203,6 +240,42 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   load-balancing test judges the hand-over rule with exact load figures instead of timing
   (no worker more than two connections ahead, every run); the burst of connections is
   still run, and its spread printed, not judged.
+
+- **giong-postgres**: session state made on a connection from `Pool::get` (`SET`,
+  `SET ROLE`, temporary tables, advisory locks, `LISTEN`, open cursors, an SQL-level
+  `PREPARE`) stayed on it when it went back to the pool, and reached the statements of
+  other tasks and the next `get`. A connection that was used now comes back with its
+  session reset (`SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN *;
+  SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES`, plus `DEALLOCATE ALL`
+  after a `PREPARE`), pipelined ahead of the next statement, so nobody waits a round trip
+  for it; settings given to `Config` survive it, and a connection whose reset fails is
+  closed.
+- **giong-postgres**: `Pool::get` could wait until it timed out while the shared
+  statements of other tasks kept every connection busy. Tasks waiting in `get` are now
+  served in the order they came, and shared statements stop using a connection while a
+  `get` waits for it (all but one, when the pool has room for two). A pooled connection
+  carries at most 1024 statements at a time; past that, the statement methods use another
+  connection or wait for room.
+- **giong-postgres**: connecting through PgBouncer failed, because it refuses the
+  `statement_timeout` sent when connecting, and the README's advice for it
+  (`statement_cache_capacity(0)`) was wrong. The error now says to call
+  `Config::statement_timeout(None)` and set the limit with `ALTER ROLE` (PgBouncer's
+  `track_extra_parameters` accepts the setting without applying it), and the README says
+  that prepared statements through PgBouncer in transaction mode need PgBouncer 1.21 or
+  later with `max_prepared_statements`. CI tests both through PgBouncer.
+- **giong-postgres**: after a schema change under a cached statement, its next run failed
+  once on each connection, and on a server whose messages are not in English
+  (`lc_messages`) every run failed, for good. Stale statements are now recognised by
+  SQLSTATE and the server's routine, prepared again and run once more, so the caller sees
+  no error; inside a transaction, which the error has aborted, that one run still fails.
+- **giong-postgres**: a notice or notification larger than `max_result_size` closed the
+  connection with a message asking whether the server was really PostgreSQL. It is now
+  skipped, and an error message that large fails only its statement, with
+  `ErrorKind::TooLarge`.
+- **giong-postgres**: compiles on systems other than Linux (`TCP_USER_TIMEOUT` is set on
+  Linux only), ahead of the macOS milestone.
+- **giong-postgres**: CI also runs the tests against PostgreSQL 18, and a new fuzz target,
+  `session`, plays a server that answers a connection's requests with arbitrary bytes.
 
 ## [0.4.0] - 2026-11-13
 

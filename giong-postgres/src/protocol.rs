@@ -142,6 +142,10 @@ pub(crate) fn terminate(out: &mut Vec<u8>) {
 }
 
 /// How a parameter value was written by [`ToSql`](crate::ToSql).
+///
+/// A parameter of any type may be sent as text, which the server parses as
+/// it would a literal; binary needs the type's binary format exactly. The
+/// enum is complete: PostgreSQL's protocol has only these two formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoded {
     /// SQL `NULL`; nothing was written.
