@@ -337,14 +337,25 @@ fn a_stalled_reader_does_not_starve_other_connections() {
             };
             sleep(Duration::from_millis(50)).await;
 
-            // The quiet connection must still get buffers.
+            // The quiet connection must still get buffers. A stream may hand
+            // the 100 bytes over in more than one piece (where a buffer of
+            // the packed ring fills up), so collect them all.
             for round in 0..20u8 {
                 quiet_client.write_all(vec![round; 100]).await.0.unwrap();
-                let data = timeout(Duration::from_secs(5), quiet_server.recv())
-                    .await
-                    .expect("quiet connection starved by a stalled one")
-                    .unwrap();
-                assert!(data.iter().all(|&b| b == round));
+                let mut got = 0;
+                while got < 100 {
+                    let data = timeout(Duration::from_secs(5), quiet_server.recv())
+                        .await
+                        .expect("quiet connection starved by a stalled one")
+                        .unwrap();
+                    assert!(!data.is_empty() && got + data.len() <= 100, "round {round}");
+                    assert!(
+                        data.iter().all(|&b| b == round),
+                        "round {round}: {:?}",
+                        &data[..]
+                    );
+                    got += data.len();
+                }
             }
             let stats = giong::stats();
             assert!(

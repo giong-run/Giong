@@ -14,7 +14,7 @@ workspace, nine crates and an example service:
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 client (proxies, gzip, streamed bodies) behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL client and per-worker pool |
@@ -99,7 +99,9 @@ versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`
 the soak test every night.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
-run, and `GIONG_DRIVER=epoll` the epoll driver; `scripts/check.sh fallback` does both for
+run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
+optional io_uring features that newer kernels have (`giong::IoUringFeature`), and
+`GIONG_DRIVER=epoll` picks the epoll driver; `scripts/check.sh fallback` does all three for
 you.
 
 The kernel TLS tests in `giong-tls` skip themselves when the kernel has no `tls` module

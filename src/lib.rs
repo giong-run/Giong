@@ -94,7 +94,7 @@ pub mod sync;
 pub mod time;
 
 pub use buf::{IoBuf, IoBufMut, RecvBuf};
-pub use driver::{ChosenBy, DriverChoice, DriverKind, KernelWorkaround};
+pub use driver::{ChosenBy, DriverChoice, DriverKind, IoUringFeature, KernelWorkaround};
 pub use executor::{spawn, yield_now, JoinError, JoinHandle, RemoteJoinHandle};
 pub use runtime::{
     block_on, driver_choice, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,

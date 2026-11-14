@@ -703,3 +703,74 @@ fn accept_backlog_is_bounded_and_no_connection_is_lost() {
         assert!(seen.iter().all(|&s| s));
     });
 }
+
+/// Many connections writing small pieces at once through a small pool: with
+/// the packed buffer ring (Linux 6.12+) the pieces of different connections
+/// share buffers and are cut where a buffer ends. Every stream must still
+/// arrive byte for byte, and every buffer must come back.
+#[test]
+fn small_writes_from_many_connections_share_buffers_and_arrive_intact() {
+    const CONNS: usize = 16;
+    const MESSAGES: usize = 300;
+    fn stream_of(conn: usize) -> Vec<Vec<u8>> {
+        (0..MESSAGES)
+            .map(|i| {
+                let len = 1 + (conn * 37 + i * 101) % 300;
+                (0..len)
+                    .map(|j| ((conn * 31 + i * 7 + j) % 251) as u8)
+                    .collect()
+            })
+            .collect()
+    }
+    giong::Builder::new()
+        .recv_buffers(8, 512)
+        .block_on(async {
+            let (l, addr) = listener();
+            let mut writers = Vec::new();
+            for conn in 0..CONNS {
+                writers.push(giong::spawn(async move {
+                    let c = TcpStream::connect(addr).await.unwrap();
+                    c.write_all(vec![conn as u8]).await.0.unwrap();
+                    for msg in stream_of(conn) {
+                        c.write_all(msg).await.0.unwrap();
+                        if conn % 3 == 0 {
+                            giong::yield_now().await;
+                        }
+                    }
+                }));
+            }
+            let mut readers = Vec::new();
+            for _ in 0..CONNS {
+                let s = l.accept().await.unwrap();
+                readers.push(giong::spawn(async move {
+                    let mut got = Vec::new();
+                    loop {
+                        let data = s.recv().await.unwrap();
+                        if data.is_empty() {
+                            break;
+                        }
+                        got.extend_from_slice(&data);
+                        // Hold no piece across an await, but yield now and
+                        // then so pieces of other streams pile up.
+                        drop(data);
+                        if got.len() % 5 == 0 {
+                            giong::yield_now().await;
+                        }
+                    }
+                    got
+                }));
+            }
+            for w in writers {
+                w.await.unwrap();
+            }
+            for r in readers {
+                let got = timeout(Duration::from_secs(30), r).await.unwrap().unwrap();
+                let conn = got[0] as usize;
+                assert_eq!(&got[1..], stream_of(conn).concat(), "connection {conn}");
+            }
+            sleep(Duration::from_millis(20)).await;
+            let stats = giong::stats();
+            assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
+        })
+        .unwrap();
+}

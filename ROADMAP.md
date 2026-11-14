@@ -227,7 +227,10 @@ the repository, and a benchmark of it against the same API on axum.
       knowledge, for the same handlers (`giong-web` included). Hardened against rapid reset,
       frame and CONTINUATION floods, HPACK bombs and readers that stall, with coded errors
       (`GIONG-E1115` to `E1118`); `h2spec` in CI; HPACK and whole connections fuzzed.
-- [ ] HTTP/2 in `giong-http`'s client, chosen through ALPN.
+- [x] HTTP/2 in `giong-http`'s client, chosen through ALPN or with prior knowledge: one
+      connection per origin for every request, bounded by flow control, refused requests
+      sent again; tested against the server and against servers that misbehave on
+      purpose, fuzzed, benchmarked against reqwest.
 - [x] Adapters for the `futures-io` / Tokio I/O traits, so protocol crates that are generic
       over the transport can run on giong: `giong-compat`, tested with tokio-rustls,
       futures-rustls, tokio-tungstenite, h2, hyper's HTTP/1 connection API and tokio-util's

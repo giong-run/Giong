@@ -1,6 +1,6 @@
 # giong-http
 
-A small, strict HTTP/1.1 and HTTP/2 server, and an HTTP/1.1 client, for the [giong](../README.md) runtime.
+A small, strict HTTP/1.1 and HTTP/2 server, and an HTTP/1.1 and HTTP/2 client, for the [giong](../README.md) runtime.
 
 ```rust
 use std::time::Duration;
@@ -194,7 +194,7 @@ An idle connection gives its buffers back, so what it keeps is its task, its HPA
 
 ## Client
 
-The `client` feature adds an HTTP/1.1 client, `giong_http::client` (HTTPS included, through giong-tls):
+The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
 giong-http = { version = "0.4", features = ["client"] }
@@ -222,13 +222,14 @@ let created = client
 
 - **Connections kept and shared.** A pool for each origin (scheme, host, port), up to 16 connections by default (`ClientBuilder::max_connections_per_host`). Further requests wait in line and are served first come, first served: a connection that comes back goes to the request that has waited longest.
 - **Connections that closed are noticed.** An idle connection the server has closed is not used. An idempotent request (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`) that meets a kept-alive connection closing under it is sent once more on a new one; a `POST` or `PATCH` is not, since the server may have processed it, and the error says so.
+- **HTTP/2 when the server picks it.** `https` connections offer `h2` and `http/1.1` through ALPN; a server that picks `h2` gets every request to its origin on one connection, as many at once as it allows (another connection is opened, up to the limit, when it allows no more), and `Response::version()` says which was spoken. `ClientBuilder::http2(false)` sticks to HTTP/1.1; `ClientBuilder::http2_prior_knowledge(true)` speaks HTTP/2 to `http` URLs from the first byte, for servers known to accept it (gRPC backends, giong-http's own). What a server can make the client hold is bounded: 1 MiB of each response body and 4 MiB in all on a connection until the program reads them, header blocks by the head limit. A request the server refused unprocessed (`REFUSED_STREAM`, or left out by a GOAWAY) is sent again whatever its method; a dropped request resets its stream and the connection carries on. The client's side of HTTP/2 is fuzzed every night (`h2_client`).
 - **HTTPS, verified.** Certificates are checked against the machine's certificate authorities and the host name; `ClientBuilder::tls` takes a `TlsConnector` for a private authority or a client certificate. A redirect from HTTPS to HTTP is refused.
 - **Redirects** (301, 302, 303, 307, 308) are followed, up to 10. 303, and 301 or 302 after a `POST`, become a `GET` without the body; 307 and 308 repeat the request as it was. `Authorization`, `Cookie` and a `Host` set by hand are not sent to another origin.
 - **Finite limits.** A request has 30 s in all (`ClientBuilder::timeout`, or `RequestBuilder::timeout` for one): waiting for a connection, connecting (10 s of it at most), sending, reading the response, redirects. A response body may have 16 MiB, its head 64 KiB. An unused connection is closed after 60 s.
 - **Strict reading.** Bodies by `Content-Length`, chunked, or up to the end of the connection; 1xx responses are skipped. A response that could be read in two ways (two lengths, bare line feeds, folded headers, bytes after the body) is an error or keeps its connection out of the pool, so one response is never read as part of another.
 - **Proxies.** `ClientBuilder::proxy(Proxy::all("http://user:pass@proxy:3128")?.no_proxy(".svc.cluster.local, 10.0.0.0/8")?)`, or `Proxy::from_env()` for `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` the way curl reads them (never read unless asked). `https` goes through a `CONNECT` tunnel, so the proxy sees only the host name; the credentials go to the proxy, never to the server. Plain `http://` proxies only, for now (no SOCKS, no TLS to the proxy itself).
 - **Compression.** Responses are asked for with `Accept-Encoding: gzip, deflate` and decompressed as they arrive (`ClientBuilder::decompress(false)` turns it off; a request with its own `Accept-Encoding` gets the bytes as sent). The size limit applies to the decompressed body, so 32 KiB that would expand to gigabytes fails at the limit instead of filling memory; the gzip checksum is checked, and a body cut short is an error, not a shorter body.
-- **Streaming.** `RequestBuilder::send_streaming()` returns once the head has arrived; `StreamingResponse::chunk()` gives the body piece by piece (64 KiB at most, decompressed), with no limit on its size and the timeout applying to each piece. Read to its end, the connection goes back to the pool; dropped before, it is closed.
+- **Streaming.** `RequestBuilder::send_streaming()` returns once the head has arrived; `StreamingResponse::chunk()` gives the body piece by piece (64 KiB at most, decompressed), with no limit on its size and the timeout applying to each piece. Read to its end, the connection goes back to the pool; dropped before, it is closed (over HTTP/2, only its stream is reset).
 - **Errors that say what to do.** `Error::kind` is one of `Request`, `Connect`, `Timeout`, `TooLarge`, `Redirect`, `Closed`, `Protocol`, `Status`, `Decode` and `Proxy`, each with a giong code (GIONG-E1101 to E1110) and a page in [docs/errors](../docs/errors/README.md); `Error::is_transient` says whether retrying can help. Any status is a `Response`; `error_for_status` turns 4xx and 5xx into an error with the start of the body.
 
 Proxies, compression, streamed bodies and the `Proxy` error kind are new in 0.4.0; giong-http 0.3 does not have them.
@@ -237,24 +238,34 @@ The client is not `Send`, like everything in giong: make one per worker (in `Bui
 
 ### Client performance
 
-Measured with `bench/http-client.sh` against reqwest 0.12 (rustls, on a current-thread Tokio runtime). Each client runs on one core and shares one client between 64 tasks that send `GET` requests back to back and read every body; giong-http's server answers on the other three cores of a 4-vCPU virtual machine (Xeon 2.1 GHz, Linux 6.18), over TCP on 127.0.0.1. `json` is a 27-byte answer, `users` an 8.5 KiB one. Medians of 5 rounds of 5 s, with the range in brackets; requests per second:
+Measured with `bench/http-client.sh` against reqwest 0.12 (rustls, HTTP/2 on, on a current-thread Tokio runtime). Each client runs on one core and shares one client between 64 tasks that send `GET` requests back to back and read every body; giong-http's server answers on the other three cores of a 4-vCPU virtual machine (Xeon 2.3 GHz, Linux 6.18), over TCP on 127.0.0.1. `json` is a 27-byte answer, `users` an 8.5 KiB one. Medians of 5 rounds of 5 s, with the range in brackets; requests per second.
+
+Over HTTP/1.1 (both clients told to speak it, since the server also offers HTTP/2):
 
 | Client | Connections | `json` | `users` | `json` over HTTPS | `users` over HTTPS |
 |---|---|---|---|---|---|
-| **giong-http** | 64 | **132.1k** (122–142k) | **109.9k** (106–117k) | **132.6k** (113–137k) | **82.2k** (61–91k) |
-| giong-http, its default | 16 | 95.8k (88–116k) | 84.0k (81–87k) | 91.1k (78–97k) | 70.1k (64–75k) |
-| reqwest, its default | 64 (one per task) | 66.0k (61–74k) | 64.8k (55–67k) | 67.2k (60–70k) | 51.6k (45–54k) |
+| **giong-http** | 64 | **150.1k** (120–167k) | **91.7k** (88–136k) | **145.3k** (118–156k) | **81.2k** (76–93k) |
+| giong-http, its default | 16 | 113.8k (84–126k) | 82.3k (78–100k) | 99.9k (80–110k) | 84.2k (65–90k) |
+| reqwest, its default | 64 (one per task) | 84.7k (66–87k) | 58.1k (56–81k) | 84.6k (62–88k) | 48.8k (40–56k) |
 
-- **With as many connections: 1.6 to 2.0 times reqwest's requests per second, with a lower p99** (0.96–1.5 ms against 1.6–2.1 ms). Every client's core is the limit (98–100% busy); the server's three cores are not (57–228% of 300).
-- **With its default of 16 connections, still 1.3 to 1.5 times reqwest with 64.** Fewer requests in flight means fewer of them handled per trip into the kernel, so 16 connections cost more per request than 64; the default is there to spare the server, and `max_connections_per_host` raises it.
+Over HTTP/2, every request on one connection:
+
+| Client | `json` over HTTPS | `users` over HTTPS | `json`, prior knowledge | `users`, prior knowledge |
+|---|---|---|---|---|
+| **giong-http** | **250.7k** (242–264k) | **64.2k** (55–66k) | **265.7k** (251–273k) | **68.4k** (68–71k) |
+| reqwest | 122.9k (116–135k) | 48.3k (43–51k) | 123.1k (119–124k) | 56.0k (43–65k) |
+
+- **HTTP/1.1 with as many connections: 1.6 to 1.8 times reqwest's requests per second, with a lower p99** (0.66–1.5 ms against 1.15–2.0 ms). Every client's core is the limit (99–100% busy); the server's three cores are not (50–159% of 300).
+- **With its default of 16 connections, still 1.2 to 1.7 times reqwest with 64.** Fewer requests in flight means fewer of them handled per trip into the kernel; the default is there to spare the server, and `max_connections_per_host` raises it.
+- **HTTP/2: 2.0 to 2.2 times reqwest on small answers, 1.2 to 1.3 times on 8.5 KiB ones**, with half the latency on small ones (p50 0.24 against 0.49 ms, p99 0.41 against 0.84 ms over HTTPS). On one connection the two ends take turns (the client writes every request queued at once, the server answers them all at once), so neither is busy all the time: giong-http's core is 51–63% busy, reqwest's 60–88%. With 8.5 KiB answers the server's single worker for the single connection is the limit (94% of a core), which is why HTTP/1.1 over 64 connections, spread over the server's three workers, gets more there; with small answers, HTTP/2 gets 1.7 times what HTTP/1.1 does.
 - Not measured: a server on another machine, `POST` bodies, more than one client core, many hosts at once.
 
 Results are in `bench/results/http-client/`.
 
 ## Not there yet
 
-Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2.
+Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2 through an `http://` proxy (HTTPS through a proxy's tunnel gets HTTP/2), the `Upgrade: h2c` handshake.
 
 ## Tests
 
-`cargo test -p giong-http --all-features`: 53 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, and 3,000 HTTP/2 connections whose every frame is checked), 36 HTTP/2 tests (17 end-to-end on real sockets with a client that writes its frames by hand, 19 of frames, HPACK and requests), 21 end-to-end tests of the server on real sockets (one of them over a Unix socket), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 11 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 12 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.
+`cargo test -p giong-http --all-features`: 55 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, 3,000 HTTP/2 connections whose every frame is checked, and 3,000 from the client's side, checking what it holds and writes), 36 HTTP/2 tests (17 end-to-end on real sockets with a client that writes its frames by hand, 19 of frames, HPACK and requests), 21 end-to-end tests of the server on real sockets (one of them over a Unix socket), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 11 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 15 of the client over HTTP/2 (against this server through ALPN, over kernel TLS where the kernel has it, and with prior knowledge, and against servers that refuse streams, send GOAWAY, reset streams, send malformed responses, close early, send past the window or wait for a window the client grants only once the connection has gone quiet), 12 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.

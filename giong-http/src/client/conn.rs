@@ -28,7 +28,7 @@ pub(crate) enum Stream {
 }
 
 /// Received bytes, from either socket.
-enum Chunk {
+pub(crate) enum Chunk {
     Pooled(RecvBuf),
     Owned(Vec<u8>),
 }
@@ -45,17 +45,25 @@ impl Deref for Chunk {
 
 impl Stream {
     /// The next bytes; empty at the end of the stream.
-    async fn recv(&self) -> io::Result<Chunk> {
+    pub(crate) async fn recv(&self) -> io::Result<Chunk> {
         match self {
             Stream::Tcp(s) => s.recv().await.map(Chunk::Pooled),
             Stream::Tls(s) => s.recv().await.map(Chunk::Owned),
         }
     }
 
-    async fn write_all(&self, buf: Vec<u8>) -> io::Result<()> {
+    pub(crate) async fn write_all(&self, buf: Vec<u8>) -> io::Result<()> {
         match self {
             Stream::Tcp(s) => s.write_all(buf).await.0,
             Stream::Tls(s) => s.write_all(buf).await.0,
+        }
+    }
+
+    /// Ends our side of the connection: `close_notify` over TLS.
+    pub(crate) async fn close(&self) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.shutdown(std::net::Shutdown::Write),
+            Stream::Tls(s) => s.shutdown().await,
         }
     }
 
@@ -208,6 +216,19 @@ impl Conn {
                 ))
             }
         }
+    }
+
+    /// Whether TLS chose HTTP/2 through ALPN.
+    pub(crate) fn is_h2(&self) -> bool {
+        match &self.stream {
+            Stream::Tcp(_) => false,
+            Stream::Tls(s) => s.alpn_protocol().as_deref() == Some(b"h2"),
+        }
+    }
+
+    /// The socket, to speak HTTP/2 on.
+    pub(crate) fn into_stream(self) -> Stream {
+        self.stream
     }
 
     /// Whether a connection that sat idle can no longer carry a request: the

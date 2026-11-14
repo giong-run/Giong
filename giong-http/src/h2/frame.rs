@@ -66,7 +66,7 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "client"))]
     pub(crate) fn from_u32(code: u32) -> Option<Reason> {
         Some(match code {
             0x0 => Reason::NoError,
@@ -88,7 +88,7 @@ impl Reason {
     }
 
     /// The name RFC 9113 gives the code.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "client"))]
     pub(crate) fn name(self) -> &'static str {
         match self {
             Reason::NoError => "NO_ERROR",
