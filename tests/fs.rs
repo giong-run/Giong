@@ -135,6 +135,7 @@ fn reads_and_writes_name_their_offset() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri's pread refuses offsets near i64::MAX")]
 fn offsets_above_i64_max_are_refused_on_every_driver() {
     // io_uring reads an offset of u64::MAX as "the current file position":
     // read_at and write_at used to read and write wherever that was, on
@@ -593,6 +594,7 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri has no mkfifo")]
 fn a_stuck_file_operation_does_not_hold_up_the_others() {
     // On epoll, file operations run on the process's blocking threads. Opening
     // a FIFO for reading blocks until a writer opens it. A burst of such opens
