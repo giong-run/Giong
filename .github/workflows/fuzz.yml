@@ -90,6 +90,7 @@ jobs:
           { "crate": "giong-mysql", "target": "framing" }
           { "crate": "giong-mysql", "target": "rows" }
           { "crate": "giong-mysql", "target": "url" }
+          { "crate": "giong-mysql", "target": "session" }
           { "crate": "giong-redis", "target": "connection" }
           { "crate": "giong-redis", "target": "replies" }
           { "crate": "giong-redis", "target": "url" }

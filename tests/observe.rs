@@ -2,6 +2,8 @@
 //! sources, and tasks named by where they were spawned.
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use giong::observe::{self, Source, WorkerState};
@@ -9,6 +11,10 @@ use giong::observe::{self, Source, WorkerState};
 fn here(file: &str) -> bool {
     file.ends_with("tests/observe.rs")
 }
+
+/// The longest a test blocks a worker on purpose, so that a failed check
+/// ends the test instead of hanging it.
+const BLOCK_LIMIT: Duration = Duration::from_secs(60);
 
 #[test]
 fn tasks_are_named_by_the_line_that_spawned_them() {
@@ -89,23 +95,38 @@ fn a_pulse_shows_the_task_a_blocked_worker_is_stuck_in() {
                 giong::shutdown_signal().await;
                 return;
             }
+            // Blocks the thread, the mistake the pulse must expose, until
+            // the checks below are done rather than for a fixed time: under
+            // Miri or on a loaded machine they can take longer than any.
+            let entered = Arc::new(AtomicBool::new(false));
+            let release = Arc::new(AtomicBool::new(false));
+            let (in_task, released) = (entered.clone(), release.clone());
             let line = line!() + 1;
-            let blocker = handle.spawn_on(1, || async {
-                // Blocks the thread: the mistake the pulse must expose.
-                std::thread::sleep(Duration::from_millis(600));
+            let blocker = handle.spawn_on(1, move || async move {
+                in_task.store(true, Ordering::Release);
+                let start = Instant::now();
+                while !released.load(Ordering::Acquire) && start.elapsed() < BLOCK_LIMIT {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             });
             // Wait until worker 1 is in it, then check that nothing moves.
+            // A worker publishes its counters with relaxed stores, which a
+            // reader may see a little late, one counter later than another
+            // (Miri does that). Seeing `entered` puts every store worker 1
+            // made before it in front of this thread's reads, so the first
+            // pulse below is the state the worker blocks in.
             let start = Instant::now();
-            let first = loop {
-                let p = handle.pulse(1);
-                if p.polling
-                    .is_some_and(|l| here(l.file()) && l.line() == line)
-                {
-                    break p;
-                }
-                assert!(start.elapsed() < Duration::from_secs(5), "{p:?}");
+            while !entered.load(Ordering::Acquire) {
+                assert!(start.elapsed() < BLOCK_LIMIT, "{:?}", handle.pulse(1));
                 giong::time::sleep(Duration::from_millis(5)).await;
-            };
+            }
+            let first = handle.pulse(1);
+            assert!(
+                first
+                    .polling
+                    .is_some_and(|l| here(l.file()) && l.line() == line),
+                "{first:?}"
+            );
             giong::time::sleep(Duration::from_millis(200)).await;
             let later = handle.pulse(1);
             assert_eq!(later.state, WorkerState::Running);
@@ -113,6 +134,7 @@ fn a_pulse_shows_the_task_a_blocked_worker_is_stuck_in() {
             assert_eq!(later.ticks, first.ticks);
             let location = later.polling.expect("polling");
             assert_eq!(location.line(), line);
+            release.store(true, Ordering::Release);
             blocker.await.unwrap();
 
             // Afterwards worker 1 goes back to sleep and polls nothing.

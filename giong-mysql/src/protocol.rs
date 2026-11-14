@@ -27,6 +27,7 @@ pub(crate) mod cap {
     pub const PLUGIN_AUTH: u32 = 1 << 19;
     pub const CONNECT_ATTRS: u32 = 1 << 20;
     pub const PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 1 << 21;
+    pub const SESSION_TRACK: u32 = 1 << 23;
     pub const DEPRECATE_EOF: u32 = 1 << 24;
 }
 
@@ -47,28 +48,41 @@ pub(crate) const WANTED: u32 = cap::LONG_PASSWORD
     | cap::CONNECT_ATTRS
     // `execute` reports the rows an UPDATE matched, not only those it
     // changed, as PostgreSQL does.
-    | cap::FOUND_ROWS;
+    | cap::FOUND_ROWS
+    // OK packets say when a statement changed the session (a variable, the
+    // database, a temporary table), so that a pooled connection is reset
+    // before other tasks use it.
+    | cap::SESSION_TRACK;
 
 /// Server status flags, in OK and EOF packets.
 pub(crate) mod status {
     pub const IN_TRANS: u16 = 0x0001;
     pub const AUTOCOMMIT: u16 = 0x0002;
     pub const MORE_RESULTS_EXISTS: u16 = 0x0008;
+    /// The OK packet carries session state changes (`CLIENT_SESSION_TRACK`).
+    pub const SESSION_STATE_CHANGED: u16 = 0x4000;
 }
 
 /// Command bytes.
 pub(crate) mod com {
     pub const QUIT: u8 = 0x01;
+    pub const INIT_DB: u8 = 0x02;
     pub const QUERY: u8 = 0x03;
+    pub const PING: u8 = 0x0E;
     pub const STMT_PREPARE: u8 = 0x16;
     pub const STMT_EXECUTE: u8 = 0x17;
     pub const STMT_CLOSE: u8 = 0x19;
+    pub const RESET_CONNECTION: u8 = 0x1F;
 }
 
-/// The collation the connection uses: `utf8mb4_0900_ai_ci`, MySQL 8's
-/// default, so that comparisons with literals behave as in the server's own
-/// tables.
+/// The collation the connection uses on MySQL: `utf8mb4_0900_ai_ci`, MySQL
+/// 8's default, so that comparisons with literals behave as in the server's
+/// own tables.
 pub(crate) const UTF8MB4_0900_AI_CI: u8 = 255;
+
+/// The collation the connection starts with on MariaDB, which has no
+/// collation 255: `utf8mb4_general_ci`.
+pub(crate) const UTF8MB4_GENERAL_CI: u8 = 45;
 
 /// The collation number MySQL gives binary data (`BLOB`, `VARBINARY`).
 pub(crate) const BINARY_COLLATION: u16 = 63;
@@ -320,11 +334,11 @@ pub(crate) fn handshake(payload: &[u8]) -> Result<Handshake, Error> {
 }
 
 /// `Protocol::SSLRequest`: the start of a handshake response, before TLS.
-pub(crate) fn ssl_request(out: &mut Vec<u8>, capabilities: u32) {
+pub(crate) fn ssl_request(out: &mut Vec<u8>, capabilities: u32, collation: u8) {
     packet(out, 1, |out| {
         out.extend_from_slice(&capabilities.to_le_bytes());
         out.extend_from_slice(&MAX_PACKET.to_le_bytes());
-        out.push(UTF8MB4_0900_AI_CI);
+        out.push(collation);
         out.extend_from_slice(&[0; 23]);
     });
 }
@@ -332,6 +346,7 @@ pub(crate) fn ssl_request(out: &mut Vec<u8>, capabilities: u32) {
 /// `Protocol::HandshakeResponse41`.
 pub(crate) struct HandshakeResponse<'a> {
     pub capabilities: u32,
+    pub collation: u8,
     pub user: &'a str,
     pub auth: &'a [u8],
     pub database: Option<&'a str>,
@@ -344,7 +359,7 @@ pub(crate) fn handshake_response(out: &mut Vec<u8>, seq: u8, h: &HandshakeRespon
     packet(out, seq, |out| {
         out.extend_from_slice(&h.capabilities.to_le_bytes());
         out.extend_from_slice(&MAX_PACKET.to_le_bytes());
-        out.push(UTF8MB4_0900_AI_CI);
+        out.push(h.collation);
         out.extend_from_slice(&[0; 23]);
         out.extend_from_slice(h.user.as_bytes());
         out.push(0);
@@ -373,17 +388,58 @@ pub(crate) struct Ok {
     pub last_insert_id: u64,
     pub status: u16,
     pub warnings: u16,
+    /// The statement changed the session: a session variable, the default
+    /// database, a user variable, a temporary table, a prepared statement
+    /// made with SQL `PREPARE`, or the characteristics of the next
+    /// transaction. Reported by the server's session trackers.
+    pub session_changed: bool,
+    /// Of those, the default database changed.
+    pub schema_changed: bool,
+}
+
+/// Session state change types (`enum_session_state_type`).
+mod track {
+    pub const SYSTEM_VARIABLES: u8 = 0;
+    pub const SCHEMA: u8 = 1;
+    pub const STATE_CHANGE: u8 = 2;
+    pub const TRANSACTION_CHARACTERISTICS: u8 = 4;
 }
 
 pub(crate) fn ok(payload: &[u8]) -> Result<Ok, Error> {
     let mut r = Reader::new(payload);
-    r.u8("an OK packet")?;
-    Ok(Ok {
-        affected_rows: r.lenenc("an OK packet")?,
-        last_insert_id: r.lenenc("an OK packet")?,
-        status: r.u16("an OK packet")?,
-        warnings: r.u16("an OK packet")?,
-    })
+    let what = "an OK packet";
+    r.u8(what)?;
+    let mut ok = Ok {
+        affected_rows: r.lenenc(what)?,
+        last_insert_id: r.lenenc(what)?,
+        status: r.u16(what)?,
+        warnings: r.u16(what)?,
+        session_changed: false,
+        schema_changed: false,
+    };
+    // With CLIENT_SESSION_TRACK, the human-readable info comes as a
+    // length-encoded string, then the state changes when the status says so.
+    // The info is optional when nothing follows it.
+    if ok.status & status::SESSION_STATE_CHANGED != 0 && !r.is_empty() {
+        r.lenenc_bytes(what)?;
+        let mut changes = Reader::new(r.lenenc_bytes(what)?);
+        while !changes.is_empty() {
+            let ty = changes.u8(what)?;
+            changes.lenenc_bytes(what)?;
+            // The transaction state (5) changes with every BEGIN and COMMIT,
+            // and GTIDs (3) with every write: neither is session state that
+            // outlives a transaction.
+            ok.session_changed |= matches!(
+                ty,
+                track::SYSTEM_VARIABLES
+                    | track::SCHEMA
+                    | track::STATE_CHANGE
+                    | track::TRANSACTION_CHARACTERISTICS
+            );
+            ok.schema_changed |= ty == track::SCHEMA;
+        }
+    }
+    Ok(ok)
 }
 
 /// Whether a packet in a result set is the OK packet that ends it, rather
@@ -398,7 +454,7 @@ pub(crate) fn is_end_of_rows(payload: &[u8]) -> bool {
 pub(crate) struct Err<'a> {
     pub code: u16,
     pub sqlstate: &'a str,
-    pub message: &'a str,
+    pub message: std::borrow::Cow<'a, str>,
 }
 
 pub(crate) fn err(payload: &[u8]) -> Result<Err<'_>, Error> {
@@ -411,8 +467,9 @@ pub(crate) fn err(payload: &[u8]) -> Result<Err<'_>, Error> {
         sqlstate = std::str::from_utf8(r.take(5, "an error packet")?)
             .map_err(|_| Error::protocol("the server sent a SQLSTATE that is not ASCII"))?;
     }
-    let message = std::str::from_utf8(r.rest())
-        .map_err(|_| Error::protocol("the server sent an error message that is not UTF-8"))?;
+    // Not UTF-8 only from an unusual server or proxy: the error is still the
+    // statement's, not a reason to close the connection.
+    let message = String::from_utf8_lossy(r.rest());
     Ok(Err {
         code,
         sqlstate,
@@ -573,9 +630,37 @@ mod tests {
                 affected_rows: 3,
                 last_insert_id: 10_000,
                 status: 3,
-                warnings: 1
+                warnings: 1,
+                session_changed: false,
+                schema_changed: false,
             }
         );
+        // With CLIENT_SESSION_TRACK: the info, then the changes. A user
+        // variable set (STATE_CHANGE) counts; a transaction starting does
+        // not.
+        let mut p = vec![0, 0, 0, 0x02, 0x40, 0, 0, 0];
+        p.extend_from_slice(&[3, 2, 1, b'1']);
+        let o = ok(&p).unwrap();
+        assert!(o.session_changed && !o.schema_changed);
+        // USE: the schema tracker, with the new name.
+        let mut p = vec![0, 0, 0, 0x02, 0x40, 0, 0, 0];
+        p.extend_from_slice(&[8, 1, 6, 5, b'm', b'y', b's', b'q', b'l']);
+        let o = ok(&p).unwrap();
+        assert!(o.session_changed && o.schema_changed);
+        let mut p = vec![0, 0, 0, 0x03, 0x40, 0, 0, 0];
+        p.extend_from_slice(&[11, 5, 9, 8, b'T', b'_', b'_', b'_', b'_', b'_', b'_', b'_']);
+        let o = ok(&p).unwrap();
+        assert!(!o.session_changed);
+        assert_eq!(o.status & status::IN_TRANS, status::IN_TRANS);
+        // The flag without a body, from an unusual server: nothing changed
+        // that can be read.
+        assert!(!ok(&[0, 0, 0, 0x02, 0x40, 0, 0]).unwrap().session_changed);
+        assert!(ok(&[0, 0, 0, 0x02, 0x40, 0, 0, 0, 9]).is_err());
+        // An error message that is not UTF-8 is still the statement's error.
+        let mut p = vec![0xFF];
+        p.extend_from_slice(&1062u16.to_le_bytes());
+        p.extend_from_slice(b"#23000Duplicate entry '\xFF'");
+        assert!(err(&p).unwrap().message.contains("Duplicate"));
         let mut p = vec![0xFF];
         p.extend_from_slice(&1146u16.to_le_bytes());
         p.extend_from_slice(b"#42S02Table 'shop.nope' doesn't exist");
