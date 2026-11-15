@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=277,
+        layer="runtime", tests=279,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
@@ -96,7 +96,7 @@ CRATES = {
                "without a socket"],
         fact="1.3× axum's `/json` on one core"),
     "giong-mcp": dict(
-        layer="tooling", tests=32,
+        layer="tooling", tests=33,
         short="A read-only MCP server: an agent sees what each worker, task and pool is doing.",
         lede="A read-only MCP server that lets an AI agent look inside a running service: which "
              "task blocks a worker, which line spawned the tasks that leak, how full the pools are.",

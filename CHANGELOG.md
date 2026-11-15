@@ -8,6 +8,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Fixed
+
+- **giong**, **giong-mcp**: a worker with nothing to do no longer reads as fully busy.
+  `Pulse::idle` grew only when a sleep ended, so a worker asleep for a minute had no idle
+  time to show for it until it woke, and giong-mcp's `overview`, which takes the busy share
+  from that figure, reported `busy: 1.0` for every worker of a quiet service (the
+  `workers` tool wakes the workers to ask them, and showed 0). The sleep in progress now
+  counts: for a sleeping worker `Pulse::idle` grows with the clock, and a later reading is
+  never lower than an earlier one. The cost on the worker is unchanged, two clock reads per
+  sleep.
+
 ## [0.6.0] - 2026-11-15
 
 The first round of reviews before 1.0, fixed. Every crate was reviewed from its code, with
