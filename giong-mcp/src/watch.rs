@@ -10,8 +10,8 @@ use giong::observe::{Location, Pulse, WorkerState};
 use crate::tools::State;
 
 pub(crate) const INTERVAL: Duration = Duration::from_millis(100);
-/// Samples kept per worker: a little over a second.
-const KEEP: usize = 12;
+/// What the rates cover, once there is that much history.
+const WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(crate) struct Watch {
@@ -60,8 +60,21 @@ impl Watch {
             if moved || w.moved.is_none() {
                 w.moved = Some(now);
             }
+            // Tools sample too, as often as they are called: a sample right
+            // after another replaces it, so that quick calls neither crowd
+            // out the history nor grow it.
+            if w.samples.len() >= 2
+                && w.samples
+                    .back()
+                    .is_some_and(|(t, _)| now.duration_since(*t) < INTERVAL / 2)
+            {
+                w.samples.pop_back();
+            }
             w.samples.push_back((now, pulse));
-            while w.samples.len() > KEEP {
+            // Keep one sample at least a window old, so that the rates
+            // cover the whole window: the history is kept by time, not by
+            // count.
+            while w.samples.len() > 2 && now.duration_since(w.samples[1].0) >= WINDOW {
                 w.samples.pop_front();
             }
         }
@@ -82,12 +95,14 @@ impl Watch {
         })
     }
 
+    /// Rates over the last second, or over what history there is, if at
+    /// least one sampling interval; `None` before that.
     pub(crate) fn rates(&self, i: usize) -> Option<Rates> {
         let w = self.workers.get(i)?;
         let (t0, first) = w.samples.front()?;
         let (t1, last) = w.samples.back()?;
         let window = t1.duration_since(*t0);
-        if window.is_zero() {
+        if window < INTERVAL {
             return None;
         }
         let secs = window.as_secs_f64();
@@ -154,5 +169,41 @@ mod tests {
         assert!((r.polls_per_s - 1000.0).abs() < 1e-6);
         assert!((r.ticks_per_s - 100.0).abs() < 1e-6);
         assert!((r.busy - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn quick_calls_keep_the_window_a_second_long() {
+        let mut watch = Watch::default();
+        let t = Instant::now();
+        // The sampler, every 100 ms for 1.2 s.
+        for i in 0..=12u64 {
+            let at = t + INTERVAL * i as u32;
+            watch.sample(vec![pulse(WorkerState::Running, i, i * 10, 0)], at);
+        }
+        // An agent calling `overview` 15 times in 2 ms.
+        let end = t + INTERVAL * 12;
+        for i in 1..=15u64 {
+            let at = end + Duration::from_micros(130 * i);
+            watch.sample(vec![pulse(WorkerState::Running, 12 + i, 120 + i, 0)], at);
+        }
+        let r = watch.rates(0).unwrap();
+        assert!(r.window >= WINDOW, "{:?}", r.window);
+        assert!(r.window < WINDOW + 2 * INTERVAL, "{:?}", r.window);
+        // The history does not grow with the calls either.
+        assert!(watch.workers[0].samples.len() <= 13);
+        // Polls: from 20 at 0.2 s to 135 at about 1.2 s.
+        assert!((r.polls_per_s - 115.0).abs() < 1.0, "{}", r.polls_per_s);
+    }
+
+    #[test]
+    fn no_rates_from_less_than_an_interval() {
+        let mut watch = Watch::default();
+        let t = Instant::now();
+        watch.sample(vec![pulse(WorkerState::Running, 0, 0, 0)], t);
+        watch.sample(
+            vec![pulse(WorkerState::Running, 1, 50, 0)],
+            t + Duration::from_millis(2),
+        );
+        assert!(watch.rates(0).is_none());
     }
 }

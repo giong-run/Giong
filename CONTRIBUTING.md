@@ -97,6 +97,7 @@ cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, fram
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: connection, url
 cd ../giong-web && cargo +nightly fuzz run request         # also: routes
 cd ../giong-tls && cargo +nightly fuzz run ktls_records    # record framing and handshake messages around kernel TLS
+cd ../giong-mcp && cargo +nightly fuzz run request         # the MCP server's checks and dispatch
 ```
 
 Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's

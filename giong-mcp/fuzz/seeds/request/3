@@ -1,0 +1,6 @@
+POST /mcp HTTP/1.1
+Host: 127.0.0.1:7777
+Content-Type: application/json
+Content-Length: 111
+
+{"jsonrpc":"2.0","id":"t","method":"tools/call","params":{"name":"tasks","arguments":{"worker":0,"limit":2.0}}}

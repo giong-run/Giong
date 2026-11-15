@@ -86,6 +86,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   records outside the kernel (the record framing during the handshake, and handshake
   messages after it), in the nightly fuzz workflow; a unit test runs the same checks on
   3,000 random streams. 1.65 million inputs ran without a failure when it was added.
+- **giong-mcp**: `Config::allow_unauthenticated()`, the explicit way to serve TCP without a
+  token; `McpServer::unix_path()`; the `FromEnv` that `start_from_env` returns; error codes
+  `GIONG-E1303` (`McpBind`: the address cannot be listened on, with the address and
+  `GIONG_MCP` in the message; the kernel's error kind is kept), `GIONG-E1304`
+  (`McpNoToken`) and `GIONG-E1305` (`McpBadToken`). Each tool declares the shape of its
+  answer as an `outputSchema`, and the README states that this JSON follows the crate's
+  semver from 1.0. A cargo-fuzz target, `request`, sends any bytes through the server's
+  checks and JSON-RPC dispatch, in CI with the other targets.
 
 ### Changed
 
@@ -262,6 +270,23 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   its tests with (`cargo update -Z direct-minimal-versions`): tokio 1.13 (was any 1.x),
   futures-io 0.3.31 (was any 0.3), and for the tests rustls 0.23.33, the same as
   giong-tls, and hyper 1.6, the first whose header-read timeout reports `is_timeout()`.
+- **giong-mcp** (breaking): a TCP server needs a token. Any local process can connect to a
+  loopback port, whichever user runs it, so `Config::tcp` without `token` fails to start
+  with `GIONG-E1304` unless the code calls `allow_unauthenticated()`; a Unix socket needs
+  none. A token must be at least 16 characters a bearer token can carry: `token("")`, or
+  `GIONG_MCP_TOKEN` set but empty, is refused with `GIONG-E1305` instead of quietly
+  turning authentication off. The `Bearer` scheme name is matched in any case
+  (RFC 9110).
+- **giong-mcp** (breaking): `start_from_env` returns `FromEnv` instead of
+  `io::Result<Option<McpServer>>`, and never stops the service: a busy port or a bad
+  `GIONG_MCP` is written to stderr and kept in the value, and the service runs without the
+  endpoint. `FromEnv` and `McpServer` are `#[must_use]`, so `start_from_env(&h);`, which
+  used to print "listening" and stop the server at once, is a warning, and
+  `start_from_env(&h)?;` no longer compiles. Remove the `?`.
+- **giong-mcp**: a tool's text copy is compact JSON instead of pretty-printed (34% fewer
+  bytes for `overview`, 42% for `workers` at four workers), and `profile` is no longer
+  annotated `readOnlyHint`, since it makes every worker time its polls while it runs.
+  `Config::snapshot_timeout` is at most 10 s.
 
 ### Fixed
 
@@ -625,6 +650,24 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   stress test (`tests/cancel.rs`), hyper's HTTP/2 client and server over `Compat` with a
   giong executor, and `Compat` over kernel TLS. `scripts/valgrind.sh` runs the `compat`
   and `memory` suites too.
+- **giong-mcp**: "over the last second" figures (`busy`, `polls_per_s`, ...) covered as
+  little as 2 ms after an agent called `overview` about a dozen times in a row, since the
+  calls' samples pushed the sampler's out of a history kept by count; it is kept by time
+  now, and rates need 100 ms of history. A panicking registered source is reported as
+  such, with its message, instead of as a stopped worker. Integer arguments sent as `2.0`
+  are accepted, as JSON Schema allows. A message with a non-string `method`, or with an
+  `id` and neither `method` nor `result`/`error`, gets `-32600` instead of a silent `202`.
+- **giong-mcp**: a Unix socket is created with mode `0600` whatever the umask (it was
+  `0775` under `umask 002`), bound under a temporary name and linked into place so that it
+  is never reachable with looser permissions and never replaces a live socket. Stopping
+  removes only the socket this server created, not one a later process bound at the same
+  path.
+- **giong-mcp**: on Linux 6.0.19 a server asked for a TCP address that was in use started
+  anyway, on a free port of every interface: that kernel's `bind` returns 1 instead of an
+  error and leaves the socket unbound, which the standard library and socket2 both read
+  as success, and listening then picks a port on `0.0.0.0`. The server now checks that it
+  listens where it was asked and otherwise fails with `GIONG-E1303`. Found by the 6.0.19
+  job in CI; later kernels return the error.
 
 ### Security
 
@@ -653,6 +696,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   fails with `ErrorKind::Connect` and kills nothing. As before, what is stopped is
   whatever the connection runs when the request arrives, which may be the next statement
   in line; the documentation says so.
+- **giong-mcp**: any local client could make the service's process run out of memory: one
+  254 KiB `POST` holding a JSON-RPC batch of 3,275 `workers` calls was answered with
+  14 MB built in memory, and 24 such connections took a 4-worker service from 4 MB to
+  2 GB of resident memory (1.9 GB still held afterwards). Now the server speaks HTTP/1.1
+  only (an HTTP/2 connection could carry a hundred requests at once) on at most 16
+  connections, bodies hold at most 64 KiB, batches at most 16 messages and only for
+  clients of MCP 2025-03-26 (later versions removed them), and an answer is at most
+  4 MiB, past which the agent is told to ask for less. 64 such connections leave the
+  service under 8 MB.
 
 ## [0.5.0] - 2026-11-14
 

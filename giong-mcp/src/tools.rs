@@ -11,10 +11,11 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use giong::observe::{self, Location, PollProfile, Snapshot, WorkerState};
-use giong::{ChosenBy, DriverChoice, Handle};
+use giong::{ChosenBy, DriverChoice, Handle, JoinError};
 use serde_json::{json, Map, Value};
 
 use crate::proc;
+use crate::schema;
 use crate::watch::{Blocked, Watch};
 
 pub(crate) struct State {
@@ -43,7 +44,17 @@ impl State {
     }
 }
 
-fn read_only(name: &str, title: &str, description: &str, properties: Value) -> Value {
+/// A tool's entry in `tools/list`. `reads_only` is false for a tool that
+/// changes what the service does while it runs, so that clients can ask
+/// before calling it.
+fn tool(
+    name: &str,
+    title: &str,
+    description: &str,
+    properties: Value,
+    output: Value,
+    reads_only: bool,
+) -> Value {
     json!({
         "name": name,
         "title": title,
@@ -53,8 +64,9 @@ fn read_only(name: &str, title: &str, description: &str, properties: Value) -> V
             "properties": properties,
             "additionalProperties": false,
         },
+        "outputSchema": output,
         "annotations": {
-            "readOnlyHint": true,
+            "readOnlyHint": reads_only,
             "destructiveHint": false,
             "idempotentHint": true,
             "openWorldHint": false,
@@ -64,23 +76,27 @@ fn read_only(name: &str, title: &str, description: &str, properties: Value) -> V
 
 pub(crate) fn list() -> Value {
     json!([
-        read_only(
+        tool(
             "overview",
             "Overview",
             "Start here. The process (memory, threads, open descriptors, uptime), the runtime \
              (workers, shutdown), each worker's state, I/O driver, live tasks and load over the \
              last second, and warnings, such as a worker blocked inside one task.",
             json!({}),
+            schema::overview(),
+            true,
         ),
-        read_only(
+        tool(
             "workers",
             "Workers",
             "Each worker in detail: counters since start, rates and busy share over the last \
              second, timers, I/O operations in flight, receive buffers, and, for a blocked \
              worker, how long and in which task.",
             json!({}),
+            schema::workers(),
+            true,
         ),
-        read_only(
+        tool(
             "tasks",
             "Live tasks",
             "Live tasks grouped by the source line that spawned them, across workers, most \
@@ -90,27 +106,34 @@ pub(crate) fn list() -> Value {
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 20,
                            "description": "How many spawn locations to list." },
             }),
+            schema::tasks(),
+            true,
         ),
-        read_only(
+        tool(
             "sources",
             "Sources",
             "What the service's registered sources report, such as giong-postgres, \
              giong-mysql and giong-redis connection pools: open, idle and busy connections, \
              waiters. Summed over workers, and per worker.",
             json!({}),
+            schema::sources(),
+            true,
         ),
-        read_only(
+        tool(
             "profile",
             "Profile",
             "Times every task poll on every worker for a while (default 1 s), then lists the \
              spawn locations the workers spent their time in, with poll counts, total, mean \
-             and longest poll. Costs two clock reads per poll while it runs.",
+             and longest poll. While it runs, every worker reads the clock twice per poll, a \
+             small cost the service pays. Refused while the service itself has profiling on.",
             json!({
                 "duration_ms": { "type": "integer", "minimum": 100, "maximum": 10000,
                                  "default": 1000, "description": "How long to measure." },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 20,
                            "description": "How many spawn locations to list." },
             }),
+            schema::profile(),
+            false,
         ),
     ])
 }
@@ -164,7 +187,12 @@ fn int_arg(
 ) -> Result<Option<u64>, String> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(default),
-        Some(v) => match v.as_u64() {
+        // JSON Schema counts 2.0 as an integer, and some clients send one.
+        Some(v) => match v.as_u64().or_else(|| {
+            v.as_f64()
+                .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+                .map(|f| f as u64)
+        }) {
             Some(n) if (min..=max).contains(&n) => Ok(Some(n)),
             _ => Err(format!(
                 "{name} must be a whole number from {min} to {max}, not {v}"
@@ -240,6 +268,19 @@ where
     let mut handle = target.spawn_on(w, f);
     match giong::time::timeout(timeout, &mut handle).await {
         Ok(Ok(value)) => Ok(value),
+        // The worker is fine: what panicked is the code that answered on
+        // it, such as a registered source.
+        Ok(Err(JoinError::Panic(payload))) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("a panic with no message");
+            Err(format!(
+                "worker {w} panicked while describing itself, most likely in a registered \
+                 source's name() or stats(): {what}"
+            ))
+        }
         Ok(Err(_)) => Err(format!("worker {w} has stopped")),
         Err(_) => {
             handle.abort();

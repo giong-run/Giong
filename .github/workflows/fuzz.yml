@@ -3,14 +3,15 @@ name: Fuzz
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
 # bytes from the network: giong's DNS answers (and resolv.conf and hosts),
 # giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and client, giong-web's
-# router and request handling, the PostgreSQL, MySQL and Redis protocol
-# readers, and what giong-tls reads of the peer's records around kernel TLS.
-# Every night each target runs for 10 minutes and its corpus is kept in the
-# Actions cache, so the corpus keeps growing. A pull request gets a one-minute
-# run of the targets of the crates it changes (one target of each crate when it
-# changes this file), and a push to main a one-minute run of every target,
-# which catches a change in one crate that breaks another's target. A crash
-# fails the job and uploads the input that caused it.
+# router and request handling, giong-mcp's request handling, the PostgreSQL,
+# MySQL and Redis protocol readers, and what giong-tls reads of the peer's
+# records around kernel TLS. Every night each target runs for 10 minutes and
+# its corpus is kept in the Actions cache, so the corpus keeps growing. A pull
+# request gets a one-minute run of the targets of the crates it changes (one
+# target of each crate when it changes this file), and a push to main a
+# one-minute run of every target, which catches a change in one crate that
+# breaks another's target. A crash fails the job and uploads the input that
+# caused it.
 
 on:
   schedule:
@@ -24,6 +25,7 @@ on:
       - "giong-redis/**"
       - "giong-web/**"
       - "giong-tls/**"
+      - "giong-mcp/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -35,6 +37,7 @@ on:
       - "giong-redis/**"
       - "giong-web/**"
       - "giong-tls/**"
+      - "giong-mcp/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -100,6 +103,7 @@ jobs:
           { "crate": "giong-web", "target": "routes" }
           { "crate": "giong-web", "target": "request" }
           { "crate": "giong-tls", "target": "ktls_records" }
+          { "crate": "giong-mcp", "target": "request" }
           EOF
           )
           if [ "$EVENT" = pull_request ]; then

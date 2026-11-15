@@ -2,6 +2,11 @@
 //! needs: one JSON-RPC message per `POST` to `/mcp`, answered with one JSON
 //! body. No event streams (`GET` is refused, as the transport allows) and no
 //! sessions.
+//!
+//! The server lives inside the service's process, so what clients can make
+//! it hold is bounded: [`MAX_CONNECTIONS`] connections over HTTP/1.1, each
+//! answered one request at a time, bodies of [`MAX_BODY`] bytes, and
+//! answers of [`rpc::MAX_ANSWER`] bytes.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -13,6 +18,13 @@ use serde_json::{json, Value};
 use crate::rpc;
 use crate::tools::State;
 use crate::Listener;
+
+/// Connections served at once; more wait in the kernel's listen queue.
+/// Agents ask one question at a time, on a connection or two.
+pub(crate) const MAX_CONNECTIONS: usize = 16;
+/// The largest request body. A JSON-RPC request to this server is a few
+/// hundred bytes.
+pub(crate) const MAX_BODY: usize = 64 * 1024;
 
 pub(crate) struct Settings {
     pub(crate) token: Option<String>,
@@ -30,11 +42,14 @@ pub(crate) async fn serve(listener: Listener, target: Handle, settings: Settings
         let settings = settings.clone();
         async move { answer(&state, &settings, req).await }
     };
-    // The answers are small and agents ask one question at a time.
+    // HTTP/1.1 only: with HTTP/2, one connection could have a hundred
+    // requests in progress at once.
     let server = Server::new()
-        .max_connections(64)
-        .idle_timeout(Duration::from_secs(300))
-        .max_body_size(256 * 1024);
+        .http2(false)
+        .max_connections(MAX_CONNECTIONS)
+        .idle_timeout(Duration::from_secs(60))
+        .request_timeout(Duration::from_secs(10))
+        .max_body_size(MAX_BODY);
     match listener {
         Listener::Tcp(l) => server.serve(l, handler).await,
         Listener::Unix(l) => server.serve_unix(l, handler).await,
@@ -51,7 +66,7 @@ fn plain(status: u16, message: &str) -> Response {
     json_response(status, json!({ "error": message }).to_string())
 }
 
-async fn answer(state: &State, settings: &Settings, req: Request) -> Response {
+pub(crate) async fn answer(state: &State, settings: &Settings, req: Request) -> Response {
     if req.path() != "/mcp" {
         return plain(404, "not found: the MCP endpoint is /mcp");
     }
@@ -73,9 +88,9 @@ async fn answer(state: &State, settings: &Settings, req: Request) -> Response {
     if let Some(token) = &settings.token {
         let given = req
             .header_str("authorization")
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(bearer)
             .unwrap_or("");
-        if !same(given.as_bytes(), token.as_bytes()) {
+        if given.is_empty() || !same(given.as_bytes(), token.as_bytes()) {
             return plain(401, "a valid bearer token is required")
                 .header("WWW-Authenticate", "Bearer");
         }
@@ -97,7 +112,8 @@ async fn answer(state: &State, settings: &Settings, req: Request) -> Response {
     if !json_body {
         return plain(415, "the body must be application/json");
     }
-    if let Some(version) = req.header_str("mcp-protocol-version") {
+    let version = req.header_str("mcp-protocol-version");
+    if let Some(version) = version {
         if !rpc::VERSIONS.contains(&version) {
             return plain(400, "unsupported MCP-Protocol-Version");
         }
@@ -109,10 +125,19 @@ async fn answer(state: &State, settings: &Settings, req: Request) -> Response {
             return json_response(400, body.to_string());
         }
     };
-    match rpc::handle(state, message).await {
-        Some(reply) => json_response(200, reply.to_string()),
+    match rpc::handle(state, message, version).await {
+        Some(reply) => json_response(200, reply),
         None => Response::new(202),
     }
+}
+
+/// The token in `Authorization: Bearer <token>`. The scheme's name is not
+/// case-sensitive (RFC 9110, section 11.1).
+pub(crate) fn bearer(value: &str) -> Option<&str> {
+    let (scheme, token) = value.trim().split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim_start())
 }
 
 /// `host` is `name[:port]` or `[v6][:port]`, naming this machine.
@@ -163,6 +188,16 @@ mod tests {
         ] {
             assert!(!is_local_host(host), "{host}");
         }
+    }
+
+    #[test]
+    fn bearer_scheme() {
+        assert_eq!(bearer("Bearer abc"), Some("abc"));
+        assert_eq!(bearer("bearer abc"), Some("abc"));
+        assert_eq!(bearer("BEARER   abc"), Some("abc"));
+        assert_eq!(bearer("Basic abc"), None);
+        assert_eq!(bearer("Bearer"), None);
+        assert_eq!(bearer("Bearerabc"), None);
     }
 
     #[test]

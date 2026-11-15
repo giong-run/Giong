@@ -1,0 +1,7 @@
+POST /mcp HTTP/1.1
+Host: evil.example
+Content-Type: application/json
+Origin: http://localhost:6274
+Content-Length: 74
+
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workers"}}

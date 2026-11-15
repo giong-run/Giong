@@ -26,3 +26,4 @@ bench/** linguist-vendored=true
 giong-http/fuzz/seeds/** binary
 giong-web/fuzz/seeds/** binary
 giong-mysql/fuzz/seeds/** binary
+giong-mcp/fuzz/seeds/** binary

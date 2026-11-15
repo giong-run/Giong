@@ -98,11 +98,12 @@ The release test binaries are built once per run (the `build` job, with
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
 CI also runs `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
-profile (`docker`) and the database crates against other server
-versions (`servers`) on every pull request, and fuzzes the parsers (`giong-http`,
-`giong-postgres`, `giong-mysql`, `giong-redis`, `giong-web`, each in its `fuzz/`) and runs
-the soak test every night, on the runner's kernel and on Linux 6.18 in QEMU; the 6.12 and
-6.18 `kernels` jobs soak for a minute on every pull request.
+profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
+against other server versions (`servers`) on every pull request, and fuzzes the parsers
+(`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
+`giong-web`, `giong-mcp`, each in its `fuzz/`) and runs the soak test every night, on the
+runner's kernel and on Linux 6.18 in QEMU; the 6.12 and 6.18 `kernels` jobs soak for a
+minute on every pull request.
 
 `GIONG_RING_TIER=coop` or `GIONG_RING_TIER=basic` forces an older ring setup in any test
 run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
