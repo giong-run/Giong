@@ -262,15 +262,15 @@ impl Cors {
         let mut resp = self.allow_origin_headers(Response::new(204), origin);
         resp = vary(resp, "Access-Control-Request-Method");
         resp = vary(resp, "Access-Control-Request-Headers");
-        resp = resp.header("Access-Control-Allow-Methods", &self.methods.join(", "));
+        resp = resp.header("Access-Control-Allow-Methods", self.methods.join(", "));
         if !self.headers.is_empty() {
-            resp = resp.header("Access-Control-Allow-Headers", &self.headers.join(", "));
+            resp = resp.header("Access-Control-Allow-Headers", self.headers.join(", "));
         }
         if self.credentials {
             resp = resp.header("Access-Control-Allow-Credentials", "true");
         }
         if let Some(age) = self.max_age {
-            resp = resp.header("Access-Control-Max-Age", &age.as_secs().to_string());
+            resp = resp.header("Access-Control-Max-Age", age.as_secs().to_string());
         }
         Ok(resp)
     }
@@ -297,7 +297,7 @@ impl<S: 'static> Middleware<S> for Cors {
             resp = resp.header("Access-Control-Allow-Credentials", "true");
         }
         if !self.expose.is_empty() {
-            resp = resp.header("Access-Control-Expose-Headers", &self.expose.join(", "));
+            resp = resp.header("Access-Control-Expose-Headers", self.expose.join(", "));
         }
         Ok(resp)
     }

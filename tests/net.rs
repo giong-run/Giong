@@ -107,7 +107,7 @@ fn echo_roundtrip() {
         drop(c);
         server.await.unwrap();
 
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
     });
 }
@@ -135,7 +135,7 @@ fn large_transfer_is_intact_in_both_directions() {
         writer.await.unwrap();
         server.await.unwrap();
 
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
     });
 }
@@ -166,7 +166,7 @@ fn a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies() {
             assert!(data.iter().all(|&b| b == 5));
             got += data.len();
         }
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.recv_copied, 0, "{stats:?}");
     });
     writer.join().unwrap();
@@ -218,7 +218,7 @@ fn large_writes_arrive_intact_with_or_without_zero_copy() {
         }
         drop(l);
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
     });
 }
@@ -517,7 +517,7 @@ fn connect_refused() {
         let (_refusing, addr) = common::refusing_addr();
         let err = TcpStream::connect(addr).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
 }
 
@@ -622,7 +622,7 @@ fn dropping_a_stream_closes_the_connection() {
         drop(c);
         drop(l); // its multishot accept is the only other tracked operation
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
         // On io_uring only the wake-up read may remain; epoll has nothing
         // in flight.
@@ -692,7 +692,7 @@ fn dropping_a_listener_with_pending_connections_closes_them() {
         sleep(Duration::from_millis(20)).await;
         drop((c1, c2));
         sleep(Duration::from_millis(20)).await;
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
 }
 
@@ -880,8 +880,78 @@ fn small_writes_from_many_connections_share_buffers_and_arrive_intact() {
                 assert_eq!(&got[1..], stream_of(conn).concat(), "connection {conn}");
             }
             sleep(Duration::from_millis(20)).await;
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
         })
         .unwrap();
+}
+
+/// A listener of another process that shares its port (`SO_REUSEPORT`, as
+/// giong's own listeners set) must not get a giong listener as a partner:
+/// the kernel would split the connections between the two processes.
+/// A socket made here with socket2 stands for it, since giong does not know
+/// it.
+#[test]
+fn a_port_shared_by_another_process_is_refused() {
+    giong::block_on(async {
+        let other =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        other.set_reuse_address(true).unwrap();
+        other.set_reuse_port(true).unwrap();
+        other
+            .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        other.listen(16).unwrap();
+        let addr = other.local_addr().unwrap().as_socket().unwrap();
+        let err = TcpListener::bind(addr).expect_err("joined another process's listener");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        // Nor through bind_balanced.
+        let err = TcpListener::bind_balanced(addr).expect_err("joined it through bind_balanced");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+    });
+}
+
+/// Dropping a listener and binding the same address again at once works,
+/// although the socket is closed through the ring a moment later; and every
+/// listener bound meanwhile shares the port.
+#[test]
+fn a_dropped_listener_s_port_can_be_bound_again_at_once() {
+    giong::block_on(async {
+        let (first, addr) = listener();
+        let second = TcpListener::bind(addr).unwrap();
+        drop(first);
+        drop(second);
+        for _ in 0..20 {
+            let again = TcpListener::bind(addr).unwrap();
+            let c = std::net::TcpStream::connect(addr).unwrap();
+            let s = timeout(Duration::from_secs(5), again.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(s.peer_addr().unwrap(), c.local_addr().unwrap());
+        }
+    });
+}
+
+/// `bind` cannot wait for a name to be resolved, so it takes IP addresses
+/// only and says what to write instead.
+#[test]
+fn bind_refuses_a_host_name_and_says_what_to_write() {
+    giong::block_on(async {
+        for f in [TcpListener::bind, TcpListener::bind_balanced] {
+            let err = f("localhost:8080").expect_err("bound a host name");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let code = giong::error::code(&err);
+            assert_eq!(code, Some(giong::error::Code::InvalidAddress), "{err}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("127.0.0.1:8080") && msg.contains("lookup_host"),
+                "{msg}"
+            );
+        }
+        // The address forms of `connect` work.
+        let (l, addr) = listener();
+        drop(l);
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, addr.port())).unwrap();
+    });
 }

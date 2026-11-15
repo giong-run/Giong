@@ -325,6 +325,7 @@ mod tests {
             "GIONG-E3103: the server refused the login: ERROR 1045 (28000): Access denied for \
              user 'app'@'localhost'. See \
              https://github.com/giong-run/Giong/blob/main/docs/errors/E3103.md"
+                .replace("blob/main", concat!("blob/v", env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(e.giong_code(), Code::MysqlAuth);
         assert_eq!(e.code(), Some(1045));

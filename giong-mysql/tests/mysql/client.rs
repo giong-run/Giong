@@ -68,13 +68,13 @@ fn after_9999() -> std::time::SystemTime {
 /// Waits until every task and operation but the caller's is gone.
 async fn assert_no_leaks() {
     for _ in 0..200 {
-        let s = giong::stats();
+        let s = giong::observe::worker_stats();
         if s.tasks == 0 && s.tracked_ops == 0 && s.free_recv_buffers == s.recv_buffers {
             return;
         }
         sleep(Duration::from_millis(10)).await;
     }
-    panic!("leaked: {:?}", giong::stats());
+    panic!("leaked: {:?}", giong::observe::worker_stats());
 }
 
 #[test]
@@ -263,12 +263,12 @@ fn row_counts_and_the_one_row_helpers() {
             .insert("INSERT INTO counts (v) VALUES (?), (?)", &[&1, &2])
             .await
             .unwrap();
-        assert_eq!(id, 1, "the id of the first row");
+        assert_eq!(id, Some(1), "the id of the first row");
         let id = client
             .insert("INSERT INTO counts (v) VALUES (?)", &[&3])
             .await
             .unwrap();
-        assert_eq!(id, 3);
+        assert_eq!(id, Some(3));
         // Rows matched, even when the value does not change.
         let n = client
             .execute("UPDATE counts SET v = 1 WHERE id <= ?", &[&2])
@@ -279,11 +279,10 @@ fn row_counts_and_the_one_row_helpers() {
             client.execute("SELECT * FROM counts", &[]).await.unwrap(),
             3
         );
-        let e = client
-            .insert("UPDATE counts SET v = 0", &[])
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::RowCount, "{e}");
+        // No id is not an error: the statement ran.
+        let id = client.insert("UPDATE counts SET v = 0", &[]).await.unwrap();
+        assert_eq!(id, None);
+        assert_eq!(s.sql("SELECT SUM(v) FROM giong.counts").trim(), "0");
 
         let e = client
             .query_one("SELECT * FROM counts", &[])

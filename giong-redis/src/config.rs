@@ -11,7 +11,11 @@ use giong_tls::TlsConnector;
 use crate::error::Error;
 
 /// How the connection is encrypted.
+///
+/// Non-exhaustive, so that other ways to check a server (pinning a
+/// certificate, say) can be added without breaking a `match`.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Tls {
     /// No TLS. Use it only on a network you trust: anyone on the path can
     /// read and change what is sent, the password included.

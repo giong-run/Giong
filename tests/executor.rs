@@ -201,7 +201,7 @@ fn no_leaks_after_tasks_finish() {
                 .await
                 .unwrap();
         }
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tasks, 0, "{stats:?}");
         assert_eq!(stats.timers, 0, "{stats:?}");
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");

@@ -180,14 +180,6 @@ impl Request {
         }
     }
 
-    /// `1` for HTTP/1.1, `0` for HTTP/1.0. An HTTP/2 request reports `1`:
-    /// it can do everything HTTP/1.1 can that HTTP/1.0 cannot (keep the
-    /// connection open, stream a body). [`version`](Self::version) tells
-    /// HTTP/2 apart.
-    pub fn version_minor(&self) -> u8 {
-        self.head.minor
-    }
-
     /// All header fields in the order they were sent, values trimmed.
     pub fn headers(&self) -> impl Iterator<Item = (&str, &[u8])> {
         header_lines(&self.head_bytes()[self.head.headers.clone()])

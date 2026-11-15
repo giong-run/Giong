@@ -1919,10 +1919,16 @@ impl<F> std::fmt::Debug for UntilShutdown<F> {
 
 // ------------------------------------------------------------------- debugging
 
-/// A snapshot of the current worker's internals, for tests and diagnostics.
-#[doc(hidden)]
+/// Counters of the current worker, read with
+/// [`worker_stats`](crate::observe::worker_stats).
+///
+/// Cheap to take (a few loads), so tests can check that what they started
+/// has ended: once every operation is done or dropped, `tracked_ops` and
+/// `inflight` go back to what they were, and `free_recv_buffers` to
+/// `recv_buffers`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stats {
+#[non_exhaustive]
+pub struct WorkerStats {
     /// Live tasks, including the caller.
     pub tasks: usize,
     /// Operations tracked by the driver (in flight or awaiting collection).
@@ -1940,11 +1946,24 @@ pub struct Stats {
     pub recv_copied: u64,
 }
 
-#[doc(hidden)]
-pub fn stats() -> Stats {
+/// The current worker's [`WorkerStats`]: its live tasks, the I/O it
+/// tracks, its receive buffers and timers.
+///
+/// ```
+/// giong::block_on(async {
+///     let before = giong::observe::worker_stats();
+///     giong::time::sleep(std::time::Duration::from_millis(1)).await;
+///     assert_eq!(giong::observe::worker_stats().timers, before.timers);
+/// });
+/// ```
+///
+/// # Panics
+///
+/// Panics when called outside of a giong runtime (`GIONG-E0011`).
+pub fn worker_stats() -> WorkerStats {
     with_worker(|w| {
         let driver = w.driver.borrow();
-        Stats {
+        WorkerStats {
             tasks: w.tasks.borrow().len(),
             tracked_ops: driver.tracked_ops(),
             inflight: driver.inflight(),

@@ -278,6 +278,13 @@ impl Timers {
 }
 
 /// Future returned by [`sleep`] and [`sleep_until`].
+///
+/// Unlike giong's other futures, `Sleep` is `Send`, and so is a
+/// [`Timeout`] around a `Send` future, so that code which needs `Send`
+/// futures (through `giong-compat`, say) can use giong's timers. This is
+/// part of the API and stays so. A `Sleep` polled on one worker and then on
+/// another arms a timer on the second; the first worker's timer fires later
+/// and wakes nothing. It must be polled inside a giong runtime.
 #[must_use = "futures do nothing unless awaited"]
 pub struct Sleep {
     deadline: Instant,

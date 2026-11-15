@@ -76,7 +76,7 @@ fn a_taken_connection_is_exclusive_and_comes_back_clean() {
             .insert("INSERT INTO pool_tx VALUES (LAST_INSERT_ID(5))", &[])
             .await
             .unwrap();
-        assert_eq!(id, 5);
+        assert_eq!(id, Some(5));
         // Another session sees that row, and not the one rolled back: the
         // shared connection is not in a transaction.
         assert_eq!(s.sql("SELECT id FROM giong.pool_tx").trim(), "5");

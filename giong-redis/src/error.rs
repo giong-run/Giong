@@ -320,6 +320,7 @@ mod tests {
             e.to_string(),
             "GIONG-E3204: WRONGTYPE Operation against a key holding the wrong kind of value. \
              See https://github.com/giong-run/Giong/blob/main/docs/errors/E3204.md"
+                .replace("blob/main", concat!("blob/v", env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(e.server_code(), Some("WRONGTYPE"));
         assert_eq!(

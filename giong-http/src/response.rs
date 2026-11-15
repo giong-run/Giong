@@ -239,12 +239,8 @@ pub struct Response {
 }
 
 /// The error of [`Response::try_new`] and [`Response::try_header`].
-///
-/// giong has no code for a response a handler built wrong;
-/// `HttpClientRequest` is the code giong-http gives a message (so far, a
-/// request) that cannot be sent as written, which is what this is.
 fn invalid(message: String, fix: &'static str) -> giong::error::Error {
-    giong::error::Error::new(giong::error::Code::HttpClientRequest, message, fix)
+    giong::error::Error::new(giong::error::Code::HttpInvalidResponse, message, fix)
 }
 
 /// Values attached to a response for the code around the handler; never
@@ -287,9 +283,8 @@ impl Response {
     ///
     /// # Errors
     ///
-    /// An error with the code `GIONG-E1101`
-    /// ([`Code::HttpClientRequest`](giong::error::Code::HttpClientRequest),
-    /// the code giong-http gives a message that cannot be sent as written)
+    /// An error with the code `GIONG-E1119`
+    /// ([`Code::HttpInvalidResponse`](giong::error::Code::HttpInvalidResponse))
     /// if `status` is not in `200..=599`.
     pub fn try_new(status: u16) -> Result<Self, giong::error::Error> {
         if !(200..=599).contains(&status) {
@@ -339,7 +334,8 @@ impl Response {
     /// target from a decoded query parameter, a file name in
     /// `Content-Disposition`), use [`try_header`](Self::try_header), which
     /// returns an error to answer instead of panicking in the handler.
-    pub fn header(mut self, name: &str, value: &str) -> Self {
+    pub fn header(mut self, name: &str, value: impl AsRef<str>) -> Self {
+        let value = value.as_ref();
         assert!(
             is_token_str(name.as_bytes()),
             "giong-http: invalid header name {name:?}"
@@ -363,7 +359,7 @@ impl Response {
     /// // in it that would start a header of its own.
     /// let name = "report.pdf\r\nSet-Cookie: session=stolen";
     /// let disposition = format!("attachment; filename=\"{name}\"");
-    /// let response = match Response::new(200).try_header("Content-Disposition", &disposition) {
+    /// let response = match Response::new(200).try_header("Content-Disposition", disposition) {
     ///     Ok(response) => response.body("..."),
     ///     Err(_) => Response::new(400).body("invalid file name"),
     /// };
@@ -372,13 +368,17 @@ impl Response {
     ///
     /// # Errors
     ///
-    /// An error with the code `GIONG-E1101`
-    /// ([`Code::HttpClientRequest`](giong::error::Code::HttpClientRequest),
-    /// the code giong-http gives a message that cannot be sent as written)
+    /// An error with the code `GIONG-E1119`
+    /// ([`Code::HttpInvalidResponse`](giong::error::Code::HttpInvalidResponse))
     /// if `name` is not a token or `value` has a control character other
     /// than a tab (CR and LF included). The message names the header and
     /// where the bad byte is, without repeating the value.
-    pub fn try_header(mut self, name: &str, value: &str) -> Result<Self, giong::error::Error> {
+    pub fn try_header(
+        mut self,
+        name: &str,
+        value: impl AsRef<str>,
+    ) -> Result<Self, giong::error::Error> {
+        let value = value.as_ref();
         if !is_token_str(name.as_bytes()) {
             return Err(invalid(
                 format!("{name:?} is not a valid header name"),
@@ -807,7 +807,7 @@ mod tests {
 
         for status in [0, 100, 101, 199, 600, 1000] {
             let e = Response::try_new(status).unwrap_err();
-            assert_eq!(e.code(), Code::HttpClientRequest);
+            assert_eq!(e.code(), Code::HttpInvalidResponse);
             assert!(e.message().contains(&status.to_string()), "{e}");
         }
         for (name, value, says) in [
@@ -820,12 +820,12 @@ mod tests {
             ("X:Y", "1", "is not a valid header name"),
         ] {
             let e = Response::new(200).try_header(name, value).unwrap_err();
-            assert_eq!(e.code(), Code::HttpClientRequest, "{name:?}");
+            assert_eq!(e.code(), Code::HttpInvalidResponse, "{name:?}");
             assert!(e.message().contains(says), "{e}");
             assert!(!e.message().contains("Set-Cookie"), "{e}");
             let io: std::io::Error = e.into();
             assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
-            assert_eq!(giong::error::code(&io), Some(Code::HttpClientRequest));
+            assert_eq!(giong::error::code(&io), Some(Code::HttpInvalidResponse));
         }
         // What `header` accepts, `try_header` accepts.
         let resp = Response::new(200)

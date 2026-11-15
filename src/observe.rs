@@ -54,6 +54,8 @@ use std::time::{Duration, Instant};
 use crate::runtime;
 use crate::DriverKind;
 
+pub use crate::runtime::{worker_stats, WorkerStats};
+
 /// Where a task was spawned: a file, a line and a column.
 pub type Location = &'static panic::Location<'static>;
 

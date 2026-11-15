@@ -48,7 +48,7 @@ impl Stream {
     pub(crate) async fn recv(&self) -> io::Result<Chunk> {
         match self {
             Stream::Tcp(s) => s.recv().await.map(Chunk::Pooled),
-            Stream::Tls(s) => s.recv().await.map(Chunk::Owned),
+            Stream::Tls(s) => s.recv().await.map(|r| Chunk::Owned(r.into_vec())),
         }
     }
 

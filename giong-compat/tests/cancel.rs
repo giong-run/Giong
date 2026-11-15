@@ -72,7 +72,7 @@ async fn settle() {
 }
 
 fn assert_idle(what: &str) {
-    let st = giong::stats();
+    let st = giong::observe::worker_stats();
     assert_eq!(st.tracked_ops, 0, "{what}: {st:?}");
     assert_eq!(st.free_recv_buffers, st.recv_buffers, "{what}: {st:?}");
     assert_eq!(st.tasks, 0, "{what}: {st:?}");

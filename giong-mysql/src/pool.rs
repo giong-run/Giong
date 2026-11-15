@@ -403,9 +403,9 @@ impl Pool {
         client.execute(sql, params).await
     }
 
-    /// Runs an `INSERT` and returns the `AUTO_INCREMENT` value it generated;
-    /// see [`Client::insert`]. Transaction statements are refused.
-    pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
+    /// Runs an `INSERT` and returns the `AUTO_INCREMENT` value it generated,
+    /// if any; see [`Client::insert`]. Transaction statements are refused.
+    pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<u64>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
         client.insert(sql, params).await

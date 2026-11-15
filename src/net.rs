@@ -19,6 +19,7 @@
 mod addr;
 mod balance;
 pub(crate) mod dns;
+mod share;
 mod udp;
 mod unix;
 
@@ -32,7 +33,7 @@ use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs as StdToSocketAddrs};
+use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -704,73 +705,85 @@ pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, datagram:
 
 // -------------------------------------------------------------------- listener
 
-/// Checks that `bind` left the TCP socket on the port that was asked for,
-/// and reports `EADDRINUSE` when it did not.
-///
-/// Linux 6.0.16 to 6.0.19, the last four releases of the 6.0 series, return
-/// 1 instead of -1 from bind(2) on a TCP socket whose address is in use
-/// (6.0.15 and older, 5.15 and 6.1 return -1 with `EADDRINUSE`, as do UDP
-/// and Unix sockets on those four). The standard library and `socket2` test
-/// for -1 like every caller of libc, so they take it for success. The socket
-/// is still unbound, and listen(2) then gives it a free port on every
-/// address: a server asked for a busy port would come up on another one,
-/// open to all interfaces.
-fn check_bound(sock: &Socket, asked: SocketAddr) -> io::Result<()> {
-    let port = sock
-        .local_addr()?
-        .as_socket()
-        .map_or(0, |local| local.port());
-    if port == 0 || (asked.port() != 0 && port != asked.port()) {
-        return Err(io::Error::from_raw_os_error(libc::EADDRINUSE));
-    }
-    Ok(())
-}
-
 /// A TCP socket listening for connections.
 pub struct TcpListener {
     inner: ListenSocket,
     /// Set by [`bind_balanced`](Self::bind_balanced).
     balance: Option<balance::Member>,
+    /// The listener's hold on its port, for one that [`bind`](Self::bind)
+    /// made (see `share`).
+    held: Option<share::Held>,
 }
 
 impl TcpListener {
-    /// Binds to `addr` with `SO_REUSEADDR` and `SO_REUSEPORT` set, so every
-    /// worker can bind its own listener to the same port and let the kernel
-    /// spread incoming connections across cores.
+    /// Listens on `addr`, an IP address and a port.
     ///
-    /// An address held by a socket that does not share it is refused with
-    /// [`AddrInUse`](io::ErrorKind::AddrInUse) on every kernel, also on Linux
-    /// 6.0.16 to 6.0.19, whose bind(2) reports success there and leaves the
-    /// socket unbound.
-    pub fn bind<A: StdToSocketAddrs>(addr: A) -> io::Result<Self> {
+    /// Every worker of a process can bind its own listener to the same
+    /// address, and connections are then spread across the workers (see
+    /// [`bind_balanced`](Self::bind_balanced) for spreading them by load).
+    /// No other process can: an address that a socket of another process
+    /// holds is refused with [`AddrInUse`](io::ErrorKind::AddrInUse), so a
+    /// service started twice fails the second time instead of taking a
+    /// share of the first one's connections.
+    ///
+    /// On Linux the workers share the port through `SO_REUSEPORT`, which by
+    /// itself would let any process of the same user bind it too; giong
+    /// checks the port before the first listener of a process binds it. To
+    /// share a port between processes on purpose (a new version started
+    /// before the old one has stopped), create the sockets yourself with
+    /// `SO_REUSEPORT` set and pass them to [`from_std`](Self::from_std).
+    ///
+    /// `addr` is an IP address with a port (see
+    /// [`ToSocketAddrs`]): a host name such as
+    /// `"localhost:8080"` is refused with `GIONG-E0100`, which says what to
+    /// write instead. Port 0 asks the kernel for a free port;
+    /// [`local_addr`](Self::local_addr) tells which one it gave.
+    ///
+    /// ```no_run
+    /// # giong::block_on(async {
+    /// let listener = giong::net::TcpListener::bind("127.0.0.1:8080")?;
+    /// let stream = listener.accept().await?;
+    /// # drop(stream);
+    /// # Ok::<_, std::io::Error>(())
+    /// # }).unwrap();
+    /// ```
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut last_err = None;
-        for addr in addr.to_socket_addrs()? {
+        for addr in addr::resolved(&addr, "TcpListener::bind")? {
             match Self::bind_addr(addr) {
                 Ok(listener) => return Ok(listener),
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(unresolved))
+        Err(last_err.unwrap_or_else(no_addresses))
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        sock.set_reuse_address(true)?;
-        sock.set_reuse_port(true)?;
-        sock.bind(&addr.into())?;
-        check_bound(&sock, addr)?;
-        sock.listen(4096)?;
-        Ok(Self {
+        let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
+            let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+            sock.set_reuse_address(true)?;
+            sock.set_reuse_port(true)?;
+            sock.bind(&addr.into())?;
+            // Linux 6.0.16 to 6.0.19 report success for a bind to an
+            // address in use and leave the socket unbound.
+            share::check_bound(&sock, addr)?;
+            Ok(sock)
+        })?;
+        let listener = Self {
             inner: ListenSocket::new(sock),
             balance: None,
-        })
+            held,
+        };
+        // A failure from here on drops `listener`, which gives the port up.
+        listener.inner.socket().listen(4096)?;
+        Ok(listener)
     }
 
     /// Like [`bind`](Self::bind), and the listener shares new connections
     /// with the listeners that other workers of this runtime bound to the
     /// same address with `bind_balanced`.
     ///
-    /// With `SO_REUSEPORT` the kernel picks a listener for each connection
+    /// The kernel picks a listener for each connection
     /// from a hash of its addresses, without regard to how busy each worker
     /// is: with few connections, or a few heavy ones, one worker can end up
     /// with several while another has none. A balanced listener checks, for
@@ -805,19 +818,22 @@ impl TcpListener {
     /// # Panics
     ///
     /// Panics when called outside of a giong runtime.
-    pub fn bind_balanced<A: StdToSocketAddrs>(addr: A) -> io::Result<Self> {
+    pub fn bind_balanced<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut listener = Self::bind(addr)?;
         listener.balance = Some(balance::Member::join(listener.local_addr()?));
         Ok(listener)
     }
 
-    /// Wraps a listener created by the standard library.
+    /// Wraps a listener created by the standard library, with the options
+    /// it was given: giong sets none, and does not check who else holds its
+    /// port.
     pub fn from_std(listener: std::net::TcpListener) -> Self {
         // SAFETY: we take over the descriptor that `listener` owned.
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };
         Self {
             inner: ListenSocket::new(sock),
             balance: None,
+            held: None,
         }
     }
 
@@ -850,6 +866,15 @@ impl TcpListener {
     }
 }
 
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        // Before the socket is closed, which happens when `inner` is dropped.
+        if let Some(held) = self.held.take() {
+            held.release(self.inner.socket());
+        }
+    }
+}
+
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
@@ -862,10 +887,6 @@ impl std::fmt::Debug for TcpListener {
             .field("fd", &self.as_raw_fd())
             .finish()
     }
-}
-
-fn unresolved() -> io::Error {
-    no_addresses()
 }
 
 /// The list of addresses to try was empty.
@@ -1048,6 +1069,12 @@ impl TcpStream {
     ///
     /// Not cancel safe: if the future is dropped, the message may have been
     /// sent.
+    ///
+    /// Hidden from the documentation and outside the semver promise: the
+    /// bytes of `control` are Linux's layout, which other systems lay out
+    /// differently. It exists for `giong-tls`, and a typed form will replace
+    /// it before other systems are supported.
+    #[doc(hidden)]
     pub async fn send_with_control<B: IoBuf, C: IoBuf>(
         &self,
         buf: B,
@@ -1135,6 +1162,7 @@ impl std::fmt::Debug for TcpStream {
 mod tests {
     use std::borrow::Cow;
 
+    use super::share::check_bound;
     use super::*;
 
     /// What Linux 6.0.19 leaves behind when its bind(2) returns 1 for a busy

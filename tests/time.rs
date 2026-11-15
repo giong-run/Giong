@@ -66,7 +66,7 @@ fn timeout_elapses() {
         assert_eq!(res, Err(Elapsed));
         assert!(start.elapsed() < Duration::from_millis(500));
         // The inner sleep was dropped and must have unregistered itself.
-        assert_eq!(giong::stats().timers, 0);
+        assert_eq!(giong::observe::worker_stats().timers, 0);
     });
 }
 
@@ -79,7 +79,7 @@ fn timeout_passes_the_value_through() {
         })
         .await;
         assert_eq!(res, Ok("done"));
-        assert_eq!(giong::stats().timers, 0);
+        assert_eq!(giong::observe::worker_stats().timers, 0);
     });
 }
 
@@ -97,7 +97,7 @@ fn many_timers() {
             h.await.unwrap();
         }
         assert!(start.elapsed() >= Duration::from_micros(1_000 + 4_999 * 10));
-        assert_eq!(giong::stats().timers, 0);
+        assert_eq!(giong::observe::worker_stats().timers, 0);
     });
 }
 

@@ -1177,7 +1177,7 @@ fn kernel_recv_is_cancel_safe() {
         drop(sender.await.unwrap());
         drop(server);
         sleep(Duration::from_millis(50)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
     });
 }
@@ -1227,7 +1227,7 @@ fn a_cancelled_kernel_write_ends_sending_instead_of_cutting_a_message() {
             assert!(total > 0);
             drop((server, client));
             sleep(Duration::from_millis(50)).await;
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert_eq!(stats.tracked_ops, 0, "{stats:?}");
         });
     }

@@ -54,7 +54,7 @@ impl Stream {
         match self {
             Stream::Tcp(s) => s.recv().await.map(Chunk::Pooled),
             Stream::Unix(s) => s.recv().await.map(Chunk::Pooled),
-            Stream::Tls(s) => s.recv().await.map(Chunk::Owned),
+            Stream::Tls(s) => s.recv().await.map(|r| Chunk::Owned(r.into_vec())),
         }
     }
 

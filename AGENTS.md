@@ -131,7 +131,7 @@ is loaded.
    of the epoll driver. New operations are an `Io` variant run through `Op`, never raw
    submissions, and work on both drivers. Every new `async fn` says in its documentation
    whether it is cancel safe. Every new operation has a test that drops it mid-flight and then checks
-   `giong::stats()` for leaked operations and buffers (examples in `tests/cancel.rs`).
+   `giong::observe::worker_stats()` for leaked operations and buffers (examples in `tests/cancel.rs`).
    Run it on both drivers (`GIONG_DRIVER=epoll`).
 2. **Tests for the normal path and the interrupted one.** A bug fix comes with a test that
    fails without it. No tight timing in tests: use generous upper bounds.

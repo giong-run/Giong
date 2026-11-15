@@ -104,9 +104,6 @@ pub use runtime::{
     until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,
 };
 
-#[doc(hidden)]
-pub use runtime::{stats, Stats};
-
 /// Entry points for the fuzz targets in `fuzz/`, built only by `cargo fuzz`
 /// (`--cfg fuzzing`). Not part of the API.
 #[cfg(fuzzing)]

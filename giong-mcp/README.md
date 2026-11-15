@@ -39,7 +39,7 @@ let mcp = giong_mcp::Config::from_env()?
     .map(|cfg| cfg.start(&rt.handle()))
     .transpose()?; // a coded error, such as GIONG-E1303, stops the service
 if let Some(mcp) = &mcp {
-    // log mcp.url() your way
+    // log mcp.url() (None on a Unix socket) your way
 }
 ```
 

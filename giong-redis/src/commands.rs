@@ -86,10 +86,11 @@ macro_rules! commands {
         }
 
         /// `MGET key...`: the values of several keys, in order, with `None`
-        /// for those that do not exist: read as `Vec<Option<T>>`.
-        pub async fn mget<T: $crate::FromValue, K: $crate::ToArg>(
+        /// for those that do not exist: read as `Vec<Option<T>>`, as in
+        /// `mget::<Vec<Option<String>>>(&["a", "b"])`.
+        pub async fn mget<T: $crate::FromValue>(
             &self,
-            keys: &[K],
+            keys: &[impl $crate::ToArg],
         ) -> Result<T, $crate::Error> {
             self.query(&$crate::cmd("MGET").args(keys)).await
         }

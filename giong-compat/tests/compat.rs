@@ -104,7 +104,7 @@ fn a_partly_read_chunk_does_not_hold_a_pool_buffer() {
         // The reader now does something else for a while: the rest of the
         // chunk must not keep a buffer of the worker's pool.
         settle().await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
         // One byte at a time, then all of it is there.
         let mut rest = Vec::new();
@@ -129,7 +129,7 @@ fn buf_read_hands_out_received_bytes_and_moves_a_partly_consumed_rest() {
         while c.read_line(&mut line).await.unwrap() > 0 {
             lines.push(std::mem::take(&mut line));
             settle().await;
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
         }
         assert_eq!(lines, ["alpha\n", "beta\n", "gamma"]);
@@ -360,7 +360,7 @@ fn dropping_reads_writes_and_the_stream_midway_leaks_nothing() {
         drop(c);
         drop(s);
         settle().await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
         assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
         assert_eq!(stats.tasks, 0, "{stats:?}");
