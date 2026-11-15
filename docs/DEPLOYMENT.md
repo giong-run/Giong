@@ -104,6 +104,18 @@ do on your side. Other software that uses buffer rings through liburing fails on
 kernels with `EINVAL`. The 7.0 HWE kernel (`linux-generic-hwe-24.04`) does not have the
 bug.
 
+## Linux 6.0.16 to 6.0.19
+
+The last four releases of the 6.0 series (which is no longer maintained) return 1
+instead of -1 from bind(2) on a TCP socket whose address is in use, and leave the socket
+unbound. Programs read that as success, and listen(2) then puts the socket on a free port
+of every interface, so a server asked for a busy port starts on another one.
+`giong::net::TcpListener::bind` checks which port the socket ended up on and fails with
+`AddrInUse`, as on every other kernel. A listener that the standard library bound, handed
+over with `TcpListener::from_std`, is not checked: compare its `local_addr()` with the
+address you asked for, or let giong bind it. 6.0.15 and older, 6.1 and later, and UDP and
+Unix sockets are not affected.
+
 ## Docker
 
 Docker's default seccomp profile does not allow the io_uring system calls, so in a

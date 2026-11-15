@@ -704,6 +704,28 @@ pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, datagram:
 
 // -------------------------------------------------------------------- listener
 
+/// Checks that `bind` left the TCP socket on the port that was asked for,
+/// and reports `EADDRINUSE` when it did not.
+///
+/// Linux 6.0.16 to 6.0.19, the last four releases of the 6.0 series, return
+/// 1 instead of -1 from bind(2) on a TCP socket whose address is in use
+/// (6.0.15 and older, 5.15 and 6.1 return -1 with `EADDRINUSE`, as do UDP
+/// and Unix sockets on those four). The standard library and `socket2` test
+/// for -1 like every caller of libc, so they take it for success. The socket
+/// is still unbound, and listen(2) then gives it a free port on every
+/// address: a server asked for a busy port would come up on another one,
+/// open to all interfaces.
+fn check_bound(sock: &Socket, asked: SocketAddr) -> io::Result<()> {
+    let port = sock
+        .local_addr()?
+        .as_socket()
+        .map_or(0, |local| local.port());
+    if port == 0 || (asked.port() != 0 && port != asked.port()) {
+        return Err(io::Error::from_raw_os_error(libc::EADDRINUSE));
+    }
+    Ok(())
+}
+
 /// A TCP socket listening for connections.
 pub struct TcpListener {
     inner: ListenSocket,
@@ -715,6 +737,11 @@ impl TcpListener {
     /// Binds to `addr` with `SO_REUSEADDR` and `SO_REUSEPORT` set, so every
     /// worker can bind its own listener to the same port and let the kernel
     /// spread incoming connections across cores.
+    ///
+    /// An address held by a socket that does not share it is refused with
+    /// [`AddrInUse`](io::ErrorKind::AddrInUse) on every kernel, also on Linux
+    /// 6.0.16 to 6.0.19, whose bind(2) reports success there and leaves the
+    /// socket unbound.
     pub fn bind<A: StdToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut last_err = None;
         for addr in addr.to_socket_addrs()? {
@@ -731,6 +758,7 @@ impl TcpListener {
         sock.set_reuse_address(true)?;
         sock.set_reuse_port(true)?;
         sock.bind(&addr.into())?;
+        check_bound(&sock, addr)?;
         sock.listen(4096)?;
         Ok(Self {
             inner: ListenSocket::new(sock),
@@ -1108,6 +1136,32 @@ mod tests {
     use std::borrow::Cow;
 
     use super::*;
+
+    /// What Linux 6.0.19 leaves behind when its bind(2) returns 1 for a busy
+    /// address: a socket without a port, which listen(2) would put on a free
+    /// one. `check_bound` must call that `AddrInUse`.
+    #[test]
+    fn a_socket_that_bind_left_unbound_counts_as_address_in_use() {
+        let asked: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let any_port: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let unbound = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        for addr in [asked, any_port] {
+            let err = check_bound(&unbound, addr).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{addr}");
+            assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE), "{addr}");
+        }
+
+        let bound = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        bound.bind(&any_port.into()).unwrap();
+        let local = bound.local_addr().unwrap().as_socket().unwrap();
+        check_bound(&bound, local).unwrap();
+        check_bound(&bound, any_port).unwrap();
+        // On another port than the one asked for.
+        let other = SocketAddr::new(local.ip(), local.port() ^ 1);
+        let err = check_bound(&bound, other).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+    }
 
     /// A socket that refuses zero-copy sends, as a kernel TLS socket does
     /// with `EOPNOTSUPP`, gets the same bytes sent again with a copy and
