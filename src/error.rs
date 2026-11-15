@@ -151,6 +151,12 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+    /// [`try_spawn_compute`](crate::try_spawn_compute) refused a closure:
+    /// as many closures as
+    /// [`Builder::compute_backlog`](crate::Builder::compute_backlog) allows
+    /// already wait for a compute thread. The closure was dropped without
+    /// running.
+    ComputeBusy = 14, WouldBlock, "the compute lane is full";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
