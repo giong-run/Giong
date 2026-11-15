@@ -128,7 +128,7 @@ Done once per repository; listed so it can be checked or rebuilt.
 | Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http, giong-postgres, giong-mysql, giong-redis: done (2026-11-13); giong-web, giong-mcp (0.4.0) and giong-compat (0.5.0): first version published by hand, then added (see [Adding a crate](#adding-a-crate)). All nine crates done (2026-11-14) |
 | Environment `release`, deployments from `v*` tags only | repo Settings → Environments | done |
 | Branch protection on `main` with the CI checks `lint`, `msrv`, `test`, `fallback`, `tsan` | repo Settings → Branches | done |
-| Merge queue on `main`: *Require merge queue* (squash, build concurrency 2), and `all-checks` added to the required checks, so that every CI job holds a merge back | repo Settings → Branches → `main` | to do |
+| Merge queue on `main`: *Require merge queue* (squash, build concurrency 2), and `all-checks` added to the required checks, so that every CI job holds a merge back | repo Settings → Branches → `main` | done (2026-11-15) |
 | *Allow GitHub Actions to create and approve pull requests* | org Settings → Actions → General, then repo Settings → Actions → General | needed for Prepare release |
 | `SITE_DEPLOY_KEY`: a deploy key with write access on giong-run.github.io, its private half as a secret here | giong-run.github.io → Settings → Deploy keys; Giong → Settings → Secrets → Actions | needed for automatic site deploys |
 

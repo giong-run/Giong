@@ -196,8 +196,11 @@ docs: explain how to run under WSL2
 3. Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for anything a user
    would notice.
 4. Fill in the pull request template. Say how you tested the change.
-5. All checks must be green. A maintainer reviews and merges; pull requests are
-   squash-merged, so the pull request title must itself be a valid commit summary.
+5. All checks must be green. A maintainer reviews the pull request and adds it to the
+   merge queue, which runs every check once more on `main` with the pull request merged,
+   and merges it when they pass. Pull requests are squash-merged, so the pull request
+   title must itself be a valid commit summary; the queue takes the commit message of a
+   pull request with one commit from that commit.
 
 ## Releases
 
