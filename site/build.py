@@ -926,36 +926,123 @@ def benchmarks():
 
 
 def roadmap():
+    """One featured milestone (the current one), then one line per other milestone.
+
+    However many versions the roadmap grows to, each milestone that is not the current one
+    takes a single row, folded until a reader opens it, and shipped milestones beyond the
+    newest few fold away together.
+    """
+    shown_shipped = 4
+
     def md_html(src):
         h = doc_md(src, heading_shift=1, heading_ids=False)
         return h.replace("<p><strong>Exit criteria:</strong>", '<p class="exit"><strong>Done when:</strong>')
 
-    def body_html(m):
-        intro, rest = split_intro(m["body"])
-        if m["state"] != "done" or not rest or not intro:
-            return md_html(m["body"])
-        label = f'Show the {m["total"]} items' if m["total"] else "Show the details"
-        return md_html(intro) + more(label, f'<div class="prose">{md_html(rest)}</div>')
-    rows = []
-    for m in MILESTONES:
-        progress = f'<span class="ms-progress">{m["done"]} of {m["total"]}</span>' if m["total"] else ""
-        bar = (f'<span class="ms-bar" style="--p:{100 * m["done"] / m["total"]:.0f}%"></span>'
-               if m["total"] else "")
-        label = m["ver"] or "crates"
-        rows.append(
-            f'<li class="ms is-{m["state"]}" id="{m["id"]}">'
-            f'<div class="ms-side"><b class="ms-ver{"" if m["ver"] else " is-word"}">{label}</b><span class="ms-state">{m["state"]}</span>{progress}{bar}</div>'
-            f'<div class="ms-main"><h2>{html.escape(m["name"] if m["ver"] else m["title"])}</h2>'
-            f'<div class="prose">{body_html(m)}</div></div></li>')
+    def split_list(src):
+        """A Markdown body that starts with a list: the list, and what follows it."""
+        lines = src.split("\n")
+        for i, line in enumerate(lines):
+            if line.strip() and not re.match(r"^(\s+|[-*] )", line):
+                return "\n".join(lines[:i]).strip(), "\n".join(lines[i:]).strip()
+        return src.strip(), ""
+
+    def tagline(m):
+        intro = split_intro(m["body"])[0].split("\n\n")[0]
+        intro = re.sub(r"\s+", " ", intro).strip()
+        s = re.match(r"^(.+?[.:])(?:\s+[A-Z(`]|$)", intro)
+        return ilm(s.group(1).rstrip(":") + ("." if s.group(1).endswith(":") else "")) if s else ilm(intro)
+
+    def release_of(m):
+        """The first release of a numbered milestone, such as 0.5.0 for 0.5."""
+        if not m["ver"]:
+            return None
+        found = [r for r in RELEASES if r["version"].startswith(m["ver"] + ".") and r["date"]]
+        return found[-1] if found else None
+
+    def label(m):
+        return m["ver"] or "crates"
+
+    def name(m):
+        return html.escape(m["name"] if m["ver"] else m["title"].replace(" (done)", ""))
+
+    def row(m):
+        rel = release_of(m) if m["state"] == "done" else None
+        if rel:
+            meta = f'<time datetime="{rel["date"]}">{nice_date(rel["date"])}</time>'
+        elif m["total"]:
+            meta = f'{m["done"]} of {m["total"]}' if m["done"] else f'{m["total"]} items'
+        else:
+            meta = "details"
+        notes = (f'<p class="mr-links"><a href="{link("releases", rel["id"])}">Release notes for '
+                 f'{rel["version"]} <span aria-hidden="true">→</span></a></p>') if rel else ""
+        line = tagline(m)
+        return (f'<details class="mr is-{m["state"]}" id="{m["id"]}"><summary>'
+                f'<b class="mr-ver{"" if m["ver"] else " is-word"}">{label(m)}</b>'
+                f'<span class="mr-name">{name(m)}</span><span class="mr-meta">{meta}</span>'
+                + (f'<span class="mr-line">{line}</span>' if line else "")
+                + f'</summary><div class="mr-body prose">{notes}{md_html(m["body"])}</div></details>')
+
+    current = next((m for m in MILESTONES if m["state"] == "current"), None)
+    shipped = [m for m in MILESTONES if m["state"] == "done"][::-1]
+    planned = [m for m in MILESTONES if m["state"] == "planned"]
+
+    now = ""
+    if current:
+        intro, rest = split_intro(current["body"])
+        gates, after = split_list(rest)
+        exit_p = next((p for p in after.split("\n\n") if p.startswith("**Exit criteria:**")), "")
+        after = after.replace(exit_p, "").strip()
+        pct = 100 * current["done"] / current["total"] if current["total"] else 0
+        progress = (f'<p class="now-progress"><span>{current["done"]} of {current["total"]} done</span>'
+                    f'<span class="ms-bar" style="--p:{pct:.0f}%"></span></p>') if current["total"] else ""
+        now = f'''<section class="band band-tight" id="now"><div class="wrap rm-col">
+  <article class="now" id="{current["id"]}">
+    <div class="now-side"><p class="eyebrow">Now</p><b class="now-ver">{label(current)}</b>{progress}</div>
+    <div class="now-main">
+      <h2>{name(current)}</h2>
+      <div class="prose">{md_html(intro)}{md_html(gates)}{md_html(exit_p) if exit_p else ""}</div>
+      {more("Read the rest of " + label(current), f'<div class="prose">{md_html(after)}</div>') if after else ""}
+    </div>
+  </article>
+</div></section>'''
+
+    later = ""
+    if planned:
+        later = f'''<section class="band band-alt" id="planned"><div class="wrap rm-col">
+  <h2 class="rm-h">Planned{" after " + label(current) if current else ""}</h2>
+  <p class="rm-sub">In the order they are planned. Open one to see its items and what marks it done.</p>
+  <div class="mrs">{"".join(row(m) for m in planned)}</div>
+</div></section>'''
+
+    done_rows = "".join(row(m) for m in shipped[:shown_shipped])
+    if len(shipped) > shown_shipped:
+        older = shipped[shown_shipped:]
+        done_rows += more(f"Show {len(older)} earlier milestones",
+                          f'<div class="mrs">{"".join(row(m) for m in older)}</div>', "more-box mrs-older")
+    done = f'''<section class="band" id="shipped"><div class="wrap rm-col">
+  <h2 class="rm-h">Shipped</h2>
+  <p class="rm-sub">Newest first. Every change is in the <a href="{link("releases")}">release notes</a>.</p>
+  <div class="mrs">{done_rows}</div>
+</div></section>'''
+
     named = ROADMAP_NAMED
+    a_intro, a_rest = split_intro(named.get("Agent-first", ""))
+    a_count = len(re.findall(r"^\d+\. ", a_rest, re.M))
+    a_more = more(f"The {a_count} principles" if a_count else "The principles",
+                  f'<div class="prose">{doc_md(a_rest, heading_ids=False)}</div>') if a_rest else ""
+    status = (f'{len(shipped)} milestones shipped'
+              + (f' · now <a href="#now">{label(current)}</a>' if current else "")
+              + (f' · {len(planned)} planned' if planned else ""))
     body = f'''{page_head("roadmap", "Where giong is going",
                           "Milestones in order, with no dates: a milestone is done when its exit criteria are met.",
-                          source_note(["ROADMAP.md"]))}
-<section class="band band-tight"><div class="wrap goal">
+                          status + " · " + source_note(["ROADMAP.md"]))}
+{now}
+{later}
+{done}
+<section class="band band-alt"><div class="wrap goal">
   <div class="prose prose-lg"><h2 id="goal">Goal</h2>{doc_md(named.get("Goal", ""), heading_ids=False)}</div>
-  <div class="prose"><h2 id="agent-first">Agent-first</h2>{doc_md(named.get("Agent-first", ""), heading_ids=False)}</div>
+  <div class="prose"><h2 id="agent-first">Agent-first</h2>{doc_md(a_intro, heading_ids=False)}{a_more}</div>
 </div></section>
-<section class="band band-alt"><div class="wrap"><ol class="timeline">{"".join(rows)}</ol></div></section>
 <section class="band" id="non-goals"><div class="wrap nongoals">
   <h2>Deliberate non-goals</h2>
   <div class="prose">{doc_md(named.get("Non-goals", ""), heading_ids=False)}</div>

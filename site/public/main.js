@@ -180,3 +180,17 @@
   }, { threshold: 0.2 }) : null;
   if (io) io.observe(tick); else later(function () { enter(0, 14); }, 1800);
 })();
+
+/* A link to a folded milestone on the roadmap (#05--http2-and-adapters-done) opens it. */
+(function () {
+  function open() {
+    var id = decodeURIComponent(location.hash.slice(1));
+    var el = id && document.getElementById(id);
+    if (!el || !el.closest) return;
+    var d = el.closest("details");
+    while (d) { d.open = true; d = d.parentElement && d.parentElement.closest("details"); }
+    if (el.tagName === "DETAILS") el.scrollIntoView();
+  }
+  open();
+  window.addEventListener("hashchange", open);
+})();
