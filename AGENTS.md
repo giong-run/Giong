@@ -37,7 +37,8 @@ Where the code is:
 | `src/driver/uring.rs` | io_uring setup, submission and completion, the ring tiers |
 | `src/driver/epoll.rs` | the epoll driver: readiness, edge-triggered registration, the per-task budget |
 | `src/driver/blocking.rs` | the thread pool the epoll driver runs file operations on |
-| `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
+| `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done; links the task deadline to operations that wait on a peer |
+| `src/task/` | `giong::task`: deadlines (`deadline.rs`, the thread-local context in `context.rs`), `Scope` (`scope.rs`), `TaskGroup` (`group.rs`), `task_local!` (`local.rs`) |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
 | `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
@@ -214,6 +215,14 @@ is loaded.
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
   cannot fix that (see `giong-compat/README.md`).
+- **Deadlines reach only some operations.** Under `giong::task::with_deadline`, the
+  io_uring driver links the deadline (`IORING_OP_LINK_TIMEOUT`) to the operations that wait
+  on a peer (`Io::links_deadline`: connect, one-off reads, waiting for a writable socket,
+  pipe reads). Multishot receive and accept cannot carry a linked timeout, and sends and
+  file I/O are left out on purpose (about 0.3 µs each, `bench/deadline.sh`); the
+  deadline's timer ends those. Keep this split when adding an `Io` variant.
+- **Children of a `Scope` cannot borrow the scope.** They are stored inside it. Tests and
+  examples give a child `scope.cancel_handle()` or open a `Scope` inside the child.
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 

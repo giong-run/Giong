@@ -154,6 +154,14 @@ pub enum IoUringFeature {
     /// write returns (a `Vec`) are always copied: the kernel reads
     /// zero-copy bytes until the peer has acknowledged them.
     ZeroCopySend,
+    /// Under a task deadline ([`crate::task`]), operations that wait on a
+    /// peer (connect, one-off reads, waiting for a writable socket, pipe
+    /// reads) carry the deadline into the kernel as a linked timeout
+    /// (`IORING_OP_LINK_TIMEOUT`, with `IOSQE_CQE_SKIP_SUCCESS` so that it
+    /// adds no completion). The kernel cancels them at the deadline by
+    /// itself, even while the worker is busy. Without it, the deadline's
+    /// timer ends them at the next turn of the event loop.
+    LinkedDeadlines,
 }
 
 impl IoUringFeature {
@@ -163,6 +171,7 @@ impl IoUringFeature {
         IoUringFeature::PackedBuffers,
         IoUringFeature::RegisteredRing,
         IoUringFeature::ZeroCopySend,
+        IoUringFeature::LinkedDeadlines,
     ];
 
     /// A stable short name, such as `"packed-buffers"`.
@@ -171,6 +180,7 @@ impl IoUringFeature {
             IoUringFeature::PackedBuffers => "packed-buffers",
             IoUringFeature::RegisteredRing => "registered-ring",
             IoUringFeature::ZeroCopySend => "zero-copy-send",
+            IoUringFeature::LinkedDeadlines => "linked-deadlines",
         }
     }
 }
@@ -441,6 +451,22 @@ impl Io {
         matches!(self, Io::OpenAt { .. })
     }
 
+    /// `true` for the operations that wait on a peer for as long as it
+    /// takes: under a task deadline ([`crate::task`]) the io_uring driver
+    /// links a kernel timeout to them. Transfers that usually finish at
+    /// once (sends, file I/O) are left alone: a linked timeout costs each
+    /// operation about 0.3 µs, and the deadline's timer still ends them.
+    pub(crate) fn links_deadline(&self) -> bool {
+        matches!(
+            self,
+            Io::Connect { .. }
+                | Io::Recv { .. }
+                | Io::RecvMsg { .. }
+                | Io::Writable { .. }
+                | Io::ReadReady { .. }
+        )
+    }
+
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
@@ -639,9 +665,27 @@ impl Driver {
 
     /// Starts a single-shot operation; `waker` is woken when it can be
     /// polled again.
+    ///
+    /// The task's deadline, if there is one ([`crate::task`]), goes with an
+    /// io_uring operation that waits on a peer
+    /// ([`Io::links_deadline`]): io_uring links a kernel timeout to it, so
+    /// the kernel cancels it at the deadline. The epoll driver starts every
+    /// operation as usual: there the deadline's timer in the worker's timer
+    /// wheel ends it.
+    #[inline]
     pub(crate) fn start(&mut self, io: &Io, waker: &Waker) -> Start {
         match self {
-            Driver::Uring(d) => Start::Submitted(d.submit_op(io, waker)),
+            Driver::Uring(d) => {
+                let deadline = if d.links_deadlines() && io.links_deadline() {
+                    crate::task::kernel_deadline()
+                } else {
+                    None
+                };
+                Start::Submitted(match deadline {
+                    None => d.submit_op(io, waker),
+                    Some(at) => d.submit_op_linked(io, waker, at),
+                })
+            }
             Driver::Epoll(d) => d.start(io, waker),
         }
     }

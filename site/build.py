@@ -1152,6 +1152,13 @@ def llms():
              "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
              "  connection from `pool.get().await?`; it comes back with its session reset.\n"
              ) if "giong-postgres" in names else ""
+    task = ("- Time limits: `giong::task::with_timeout(d, fut)` holds for everything inside `fut`,\n"
+            "  including tasks started in a `giong::task::Scope` or `TaskGroup` there; on io_uring the\n"
+            "  kernel cancels waiting reads and connects at the deadline. The error is `GIONG-E0020`.\n"
+            "  `giong::spawn` starts a detached task that inherits no deadline and no task-local value.\n"
+            "  For futures that borrow local data and must all finish (or all stop at the first\n"
+            "  error), use `Scope::new()` and `scope.run(async { .. })`.\n"
+            ) if released("src/task/mod.rs") is not None else ""
     return f"""# giong
 
 > A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
@@ -1195,7 +1202,7 @@ Facts that are easy to get wrong:
 - On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
-{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
+{task}{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs
 

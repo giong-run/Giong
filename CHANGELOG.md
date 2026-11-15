@@ -8,6 +8,29 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **`giong::task`: structured concurrency and deadlines that reach the kernel** (1.x, on a
+  branch until 1.0.0 is out). `with_deadline` and `with_timeout` put a deadline on a piece of
+  work that everything inside inherits; the work is dropped when it passes, and code inside
+  never runs past it (`Cancelled`, `GIONG-E0020` as an `io::Error`). On io_uring the
+  operations inside that wait on a peer (connect, one-off reads, waiting for a writable
+  socket, pipe reads) carry the deadline as a linked kernel timeout, so the kernel cancels
+  them at the deadline by itself, even while the worker is busy; on epoll the deadline's
+  timer ends them. `deadline()` and `remaining()` read it. `Scope` runs futures that borrow
+  local data as children of one call: none outlives `run`, the first error cancels the
+  rest, `cancel()` stops them (`GIONG-E0021`). `TaskGroup` owns a set of `'static` tasks,
+  returns results as they finish and aborts the rest on drop. `task_local!` declares values
+  set for a piece of work with `KEY.scope(value, fut)` (`GIONG-E0022` when read unset).
+  Scope children and group tasks inherit the deadline and task-local values; `giong::spawn`
+  is unchanged and inherits nothing. `JoinError::DeadlineExceeded` and `IoUringFeature::LinkedDeadlines` (off with
+  `GIONG_IO_URING_OFF=linked-deadlines`) are new. Code that uses none of this runs the
+  same instructions as before (`bench/deadline.sh`, loopback round trips: 5,310 vs 5,429 per
+  round trip on io_uring, 4,955 vs 4,986 on epoll). A deadline is not free: around a loop
+  of round trips it adds about 800 instructions (0.5 µs) per round trip for the wrapper,
+  and on io_uring about 0.34 µs per linked read in the kernel (6.25 → 6.93 µs per round trip
+  with two reads); raw data in `bench/results/deadline/summary.txt`.
+
 ### Changed
 
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the

@@ -42,6 +42,10 @@ when it is no longer raised.
 | [GIONG-E0011](E0011.md) | `NotInRuntime` | not inside a giong runtime |
 | [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
 | [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
+| [GIONG-E0020](E0020.md) | `DeadlineExceeded` | the deadline passed |
+| [GIONG-E0021](E0021.md) | `ScopeCancelled` | the scope was cancelled |
+| [GIONG-E0022](E0022.md) | `TaskLocalNotSet` | task-local value not set |
+| [GIONG-E0023](E0023.md) | `ScopeAlreadyRunning` | the scope is already running |
 
 ## Network and name resolution
 

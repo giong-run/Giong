@@ -151,6 +151,22 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+    /// The deadline of [`task::with_deadline`](crate::task::with_deadline),
+    /// [`task::with_timeout`](crate::task::with_timeout) or
+    /// [`Scope::with_deadline`](crate::task::Scope::with_deadline) passed
+    /// before the work finished; the work was dropped.
+    DeadlineExceeded = 20, TimedOut, "the deadline passed";
+    /// [`Scope::cancel`](crate::task::Scope::cancel) was called before the
+    /// scope's body returned.
+    ScopeCancelled = 21, Other, "the scope was cancelled";
+    /// A task-local value was read with
+    /// [`LocalKey::with`](crate::task::LocalKey::with) or
+    /// [`get`](crate::task::LocalKey::get) where it is not set. It panics
+    /// with this code.
+    TaskLocalNotSet = 22, NotFound, "task-local value not set";
+    /// [`Scope::run`](crate::task::Scope::run) was polled while another run
+    /// of the same scope was going. It panics with this code.
+    ScopeAlreadyRunning = 23, Other, "the scope is already running";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.

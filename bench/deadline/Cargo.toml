@@ -1,0 +1,23 @@
+[package]
+name = "bench-deadline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+# What a deadline costs: see bench/deadline.sh.
+[dependencies]
+giong = { path = "../.." }
+
+[features]
+default = ["task"]
+# Off to build the same benchmark against a giong without `giong::task`
+# (the plain mode only), to compare the code path without deadlines.
+task = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 1
