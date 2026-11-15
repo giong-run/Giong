@@ -18,7 +18,10 @@ reqwest, axum), and the README says where giong does not win.
 
 After 1.0, the 1.x releases add gRPC, macOS, HTTP/3 and Windows, then a memory limit kept
 under any load, one at a time and without breaking the 1.0 API (see the milestones after 1.0
-below). Linux stays the platform giong is tuned and measured on.
+below). Alongside them, a third track fills in what a general runtime still lacks: blocking
+and compute work, processes and signals, structured concurrency, and scheduling that keeps
+a small machine efficient (see [Runtime core](#runtime-core-track-r-after-10)). Linux stays
+the platform giong is tuned and measured on.
 
 ## Agent-first
 
@@ -61,8 +64,12 @@ These are deliberate. Proposals that need them will be declined.
 - **Work stealing.** A task that has started stays on its worker, so tasks need not be
   `Send`. Balancing happens where new work starts: `Handle::spawn_balanced` and
   `TcpListener::bind_balanced`.
-- **Every workload.** giong covers network services: HTTP, databases, caches and the clients
-  they need. It does not try to replace Tokio for everything Tokio is used for.
+- **Everything in one crate.** giong is a runtime: it takes only what a runtime alone can do
+  (scheduling, I/O, time, processes, memory, observation). Protocols, frameworks and tools
+  are crates built on top of it, as giong-http, giong-web and the database drivers are.
+  Network services come first and set the priorities, but blocking work, CPU-heavy work and
+  child processes have a place in the runtime too (see
+  [Runtime core](#runtime-core-track-r-after-10)).
 - **`Send` futures as a requirement.** The API stays usable with `Rc` and `RefCell`.
 - **Macros that hide control flow, and unbounded defaults.** See [Agent-first](#agent-first).
 
@@ -365,7 +372,8 @@ that forces a 2.0, and a short list to settle before the freeze
 ([findings](docs/reviews/2026-11-api-portability.md)).
 
 After 1.0, each minor release has one main theme and breaks nothing: code written for 1.0 keeps
-compiling. The work runs on two tracks at once, and each release ships as soon as its own
+compiling. The protocol and platform work runs on two tracks at once (a third, the runtime
+core, is described after 1.5), and each release ships as soon as its own
 gates pass. The protocol track does gRPC, which builds on HTTP/2, then HTTP/3, the largest
 piece of protocol work. The platform track first moves the system calls outside the drivers
 behind one internal layer, built once for both systems, then adds macOS, whose kqueue driver
@@ -547,3 +555,55 @@ hold to it.
 clients mixed into it keep at least 90% of their requests per second, the limit costs at
 most 1% more instructions per request, and the cheapest-machine benchmark of 0.9 is
 published again with the limit on, against Tokio, Go and nginx.
+
+## Runtime core (track R, after 1.0)
+
+What a general runtime still lacks, from a [gap analysis of the core](docs/reviews/2026-11-runtime-gaps.md)
+against Tokio, Seastar, glommio, monoio, Go and Erlang. This track runs beside the protocol
+and platform tracks; each item ships in the first 1.x release whose gates it passes, breaks
+nothing, and lands only with its tests under the simulation driver, a coded error and page
+for every new failure, and a benchmark with raw data for any claim about speed or memory.
+Like the rest of 1.x, it stays on branches until 1.0.0.
+
+First wave, needing nothing else:
+
+- [ ] Blocking and compute work: `spawn_blocking` on a bounded pool, and a compute pool
+      sized from the same CPU budget as the workers (the container's quota), with a bounded
+      queue, so a blocking call or a CPU-heavy job never stalls a worker.
+- [ ] Processes and signals: child processes waited for through the ring (`waitid`, or a
+      pidfd), their standard input and output as streams, the process's own stdin and
+      stdout, pipes, any signal as a stream, Unix datagram sockets, passing descriptors
+      between processes, and listeners taken from systemd.
+- [ ] Structured concurrency: scopes whose child tasks never outlive them, task groups,
+      values local to a task, and a deadline per scope that the kernel enforces on every
+      operation inside it (a linked timeout in io_uring, the timer wheel on epoll), with
+      the reason for a cancellation as a coded error.
+- [ ] Work done inside the kernel: `splice` between sockets, wake-ups and descriptors sent
+      between workers' rings (`MSG_RING`), registered buffers, receive bundles.
+
+Second wave, after the first:
+
+- [ ] Scheduling groups: shares of CPU and of disk I/O per class of work (requests,
+      background jobs, tenants), so background work does not raise request latency.
+      Needs the scopes.
+- [ ] Restarts that drop nothing: the new process takes the listeners from the old one,
+      which drains; later, idle connections are handed over too, kernel TLS ones included.
+      Needs descriptor passing.
+- [ ] Record and replay: a bounded recording of everything nondeterministic a worker sees
+      (completions, timers, wake-ups from other threads, received bytes), which the
+      simulation driver replays exactly, so a failure in production becomes a test an
+      agent can run. Needs the simulation driver.
+
+Third wave, measured on bare metal:
+
+- [ ] Workers matched to the network card's receive queues, so a connection runs on the
+      core its packets arrive on.
+- [ ] Elastic cores: a quiet service gathers its connections onto fewer workers and lets
+      the rest sleep, and spreads out again under load, so several services share a small
+      machine.
+
+The cgroup's memory limit and its pressure signal (PSI) belong to the memory limit of 1.5,
+which reads them and tightens before the kernel's out-of-memory killer acts.
+
+**Exit criteria:** per item, as above. The track is done when every item has shipped in a
+1.x release.
