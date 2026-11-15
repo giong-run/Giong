@@ -979,10 +979,11 @@ def releases():
             meta.append(f'<a href="{r["compare"]}">every commit</a>')
         latest = r is LATEST
         badge = '<span class="badge">latest</span>' if latest else ""
-        count = len(re.findall(r"^- ", r["body"], re.M))
-        intro, rest = split_intro(r["body"])
-        if unreleased:
-            intro, rest = "", r["body"]
+        # A release's introduction runs to its first "### " heading, lists included
+        # (the breaking changes by crate, say); the entries below it are folded away.
+        intro = "" if unreleased else r["intro"]
+        rest = r["body"][len(intro):].strip()
+        count = len(re.findall(r"^- ", rest, re.M))
         notes = f'<div class="prose">{doc_md(intro, heading_ids=False)}</div>' if intro else ""
         if rest:
             label = (f"Show the {count} entries waiting for the next release" if unreleased
@@ -1046,9 +1047,17 @@ def llms():
     examples = "".join(f"- [examples/{name}.rs]({REL_BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
                        for name, desc, _, _ in C.EXAMPLES if released(f"examples/{name}.rs") is not None)
     mcp = ("- To let an agent look inside a running service (which task blocks a worker, which line\n"
-           "  spawned the tasks that leak, how full the pools are), add giong-mcp and call\n"
-           "  `giong_mcp::start_from_env` with the runtime's handle: it serves MCP on the address\n"
-           "  in `GIONG_MCP`. Its README says how to connect a client.\n") if "giong-mcp" in names else ""
+           "  spawned the tasks that leak, how full the pools are), add giong-mcp and keep\n"
+           "  `let _mcp = giong_mcp::start_from_env(&handle);` alive (no `?`: it never fails the\n"
+           "  service). It serves MCP on the address in `GIONG_MCP`; a TCP address also needs a\n"
+           "  token of 16 characters or more in `GIONG_MCP_TOKEN`, which the client sends as\n"
+           "  `Authorization: Bearer`, and a Unix socket needs none. Its README says how to\n"
+           "  connect a client.\n") if "giong-mcp" in names else ""
+    pools = ("- giong-postgres and giong-mysql: `pool.query(..)` and the other methods on a `Pool`\n"
+             "  share connections between tasks, so they refuse statements that change the session\n"
+             "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
+             "  connection from `pool.get().await?`; it comes back with its session reset.\n"
+             ) if "giong-postgres" in names else ""
     return f"""# giong
 
 > A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
@@ -1079,7 +1088,7 @@ Facts that are easy to get wrong:
 - On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
-{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
+{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs
 

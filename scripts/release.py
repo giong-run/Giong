@@ -474,8 +474,11 @@ def cmd_notes(args):
     section = re.sub(r"<!--.*?-->\s*", "", section, flags=re.S).strip()
     generated = Path(args.github_notes).read_text(encoding="utf-8").strip() if args.github_notes else ""
 
+    # A handle is thanked only where prose names it: `@@server_uuid` in a code span is
+    # SQL, and would notify whoever has the account "server".
+    prose = re.sub(r"```.*?```|`[^`]*`", "", section, flags=re.S)
     handles = []
-    for h in re.findall(r"(?<![\w/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?)", section + "\n" + generated):
+    for h in re.findall(r"(?<![\w/@])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\[bot\])?)", prose + "\n" + generated):
         if h.endswith("[bot]") or h.lower() in (x.lower() for x in handles):
             continue
         handles.append(h)

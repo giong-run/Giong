@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=250,
+        layer="runtime", tests=277,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
@@ -34,18 +34,19 @@ CRATES = {
                "`spawn_on`, `spawn_balanced` and `bind_balanced` to spread new work"],
         fact="3 dependencies: `io-uring`, `libc`, `socket2`"),
     "giong-http": dict(
-        layer="protocols", tests=191,
+        layer="protocols", tests=205,
         short="A strict HTTP/1.1 and HTTP/2 server, HTTPS behind a feature, and a pooled client.",
         lede="A small, strict HTTP/1.1 and HTTP/2 server with one async handler, and a client that speaks both.",
         items=["HTTP/2 through ALPN or with prior knowledge, for the same handlers",
                "Keep-alive, pipelining, bodies by `Content-Length` or chunked, streamed both ways",
-               "Limits and timeouts everywhere; HTTP/2 rapid reset and floods answered with a GOAWAY",
+               "Limits and timeouts everywhere; HTTP/2 rapid reset and floods answered with a GOAWAY, "
+               "and what a connection holds bounded by a budget",
                "Answers `400` to any request a proxy in front could read differently",
                "`Server::serve`, `serve_unix`, `serve_tls`; a pooled HTTPS `Client` with proxies "
                "and gzip behind `client`"],
         fact="`h2spec`: all 147 cases pass"),
     "giong-tls": dict(
-        layer="protocols", tests=64,
+        layer="protocols", tests=75,
         short="TLS 1.2 and 1.3 for servers and clients on rustls. No OpenSSL.",
         lede="TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
         items=["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
@@ -55,25 +56,27 @@ CRATES = {
                "Kernel TLS after the handshake (`Ktls::Auto`), and files sent with `sendfile`"],
         fact="TLS costs 4% on `/json`"),
     "giong-postgres": dict(
-        layer="clients", tests=79,
+        layer="clients", tests=105,
         short="PostgreSQL client and pool; statements of every task pipeline together.",
         lede="A PostgreSQL client and pool. The statements of every task pipeline over a few connections.",
         items=["`Client::connect`, `query`, `execute`, `transaction`, `cancel_token`",
                "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
                "Every statement prepared once per connection and cached",
-               "TLS verified by default for remote hosts; SCRAM-SHA-256"],
+               "TLS verified by default for remote hosts; SCRAM-SHA-256; `require_auth`",
+               "A connection taken with `get()` comes back to the pool with its session reset"],
         fact="2.6× deadpool's statements per core"),
     "giong-mysql": dict(
-        layer="clients", tests=88,
-        short="MySQL 8 client and pool, built the same way as giong-postgres.",
-        lede="A MySQL 8 client and pool, built the same way as giong-postgres.",
+        layer="clients", tests=118,
+        short="MySQL and MariaDB client and pool, built the same way as giong-postgres.",
+        lede="A client and pool for MySQL 8 and MariaDB 10.6 or newer, built the same way as giong-postgres.",
         items=["`Client::connect`, `query`, `execute`, `transaction`",
                "A `Pool` per worker: shared, pipelined statements; `get()` for a transaction",
                "Prepared statements on the binary protocol, cached per connection",
-               "TLS; `caching_sha2_password` and `mysql_native_password`"],
+               "TLS; `caching_sha2_password` and `mysql_native_password`",
+               "A connection taken with `get()` comes back to the pool with its session reset"],
         fact="4.7× SQLx's statements per core"),
     "giong-redis": dict(
-        layer="clients", tests=71,
+        layer="clients", tests=86,
         short="Redis client on RESP3: pipelining across tasks, Pub/Sub, a pool.",
         lede="A Redis client and pool on RESP3. The commands of every task pipeline over one connection.",
         items=["Typed commands, `query` for any other, `Pipeline` for a batch",
@@ -82,7 +85,7 @@ CRATES = {
                "TLS; Redis 6 or newer (RESP3)"],
         fact="1.4× redis-rs's `GET`s per core"),
     "giong-web": dict(
-        layer="framework", tests=79,
+        layer="framework", tests=106,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
         lede="A router, middleware and JSON on giong-http. Handlers are plain `async fn`s; every "
              "error is a coded problem+json answer.",
@@ -93,17 +96,17 @@ CRATES = {
                "without a socket"],
         fact="1.3× axum's `/json` on one core"),
     "giong-mcp": dict(
-        layer="tooling", tests=16,
+        layer="tooling", tests=32,
         short="A read-only MCP server: an agent sees what each worker, task and pool is doing.",
         lede="A read-only MCP server that lets an AI agent look inside a running service: which "
              "task blocks a worker, which line spawned the tasks that leak, how full the pools are.",
-        items=["`giong_mcp::start_from_env(&handle)`, on when `GIONG_MCP` is set",
+        items=["`let _mcp = giong_mcp::start_from_env(&handle);`, on when `GIONG_MCP` is set",
                "Tools: `overview`, `workers`, `tasks`, `sources`, `profile`",
                "A worker stuck in one poll is reported with the line that spawned the task",
-               "Loopback or a Unix socket only; `Host` and `Origin` checked; optional token"],
+               "Loopback or a Unix socket only; `Host` and `Origin` checked; a token required on TCP"],
         fact="about 9 instructions per task poll"),
     "giong-compat": dict(
-        layer="protocols", tests=30,
+        layer="protocols", tests=42,
         short="Tokio's and futures-io's I/O traits for giong's streams, for h2, tokio-rustls and the like.",
         lede="`AsyncRead`, `AsyncWrite` and `AsyncBufRead` from Tokio and futures-io for giong's "
              "streams, so protocol crates that take a stream run on giong with no Tokio runtime.",
@@ -112,7 +115,7 @@ CRATES = {
                "tokio-util's codecs",
                "Buffered writes like `BufWriter`; reads lose nothing when cancelled",
                "Says plainly which crates cannot work: those that need Tokio's reactor, timers or `spawn`"],
-        fact="one copy per byte; sending costs 10–20% of throughput"),
+        fact="one copy per byte; sending costs up to 20% of throughput"),
 }
 
 # Crates on the roadmap that do not exist yet. Each disappears from this list on its
@@ -189,12 +192,13 @@ CHECKED = [
     "ThreadSanitizer: no data race",
     "`loom` model check of the cross-thread wake-up",
     "Parsers and HTTP/2 fuzzed every night; `h2spec` on every change; a two-hour soak test",
+    "Miri over the tests it can run, on every change",
     "valgrind memcheck: no invalid access, no leak",
 ]
 NOT_YET = [
     "giong has **not run in production**",
     "Bare metal measured on one pair of 8-core machines only; nothing larger yet",
-    "`giong-tls` has had no independent security audit, only a review by the project's AI agent",
+    "No independent audit: every crate has been reviewed, but by the project's AI agents",
 ]
 
 # ---------------------------------------------------------------- code
