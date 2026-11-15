@@ -305,40 +305,87 @@ breaking changes made now rather than after 1.0.
 **Exit criteria:** no item left for the freeze undecided. Met. The freeze is declared once
 real use in a service has reported back, which may still add items before 1.0.0-rc.1.
 
+## 0.8 — Verified in CI
+
+The verification that needs no machines of its own, run on every change. No new public
+features.
+
+- [x] `cargo-semver-checks` in CI, checking every change against 0.7.0.
+- [ ] Speed and memory thresholds checked in CI: instructions per request, counted so the
+      result is the same on every run of a shared runner, and memory per connection, each
+      with its raw data in `bench/`.
+- [ ] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
+      boxes, the lifetimes of operations), run in CI.
+- [ ] Fault injection through an internal simulation driver: lost, reordered and delayed
+      packets, reset connections, failing disks and jumping clocks, chosen by a seed, and a
+      failing run replayed exactly from its seed. Internal only; a public form is a 1.x
+      addition.
+- [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
+- [ ] The remaining code fixes from the service built from the documentation alone.
+
+**Exit criteria:** all of the above green on `main`.
+
+## 0.9 — Bare metal and real use
+
+What only real machines and a real service can show. No new public features.
+
+- [ ] A 72-hour soak on bare metal.
+- [ ] Benchmarks on bare metal against Tokio and the other runtimes, compared with 0.5.0's
+      pass, with method and raw data in the repository; the README and giong.run take their
+      numbers from them.
+- [ ] UDP segmentation offload measured in the same rental, as input for HTTP/3 (no API).
+- [ ] Real use: giong in a production service, with its user reporting back.
+
+**Exit criteria:** the soak ends with no leak, crash or stall, and the service's user
+reports no blocker.
+
 ## 1.0
 
 A stable API. No features are added between 0.6 and 1.0; what is left is a series of
-gates, and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass them all.
+gates (0.6, 0.7, 0.8, 0.9), and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass
+them all.
 
-- [x] A review of every crate, the `unsafe` code and security (0.6).
-- [x] The API settled: every public item reviewed against the [Agent-first](#agent-first)
-      principles, with the items the 0.6 reviews left for it, and a service built by an AI
-      agent from the documentation alone (0.7).
-- [ ] `cargo-semver-checks` in CI, checking every change against 0.7.0.
-- [ ] Real use: giong in a production service, with its user reporting back.
 - [ ] Documentation: every public item documented, and the limitations section of the
       README reduced to deliberate non-goals.
-- [ ] Verification as the release gate: a 72-hour soak, fuzzing, fault injection, speed
-      and memory thresholds checked in CI, and a run on bare metal.
+- [ ] 0.8 and 0.9 passed.
+- [ ] `1.0.0-rc.N`: release candidates that change nothing but fixes, until one passes
+      every gate; that one becomes 1.0.0.
 
 The API freeze also makes sure that nothing public ties the API to Linux or to HTTP/2 in a
 way that the releases below would have to break. A first pass over `main` found nothing
 that forces a 2.0, and a short list to settle before the freeze
 ([findings](docs/reviews/2026-11-api-portability.md)).
 
-After 1.0, each minor release adds one thing and breaks nothing: code written for 1.0 keeps
-compiling. gRPC comes first because it builds on HTTP/2, which is done; macOS next, because
-its kqueue driver follows the path the epoll driver opened; HTTP/3 after that, the largest
-piece of protocol work, once UDP has been measured on bare metal; Windows last, the largest
-change of platform. WebSocket comes later, when someone needs it.
+After 1.0, each minor release has one main theme and breaks nothing: code written for 1.0 keeps
+compiling. The work runs on two tracks at once, and each release ships as soon as its own
+gates pass. The protocol track does gRPC, which builds on HTTP/2, then HTTP/3, the largest
+piece of protocol work. The platform track first moves the system calls outside the drivers
+behind one internal layer, built once for both systems, then adds macOS, whose kqueue driver
+follows the path the epoll driver opened, then Windows, the largest change of platform.
+gRPC is 1.1 and macOS 1.2; HTTP/3 and Windows take 1.3 and 1.4 in the order they pass their
+gates. Nothing of 1.x lands on `main` before 1.0.0: until then only prototypes and
+measurements that touch no released code, and 1.0.x fixes come from a `release/1.0` branch
+afterwards. WebSocket comes later, when someone needs it.
+
+Every 1.x release keeps the [Agent-first](#agent-first) line (coded errors with their
+pages, one obvious way, `llms.txt` and `AGENTS.md` updated with the feature, giong-mcp and
+tracing for what it adds), passes a build of a small service by an AI agent from the
+documentation alone, and is benchmarked against the reference implementation named in its
+section before any claim about speed.
 
 Two speed items once planned for 0.6 also wait until after 1.0, and land only with a
 benchmark showing what they buy: receive bundles (several buffers per completion) and
-optional NAPI busy polling.
+optional NAPI busy polling. Two more for large machines, measured on a server with two
+sockets: workers that use the memory of their own NUMA node, and workers matched to the
+receive queues of the network card, so a packet is handled on the core it arrived on.
+giong already sizes and pins its workers by itself (CPU affinity and container quota) and
+spreads connections between them; it does not retune itself while running, which would
+make behaviour hard to predict, but giong-mcp suggests settings from what it measures.
 
 ## 1.1 — gRPC
 
-gRPC on `giong-http`'s HTTP/2 server and client, in a new crate, `giong-grpc`.
+gRPC on `giong-http`'s HTTP/2 server and client, in a new crate, `giong-grpc`, on a
+protobuf of its own, and a simulation driver that tests every service deterministically.
 
 - [ ] Trailers in `giong-http`: a streamed response body that ends with trailers, and
       trailers that can be read at the end of a request body and of a client response. gRPC
@@ -350,11 +397,21 @@ gRPC on `giong-http`'s HTTP/2 server and client, in a new crate, `giong-grpc`.
 - [ ] `giong-grpc`: unary, server-streaming, client-streaming and bidirectional calls;
       deadlines (`grpc-timeout`), status codes, metadata, cancellation, message size limits
       and gzip. Code generated from `.proto` files at build time, with no macros in user
-      code. Errors carry giong codes.
+      code and no `protoc` to install. Errors carry giong codes.
+- [ ] `giong-proto`: protobuf messages decoded as views over the receive buffer, with no
+      copy and no allocation for strings and bytes, and encoded straight into the send
+      buffer. Held to Google's protobuf conformance suite and fuzzed against prost.
+- [ ] The same service over gRPC-Web, for browsers, and as JSON over HTTP from the
+      `google.api.http` annotations of its `.proto`: one definition, three ways to call it.
+- [ ] A simulation driver: a service, its clients and the network run in one thread, in
+      simulated time, from a seed. Packets are lost, reordered and delayed, connections
+      reset, disks fail and clocks jump as the seed decides, and a failing run replays
+      exactly from its seed.
 - [ ] Health checking and server reflection, so standard tools (`grpcurl`, Kubernetes gRPC
       probes) work against a giong service.
 - [ ] Tested against grpc-go in both directions with gRPC's interoperability test cases,
-      the message framing fuzzed, and benchmarked against tonic.
+      the message framing fuzzed, and benchmarked against tonic: calls per second, p99
+      latency and memory per open stream, for unary and streaming calls.
 
 **Exit criteria:** the interoperability test cases pass against grpc-go as client and as
 server, and a benchmark compares unary and streaming calls with tonic.
@@ -362,7 +419,7 @@ server, and a benchmark compares unary and streaming calls with tonic.
 ## 1.2 — macOS
 
 giong builds and runs on macOS, for developing and testing services on a Mac. Production
-stays on Linux.
+stays on Linux. Two safeguards for code written in a hurry, on every system, ship with it.
 
 - [ ] A kqueue driver behind the same operations as io_uring and epoll: readiness like
       epoll, file operations on the pool of blocking threads, `EVFILT_USER` for wake-ups
@@ -374,6 +431,12 @@ stays on Linux.
       configuration. Kernel TLS stays Linux only: `Ktls::Auto` keeps connections in the
       process.
 - [ ] CI on Apple Silicon: the test suite and the examples.
+- [ ] A worker guard: code that blocks a worker (a blocking call, a long loop) is reported
+      while it happens, with where it was spawned and its stack, a coded error and the fix
+      (`spawn_blocking`, or a yield in the loop).
+- [ ] Overload protection: an adaptive limit on requests in flight and load shedding with
+      `503` and `Retry-After` before latency climbs, and a memory budget per worker, so a
+      small server under a spike slows down gracefully instead of falling over.
 
 **Exit criteria:** the test suite passes on macOS in CI, and the examples run there
 unchanged.
@@ -383,8 +446,14 @@ unchanged.
 HTTP/3 (RFC 9114) over QUIC (RFC 9000) in `giong-http`'s server and client, for the same
 handlers.
 
-- [ ] QUIC. The first decision, made with a benchmark: build on a sans-I/O implementation
-      that needs no runtime (quinn-proto) or write one here. Then TLS 1.3 through rustls's
+- [ ] QUIC of its own, in a new crate, `giong-quic`, built for one core per connection:
+      packets encrypted in place in the pool buffer, a whole flight sent with one
+      segmentation-offload submission, connection IDs steered to their core, and no lock
+      shared between workers. Crypto stays with rustls. Held to the QUIC interop runner
+      against quinn, quiche, ngtcp2 and msquic, and fuzzed against quinn-proto. If it does
+      not pass the core interop cases at a checkpoint about four weeks in, this release
+      ships on quinn-proto behind the same API and the native engine follows in a later
+      1.x. Then TLS 1.3 through rustls's
       QUIC support (RFC 9001), loss recovery and congestion control (RFC 9002), connection
       migration, and 0-RTT off by default.
 - [ ] UDP for QUIC in `giong::net`: segmentation offload on send (GSO) and receive (GRO),
@@ -393,8 +462,12 @@ handlers.
       not by the sender's address, which changes when a client moves between networks.
 - [ ] HTTP/3 and QPACK (RFC 9204) in the server and the client, advertised with `Alt-Svc`,
       with the same limits and coded errors as HTTP/2. Frames, QPACK and packets fuzzed.
-- [ ] Tested with the QUIC interop runner and with browsers; benchmarked on bare metal
-      against HTTP/2 on giong and against quinn with h3 on Tokio.
+- [ ] Automatic HTTPS: certificates from Let's Encrypt or any ACME server (RFC 8555,
+      TLS-ALPN-01), renewed in the background, and one call that serves HTTP/1.1, HTTP/2
+      and HTTP/3 for a domain. Tested against Pebble, Let's Encrypt's test server.
+- [ ] Tested with h3spec, the QUIC interop runner and browsers (Chromium and Firefox in
+      CI), with packet loss and reordering injected; benchmarked on bare metal against
+      HTTP/2 on giong and against quinn with h3 on Tokio.
 
 **Exit criteria:** browsers load pages from a giong server over HTTP/3, the interop
 runner's core test cases pass, and the bare-metal benchmark is published with its method.
@@ -415,7 +488,13 @@ platform it is tuned for.
 - [ ] Trust roots for `giong-tls` from the Windows certificate store, and DNS servers from
       the network adapters.
 - [ ] CI on Windows: the test suite and the examples. Speed measured against Tokio on the
-      same Windows machine, and published as it comes out.
+      same Windows machine, and published as it comes out. Tokio emulates readiness on top
+      of I/O completion ports; a driver that uses completions directly does not have to.
+- [ ] Registered I/O (RIO), Windows' registered-buffer interface, closest to io_uring,
+      where a benchmark shows it beats plain completion ports.
+- [ ] `giong-mcp` answers "why is this slow, why is it stuck" on every system: the slowest
+      places tasks are spawned from, blocked workers, pools waiting, shed requests, in one
+      report an agent can act on.
 
 **Exit criteria:** the test suite passes on Windows in CI, and a benchmark against Tokio on
 Windows is published with its method.
