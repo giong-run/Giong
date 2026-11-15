@@ -48,7 +48,8 @@ use std::panic;
 use std::ptr;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::runtime;
 use crate::DriverKind;
@@ -57,6 +58,18 @@ pub use crate::runtime::{worker_stats, WorkerStats};
 
 /// Where a task was spawned: a file, a line and a column.
 pub type Location = &'static panic::Location<'static>;
+
+/// Set in [`Counters::idle_ns`] while the worker is asleep.
+const ASLEEP: u64 = 1 << 63;
+
+/// Nanoseconds on a clock that is the same for every thread of the process,
+/// below 2^63 (292 years): what a sleep in progress is measured on, by the
+/// worker that sleeps and by the threads that read its pulse.
+fn clock_ns() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let since = EPOCH.get_or_init(Instant::now).elapsed();
+    u64::try_from(since.as_nanos()).unwrap_or(u64::MAX) & !ASLEEP
+}
 
 /// The counters a worker publishes for other threads (see [`Pulse`]).
 ///
@@ -67,6 +80,10 @@ pub(crate) struct Counters {
     ticks: AtomicU64,
     polls: AtomicU64,
     parks: AtomicU64,
+    /// Nanoseconds asleep. While the worker sleeps, [`ASLEEP`] is set and the
+    /// other bits hold the total minus the moment the sleep began (on
+    /// [`clock_ns`], modulo 2^63): a reader adds its own clock and has the
+    /// total with the sleep in progress, from one value.
     idle_ns: AtomicU64,
     spawned: AtomicU64,
     /// The location of the task being polled, or null between batches.
@@ -121,12 +138,54 @@ impl Counters {
         Self::bump(&self.spawned, 1);
     }
 
-    pub(crate) fn parked(&self, slept: Duration) {
+    /// The worker is about to sleep in the kernel. From here until
+    /// [`woke`](Self::woke), readers count the sleep in progress as idle
+    /// time: a worker that sleeps for minutes is idle for those minutes, not
+    /// only once it wakes.
+    pub(crate) fn sleeping(&self) {
+        let total = self.idle_ns.load(Ordering::Relaxed);
+        self.idle_ns
+            .store(total.wrapping_sub(clock_ns()) | ASLEEP, Ordering::Relaxed);
+    }
+
+    /// The sleep announced with [`sleeping`](Self::sleeping) is over.
+    pub(crate) fn woke(&self) {
         Self::bump(&self.parks, 1);
-        Self::bump(
-            &self.idle_ns,
-            u64::try_from(slept.as_nanos()).unwrap_or(u64::MAX),
-        );
+        let open = self.idle_ns.load(Ordering::Relaxed);
+        self.idle_ns
+            .store(open.wrapping_add(clock_ns()) & !ASLEEP, Ordering::Relaxed);
+    }
+
+    /// Nanoseconds asleep so far, the sleep in progress included.
+    ///
+    /// A reader's clock can run a little past the end of a sleep: the worker
+    /// reads the clock, then stores the total, and a reader in between sees
+    /// the sleep as still going. So a reading can be a few hundred
+    /// nanoseconds more than the next one; the caller keeps the highest
+    /// value it has given out (`WorkerShared::idle_seen`).
+    fn idle_ns(&self) -> u64 {
+        let mut value = self.idle_ns.load(Ordering::Relaxed);
+        // Read the clock during the sleep the value describes, not after
+        // it: the value is read again after the clock, and when it has
+        // changed the worker woke (or slept again) in between. It changes
+        // twice per sleep, each a system call apart, so a few tries are
+        // plenty; the last one is used as it is.
+        for _ in 0..4 {
+            if value & ASLEEP == 0 {
+                return value;
+            }
+            let now = clock_ns();
+            let again = self.idle_ns.load(Ordering::Relaxed);
+            if again == value {
+                return value.wrapping_add(now) & !ASLEEP;
+            }
+            value = again;
+        }
+        if value & ASLEEP == 0 {
+            value
+        } else {
+            value.wrapping_add(clock_ns()) & !ASLEEP
+        }
     }
 
     /// A task spawned at `location` is about to be polled.
@@ -143,13 +202,15 @@ impl Counters {
         self.polling.store(ptr::null_mut(), Ordering::Relaxed);
     }
 
-    pub(crate) fn read(&self) -> (u64, u64, u64, Duration, u64, Option<Location>) {
+    /// Ticks, polls, parks, nanoseconds asleep, tasks spawned, and the task
+    /// being polled.
+    pub(crate) fn read(&self) -> (u64, u64, u64, u64, u64, Option<Location>) {
         let polling = self.polling.load(Ordering::Relaxed);
         (
             self.ticks.load(Ordering::Relaxed),
             self.polls.load(Ordering::Relaxed),
             self.parks.load(Ordering::Relaxed),
-            Duration::from_nanos(self.idle_ns.load(Ordering::Relaxed)),
+            self.idle_ns(),
             self.spawned.load(Ordering::Relaxed),
             // SAFETY: the pointer is null or came from a `&'static Location`.
             unsafe { polling.as_ref() },
@@ -191,7 +252,8 @@ pub struct Pulse {
     pub polls: u64,
     /// Times the worker went to sleep in the kernel.
     pub parks: u64,
-    /// Total time spent asleep in the kernel.
+    /// Total time spent asleep in the kernel, the sleep in progress
+    /// included: for a worker with nothing to do it grows with the clock.
     pub idle: Duration,
     /// Tasks spawned on the worker.
     pub spawned: u64,

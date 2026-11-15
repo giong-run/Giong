@@ -1,6 +1,6 @@
 # giong-web
 
-Routing, middleware and JSON for HTTP services on the [giong](../README.md) runtime, on top of [`giong-http`](../giong-http/README.md). A handler is a plain `async fn`; every error, yours or the framework's, is answered as a problem+json body with a stable code. No macros, no Tokio.
+Routing, middleware and JSON for HTTP services on the [giong](../README.md) runtime, on top of [`giong-http`](../giong-http/README.md). A handler is a plain `async fn`; every error, yours or the framework's, is answered as a problem+json body with a stable code (the three answers `giong-http` gives before a request reaches the app are the [exception](#errors)). No macros, no Tokio.
 
 ```toml
 [dependencies]
@@ -111,6 +111,7 @@ async fn file(req: Req<State>) -> Result<Response, Error> {
 - `/users` and `/users/` are different paths. giong-web does not redirect from one to the other; its `404` names the one that exists.
 - `req.route()` gives the pattern that matched (`/teams/{team}/members/{id}`), for logs and metrics.
 - `Router::route(method, pattern, handler)` takes any method; `get`, `post`, `put`, `patch` and `delete` are shortcuts.
+- There is no `merge`. To keep the routes under one prefix in several routers (public ones and ones behind a key, say), `nest` each of them at the same prefix: `.nest("/api", public).nest("/api", private)`. Each keeps its own middleware; a `404` under the prefix goes through the first one's.
 
 ## Errors
 
@@ -128,10 +129,12 @@ async fn file(req: Req<State>) -> Result<Response, Error> {
 | 415 | `GIONG-E1208` | a body that should be JSON and has another `Content-Type` |
 | 503 | `GIONG-E1209` | `Timeout` ran out |
 | 500 | `GIONG-E1210` | the handler failed, or a handler or middleware panicked; the cause is logged, never sent |
-| 503 | `GIONG-E1211` | a database or service the handler needs cannot be reached (giong's connect, timeout and pool errors); `Retry-After: 1` |
+| 503 | `GIONG-E1211` | a database or service the handler needs cannot be reached (giong's connect, timeout and pool errors); `Retry-After: 1`. A statement the database cancelled at its own statement timeout (`GIONG-E3004`) is not among them: it is a `500` |
 | 403 | `GIONG-E1212` | a CORS preflight that `Cors` refused, saying which of origin, method or header |
 
 Your own errors take your own codes: `Error::not_found("user_not_found", "no user 42")`, `Error::conflict(..)`, `Error::new(429, "rate_limited", ..).with_header("Retry-After", "30")`. `Error::new` and `with_header` panic on a status outside `400..=599` and on a header value with a control character, which suits literals; a status or a value that comes from elsewhere goes through `Error::from_status` (anything else becomes `502`, the status given logged) and `try_with_header` (`Err` gives the error back without the header). `Error::of(&response)` reads the error back from a response, for middleware and tests. Every error response has `Cache-Control: no-store`.
+
+**Not problem+json: what `giong-http` refuses before the app sees the request.** A body larger than the server's `max_body_size` (`413`; 1 MiB unless changed, so a large JSON `POST` is enough), a head larger than its limit (`431`) and a request that is not valid HTTP (`400`) are answered by the server below giong-web: the status with an empty body, no code, no `X-Request-Id`, and no line from `Logger` or `Trace`, since no middleware runs. A client should read a `4xx` without a body as one of these three. On a route with `stream_bodies`, a body announced as longer than the route's limit is refused before the handler runs, the same bare way; one that grows past the limit while the handler reads it is a problem+json `413` (`GIONG-E1111`).
 
 `?` finds a giong code anywhere down the error's `source()` chain, so a pool timeout wrapped in your own error type is still a `503`. It reads the code from the type of giong's errors and from the start of the companion crates' messages, never from the text of an `io::Error`.
 

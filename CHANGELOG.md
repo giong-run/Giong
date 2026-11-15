@@ -84,12 +84,41 @@ kept as it is and what can be added in 1.x without breaking anything.
   `mget::<Vec<Option<String>>>(&keys)`, not `mget::<Vec<Option<String>>, _>(&keys)`.
 - **Breaking:** **giong-mcp**: `McpServer::url` returns `Option<String>`, `None` on a Unix
   socket, for which it used to return `unix:/path/mcp`, which no MCP client understands.
+- **giong-tls**: a certificate refused because it is marked as a certificate authority says
+  so, and how to make one that is not. A self-signed certificate from `openssl req -x509`
+  is marked that way unless told otherwise; curl accepts it once trusted and rustls does
+  not, and the error (`GIONG-E2004`) showed only rustls's debug value,
+  `Other(OtherError(CaUsedAsEndEntity))`, with a fix that told the reader to trust the
+  certificate they had already trusted. The example API's README, giong-tls's README and
+  the E2004 page now give the `openssl` command with `basicConstraints=critical,CA:FALSE`.
+- **Docs**: the gaps found by building a service from the published 0.6.0 documentation
+  alone. The README has a table for someone coming from Tokio (what takes the place of
+  `tokio::spawn`, `join!` and `select!`, `spawn_blocking`, `Arc<Mutex<..>>`, `tokio::sync`,
+  `interval` and `ctrl_c`), and `llms.txt` its short form. `examples/rest-api`, the one
+  whole service, is listed in `llms.txt`, in `llms-full.txt` and on the site. giong-http's
+  README says when a handler's future is dropped (a reset HTTP/2 stream, a timeout, the
+  end of a shutdown's grace period) and when it is not (a closed connection), and how to
+  serve one handler on two listeners. giong-web's README no longer says that every error
+  is problem+json: the `413`, `431` and `400` that giong-http answers before a request
+  reaches the app have an empty body and no log line, and a statement timeout is a `500`,
+  not a `503`; it also says how to split one prefix over several routers. giong-postgres's
+  README no longer says that any column can be read as a `String`, and says that
+  `Pool::get` can take every connection and that the pool's check for session changes
+  does not see inside functions such as `set_config`.
 
 ### Fixed
 
 - **giong**: a dropped UDP socket no longer takes a share of the datagrams meant for a
   socket bound to the same port right after it, during the moment before its close
   reaches the kernel.
+- **giong**, **giong-mcp**: a worker with nothing to do no longer reads as fully busy.
+  `Pulse::idle` grew only when a sleep ended, so a worker asleep for a minute had no idle
+  time to show for it until it woke, and giong-mcp's `overview`, which takes the busy share
+  from that figure, reported `busy: 1.0` for every worker of a quiet service (the
+  `workers` tool wakes the workers to ask them, and showed 0). The sleep in progress now
+  counts: for a sleeping worker `Pulse::idle` grows with the clock, and a later reading is
+  never lower than an earlier one. The cost on the worker is unchanged, two clock reads per
+  sleep.
 
 ## [0.6.0] - 2026-11-15
 

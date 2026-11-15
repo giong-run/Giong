@@ -257,6 +257,41 @@ fn a_certificate_from_an_unknown_authority_is_refused() {
     });
 }
 
+/// What `openssl req -x509` makes unless told otherwise: a self-signed
+/// certificate marked as an authority. Trusting it is not enough, and the
+/// error says what is wrong with it.
+#[test]
+fn a_self_signed_certificate_marked_as_an_authority_is_refused_with_the_reason() {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let authority = params.self_signed(&key).unwrap().pem();
+    // The same key and name without the mark: accepted.
+    let params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    let leaf = params.self_signed(&key).unwrap().pem();
+    let key = key.serialize_pem();
+    giong::block_on(async move {
+        let acceptor = TlsAcceptor::from_pem(authority.as_bytes(), key.as_bytes()).unwrap();
+        let connector = TlsConnector::with_root_pem(authority.as_bytes()).unwrap();
+        let addr = serve(acceptor, echo);
+        let err = connect(&connector, addr, "localhost").await.unwrap_err();
+        assert_eq!(code(&err), Some(Code::TlsCertificate), "{err}");
+        let shown = err.to_string();
+        assert!(shown.contains("marked as a certificate authority"), "{err}");
+        assert!(
+            shown.contains("basicConstraints=critical,CA:FALSE"),
+            "{err}"
+        );
+
+        let acceptor = TlsAcceptor::from_pem(leaf.as_bytes(), key.as_bytes()).unwrap();
+        let connector = TlsConnector::with_root_pem(leaf.as_bytes()).unwrap();
+        let addr = serve(acceptor, echo);
+        let tls = connect(&connector, addr, "localhost").await.unwrap();
+        tls.write_all(b"ok".to_vec()).await.0.unwrap();
+        assert_eq!(recv_exact(&tls, 2).await, b"ok");
+    });
+}
+
 #[test]
 fn an_ip_address_can_be_the_server_name() {
     let pki = pki();

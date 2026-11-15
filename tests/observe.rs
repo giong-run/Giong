@@ -180,6 +180,78 @@ fn counters_go_up_and_idle_time_is_counted() {
     });
 }
 
+/// A worker with nothing to do sleeps for as long as nothing happens. Its
+/// idle time has to grow meanwhile, not only when it next wakes: a reader
+/// that takes `1 - idle / window` for how busy a worker is would otherwise
+/// see a worker asleep for the whole window as fully busy.
+#[test]
+#[cfg_attr(miri, ignore = "timing: compares idle time with the clock")]
+fn a_sleep_in_progress_counts_as_idle() {
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let watcher = std::thread::spawn(move || {
+        let started = Instant::now();
+        while handle.pulse(0).state != WorkerState::Parked {
+            assert!(started.elapsed() < BLOCK_LIMIT, "never parked");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Nothing wakes the worker from here on: one sleep, for the whole
+        // window and longer.
+        let t = Instant::now();
+        let before = handle.pulse(0);
+        std::thread::sleep(Duration::from_millis(200));
+        let after = handle.pulse(0);
+        let window = t.elapsed();
+        handle.shutdown();
+        (before, after, window)
+    });
+    rt.run(|_| async { giong::shutdown_signal().await })
+        .unwrap();
+    let (before, after, window) = watcher.join().unwrap();
+    let idle = after.idle - before.idle;
+    assert!(idle >= Duration::from_millis(190), "{idle:?}");
+    assert!(idle <= window, "{idle:?} in {window:?}");
+}
+
+/// Read from another thread while the worker goes to sleep and wakes a
+/// thousand times a second, idle time never goes down, never passes the
+/// time since the runtime was built, and ends at what the sleeps add up to.
+#[test]
+#[cfg_attr(miri, ignore = "timing: compares idle time with the clock")]
+fn idle_time_only_goes_up_while_a_worker_sleeps_and_wakes() {
+    let built = Instant::now();
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let stop = Arc::new(AtomicBool::new(false));
+    let watcher = std::thread::spawn({
+        let (handle, stop) = (handle.clone(), stop.clone());
+        move || {
+            let mut last = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let idle = handle.pulse(0).idle;
+                assert!(idle >= last, "{idle:?} after {last:?}");
+                assert!(idle <= built.elapsed(), "{idle:?}");
+                last = idle;
+            }
+        }
+    });
+    rt.run(move |_| {
+        let stop = stop.clone();
+        async move {
+            for _ in 0..200 {
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+            stop.store(true, Ordering::Relaxed);
+        }
+    })
+    .unwrap();
+    watcher.join().unwrap();
+    let end = handle.pulse(0);
+    assert!(end.parks >= 200, "{end:?}");
+    assert!(end.idle >= Duration::from_millis(100), "{end:?}");
+    assert!(end.idle <= built.elapsed(), "{end:?}");
+}
+
 #[test]
 fn a_finished_runtime_reads_as_stopped() {
     let rt = giong::Builder::new().workers(1).build().unwrap();

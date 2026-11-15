@@ -175,6 +175,19 @@ fn mismatched_key(e: rustls::Error) -> io::Error {
 /// What rustls reported, with the code that says what to do about it.
 fn tls_error(e: rustls::Error) -> io::Error {
     match e {
+        // What `openssl req -x509` makes unless told otherwise, and what
+        // rustls reports only as a debug value.
+        rustls::Error::InvalidCertificate(_) if e.to_string().contains("CaUsedAsEndEntity") => {
+            coded(
+                Code::TlsCertificate,
+                "the peer's certificate was rejected: it is marked as a certificate authority \
+                 (basicConstraints CA:TRUE), and an authority's certificate cannot be the \
+                 peer's own (CaUsedAsEndEntity)",
+                "issue the peer's certificate with CA:FALSE: a self-signed one made with \
+                 `openssl req -x509` needs -addext \"basicConstraints=critical,CA:FALSE\"; or \
+                 have the authority sign a separate certificate for the peer.",
+            )
+        }
         rustls::Error::InvalidCertificate(_) => coded(
             Code::TlsCertificate,
             format!("the peer's certificate was rejected: {e}"),
@@ -472,6 +485,12 @@ impl TlsConnector {
 
     /// A connector that trusts the certificate authorities in `pem`: a
     /// private CA, or a server's own self-signed certificate.
+    ///
+    /// A self-signed certificate must not be marked as an authority
+    /// (`CA:TRUE`), which `openssl req -x509` does unless it is given
+    /// `-addext "basicConstraints=critical,CA:FALSE"`: a server that
+    /// presents an authority's certificate as its own is refused with
+    /// `GIONG-E2004`, whether the certificate is trusted or not.
     pub fn with_root_pem(pem: &[u8]) -> io::Result<Self> {
         let mut roots = RootCertStore::empty();
         for cert in pem_certs(pem)? {
