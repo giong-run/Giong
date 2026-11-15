@@ -85,6 +85,18 @@ impl Held {
         port.live = port.live.saturating_sub(1);
         port.released = true;
     }
+
+    /// Gives the port up for a socket whose descriptor was lent out, and so
+    /// may live on in a copy (passed to another process, say): only counts
+    /// it out, leaving the socket as it is. A bind of the same port right
+    /// after may then fail with `AddrInUse` while the copy listens, which is
+    /// what a copy that still listens means.
+    pub(crate) fn release_lent(self) {
+        let mut ports = ports();
+        let port = ports.entry((self.proto, self.port)).or_default();
+        port.live = port.live.saturating_sub(1);
+        port.released = true;
+    }
 }
 
 /// Binds a socket to `addr` with `bind`, which is refused with `AddrInUse`

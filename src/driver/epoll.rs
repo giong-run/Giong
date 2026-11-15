@@ -186,6 +186,10 @@ unsafe fn run_blocking(io: Io) -> i32 {
             len,
             offset,
         } => {
+            if offset == u64::MAX {
+                // The file's own position, as io_uring reads at offset -1.
+                return retry(|| libc::read(fd, buf.cast(), len as usize));
+            }
             let res = retry(|| libc::pread64(fd, buf.cast(), len as usize, offset as i64));
             if res == -libc::ESPIPE {
                 // A pipe or a device: no offsets, as with io_uring.
@@ -200,6 +204,9 @@ unsafe fn run_blocking(io: Io) -> i32 {
             len,
             offset,
         } => {
+            if offset == u64::MAX {
+                return retry(|| libc::write(fd, buf.cast(), len as usize));
+            }
             let res = retry(|| libc::pwrite64(fd, buf.cast(), len as usize, offset as i64));
             if res == -libc::ESPIPE {
                 retry(|| libc::write(fd, buf.cast(), len as usize))
@@ -247,6 +254,7 @@ unsafe fn run_blocking(io: Io) -> i32 {
         | Io::Writable { .. }
         | Io::SendMsg { .. }
         | Io::RecvMsg { .. }
+        | Io::Readable { .. }
         | Io::ReadReady { .. } => unreachable!("socket operations never block a thread"),
     }
 }
@@ -411,6 +419,35 @@ impl Epoll {
         false
     }
 
+    /// Sends `fd`'s reads and writes to the blocking threads from now on,
+    /// leaving its flags alone (see `Driver::keep_blocking`).
+    pub(crate) fn keep_blocking(&mut self, fd: RawFd) {
+        if let Ok(i) = usize::try_from(fd) {
+            if !matches!(self.fds.get(i), Some(Some(Slot::Pollable(_)))) {
+                self.set_slot(i, Slot::Blocking);
+            }
+        }
+    }
+
+    /// Forgets `fd`, which leaves this driver's care without being closed,
+    /// and takes it out of the epoll set.
+    pub(crate) fn release_fd(&mut self, fd: RawFd) {
+        if let Ok(i) = usize::try_from(fd) {
+            if matches!(self.fds.get(i), Some(Some(Slot::Pollable(_)))) {
+                // SAFETY: valid descriptors; the event is ignored for DEL.
+                unsafe {
+                    libc::epoll_ctl(
+                        self.epfd.as_raw_fd(),
+                        libc::EPOLL_CTL_DEL,
+                        fd,
+                        std::ptr::null_mut(),
+                    )
+                };
+            }
+        }
+        self.forget(fd);
+    }
+
     /// Forgets what is known about `fd`, which is being closed.
     fn forget(&mut self, fd: RawFd) {
         if let Some(slot) = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)) {
@@ -478,6 +515,7 @@ impl Epoll {
             | Io::Writable { fd }
             | Io::SendMsg { fd, .. }
             | Io::RecvMsg { fd, .. }
+            | Io::Readable { fd }
             | Io::ReadReady { fd, .. }
             | Io::Read { fd, .. }
             | Io::Write { fd, .. } => fd,
@@ -537,10 +575,29 @@ impl Epoll {
                     retry(|| libc::sendmsg(fd, msg, flags as i32 | libc::MSG_DONTWAIT)),
                     Dir::Write,
                 ),
-                Io::RecvMsg { fd, msg } => (
-                    retry(|| libc::recvmsg(fd, msg, libc::MSG_DONTWAIT)),
+                Io::RecvMsg { fd, msg, flags } => (
+                    retry(|| libc::recvmsg(fd, msg, flags | libc::MSG_DONTWAIT)),
                     Dir::Read,
                 ),
+                Io::Readable { fd } => {
+                    // As `Writable`: wait for the next "readable" edge
+                    // (`connecting` marks a wait that has begun). A
+                    // descriptor that is readable already reports it at
+                    // once, since registering it raises the edge.
+                    if *connecting {
+                        return Attempt::Done(0);
+                    }
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut pfd, 1, 0) > 0 {
+                        return Attempt::Done(0);
+                    }
+                    *connecting = true;
+                    return Attempt::Wait(fd, Dir::Read);
+                }
                 // A pipe or a socket: offsets do not apply.
                 Io::ReadReady { fd, buf, len } | Io::Read { fd, buf, len, .. } => (
                     retry(|| libc::read(fd, buf.cast(), len as usize)),
@@ -619,6 +676,7 @@ impl Epoll {
             | Io::Writable { .. }
             | Io::SendMsg { .. }
             | Io::RecvMsg { .. }
+            | Io::Readable { .. }
             | Io::ReadReady { .. } => false,
         }
     }

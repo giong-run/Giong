@@ -364,6 +364,7 @@ impl UdpSocket {
             // SAFETY: `msg` owns a live `Message`; the field pointer is taken
             // without making a reference.
             msg: unsafe { ptr::addr_of_mut!((*msg.as_ptr()).hdr) },
+            flags: 0,
         };
         // SAFETY: the header is in a `KernelBox` and points at its own fields
         // and at `buf`'s bytes; an `IoBufMut`'s bytes stay put when it moves.
@@ -462,6 +463,12 @@ impl UdpSocket {
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
+    }
+}
+
+impl std::os::fd::AsFd for UdpSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&*self.sock)
     }
 }
 

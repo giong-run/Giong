@@ -402,7 +402,10 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
         Io::SendMsg { fd, msg, flags, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),
-        Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
+        Io::RecvMsg { fd, msg, flags } => opcode::RecvMsg::new(types::Fd(fd), msg)
+            .flags(flags as u32)
+            .build(),
+        Io::Readable { fd } => opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32).build(),
         Io::ReadReady { fd, buf, len } => opcode::Read::new(types::Fd(fd), buf, len).build(),
         Io::Read {
             fd,

@@ -13,7 +13,7 @@ workspace, nine crates and an example service:
 
 | Path | Crate | What it is |
 |---|---|---|
-| `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
+| `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels, child processes, pipes, signals |
 | `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client` |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
@@ -40,6 +40,9 @@ Where the code is:
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
+| `src/process.rs`, `src/process/` | `Command` and `Child` (waited for through a pidfd), pipes and the process's own stdio (`pipe.rs`), the Linux calls (`sys.rs`) |
+| `src/signal.rs` | `signal::listen`: the process-wide handlers and the `giong-signal` thread that wakes listeners |
+| `src/net/fds.rs`, `src/net/activation.rs` | passing descriptors over Unix sockets (`SCM_RIGHTS`), Unix addresses and peer credentials; socket activation (`LISTEN_FDS`) |
 | `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
@@ -214,6 +217,10 @@ is loaded.
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
   cannot fix that (see `giong-compat/README.md`).
+- **Signals are process-wide.** A test that installs a handler (`giong::signal::listen`)
+  changes the whole test binary, so such tests live in `tests/signal.rs`. Tests that need
+  a child process with a particular environment re-run their own test binary with an
+  environment variable set (see `tests/process.rs` and `tests/activation.rs`).
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 
