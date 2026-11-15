@@ -937,6 +937,13 @@ Also:
   tasks, channels, timers, `observe`, several workers), on the epoll driver, in CI on
   every change. It found memory the kernel writes into being reached through a pointer
   taken before its `Box` moved, in the file and UDP paths (nothing miscompiled); fixed.
+- **Kani proofs** (`scripts/check.sh kani`, [docs/kani.md](docs/kani.md)): the model
+  checker proves, for every input within stated bounds, that the slab's free list stays
+  sound, that no receive buffer is ever both lent to the kernel and read by user space or
+  lent twice (from any pool state of two buffers, so for sequences of any length), that a
+  dropped operation's memory and slab entry outlive the kernel's last completion in every
+  order of events, and that `KernelBox` pointers survive moves; in CI on every change. No
+  bug found; each proof caught a planted one.
 - **Soak** (`scripts/check.sh soak`, `tests/soak.rs`): TCP clients on every worker that
   close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
   traffic alongside; afterwards no descriptor, memory or driver state may be left over.
@@ -953,7 +960,7 @@ Also:
   period 156 of 200 requests were answered; with one, 400 of 400.
 - **CI** runs formatting, clippy, the documentation build, a build with Rust 1.80, the
   repeated tests, the fallback setups and the epoll driver, the tests inside Docker,
-  ThreadSanitizer, Miri, the loom models, the real 5.15, 6.0 and 6.1 kernels and the core
+  ThreadSanitizer, Miri, the Kani proofs, the loom models, the real 5.15, 6.0 and 6.1 kernels and the core
   crate with its direct dependencies at the lowest versions it allows on every change, and
   fuzzing and the soak test every night.
 

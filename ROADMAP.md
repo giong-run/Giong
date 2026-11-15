@@ -315,7 +315,7 @@ features.
       result is the same on every run of a shared runner, heap allocations per request, and
       memory per idle connection over HTTP/1.1, HTTP/2 and HTTPS, each with its raw data in
       `bench/`.
-- [ ] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
+- [x] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
       boxes, the lifetimes of operations), run in CI.
 - [ ] Fault injection through an internal simulation driver: lost, reordered and delayed
       packets, reset connections, failing disks and jumping clocks, chosen by a seed, and a
