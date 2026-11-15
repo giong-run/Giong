@@ -27,6 +27,7 @@ dependencies = [
  "giong-web",
  "libc",
  "rcgen",
+ "rustls",
 ]
 
 [[package]]
