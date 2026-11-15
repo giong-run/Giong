@@ -1,0 +1,19 @@
+[package]
+name = "giong-sim"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+giong = { path = ".." }
+libc = "0.2.172"
+
+[dev-dependencies]
+socket2 = "0.6"
+giong-redis = { path = "../giong-redis" }
+giong-http = { path = "../giong-http", features = ["tls", "client"] }
+giong-tls = { path = "../giong-tls" }
+rcgen = "0.13"
+giong-postgres = { path = "../giong-postgres" }
