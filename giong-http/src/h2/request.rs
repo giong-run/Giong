@@ -20,6 +20,9 @@ use crate::request::{BodyBytes, Request};
 /// section 6.5.2).
 const FIELD_OVERHEAD: usize = 32;
 
+/// The largest field buffer a connection keeps between requests.
+const KEEP_SCRATCH: usize = 4 * 1024;
+
 /// What a header block makes of a request.
 pub(crate) enum Built {
     Request(Request),
@@ -33,10 +36,12 @@ pub(crate) enum Built {
 
 /// Collects the fields of one request header block.
 pub(crate) struct Builder {
-    /// `name: value\r\n` lines of the regular fields.
-    lines: Vec<u8>,
-    /// Values of the pseudo-header fields, back to back.
-    pseudo: Vec<u8>,
+    /// The values of the pseudo-header fields, back to back, then (from
+    /// `lines_from`) the `name: value\r\n` lines of the regular fields: the
+    /// pseudo-header fields come first. A connection reuses this buffer
+    /// from one request to the next.
+    scratch: Vec<u8>,
+    lines_from: usize,
     method: Option<Range<usize>>,
     scheme: Option<Range<usize>>,
     path: Option<Range<usize>>,
@@ -90,10 +95,18 @@ fn parse_length(value: &[u8]) -> Option<u64> {
 impl Builder {
     /// A builder for a header list of at most `limit` bytes (counted as
     /// RFC 9113 counts `SETTINGS_MAX_HEADER_LIST_SIZE`).
+    #[cfg(test)]
     pub(crate) fn new(limit: usize) -> Self {
+        Self::with_scratch(limit, Vec::new())
+    }
+
+    /// The same, writing into `scratch` (its contents are dropped), which
+    /// [`into_scratch`](Self::into_scratch) gives back for the next request.
+    pub(crate) fn with_scratch(limit: usize, mut scratch: Vec<u8>) -> Self {
+        scratch.clear();
         Self {
-            lines: Vec::new(),
-            pseudo: Vec::new(),
+            scratch,
+            lines_from: 0,
             method: None,
             scheme: None,
             path: None,
@@ -117,9 +130,9 @@ impl Builder {
     }
 
     fn set_pseudo(&mut self, which: u8, value: &[u8]) {
-        let start = self.pseudo.len();
-        self.pseudo.extend_from_slice(value);
-        let range = Some(start..self.pseudo.len());
+        let start = self.scratch.len();
+        self.scratch.extend_from_slice(value);
+        let range = Some(start..self.scratch.len());
         let slot = match which {
             b'm' => &mut self.method,
             b's' => &mut self.scheme,
@@ -178,7 +191,10 @@ impl Builder {
             };
             return self.set_pseudo(which, value);
         }
-        self.regular = true;
+        if !self.regular {
+            self.regular = true;
+            self.lines_from = self.scratch.len();
+        }
         if !valid_name(name) {
             return self.fail("a field name that is not a lowercase token");
         }
@@ -208,7 +224,7 @@ impl Builder {
                 if self.host.is_some() {
                     return self.fail("two host header fields");
                 }
-                let start = self.lines.len() + name.len() + 2;
+                let start = self.scratch.len() - self.lines_from + name.len() + 2;
                 self.host = Some(start..start + value.len());
             }
             b"cookie" => {
@@ -220,14 +236,14 @@ impl Builder {
             }
             _ => {}
         }
-        self.lines.extend_from_slice(name);
-        self.lines.extend_from_slice(b": ");
-        self.lines.extend_from_slice(value);
-        self.lines.extend_from_slice(b"\r\n");
+        self.scratch.extend_from_slice(name);
+        self.scratch.extend_from_slice(b": ");
+        self.scratch.extend_from_slice(value);
+        self.scratch.extend_from_slice(b"\r\n");
     }
 
     /// Checks the whole list and builds the request (with no body yet).
-    pub(crate) fn finish(mut self, peer: Option<SocketAddr>) -> Built {
+    pub(crate) fn finish(&mut self, peer: Option<SocketAddr>) -> Built {
         if let Some(status) = self.status {
             return Built::Status(status);
         }
@@ -237,7 +253,11 @@ impl Builder {
         let Some(method) = self.method.clone() else {
             return Built::Malformed("no :method");
         };
-        let connect = &self.pseudo[method.clone()] == b"CONNECT";
+        if !self.regular {
+            self.lines_from = self.scratch.len();
+        }
+        let (pseudo, lines) = (&self.scratch[..], &self.scratch[self.lines_from..]);
+        let connect = &pseudo[method.clone()] == b"CONNECT";
         let target = if connect {
             // RFC 9113, section 8.5: only :method and :authority.
             if self.scheme.is_some() || self.path.is_some() {
@@ -254,8 +274,8 @@ impl Builder {
             let Some(path) = self.path.clone() else {
                 return Built::Malformed("no :path");
             };
-            let value = &self.pseudo[path.clone()];
-            let options = &self.pseudo[method.clone()] == b"OPTIONS";
+            let value = &pseudo[path.clone()];
+            let options = &pseudo[method.clone()] == b"OPTIONS";
             if !(value.starts_with(b"/") || (options && value == b"*")) {
                 return Built::Malformed("a :path that is neither absolute nor *");
             }
@@ -264,30 +284,30 @@ impl Builder {
         // RFC 9113, section 8.3.1. HTTP/1.1 holds an absolute target's
         // authority to the same rule (see `parse_head`).
         if let (Some(authority), Some(host)) = (&self.authority, &self.host) {
-            if !same_authority(&self.lines[host.clone()], &self.pseudo[authority.clone()]) {
+            if !same_authority(&lines[host.clone()], &pseudo[authority.clone()]) {
                 return Built::Malformed("a host header field that differs from :authority");
             }
         }
 
         // The head, as HTTP/1.1 would have it.
         let mut buf = Vec::with_capacity(
-            method.len() + target.len() + 11 + self.lines.len() + self.cookies.len() + 64,
+            method.len() + target.len() + 11 + lines.len() + self.cookies.len() + 64,
         );
-        buf.extend_from_slice(&self.pseudo[method.clone()]);
+        buf.extend_from_slice(&pseudo[method.clone()]);
         buf.push(b' ');
         let target_start = buf.len();
-        buf.extend_from_slice(&self.pseudo[target.clone()]);
+        buf.extend_from_slice(&pseudo[target.clone()]);
         let target_end = buf.len();
         buf.extend_from_slice(b" HTTP/2\r\n");
         let headers_start = buf.len();
         if self.host.is_none() {
             if let Some(authority) = self.authority.clone().filter(|a| !a.is_empty()) {
                 buf.extend_from_slice(b"host: ");
-                buf.extend_from_slice(&self.pseudo[authority]);
+                buf.extend_from_slice(&pseudo[authority]);
                 buf.extend_from_slice(b"\r\n");
             }
         }
-        buf.append(&mut self.lines);
+        buf.extend_from_slice(lines);
         if !self.cookies.is_empty() {
             buf.extend_from_slice(b"cookie: ");
             buf.extend_from_slice(&self.cookies);
@@ -317,6 +337,17 @@ impl Builder {
             peer,
             charge: Charge::none(),
         })
+    }
+
+    /// The buffer the fields were written to, emptied, for the next request.
+    /// One that grew past `KEEP_SCRATCH` (a request with large headers) is
+    /// dropped instead of kept for the life of the connection.
+    pub(crate) fn into_scratch(mut self) -> Vec<u8> {
+        if self.scratch.capacity() > KEEP_SCRATCH {
+            return Vec::new();
+        }
+        self.scratch.clear();
+        self.scratch
     }
 }
 

@@ -153,13 +153,13 @@ memory per worker  ≈  max_buffered_request_bytes
   are refused with `503` (HTTP/1.1) or `REFUSED_STREAM` (HTTP/2) instead of being buffered
   ([GIONG-E1120](errors/E1120.md)). Bodies read as a stream (`Handler::stream_body`) hold
   one piece at a time and are not counted.
-- An idle connection costs about 2 KiB over HTTP/1.1, 4.5 KiB over HTTP/2 and 12.5 KiB over
+- An idle connection costs about 2 KiB over HTTP/1.1, 4.5 KiB over HTTP/2 and 11 KiB over
   HTTPS in the process, and the kernel about 4 KiB more per socket (charged to the
   container's memory under cgroup v2). `max_connections` (10,000 per `serve` call by
   default) bounds the count.
 
 The defaults fit the budget to the container, but not the number of connections: 10,000
-idle HTTPS connections take about 165 MiB with the kernel's share. In a small container,
+idle HTTPS connections take about 145 MiB with the kernel's share. In a small container,
 lower `max_connections` to what fits next to the budget:
 
 ```rust

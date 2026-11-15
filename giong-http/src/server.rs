@@ -765,16 +765,29 @@ impl Server {
         let accept = || listener.accept();
         self.accept_loop(accept, |stream: TcpStream, slot| {
             let _ = stream.set_nodelay(true);
-            let (acceptor, handler) = (acceptor.clone(), handler.clone());
+            let acceptor = acceptor.clone();
+            let handler = handler.clone();
+            // The handshake, on the heap for its length only, holding what
+            // the connection needs (the acceptor and TCP stream for the
+            // handshake, then the rest), and reading the connection's address
+            // and protocol. The connection's task then holds the TLS stream
+            // once, inside the HTTP state, and nothing else: an input the
+            // task captures, or a local of it that is borrowed, keeps its
+            // bytes in the task for as long as the connection lasts.
+            let handshake = HeapFuture::new(async move {
+                let tls = acceptor.accept(stream).await?;
+                let h2 = tls.alpn_protocol().as_deref() == Some(b"h2");
+                let peer = Transport::peer_addr(&tls);
+                io::Result::Ok((tls, h2, peer, cfg, slot, handler))
+            });
             drop(giong::spawn(async move {
                 // A failed handshake (a port scan, a plain-HTTP client, an
                 // unknown protocol version) just ends the connection.
-                let Ok(tls) = acceptor.accept(stream).await else {
+                let Ok((tls, h2, peer, cfg, slot, handler)) = handshake.await else {
                     return;
                 };
-                if tls.alpn_protocol().as_deref() == Some(b"h2") {
+                if h2 {
                     let _slot = slot;
-                    let peer = Transport::peer_addr(&tls);
                     // On the heap, so that HTTP/1.1 connections do not
                     // carry the larger HTTP/2 state.
                     HeapFuture::new(serve_h2(tls, cfg, peer, handler)).await;
