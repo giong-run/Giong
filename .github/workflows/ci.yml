@@ -585,12 +585,27 @@ jobs:
           name: linux-${{ matrix.kernel }}-log
           path: target/kernels/linux-${{ matrix.kernel }}.log
 
+  # The public API keeps the semver promise against the last release: no
+  # breaking change between releases (scripts/semver.sh).
+  semver:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install cargo-semver-checks
+        run: cargo install --locked cargo-semver-checks --version 0.51.0
+      - run: scripts/semver.sh
+
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, the kernels, Docker,
   # the other server versions, loom, h2spec, the lowest dependency versions)
   # hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver]
     if: always()
     runs-on: ubuntu-24.04
     steps:
