@@ -21,6 +21,11 @@ io-uring = "0.7.2"
 libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
 
+[features]
+# UDP offloads for QUIC (GSO, GRO, ECN) on UdpSocket. Prototype on the
+# feat/quic-prototype branch: not part of the 1.0 API.
+unstable-udp-offload = []
+
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.

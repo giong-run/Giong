@@ -34,6 +34,17 @@ const NAME_LEN: usize = mem::size_of::<libc::sockaddr_in6>();
 /// Bytes of every pool buffer that are not available for payload.
 const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 
+/// Room for control messages in front of the payload when GRO or ECN is on
+/// (`unstable-udp-offload`): one `int` for `UDP_GRO` and one for `IP_TOS` or
+/// `IPV6_TCLASS`, each `CMSG_SPACE(4)` = 24 bytes on 64-bit Linux.
+const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE;
+const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
+const CMSG_INT_SPACE: usize = (CMSG_HDR + 4 + 7) & !7;
+/// Largest payload a GRO receive can hand over: 64 KiB of coalesced
+/// datagrams.
+#[cfg(feature = "unstable-udp-offload")]
+const GRO_MAX: usize = 65_535;
+
 /// The `msghdr` of every multishot receive. The kernel only reads the two
 /// length fields from it: room for the sender's address, no control data.
 struct RecvHeader(libc::msghdr);
@@ -48,6 +59,16 @@ static RECV_HEADER: RecvHeader = {
     RecvHeader(hdr)
 };
 
+/// The header of a multishot receive that also takes control messages
+/// (GRO segment size, ECN bits).
+static RECV_HEADER_CONTROL: RecvHeader = {
+    // SAFETY: as above.
+    let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
+    hdr.msg_namelen = NAME_LEN as libc::socklen_t;
+    hdr.msg_controllen = CONTROL_SPACE as _;
+    RecvHeader(hdr)
+};
+
 /// Everything a one-off `sendmsg` / `recvmsg` points at, in a [`KernelBox`]
 /// so that the addresses stay put, and stay valid, while the kernel uses
 /// them.
@@ -55,6 +76,10 @@ struct Message {
     hdr: libc::msghdr,
     iov: libc::iovec,
     addr: libc::sockaddr_storage,
+    /// Control messages of a send (`UDP_SEGMENT`, `IP_TOS`), aligned for
+    /// `cmsghdr`. Unused unless `unstable-udp-offload` sets them.
+    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    control: [u64; CONTROL_SPACE / 8],
 }
 
 impl Message {
@@ -91,6 +116,38 @@ impl Message {
     }
 }
 
+/// The GRO segment size and the ECN bits from the control messages of a
+/// receive. Unknown or malformed messages are skipped.
+pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8) {
+    let (mut segment, mut ecn) = (0, 0);
+    while control.len() >= CMSG_HDR {
+        let len = usize::from_ne_bytes(control[..8].try_into().expect("eight bytes"));
+        let level = i32::from_ne_bytes(control[8..12].try_into().expect("four bytes"));
+        let kind = i32::from_ne_bytes(control[12..16].try_into().expect("four bytes"));
+        if len < CMSG_HDR || len > control.len() {
+            break;
+        }
+        let data = &control[CMSG_HDR..len];
+        let int = || {
+            data.get(..4)
+                .map(|b| i32::from_ne_bytes(b.try_into().expect("four")))
+        };
+        match (level, kind) {
+            (libc::SOL_UDP, libc::UDP_GRO) => {
+                segment = int().map_or(0, |v| u16::try_from(v).unwrap_or(0));
+            }
+            // IPv4 hands the TOS byte over as one byte, IPv6 the traffic
+            // class as an int.
+            (libc::IPPROTO_IP, libc::IP_TOS) => ecn = data.first().map_or(0, |b| b & 3),
+            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => ecn = int().map_or(0, |v| (v & 3) as u8),
+            _ => {}
+        }
+        let next = (len + 7) & !7;
+        control = control.get(next..).unwrap_or(&[]);
+    }
+    (segment, ecn)
+}
+
 fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
     let family = i32::from(u16::from_ne_bytes([*name.first()?, *name.get(1)?]));
     let port = u16::from_be_bytes([*name.get(2)?, *name.get(3)?]);
@@ -116,29 +173,79 @@ fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
 pub struct Datagram {
     buf: RecvBuf,
     truncated: bool,
+    /// Where the payload starts in `buf`.
+    payload_at: u16,
+    /// GRO: the size of every coalesced datagram but the last (0: one
+    /// datagram).
+    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    segment: u16,
+    /// The ECN bits of the IP header (0 when not asked for).
+    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    ecn: u8,
 }
 
 impl Datagram {
-    /// Splits what a multishot `recvmsg` wrote into a buffer.
-    fn parse(buf: RecvBuf) -> io::Result<(Self, SocketAddr)> {
+    /// Splits what a multishot `recvmsg` wrote into a buffer, armed with
+    /// `control_space` bytes of room for control messages.
+    fn parse(buf: RecvBuf, control_space: usize) -> io::Result<(Self, SocketAddr)> {
         let malformed = || unexpected("io_uring returned a malformed datagram");
-        if buf.len() < OVERHEAD {
+        let payload_at = OVERHEAD + control_space;
+        if buf.len() < payload_at {
             return Err(malformed());
         }
         let field = |i: usize| {
             let bytes: [u8; 4] = buf[i * 4..i * 4 + 4].try_into().expect("four bytes");
             u32::from_ne_bytes(bytes) as usize
         };
-        let (name_len, payload_len, flags) = (field(0), field(2), field(3) as i32);
+        let (name_len, control_len, payload_len, flags) =
+            (field(0), field(1), field(2), field(3) as i32);
         let from = parse_addr(&buf[OUT_HEADER..OUT_HEADER + name_len.min(NAME_LEN)])
             .ok_or_else(malformed)?;
-        let truncated = flags & libc::MSG_TRUNC != 0 || payload_len > buf.len() - OVERHEAD;
-        Ok((Self { buf, truncated }, from))
+        let truncated = flags & libc::MSG_TRUNC != 0 || payload_len > buf.len() - payload_at;
+        let (segment, ecn) = if control_space > 0 {
+            parse_control(&buf[OVERHEAD..OVERHEAD + control_len.min(control_space)])
+        } else {
+            (0, 0)
+        };
+        let payload_at = payload_at as u16;
+        Ok((
+            Self {
+                buf,
+                truncated,
+                payload_at,
+                segment,
+                ecn,
+            },
+            from,
+        ))
     }
 
     /// The payload.
     pub fn as_slice(&self) -> &[u8] {
-        &self.buf[OVERHEAD..]
+        &self.buf[usize::from(self.payload_at)..]
+    }
+
+    /// With GRO on ([`UdpSocket::set_gro`]), several datagrams of one sender
+    /// can arrive coalesced in one: this is the size of each of them but the
+    /// last, which may be shorter. `None` for a single datagram.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn segment_size(&self) -> Option<usize> {
+        (self.segment != 0 && usize::from(self.segment) < self.as_slice().len())
+            .then_some(usize::from(self.segment))
+    }
+
+    /// The datagrams in this one: one, or several coalesced by GRO.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn segments(&self) -> std::slice::Chunks<'_, u8> {
+        let payload = self.as_slice();
+        payload.chunks(self.segment_size().unwrap_or(payload.len()).max(1))
+    }
+
+    /// The two ECN bits of the IP header the datagram came with (0 to 3),
+    /// once [`UdpSocket::set_recv_ecn`] is on; 0 otherwise.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn ecn(&self) -> u8 {
+        self.ecn
     }
 
     /// `true` if the datagram was longer than a receive buffer and its end
@@ -188,6 +295,9 @@ impl std::fmt::Debug for Datagram {
 pub struct UdpSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
+    /// Receives take control messages (GRO, ECN): set before the first
+    /// `recv_from`.
+    control: std::cell::Cell<bool>,
     /// The socket's hold on its port, for one that [`bind`](Self::bind)
     /// made on a port of the caller's choice (see `share`).
     held: Option<share::Held>,
@@ -262,6 +372,7 @@ impl UdpSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
+            control: std::cell::Cell::new(false),
             held: None,
             _not_send: PhantomData,
         }
@@ -328,14 +439,22 @@ impl UdpSocket {
                             Err(unexpected("io_uring returned a datagram without a buffer"))
                         });
                     }
-                    MultiPoll::Data(buf) => return Poll::Ready(Datagram::parse(buf)),
+                    MultiPoll::Data(buf) => {
+                        let space = if self.control.get() { CONTROL_SPACE } else { 0 };
+                        return Poll::Ready(Datagram::parse(buf, space));
+                    }
                     MultiPoll::NeedArm => {
                         if !wait_for_pool(&mut driver, cx, true) {
                             return Poll::Pending;
                         }
+                        let hdr = if self.control.get() {
+                            &RECV_HEADER_CONTROL.0
+                        } else {
+                            &RECV_HEADER.0
+                        };
                         let io = MultiIo::RecvMsg {
                             fd: self.sock.as_raw_fd(),
-                            hdr: &RECV_HEADER.0,
+                            hdr,
                         };
                         driver.arm_multi(key, io);
                     }
@@ -556,9 +675,188 @@ impl UdpSocket {
         inet_addr(self.sock.peer_addr()?)
     }
 
+    /// Turns UDP generic receive offload on or off (Linux 5.0+,
+    /// `unstable-udp-offload`): the kernel may hand over several datagrams
+    /// of one sender, of one size, as one [`Datagram`], whose
+    /// [`segment_size`](Datagram::segment_size) says where to cut it. One
+    /// receive then costs what one datagram did, for up to 64 KiB of them.
+    ///
+    /// Call it before the first [`recv_from`](Self::recv_from). The worker's
+    /// receive buffers must hold 64 KiB of payload (see
+    /// [`Builder::recv_buffers`](crate::Builder::recv_buffers)): the kernel
+    /// cuts a coalesced datagram that does not fit and drops the rest.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn set_gro(&self, on: bool) -> io::Result<()> {
+        self.before_recv("set_gro")?;
+        if on {
+            let size = runtime::with_worker(|w| w.driver.borrow().pool().buf_len());
+            let need = GRO_MAX + OVERHEAD + CONTROL_SPACE;
+            if size < need {
+                return Err(raise(
+                    Code::RecvBufferTooSmall,
+                    format!(
+                        "set_gro needs receive buffers of {need} bytes and this worker's are \
+                         {size}: the kernel would cut coalesced datagrams and drop the rest"
+                    ),
+                    format!(
+                        "build the runtime with Builder::recv_buffers(count, {need}) (or more), \
+                         or leave GRO off."
+                    ),
+                ));
+            }
+        }
+        setsockopt_int(&self.sock, libc::SOL_UDP, libc::UDP_GRO, on as libc::c_int)?;
+        if on {
+            self.control.set(true);
+        }
+        Ok(())
+    }
+
+    /// Reports the ECN bits of received datagrams ([`Datagram::ecn`]):
+    /// `IP_RECVTOS`, and `IPV6_RECVTCLASS` on an IPv6 socket. QUIC uses them
+    /// for congestion control (RFC 9000, section 13.4). Call it before the
+    /// first [`recv_from`](Self::recv_from). `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn set_recv_ecn(&self, on: bool) -> io::Result<()> {
+        self.before_recv("set_recv_ecn")?;
+        let v = on as libc::c_int;
+        if self.local_addr()?.is_ipv6() {
+            setsockopt_int(&self.sock, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, v)?;
+            // A dual-stack socket gets IPv4 datagrams too; refusal is fine
+            // on an IPv6-only one.
+            let _ = setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_RECVTOS, v);
+        } else {
+            setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_RECVTOS, v)?;
+        }
+        if on {
+            self.control.set(true);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "unstable-udp-offload")]
+    fn before_recv(&self, what: &str) -> io::Result<()> {
+        if runtime::with_worker(|w| self.recv.is_active(w)) {
+            return Err(raise(
+                Code::RecvAlreadyStarted,
+                format!("{what} was called after recv_from had started receiving on this socket"),
+                format!("call {what} right after binding the socket, before the first recv_from."),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `true` if the kernel can split one send into several datagrams
+    /// (`UDP_SEGMENT`, Linux 4.18+), as
+    /// [`send_segments_to`](Self::send_segments_to) asks. `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn gso_supported(&self) -> bool {
+        let mut v: libc::c_int = 0;
+        let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v` and `len` are valid for the kernel to write.
+        unsafe {
+            libc::getsockopt(
+                self.sock.as_raw_fd(),
+                libc::SOL_UDP,
+                libc::UDP_SEGMENT,
+                ptr::addr_of_mut!(v).cast(),
+                &mut len,
+            ) == 0
+        }
+    }
+
+    /// Sends `buf` to `addr` as datagrams of `segment_size` bytes each (the
+    /// last may be shorter), in one system call: UDP generic segmentation
+    /// offload (`UDP_SEGMENT`). With `segment_size` equal to or above the
+    /// length it is one datagram. `ecn` (0 to 3) goes into the IP header's
+    /// ECN bits.
+    ///
+    /// Linux takes at most 64 segments and 64 KiB in one send, and refuses
+    /// GSO on a route without checksum offload with `EIO`; see
+    /// [`gso_supported`](Self::gso_supported). `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub async fn send_segments_to<B: IoBuf>(
+        &self,
+        buf: B,
+        addr: SocketAddr,
+        segment_size: usize,
+        ecn: u8,
+    ) -> (io::Result<usize>, B) {
+        let sa = SockAddr::from(addr);
+        let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&sa));
+        let m = msg.as_ptr();
+        // SAFETY: `m` is the live `Message` that `msg` owns; the control
+        // buffer is `CONTROL_SPACE` bytes, room for the two `int` messages
+        // written here, each `CMSG_INT_SPACE` long.
+        unsafe {
+            let control = ptr::addr_of_mut!((*m).control).cast::<u8>();
+            let mut at = 0;
+            let mut put = |level: i32, kind: i32, data: &[u8]| {
+                let len = CMSG_HDR + data.len();
+                let p = control.add(at);
+                p.cast::<usize>().write_unaligned(len);
+                p.add(8).cast::<i32>().write_unaligned(level);
+                p.add(12).cast::<i32>().write_unaligned(kind);
+                ptr::copy_nonoverlapping(data.as_ptr(), p.add(CMSG_HDR), data.len());
+                at += CMSG_INT_SPACE;
+            };
+            if segment_size > 0 && segment_size < buf.len() {
+                let seg = u16::try_from(segment_size).unwrap_or(u16::MAX);
+                put(libc::SOL_UDP, libc::UDP_SEGMENT, &seg.to_ne_bytes());
+            }
+            if ecn & 3 != 0 {
+                let v = libc::c_int::from(ecn & 3);
+                if addr.is_ipv6() {
+                    put(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &v.to_ne_bytes());
+                } else {
+                    put(libc::IPPROTO_IP, libc::IP_TOS, &v.to_ne_bytes());
+                }
+            }
+            if at > 0 {
+                (*m).hdr.msg_control = control.cast();
+                (*m).hdr.msg_controllen = at as _;
+            }
+        }
+        let io = Io::SendMsg {
+            fd: self.sock.as_raw_fd(),
+            // SAFETY: `msg` owns a live `Message`; the field pointer is taken
+            // without making a reference.
+            msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
+            flags: libc::MSG_NOSIGNAL as u32,
+            zero_copy: false,
+        };
+        // SAFETY: the header is in a `KernelBox` and points at its own fields
+        // and at `buf`'s bytes; an `IoBuf`'s bytes stay put when it moves.
+        let (res, _, (_msg, buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
+        if res < 0 {
+            (Err(os_err(res)), buf)
+        } else {
+            (Ok(res as usize), buf)
+        }
+    }
+
     /// Allows sending to broadcast addresses (`SO_BROADCAST`).
     pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         self.sock.set_broadcast(broadcast)
+    }
+}
+
+#[cfg(feature = "unstable-udp-offload")]
+fn setsockopt_int(sock: &Socket, level: i32, name: i32, v: libc::c_int) -> io::Result<()> {
+    // SAFETY: `v` is a valid `int` for the kernel to read.
+    let r = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            ptr::addr_of!(v).cast(),
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -592,7 +890,45 @@ mod tests {
 
     use socket2::SockAddr;
 
-    use super::{parse_addr, Message};
+    use super::{parse_addr, parse_control, Message, CMSG_HDR, CMSG_INT_SPACE};
+
+    fn cmsg(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
+        let mut v = (CMSG_HDR + data.len()).to_ne_bytes().to_vec();
+        v.extend(level.to_ne_bytes());
+        v.extend(kind.to_ne_bytes());
+        v.extend(data);
+        v.resize((v.len() + 7) & !7, 0);
+        v
+    }
+
+    /// GRO and ECN control messages are read, whatever their order; a
+    /// malformed or unknown one ends or is skipped, never read past.
+    #[test]
+    fn control_messages_give_segment_size_and_ecn() {
+        let gro = cmsg(libc::SOL_UDP, libc::UDP_GRO, &1200i32.to_ne_bytes());
+        let tos = cmsg(libc::IPPROTO_IP, libc::IP_TOS, &[0b1011_1110]);
+        let tclass = cmsg(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &3i32.to_ne_bytes());
+        assert_eq!(gro.len(), CMSG_INT_SPACE);
+        assert_eq!(
+            parse_control(&[gro.clone(), tos.clone()].concat()),
+            (1200, 2)
+        );
+        assert_eq!(parse_control(&[tclass, gro.clone()].concat()), (1200, 3));
+        assert_eq!(parse_control(&tos), (0, 2));
+        assert_eq!(parse_control(&[]), (0, 0));
+        // A length past the end, or shorter than a header, stops parsing.
+        let mut bad = gro.clone();
+        bad[..8].copy_from_slice(&999usize.to_ne_bytes());
+        assert_eq!(parse_control(&bad), (0, 0));
+        let mut bad = gro.clone();
+        bad[..8].copy_from_slice(&3usize.to_ne_bytes());
+        assert_eq!(parse_control(&bad), (0, 0));
+        // An unknown message is skipped; a GRO size above u16 is ignored.
+        let other = cmsg(libc::SOL_SOCKET, libc::SO_TIMESTAMP, &[0; 16]);
+        assert_eq!(parse_control(&[other, gro].concat()), (1200, 0));
+        let huge = cmsg(libc::SOL_UDP, libc::UDP_GRO, &70_000i32.to_ne_bytes());
+        assert_eq!(parse_control(&huge), (0, 0));
+    }
 
     /// The header of a `Message` stays valid while the message moves, as it
     /// does into the operation and back, and the kernel's writes through it

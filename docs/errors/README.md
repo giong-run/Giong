@@ -57,6 +57,8 @@ when it is no longer raised.
 | [GIONG-E0107](E0107.md) | `DnsBadResponse` | malformed DNS answer |
 | [GIONG-E0108](E0108.md) | `DnsServerUnreachable` | cannot reach the DNS server |
 | [GIONG-E0109](E0109.md) | `EmptyBuffer` | buffer with no room |
+| [GIONG-E0110](E0110.md) | `RecvBufferTooSmall` | receive buffers too small for GRO |
+| [GIONG-E0111](E0111.md) | `RecvAlreadyStarted` | receive option set after recv started |
 
 ## Files
 
@@ -194,3 +196,7 @@ when it is no longer raised.
 | [GIONG-E3209](E3209.md) | `RedisPoolTimeout` | Redis pool wait timed out |
 | [GIONG-E3210](E3210.md) | `RedisProtocol` | Redis protocol error |
 | [GIONG-E3211](E3211.md) | `RedisTimeout` | Redis reply timed out |
+| [GIONG-E3601](E3601.md) | `QuicConfig` | invalid QUIC configuration |
+| [GIONG-E3602](E3602.md) | `QuicConnect` | cannot set up the QUIC connection |
+| [GIONG-E3603](E3603.md) | `QuicConnectionLost` | the QUIC connection was lost |
+| [GIONG-E3604](E3604.md) | `QuicStreamReset` | the QUIC stream was reset |
