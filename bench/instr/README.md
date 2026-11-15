@@ -64,19 +64,25 @@ instructions per request.
 Each case also records heap allocations per operation (counted by a global allocator in the
 benchmark), with the same 1% limit: one more allocation per request fails.
 
-Two more cases measure memory, outside valgrind: `idle-http1` and `idle-h2` open 2,000 idle
-connections to a giong-http server in the process (from another thread, with blocking std
-sockets, which own no heap) and record how much the live heap and the resident set grew per
-connection. The heap count is exact and repeats to the byte; its limit is 2%. The resident set
-moves with the allocator's choices; its limit is 10%. HTTP/2 connections are opened one at a
-time, each after the server's SETTINGS: opened all at once, the receive buffer pool runs low and
-the driver moves bytes to the heap depending on timing, which made the heap per connection vary
-by 7%.
+Three more cases measure memory, outside valgrind: `idle-http1`, `idle-h2` and `idle-https`
+open 2,000 idle connections to a giong-http server in the process (from another thread, with
+blocking std sockets, which own no heap) and record how much the live heap and the resident
+set grew per connection. For `idle-https` that thread does each TLS handshake and one
+keep-alive request with rustls, then drops its TLS state and keeps the socket, so the heap
+that stays is the server's (the server cannot tell; nothing is sent). Its allocation count, like
+the other cases', covers both ends, handshakes included. Leaving the client thread out would
+take a check in the counting allocator, and that alone moved the instruction counts of the
+other cases by up to 2% (inlining under LTO), so it was not done. The heap count is exact and
+repeats within a byte per connection; its limit is 2%. The resident set moves with the
+allocator's choices; its limit is 10%. HTTP/2 connections are opened one at a time, each after
+the server's SETTINGS: opened all at once, the receive buffer pool runs low and the driver
+moves bytes to the heap depending on timing, which made the heap per connection vary by 7%.
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
 | `idle-http1` (io_uring / epoll) | 1,940 / 2,102 bytes | 1,995 / 2,169 bytes |
 | `idle-h2` (io_uring / epoll) | 4,166 / 4,232 bytes | 4,307 / 4,338 bytes |
+| `idle-https` (io_uring / epoll) | 12,400 / 12,437 bytes | 12,739 / 12,698 bytes |
 
 The numbers above were measured on a 4-vCPU Xeon VM (Linux 6.18) on 2026-11-15; what CI
 compares against is `baseline.csv`, whose header names the machine it came from.
