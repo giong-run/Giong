@@ -810,7 +810,10 @@ Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/sysc
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per
-request with callgrind instead, which repeats within 0.1%.
+request with callgrind instead, which repeats within 0.1%. CI holds the hot paths to
+their counts: `scripts/instr.py check` fails a change that makes any of 16 operations
+(spawning a task, a TCP round trip, an HTTP/1.1, HTTP/2 or TLS request, a database query)
+cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](bench/instr/README.md)).
 
 ## Testing and safety
 
