@@ -209,6 +209,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn a_released_port_is_counted_out_and_can_be_bound_again() {
         let addr = free_port();
         let (first, hold) = udp(addr).unwrap();
