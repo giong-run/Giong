@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
   # A pull request in the merge queue: the same jobs, on main with the pull
   # request and those queued before it merged, before main moves.
@@ -10,6 +8,9 @@ on:
   # The release pull request is opened by GitHub Actions, which starts no
   # pull_request run; prepare-release.yml starts CI on its branch this way.
   workflow_dispatch:
+  # A push to main: main.yml runs these jobs for a commit that no run in the
+  # merge queue has tested.
+  workflow_call:
 
 permissions:
   contents: read

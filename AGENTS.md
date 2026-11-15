@@ -94,7 +94,10 @@ Continuous integration requires `all-checks` on every pull request, which passes
 every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`, `test`, `fallback`,
 `tsan` and the jobs named below. A change is done when all of them would pass. A pull
 request is merged through the merge queue, which runs the same jobs once more on `main`
-with the pull request merged, and merges it only if they pass.
+with the pull request merged, and merges it only if they pass. `main` then moves to the
+commit that run tested, so a push to `main` (`.github/workflows/main.yml`) runs the jobs
+again only when no merge queue run passed for that commit, or when the push changes one
+of the two workflows.
 The release test binaries are built once per run (the `build` job, with
 `scripts/shared-build.sh`) for `test`, `docker`, the `kernels` jobs and the four
 `fallback (…)` jobs, which run the tiers of `scripts/check.sh fallback` side by side, as
