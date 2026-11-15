@@ -91,7 +91,12 @@ impl Message {
 }
 
 fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
+    // Linux's `sa_family` is a `u16`; the BSDs, macOS among them, start
+    // with a `u8` length and a `u8` family.
+    #[cfg(target_os = "linux")]
     let family = i32::from(u16::from_ne_bytes([*name.first()?, *name.get(1)?]));
+    #[cfg(not(target_os = "linux"))]
+    let family = i32::from(*name.get(1)?);
     let port = u16::from_be_bytes([*name.get(2)?, *name.get(3)?]);
     match family {
         libc::AF_INET => {
@@ -120,7 +125,7 @@ pub struct Datagram {
 impl Datagram {
     /// Splits what a multishot `recvmsg` wrote into a buffer.
     fn parse(buf: RecvBuf) -> io::Result<(Self, SocketAddr)> {
-        let malformed = || unexpected("io_uring returned a malformed datagram");
+        let malformed = || unexpected("the driver returned a malformed datagram");
         if buf.len() < OVERHEAD {
             return Err(malformed());
         }

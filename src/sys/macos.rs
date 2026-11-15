@@ -172,6 +172,12 @@ pub(crate) unsafe fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> 
 ///
 /// `buf` must be valid for `len` bytes of reads.
 pub(crate) unsafe fn pwrite(fd: RawFd, buf: *const u8, len: usize, offset: u64) -> isize {
+    // Linux's pwrite appends on an `O_APPEND` descriptor whatever the
+    // offset, which `OpenOptions::append` promises; macOS writes at the
+    // offset. So an append-mode file is written with write(2).
+    if libc::fcntl(fd, libc::F_GETFL) & libc::O_APPEND != 0 {
+        return libc::write(fd, buf.cast(), len);
+    }
     libc::pwrite(fd, buf.cast(), len, offset as libc::off_t)
 }
 
@@ -206,6 +212,18 @@ pub(crate) fn fallocate(fd: RawFd, offset: u64, len: u64) -> isize {
         unsafe { *libc::__error() = libc::EFBIG };
         return -1;
     };
+    // fallocate(2) refuses a descriptor not open for writing with EBADF;
+    // F_PREALLOCATE does not check, and a range inside the file is a no-op.
+    // SAFETY: plain fcntl on a descriptor.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return -1;
+    }
+    if flags & libc::O_ACCMODE == libc::O_RDONLY {
+        // SAFETY: sets errno for the caller.
+        unsafe { *libc::__error() = libc::EBADF };
+        return -1;
+    }
     // SAFETY: all-zero is a valid `stat`, which fstat fills in.
     let mut st: libc::stat = unsafe { mem::zeroed() };
     // SAFETY: a valid pointer to a `stat`.

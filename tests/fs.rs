@@ -939,9 +939,12 @@ fn directories_list_like_the_standard_library() {
         std::os::unix::fs::symlink(dir.path("file"), dir.path("link")).unwrap();
         std::os::unix::fs::symlink(dir.path("missing"), dir.path("dangling")).unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(dir.path("socket")).unwrap();
-        // A name that is not UTF-8.
-        let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
-        std::fs::write(dir.0.join(latin1), "").unwrap();
+        // A name that is not UTF-8 (APFS refuses one with EILSEQ).
+        #[cfg(target_os = "linux")]
+        {
+            let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
+            std::fs::write(dir.0.join(latin1), "").unwrap();
+        }
 
         let ours = list(&dir.0).await;
         let mut theirs: Vec<_> = std::fs::read_dir(&dir.0)

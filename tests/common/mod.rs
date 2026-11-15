@@ -20,6 +20,14 @@ pub fn refusing_addr() -> (Socket, SocketAddr) {
         .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
         .unwrap();
     let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    // macOS drops a SYN to a socket that is bound but not listening (Linux
+    // answers with a reset), so there the port is given back: a closed port
+    // is refused, and the short race with another bind is accepted.
+    #[cfg(not(target_os = "linux"))]
+    let socket = {
+        drop(socket);
+        Socket::new(Domain::IPV4, Type::STREAM, None).unwrap()
+    };
     (socket, addr)
 }
 

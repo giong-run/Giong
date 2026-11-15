@@ -9,7 +9,7 @@
 //! preceded by a probe: a socket without `SO_REUSEPORT` bound to the same
 //! address and closed again, which fails with `EADDRINUSE` when anything
 //! else holds the port. Later binds of the port (the other workers) skip the
-//! probe, which their own process would fail.
+//! probe, which their own process would fail. (Linux only: see [`bind`].)
 //!
 //! A socket that was dropped is closed through the ring, a moment later, and
 //! would fail the probe of a bind that follows at once. So a dropped socket
@@ -107,7 +107,13 @@ pub(crate) fn bind(
     // Held across the probe and the bind, so that two workers binding the
     // same port for the first time do not both probe, or probe each other.
     let mut ports = ports();
-    if addr.port() != 0 {
+    // The probe relies on Linux's rules: a socket without `SO_REUSEPORT`
+    // conflicts only with listening or unmarked sockets. On macOS two
+    // sockets bound to the same address both need `SO_REUSEPORT`, so the
+    // probe would refuse this process's own workers; there the port is not
+    // guarded against another process (a gap noted in
+    // docs/design/portability.md).
+    if cfg!(target_os = "linux") && addr.port() != 0 {
         let known = ports
             .get(&(proto, addr.port()))
             .copied()

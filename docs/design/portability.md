@@ -160,6 +160,8 @@ plan or a limit of macOS itself):
 | `sync_all`/`sync_data` | `fsync`/`fdatasync` | `F_FULLFSYNC` for both | slower but durable; macOS has no `fdatasync` |
 | `allocate` | `fallocate` | `F_PREALLOCATE` + `ftruncate` | emulated; same visible result |
 | Ports shared by workers | `SO_REUSEPORT` spreads connections | `SO_REUSEPORT` binds but sends every connection to one socket | **gap**; plan S2: one listening socket shared by the workers |
+| Port guard against a second process | a probe socket without `SO_REUSEPORT` (`src/net/share.rs`) | no probe: on macOS it would refuse the process's own workers | **gap**; macOS needs `SO_REUSEPORT` on both sockets, so another process of the user can bind the port too |
+| Append-mode writes | `pwrite` appends on `O_APPEND` | `write(2)` when the descriptor has `O_APPEND` | emulated; same visible result |
 | UDP truncated datagram | true length reported (`MSG_TRUNC` in) | truncation flagged, true length unknown | macOS limit |
 | UDP GSO/GRO, `IP_PKTINFO`, ECN | not in the API yet | not in the API yet | later 1.x, Linux first |
 | TLS offload | kTLS | in-process rustls (`Ktls::Auto` falls back; `Required` fails) | kTLS is Linux-only by design |
@@ -180,7 +182,7 @@ platform's readiness driver.
 
 ### 4.1 Results
 
-See section 7 (filled in from the CI runs).
+See section 7.
 
 ## 5. How the kqueue code is tested without a Mac
 
@@ -215,8 +217,32 @@ Cross-checking the whole workspace for macOS from Linux also works for
 
 ## 7. Results
 
-To be filled from the runs: Linux suite counts on both drivers, libkqueue
-counts, and the macOS runner counts per crate.
+**Linux** (kernel 6.18): `cargo test --release --workspace --all-features`
+passes 1062, fails 0, ignores 5, on io_uring and with `GIONG_DRIVER=epoll`.
+Clippy is clean for Linux and, cross-checked, for `aarch64-apple-darwin`.
+
+**libkqueue** (section 5): 11 test files pass whole (blocked, cancel,
+channels, driver, error_docs, executor, fs, observe, spin, time, udp). The
+multi-worker, large-transfer and shutdown tests hang there, as libkqueue's
+thread-based emulation does; the macOS runners are the verdict for those.
+
+**macOS 15, Apple Silicon, first run** (commit 9112aa4). Clippy and the
+build of every test pass. In the `giong` crate, by binary:
+
+| Binary | Passed | Failed | Cause |
+|---|---|---|---|
+| unit tests | 36 | 2 | sockaddr family read as Linux's `u16` (fixed); port probe (fixed) |
+| balance | 4 | 3 (1 ignored) | port probe refused the workers' own binds (fixed) |
+| cancel, channels, driver, error_docs, executor | 60 | 0 | |
+| dns | 6 | 11 | 10 from the sockaddr family (fixed); 1 from a test helper whose bound, non-listening port macOS does not refuse (fixed) |
+| fs | 21 | 4 | append writes (fixed), `allocate` on a read-only file (fixed), a non-UTF-8 name APFS refuses (test, fixed), a pseudo-terminal read that returns at once (open) |
+| multi | 15 | hung 1 | `SO_REUSEPORT` does not spread connections (the gap above, plan S2) |
+
+The run stopped at the job's 60-minute limit inside `multi`, so the later
+binaries and crates did not run. The workflow now runs every test binary
+under a time limit and names hung tests, so the next run covers the whole
+workspace. (`macos-14` is no longer offered by GitHub; the matrix is
+`macos-15` and `macos-26`.)
 
 ## 8. Next steps (1.2 plan items)
 
