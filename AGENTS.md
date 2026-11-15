@@ -89,6 +89,7 @@ scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kerne
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
+scripts/semver.sh            # no breaking API change since the last release (cargo-semver-checks)
 ```
 
 Continuous integration requires `all-checks` on every pull request, which passes when
@@ -104,7 +105,8 @@ The release test binaries are built once per run (the `build` job, with
 `fallback (…)` jobs, which run the tiers of `scripts/check.sh fallback` side by side, as
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
-CI also runs `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the last
+release, so no breaking change lands between releases), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
 against other server versions (`servers`) on every pull request, and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
