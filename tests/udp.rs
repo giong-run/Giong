@@ -649,14 +649,27 @@ fn a_port_held_by_another_process_is_refused() {
     });
 }
 
+/// A UDP port on loopback that is free now and that the kernel never hands
+/// out for port 0, so the other tests of this binary, which bind port 0 in
+/// parallel, cannot take it while a test has let go of it.
+fn port_outside_ephemeral_range() -> std::net::SocketAddr {
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+    (1024..low)
+        .rev()
+        .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .find(|addr| std::net::UdpSocket::bind(addr).is_ok())
+        .expect("no free UDP port below the ephemeral range")
+}
+
 /// Workers of one process share a port; a dropped socket's port can be
 /// bound again at once.
 #[test]
 fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
     giong::block_on(async {
-        let free = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = free.local_addr().unwrap();
-        drop(free);
+        // Not a port from port 0: between the drops and the binds below,
+        // another test's socket could be given the same port (seen in CI).
+        let addr = port_outside_ephemeral_range();
         let first = UdpSocket::bind(addr).unwrap();
         let second = UdpSocket::bind(addr).unwrap();
         drop(first);
