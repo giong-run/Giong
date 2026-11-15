@@ -2611,7 +2611,7 @@ mod tests {
             assert!(recv_was_used(&client).await.unwrap());
             drop((client, server, listener));
             giong::time::sleep(Duration::from_millis(50)).await;
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert_eq!(stats.tracked_ops, 0, "{stats:?}");
         });
     }

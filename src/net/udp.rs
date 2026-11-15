@@ -4,7 +4,7 @@ use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr;
@@ -12,7 +12,10 @@ use std::task::{Context, Poll};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-use super::{close_socket, inet_addr, no_addresses, os_err, unexpected, wait_for_pool, MultiSlot};
+use super::addr::{resolved, ToSocketAddrs};
+use super::{
+    close_socket, inet_addr, no_addresses, os_err, share, unexpected, wait_for_pool, MultiSlot,
+};
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
 use crate::driver::{Io, MultiIo, MultiKind, MultiPoll};
 use crate::error::{raise, Code};
@@ -174,20 +177,37 @@ impl std::fmt::Debug for Datagram {
 pub struct UdpSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
+    /// The socket's hold on its port, for one that [`bind`](Self::bind)
+    /// made on a port of the caller's choice (see `share`).
+    held: Option<share::Held>,
     _not_send: PhantomData<*const ()>,
 }
 
 impl UdpSocket {
-    /// Binds to `addr` with `SO_REUSEADDR` and `SO_REUSEPORT` set, so every
-    /// worker can bind its own socket to the same port and let the kernel
-    /// spread incoming datagrams across cores (all datagrams of one sender
-    /// address go to the same worker).
+    /// Binds to `addr`, an IP address and a port.
     ///
-    /// Port 0 asks the kernel for a port of the socket's own: it is bound
-    /// without those options, so no other socket can share the port.
+    /// Every worker of a process can bind its own socket to the same
+    /// address, and datagrams are then spread across the workers: on Linux
+    /// by a hash of the sender's address, so that all datagrams of one
+    /// sender go to the same worker. No other process can: an address that
+    /// a socket of another process holds is refused with
+    /// [`AddrInUse`](io::ErrorKind::AddrInUse).
+    ///
+    /// On Linux the workers share the port through `SO_REUSEPORT`, which by
+    /// itself would let any process of the same user bind it too; giong
+    /// checks the port before the first socket of a process binds it. To
+    /// share a port between processes on purpose, create the sockets
+    /// yourself and pass them to [`from_std`](Self::from_std).
+    ///
+    /// Port 0 asks the kernel for a port of the socket's own, which no other
+    /// socket can share.
+    ///
+    /// `addr` is an IP address with a port (see
+    /// [`ToSocketAddrs`]): a host name is refused
+    /// with `GIONG-E0100`, which says what to write instead.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let mut last_err = None;
-        for addr in addr.to_socket_addrs()? {
+        for addr in resolved(&addr, "UdpSocket::bind")? {
             match Self::bind_addr(addr) {
                 Ok(socket) => return Ok(socket),
                 Err(e) => last_err = Some(e),
@@ -197,20 +217,31 @@ impl UdpSocket {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
-        let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        // Not for port 0: with either option set, Linux may pick a port that
-        // another UDP socket of the same user already holds with the same
-        // options, and join the two. Datagrams for either socket would then
-        // be split between them by a hash of the sender's address.
-        if addr.port() != 0 {
-            sock.set_reuse_address(true)?;
-            sock.set_reuse_port(true)?;
-        }
-        sock.bind(&addr.into())?;
-        Ok(Self::from_socket(sock))
+        // Not for port 0: with `SO_REUSEPORT` set, Linux may pick a port
+        // that another UDP socket of the same user already holds with it,
+        // and join the two. Datagrams for either socket would then be split
+        // between them by a hash of the sender's address.
+        let share = addr.port() != 0;
+        let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
+            let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+            if share {
+                // `SO_REUSEPORT` only. With `SO_REUSEADDR` as well, any
+                // user's socket that sets `SO_REUSEADDR` could bind the
+                // port and receive its datagrams; `SO_REUSEPORT` is for
+                // sockets of the same user.
+                sock.set_reuse_port(true)?;
+            }
+            sock.bind(&addr.into())?;
+            Ok(sock)
+        })?;
+        let mut socket = Self::from_socket(sock);
+        socket.held = held;
+        Ok(socket)
     }
 
-    /// Wraps a socket created by the standard library.
+    /// Wraps a socket created by the standard library, with the options it
+    /// was given: giong sets none, and does not check who else holds its
+    /// port.
     pub fn from_std(socket: std::net::UdpSocket) -> Self {
         // SAFETY: we take over the descriptor that `socket` owned.
         Self::from_socket(unsafe { Socket::from_raw_fd(socket.into_raw_fd()) })
@@ -220,15 +251,20 @@ impl UdpSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
+            held: None,
             _not_send: PhantomData,
         }
     }
 
     /// Sets the peer: [`send`](Self::send) goes to `addr`, and only datagrams
     /// from `addr` are received.
+    ///
+    /// `addr` is an IP address with a port: a host name is refused with
+    /// `GIONG-E0100`. Resolve one first with
+    /// [`lookup_host`](crate::net::lookup_host).
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let mut last_err = None;
-        for addr in addr.to_socket_addrs()? {
+        for addr in resolved(&addr, "UdpSocket::connect")? {
             // Connecting a UDP socket only records the address: it never blocks.
             match self.sock.connect(&addr.into()) {
                 Ok(()) => return Ok(()),
@@ -431,6 +467,9 @@ impl AsRawFd for UdpSocket {
 
 impl Drop for UdpSocket {
     fn drop(&mut self) {
+        if let Some(held) = self.held.take() {
+            held.release(&self.sock);
+        }
         close_socket(&mut self.sock, &self.recv);
     }
 }

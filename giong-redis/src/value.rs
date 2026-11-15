@@ -12,7 +12,11 @@ use crate::error::{Error, ServerError};
 /// type asked for (`Option<String>`, `i64`, `Vec<String>`,
 /// `HashMap<String, String>`...). It is there for replies whose shape
 /// varies, such as those of scripts.
+///
+/// Non-exhaustive, so that a reply type a later RESP version adds, or
+/// attributes kept with a reply, can be added without breaking a `match`.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// Nothing: a key that does not exist, or a command that timed out
     /// (`_`, or RESP2's `$-1` and `*-1`).

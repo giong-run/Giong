@@ -202,6 +202,7 @@ mod tests {
             e.to_string(),
             "GIONG-E1103: GET http://x/ did not finish within 1 s. See \
              https://github.com/giong-run/Giong/blob/main/docs/errors/E1103.md"
+                .replace("blob/main", concat!("blob/v", env!("CARGO_PKG_VERSION")))
         );
         let io: io::Error = e.into();
         assert_eq!(io.kind(), io::ErrorKind::TimedOut);

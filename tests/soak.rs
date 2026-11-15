@@ -491,7 +491,7 @@ fn soak() {
                     let settle = Instant::now() + Duration::from_secs(5);
                     loop {
                         sleep(Duration::from_millis(20)).await;
-                        let stats = giong::stats();
+                        let stats = giong::observe::worker_stats();
                         // The main future is not counted as a task; the one
                         // operation left in flight is the eventfd read that
                         // cross-thread wake-ups complete.

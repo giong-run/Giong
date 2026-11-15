@@ -261,7 +261,7 @@ impl Transport for UnixStream {
 
 #[cfg(feature = "tls")]
 impl Transport for giong_tls::TlsStream {
-    type Chunk = Vec<u8>;
+    type Chunk = giong_tls::Received;
 
     fn recv(&self) -> impl Future<Output = io::Result<Self::Chunk>> {
         giong_tls::TlsStream::recv(self)
@@ -354,6 +354,19 @@ pub trait Handler: 'static {
     }
 }
 
+/// A handler shared between servers: one `App` serving a plain port and a
+/// TLS port, say, through `Rc::new(app)` and a clone for each. Both calls go
+/// to the shared handler, [`stream_body`](Handler::stream_body) included.
+impl<H: Handler> Handler for Rc<H> {
+    fn call(&self, req: Request) -> impl Future<Output = Response> {
+        (**self).call(req)
+    }
+
+    fn stream_body(&self, req: &Request) -> Option<u64> {
+        (**self).stream_body(req)
+    }
+}
+
 impl<F, Fut> Handler for F
 where
     F: Fn(Request) -> Fut + 'static,
@@ -430,7 +443,7 @@ impl Server {
                 max_head_size: 64 * 1024,
                 max_body_size: 1024 * 1024,
                 shutdown_linger: Duration::from_millis(100),
-                max_connections: usize::MAX,
+                max_connections: 10_000,
                 http2: true,
                 http2_prior_knowledge: true,
                 max_concurrent_streams: 100,
@@ -486,8 +499,14 @@ impl Server {
     }
 
     /// Most connections one [`serve`](Self::serve) call keeps open at once
-    /// (default: no limit). Normally every worker makes its own call, so the
+    /// (default: 10,000). Normally every worker makes its own call, so the
     /// limit applies per worker.
+    ///
+    /// The default keeps a worker's memory bounded: an idle connection costs
+    /// a few KiB, and the most a client can make one hold is about 1.2 MiB
+    /// over HTTP/1.1 and 1.7 MiB over HTTP/2 with the default sizes. Raise
+    /// it for many long-lived connections per worker (event streams), lower
+    /// it to bound memory more tightly.
     ///
     /// At the limit the server stops accepting until a connection closes.
     /// New clients wait in the kernel's listen queue meanwhile instead of
@@ -1530,6 +1549,27 @@ impl<T: Transport> Conn<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shared handler answers through the handler it shares, and keeps its
+    /// choice of streaming: a closure around it would lose that.
+    #[test]
+    fn a_shared_handler_keeps_its_streaming_routes() {
+        struct Streams;
+        impl Handler for Streams {
+            async fn call(&self, _req: Request) -> Response {
+                Response::new(204)
+            }
+            fn stream_body(&self, _req: &Request) -> Option<u64> {
+                Some(5)
+            }
+        }
+        let shared = Rc::new(Streams);
+        let other = Rc::clone(&shared);
+        let req = Request::from_bytes(b"POST / HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+        assert_eq!(other.stream_body(&req), Some(5));
+        let status = giong::block_on(async { shared.call(req).await.status() });
+        assert_eq!(status, 204);
+    }
 
     /// What an idle connection costs is mostly its task, the connection's
     /// future. That future must not grow with the handler's (which lives on

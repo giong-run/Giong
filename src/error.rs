@@ -9,7 +9,7 @@
 //! ```text
 //! GIONG-E0102: no address found for db.internal. Fix: check the spelling of
 //! the name, /etc/hosts, and the DNS servers in /etc/resolv.conf. See
-//! https://github.com/giong-run/Giong/blob/main/docs/errors/E0102.md
+//! https://github.com/giong-run/Giong/blob/v<version>/docs/errors/E0102.md
 //! ```
 //!
 //! [`code`] reads the code back, so programs (and the agents that write them)
@@ -39,7 +39,13 @@ use std::fmt;
 use std::io;
 
 /// Where the page for every code lives.
-const DOCS: &str = "https://github.com/giong-run/Giong/blob/main/docs/errors";
+/// The error pages of this release: a message keeps pointing at the page as
+/// it read when the binary was built, not at whatever `main` says later.
+const DOCS: &str = concat!(
+    "https://github.com/giong-run/Giong/blob/v",
+    env!("CARGO_PKG_VERSION"),
+    "/docs/errors"
+);
 
 macro_rules! codes {
     ($( $(#[$doc:meta])* $name:ident = $number:literal, $kind:ident, $summary:literal; )*) => {
@@ -250,6 +256,11 @@ codes! {
     /// past the limit before it ended. The server closes the connection
     /// with `ENHANCE_YOUR_CALM`.
     Http2HeadersTooLarge = 1118, InvalidData, "HTTP/2 header block too large";
+    /// A response a handler builds cannot be sent as written: a header name
+    /// that is not a token, a header value with a line break or another
+    /// control character, or a status outside `200..=599`. Raised by
+    /// `Response::try_header` and `Response::try_new`.
+    HttpInvalidResponse = 1119, InvalidInput, "invalid HTTP response";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
@@ -641,6 +652,7 @@ mod tests {
             e.to_string(),
             "GIONG-E0102: no address found for db.internal. Fix: check the spelling. See \
              https://github.com/giong-run/Giong/blob/main/docs/errors/E0102.md"
+                .replace("blob/main", concat!("blob/v", env!("CARGO_PKG_VERSION")))
         );
         let io: io::Error = e.into();
         assert_eq!(io.kind(), io::ErrorKind::NotFound);

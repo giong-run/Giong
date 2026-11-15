@@ -67,7 +67,7 @@ fn main() {
                                 1
                             }
                             "mget" => pool
-                                .mget::<Vec<Vec<u8>>, _>(&keys)
+                                .mget::<Vec<Vec<u8>>>(&keys)
                                 .await
                                 .unwrap()
                                 .len(),

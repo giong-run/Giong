@@ -425,7 +425,10 @@ fn a_cancelled_write_poisons_the_connection_instead_of_corrupting_it() {
             let later = tls.write_all(b"more".to_vec()).await.0;
             let _ = tx.send((cancelled, later.is_err()));
             // What the client sent before can still be received.
-            let _ = tx.send((tls.recv().await.ok() == Some(b"second".to_vec()), true));
+            let _ = tx.send((
+                tls.recv().await.ok().map(|r| r.into_vec()) == Some(b"second".to_vec()),
+                true,
+            ));
         }
     };
     with_server(c.acceptor, serve, move |addr| {
@@ -510,7 +513,7 @@ fn close_notify_is_told_apart_from_a_cut_connection() {
         async move {
             let mut got = Vec::new();
             while let Ok(data) = tls.recv().await {
-                if data.is_empty() || tls.write_all(data.clone()).await.0.is_err() {
+                if data.is_empty() || tls.write_all(data.to_vec()).await.0.is_err() {
                     break;
                 }
                 got.extend_from_slice(&data);

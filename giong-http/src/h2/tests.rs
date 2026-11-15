@@ -199,7 +199,7 @@ impl App {
             "/big-headers" => {
                 let mut resp = Response::new(200);
                 for i in 0..40 {
-                    resp = resp.header(&format!("x-big-{i}"), &"v".repeat(1000));
+                    resp = resp.header(&format!("x-big-{i}"), "v".repeat(1000));
                 }
                 resp.body("big")
             }

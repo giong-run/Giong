@@ -324,7 +324,7 @@ pub fn start_from_env(runtime: &Handle) -> FromEnv {
     };
     match started {
         Ok(server) => {
-            eprintln!("giong-mcp: listening on {}", server.url());
+            eprintln!("giong-mcp: listening on {}", server.place());
             FromEnv::Running(server)
         }
         Err(e) => {
@@ -422,13 +422,21 @@ impl FileId {
 }
 
 impl McpServer {
-    /// Where to point an MCP client: `http://127.0.0.1:7777/mcp`, or
-    /// `unix:/path/to/socket` followed by `/mcp` for a Unix socket (which
-    /// most clients cannot use directly: see [`Config::unix`]).
-    pub fn url(&self) -> String {
+    /// Where to point an MCP client, such as `http://127.0.0.1:7777/mcp`;
+    /// `None` for a Unix socket, which has no URL MCP clients understand:
+    /// see [`unix_path`](Self::unix_path) and [`Config::unix`].
+    pub fn url(&self) -> Option<String> {
+        match &self.bound {
+            Bound::Tcp(addr) => Some(format!("http://{addr}/mcp")),
+            Bound::Unix(..) => None,
+        }
+    }
+
+    /// Where it listens, for a log line: the URL, or the socket's path.
+    fn place(&self) -> String {
         match &self.bound {
             Bound::Tcp(addr) => format!("http://{addr}/mcp"),
-            Bound::Unix(path, _) => format!("unix:{}/mcp", path.display()),
+            Bound::Unix(path, _) => format!("the Unix socket {}", path.display()),
         }
     }
 
@@ -476,7 +484,7 @@ impl Drop for McpServer {
 impl fmt::Debug for McpServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpServer")
-            .field("url", &self.url())
+            .field("listening_on", &self.place())
             .finish()
     }
 }

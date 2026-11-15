@@ -177,15 +177,15 @@ async fn echo(req: Request) -> Response {
         return Response::new(200).body(BIG);
     }
     let text = format!(
-        "{} {} q={:?} v=1.{} ua={:?} body={}",
+        "{} {} q={:?} v={} ua={:?} body={}",
         req.method(),
         req.path(),
         req.query(),
-        req.version_minor(),
+        req.version().as_str().trim_start_matches("HTTP/"),
         req.header_str("user-agent"),
         String::from_utf8_lossy(req.body()),
     );
-    Response::text(text).header("X-Body-Len", &req.body().len().to_string())
+    Response::text(text).header("X-Body-Len", req.body().len().to_string())
 }
 
 fn default_server() -> TestServer {

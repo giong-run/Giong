@@ -115,7 +115,10 @@ pub(crate) fn escape_into(out: &mut String, s: &str) {
 /// ```
 ///
 /// A value that cannot be serialised (a map with keys that are not strings,
-/// say) is an [`Error::internal`].
+/// say), or a status outside `200..=599`, is an [`Error::internal`]: the
+/// client gets `500`, and the log says what was wrong. The status is meant
+/// to be a literal; for an error status that comes from elsewhere, see
+/// [`Error::from_status`].
 ///
 /// # `json` and `Response::json`
 ///
@@ -125,16 +128,11 @@ pub(crate) fn escape_into(out: &mut String, s: &str) {
 /// `Content-Type`, with status `200`. Use this one for values, so that
 /// strings are escaped by serde_json rather than by hand, and
 /// `Response::json` only to pass on JSON made elsewhere.
-///
-/// # Panics
-///
-/// Panics if `status` is not in `200..=599`, as [`Response::new`] does. The
-/// status is meant to be a literal; for an error status that comes from
-/// elsewhere, see [`Error::from_status`].
 #[cfg(feature = "serde")]
 pub fn json<T: serde::Serialize + ?Sized>(status: u16, value: &T) -> Result<Response, Error> {
+    let response = Response::try_new(status).map_err(Error::internal)?;
     let body = serde_json::to_vec(value).map_err(Error::internal)?;
-    Ok(Response::new(status)
+    Ok(response
         .header("Content-Type", "application/json")
         .body(body))
 }
@@ -161,5 +159,17 @@ mod tests {
             w.finish_line(),
             "{\"a\":\"x\",\"n\":7,\"z\":null,\"o\":{}}\n"
         );
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod json_tests {
+    use super::*;
+
+    #[test]
+    fn a_status_outside_the_range_is_an_internal_error_not_a_panic() {
+        let err = json(103, &1).unwrap_err();
+        assert_eq!(err.status(), 500);
+        assert_eq!(json(201, &1).unwrap().status(), 201);
     }
 }

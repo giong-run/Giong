@@ -140,7 +140,7 @@ fn offsets_above_i64_max_are_refused_on_every_driver() {
     // io_uring reads an offset of u64::MAX as "the current file position":
     // read_at and write_at used to read and write wherever that was, on
     // io_uring only.
-    let dir = TempDir::new("offsets");
+    let dir = TempDir::new("offsets-max");
     let path = dir.path("digits");
     std::fs::write(&path, b"0123456789").unwrap();
     giong::block_on(async move {
@@ -1079,7 +1079,7 @@ fn allocations_dropped_mid_flight_are_cleaned_up() {
         }
         assert!(abandoned > 0, "expected some allocations to be in flight");
         timeout(Duration::from_secs(5), async {
-            while giong::stats().tracked_ops > 0 {
+            while giong::observe::worker_stats().tracked_ops > 0 {
                 giong::time::sleep(Duration::from_millis(1)).await;
             }
         })

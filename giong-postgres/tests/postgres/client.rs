@@ -35,13 +35,13 @@ async fn count(client: &Client, table: &str) -> i64 {
 /// Waits until every task and operation but the caller's is gone.
 async fn assert_no_leaks() {
     for _ in 0..200 {
-        let s = giong::stats();
+        let s = giong::observe::worker_stats();
         if s.tasks == 0 && s.tracked_ops == 0 && s.free_recv_buffers == s.recv_buffers {
             return;
         }
         sleep(Duration::from_millis(10)).await;
     }
-    panic!("leaked: {:?}", giong::stats());
+    panic!("leaked: {:?}", giong::observe::worker_stats());
 }
 
 #[test]

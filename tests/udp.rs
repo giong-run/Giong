@@ -457,7 +457,7 @@ fn an_unread_socket_does_not_pin_the_buffer_pool() {
                 assert!(*got == expected[..], "datagram {i}");
             }
             sleep(Duration::from_millis(20)).await;
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert_eq!(stats.free_recv_buffers, 4, "{stats:?}");
         })
         .unwrap();
@@ -540,7 +540,7 @@ fn a_cancelled_read_from_leaves_the_socket_usable() {
         }
         sleep(Duration::from_millis(20)).await;
         assert_eq!(
-            giong::stats().tracked_ops,
+            giong::observe::worker_stats().tracked_ops,
             0,
             "cancelled reads were not cleaned up"
         );
@@ -619,5 +619,79 @@ fn one_buffer_echoes_many_datagrams_between_tasks() {
             assert_eq!(buf, i.to_le_bytes());
         }
         echo.await.unwrap();
+    });
+}
+
+/// Another process's UDP socket on a port, whatever options it set, keeps
+/// giong's sockets off that port: with `SO_REUSEPORT` the kernel would share
+/// its datagrams with them, and with `SO_REUSEADDR` on both sides (which
+/// giong no longer sets) any user could.
+#[test]
+fn a_port_held_by_another_process_is_refused() {
+    giong::block_on(async {
+        for (reuse_addr, reuse_port) in [(false, true), (true, false), (true, true), (false, false)]
+        {
+            let other =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+            other.set_reuse_address(reuse_addr).unwrap();
+            other.set_reuse_port(reuse_port).unwrap();
+            other
+                .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+                .unwrap();
+            let addr = other.local_addr().unwrap().as_socket().unwrap();
+            let err = UdpSocket::bind(addr).expect_err("joined another process's socket");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::AddrInUse,
+                "{reuse_addr} {reuse_port}: {err}"
+            );
+        }
+    });
+}
+
+/// Workers of one process share a port; a dropped socket's port can be
+/// bound again at once.
+#[test]
+fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
+    giong::block_on(async {
+        let free = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = free.local_addr().unwrap();
+        drop(free);
+        let first = UdpSocket::bind(addr).unwrap();
+        let second = UdpSocket::bind(addr).unwrap();
+        drop(first);
+        drop(second);
+        for _ in 0..20 {
+            let again = UdpSocket::bind(addr).unwrap();
+            let (sender, _) = socket();
+            sender.send_to(vec![7; 10], addr).await.0.unwrap();
+            let got = timeout(Duration::from_secs(5), again.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&*got, &[7; 10]);
+        }
+    });
+}
+
+#[test]
+fn bind_and_connect_refuse_a_host_name() {
+    giong::block_on(async {
+        let err = UdpSocket::bind("localhost:5353").expect_err("bound a host name");
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::InvalidAddress),
+            "{err}"
+        );
+        let (s, _) = socket();
+        let err = s
+            .connect("localhost:53")
+            .expect_err("connected to a host name");
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::InvalidAddress),
+            "{err}"
+        );
+        s.connect("127.0.0.1:53").unwrap();
     });
 }

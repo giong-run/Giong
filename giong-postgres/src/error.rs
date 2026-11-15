@@ -449,6 +449,7 @@ mod tests {
             e.to_string(),
             "GIONG-E3003: password authentication failed for user \"app\". See \
              https://github.com/giong-run/Giong/blob/main/docs/errors/E3003.md"
+                .replace("blob/main", concat!("blob/v", env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(e.giong_code(), Code::PostgresAuth);
     }

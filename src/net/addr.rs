@@ -12,11 +12,23 @@ use crate::error::{raise, Code};
 use crate::net::dns;
 use crate::time::{sleep, Instant};
 
-/// Something [`TcpStream::connect`](crate::net::TcpStream::connect) and
-/// [`lookup_host`] can turn into socket addresses: a `SocketAddr`, an
-/// `(IpAddr, u16)` pair, a `"host:port"` string, a `(host, port)` pair or a
-/// slice of addresses. Host names are resolved with the worker's
+/// An address argument: a `SocketAddr`, an `(IpAddr, u16)` pair, a
+/// `"host:port"` string, a `(host, port)` pair or a slice of addresses.
+///
+/// [`TcpStream::connect`](crate::net::TcpStream::connect) and [`lookup_host`]
+/// take any of them, and resolve a host name with the worker's
 /// [`Resolver`](crate::net::Resolver), without blocking.
+///
+/// The functions that are not `async` take IP addresses only:
+/// [`TcpListener::bind`](crate::net::TcpListener::bind),
+/// [`TcpListener::bind_balanced`](crate::net::TcpListener::bind_balanced),
+/// [`UdpSocket::bind`](crate::net::UdpSocket::bind) and
+/// [`UdpSocket::connect`](crate::net::UdpSocket::connect). Given a host name
+/// (`"localhost:8080"`) they fail with `GIONG-E0100`, because looking a name
+/// up takes time the worker would spend blocked, and because a name such as
+/// `localhost` can stand for `127.0.0.1`, for `::1` or for both, which is
+/// not something a server should leave to the resolver. Write the IP
+/// address, or resolve the name first with [`lookup_host`].
 ///
 /// This trait is sealed: it cannot be implemented outside of giong.
 pub trait ToSocketAddrs: sealed::Sealed {}
@@ -154,6 +166,23 @@ impl<T: ToSocketAddrs + ?Sized> ToSocketAddrs for &T {}
 impl<T: Sealed + ?Sized> Sealed for &T {
     fn target(&self) -> io::Result<Target<'_>> {
         (**self).target()
+    }
+}
+
+/// The addresses `addr` names, for a function that cannot wait for a name
+/// to be resolved: `what` is that function, for the message.
+pub(crate) fn resolved<A: ToSocketAddrs>(addr: &A, what: &str) -> io::Result<Vec<SocketAddr>> {
+    match addr.target()? {
+        Target::Resolved(addrs) => Ok(addrs),
+        Target::Host(host, port) => Err(raise(
+            Code::InvalidAddress,
+            format!("{host:?} is a host name, and {what} takes an IP address"),
+            format!(
+                "write the IP address, as in \"127.0.0.1:{port}\" or \"[::1]:{port}\" \
+                 (\"0.0.0.0:{port}\" for every interface), or resolve the name first with \
+                 giong::net::lookup_host(\"{host}:{port}\").await."
+            ),
+        )),
     }
 }
 

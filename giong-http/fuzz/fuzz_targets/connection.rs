@@ -56,7 +56,10 @@ fn is_token(s: &str) -> bool {
 fn check_request(req: &Request) {
     assert!(is_token(req.method()), "method {:?}", req.method());
     assert!(!req.target().is_empty());
-    assert!(req.version_minor() <= 1);
+    assert!(matches!(
+        req.version(),
+        giong_http::Version::Http10 | giong_http::Version::Http11
+    ));
     for (name, value) in req.headers() {
         assert!(is_token(name), "header name {name:?}");
         assert!(!value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0)));

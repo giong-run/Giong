@@ -518,30 +518,17 @@ impl Client {
         Ok(if rows > 0 { rows } else { ok.affected_rows })
     }
 
-    /// Runs an `INSERT` into a table with an `AUTO_INCREMENT` column and
-    /// returns the id it generated (for several rows, the id of the first).
+    /// Runs an `INSERT` and returns the `AUTO_INCREMENT` id it generated
+    /// (for several rows, the id of the first), or `None` when it generated
+    /// none: a table without such a column, or an `INSERT ... ON DUPLICATE
+    /// KEY UPDATE` that updated a row without changing its id.
     ///
-    /// Fails with [`ErrorKind::RowCount`] when the statement generated no id;
-    /// use [`execute`](Self::execute) for those.
-    ///
-    /// That error comes after the statement has run: its rows are written,
-    /// and under autocommit committed. Do not retry on it, or the rows are
-    /// written twice. `INSERT ... ON DUPLICATE KEY UPDATE` that updates a row
-    /// without changing its id also ends this way; use `execute` for it.
-    pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
+    /// `None` is not an error: the statement ran, and its rows are written
+    /// (under autocommit, committed). An error always means the statement
+    /// failed, so code that retries on errors never writes twice.
+    pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<u64>, Error> {
         let (_, ok, _) = self.run(sql, params, false).await?;
-        if ok.last_insert_id == 0 {
-            return Err(Error::new(
-                ErrorKind::RowCount,
-                format!(
-                    "the statement ran ({} rows affected, and committed under autocommit) but \
-                     generated no AUTO_INCREMENT id, so do not run it again; use execute for \
-                     statements on tables without one, and for ON DUPLICATE KEY UPDATE",
-                    ok.affected_rows
-                ),
-            ));
-        }
-        Ok(ok.last_insert_id)
+        Ok((ok.last_insert_id != 0).then_some(ok.last_insert_id))
     }
 
     /// Runs SQL that may hold several statements separated by `;`, with no

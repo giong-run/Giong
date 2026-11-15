@@ -139,7 +139,7 @@ epoll driver, a file operation running on a blocking thread does the same.
 - State in the documentation of every new `async fn` whether it is cancel safe, meaning
   whether dropping it can lose data.
 - Add a test that drops the operation while it is in flight and then checks
-  `giong::stats()` for leaked operations and buffers. `tests/cancel.rs` has examples.
+  `giong::observe::worker_stats()` for leaked operations and buffers. `tests/cancel.rs` has examples.
 
 ### Performance claims
 

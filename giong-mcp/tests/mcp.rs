@@ -167,7 +167,7 @@ fn with_service(cfg: Config, f: impl FnOnce(SocketAddr, giong::Handle) + Send + 
     let handle = rt.handle();
     let server = cfg.start(&handle).unwrap();
     let addr = server.local_addr().unwrap();
-    assert_eq!(server.url(), format!("http://{addr}/mcp"));
+    assert_eq!(server.url(), Some(format!("http://{addr}/mcp")));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let h = handle.clone();
     let test = thread::spawn(move || {
@@ -566,7 +566,7 @@ fn it_listens_on_loopback_or_a_unix_socket_only() {
     let server = Config::unix(&path).start(&handle).unwrap();
     assert_eq!(server.local_addr(), None);
     assert_eq!(server.unix_path(), Some(path.as_path()));
-    assert!(server.url().starts_with("unix:"));
+    assert_eq!(server.url(), None);
     // Only the service's user can connect, whatever the umask.
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "{mode:o}");

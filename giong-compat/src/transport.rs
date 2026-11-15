@@ -142,7 +142,7 @@ mod tls {
             // the adapter loses nothing.
             let recv = receiver.get_or_insert_with(|| {
                 let stream = this.clone();
-                Box::pin(async move { stream.recv().await })
+                Box::pin(async move { stream.recv().await.map(giong_tls::Received::into_vec) })
             });
             let res = std::task::ready!(recv.as_mut().poll(cx));
             *receiver = None;

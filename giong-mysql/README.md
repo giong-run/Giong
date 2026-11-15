@@ -42,7 +42,8 @@ fn main() -> std::io::Result<()> {
             let id = pool
                 .insert("INSERT INTO orders (customer) VALUES (?)", &[&42u64])
                 .await
-                .unwrap();
+                .unwrap()
+                .expect("orders has an AUTO_INCREMENT id");
             println!("order {id}");
         }
     })
@@ -127,7 +128,7 @@ Each connection starts its session with:
 | `client.query(sql, &[&a, &b])` | All the rows, as `Vec<Row>`. Parameters are `?`. A stored procedure (`CALL`) gives the rows of its first result. |
 | `client.query_one(..)`, `query_opt(..)` | Exactly one row (`ErrorKind::RowCount` otherwise); at most one. |
 | `client.execute(..)` | The number of rows inserted, updated (matched, including rows already holding the new values) or deleted. |
-| `client.insert(..)` | The `AUTO_INCREMENT` id an `INSERT` generated (of its first row); `ErrorKind::RowCount` if it generated none, after the statement ran: do not retry on it. |
+| `client.insert(..)` | The `AUTO_INCREMENT` id an `INSERT` generated (of its first row), or `None` if it generated none; the statement ran either way. |
 | `client.batch_execute(sql)` | Several statements separated by `;`, with no parameters and no results, stopping at the first error. For migrations and setup. |
 | `client.transaction()` | Starts a transaction and borrows the client mutably until it ends. `tx.commit()` or `tx.rollback()`; dropping the transaction rolls it back. A transaction the server ended early (deadlock, lock wait timeout with `innodb_rollback_on_timeout`, DDL), or one with a statement given up, refuses further statements, and its `commit` fails. |
 | `client.reset_session()` | Resets the session the way the pool does when a connection comes back: rolls back, releases locks, drops temporary tables and variables, and sets the session up again. For a stored function or trigger that takes a named lock or sets a user variable, which the server does not report. |

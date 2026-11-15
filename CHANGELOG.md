@@ -8,6 +8,89 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+The API freeze for 1.0: the decisions the 0.6 reviews and an outside build of a service
+left open, settled. Every item and the reason for each choice is in
+[docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md), with what was
+kept as it is and what can be added in 1.x without breaking anything.
+
+### Added
+
+- **giong**: `observe::worker_stats()` and `observe::WorkerStats`, the counters of the
+  current worker (live tasks, tracked and in-flight operations, receive buffers, timers),
+  documented and `#[non_exhaustive]`. They were `giong::stats()` and `giong::Stats`,
+  hidden from the documentation, which the tests of every crate already used to check
+  for leaks.
+- **giong-http**: `Handler` is implemented for `Rc<H>`, so one handler (a giong-web `App`
+  with its pools) can serve a plain port and a TLS port: `let app = Rc::new(app);` and a
+  clone for each `serve`. Streaming routes keep streaming, which a closure around the
+  handler silently turned off.
+- **giong-http**: error code `GIONG-E1119` (`Code::HttpInvalidResponse`) for
+  `Response::try_header` and `Response::try_new`, which used `GIONG-E1101`, a code whose
+  page is about the client.
+- **giong-tls**: `Received`, what `TlsStream::recv` returns (see Changed).
+
+### Changed
+
+- **Breaking:** **giong**: `TcpListener::bind`, `TcpListener::bind_balanced` and
+  `UdpSocket::bind` refuse an address that a socket of another process holds, with
+  `AddrInUse`, even when that socket shares its port with `SO_REUSEPORT` as giong's own
+  do. A service started twice by mistake used to come up twice and split the
+  connections (or datagrams) between the two processes. Workers of one process still
+  share a port. To share one between processes on purpose, create the sockets yourself
+  and pass them to `from_std`. A dropped listener's port can be bound again at once.
+- **Breaking:** **giong**: `TcpListener::bind`, `TcpListener::bind_balanced`,
+  `UdpSocket::bind` and `UdpSocket::connect` take giong's `net::ToSocketAddrs` with IP
+  addresses only, instead of the standard library's trait. A host name
+  (`"localhost:8080"`) is refused with `GIONG-E0100`, which says what to write instead:
+  the standard library looked it up with a blocking `getaddrinfo` on the worker, outside
+  giong's resolver, and `localhost` can mean `127.0.0.1`, `::1` or both. Write the IP
+  address, or resolve the name first with `net::lookup_host`. The module no longer has two
+  traits named `ToSocketAddrs`.
+- **Breaking:** **giong**: `UdpSocket::bind` sets `SO_REUSEPORT` only, not `SO_REUSEADDR`
+  as well: with both, a socket of any user that set `SO_REUSEADDR` could bind the port
+  and receive its datagrams.
+- **Breaking:** **giong**: `giong::stats()` and `giong::Stats` are now
+  `giong::observe::worker_stats()` and `giong::observe::WorkerStats` (see Added).
+- **giong**: `TcpStream::send_with_control` is hidden from the documentation and outside
+  the semver promise: its control bytes are Linux's layout. It stays for `giong-tls`.
+- **giong**: error messages link to the error pages of the release that raised them
+  (`blob/vX.Y.Z/docs/errors/…`) instead of `main`, which a binary kept for years would
+  otherwise point at as the pages change.
+- **giong**: the docs of `Sleep` say that it is `Send` on purpose, and stays so.
+- **Breaking:** **giong-http**: `Request::version_minor` is removed; `Request::version`
+  tells every version apart (it reported `1` for HTTP/2).
+- **Breaking:** **giong-http**: `Server::max_connections` defaults to 10,000 connections
+  per `serve` call (per worker), not unlimited, so that a worker's memory is bounded by
+  default. Clients past the limit wait in the listen queue.
+- **giong-http**: `Response::header` and `Response::try_header` take the value as
+  `impl AsRef<str>`, so a `String` from `format!` needs no `&`.
+- **giong-web**: `json(status, value)` with a status outside `200..=599` returns an
+  internal error (`500`, with the cause in the log) instead of panicking.
+- **Breaking:** **giong-tls**: `TlsStream::recv` returns `Received` instead of
+  `Vec<u8>`. It derefs to `&[u8]`, can be sent on as it is (`tls.write_all(data)`), and
+  `into_vec()` gives the `Vec`. The type leaves room to hand over kernel TLS's receive
+  buffer without a copy later without breaking anyone.
+- **Breaking:** **giong-postgres**, **giong-redis**: `Tls` is `#[non_exhaustive]`, as
+  giong-mysql's already was, so that ways to check a server can be added; a `match` on it
+  needs a `_` arm.
+- **giong-postgres**: the `FromSql` docs promise that the list of types read in binary
+  does not change within 1.x.
+- **Breaking:** **giong-mysql**: `insert` returns `Result<Option<u64>, Error>`: `None`
+  when the statement generated no `AUTO_INCREMENT` id, where it used to fail with
+  `ErrorKind::RowCount` after the rows were written, so code that retried on errors wrote
+  them twice.
+- **Breaking:** **giong-redis**: `Value` is `#[non_exhaustive]`.
+- **Breaking:** **giong-redis**: `mget` has one type parameter, the result:
+  `mget::<Vec<Option<String>>>(&keys)`, not `mget::<Vec<Option<String>>, _>(&keys)`.
+- **Breaking:** **giong-mcp**: `McpServer::url` returns `Option<String>`, `None` on a Unix
+  socket, for which it used to return `unix:/path/mcp`, which no MCP client understands.
+
+### Fixed
+
+- **giong**: a dropped UDP socket no longer takes a share of the datagrams meant for a
+  socket bound to the same port right after it, during the moment before its close
+  reaches the kernel.
+
 ## [0.6.0] - 2026-11-15
 
 The first round of reviews before 1.0, fixed. Every crate was reviewed from its code, with

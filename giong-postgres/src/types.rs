@@ -399,6 +399,11 @@ impl<T: ToSql + ?Sized> ToSql for Box<T> {
 /// assume it, so that a value in another format is an error and never a
 /// wrong value.
 ///
+/// This list is part of the API: within 1.x no type moves from text to
+/// binary, so an implementation written for a type that arrives as text
+/// keeps receiving text. Faster decoding for more types, when it comes,
+/// comes as new Rust types read in binary, not as a new format for these.
+///
 /// ```
 /// use giong_postgres::types::Format;
 /// use giong_postgres::{Error, FromSql, Type};

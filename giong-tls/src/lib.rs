@@ -79,8 +79,10 @@
 #![warn(missing_docs)]
 
 mod ktls;
+mod received;
 
 pub use ktls::{ktls_stats, ktls_support, Ktls, KtlsStats, KtlsSupport};
+pub use received::Received;
 
 /// Entry points for the fuzz targets in `giong-tls/fuzz`. Only built by
 /// `cargo fuzz` (`--cfg fuzzing`); not part of the API.
@@ -1156,10 +1158,14 @@ impl TlsStream {
     /// One task may receive while others send. Only one task may receive at
     /// a time: like [`TcpStream::recv`], the stream wakes only the task that
     /// waited last, so a second receiver can wait forever.
-    pub async fn recv(&self) -> io::Result<Vec<u8>> {
+    pub async fn recv(&self) -> io::Result<Received> {
         if self.is_ktls() {
-            return self.kernel_recv().await;
+            return self.kernel_recv().await.map(Received);
         }
+        self.user_recv().await.map(Received)
+    }
+
+    async fn user_recv(&self) -> io::Result<Vec<u8>> {
         loop {
             {
                 let mut plain = self.plain.borrow_mut();

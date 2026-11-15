@@ -67,7 +67,7 @@ fn dropping_an_in_flight_read_keeps_its_buffer_alive() {
         assert_eq!(buf, b"still alive");
 
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(
             stats.tracked_ops, 0,
             "cancelled reads were not cleaned up: {stats:?}"
@@ -103,7 +103,7 @@ fn dropping_an_in_flight_vectored_write_keeps_its_buffers_alive() {
         assert!(total > 0);
         drop((c, s));
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
     });
 }
@@ -136,7 +136,7 @@ fn dropping_an_in_flight_write_keeps_its_buffer_alive() {
         assert!(total > 0);
         drop((c, s));
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
         assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
     });
@@ -176,7 +176,7 @@ fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
         assert!(total > 0);
         drop((c, s));
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
     });
 }
@@ -216,7 +216,7 @@ fn a_dropped_send_file_leaves_nothing_behind() {
         drop((c, s, file));
         std::fs::remove_file(&path).unwrap();
         sleep(Duration::from_millis(20)).await;
-        let stats = giong::stats();
+        let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
     });
 }
@@ -240,7 +240,7 @@ fn aborting_a_task_blocked_on_io_cleans_up() {
         assert!(eof.is_empty());
         drop(c);
         sleep(Duration::from_millis(20)).await;
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
 }
 
@@ -307,7 +307,7 @@ fn receive_pool_exhaustion_recovers() {
             assert_eq!(results, expected);
 
             sleep(Duration::from_millis(20)).await;
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert_eq!(stats.free_recv_buffers, 4, "{stats:?}");
         })
         .unwrap();
@@ -358,7 +358,7 @@ fn a_stalled_reader_does_not_starve_other_connections() {
                     got += data.len();
                 }
             }
-            let stats = giong::stats();
+            let stats = giong::observe::worker_stats();
             assert!(
                 stats.free_recv_buffers > 0,
                 "stalled reader took the whole pool: {stats:?}"
@@ -459,7 +459,7 @@ fn a_cancelled_operation_owns_its_buffer_until_the_kernel_confirms() {
         let (_c, s) = pair().await;
         // Let the cancellation of `pair`'s listener settle first.
         sleep(Duration::from_millis(20)).await;
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
         let freed = Rc::new(std::cell::Cell::new(false));
         let buf = Tracked {
             data: Vec::with_capacity(4096),
@@ -486,12 +486,12 @@ fn a_cancelled_operation_owns_its_buffer_until_the_kernel_confirms() {
             giong::DriverKind::IoUring => 1,
             _ => 0,
         };
-        assert_eq!(giong::stats().tracked_ops, expected);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, expected);
 
         // After the completion arrives, the buffer is released — no leak.
         sleep(Duration::from_millis(20)).await;
         assert!(freed.get(), "buffer of a cancelled operation was leaked");
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
 }
 
@@ -515,7 +515,7 @@ fn a_completed_but_uncollected_operation_releases_its_buffer() {
         sleep(Duration::from_millis(5)).await;
 
         assert!(freed.get());
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
 }
 
@@ -559,13 +559,13 @@ fn a_dropped_open_closes_the_descriptor_it_produced() {
         }
         // Let every open finish and its descriptor be closed.
         for _ in 0..100 {
-            if open_fds(&path) == 0 && giong::stats().tracked_ops == 0 {
+            if open_fds(&path) == 0 && giong::observe::worker_stats().tracked_ops == 0 {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(open_fds(&path), 0, "descriptors left open");
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
     std::fs::remove_file(&path).unwrap();
 }
@@ -646,7 +646,11 @@ fn a_stream_dropped_inside_the_driver_still_closes() {
         assert_eq!(res.unwrap(), 0);
         drop((c, c2, s2));
         sleep(Duration::from_millis(20)).await;
-        assert_eq!(giong::stats().tracked_ops, 0, "entries left");
+        assert_eq!(
+            giong::observe::worker_stats().tracked_ops,
+            0,
+            "entries left"
+        );
     });
 }
 
@@ -688,7 +692,7 @@ fn an_operation_dropped_inside_the_driver_is_still_cancelled() {
         assert!(freed.get(), "the read's buffer was never released");
         drop((c2, s2, s));
         sleep(Duration::from_millis(20)).await;
-        assert_eq!(giong::stats().tracked_ops, 0);
+        assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
     });
 }
 

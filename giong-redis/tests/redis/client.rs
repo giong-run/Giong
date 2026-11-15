@@ -794,15 +794,15 @@ fn a_dropped_client_closes_even_if_the_server_keeps_its_side_open() {
             let _ = looked_rx.recv_timeout(Duration::from_secs(30));
             drop(s);
         });
-        let tasks = giong::stats().tasks;
+        let tasks = giong::observe::worker_stats().tasks;
         let c = Client::connect(&giong_redis::Config::new().host("127.0.0.1").port(port))
             .await
             .unwrap();
         c.ping().await.unwrap();
-        assert_eq!(giong::stats().tasks, tasks + 2);
+        assert_eq!(giong::observe::worker_stats().tasks, tasks + 2);
         drop(c);
         let deadline = Instant::now() + Duration::from_secs(10);
-        while giong::stats().tasks > tasks {
+        while giong::observe::worker_stats().tasks > tasks {
             assert!(
                 Instant::now() < deadline,
                 "the connection's tasks are still running"
