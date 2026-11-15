@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A pull request in the merge queue: the same jobs, on main with the pull
+  # request and those queued before it merged, before main moves.
+  merge_group:
   # The release pull request is opened by GitHub Actions, which starts no
   # pull_request run; prepare-release.yml starts CI on its branch this way.
   workflow_dispatch:
@@ -11,8 +14,13 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels the run of the push before it. A run
+# on main is never cancelled (each has a group of its own): in a cancelled run
+# `fallback` and `tsan` report a failure, as they must on a pull request, where
+# a skipped required check would count as passed, and main would look broken
+# when it is not.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -575,3 +583,18 @@ jobs:
         with:
           name: linux-${{ matrix.kernel }}-log
           path: target/kernels/linux-${{ matrix.kernel }}.log
+
+  # Every job of this workflow passed. One name to require on main, so that
+  # the jobs that are not required by themselves (Miri, the kernels, Docker,
+  # the other server versions, loom, h2spec, the lowest dependency versions)
+  # hold a merge back as well.
+  all-checks:
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" > /dev/null
