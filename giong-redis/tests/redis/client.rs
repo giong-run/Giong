@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -169,12 +170,20 @@ fn many_tasks_share_one_connection_and_each_gets_its_own_reply() {
     run(|server| async move {
         let c = Rc::new(Client::connect(&server.tcp()).await.unwrap());
         let prefix = key("share");
+        // The most commands in flight that a task saw as it sent its own.
+        // Read by the tasks, not by a task that samples on a timer: which
+        // of a timer and a reply wakes the worker first decides what such a
+        // task sees, and on a loaded machine it can see an empty queue every
+        // time (the merge queue's epoll job did, "at most 0 in flight").
+        let most = Rc::new(Cell::new(0));
         let mut tasks = Vec::new();
         for t in 0..200 {
             let c = c.clone();
+            let most = most.clone();
             let k = format!("{prefix}:{t}");
             tasks.push(giong::spawn(async move {
                 for i in 1..=50i64 {
+                    most.set(most.get().max(c.in_flight()));
                     let n = c.incr(&k, t).await.unwrap();
                     assert_eq!(n, i * t);
                     let s: String = c.query(&cmd("ECHO").arg(format!("{t}-{i}"))).await.unwrap();
@@ -182,15 +191,11 @@ fn many_tasks_share_one_connection_and_each_gets_its_own_reply() {
                 }
             }));
         }
-        let mut most = 0;
-        while tasks.iter().any(|t| !t.is_finished()) {
-            most = most.max(c.in_flight());
-            giong::time::sleep(Duration::from_micros(200)).await;
-        }
         for t in tasks {
             t.await.unwrap();
         }
         // The commands of many tasks were in flight together.
+        let most = most.get();
         assert!(most > 10, "at most {most} in flight");
         assert_eq!(c.in_flight(), 0);
     });
