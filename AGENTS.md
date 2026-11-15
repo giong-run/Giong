@@ -90,6 +90,7 @@ KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls mod
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 scripts/semver.sh            # no breaking API change since the last release (cargo-semver-checks)
+scripts/instr.py check       # instructions per operation and heap per idle connection vs bench/instr/baseline.csv
 ```
 
 Continuous integration requires `all-checks` on every pull request, which passes when
@@ -106,7 +107,10 @@ The release test binaries are built once per run (the `build` job, with
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
 CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the last
-release, so no breaking change lands between releases), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+release, so no breaking change lands between releases), `instr` (`scripts/instr.py`:
+instructions per operation on the hot paths, counted by callgrind, and heap per idle
+connection, within 1% and 2% of `bench/instr/baseline.csv`; a change meant to move them
+commits the new baseline the job prints, see `bench/instr/README.md`), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
 against other server versions (`servers`) on every pull request, and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,

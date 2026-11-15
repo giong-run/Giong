@@ -16,9 +16,9 @@ Kubernetes setup. Each crate that replaces a Tokio-based one is measured against
 reproducible benchmark (tokio-postgres with deadpool, mysql_async and SQLx, redis-rs,
 reqwest, axum), and the README says where giong does not win.
 
-After 1.0, the 1.x releases add gRPC, macOS, HTTP/3 and Windows, one at a time and without
-breaking the 1.0 API (see the milestones after 1.0 below). Linux stays the platform giong is
-tuned and measured on.
+After 1.0, the 1.x releases add gRPC, macOS, HTTP/3 and Windows, then a memory limit kept
+under any load, one at a time and without breaking the 1.0 API (see the milestones after 1.0
+below). Linux stays the platform giong is tuned and measured on.
 
 ## Agent-first
 
@@ -312,8 +312,9 @@ features.
 
 - [x] `cargo-semver-checks` in CI, checking every change against 0.7.0.
 - [ ] Speed and memory thresholds checked in CI: instructions per request, counted so the
-      result is the same on every run of a shared runner, and memory per connection, each
-      with its raw data in `bench/`.
+      result is the same on every run of a shared runner, heap allocations per request, and
+      memory per idle connection over HTTP/1.1, HTTP/2 and HTTPS, each with its raw data in
+      `bench/`.
 - [ ] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
       boxes, the lifetimes of operations), run in CI.
 - [ ] Fault injection through an internal simulation driver: lost, reordered and delayed
@@ -337,6 +338,10 @@ What only real machines and a real service can show. No new public features.
       pass, with method and raw data in the repository; the README and giong.run take their
       numbers from them.
 - [ ] UDP segmentation offload measured in the same rental, as input for HTTP/3 (no API).
+- [ ] The server held to the cheapest class of machine, 1 CPU and 512 MB (a container on
+      the rental), against Tokio, Go and nginx: requests per second, idle HTTPS connections
+      held, and memory per idle connection with kernel TLS, which a virtual machine cannot
+      measure. Input for 1.5.
 - [ ] Real use: giong in a production service, with its user reporting back.
 
 **Exit criteria:** the soak ends with no leak, crash or stall, and the service's user
@@ -368,7 +373,8 @@ follows the path the epoll driver opened, then Windows, the largest change of pl
 gRPC is 1.1 and macOS 1.2; HTTP/3 and Windows take 1.3 and 1.4 in the order they pass their
 gates. Nothing of 1.x lands on `main` before 1.0.0: until then only prototypes and
 measurements that touch no released code, and 1.0.x fixes come from a `release/1.0` branch
-afterwards. WebSocket comes later, when someone needs it.
+afterwards. 1.5 follows on its own: it needs 1.2's overload protection and nothing from the
+others. WebSocket comes later, when someone needs it.
 
 Every 1.x release keeps the [Agent-first](#agent-first) line (coded errors with their
 pages, one obvious way, `llms.txt` and `AGENTS.md` updated with the feature, giong-mcp and
@@ -438,8 +444,9 @@ stays on Linux. Two safeguards for code written in a hurry, on every system, shi
       while it happens, with where it was spawned and its stack, a coded error and the fix
       (`spawn_blocking`, or a yield in the loop).
 - [ ] Overload protection: an adaptive limit on requests in flight and load shedding with
-      `503` and `Retry-After` before latency climbs, and a memory budget per worker, so a
-      small server under a spike slows down gracefully instead of falling over.
+      `503` and `Retry-After` before latency climbs, the path that 1.5's memory limit refuses
+      work through, so a small server under a spike slows down gracefully instead of
+      falling over.
 
 **Exit criteria:** the test suite passes on macOS in CI, and the examples run there
 unchanged.
@@ -501,3 +508,42 @@ platform it is tuned for.
 
 **Exit criteria:** the test suite passes on Windows in CI, and a benchmark against Tokio on
 Windows is published with its method.
+
+## 1.5 — Lean under pressure
+
+Hardware, memory above all, is expensive, so a service should carry heavy load on a small
+machine and never fall over for lack of memory. giong already spends 5 to 10 times less
+memory per idle connection than Tokio and Go (see the README); what no Rust runtime offers
+is a memory limit it keeps whatever clients do. Like the releases above, this one breaks nothing:
+everything is opt-in, and code written for 1.0 behaves as before. It stays a runtime
+feature: the limit and its ledger live in `giong`, and the protocol crates charge what they
+hold to it.
+
+- [ ] A memory limit for the whole process (`Builder::memory_limit`, or read from the
+      container's cgroup), kept by one ledger per worker with no lock: buffers, request
+      bodies, HTTP/2 and TLS state, queued messages, tasks, and the kernel's socket memory,
+      which a container's limit counts too. As memory runs short giong gives back what it
+      can spare first, then slows clients down by not reading from them, then refuses new
+      work (`503` with `Retry-After`, `REFUSED_STREAM`), and only last cuts the one request
+      holding the most memory, with a coded error naming it. It never aborts.
+- [ ] Memory charged to the request that holds it: a declared estimate per request, and an
+      optional counting global allocator that wraps the system's or another (jemalloc,
+      mimalloc), so the limit covers the application's allocations too. giong-mcp shows
+      what holds memory, by connection and request.
+- [ ] Accounts per tenant in the ledger, under a key the service chooses, so one tenant
+      over its quota of memory or requests in flight is refused while the others are
+      served. The runtime keeps the accounts; which key to use (a client address, a header,
+      a TLS identity) is decided in `giong-web`, with the rate limiting planned for 1.x.
+- [ ] Idle connections as small as the kernel's share of them or smaller, where it is not
+      done before: an idle HTTPS connection under 4.5 KiB (12.5 KiB in 0.7; nginx with
+      OpenSSL 15), an idle HTTP/2 connection under 3 KiB (4.5), and HTTP/2 requests with
+      at most 4 heap allocations each (22).
+- [ ] Proven under attack: slow uploads, slow heads, slow readers, floods of HTTP/2 streams
+      and of new connections, handlers that allocate more than they declared, alone and
+      mixed, in containers of 64, 128 and 256 MiB, in CI, under the simulation driver and on
+      bare metal.
+
+**Exit criteria:** no out-of-memory kill in any case of the attack matrix, well-behaved
+clients mixed into it keep at least 90% of their requests per second, the limit costs at
+most 1% more instructions per request, and the cheapest-machine benchmark of 0.9 is
+published again with the limit on, against Tokio, Go and nginx.

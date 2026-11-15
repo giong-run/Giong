@@ -1,0 +1,4 @@
+# The compiler the instruction counts in baseline.csv were measured with:
+# another one changes them. CI installs this version for the `instr` job.
+[toolchain]
+channel = "1.97.0"
