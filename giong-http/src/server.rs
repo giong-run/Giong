@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io::{self, Write as _};
 use std::mem;
@@ -17,6 +18,7 @@ use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use giong::time::{sleep, timeout};
 
 use crate::body::{Failure, Next, Pipe, StreamBody};
+use crate::budget::{self, Charge, FREE};
 use crate::chunked::{Decoder, Progress};
 use crate::h2::PREFACE;
 use crate::heap::HeapFuture;
@@ -393,6 +395,49 @@ pub(crate) struct Config {
     /// responses not sent yet, instead of the larger of `max_body_size`
     /// and 1 MiB: for the fuzz harness, which needs a small one.
     pub(crate) http2_budget: Option<u64>,
+    pub(crate) max_buffered_request_bytes: BufferedLimit,
+}
+
+impl Config {
+    /// The worker's budget for requests received in full (see
+    /// `Server::max_buffered_request_bytes`). Worked out on the worker, the
+    /// first time it is needed.
+    pub(crate) fn buffered_limit(&self) -> u64 {
+        match self.max_buffered_request_bytes {
+            BufferedLimit::AUTO => {
+                let single = (self.max_body_size as u64).saturating_add(self.max_head_size as u64);
+                crate::budget::auto_limit(single)
+            }
+            BufferedLimit(limit) => limit,
+        }
+    }
+}
+
+/// `Server::max_buffered_request_bytes`: a number of bytes, or
+/// [`AUTO`](Self::AUTO) for the default, which depends on the worker count
+/// and the cgroup the process runs in and so is worked out on the worker.
+/// Not an `Option`, which would take 8 bytes more in every connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BufferedLimit(pub(crate) u64);
+
+impl BufferedLimit {
+    pub(crate) const AUTO: Self = Self(u64::MAX);
+
+    fn bytes(bytes: usize) -> Self {
+        // `u64::MAX` bytes is no limit anyway.
+        Self((bytes as u64).min(u64::MAX - 1))
+    }
+}
+
+impl fmt::Debug for BufferedLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::AUTO => {
+                f.write_str("auto (64 MiB, or the cgroup memory limit / 4 / workers if less)")
+            }
+            Self(bytes) => write!(f, "{bytes}"),
+        }
+    }
 }
 
 /// An HTTP/1.1 and HTTP/2 server. Configure it, then call
@@ -448,6 +493,7 @@ impl Server {
                 http2_prior_knowledge: true,
                 max_concurrent_streams: 100,
                 http2_budget: None,
+                max_buffered_request_bytes: BufferedLimit::AUTO,
             },
         }
     }
@@ -489,6 +535,51 @@ impl Server {
         self
     }
 
+    /// Most bytes of requests one worker holds while receiving them
+    /// (default: 64 MiB, or less in a container: see below).
+    ///
+    /// [`max_head_size`](Self::max_head_size) and
+    /// [`max_body_size`](Self::max_body_size) bound one request, and
+    /// [`max_connections`](Self::max_connections) the number of
+    /// connections, but not the sum: 10,000 clients each sending a 1 MiB
+    /// body slowly would make one worker hold about 11 GiB. This bounds the
+    /// sum. It counts what the server receives in full before calling the
+    /// handler, over HTTP/1.1 and HTTP/2, on every connection of the worker
+    /// (every `Server` serving on it shares the count, each against its own
+    /// limit), from the moment the bytes arrive until the request is
+    /// dropped. Over HTTP/1.1 the first 4 KiB of each request are not
+    /// counted, so that ordinary requests keep being served while uploads
+    /// fill the budget. A body read as a stream (see
+    /// [`Handler::stream_body`]) is not counted: it holds one piece at a
+    /// time.
+    ///
+    /// A request that would take the count past the limit is refused
+    /// without calling the handler, with `503 Service Unavailable`,
+    /// `Retry-After: 1` and `Connection: close` over HTTP/1.1 (before its
+    /// body is read, if its `Content-Length` does not fit; otherwise as
+    /// soon as the next bytes would not), and with `REFUSED_STREAM` over
+    /// HTTP/2, which clients retry. The body of the `503` names
+    /// `GIONG-E1120`, and each worker says on stderr, at most once a
+    /// minute, how many requests it refused. A request larger than the
+    /// limit itself gets `413 Content Too Large`.
+    ///
+    /// The default is 64 MiB per worker, or, when the process has a cgroup
+    /// memory limit (a container's memory limit, systemd's `MemoryMax`), a
+    /// quarter of that limit divided among the workers if that is less; but
+    /// never less than one request of `max_head_size` plus `max_body_size`.
+    /// With one worker in 128 MiB that is 32 MiB. `Debug` shows `auto` for
+    /// it, since the worker count is only known on the worker.
+    ///
+    /// What a worker holds is then about this limit plus what its
+    /// connections cost on their own (about 2 KiB each while idle over
+    /// HTTP/1.1, 4.5 KiB over HTTP/2 and 12.5 KiB over HTTPS, and up to the
+    /// 4 KiB above while a request arrives); see `docs/DEPLOYMENT.md` for
+    /// sizing a container.
+    pub fn max_buffered_request_bytes(mut self, bytes: usize) -> Self {
+        self.cfg.max_buffered_request_bytes = BufferedLimit::bytes(bytes);
+        self
+    }
+
     /// After a shutdown is requested, how long the server keeps picking up
     /// connections and requests that were already on their way (default:
     /// 100 ms). Requests in progress are not affected by this: they get the
@@ -502,16 +593,20 @@ impl Server {
     /// (default: 10,000). Normally every worker makes its own call, so the
     /// limit applies per worker.
     ///
-    /// The default keeps a worker's memory bounded: an idle connection costs
-    /// a few KiB, and the most a client can make one hold is about 1.2 MiB
-    /// over HTTP/1.1 and 1.7 MiB over HTTP/2 with the default sizes. Raise
-    /// it for many long-lived connections per worker (event streams), lower
-    /// it to bound memory more tightly.
+    /// An idle connection costs a few KiB (about 2 KiB over HTTP/1.1, 4.5
+    /// KiB over HTTP/2, 12.5 KiB over HTTPS, plus the kernel's socket
+    /// buffers), so the default holds a worker's idle connections to tens
+    /// of MiB. The requests the connections are receiving have a bound of
+    /// their own, shared by all of them:
+    /// [`max_buffered_request_bytes`](Self::max_buffered_request_bytes).
+    /// Raise this limit for many long-lived connections per worker (event
+    /// streams), lower it to bound memory more tightly, as in a small
+    /// container.
     ///
     /// At the limit the server stops accepting until a connection closes.
     /// New clients wait in the kernel's listen queue meanwhile instead of
-    /// being refused, and the server never runs out of file descriptors or
-    /// memory because of the number of clients. Connections handed to
+    /// being refused, so the server does not run out of file descriptors
+    /// because of the number of clients. Connections handed to
     /// [`serve_connection`](Self::serve_connection) are not counted.
     pub fn max_connections(mut self, max: usize) -> Self {
         self.cfg.max_connections = max.max(1);
@@ -797,6 +892,21 @@ enum End {
     Status(u16),
     /// The connection starts with the HTTP/2 preface: hand it over.
     Http2,
+    /// The worker holds as many request bytes as it may
+    /// (`max_buffered_request_bytes`): answer `503`, then close.
+    Busy,
+}
+
+/// The answer to a request refused because the worker holds as many
+/// request bytes as it may.
+fn busy() -> Response {
+    Response::new(503)
+        .header("retry-after", "1")
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(
+            &b"GIONG-E1120: the server is receiving as many requests as its memory budget \
+               allows (max_buffered_request_bytes). Retry later.\n"[..],
+        )
 }
 
 /// A request body read as it arrives (see `Handler::stream_body`).
@@ -890,6 +1000,9 @@ struct Conn<T> {
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
+    /// What the unparsed data and the body being decoded hold against the
+    /// worker's budget for requests (see `budget`).
+    charge: Charge,
     /// The connection's place under `max_connections`, given back when the
     /// connection is dropped. Declared last, so that the stream is closed
     /// first.
@@ -910,6 +1023,7 @@ impl<T: Transport> Conn<T> {
             closing: false,
             deadline: None,
             first: true,
+            charge: Charge::none(),
             _slot: slot,
         }
     }
@@ -935,13 +1049,13 @@ impl<T: Transport> Conn<T> {
                 Err(End::Http2) => {
                     let input = self.buf[self.pos..].to_vec();
                     self.release_read_buffer_all();
+                    self.charge.shrink_to(0);
                     let h2 = crate::h2::serve(&self.stream, self.cfg, self.peer, handler, input);
                     HeapFuture::new(h2).await;
                     return;
                 }
-                Err(End::Status(status)) => {
-                    self.reserve_out();
-                    Response::new(status).write_to(&mut self.out, 1, false, false);
+                Err(end @ (End::Status(_) | End::Busy)) => {
+                    self.write_refusal(end);
                     if self.flush().await.is_ok() {
                         self.lingering_close().await;
                     }
@@ -1068,6 +1182,22 @@ impl<T: Transport> Conn<T> {
                 self.close_write().await;
             }
         }
+    }
+
+    /// Writes the answer to a request that is refused without its handler
+    /// (an error status, or `503` for a full budget). Not inline in `run`:
+    /// a `Response` there would be kept in every connection's future.
+    fn write_refusal(&mut self, end: End) {
+        // Nothing more of the request is read: what it holds goes back now
+        // rather than after the answer.
+        self.release_read_buffer_all();
+        self.charge.shrink_to(0);
+        self.reserve_out();
+        let resp = match end {
+            End::Status(status) => Response::new(status),
+            _ => busy(),
+        };
+        resp.write_to(&mut self.out, 1, false, false);
     }
 
     /// Runs the handler of a request whose body it reads as a stream, while
@@ -1318,6 +1448,7 @@ impl<T: Transport> Conn<T> {
                 head,
                 body: BodyBytes::InBuffer(start..start),
                 peer: self.peer,
+                charge: Charge::none(),
             };
             let stream_body =
                 catching(|| handler.stream_body(&req)).map_err(|()| End::Status(500))?;
@@ -1340,6 +1471,7 @@ impl<T: Transport> Conn<T> {
                     self.pos += req.head.len;
                     self.scanned = 0;
                     self.deadline = None;
+                    self.settle();
                     return Ok((req, Some(streamed)));
                 }
                 None => head = req.head,
@@ -1351,14 +1483,17 @@ impl<T: Transport> Conn<T> {
             let mut decoder = Decoder::new(self.cfg.max_body_size);
             loop {
                 let data = &self.buf[self.pos + head.len..];
+                // The decoded body is held as well as the bytes it came from.
                 match decoder.feed(data).map_err(End::Status)? {
                     Progress::Done(used) => {
+                        self.account(decoder.body.len())?;
                         break (
                             BodyBytes::Decoded(mem::take(&mut decoder.body)),
                             head.len + used,
-                        )
+                        );
                     }
                     Progress::NeedMore => {
+                        self.account(decoder.body.len())?;
                         self.send_continue(&head, &mut interim_sent);
                         self.read_more(false).await?;
                     }
@@ -1370,6 +1505,9 @@ impl<T: Transport> Conn<T> {
                 return Err(End::Status(413));
             }
             let len = len as usize;
+            // Refused before the body is read (and before `100 Continue`)
+            // if it cannot fit in the worker's budget.
+            self.admit(head.len + len)?;
             while self.buf.len() - self.pos - head.len < len {
                 self.send_continue(&head, &mut interim_sent);
                 self.read_more(false).await?;
@@ -1378,12 +1516,23 @@ impl<T: Transport> Conn<T> {
             (BodyBytes::InBuffer(start..start + len), head.len + len)
         };
 
+        // What the request holds goes with it, and is given back when the
+        // handler drops it; the connection keeps the share of whatever
+        // follows it in the buffer.
+        let charge = if self.charge.bytes() == 0 {
+            // A request within `FREE`: the usual case, and nothing to work out.
+            Charge::none()
+        } else {
+            let rest = self.buf.len() - self.pos - total;
+            self.charge.split_off(rest.saturating_sub(FREE) as u64)
+        };
         let req = Request {
             buf: self.buf.clone(),
             start: self.pos,
             head,
             body,
             peer: self.peer,
+            charge,
         };
         self.pos += total;
         self.scanned = 0;
@@ -1439,7 +1588,8 @@ impl<T: Transport> Conn<T> {
         match received {
             Ok(Ok(chunk)) if !chunk.is_empty() => {
                 self.append(&chunk);
-                Ok(())
+                drop(chunk);
+                self.account(0)
             }
             // Idle for too long, an I/O error, or closed by the peer.
             _ => Err(End::Close),
@@ -1470,6 +1620,57 @@ impl<T: Transport> Conn<T> {
         }
     }
 
+    /// Charges the unparsed data, less the first `FREE` bytes, and `extra`
+    /// (a body being decoded) against the worker's budget. `Busy` if that
+    /// would take the worker past its limit.
+    fn account(&mut self, extra: usize) -> Result<(), End> {
+        let unparsed = self.buf.len() - self.pos;
+        if unparsed <= FREE && extra == 0 {
+            return Ok(());
+        }
+        let held = (unparsed.saturating_sub(FREE) + extra) as u64;
+        if held <= self.charge.bytes() {
+            return Ok(());
+        }
+        let limit = self.cfg.buffered_limit();
+        if self.charge.grow_to(held, limit) {
+            Ok(())
+        } else {
+            budget::note_refused(limit);
+            Err(End::Busy)
+        }
+    }
+
+    /// Whether a request taking `total` bytes from `pos` can be received:
+    /// `413` if it is larger than the worker's whole budget, `Busy` if the
+    /// budget cannot take it now. Nothing is charged: bytes are, as they
+    /// arrive.
+    fn admit(&mut self, total: usize) -> Result<(), End> {
+        let held = (total.saturating_sub(FREE)) as u64;
+        let Some(more) = held
+            .checked_sub(self.charge.bytes())
+            .filter(|&more| more > 0)
+        else {
+            return Ok(());
+        };
+        let limit = self.cfg.buffered_limit();
+        if held > limit {
+            return Err(End::Status(413));
+        }
+        if budget::fits(more, limit) {
+            Ok(())
+        } else {
+            budget::note_refused(limit);
+            Err(End::Busy)
+        }
+    }
+
+    /// Gives back what is charged beyond the unparsed data's share.
+    fn settle(&mut self) {
+        let held = (self.buf.len() - self.pos).saturating_sub(FREE);
+        self.charge.shrink_to(held as u64);
+    }
+
     fn reserve_out(&mut self) {
         if self.out.capacity() == 0 {
             self.out = take_buffer();
@@ -1491,6 +1692,7 @@ impl<T: Transport> Conn<T> {
                 None => self.buf = Rc::new(Vec::new()),
             }
             self.pos = 0;
+            self.charge.shrink_to(0);
         }
     }
 

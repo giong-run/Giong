@@ -83,6 +83,7 @@
 #![warn(missing_docs)]
 
 mod body;
+mod budget;
 mod chunked;
 #[cfg(feature = "client")]
 pub mod client;
