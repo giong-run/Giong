@@ -89,6 +89,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **Docs**: `llms.txt` on giong.run links the documentation of the release it names
+  (`blob/vX.Y.Z/`, and docs.rs at that version) instead of `main`, which already described
+  features no published crate had, so an agent following it wrote code that did not
+  compile against what `cargo add` installs. It lists every released crate's README and
+  says how to turn giong-mcp on. `llms-full.txt` is new: every crate's README, the
+  deployment notes and every error page of the release in one file, read from the tag.
+  The commit scopes in AGENTS.md and CONTRIBUTING.md cover every crate.
 - **giong**: the default number of workers follows the CPU quota. It was the number of CPUs
   in the process's affinity mask, which in a container with a CPU limit is every CPU of the
   machine: a Kubernetes pod with `limits.cpu: 2` on a 64-core node ran 64 pinned workers
