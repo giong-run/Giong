@@ -516,22 +516,33 @@ pre.code .t { color: var(--code-type); }
 
 /* roadmap page */
 .goal { display: grid; grid-template-columns: minmax(0, 6fr) minmax(0, 6fr); gap: 2rem clamp(2rem, 5vw, 4.5rem); align-items: start; }
-.timeline { display: grid; }
-.ms { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: 1rem clamp(1.5rem, 4vw, 3.5rem); padding-block: clamp(1.75rem, 3.5vw, 2.5rem); border-top: 1px solid var(--line); }
-.ms:first-child { border-top: 0; padding-top: 0; }
-.ms-side { display: grid; gap: 0.45rem; align-content: start; justify-items: start; }
-.ms-ver { font: 800 2rem/1 var(--display); letter-spacing: -0.04em; font-variant-numeric: tabular-nums; }
-.ms-ver.is-word { font: 600 0.8125rem/1.4 var(--mono); letter-spacing: 0.04em; color: var(--fg-3); padding-top: 0.4rem; }
-.ms-state { font: 600 0.6875rem/1 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; border-radius: 999px; padding: 0.35rem 0.55rem; border: 1px solid var(--line-2); color: var(--fg-3); }
-.ms.is-done .ms-state { background: var(--ink-3); border-color: transparent; color: var(--fg-2); }
-.ms.is-current .ms-state { background: var(--ember); border-color: var(--ember); color: var(--on-ember); }
-.ms.is-current .ms-ver { color: var(--ember); }
-.ms.is-planned .ms-ver { color: var(--fg-3); }
-.ms-progress { font: 0.75rem/1.4 var(--mono); color: var(--fg-3); }
+.rm-col > * { max-width: 56rem; }
+.rm-h { font-size: clamp(1.5rem, 2.6vw, 2rem); }
+.rm-sub { color: var(--fg-2); margin: 0.5rem 0 1.5rem; }
+.now { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: 1rem clamp(1.5rem, 4vw, 3.5rem); }
+.now-side { display: grid; gap: 0.6rem; align-content: start; justify-items: start; }
+.now-ver { font: 800 3.25rem/1 var(--display); letter-spacing: -0.045em; color: var(--ember); font-variant-numeric: tabular-nums; }
+.now-progress { display: grid; gap: 0.45rem; font: 0.75rem/1.4 var(--mono); color: var(--fg-3); }
+.now-main { display: grid; gap: 1.1rem; min-width: 0; }
+.now-main h2 { font-size: clamp(1.6rem, 3vw, 2.25rem); }
 .ms-bar { width: 6rem; height: 3px; border-radius: 2px; background: linear-gradient(90deg, var(--ember) var(--p), var(--line) var(--p)); }
-.ms.is-done .ms-bar { background: linear-gradient(90deg, var(--ember-3) var(--p), var(--line) var(--p)); }
-.ms-main { display: grid; gap: 0.9rem; min-width: 0; }
-.ms-main h2 { font-size: clamp(1.35rem, 2.4vw, 1.75rem); }
+.mrs { display: grid; border-top: 1px solid var(--line); }
+.mr { border-bottom: 1px solid var(--line); }
+.mr summary { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr) auto; column-gap: 1rem; row-gap: 0.15rem; align-items: baseline; padding: 0.85rem 0; cursor: pointer; list-style: none; }
+.mr summary::-webkit-details-marker { display: none; }
+.mr summary:hover .mr-name { color: var(--ember-ink); }
+.mr-ver { grid-row: span 2; font: 750 1.25rem/1.2 var(--display); letter-spacing: -0.03em; font-variant-numeric: tabular-nums; color: var(--fg-2); }
+.mr-ver.is-word { font: 600 0.75rem/2 var(--mono); letter-spacing: 0.04em; color: var(--fg-3); }
+.mr.is-planned .mr-ver { color: var(--fg-3); }
+.mr-name { font-weight: 650; color: var(--fg); }
+.mr-meta { font: 0.75rem/1.6 var(--mono); color: var(--fg-3); white-space: nowrap; }
+.mr-meta::after { content: " +"; color: var(--fg-3); }
+.mr[open] .mr-meta::after { content: " 2"; color: var(--ember-ink); }
+.mr-line { grid-column: 2 / -1; color: var(--fg-3); font-size: 0.9063rem; line-height: 1.5; }
+.mr-body { padding: 0.25rem 0 1.75rem 5.5rem; }
+.mr-links a { font-weight: 600; }
+.mrs-older { margin-top: 1.25rem; }
+.mrs-older[open] summary { margin-bottom: 0; }
 .nongoals { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: 1.5rem clamp(2rem, 5vw, 4.5rem); }
 .nongoals h2 { font-size: clamp(1.5rem, 2.6vw, 2rem); }
 
@@ -667,7 +678,7 @@ pre.code .t { color: var(--code-type); }
 .bench-intro .head-text { max-width: none; }
 
 /* grid tracks never grow past their container: long code scrolls inside its own box */
-.doc, .doc section, .releases, .rel, .rel-head, .prose, .ms-main, .crate-main, .crate-side,
+.doc, .doc section, .releases, .rel, .rel-head, .prose, .now-main, .crate-main, .crate-side,
 .chart, .head-text, .agents-side, .hero-copy, .page-head .wrap, .stack, .panels { grid-template-columns: minmax(0, 1fr); }
 
 /* 404 */
@@ -718,9 +729,11 @@ pre.code .t { color: var(--code-type); }
 @media (max-width: 720px) {
   .charts, .status, .caveats ul, .examples, .apis, .limits, .points { grid-template-columns: minmax(0, 1fr); }
   .files { grid-template-columns: minmax(0, 1fr); }
-  .ms { grid-template-columns: minmax(0, 1fr); }
-  .ms-side { grid-auto-flow: column; align-items: center; justify-content: start; gap: 0.75rem; }
-  .ms-ver { font-size: 1.6rem; }
+  .now { grid-template-columns: minmax(0, 1fr); }
+  .now-side { grid-auto-flow: column; align-items: end; justify-content: start; gap: 1rem; }
+  .now-ver { font-size: 2.5rem; }
+  .mr summary { grid-template-columns: 3.25rem minmax(0, 1fr) auto; column-gap: 0.75rem; }
+  .mr-body { padding-left: 0; }
   .layer { grid-template-columns: minmax(0, 1fr); gap: 0.4rem; }
   .layer-name, .layer.is-kernel .layer-name { padding-top: 0.5rem; }
   .tabs { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 2.5rem), transparent); mask-image: linear-gradient(90deg, #000 calc(100% - 2.5rem), transparent); }
