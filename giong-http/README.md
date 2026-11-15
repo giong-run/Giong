@@ -2,7 +2,7 @@
 
 A small, strict HTTP/1.1 and HTTP/2 server, and an HTTP/1.1 and HTTP/2 client, for the [giong](../README.md) runtime.
 
-```rust
+```rust,no_run
 use std::time::Duration;
 use giong::net::TcpListener;
 use giong_http::{Request, Response, Server};
@@ -38,7 +38,7 @@ fn main() -> std::io::Result<()> {
 - Or streamed, both ways. A handler whose `Handler::stream_body` returns a limit is called as soon as the head is in and reads the body piece by piece with `Request::body_stream`; nothing is read until it asks, so it can refuse an upload before the client sends it. `Body::channel()` gives a response body that is written as it is produced (chunked), for downloads, exports and server-sent events. One piece is in flight at a time in each direction, so a slow peer slows the other side down instead of filling memory. See "Streaming" below.
 - A `Request` shares the connection's receive buffer instead of copying it, so building a request allocates nothing. A handler may keep the request for as long as it likes.
 - Limits on the size of the head (64 KiB) and the body (1 MiB); timeouts for idle connections (60 s), slow requests (30 s, against slowloris) and clients that read slowly (30 s). All of them can be changed on `Server`.
-- An optional cap on open connections (`Server::max_connections`): at the cap the server stops accepting, and new clients wait in the kernel's listen queue until a connection closes.
+- A cap on open connections, 10,000 per `serve` call (so per worker) unless `Server::max_connections` says otherwise, which bounds a worker's memory: at the cap the server stops accepting, and new clients wait in the kernel's listen queue until a connection closes.
 - Handlers that keep a worker busy (heavy computation, long responses) leave the kernel's even spread of connections uneven. Bind each worker's listener with `giong::net::TcpListener::bind_balanced` instead of `bind` and a busy worker hands new connections to a quieter one; `Server::serve` takes either.
 - A handler is an `async fn(Request) -> Response`, a closure that returns a future (write its argument's type: `|req: Request| async move { .. }`), or a type of your own that implements `Handler` and borrows from itself while it answers. [`giong-web`](../giong-web/README.md) builds routing, middleware and JSON on it.
 - `Server::serve` takes its handler by value. To serve one handler on two listeners (plain HTTP and HTTPS, a public port and an internal one), put it in an `Rc` and give each `serve` a clone: `Handler` is implemented for `Rc<H>`, and streaming routes keep streaming. Do not wrap it in a closure instead: a closure never streams, so every route that reads its body as it arrives would get it whole, or a `413`.
@@ -114,14 +114,28 @@ giong-http = { version = "0.7", features = ["tls"] }
 giong-tls = "0.7"
 ```
 
-```rust
-let acceptor = giong_tls::TlsAcceptor::from_pem(
-    &std::fs::read("cert.pem")?,
-    &std::fs::read("key.pem")?,
-)?;
-// ... in each worker:
-let listener = TcpListener::bind("0.0.0.0:8443").expect("bind");
-Server::new().serve_tls(listener, acceptor.clone(), handler).await;
+```rust,no_run
+use giong::net::TcpListener;
+use giong_http::{Request, Response, Server};
+
+async fn handler(_req: Request) -> Response {
+    Response::text("hello over TLS")
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let acceptor = giong_tls::TlsAcceptor::from_pem(
+        &std::fs::read("cert.pem")?,
+        &std::fs::read("key.pem")?,
+    )?;
+    giong::Builder::new().build()?.run(move |_worker| {
+        let acceptor = acceptor.clone();
+        async move {
+            let listener = TcpListener::bind("0.0.0.0:8443").expect("bind");
+            Server::new().serve_tls(listener, acceptor, handler).await;
+        }
+    })?;
+    Ok(())
+}
 ```
 
 Handlers, limits, timeouts and graceful shutdown are the same as for plain HTTP. Each handshake runs in its connection's own task, so a slow client does not hold up accepting new connections; a client that does not speak TLS (a port scan, plain HTTP sent to the wrong port) is closed when the handshake timeout expires. When it closes a connection the server sends `close_notify`, so the client can tell a complete response from a connection that was cut.
@@ -205,24 +219,28 @@ The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (H
 giong-http = { version = "0.7", features = ["client"] }
 ```
 
-```rust
-use giong_http::client::Client;
+```rust,no_run
+use giong_http::client::{Client, Error};
 
-// One client per worker; clones share its connections.
-let client = Client::new();
-let user = client
-    .get("https://api.example.com/users/7")
-    .header("authorization", "Bearer ...")
-    .send()
-    .await?
-    .error_for_status()?;
-println!("{}", user.text()?);
+async fn demo() -> Result<(), Error> {
+    // One client per worker; clones share its connections.
+    let client = Client::new();
+    let user = client
+        .get("https://api.example.com/users/7")
+        .header("authorization", "Bearer ...")
+        .send()
+        .await?
+        .error_for_status()?;
+    println!("{}", user.text()?);
 
-let created = client
-    .post("https://api.example.com/users")
-    .json(r#"{"name":"Ada"}"#)
-    .send()
-    .await?;
+    let created = client
+        .post("https://api.example.com/users")
+        .json(r#"{"name":"Ada"}"#)
+        .send()
+        .await?;
+    println!("{}", created.status());
+    Ok(())
+}
 ```
 
 - **Connections kept and shared.** A pool for each origin (scheme, host, port), up to 16 connections by default (`ClientBuilder::max_connections_per_host`). Further requests wait in line and are served first come, first served: a connection that comes back goes to the request that has waited longest.
@@ -237,9 +255,7 @@ let created = client
 - **Streaming.** `RequestBuilder::send_streaming()` returns once the head has arrived; `StreamingResponse::chunk()` gives the body piece by piece (64 KiB at most, decompressed), with no limit on its size and the timeout applying to each piece. Read to its end, the connection goes back to the pool; dropped before, it is closed (over HTTP/2, only its stream is reset).
 - **Errors that say what to do.** `Error::kind` is one of `Request`, `Connect`, `Timeout`, `TooLarge`, `Redirect`, `Closed`, `Protocol`, `Status`, `Decode` and `Proxy`, each with a giong code (GIONG-E1101 to E1110) and a page in [docs/errors](../docs/errors/README.md); `Error::is_transient` says whether retrying can help. Any status is a `Response`; `error_for_status` turns 4xx and 5xx into an error with the start of the body.
 
-Proxies, compression, streamed bodies and the `Proxy` error kind are new in 0.4.0; giong-http 0.3 does not have them.
-
-The client is not `Send`, like everything in giong: make one per worker (in `Builder::run`'s closure) and clone it into that worker's tasks.
+The client is not `Send`, like everything in giong: make one per worker (in the closure given to `Runtime::run`) and clone it into that worker's tasks.
 
 ### Client performance
 

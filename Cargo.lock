@@ -674,15 +674,22 @@ name = "rest-api"
 version = "0.0.0"
 dependencies = [
  "giong",
+ "giong-compat",
  "giong-http",
+ "giong-mcp",
+ "giong-mysql",
  "giong-postgres",
  "giong-redis",
  "giong-tls",
  "giong-web",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "rcgen",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

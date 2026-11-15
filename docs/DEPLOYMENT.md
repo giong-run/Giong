@@ -116,6 +116,26 @@ over with `TcpListener::from_std`, is not checked: compare its `local_addr()` wi
 address you asked for, or let giong bind it. 6.0.15 and older, 6.1 and later, and UDP and
 Unix sockets are not affected.
 
+## Restarting on the same port
+
+`TcpListener::bind`, `bind_balanced` and `UdpSocket::bind` let the workers of one process
+share a port, and refuse it, with `AddrInUse`, while a socket of another process holds
+it: a service started twice by mistake fails the second time instead of quietly taking
+half of the first one's connections. What that means for a restart:
+
+- Stopping the old process before starting the new one (systemd's `Restart=`, a container
+  replaced by its orchestrator) needs nothing: the port of a closed listener can be bound
+  again at once.
+- Starting the new version on the same machine and port while the old one still serves
+  fails until the old one has let the port go. Run the two on different ports behind the
+  load balancer or proxy, or create the sockets outside giong: one per worker, with
+  `SO_REUSEPORT` set (with the `socket2` crate, say) by every process that is to share the
+  port, wrapped with `TcpListener::from_std` or `UdpSocket::from_std` in each worker.
+  giong sets no option on such a socket and does not check who else holds its port.
+- Connections still in a closing listener's accept queue are refused when it closes: have
+  the load balancer stop sending to the old process first, and give it a
+  `Builder::shutdown_grace` to answer what it already has.
+
 ## Docker
 
 Docker's default seccomp profile does not allow the io_uring system calls, so in a

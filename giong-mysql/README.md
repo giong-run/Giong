@@ -8,7 +8,7 @@ giong = "0.7"
 giong-mysql = "0.7"
 ```
 
-```rust
+```rust,no_run
 use giong_mysql::{Client, Config};
 
 fn main() -> Result<(), giong_mysql::Error> {
@@ -30,7 +30,7 @@ fn main() -> Result<(), giong_mysql::Error> {
 
 In a service, make one `Pool` per worker. Nothing is shared between threads, so nothing is locked:
 
-```rust
+```rust,no_run
 use giong_mysql::{Config, Pool};
 
 fn main() -> std::io::Result<()> {
@@ -64,16 +64,20 @@ fn main() -> std::io::Result<()> {
 
 ```rust
 use std::time::Duration;
-use giong_mysql::Config;
+use giong_mysql::{Config, Error};
 
-let config = Config::from_url("mysql://app:secret@db.internal:3306/shop?ssl-mode=VERIFY_IDENTITY")?;
+fn configs() -> Result<(), Error> {
+    let config = Config::from_url("mysql://app:secret@db.internal:3306/shop?ssl-mode=VERIFY_IDENTITY")?;
 
-let same_place = Config::new()
-    .host("db.internal")
-    .user("app")
-    .password("secret")
-    .database("shop")
-    .statement_timeout(Duration::from_secs(5));
+    let same_place = Config::new()
+        .host("db.internal")
+        .user("app")
+        .password("secret")
+        .database("shop")
+        .statement_timeout(Duration::from_secs(5));
+    let _ = (config, same_place);
+    Ok(())
+}
 ```
 
 A URL is `mysql://user:password@host:port/database?param=value`. The host can be an IPv6 address in brackets, or empty with the server's Unix socket in a `socket` parameter: `mysql://app@/shop?socket=/var/run/mysqld/mysqld.sock` (in code, a host starting with `/` is a socket). The parameters understood are `ssl-mode`, `ssl-ca`, `socket`, `server-public-key-path`, `connect-timeout` (seconds) and `application-name`. Any other parameter is an error, not silently ignored.
@@ -173,7 +177,7 @@ Conversions never lose anything silently: a value that does not fit, a binary co
 | `Auth` | [E3103](../docs/errors/E3103.md) | The server refused the credentials, asked for a plugin this crate does not support, or would have needed the password where it could be read. |
 | `Db` | [E3104](../docs/errors/E3104.md) | The server reported an error for the statement; `error.code()` is MySQL's error number (1062 for a duplicate key, 1213 for a deadlock...) and `error.db()` has the SQLSTATE too. |
 | `Type` | [E3105](../docs/errors/E3105.md) | A value could not be converted between Rust and MySQL, or the number of parameters is wrong. The message names the parameter or column and suggests the Rust type to use. |
-| `RowCount` | [E3106](../docs/errors/E3106.md) | `query_one` found no row or several, `query_opt` several, `insert` no id. |
+| `RowCount` | [E3106](../docs/errors/E3106.md) | `query_one` found no row or several, `query_opt` several. |
 | `TooLarge` | [E3107](../docs/errors/E3107.md) | The result was larger than `max_result_size`. The connection stays usable. |
 | `Closed` | [E3108](../docs/errors/E3108.md) | The connection is closed. A `Pool` replaces it by itself. |
 | `PoolTimeout` | [E3109](../docs/errors/E3109.md) | No pooled connection became free within `wait_timeout`. |

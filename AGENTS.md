@@ -31,15 +31,16 @@ Where the code is:
 
 | File | Holds |
 |---|---|
-| `src/runtime.rs` | `Builder`, workers, `block_on`, `run`, shutdown, `stats()`, load hints and `spawn_balanced` |
+| `src/runtime.rs` | `Builder`, workers, `block_on`, `run`, shutdown, `observe::worker_stats()`, load hints and `spawn_balanced` |
 | `src/executor.rs` | tasks, `spawn`, `JoinHandle`, `RemoteJoinHandle` (for `Handle::spawn_on`) |
 | `src/driver/mod.rs` | the driver facade: `Io` (one operation, driver-neutral), `DriverKind`, choosing a driver and falling back |
 | `src/driver/uring.rs` | io_uring setup, submission and completion, the ring tiers |
 | `src/driver/epoll.rs` | the epoll driver: readiness, edge-triggered registration, the per-task budget |
 | `src/driver/blocking.rs` | the thread pool the epoll driver runs file operations on |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
-| `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/balance.rs` for `TcpListener::bind_balanced` |
+| `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
+| `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
@@ -180,6 +181,14 @@ is loaded.
   one `README.md`. `scripts/release.py check` verifies the images and install snippets in
   them, not the test counts or benchmark numbers: update those by hand when a change moves
   them.
+- The public API was settled for 1.0 in 0.7.0 ([docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md)):
+  add, do not break. A change that would break code written for 0.7 (a removed or renamed
+  item, a changed signature, an enum made exhaustive) needs an issue first; additions to
+  `#[non_exhaustive]` types and new methods are fine.
+- A Rust sample in a README, `docs/DEPLOYMENT.md` or `docs/errors/README.md` is compiled by
+  `cargo test -p rest-api --doc` (and run unless it is marked `no_run`): change the sample
+  with the API. A new Markdown file with Rust samples goes into `markdown` in
+  `examples/rest-api/src/lib.rs`.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps

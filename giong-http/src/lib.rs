@@ -36,7 +36,8 @@
 //! * HTTP/2 (RFC 9113), chosen through ALPN over TLS and with prior
 //!   knowledge over plain TCP, for the same handlers: every stream is a
 //!   [`Request`] like any other ([`Request::version`] tells them apart).
-//!   Flow control, HPACK, trailers, `Expect: 100-continue` and streamed
+//!   Flow control, HPACK, request trailers (checked, then dropped: a
+//!   [`Request`] has none), `Expect: 100-continue` and streamed
 //!   bodies both ways; limits against rapid reset, frame floods,
 //!   CONTINUATION floods, HPACK bombs and stalled readers, each with its
 //!   `GIONG-E` code. See [`Server::http2`].
@@ -47,7 +48,9 @@
 //!   response body as it is produced ([`Body::channel`], [`BodySender`]),
 //!   with backpressure both ways.
 //! * Limits on head and body size, timeouts for idle connections, slow
-//!   requests and slow readers, and an optional cap on open connections.
+//!   requests and slow readers, and a cap on open connections (10,000 per
+//!   [`Server::serve`] call unless [`Server::max_connections`] says
+//!   otherwise).
 //! * The client's address on every request ([`Request::peer_addr`]).
 //! * Graceful shutdown: requests in progress are answered, idle connections
 //!   close.

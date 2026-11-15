@@ -8,7 +8,7 @@ giong = "0.7"
 giong-postgres = "0.7"
 ```
 
-```rust
+```rust,no_run
 use giong_postgres::{Client, Config};
 
 fn main() -> Result<(), giong_postgres::Error> {
@@ -30,7 +30,7 @@ fn main() -> Result<(), giong_postgres::Error> {
 
 In a service, make one `Pool` per worker. Nothing is shared between threads, so nothing is locked:
 
-```rust
+```rust,no_run
 use giong_postgres::{Config, Pool};
 
 fn main() -> std::io::Result<()> {
@@ -61,16 +61,20 @@ fn main() -> std::io::Result<()> {
 
 ```rust
 use std::time::Duration;
-use giong_postgres::Config;
+use giong_postgres::{Config, Error};
 
-let config = Config::from_url("postgres://app:secret@db.internal:5432/shop?sslmode=verify-full")?;
+fn configs() -> Result<(), Error> {
+    let config = Config::from_url("postgres://app:secret@db.internal:5432/shop?sslmode=verify-full")?;
 
-let same_place = Config::new()
-    .host("db.internal")
-    .user("app")
-    .password("secret")
-    .dbname("shop")
-    .statement_timeout(Duration::from_secs(5));
+    let same_place = Config::new()
+        .host("db.internal")
+        .user("app")
+        .password("secret")
+        .dbname("shop")
+        .statement_timeout(Duration::from_secs(5));
+    let _ = (config, same_place);
+    Ok(())
+}
 ```
 
 A URL is `postgres://user:password@host:port/dbname?param=value` (`postgresql://` too). The host can be an IPv6 address in brackets, or, as with libpq, empty with the socket directory in a `host` parameter: `postgres:///shop?host=/var/run/postgresql`. The parameters understood are `sslmode`, `sslrootcert`, `host`, `port`, `user`, `password`, `dbname`, `application_name`, `connect_timeout` (seconds) and `require_auth`. Any other parameter is an error, not silently ignored.

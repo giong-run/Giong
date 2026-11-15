@@ -412,8 +412,8 @@ codes! {
     MysqlServer = 3104, Other, "MySQL server error";
     /// A value could not be converted between Rust and MySQL.
     MysqlType = 3105, InvalidData, "MySQL type mismatch";
-    /// `query_one` found no row or more than one, or `insert` found no
-    /// generated id.
+    /// `query_one` found no row or more than one, or `query_opt` more than
+    /// one.
     MysqlRowCount = 3106, Other, "wrong number of rows";
     /// A result was larger than the configured maximum.
     MysqlTooLarge = 3107, Other, "MySQL result too large";
