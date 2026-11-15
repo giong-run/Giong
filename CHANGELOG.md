@@ -8,10 +8,35 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
-The API freeze for 1.0: the decisions the 0.6 reviews and an outside build of a service
-left open, settled. Every item and the reason for each choice is in
-[docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md), with what was
-kept as it is and what can be added in 1.x without breaking anything.
+## [0.7.0] - 2026-11-15
+
+The API freeze for 1.0: the decisions that the 0.6 reviews, and a service an AI agent built
+from the 0.6.0 documentation alone, left open, settled. Every item and the reason for each
+choice is in [docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md),
+with what was kept as it is and what can be added in 1.x without breaking anything. Code
+written for 0.7 is meant to build unchanged on 1.0: from here on, `cargo-semver-checks`
+checks every change against 0.7.0, and a break before 1.0.0-rc.1 comes only from what
+real use in a service turns up.
+
+Changes that break code written for 0.6, by crate; each is marked **Breaking:** below and
+says how to migrate:
+
+- **giong**: `bind` refuses an address that another process holds, even one shared with
+  `SO_REUSEPORT`; `bind`, `bind_balanced` and `UdpSocket::connect` take IP addresses only
+  and refuse a host name with `GIONG-E0100`; `UdpSocket::bind` no longer sets
+  `SO_REUSEADDR`; `giong::stats()` is `giong::observe::worker_stats()`.
+- **giong-http**: `Request::version_minor` is removed, and `Server::max_connections`
+  defaults to 10,000 connections per `serve` call instead of no limit.
+- **giong-tls**: `TlsStream::recv` returns `Received`, which derefs to `&[u8]`.
+- **giong-postgres**: `Tls` is `#[non_exhaustive]`.
+- **giong-mysql**: `insert` returns `Option<u64>`, `None` when no id was generated.
+- **giong-redis**: `Tls` and `Value` are `#[non_exhaustive]`, and `mget` takes one type
+  parameter.
+- **giong-mcp**: `McpServer::url` returns `Option<String>`.
+
+`giong-web` and `giong-compat` have none. Also fixed: giong-mcp's `overview` reported every
+worker of a quiet service as fully busy. This release has no benchmark run of its own: the
+numbers in the README are those of 0.6.0 and of 0.5.0's bare-metal pass.
 
 ### Added
 
@@ -1902,7 +1927,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/giong-run/Giong/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/giong-run/Giong/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/giong-run/Giong/compare/v0.3.0...v0.4.0

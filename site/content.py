@@ -24,7 +24,7 @@ Rules for this file:
 # not ignored), counted by hand when it changes; the site adds them up.
 CRATES = {
     "giong": dict(
-        layer="runtime", tests=279,
+        layer="runtime", tests=288,
         short="Executor, io_uring driver, TCP, UDP, Unix sockets, files, timers, DNS, channels.",
         lede="The runtime: TCP, UDP, Unix sockets, files, timers, DNS, channels and graceful shutdown.",
         items=["`Builder::new().workers(n)`, one worker per core",
@@ -34,7 +34,7 @@ CRATES = {
                "`spawn_on`, `spawn_balanced` and `bind_balanced` to spread new work"],
         fact="3 dependencies: `io-uring`, `libc`, `socket2`"),
     "giong-http": dict(
-        layer="protocols", tests=205,
+        layer="protocols", tests=206,
         short="A strict HTTP/1.1 and HTTP/2 server, HTTPS behind a feature, and a pooled client.",
         lede="A small, strict HTTP/1.1 and HTTP/2 server with one async handler, and a client that speaks both.",
         items=["HTTP/2 through ALPN or with prior knowledge, for the same handlers",
@@ -85,7 +85,7 @@ CRATES = {
                "TLS; Redis 6 or newer (RESP3)"],
         fact="1.4× redis-rs's `GET`s per core"),
     "giong-web": dict(
-        layer="framework", tests=106,
+        layer="framework", tests=107,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
         lede="A router, middleware and JSON on giong-http. Handlers are plain `async fn`s; every "
              "error is a coded problem+json answer.",
