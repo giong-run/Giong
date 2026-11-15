@@ -104,6 +104,7 @@ jobs:
           { "crate": "giong-web", "target": "request" }
           { "crate": "giong-tls", "target": "ktls_records" }
           { "crate": "giong-mcp", "target": "request" }
+          { "crate": "giong-proto", "target": "differential" }
           EOF
           )
           if [ "$EVENT" = pull_request ]; then

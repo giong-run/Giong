@@ -9,7 +9,7 @@ disagree, CONTRIBUTING.md wins: report the difference.
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
 driver where io_uring is blocked or the kernel is too old. One Cargo
-workspace, nine crates and an example service:
+workspace, nine crates, two prototype crates for 1.1 (not published) and two examples:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -23,6 +23,9 @@ workspace, nine crates and an example service:
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
 | `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
+| `giong-proto/` | `giong-proto` (1.1 prototype, not published) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
+| `giong-grpc-build/` | `giong-grpc-build` (1.1 prototype, not published) | generates giong-proto code from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
+| `examples/proto-hello/` | `proto-hello` (not published) | giong-grpc-build and giong-proto in one small program |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.
@@ -97,6 +100,8 @@ scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kerne
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
+giong-proto/conformance/run.sh     # Google's protobuf conformance suite (builds the runner once, ~10 min)
+(cd giong-proto/conformance && cargo test --release)   # differential tests against prost
 scripts/semver.sh            # no breaking API change since the last release (cargo-semver-checks)
 scripts/instr.py check       # instructions per operation and heap per idle connection vs bench/instr/baseline.csv
 ```

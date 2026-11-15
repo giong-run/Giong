@@ -191,3 +191,18 @@ when it is no longer raised.
 | [GIONG-E3209](E3209.md) | `RedisPoolTimeout` | Redis pool wait timed out |
 | [GIONG-E3210](E3210.md) | `RedisProtocol` | Redis protocol error |
 | [GIONG-E3211](E3211.md) | `RedisTimeout` | Redis reply timed out |
+
+## giong-proto
+
+A prototype for giong 1.1, not published yet; its codes are `giong_proto::ErrorKind` until it joins `giong::error::Code`.
+
+| Code | `ErrorKind::` | Meaning |
+|---|---|---|
+| [GIONG-E4001](E4001.md) | `ErrorKind::Truncated` | the message ends in the middle of a field |
+| [GIONG-E4002](E4002.md) | `ErrorKind::BadVarint` | malformed varint |
+| [GIONG-E4003](E4003.md) | `ErrorKind::BadTag` | invalid field tag |
+| [GIONG-E4004](E4004.md) | `ErrorKind::BadGroup` | unbalanced group |
+| [GIONG-E4005](E4005.md) | `ErrorKind::BadUtf8` | string field is not UTF-8 |
+| [GIONG-E4006](E4006.md) | `ErrorKind::TooDeep` | messages nested too deeply |
+| [GIONG-E4007](E4007.md) | `ErrorKind::BadPacked` | malformed packed field |
+| [GIONG-E4008](E4008.md) | `ErrorKind::TooLarge` | message larger than 2 GiB |

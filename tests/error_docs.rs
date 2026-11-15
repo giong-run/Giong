@@ -37,8 +37,10 @@ fn every_code_has_its_page() {
     }
     for entry in fs::read_dir(&dir).unwrap() {
         let name = entry.unwrap().file_name().into_string().unwrap();
+        // E4001-E4099 are giong-proto's (a prototype for 1.1 with its own
+        // `ErrorKind`, checked by giong-proto/tests/error_docs.rs).
         assert!(
-            name == "README.md" || pages.contains(&name),
+            name == "README.md" || pages.contains(&name) || name.starts_with("E40"),
             "docs/errors/{name} belongs to no code"
         );
     }
