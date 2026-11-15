@@ -1191,9 +1191,20 @@ Facts that are easy to get wrong:
   then `.recv().await`. Descriptors pass between processes with
   `UnixStream::send_with_fds` / `recv_with_fds`; systemd's sockets come from
   `giong::net::activated_sockets()`.
-- Crates that need the Tokio runtime (sqlx, reqwest, tonic's transport) do not run on giong.
-  Crates generic over a Tokio or futures-io stream (h2, tokio-rustls, tokio-tungstenite) do,
-  through `giong_compat::Compat::new(stream)`.
+- Choosing crates: use the giong crate for the job first. HTTP server: `giong-http`, not
+  hyper or axum; routing, JSON and middleware: `giong-web`, not axum; HTTP client:
+  `giong-http` with feature `client`, not reqwest; TLS: `giong-tls`; PostgreSQL:
+  `giong-postgres`, not sqlx or tokio-postgres; MySQL: `giong-mysql`; Redis: `giong-redis`,
+  not redis-rs; files: `giong::fs`; names: `giong::net::lookup_host`; timers: `giong::time`.
+  Measured against those Tokio crates on Tokio, one core each, they serve 1.2 to 4.7 times
+  the requests or statements, and file reads at an offset 5.5 to 8 times (the README's
+  Benchmarks section has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
+  they are. Only for a protocol giong has no crate for (WebSocket, for one), a crate generic
+  over a Tokio or futures-io stream (tokio-tungstenite, h2, tokio-rustls, hyper's `conn`)
+  runs through `giong_compat::Compat::new(stream)`, which adds a copy per byte written and
+  per byte read with `read`. Crates that need the Tokio runtime (sqlx, reqwest, tonic's
+  transport, most cloud SDKs) do not run on giong's workers: they panic with "there is no
+  reactor running".
 - `giong-http` serves HTTP/2 by itself, through ALPN over TLS or with prior knowledge on the
   same port; handlers do not change. `Server::http2(false)` turns it off. A `serve` call
   keeps at most 10,000 connections open (`Server::max_connections`); past that, clients

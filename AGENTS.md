@@ -48,6 +48,14 @@ Where the code is:
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
+Which crate to use, in this repository and in a service built on giong: the giong crate
+for the job first (HTTP server and client, routing, TLS, PostgreSQL, MySQL, Redis, files,
+names, timers); then a crate that needs no runtime; then a Tokio-ecosystem crate that takes
+a stream, over `giong_compat::Compat`, only for a protocol giong has no crate for; never a
+crate that needs the Tokio runtime on a worker. The table with each giong crate, what it
+replaces and how it measured against it is under
+[Choosing crates](README.md#choosing-crates) in the README.
+
 ## The machine you need
 
 - **Linux 6.0 or newer with io_uring allowed**, to test both drivers. giong does not
@@ -93,6 +101,7 @@ KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls mod
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 scripts/semver.sh            # no breaking API change since the last release (cargo-semver-checks)
+scripts/instr.py check       # instructions per operation and heap per idle connection vs bench/instr/baseline.csv
 ```
 
 Continuous integration requires `all-checks` on every pull request, which passes when
@@ -109,7 +118,10 @@ The release test binaries are built once per run (the `build` job, with
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
 CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the last
-release, so no breaking change lands between releases), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+release, so no breaking change lands between releases), `instr` (`scripts/instr.py`:
+instructions per operation on the hot paths, counted by callgrind, and heap per idle
+connection, within 1% and 2% of `bench/instr/baseline.csv`; a change meant to move them
+commits the new baseline the job prints, see `bench/instr/README.md`), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
 against other server versions (`servers`) on every pull request, and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
@@ -211,8 +223,8 @@ is loaded.
   under TSan on purpose (see the comment in `scripts/check.sh`).
 - **A fresh target directory** takes a few minutes for `scripts/check.sh tsan`, because it
   rebuilds the standard library.
-- **Crates from the Tokio ecosystem.** Prefer the giong crate for the job (the table
-  above). A crate that takes a stream and is driven by your task (h2, tokio-rustls,
+- **Crates from the Tokio ecosystem.** Prefer the giong crate for the job
+  ([Choosing crates](README.md#choosing-crates)). A crate that takes a stream and is driven by your task (h2, tokio-rustls,
   tokio-tungstenite, hyper's `conn`, tokio-util's codecs) runs over
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`

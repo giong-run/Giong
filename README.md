@@ -249,6 +249,64 @@ Five things to remember:
    `append(true)`, writes go to the end whatever the offset.
 5. Timers have 1 ms resolution and never fire early.
 
+## Choosing crates
+
+For each job a service has, try these in order and take the first that fits:
+
+1. **A giong crate.** Each one was written for giong: it reads into the worker's buffer
+   pool, hands owned buffers to the kernel, and batches system calls (many requests per
+   read and many answers per write on a connection, and the statements of every task
+   pipelined over a pool's few connections). Most were measured against the Tokio crate
+   they replace, with the factors in the table below.
+2. **A crate that needs no runtime.** serde, rustls, `futures`' combinators, Tokio's
+   `sync` module (`Semaphore`, `Notify`, `watch`, `broadcast`), and anything else built
+   only on `std::future`, run on giong as they are.
+3. **A Tokio-ecosystem crate that takes a stream from you**, over
+   [`giong_compat::Compat`](giong-compat/README.md): h2, tokio-rustls, tokio-tungstenite,
+   hyper's `conn` API, tokio-util's codecs. This is the bridge for a protocol giong has no
+   crate for yet (WebSocket, for one), not a second way to do what a giong crate does.
+4. **A crate that needs the Tokio runtime** (reqwest, sqlx, tonic's `transport`,
+   redis-rs, most cloud SDKs) does not run on giong's workers: it panics with "there is no
+   reactor running", or never finishes. Use the giong crate for the job if there is one;
+   otherwise run the crate on a Tokio runtime in a thread of its own and pass work to it
+   over a channel.
+
+| You need | Use | Instead of | Measured against it (one core each, medians, method under [Benchmarks](#benchmarks)) |
+|---|---|---|---|
+| An HTTP/1.1 server | [`giong-http`](giong-http/README.md) | hyper, axum | 1.2 to 1.6 times axum on `/json` (1.2 where the load generator was the limit), 2.8 to 3.2 times on 8 KB answers ([Throughput](#throughput-at-50-connections), and the plain rows under [HTTPS](#https)) |
+| An HTTP/2 server | `giong-http` (on by default) | hyper, axum | 3.8 to 4.4 times axum on small answers, 2.5 to 3.0 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
+| Routing, JSON, middleware | [`giong-web`](giong-web/README.md) | axum, tower-http | 1.3 times axum on `/json` and 1.8 times on 8 KB answers; with request ids, gzip and a timeout, 1.9 and 2.3 times ([Routing](#routing-json-and-middleware)) |
+| An HTTP client | `giong-http`, feature `client` | reqwest, hyper's client | 1.6 to 1.8 times reqwest over HTTP/1.1; over HTTP/2 2.0 to 2.2 times on small answers, 1.2 to 1.3 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
+| TLS | [`giong-tls`](giong-tls/README.md) | tokio-rustls | The same rustls underneath, so handshakes are level. Measured with `giong-http`: 1.8 times axum + rustls on `/json`, 2.5 times on 8 KB answers ([HTTPS](#https)) |
+| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 2.6 times tokio-postgres + deadpool at its best on one row by key ([PostgreSQL](#postgresql)) |
+| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 4.7 times SQLx at its best on one row by key, 3.4 times on 100 rows ([MySQL](#mysql)) |
+| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.3 to 1.9 times redis-rs, at half its CPU per command or less ([Redis](#redis)) |
+| Files | `giong::fs` | `tokio::fs` | 5.5 to 8 times Tokio on reads at an offset, 1.5 to 2.5 times on whole small files ([File I/O](#file-io)) |
+| Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | Not measured |
+| Timers, channels | `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::time`, `tokio::sync::mpsc` | Not measured on their own |
+| Runtime state for an AI agent | [`giong-mcp`](giong-mcp/README.md) | | |
+
+Where a giong crate is not ahead, the sections linked above say so: over one shared
+connection giong-postgres is 8–11% below tokio-postgres at the median, a blocking `std`
+read of a cached file beats every async one, and TLS handshakes cost the same on both.
+
+What `Compat` adds is measured on its own, on one TCP stream with no protocol on top
+([giong-compat](giong-compat/README.md#what-it-costs)): against giong's own `write_all`,
+up to 20% less throughput and up to 25% more CPU per byte sent, for the copy into its
+write buffer; against giong's own `recv`, 6–16% more CPU per byte read with `read`, and no
+measurable difference through `AsyncBufRead`; 1–5% more CPU per small request and reply.
+A protocol crate over `Compat` brings its own design on top of that, and none has been
+measured against the giong crate for the same protocol. The reason to prefer the giong
+crate is its design (step 1) and the gaps in the table, measured against these Tokio
+crates on Tokio: running one of them on giong through `Compat` does not change how it
+reads, writes or pipelines, and adds the copies above.
+
+To tell steps 3 and 4 apart: a crate of step 3 takes a stream you made
+(`S: AsyncRead + AsyncWrite`) and gives back a future or a connection object for your task
+to poll. A crate of step 4 opens its own sockets (`connect(url)`), sleeps or spawns:
+`cargo tree -e features -i tokio` shows it turning on Tokio's `net`, `time`, `rt` or
+`process` feature. Running it once settles it.
+
 ## Coming from Tokio
 
 giong has no macros and no `spawn_blocking`, and a worker's state is never shared with
@@ -271,7 +329,7 @@ giong 0.7.0.
 | `tokio::process::Command` | `giong::process::Command`: the same builder, `spawn`, `status().await`, `output().await`; a child's pipes are `PipeReader` / `PipeWriter`, read and written with owned buffers |
 | `tokio::io::{stdin, stdout}` | `giong::process::{stdin, stdout}` |
 | `stream.read(&mut buf)`, `stream.write_all(&buf)` | `stream.recv().await?` lends a buffer from the worker's pool; a write takes its buffer by value and hands it back: `let (result, buf) = stream.write_all(buf).await;` |
-| sqlx, tokio-postgres, redis-rs, reqwest, axum | `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-http`'s client, `giong-web`. Crates that are handed a stream (h2, tokio-rustls, tokio-tungstenite) run through `giong_compat::Compat::new(stream)` |
+| sqlx, tokio-postgres, redis-rs, reqwest, axum | `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-http`'s client, `giong-web`. Crates that are handed a stream (h2, tokio-rustls, tokio-tungstenite) run through `giong_compat::Compat::new(stream)`; see [Choosing crates](#choosing-crates) |
 
 ## Design
 
@@ -816,7 +874,10 @@ Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/sysc
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per
-request with callgrind instead, which repeats within 0.1%.
+request with callgrind instead, which repeats within 0.1%. CI holds the hot paths to
+their counts: `scripts/instr.py check` fails a change that makes any of 16 operations
+(spawning a task, a TCP round trip, an HTTP/1.1, HTTP/2 or TLS request, a database query)
+cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](bench/instr/README.md)).
 
 ## Testing and safety
 

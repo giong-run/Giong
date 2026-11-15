@@ -1,0 +1,55 @@
+Checks behind the limits in bench/instr/baseline.csv (2026-11-15, the machine of the
+baseline: 4-vCPU VM, Intel Xeon @ 2.10GHz, Linux 6.18, rustc 1.97.0, valgrind 3.22.0).
+Instructions per operation, 2,000 operations after 500 of warm-up, integer part.
+
+1. Five runs on io_uring, then three more with four busy loops on the four vCPUs
+   (`while :; do :; done` x4), so the run is slowed and rescheduled at random:
+
+   case             quiet (5 runs)                      4 busy loops (3 runs)
+   spawn            1707 1707 1707 1707 1707            1707 1707 1707
+   yield            481 481 481 481 481                 481 481 481
+   oneshot          386 386 386 386 386                 386 386 386
+   channel          1757 1757 1757 1757 1757            1757 1757 1757
+   timeout          99 99 99 99 99                      99 99 99
+   tcp-echo         4884 4884 4884 4884 4884            4884 4884 4884
+   udp-echo         5357 5357 5357 5357 5357            5357 5357 5357
+   file-read        1478 1478 1478 1478 1478            1478 1478 1478
+   http1            11140 11146 11143 11140 11146       11143 11143 11140
+   http1-client     33944 33938 33944 33944 33944       33938 33944 33944
+   h2               54722 54744 54734 54730 54721       54731 54724 54725
+   https            46801 46800 46800 46795 46795       46801 46801 46795
+   web              15245 15245 15248 15248 15245       15251 15248 15248
+   redis-get        9611 9617 9617 9611 9617            9617 9611 9617
+   postgres-query   12705 12705 12705 12705 12705       12705 12705 12705
+   mysql-query      18073 18073 18073 18073 18073       18073 18073 18073
+
+   The same on epoll (5 runs): every case within 0.07% except file-read
+   (2930 2932 2957 2960 2947, 1.0%): on epoll a file read goes to a blocking
+   thread, and how often the worker finds it done on its first look depends on
+   timing. Its limit is 3%.
+
+2. CPU-dependent code paths. glibc picks memcpy/strlen variants and ring picks
+   AES-GCM code by CPU feature, so runners with other CPUs could count otherwise.
+   Forcing glibc onto very different paths (GLIBC_TUNABLES), io_uring:
+
+   case             default    hwcaps=-AVX2,-ERMS,-FSRM    x86_rep_movsb_threshold=100000
+   http1            11143      11131 (-0.11%)              11140 (-0.03%)
+   h2               54722      54594 (-0.23%)              54742 (+0.04%)
+   https            46794      46736 (-0.12%)              46792 (-0.00%)
+   postgres-query   12705      12718 (+0.10%)              12705 (0)
+
+   Real runners differ far less than this (all have AVX2, ERMS, AES-NI). Hence a
+   limit of 1%, ten times the spread of item 1 and four times the worst shift here.
+
+3. Negative control: a loop planted in giong-http's `Response::write_head` (not
+   committed). 40 iterations: http1 +0.39% (io_uring), +0.44% (epoll), web +0.31%,
+   seen but within the limit. 150 iterations: http1 +5.42% / +6.06%, web +4.00% /
+   +4.34%, and `scripts/instr.py check` failed with exit status 1, naming the four.
+   tcp-echo and h2 (which do not use that function) did not move.
+
+4. Heap per idle HTTP/2 connection, 5,000 connections, five runs on io_uring when
+   the connections were opened as fast as possible: 4354.8 4314.5 4320.1 4621.7
+   4313.0 bytes (7% apart): with thousands of prefaces queued at once the receive
+   buffer pool runs low and the driver moves data to the heap, by timing. Opening
+   them one at a time (waiting for each server SETTINGS): 4298.8 in all five runs,
+   which is what bench/instr does.

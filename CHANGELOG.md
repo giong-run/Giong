@@ -37,12 +37,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **examples**: `stdio`, a line protocol over stdin and stdout that runs programs and notes
   `SIGHUP`.
 
-### Fixed
-
-- **giong**: dropping a `TcpListener` whose descriptor was lent out (`as_fd`, `as_raw_fd`)
-  no longer shuts the socket down for every copy of it: a listener passed to another
-  process, or duplicated, keeps listening.
-
 ### Changed
 
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
@@ -58,6 +52,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `llms.txt` states the address and connection-limit rules. The 0.7.0 migration notes
   below say what implements `net::ToSocketAddrs`, what replaces `version_minor()`, how to
   raise `max_connections`, and that a `match` on giong-redis's `Value` needs a `_` arm.
+- **Docs**: a "Choosing crates" section in the README says which crate to reach for: the
+  giong crate for the job first, with a table of each one, the Tokio crates it replaces
+  and how it measured against them; then crates that need no runtime; then a Tokio crate
+  over `giong_compat::Compat` only for a protocol giong has no crate for; and how to spot a
+  crate that needs the Tokio runtime. `AGENTS.md`, `llms.txt` and giong-compat's README
+  and crate docs say the same, and no longer call the giong crates faster than the same
+  protocol through `Compat`, which was never measured.
+
+### Fixed
+
+- **giong**: dropping a `TcpListener` whose descriptor was lent out (`as_fd`, `as_raw_fd`)
+  no longer shuts the socket down for every copy of it: a listener passed to another
+  process, or duplicated, keeps listening.
 
 ## [0.7.0] - 2026-11-15
 
