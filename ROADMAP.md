@@ -323,6 +323,9 @@ features.
       addition.
 - [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
 - [ ] The remaining code fixes from the service built from the documentation alone.
+- [x] Memory bounded under attack: the requests a worker receives in full share a budget
+      (`max_buffered_request_bytes`), and CI runs hundreds of slow uploads against a server
+      in a 128 MiB container on every change.
 
 **Exit criteria:** all of the above green on `main`.
 

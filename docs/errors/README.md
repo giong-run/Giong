@@ -90,6 +90,7 @@ when it is no longer raised.
 | [GIONG-E1117](E1117.md) | `Http2Flood` | too many HTTP/2 control frames |
 | [GIONG-E1118](E1118.md) | `Http2HeadersTooLarge` | HTTP/2 header block too large |
 | [GIONG-E1119](E1119.md) | `HttpInvalidResponse` | invalid HTTP response |
+| [GIONG-E1120](E1120.md) | `HttpServerBusy` | request refused: the server's memory budget for requests is full |
 
 ## giong-web
 
