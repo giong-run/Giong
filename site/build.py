@@ -762,6 +762,9 @@ def docs():
         f'<p>{ilm(desc)}</p><pre class="code sm"><code>{html.escape(cmd)}'
         + (f'\n<span class="c">{html.escape(then)}</span>' if then else "")
         + "</code></pre></article>" for name, desc, cmd, then in C.EXAMPLES)
+    folder, desc, cmd = C.SERVICE
+    examples += (f'<article class="ex"><h3><a href="{TREE}examples/{folder}">examples/{folder}/</a></h3>'
+                 f'<p>{ilm(desc)}</p><pre class="code sm"><code>{html.escape(cmd)}</code></pre></article>')
     api = "".join(
         f'<a class="api" href="https://docs.rs/{c["name"]}"><b>{c["name"]}</b><span>{ilm(c["short"])}</span></a>'
         for c in CRATES)
@@ -1046,6 +1049,10 @@ def llms():
                       for name, d in crates if d != ".")
     examples = "".join(f"- [examples/{name}.rs]({REL_BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
                        for name, desc, _, _ in C.EXAMPLES if released(f"examples/{name}.rs") is not None)
+    folder, desc, _ = C.SERVICE
+    if released(f"examples/{folder}/README.md") is not None:
+        examples = (f"- [examples/{folder}]({REL_BLOB}examples/{folder}/README.md): "
+                    f"{re.sub(r'[`*]', '', desc)}\n") + examples
     mcp = ("- To let an agent look inside a running service (which task blocks a worker, which line\n"
            "  spawned the tasks that leak, how full the pools are), add giong-mcp and keep\n"
            "  `let _mcp = giong_mcp::start_from_env(&handle);` alive (no `?`: it never fails the\n"
@@ -1080,6 +1087,12 @@ Facts that are easy to get wrong:
 - giong-web: build the `Router` inside each worker's future (`run(|_| async {{ .. }})`), since
   an `App` is not `Send`. A handler is `async fn(Req<S>) -> Result<Response, Error>`; `?` on
   any other error answers `500` and logs the cause, never sending it.
+- Coming from Tokio: `giong::spawn` keeps a task on its worker, so nothing needs `Send` and
+  per-worker state is an `Rc<RefCell<..>>`, not an `Arc<Mutex<..>>`. `futures::join!` and
+  `futures::select!` take the place of Tokio's macros. There is no `spawn_blocking`: use
+  `std::thread::spawn` and a `giong::sync::oneshot` channel, and never block a worker.
+  `giong::sync` has `mpsc` and `oneshot`; Tokio's `sync` module (`Semaphore`, `Notify`,
+  `watch`, `broadcast`) needs no Tokio runtime and works on giong.
 - Crates that need the Tokio runtime (sqlx, reqwest, tonic's transport) do not run on giong.
   Crates generic over a Tokio or futures-io stream (h2, tokio-rustls, tokio-tungstenite) do,
   through `giong_compat::Compat::new(stream)`.
@@ -1129,19 +1142,20 @@ def absolute_links(text, src_dir):
 
 
 def llms_full():
-    """llms-full.txt: every crate's README, the deployment notes and every error page
-    of the release, in one file, for a model that reads it whole."""
+    """llms-full.txt: every crate's README, the example service's, the deployment notes
+    and every error page of the release, in one file, for a model that reads it whole."""
     docs = [("README.md", ".")]
     docs += [(f"{d}/README.md", d) for _, d in released_crates() if d != "."]
+    docs += [(f"examples/{C.SERVICE[0]}/README.md", f"examples/{C.SERVICE[0]}")]
     docs += [("docs/DEPLOYMENT.md", "docs"), ("docs/errors/README.md", "docs/errors")]
     index = released("docs/errors/README.md") or ""
     docs += [(f"docs/errors/{page}", "docs/errors")
              for page in dict.fromkeys(re.findall(r"\]\((E\d{4}\.md)\)", index))]
     parts = [f"""# giong {VERSION}: the documentation in one file
 
-> The README of every crate, the deployment notes and every error code page of giong
-> {VERSION}, as released in {TAG}. Links point at the same release. The short index is
-> {SITE}llms.txt.
+> The README of every crate and of the example service, the deployment notes and every
+> error code page of giong {VERSION}, as released in {TAG}. Links point at the same
+> release. The short index is {SITE}llms.txt.
 """]
     for path, d in docs:
         text = released(path)
