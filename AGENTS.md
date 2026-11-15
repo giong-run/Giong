@@ -90,8 +90,11 @@ scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
 ```
 
-Continuous integration requires five checks on every pull request: `lint` (fmt, clippy,
-doc), `msrv`, `test`, `fallback` and `tsan`. A change is done when all five would pass.
+Continuous integration requires `all-checks` on every pull request, which passes when
+every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`, `test`, `fallback`,
+`tsan` and the jobs named below. A change is done when all of them would pass. A pull
+request is merged through the merge queue, which runs the same jobs once more on `main`
+with the pull request merged, and merges it only if they pass.
 The release test binaries are built once per run (the `build` job, with
 `scripts/shared-build.sh`) for `test`, `docker`, the `kernels` jobs and the four
 `fallback (…)` jobs, which run the tiers of `scripts/check.sh fallback` side by side, as
@@ -161,7 +164,10 @@ is loaded.
   `tls`, `web`, `postgres`, `mysql`, `redis`, `mcp`, `compat`), and `examples`, `bench`,
   `site`, `release`. Leave the scope out when a change spans several. A breaking change
   takes `!` after the scope and a `BREAKING CHANGE:` footer. The body says why.
-- Pull requests are squash-merged, so the title must be a valid commit summary. Fill in
+- Pull requests are squash-merged by the merge queue, which writes the commit message
+  itself: for a pull request of one commit it is that commit's message, so keep one commit
+  whose message is the one `main` should get; for several commits it is the title and the
+  list of their messages. Either way the title must be a valid commit summary. Fill in
   `.github/PULL_REQUEST_TEMPLATE.md`, including how the change was tested.
 - Anything a user would notice gets a line under `## [Unreleased]` in `CHANGELOG.md`
   ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)), grouped by crate.
