@@ -1,0 +1,238 @@
+//! QUIC for giong (prototype on the `feat/quic-prototype` branch; not part
+//! of 1.0).
+//!
+//! One [`Endpoint`] per worker: each worker binds its own socket to the same
+//! address (giong's `UdpSocket::bind` shares the port), and the kernel
+//! spreads clients over the workers by their address. A connection then
+//! lives on one worker for its whole life, with no lock anywhere.
+//!
+//! The engine underneath is quinn-proto today. A native engine built for
+//! io_uring and thread-per-core (encryption in place in the receive and send
+//! buffers, whole flights in one GSO send) grows in [`native`] and replaces
+//! it behind this same API once it passes the QUIC interop runner. Nothing
+//! of quinn-proto appears in this API, so the swap is invisible to users.
+//!
+//! ```no_run
+//! # fn tls() -> rustls::ServerConfig { unimplemented!() }
+//! # fn main() -> std::io::Result<()> {
+//! use giong_quic::{Endpoint, ServerConfig};
+//! giong::block_on(async {
+//!     let ep = Endpoint::server("0.0.0.0:4433".parse().unwrap(), ServerConfig::new(tls())?)?;
+//!     while let Some(conn) = ep.accept().await {
+//!         giong::spawn(async move {
+//!             while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+//!                 let req = recv.read_to_end(64 * 1024).await?;
+//!                 send.write_all(&req).await?;
+//!                 send.finish()?;
+//!             }
+//!             std::io::Result::Ok(())
+//!         });
+//!     }
+//!     Ok(())
+//! })
+//! # }
+//! ```
+
+use std::io;
+use std::net::SocketAddr;
+use std::rc::Rc;
+
+use bytes::Bytes;
+
+mod config;
+mod error;
+pub mod native;
+mod proto;
+
+pub use config::{ClientConfig, ServerConfig, TransportConfig};
+
+/// A QUIC endpoint on the current giong worker: a UDP socket and the
+/// connections on it. Dropping it refuses new connections; existing ones
+/// carry on until they close.
+pub struct Endpoint {
+    sh: Rc<proto::Shared>,
+}
+
+impl Endpoint {
+    /// Binds a server endpoint to `addr` on this worker. Bind one on every
+    /// worker (for instance in `Runtime::run`) to use every core.
+    pub fn server(addr: SocketAddr, config: ServerConfig) -> io::Result<Self> {
+        let cfg = std::sync::Arc::new(config.to_proto()?);
+        Ok(Self {
+            sh: proto::bind(addr, Some(cfg))?,
+        })
+    }
+
+    /// A client endpoint bound to `addr` (`0.0.0.0:0` for any port).
+    pub fn client(addr: SocketAddr) -> io::Result<Self> {
+        Ok(Self {
+            sh: proto::bind(addr, None)?,
+        })
+    }
+
+    /// The next connection whose handshake has completed. `None` once the
+    /// endpoint is closed.
+    pub async fn accept(&self) -> Option<Connection> {
+        let h = self.sh.accept().await?;
+        Some(Connection {
+            sh: self.sh.clone(),
+            h,
+        })
+    }
+
+    /// Connects to `to`, checking its certificate against `server_name`.
+    /// Fails with `GIONG-E3602`.
+    pub async fn connect(
+        &self,
+        to: SocketAddr,
+        server_name: &str,
+        config: &ClientConfig,
+    ) -> io::Result<Connection> {
+        let h = self.sh.connect(config.to_proto()?, to, server_name).await?;
+        Ok(Connection {
+            sh: self.sh.clone(),
+            h,
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.sh.local_addr()
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        self.sh.close();
+    }
+}
+
+/// An established QUIC connection. Dropping the connection and all its
+/// streams closes it.
+pub struct Connection {
+    sh: Rc<proto::Shared>,
+    h: usize,
+}
+
+impl Connection {
+    /// The next bidirectional stream the peer opens.
+    pub async fn accept_bi(&self) -> io::Result<(SendStream, RecvStream)> {
+        let id = self.sh.stream(self.h, false).await?;
+        Ok(self.pair(id))
+    }
+
+    /// Opens a bidirectional stream, waiting while the peer's stream limit
+    /// is reached.
+    pub async fn open_bi(&self) -> io::Result<(SendStream, RecvStream)> {
+        let id = self.sh.stream(self.h, true).await?;
+        Ok(self.pair(id))
+    }
+
+    fn pair(&self, id: quinn_proto::StreamId) -> (SendStream, RecvStream) {
+        (
+            SendStream {
+                sh: self.sh.clone(),
+                h: self.h,
+                id,
+                finished: false,
+            },
+            RecvStream {
+                sh: self.sh.clone(),
+                h: self.h,
+                id,
+                done: false,
+            },
+        )
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.sh.remote_addr(self.h)
+    }
+
+    /// Closes the connection with an application error code and reason.
+    pub fn close(&self, code: u32, reason: &[u8]) {
+        self.sh.close_conn(self.h, code, reason);
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.sh.release(self.h);
+    }
+}
+
+/// The sending half of a stream. Dropping it finishes the stream.
+pub struct SendStream {
+    sh: Rc<proto::Shared>,
+    h: usize,
+    id: quinn_proto::StreamId,
+    finished: bool,
+}
+
+impl SendStream {
+    /// Sends all of `data`, waiting while flow control holds it back.
+    pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.sh.write(self.h, self.id, data).await
+    }
+
+    /// Ends the stream after what was written.
+    pub fn finish(&mut self) -> io::Result<()> {
+        self.finished = true;
+        self.sh.finish(self.h, self.id)
+    }
+}
+
+impl Drop for SendStream {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.sh.finish(self.h, self.id);
+        }
+        self.sh.release(self.h);
+    }
+}
+
+/// The receiving half of a stream. Dropping it before the end asks the
+/// peer to stop sending.
+pub struct RecvStream {
+    sh: Rc<proto::Shared>,
+    h: usize,
+    id: quinn_proto::StreamId,
+    done: bool,
+}
+
+impl RecvStream {
+    /// The next piece of the stream, in order; `None` at its end.
+    pub async fn read(&mut self) -> io::Result<Option<Bytes>> {
+        let r = self.sh.read(self.h, self.id).await;
+        if matches!(r, Ok(None) | Err(_)) {
+            self.done = true;
+        }
+        r
+    }
+
+    /// Everything up to the end of the stream, at most `limit` bytes.
+    pub async fn read_to_end(&mut self, limit: usize) -> io::Result<Vec<u8>> {
+        let mut all = Vec::new();
+        while let Some(b) = self.read().await? {
+            if all.len() + b.len() > limit {
+                self.sh.stop(self.h, self.id, 0);
+                self.done = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the stream is longer than the limit of {limit} bytes"),
+                ));
+            }
+            all.extend_from_slice(&b);
+        }
+        Ok(all)
+    }
+}
+
+impl Drop for RecvStream {
+    fn drop(&mut self) {
+        if !self.done {
+            self.sh.stop(self.h, self.id, 0);
+        }
+        self.sh.forget_stream(self.h, self.id);
+        self.sh.release(self.h);
+    }
+}
