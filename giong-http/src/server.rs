@@ -692,7 +692,7 @@ impl Server {
     }
 
     /// Accepts until a shutdown is requested, then for a moment longer.
-    /// Waits for a free slot before each accept when `max_connections` is set.
+    /// Waits for a free slot under `max_connections` before each accept.
     async fn accept_loop<S, A>(&self, accept: impl Fn() -> A, spawn: impl Fn(S, Slot))
     where
         A: Future<Output = io::Result<S>>,

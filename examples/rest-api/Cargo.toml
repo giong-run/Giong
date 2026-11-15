@@ -20,3 +20,13 @@ serde_json = "1"
 giong-http = { path = "../../giong-http", features = ["client"] }
 libc = "0.2"
 rcgen = "0.13"
+# For the Rust samples of the repository's Markdown, compiled as doctests of
+# this crate (see `markdown` in src/lib.rs): the crates and the Tokio-ecosystem
+# crates they show.
+giong-compat = { path = "../../giong-compat", features = ["tls"] }
+giong-mcp = { path = "../../giong-mcp" }
+giong-mysql = { path = "../../giong-mysql" }
+http-body-util = "0.1"
+hyper = { version = "1.6", features = ["http1", "http2", "client", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tokio = { version = "1.13", default-features = false, features = ["io-util"] }

@@ -151,9 +151,15 @@ epoll driver, a file operation running on a blocking thread does the same.
 ### Dependencies and API
 
 - New dependencies need a reason. The runtime depends on three crates; `giong-tls` adds
-  `rustls`, and `giong-http` adds nothing.
-- Public items need documentation. Breaking changes to the public API need an issue first
-  and an entry in the changelog.
+  `rustls`, and `giong-http`'s server adds nothing (its `client` feature adds
+  `miniz_oxide` for gzip, and `tls` or `client` giong-tls).
+- Public items need documentation. The API was settled for 1.0 in 0.7.0
+  ([docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md)): add rather
+  than break. A breaking change needs an issue first and an entry in the changelog that
+  says how to migrate.
+- The Rust samples in the READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are
+  compiled by `cargo test -p rest-api --doc`, and run unless marked `no_run`; a change to
+  the API changes them in the same pull request.
 
 ## Commits
 

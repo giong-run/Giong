@@ -324,3 +324,35 @@ pub fn app(state: State, log: AccessLog) -> App<State> {
         .layer(Timeout::new(Duration::from_secs(10)))
         .build(state)
 }
+
+/// The Rust samples in the repository's Markdown, compiled by
+/// `cargo test --doc -p rest-api` so that none of them drifts from the API.
+/// The ones that need a server, a database or a certificate are marked
+/// `no_run` and only compiled; the rest run.
+#[cfg(doctest)]
+mod markdown {
+    #[doc = include_str!("../../../README.md")]
+    mod readme {}
+    #[doc = include_str!("../../../docs/DEPLOYMENT.md")]
+    mod deployment {}
+    #[doc = include_str!("../../../docs/errors/README.md")]
+    mod errors {}
+    #[doc = include_str!("../../../giong-compat/README.md")]
+    mod giong_compat {}
+    #[doc = include_str!("../../../giong-http/README.md")]
+    mod giong_http {}
+    #[doc = include_str!("../../../giong-mcp/README.md")]
+    mod giong_mcp {}
+    #[doc = include_str!("../../../giong-mysql/README.md")]
+    mod giong_mysql {}
+    #[doc = include_str!("../../../giong-postgres/README.md")]
+    mod giong_postgres {}
+    #[doc = include_str!("../../../giong-redis/README.md")]
+    mod giong_redis {}
+    #[doc = include_str!("../../../giong-tls/README.md")]
+    mod giong_tls {}
+    #[doc = include_str!("../../../giong-web/README.md")]
+    mod giong_web {}
+    #[doc = include_str!("../README.md")]
+    mod rest_api {}
+}

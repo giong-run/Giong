@@ -2,7 +2,7 @@
 
 TLS for the [giong](../README.md) runtime, built on [rustls](https://github.com/rustls/rustls) (TLS 1.2 and 1.3, cryptography from `ring`, no OpenSSL): `TlsAcceptor` for servers, `TlsConnector` for clients.
 
-```rust
+```rust,no_run
 use giong::net::TcpListener;
 use giong_tls::TlsAcceptor;
 
@@ -38,7 +38,7 @@ For HTTPS you do not need to write this loop yourself: turn on the `tls` feature
 
 A client, checking the server's certificate against the certificate authorities installed on the machine:
 
-```rust
+```rust,no_run
 use giong::net::TcpStream;
 use giong_tls::TlsConnector;
 
@@ -77,7 +77,7 @@ fn main() -> std::io::Result<()> {
 | `TlsConnector::new(config)` | Bring your own `rustls::ClientConfig`. |
 | `.alpn(&[b"h2", b"http/1.1"])`, `.client_auth(cert, key)` | Protocols to offer through ALPN; a client certificate for servers that ask for one (mutual TLS). |
 | `connector.connect(name, tcp)` | Runs the handshake, checking that the certificate is valid for `name` (a DNS name, sent through SNI, or an IP address). A certificate for another name, expired, or from an unknown authority fails with `InvalidData` and a message saying which. Clones of a connector share a session cache, so reconnecting resumes the session. |
-| `tls.recv()` | Decrypted data. An empty buffer means the peer closed. |
+| `tls.recv()` | Decrypted data, as a `Received`: it derefs to `&[u8]`, can be passed straight to `write_all`, and `into_vec()` gives a `Vec<u8>`. An empty one means the peer closed. |
 | `tls.received_close_notify()` | Whether the peer ended the connection with `close_notify`. Without it, the TCP connection merely closed, which anyone on the path can cause: check it before trusting data that ends where the connection ends. |
 | `tls.write_all(buf)` | Encrypts and sends all of `buf` (a `Vec<u8>`, `Box<[u8]>`, `&'static [u8]`, ...), then hands the buffer back, like `TcpStream::write_all`. |
 | `tls.write_all_vectored(bufs)` | The same for several buffers in order (a header and a body), without copying them into one first. |
@@ -101,7 +101,7 @@ Things to remember:
 
 With kernel TLS (kTLS), rustls still does the handshake and checks the certificates; then giong-tls hands the connection's keys to the kernel, which encrypts what the program sends and decrypts what it receives. The program keeps the same `TlsStream` API, and the kernel can send encrypted data straight from its own buffers, which is what makes zero-copy sending possible over TLS.
 
-```rust
+```rust,no_run
 use giong_tls::{Ktls, TlsAcceptor};
 
 fn main() -> std::io::Result<()> {

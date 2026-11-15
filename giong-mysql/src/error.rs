@@ -49,7 +49,7 @@ pub enum ErrorKind {
     /// or a column read with [`Row::get`](crate::Row::get).
     Type,
     /// [`query_one`](crate::Client::query_one) found no row or more than one,
-    /// or [`insert`](crate::Client::insert) found no generated id.
+    /// or [`query_opt`](crate::Client::query_opt) more than one.
     RowCount,
     /// The result was larger than
     /// [`Config::max_result_size`](crate::Config::max_result_size).

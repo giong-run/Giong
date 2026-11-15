@@ -8,6 +8,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Changed
+
+- **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
+  READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are now compiled by
+  `cargo test -p rest-api --doc`, and run where they need no server; 11 of the 34 did not
+  compile before (fragments without their imports or an `async fn`), and three plain-text
+  blocks were taken for Rust. Text that still described 0.6: giong-http's README and crate docs called the
+  connection cap optional (it is 10,000 per `serve` call), the README's limitations said
+  `bind` resolves names with a blocking call (it takes IP addresses only), and
+  giong-mysql's `ErrorKind::RowCount`, `Code::MysqlRowCount` and the E3106 page said
+  `insert` raises it (it returns `None`). `docs/DEPLOYMENT.md` says how to restart a
+  service on the same port now that `bind` refuses a port another process holds.
+  `llms.txt` states the address and connection-limit rules. The 0.7.0 migration notes
+  below say what implements `net::ToSocketAddrs`, what replaces `version_minor()`, how to
+  raise `max_connections`, and that a `match` on giong-redis's `Value` needs a `_` arm.
+
 ## [0.7.0] - 2026-11-15
 
 The API freeze for 1.0: the decisions that the 0.6 reviews, and a service an AI agent built
@@ -22,7 +38,7 @@ Changes that break code written for 0.6, by crate; each is marked **Breaking:** 
 says how to migrate:
 
 - **giong**: `bind` refuses an address that another process holds, even one shared with
-  `SO_REUSEPORT`; `bind`, `bind_balanced` and `UdpSocket::connect` take IP addresses only
+  `SO_REUSEPORT`; `bind`, `bind_balanced`, `UdpSocket::bind` and `UdpSocket::connect` take IP addresses only
   and refuse a host name with `GIONG-E0100`; `UdpSocket::bind` no longer sets
   `SO_REUSEADDR`; `giong::stats()` is `giong::observe::worker_stats()`.
 - **giong-http**: `Request::version_minor` is removed, and `Server::max_connections`
@@ -70,7 +86,10 @@ numbers in the README are those of 0.6.0 and of 0.5.0's bare-metal pass.
   the standard library looked it up with a blocking `getaddrinfo` on the worker, outside
   giong's resolver, and `localhost` can mean `127.0.0.1`, `::1` or both. Write the IP
   address, or resolve the name first with `net::lookup_host`. The module no longer has two
-  traits named `ToSocketAddrs`.
+  traits named `ToSocketAddrs`. `SocketAddr`, `(IpAddr, u16)`, `&str`, `String`,
+  `(&str, u16)` and slices, arrays and `Vec`s of `SocketAddr` implement giong's trait, so
+  most calls build unchanged; a function generic over `std::net::ToSocketAddrs` that
+  passes its argument on bounds it by `giong::net::ToSocketAddrs` instead.
 - **Breaking:** **giong**: `UdpSocket::bind` sets `SO_REUSEPORT` only, not `SO_REUSEADDR`
   as well: with both, a socket of any user that set `SO_REUSEADDR` could bind the port
   and receive its datagrams.
@@ -83,10 +102,13 @@ numbers in the README are those of 0.6.0 and of 0.5.0's bare-metal pass.
   otherwise point at as the pages change.
 - **giong**: the docs of `Sleep` say that it is `Send` on purpose, and stays so.
 - **Breaking:** **giong-http**: `Request::version_minor` is removed; `Request::version`
-  tells every version apart (it reported `1` for HTTP/2).
+  tells every version apart (it reported `1` for HTTP/2): `req.version_minor() == 0` is
+  `req.version() == Version::Http10`.
 - **Breaking:** **giong-http**: `Server::max_connections` defaults to 10,000 connections
   per `serve` call (per worker), not unlimited, so that a worker's memory is bounded by
-  default. Clients past the limit wait in the listen queue.
+  default. Clients past the limit wait in the listen queue. A worker that holds more
+  long-lived connections (event streams, WebSockets) sets
+  `Server::new().max_connections(n)`.
 - **giong-http**: `Response::header` and `Response::try_header` take the value as
   `impl AsRef<str>`, so a `String` from `format!` needs no `&`.
 - **giong-web**: `json(status, value)` with a status outside `200..=599` returns an
@@ -104,7 +126,8 @@ numbers in the README are those of 0.6.0 and of 0.5.0's bare-metal pass.
   when the statement generated no `AUTO_INCREMENT` id, where it used to fail with
   `ErrorKind::RowCount` after the rows were written, so code that retried on errors wrote
   them twice.
-- **Breaking:** **giong-redis**: `Value` is `#[non_exhaustive]`.
+- **Breaking:** **giong-redis**: `Value` is `#[non_exhaustive]`, so that a reply type
+  added to RESP later is not a breaking change; a `match` on it needs a `_` arm.
 - **Breaking:** **giong-redis**: `mget` has one type parameter, the result:
   `mget::<Vec<Option<String>>>(&keys)`, not `mget::<Vec<Option<String>>, _>(&keys)`.
 - **Breaking:** **giong-mcp**: `McpServer::url` returns `Option<String>`, `None` on a Unix

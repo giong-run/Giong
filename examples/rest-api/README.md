@@ -55,6 +55,8 @@ The table is created at startup when it is missing. SIGTERM and SIGINT stop acce
 
 `cargo test -p rest-api` starts a throwaway PostgreSQL cluster and Redis server (both on Unix sockets in a temporary directory), serves the API over HTTPS on a free port, and goes through every route with giong-http's client: create, conflict, validation, cache miss then hit, update and the cache dropped, pages, the export, delete, and reads that still work with the cache unreachable while `/ready` says `503`. Without PostgreSQL or Redis installed the test is skipped, unless `GIONG_PG_REQUIRED=1` or `GIONG_REDIS_REQUIRED=1`.
 
+`cargo test -p rest-api --doc` compiles the Rust samples in the repository's READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` against the crates as they are, and runs the ones that need no server, database or certificate, so that no sample drifts from the API.
+
 ## Against axum
 
 [`bench/rest-api-axum`](../../bench/rest-api-axum) is the same API on axum 0.8, tokio-postgres with deadpool-postgres, redis-rs and rustls: the same routes, SQL, validation, cache and middleware. `bench/rest-api.sh` measures both; see [Performance](#performance).

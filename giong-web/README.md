@@ -9,7 +9,7 @@ giong-web = { version = "0.7", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-```rust
+```rust,no_run
 use std::time::Duration;
 use giong::net::TcpListener;
 use giong_web::middleware::{Compression, Logger, RequestId, Timeout};
@@ -87,20 +87,42 @@ fn main() -> std::io::Result<()> {
 ## Routing
 
 ```rust
-let members = Router::new()
-    .get("/", list_members)          // GET /teams/{team}
-    .get("/members/{id}", member)    // GET /teams/{team}/members/{id}
-    .layer(RequireAuth);             // for these routes, and the 404s under /teams/{team}
-let app = Router::new()
-    .get("/files/{*path}", file)     // path = "a/b c.txt" for /files/a/b%20c.txt
-    .nest("/teams/{team}", members)
-    .build(state);
+use std::path::PathBuf;
+use std::time::Duration;
+use giong_web::middleware::Timeout;
+use giong_web::{App, Error, Req, Response, Router};
+
+struct State {
+    root: PathBuf,
+}
+
+fn app(state: State) -> App<State> {
+    let members = Router::new()
+        .get("/", list_members)          // GET /teams/{team}
+        .get("/members/{id}", member)    // GET /teams/{team}/members/{id}
+        .layer(Timeout::new(Duration::from_secs(2))); // these routes, and the 404s under /teams/{team}
+    Router::new()
+        .get("/files/{*path}", file)     // path = "a/b c.txt" for /files/a/b%20c.txt
+        .nest("/teams/{team}", members)
+        .build(state)
+}
+
+async fn list_members(req: Req<State>) -> Result<Response, Error> {
+    let team: String = req.param("team")?;
+    Ok(Response::text(format!("the members of {team}")))
+}
+
+async fn member(req: Req<State>) -> Result<Response, Error> {
+    let (team, id): (String, u64) = (req.param("team")?, req.param("id")?);
+    Ok(Response::text(format!("member {id} of {team}")))
+}
 
 async fn file(req: Req<State>) -> Result<Response, Error> {
     // Never `..`, `.`, NUL or absolute, so it stays under the root.
     let path: String = req.param("path")?;
     let full = req.state().root.join(&path);
-    // ...
+    let bytes = giong::fs::read(&full).await?;
+    Ok(Response::new(200).body(bytes))
 }
 ```
 
@@ -144,6 +166,7 @@ Your own errors take your own codes: `Error::not_found("user_not_found", "no use
 use giong_web::{Error, Middleware, Next, Req, Response};
 
 struct RequireAuth;
+struct UserId(u64);
 
 impl<S: 'static> Middleware<S> for RequireAuth {
     async fn call(&self, mut req: Req<S>, next: Next<'_, S>) -> Result<Response, Error> {
@@ -220,9 +243,14 @@ let app = Router::new().get("/events", events).nest("/api", uploads).build(());
 ## Testing
 
 ```rust
-use giong_web::{Request, Router};
+use giong_web::{Error, Req, Request, Response, Router};
 
-let app = Router::new().get("/users/{id}", get_user).build(state);
+async fn get_user(req: Req<()>) -> Result<Response, Error> {
+    let id: u64 = req.param("id")?;
+    Ok(Response::text(format!("user {id}")))
+}
+
+let app = Router::new().get("/users/{id}", get_user).build(());
 let req = Request::from_bytes(b"GET /users/abc HTTP/1.1\r\nHost: t\r\n\r\n").unwrap();
 let resp = giong::block_on(app.handle(req));
 assert_eq!(resp.status(), 400);

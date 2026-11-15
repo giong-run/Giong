@@ -8,7 +8,7 @@ giong = "0.7"
 giong-mcp = "0.7"
 ```
 
-```rust
+```rust,no_run
 fn main() -> std::io::Result<()> {
     let rt = giong::Builder::new().shutdown_on_signals(true).build()?;
     // Starts only when GIONG_MCP is set. Keep the value: dropping it stops
@@ -33,13 +33,21 @@ Any MCP client that speaks the Streamable HTTP transport works the same way; giv
 
 `start_from_env` writes one line to stderr, `giong-mcp: listening on http://127.0.0.1:7777/mcp`, or the coded error that kept the server from starting: a busy port or a bad `GIONG_MCP` leaves the service running without the endpoint, since a debugging aid should not decide whether the service starts. For a JSON log line instead, or to stop the service when the endpoint cannot start, use `Config` and log the result yourself:
 
-```rust
-// Kept for as long as the service runs, like `_mcp` above.
-let mcp = giong_mcp::Config::from_env()?
-    .map(|cfg| cfg.start(&rt.handle()))
-    .transpose()?; // a coded error, such as GIONG-E1303, stops the service
-if let Some(mcp) = &mcp {
-    // log mcp.url() (None on a Unix socket) your way
+```rust,no_run
+fn main() -> std::io::Result<()> {
+    let rt = giong::Builder::new().shutdown_on_signals(true).build()?;
+    // Kept for as long as the service runs, like `_mcp` above.
+    let mcp = giong_mcp::Config::from_env()?
+        .map(|cfg| cfg.start(&rt.handle()))
+        .transpose()?; // a coded error, such as GIONG-E1303, stops the service
+    if let Some(mcp) = &mcp {
+        // log mcp.url() (None on a Unix socket) your way
+        let _ = mcp.url();
+    }
+    rt.run(|_worker| async {
+        // ... the service ...
+        giong::shutdown_signal().await;
+    })
 }
 ```
 

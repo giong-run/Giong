@@ -115,7 +115,7 @@ A whole service, with PostgreSQL, a Redis cache and HTTPS, is in
 
 An HTTP service on every core, with [`giong-http`](giong-http/README.md):
 
-```rust
+```rust,no_run
 use std::time::Duration;
 use giong::net::TcpListener;
 use giong_http::{Request, Response, Server};
@@ -134,8 +134,8 @@ fn main() -> std::io::Result<()> {
         .shutdown_grace(Duration::from_secs(10))    // requests in progress are answered
         .build()?
         .run(|_worker| async {
-            // Every worker binds its own SO_REUSEPORT listener on the same port;
-            // the kernel spreads connections across cores.
+            // Every worker binds its own listener on the same port (another process
+            // cannot take it); the kernel spreads connections across cores.
             let listener = TcpListener::bind("0.0.0.0:8080").expect("bind");
             Server::new().serve(listener, handler).await;
         })
@@ -147,7 +147,7 @@ For HTTPS, turn on the `tls` feature and call `serve_tls` with a
 
 The runtime itself, without the library: a TCP echo server.
 
-```rust
+```rust,no_run
 use giong::net::TcpListener;
 
 fn main() -> std::io::Result<()> {
@@ -195,10 +195,13 @@ async fn demo() -> std::io::Result<()> {
 
 For a latency-sensitive service on dedicated cores:
 
-```rust
-let runtime = giong::Builder::new()
-    .spin_before_park(std::time::Duration::from_micros(200))
-    .build()?;
+```rust,no_run
+fn main() -> std::io::Result<()> {
+    let runtime = giong::Builder::new()
+        .spin_before_park(std::time::Duration::from_micros(200))
+        .build()?;
+    runtime.run(|_worker| async { /* ... */ })
+}
 ```
 
 ## What is in the box
@@ -208,10 +211,10 @@ let runtime = giong::Builder::new()
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
 | Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`; `giong::driver_kind()` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
-| TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
+| TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`, on an IP address (a host name is refused: `lookup_host` first), shared by the workers of one process and refused to any other; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
 | Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
-| UDP | `UdpSocket::bind` / `connect`; `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast` |
+| UDP | `UdpSocket::bind` / `connect` (IP addresses); `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast` |
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
@@ -224,7 +227,7 @@ let runtime = giong::Builder::new()
 | Redis | [`giong-redis`](giong-redis/README.md): `Client`, `Pool`, `Config`, `cmd`, `Pipeline`, `PubSub` |
 | Web services | [`giong-web`](giong-web/README.md): `Router`, `App`, `Req`, `Error`, `Middleware`; `middleware::{RequestId, Logger, Cors, Compression, Timeout}`; `json` with `serde` |
 | Tokio-ecosystem crates | [`giong-compat`](giong-compat/README.md): `Compat::new(stream)` implements `AsyncRead`, `AsyncWrite` and `AsyncBufRead` from `tokio::io` and `futures_io` for `TcpStream`, `UnixStream` and `TlsStream`, for crates that take a stream and are driven by you (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`, tokio-util's codecs) |
-| Looking inside | `Handle::pulse(worker)` (counters and the task being polled, from any thread), `observe::snapshot()` (live tasks by the line that spawned them, timers, I/O, pools), `Handle::set_profiling` and `observe::take_profile()`; [`giong-mcp`](giong-mcp/README.md) serves them to AI agents over MCP |
+| Looking inside | `Handle::pulse(worker)` (counters and the task being polled, from any thread), `observe::snapshot()` (live tasks by the line that spawned them, timers, I/O, pools), `Handle::set_profiling` and `observe::take_profile()`, `observe::worker_stats()` (the current worker's counters, for leak checks in tests); [`giong-mcp`](giong-mcp/README.md) serves them to AI agents over MCP |
 
 Five things to remember:
 
@@ -247,7 +250,7 @@ Five things to remember:
 
 giong has no macros and no `spawn_blocking`, and a worker's state is never shared with
 another thread, so some everyday Tokio code is written another way. Every row was run on
-giong 0.6.0.
+giong 0.7.0.
 
 | With Tokio | On giong |
 |---|---|
@@ -266,7 +269,7 @@ giong 0.6.0.
 
 ## Design
 
-```
+```text
         worker 0                 worker 1                 worker N
  ┌────────────────────┐   ┌────────────────────┐   ┌────────────────────┐
  │ tasks (!Send)      │   │                    │   │                    │
@@ -281,7 +284,7 @@ giong 0.6.0.
 
 Each worker is a thread pinned to one core that owns everything it touches. Its loop:
 
-```
+```text
 run the tasks that are ready  →  io_uring_enter (submit everything, collect everything)  →  fire timers  →  repeat
 ```
 
@@ -813,9 +816,10 @@ request with callgrind instead, which repeats within 0.1%.
 
 1,062 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
-driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
-database clients, giong-web, giong-mcp, giong-compat and the example API describe theirs
-in their READMEs.
+driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
+where they need no server) as doctests of the example API. The runtime's, HTTP's and
+TLS's main suites are below; the database clients, giong-web, giong-mcp, giong-compat and
+the example API describe theirs in their READMEs.
 
 | Suite | What it checks |
 |---|---|
@@ -934,8 +938,8 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
 
 - **Name resolution reads files and DNS only.** `connect` and `lookup_host` resolve names
   without blocking, from `/etc/hosts` and the DNS servers in `/etc/resolv.conf`; other
-  Name Service Switch sources (mDNS, LDAP) are not used. `bind` still resolves with a
-  blocking call, which only matters at startup. `fs::read_dir` reads each batch of
+  Name Service Switch sources (mDNS, LDAP) are not used. `bind` takes IP addresses only,
+  so it never waits on a lookup. `fs::read_dir` reads each batch of
   entries with a direct system call on the worker (io_uring cannot read directories):
   quick on a local disk, a network round trip on NFS. On the epoll driver, file
   operations run on a pool of blocking threads, and one that is cancelled while running
@@ -975,25 +979,32 @@ the latency dial, a strict HTTP server on top, and code small enough to audit.
   [giong.run/llms.txt](https://giong.run/llms.txt) points a model at the docs.
 - [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 
-```
+```text
 src/
   lib.rs        entry point and docs
   runtime.rs    Builder, Runtime, Handle, the event loop, shutdown, signals
   executor.rs   tasks, wakers, spawn, JoinHandle
+  notify.rs     the lock-free wake-up handshakes, checked with loom
   driver/       the drivers behind one interface (mod.rs: operations, choosing, falling back)
     uring.rs    io_uring: submit and reap, operation tracking, cancellation, backpressure
     epoll.rs    epoll: readiness, edge-triggered registration, the per-task budget
     blocking.rs the thread pool for file operations on epoll
   op.rs         a single operation as a future
   buf.rs        IoBuf / IoBufMut, the kernel-shared buffer pool, RecvBuf
+  kbox.rs       heap memory the kernel uses while an operation is in flight
   net.rs        the core shared by stream sockets, TcpListener, TcpStream
+  net/addr.rs   ToSocketAddrs, connecting to the first of several addresses (Happy Eyeballs)
+  net/dns.rs    lookup_host and Resolver: /etc/hosts, DNS over UDP and TCP, cache
+  net/balance.rs  bind_balanced: handing new connections to idle workers
+  net/share.rs  which ports this process holds, so bind refuses another process's
   net/unix.rs   UnixListener, UnixStream
   net/udp.rs    UdpSocket, Datagram
   fs.rs         File, OpenOptions, Metadata, the path operations
   time.rs       timing wheel, sleep, timeout
-  sync.rs       mpsc channel
+  sync.rs       mpsc channels (sync/bounded.rs: bounded), sync/oneshot.rs
+  error.rs      Code, the GIONG-Exxxx codes and their pages
   observe.rs    pulses, snapshots, profiles and sources, for diagnostics and giong-mcp
-giong-http/     the HTTP/1.1 crate: the server (parser, chunked decoding, connections, HTTPS behind `tls`), the client behind `client`
+giong-http/     HTTP/1.1 and HTTP/2: the server (parser, chunked decoding, connections, HTTPS behind `tls`), the client behind `client`
 giong-tls/      the TLS crate on rustls (TlsAcceptor, TlsConnector, TlsStream)
 giong-postgres/ the PostgreSQL client crate (wire protocol, authentication, statement cache, Pool)
 giong-mysql/    the MySQL client crate (client/server protocol, authentication, statement cache, Pool)
@@ -1002,9 +1013,9 @@ giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Er
 giong-mcp/      the MCP server for agents: Streamable HTTP, tools over giong::observe
 giong-compat/   Compat: the Tokio and futures-io I/O traits for giong's streams
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs; rest-api/, a complete REST API (PostgreSQL, a Redis cache, HTTPS)
-tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, ...
+tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, dns, channels, observe, soak, ...
 bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, rest-api.sh, compat.sh, the programs compared against, results/
-scripts/        check.sh (repeated tests, fallback setups, epoll, seccomp, ThreadSanitizer), kernels.sh, no-io-uring.py, valgrind.sh
+scripts/        check.sh (repeated tests, fallback setups, epoll, seccomp, ThreadSanitizer), kernels.sh, no-io-uring.py, valgrind.sh, release.py
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```
 

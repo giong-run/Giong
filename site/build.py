@@ -704,7 +704,7 @@ def home():
         <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>cargo run</span></div>
         <pre><code><span class="p">$</span> cargo run
 <span class="c">   Running `target/debug/shop`</span>
-Error: <span class="e">{html.escape(a["error"])}</span></code></pre>
+Error: <span class="e">{html.escape(a["error"].replace("{version}", VERSION))}</span></code></pre>
       </figure>
       <div class="files">
         <a href="{BLOB}AGENTS.md"><b>AGENTS.md</b><span>how to build, test and change giong</span></a>
@@ -824,7 +824,7 @@ cargo add giong-http          # or giong-web for routing, middleware and JSON</c
       <p>Every error giong raises starts with a code, says what went wrong and how to fix it, and
       links to its page. {ERROR_COUNT} codes so far. Match on <code>giong::error::code(&amp;err)</code>,
       never on the message.</p>
-      <pre class="code sm"><code>{html.escape(C.AGENTS["error"])}</code></pre>
+      <pre class="code sm"><code>{html.escape(C.AGENTS["error"].replace("{version}", VERSION))}</code></pre>
       {errs}
       <p class="src-note">{source_note(["docs/errors/README.md"])}</p>
     </section>
@@ -1169,6 +1169,11 @@ Facts that are easy to get wrong:
 - `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may
   have sent part of its buffer.
 - There are no macros: start a runtime with `giong::block_on` or `giong::Builder`.
+- `TcpListener::bind`, `bind_balanced`, `UdpSocket::bind` and `UdpSocket::connect` take IP
+  addresses only (`"0.0.0.0:8080"`, `"[::]:8080"`); a host name such as `"localhost:8080"`
+  is refused with `GIONG-E0100`. Resolve names with `giong::net::lookup_host` first;
+  `TcpStream::connect` resolves them itself. The workers of one process share a port, and
+  `bind` refuses a port that another process holds.
 - An error giong raises starts with a code, such as `GIONG-E0102`, says how to fix it, and
   links to its page; `giong::error::code(&err)` returns the code to match on.
 - giong-web: build the `Router` inside each worker's future (`run(|_| async {{ .. }})`), since
@@ -1184,7 +1189,9 @@ Facts that are easy to get wrong:
   Crates generic over a Tokio or futures-io stream (h2, tokio-rustls, tokio-tungstenite) do,
   through `giong_compat::Compat::new(stream)`.
 - `giong-http` serves HTTP/2 by itself, through ALPN over TLS or with prior knowledge on the
-  same port; handlers do not change. `Server::http2(false)` turns it off.
+  same port; handlers do not change. `Server::http2(false)` turns it off. A `serve` call
+  keeps at most 10,000 connections open (`Server::max_connections`); past that, clients
+  wait in the listen queue.
 - On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.

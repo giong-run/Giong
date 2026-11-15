@@ -181,9 +181,11 @@ AGENTS = dict(
          "`AGENTS.md` in the repository and `llms.txt` on this site. `giong-mcp` lets an "
          "agent look inside a running service."),
     ],
+    # `{version}` becomes the release's version: messages link to the pages of
+    # the release that raised them.
     error=("GIONG-E0102: no address found for db.internal. Fix: check the spelling of the name, "
            "/etc/hosts, and the DNS servers in /etc/resolv.conf (in a container, the network it is "
-           "attached to). See https://github.com/giong-run/Giong/blob/main/docs/errors/E0102.md"),
+           "attached to). See https://github.com/giong-run/Giong/blob/v{version}/docs/errors/E0102.md"),
 )
 
 CHECKED = [
@@ -239,8 +241,8 @@ fn main() -> std::io::Result<()> {
 }'''),
     dict(
         tab="HTTP server", crate="giong-http", file="src/main.rs",
-        foot="One `SO_REUSEPORT` listener per worker; requests in progress are answered before a "
-             "worker stops.",
+        foot="One listener per worker on the same port, which no other process can take; requests in "
+             "progress are answered before a worker stops.",
         src='''use std::time::Duration;
 use giong::net::TcpListener;
 use giong_http::{Request, Response, Server};

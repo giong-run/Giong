@@ -8,7 +8,7 @@ giong = "0.7"
 giong-redis = "0.7"
 ```
 
-```rust
+```rust,no_run
 use std::time::Duration;
 use giong_redis::{cmd, Client, Config};
 
@@ -30,7 +30,7 @@ fn main() -> Result<(), giong_redis::Error> {
 
 In a service, make one `Pool` per worker. Nothing is shared between threads, so nothing is locked:
 
-```rust
+```rust,no_run
 use giong_redis::{Config, Pool};
 
 fn main() -> std::io::Result<()> {
@@ -64,17 +64,21 @@ RESP3 needs Redis 6 or later; Valkey works too.
 
 ```rust
 use std::time::Duration;
-use giong_redis::Config;
+use giong_redis::{Config, Error};
 
-let config = Config::from_url("rediss://app:secret@cache.internal:6380/2")?;
+fn configs() -> Result<(), Error> {
+    let config = Config::from_url("rediss://app:secret@cache.internal:6380/2")?;
 
-let same_place = Config::new()
-    .host("cache.internal")
-    .port(6380)
-    .user("app")
-    .password("secret")
-    .database(2)
-    .response_timeout(Duration::from_millis(500));
+    let same_place = Config::new()
+        .host("cache.internal")
+        .port(6380)
+        .user("app")
+        .password("secret")
+        .database(2)
+        .response_timeout(Duration::from_millis(500));
+    let _ = (config, same_place);
+    Ok(())
+}
 ```
 
 A URL is `redis://user:password@host:port/database?param=value`, `rediss://` for TLS, and `redis+unix:///run/redis/redis.sock?db=2` (or `unix://`) for a Unix socket; in code, a host starting with `/` is a socket. `redis://:secret@host` gives a password alone, for `requirepass`. The parameters understood are `db`, `client-name`, `connect-timeout` and `response-timeout` (seconds, as `0.5`), and `cacert` (a PEM file of the authorities to trust, for `rediss://`). Any other parameter is an error, not silently ignored.
@@ -99,24 +103,28 @@ Every method of `Client` that sends a command takes `&self`, so tasks share one 
 
 A blocking command inside an atomic pipeline does not block (Redis runs it with a timeout of zero), so it is allowed there.
 
-```rust
-use giong_redis::{cmd, Pipeline};
+```rust,no_run
+use giong_redis::{cmd, Error, Pipeline, Pool};
 
-// One round trip, run as one transaction.
-let (count, _): (i64, bool) = pool
-    .pipeline(
-        &Pipeline::new()
-            .add(cmd("INCR").arg("visits"))
-            .add(cmd("EXPIRE").arg("visits").arg(60))
-            .atomic(),
-    )
-    .await?;
+async fn demo(pool: &Pool) -> Result<(), Error> {
+    // One round trip, run as one transaction.
+    let (count, _): (i64, bool) = pool
+        .pipeline(
+            &Pipeline::new()
+                .add(cmd("INCR").arg("visits"))
+                .add(cmd("EXPIRE").arg("visits").arg(60))
+                .atomic(),
+        )
+        .await?;
 
-// A job queue: a connection to itself, waiting up to 10 seconds.
-let mut conn = pool.take().await?;
-let job: Option<(String, String)> = conn
-    .query_blocking(&cmd("BRPOP").arg("jobs").arg(10))
-    .await?;
+    // A job queue: a connection to itself, waiting up to 10 seconds.
+    let mut conn = pool.take().await?;
+    let job: Option<(String, String)> = conn
+        .query_blocking(&cmd("BRPOP").arg("jobs").arg(10))
+        .await?;
+    println!("{count} visits, job {job:?}");
+    Ok(())
+}
 ```
 
 ## API
@@ -170,7 +178,7 @@ Replies convert with `FromValue`:
 | `Vec<T>`, `HashSet<T>`, `BTreeSet<T>` | Arrays and sets; a map as `(key, value)` pairs. |
 | `HashMap<K, V>`, `BTreeMap<K, V>` | Maps (`HGETALL`, `CONFIG GET`), and flat arrays of keys and values (a stream entry's fields). |
 | Tuples of 1 to 6 | An array of exactly that many replies (`(String, f64)` for `WITHSCORES` pairs). |
-| `Value` | Any reply, as it arrived. |
+| `Value` | Any reply, as it arrived. `#[non_exhaustive]`: a `match` on it needs a `_` arm, so that a later RESP type is not a breaking change. |
 
 A conversion never loses anything silently: a number that does not fit, bytes that are not UTF-8, or an array of the wrong length fails with `ErrorKind::Type` and names what arrived and what to read it as. Implement `FromValue` for your own types.
 

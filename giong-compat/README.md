@@ -8,7 +8,7 @@ giong = "0.7"
 giong-compat = "0.7"
 ```
 
-```rust
+```rust,no_run
 use giong::net::TcpStream;
 use giong_compat::Compat;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
