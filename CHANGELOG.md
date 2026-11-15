@@ -8,6 +8,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **CI**: Kani proofs of the `unsafe` core, in a new `kani` job and
+  `scripts/check.sh kani` (docs/kani.md): the slab (any state up to 5 slots), the receive
+  buffer pool against a model of the kernel's buffer rings (any state of 2 buffers, on
+  epoll, the whole ring and the packed ring: no buffer both lent to the kernel and held,
+  lent twice or lost), the lifetime of an io_uring single-shot operation across cancel,
+  completion and a zero-copy notification (every order of events), and `KernelBox`. No bug
+  found; each proof caught a planted one. The driver's single-shot lifecycle functions now
+  take the slab and the graveyard as arguments and are generic over the entry and leftover
+  types, so the proofs run the driver's own code; no behaviour change, and the instruction
+  counts are unchanged.
+
 ### Security
 
 - **giong-http** (hardening, **behaviour change**): the requests a worker is receiving in
