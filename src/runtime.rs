@@ -96,6 +96,14 @@ pub(crate) struct WorkerShared {
     /// threads that read, never by the worker, and away from `counters`.
     idle_seen: AtomicU64,
     eventfd: OwnedFd,
+    /// A duplicate of the worker's io_uring descriptor, for other workers to
+    /// wake it through ([`IoUringFeature::MessageRing`]); set once the
+    /// driver is up, never where the driver has no such feature. Kept open
+    /// for as long as this struct lives, so a worker that wakes this one
+    /// never names a closed or reused descriptor.
+    ///
+    /// [`IoUringFeature::MessageRing`]: crate::IoUringFeature::MessageRing
+    wake_ring: OnceLock<OwnedFd>,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
 }
@@ -123,6 +131,7 @@ impl WorkerShared {
             idle_seen: AtomicU64::new(0),
             // SAFETY: a fresh descriptor we own.
             eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            wake_ring: OnceLock::new(),
             driver_choice: OnceLock::new(),
         }))
     }
@@ -138,18 +147,55 @@ impl WorkerShared {
         }
         // Handshake with `Doorbell::prepare_park` in `Worker::drive`: at least
         // one side always observes the other (modelled in `notify`).
-        if self.bell.ring() {
-            let one: u64 = 1;
-            // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own.
-            unsafe {
-                libc::write(
-                    self.eventfd.as_raw_fd(),
-                    &one as *const u64 as *const libc::c_void,
-                    8,
-                );
-            }
+        if self.bell.ring() && !self.wake_through_ring() {
+            self.write_eventfd();
         }
         true
+    }
+
+    /// Wakes the worker through its eventfd.
+    fn write_eventfd(&self) {
+        let one: u64 = 1;
+        // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own.
+        unsafe {
+            libc::write(
+                self.eventfd.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+    }
+
+    /// Has the worker running on this thread wake this one through its ring
+    /// at its next turn ([`IoUringFeature::MessageRing`]), which spares the
+    /// `write` system call. `false` where it cannot: this thread runs no
+    /// worker of the same runtime, or either driver lacks the feature.
+    ///
+    /// The wake-up is late by the rest of the waking worker's batch of
+    /// tasks, which ends with a turn of its event loop. The worker queues it
+    /// in `Worker::ring_wakes`, never in the driver: a waker can run while
+    /// the driver is borrowed.
+    ///
+    /// [`IoUringFeature::MessageRing`]: crate::IoUringFeature::MessageRing
+    fn wake_through_ring(&self) -> bool {
+        if self.wake_ring.get().is_none() {
+            return false;
+        }
+        try_with_worker(|w| {
+            if !w.ring_wakes_on.get() {
+                return false;
+            }
+            // Same runtime only: its workers outlive this one's turns, so
+            // their descriptors stay open until the wake-up is submitted.
+            match w.rt.workers.iter().position(|x| std::ptr::eq(&**x, self)) {
+                Some(index) => {
+                    w.ring_wakes.borrow_mut().push(index);
+                    true
+                }
+                None => false,
+            }
+        })
+        .unwrap_or(false)
     }
 
     fn close(&self) {
@@ -428,6 +474,12 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+    /// This worker wakes others through their rings
+    /// ([`IoUringFeature::MessageRing`](crate::IoUringFeature::MessageRing)).
+    ring_wakes_on: Cell<bool>,
+    /// Workers (by index) to wake through their rings at the next turn of
+    /// the event loop (see `WorkerShared::wake_through_ring`).
+    ring_wakes: RefCell<Vec<usize>>,
 }
 
 thread_local! {
@@ -486,6 +538,19 @@ impl Worker {
             shared.eventfd.as_raw_fd(),
         )?;
         shared.counters.set_driver(driver.kind());
+        let ring_wakes_on = match driver.wake_ring_fd() {
+            // SAFETY: duplicates a descriptor the driver owns and keeps open
+            // for the rest of this call.
+            Some(fd) => match unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) } {
+                dup if dup >= 0 => {
+                    // SAFETY: a fresh descriptor we own.
+                    let _ = shared.wake_ring.set(unsafe { OwnedFd::from_raw_fd(dup) });
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        };
         // A worker instance is built once, so the slot is always empty here.
         let _ = shared.driver_choice.set(choice);
         Ok(Rc::new(Self {
@@ -506,6 +571,8 @@ impl Worker {
             draining: Cell::new(false),
             main_location: Cell::new(panic::Location::caller()),
             observe: observe::Local::default(),
+            ring_wakes_on: Cell::new(ring_wakes_on),
+            ring_wakes: RefCell::new(Vec::new()),
         }))
     }
 
@@ -629,7 +696,7 @@ impl Worker {
 
             if !self.queue.borrow().is_empty() {
                 // More tasks are runnable: just exchange work with the kernel.
-                let graveyard = self.driver.borrow_mut().park(Park::Poll);
+                let graveyard = self.park(Park::Poll);
                 drop(graveyard);
                 self.fire_timers();
                 continue;
@@ -638,7 +705,7 @@ impl Worker {
             if let Some(spin) = self.spin {
                 // Hand queued submissions (responses!) to the kernel first, then
                 // watch for new work without giving up the CPU.
-                let graveyard = self.driver.borrow_mut().park(Park::Poll);
+                let graveyard = self.park(Park::Poll);
                 drop(graveyard);
                 self.fire_timers();
                 if !self.queue.borrow().is_empty() || self.spin_for_work(spin) {
@@ -672,7 +739,7 @@ impl Worker {
             if sleeps {
                 self.shared.counters.sleeping();
             }
-            let graveyard = self.driver.borrow_mut().park(mode);
+            let graveyard = self.park(mode);
             self.shared.bell.unpark();
             if sleeps {
                 self.shared.counters.woke();
@@ -681,6 +748,45 @@ impl Worker {
             drop(graveyard);
 
             self.fire_timers();
+        }
+    }
+
+    /// One turn of the driver ([`Driver::park`]), with the wake-ups of other
+    /// workers queued since the last one going out in the same
+    /// `io_uring_enter`.
+    fn park(&self, mode: Park) -> Vec<Box<dyn Any>> {
+        let mut driver = self.driver.borrow_mut();
+        let wakes = mem::take(&mut *self.ring_wakes.borrow_mut());
+        for index in wakes {
+            let target = &self.rt.workers[index];
+            let sent = match target.wake_ring.get() {
+                Some(fd) => driver.wake_ring(fd.as_raw_fd()),
+                None => false,
+            };
+            if !sent {
+                target.write_eventfd();
+            }
+        }
+        let graveyard = driver.park(mode);
+        if driver.take_ring_wake_failed() {
+            // A wake-up did not arrive, and nobody knows whose: wake them
+            // all the old way (a needless wake-up costs one turn), and send
+            // no more through rings.
+            self.ring_wakes_on.set(false);
+            for target in &self.rt.workers {
+                target.write_eventfd();
+            }
+        }
+        graveyard
+    }
+
+    /// Wakes, through their eventfds, the workers still waiting for a
+    /// wake-up from this one that no turn will send any more.
+    fn flush_ring_wakes(&self) {
+        self.ring_wakes_on.set(false);
+        let wakes = mem::take(&mut *self.ring_wakes.borrow_mut());
+        for index in wakes {
+            self.rt.workers[index].write_eventfd();
         }
     }
 
@@ -840,6 +946,8 @@ impl Worker {
         let waiters = self.shutdown_waiters.borrow_mut().take_all();
         drop(waiters);
         self.close_deferred();
+        // Wake-ups of other workers that the loop queued but did not send.
+        self.flush_ring_wakes();
         // 3. Cancel all I/O and wait until the kernel has let go of our memory.
         let (quiesced, graveyard) = {
             let mut driver = self.driver.borrow_mut();

@@ -438,6 +438,12 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         if kernel_version() >= (6, 2) {
             assert!(got.contains(&"zero-copy-send"), "{got:?}");
         }
+        if kernel_version() >= (6, 3) {
+            assert!(got.contains(&"msg-ring"), "{got:?}");
+        }
+        if kernel_version() >= (6, 18) {
+            assert!(got.contains(&"recv-bundles"), "{got:?}");
+        }
     }
 
     // Turned off, one by one and all at once. Each child sets its own
@@ -465,7 +471,9 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
             .unwrap();
         for f in IoUringFeature::ALL {
             let shown = line.contains(&format!("{f:?}"));
-            if off == "all" || off == f.name() {
+            // Receive bundles come from the packed ring: without it, none.
+            let needs_off = off == "packed-buffers" && *f == IoUringFeature::RecvBundles;
+            if off == "all" || off == f.name() || needs_off {
                 assert!(!shown, "{off}: {line}");
             } else {
                 assert_eq!(shown, got.contains(&f.name()), "{off}: {line}");

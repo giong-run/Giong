@@ -44,6 +44,12 @@ const UD_IGNORE: u64 = u64::MAX;
 const UD_WAKE: u64 = u64::MAX - 1;
 /// `user_data` of batched closes, which must finish before shutdown cancels I/O.
 const UD_CLOSE: u64 = u64::MAX - 2;
+/// `user_data` of the completion another worker posts into this ring to wake
+/// it ([`IoUringFeature::MessageRing`]). No SQE of this ring produced it, so
+/// it does not count against `inflight`.
+const UD_WOKEN: u64 = u64::MAX - 8;
+/// `user_data` of the `IORING_OP_MSG_RING` that wakes another worker.
+const UD_WAKE_SENT: u64 = u64::MAX - 9;
 
 /// Backpressure for multishot receive. Once a stream has this many
 /// completions its reader has not taken yet:
@@ -115,6 +121,9 @@ struct Multi {
     waker: Option<Waker>,
     /// An SQE is in flight and may still produce completions.
     armed: bool,
+    /// The receive in flight takes buffer bundles
+    /// ([`IoUringFeature::RecvBundles`]).
+    bundle: bool,
     /// We asked the kernel to stop (backpressure); the terminal CQE is pending.
     pausing: bool,
     /// The owner is gone; release whatever still arrives.
@@ -138,6 +147,10 @@ pub(crate) struct Uring {
     pool: Rc<BufPool>,
     /// Scratch space for a batch of CQEs.
     cqes: Vec<(u64, i32, u32)>,
+    /// Scratch space for the items one multishot completion brings.
+    items: Vec<Queued>,
+    /// Stream receives take buffer bundles ([`IoUringFeature::RecvBundles`]).
+    recv_bundles: bool,
     /// Multishot receives to pause once the current batch is dispatched.
     to_pause: Vec<usize>,
     /// A receive ran out of pool buffers during the current batch.
@@ -160,6 +173,11 @@ pub(crate) struct Uring {
     /// The smallest send that goes out without a copy, with
     /// [`IoUringFeature::ZeroCopySend`].
     zero_copy_min: Option<usize>,
+    /// Workers wake this one through its ring, and it wakes them through
+    /// theirs ([`IoUringFeature::MessageRing`]).
+    message_ring: bool,
+    /// A wake-up this ring sent failed (see [`Uring::take_ring_wake_failed`]).
+    ring_wake_failed: bool,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -595,6 +613,33 @@ fn has_zero_copy_send(ring: &IoUring) -> bool {
     probe.is_supported(opcode::SendZc::CODE) && probe.is_supported(opcode::SendMsgZc::CODE)
 }
 
+/// `true` if workers can wake each other through their rings: the kernel
+/// has `IORING_OP_MSG_RING` (5.18) and posts its completion correctly into
+/// a ring set up with `DEFER_TASKRUN`, which it does from Linux 6.3 (before,
+/// the target could miss the wake-up while it waited). A probe cannot see
+/// the second, hence the version.
+fn has_message_ring(ring: &IoUring) -> bool {
+    if !kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 3)) {
+        return false;
+    }
+    let mut probe = io_uring::Probe::new();
+    if ring.submitter().register_probe(&mut probe).is_err() {
+        return false;
+    }
+    probe.is_supported(opcode::MsgRingData::CODE)
+}
+
+/// `true` if stream receives can take buffer bundles from the packed ring
+/// the way giong reads them: the kernel has `IORING_RECVSEND_BUNDLE` (6.10)
+/// and commits a packed ring's buffers on every path of a bundle, retries
+/// included, which it does from Linux 6.18 ("io_uring/net: commit partial
+/// buffers on retry"; earlier kernels could leave the ring and giong's
+/// count of it apart). A probe cannot see the second, hence the version.
+fn has_recv_bundles(ring: &IoUring) -> bool {
+    ring.params().is_feature_recvsend_bundle()
+        && kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 18))
+}
+
 /// `IORING_REGISTER_RING_FDS` and `IORING_UNREGISTER_RING_FDS`.
 const REGISTER_RING_FDS: libc::c_uint = 20;
 const UNREGISTER_RING_FDS: libc::c_uint = 21;
@@ -751,18 +796,33 @@ impl Uring {
         if zero_copy_min.is_some() {
             features.push(IoUringFeature::ZeroCopySend);
         }
+        let recv_bundles = features.contains(&IoUringFeature::PackedBuffers)
+            && super::feature_enabled(IoUringFeature::RecvBundles)
+            && has_recv_bundles(&ring);
+        let message_ring =
+            super::feature_enabled(IoUringFeature::MessageRing) && has_message_ring(&ring);
+        if message_ring {
+            features.push(IoUringFeature::MessageRing);
+        }
+        if recv_bundles {
+            features.push(IoUringFeature::RecvBundles);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         Ok(Self {
             workarounds,
             features,
             registered_ring,
             zero_copy_min,
+            message_ring,
+            ring_wake_failed: false,
             ring,
             ops: Slab::new(),
             inflight: 0,
             pending_closes: 0,
             pool,
             cqes: Vec::with_capacity(256),
+            items: Vec::with_capacity(8),
+            recv_bundles,
             to_pause: Vec::new(),
             starved: false,
             pooled_queued: 0,
@@ -912,6 +972,7 @@ impl Uring {
             queue: VecDeque::new(),
             waker: None,
             armed: false,
+            bundle: false,
             pausing: false,
             orphan: false,
         }))
@@ -940,12 +1001,19 @@ impl Uring {
 
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
         let stream_ring = self.stream_ring();
+        let bundle = matches!(io, MultiIo::Recv { .. })
+            && self.recv_bundles
+            && stream_ring == RingId::Packed;
         let (sqe, ring) = match io {
             MultiIo::Accept { fd } => (
                 opcode::AcceptMulti::new(types::Fd(fd))
                     .flags(libc::SOCK_CLOEXEC)
                     .build(),
                 RingId::Whole,
+            ),
+            MultiIo::Recv { fd } if bundle => (
+                opcode::RecvMultiBundle::new(types::Fd(fd), stream_ring.group()).build(),
+                stream_ring,
             ),
             MultiIo::Recv { fd } => (
                 opcode::RecvMulti::new(types::Fd(fd), stream_ring.group()).build(),
@@ -960,6 +1028,7 @@ impl Uring {
             Some(OpState::Multi(m)) if !m.armed => {
                 m.armed = true;
                 m.ring = ring;
+                m.bundle = bundle;
             }
             _ => panic!("giong: arming an invalid multishot operation"),
         }
@@ -1138,6 +1207,34 @@ impl Uring {
         &self.pool
     }
 
+    /// The ring's descriptor, for other workers to wake this one through
+    /// ([`IoUringFeature::MessageRing`]).
+    pub(crate) fn wake_ring_fd(&self) -> Option<RawFd> {
+        self.message_ring.then(|| self.ring.as_raw_fd())
+    }
+
+    /// Queues an `IORING_OP_MSG_RING` that posts a [`UD_WOKEN`] completion
+    /// into the ring `ring_fd`, which wakes the worker waiting on it. It
+    /// reaches the kernel with the next `park`. `false` without
+    /// [`IoUringFeature::MessageRing`].
+    pub(crate) fn wake_ring(&mut self, ring_fd: RawFd) -> bool {
+        if !self.message_ring || self.closing {
+            return false;
+        }
+        self.push(
+            opcode::MsgRingData::new(types::Fd(ring_fd), 0, UD_WOKEN, None)
+                .build()
+                .user_data(UD_WAKE_SENT),
+        );
+        true
+    }
+
+    /// `true` once after a wake-up sent with [`wake_ring`](Self::wake_ring)
+    /// failed. After a failure this ring stops sending them.
+    pub(crate) fn take_ring_wake_failed(&mut self) -> bool {
+        mem::take(&mut self.ring_wake_failed)
+    }
+
     // ------------------------------------------------------------------ park
 
     /// `true` if completions are waiting to be collected: either already in
@@ -1291,12 +1388,26 @@ impl Uring {
     }
 
     fn dispatch(&mut self, user_data: u64, res: i32, flags: u32) {
+        // Another worker's wake-up: the doorbell already says why, and the
+        // event loop looks at the injector next.
+        if user_data == UD_WOKEN {
+            return;
+        }
         let more = cqueue::more(flags);
         if !more {
             self.inflight = self.inflight.saturating_sub(1);
         }
         match user_data {
             UD_IGNORE => {}
+            UD_WAKE_SENT => {
+                if res < 0 {
+                    // The target cannot be told which worker missed it;
+                    // the event loop wakes them all through their eventfds,
+                    // and this ring sends no more.
+                    self.ring_wake_failed = true;
+                    self.message_ring = false;
+                }
+            }
             UD_WAKE => self.wake_armed = false,
             UD_CLOSE => self.pending_closes -= 1,
             key => {
@@ -1321,25 +1432,44 @@ impl Uring {
                         if !more {
                             m.armed = false;
                         }
-                        // What a receive brought: account for its buffer
+                        // What a receive brought: account for its buffers
                         // first, in the order the kernel posted completions.
-                        let item = match cqueue::buffer_select(flags) {
-                            Some(bid) if m.kind == MultiKind::Recv => {
-                                let more_in_buf = flags & F_BUF_MORE != 0;
-                                match self.pool.received(m.ring, bid, res, more_in_buf) {
-                                    Received::Data { bid, off, len } => Queued::Piece {
+                        // A bundle brings several pieces, anything else one
+                        // item.
+                        let mut items = mem::take(&mut self.items);
+                        items.clear();
+                        let turn = self.turn;
+                        match cqueue::buffer_select(flags) {
+                            Some(bid) if m.kind == MultiKind::Recv && m.bundle && res > 0 => {
+                                self.pool.received_bundle(bid, res, |bid, off, len| {
+                                    items.push(Queued::Piece {
                                         bid,
                                         off,
                                         len,
-                                        turn: self.turn,
-                                    },
-                                    Received::Nothing => Queued::Raw(res),
-                                }
+                                        turn,
+                                    })
+                                });
                             }
-                            _ => Queued::Raw(res),
-                        };
-                        if m.orphan {
-                            Self::release(&self.pool, m.kind, item);
+                            Some(bid) if m.kind == MultiKind::Recv => {
+                                let more_in_buf = flags & F_BUF_MORE != 0;
+                                items.push(
+                                    match self.pool.received(m.ring, bid, res, more_in_buf) {
+                                        Received::Data { bid, off, len } => Queued::Piece {
+                                            bid,
+                                            off,
+                                            len,
+                                            turn,
+                                        },
+                                        Received::Nothing => Queued::Raw(res),
+                                    },
+                                );
+                            }
+                            _ => items.push(Queued::Raw(res)),
+                        }
+                        let remove = if m.orphan {
+                            for item in items.drain(..) {
+                                Self::release(&self.pool, m.kind, item);
+                            }
                             !more
                         } else {
                             let paused = !more && mem::replace(&mut m.pausing, false);
@@ -1350,47 +1480,55 @@ impl Uring {
                                 // and free up buffers after this batch.
                                 self.pool.ran_dry(m.ring);
                                 self.starved = true;
-                                Self::release(&self.pool, m.kind, item);
+                                for item in items.drain(..) {
+                                    Self::release(&self.pool, m.kind, item);
+                                }
                             } else if paused && res == -libc::ECANCELED {
                                 // The cancellation we asked for when pausing.
-                                Self::release(&self.pool, m.kind, item);
+                                for item in items.drain(..) {
+                                    Self::release(&self.pool, m.kind, item);
+                                }
                             } else {
                                 let limit = match m.kind {
                                     MultiKind::Accept => ACCEPT_BACKLOG_LIMIT,
                                     MultiKind::Recv => self.recv_limit,
                                 };
-                                // Behind: the oldest unread piece was already
-                                // there in an earlier turn, so the reader ran
-                                // and did not take it.
-                                let behind = matches!(
-                                    m.queue.front(),
-                                    Some(Queued::Piece { turn, .. }) if *turn != self.turn
-                                );
-                                let pool_low = self.pool.free() * 4 < self.pool.count() as usize;
-                                match item {
-                                    Queued::Piece { bid, off, len, .. }
-                                        if m.queue.len() >= limit && behind && pool_low =>
-                                    {
-                                        // Nobody is keeping up with this stream, and
-                                        // others need buffers: do not let it sit on
-                                        // pool buffers.
-                                        m.queue.push_back(Queued::Heap(
-                                            self.pool.copy_out(bid, off, len),
-                                        ));
-                                        self.pool.release(bid);
-                                        self.recv_copied += u64::from(len);
-                                    }
-                                    item => {
-                                        if let Queued::Piece { .. } = item {
-                                            self.pooled_queued += 1;
+                                let before = m.queue.len();
+                                for item in items.drain(..) {
+                                    // Behind: the oldest unread piece was already
+                                    // there in an earlier turn, so the reader ran
+                                    // and did not take it.
+                                    let behind = matches!(
+                                        m.queue.front(),
+                                        Some(Queued::Piece { turn, .. }) if *turn != self.turn
+                                    );
+                                    let pool_low =
+                                        self.pool.free() * 4 < self.pool.count() as usize;
+                                    match item {
+                                        Queued::Piece { bid, off, len, .. }
+                                            if m.queue.len() >= limit && behind && pool_low =>
+                                        {
+                                            // Nobody is keeping up with this stream, and
+                                            // others need buffers: do not let it sit on
+                                            // pool buffers.
+                                            m.queue.push_back(Queued::Heap(
+                                                self.pool.copy_out(bid, off, len),
+                                            ));
+                                            self.pool.release(bid);
+                                            self.recv_copied += u64::from(len);
                                         }
-                                        m.queue.push_back(item);
+                                        item => {
+                                            if let Queued::Piece { .. } = item {
+                                                self.pooled_queued += 1;
+                                            }
+                                            m.queue.push_back(item);
+                                        }
                                     }
                                 }
                                 // Pause when the backlog reaches the limit — and ask again
                                 // each time it grows by another `limit`, in case an
                                 // earlier cancellation did not take.
-                                if m.armed && m.queue.len() % limit == 0 {
+                                if m.armed && m.queue.len() / limit > before / limit {
                                     m.pausing = true;
                                     self.to_pause.push(key);
                                 }
@@ -1399,7 +1537,9 @@ impl Uring {
                                 waker.wake();
                             }
                             false
-                        }
+                        };
+                        self.items = items;
+                        remove
                     }
                 };
                 if remove {

@@ -154,6 +154,20 @@ pub enum IoUringFeature {
     /// write returns (a `Vec`) are always copied: the kernel reads
     /// zero-copy bytes until the peer has acknowledged them.
     ZeroCopySend,
+    /// A worker wakes another worker that sleeps in the kernel by posting a
+    /// completion straight into that worker's ring (`IORING_OP_MSG_RING`,
+    /// used from Linux 6.3), submitted with the waking worker's next
+    /// `io_uring_enter`, instead of a `write` to the sleeping worker's
+    /// eventfd. Wakes from threads that are not workers still use the
+    /// eventfd.
+    MessageRing,
+    /// A stream receive takes as many packed buffers as the data that
+    /// arrived fills, in one completion (`IORING_RECVSEND_BUNDLE` on the
+    /// packed ring, used from Linux 6.18), instead of one completion and
+    /// one pass through the socket per buffer. Each buffer still reaches
+    /// `recv` as its own [`RecvBuf`](crate::buf::RecvBuf). Needs
+    /// [`PackedBuffers`](Self::PackedBuffers).
+    RecvBundles,
 }
 
 impl IoUringFeature {
@@ -163,6 +177,8 @@ impl IoUringFeature {
         IoUringFeature::PackedBuffers,
         IoUringFeature::RegisteredRing,
         IoUringFeature::ZeroCopySend,
+        IoUringFeature::MessageRing,
+        IoUringFeature::RecvBundles,
     ];
 
     /// A stable short name, such as `"packed-buffers"`.
@@ -171,6 +187,8 @@ impl IoUringFeature {
             IoUringFeature::PackedBuffers => "packed-buffers",
             IoUringFeature::RegisteredRing => "registered-ring",
             IoUringFeature::ZeroCopySend => "zero-copy-send",
+            IoUringFeature::MessageRing => "msg-ring",
+            IoUringFeature::RecvBundles => "recv-bundles",
         }
     }
 }
@@ -751,6 +769,36 @@ impl Driver {
         match self {
             Driver::Uring(d) => d.zero_copy_min(),
             Driver::Epoll(_) => None,
+        }
+    }
+
+    /// The descriptor of the worker's ring, for other workers to wake it
+    /// through ([`IoUringFeature::MessageRing`]); `None` without that.
+    pub(crate) fn wake_ring_fd(&self) -> Option<RawFd> {
+        match self {
+            Driver::Uring(d) => d.wake_ring_fd(),
+            Driver::Epoll(_) => None,
+        }
+    }
+
+    /// Queues a wake-up of the worker whose ring is `ring_fd` (see
+    /// [`wake_ring_fd`](Self::wake_ring_fd)); it goes out with the next
+    /// [`park`](Self::park). `false` where this driver cannot send one: the
+    /// caller then writes the worker's eventfd.
+    pub(crate) fn wake_ring(&mut self, ring_fd: RawFd) -> bool {
+        match self {
+            Driver::Uring(d) => d.wake_ring(ring_fd),
+            Driver::Epoll(_) => false,
+        }
+    }
+
+    /// `true` once if a wake-up sent with [`wake_ring`](Self::wake_ring)
+    /// failed since the last call: the caller must then wake every worker
+    /// through its eventfd, since the driver cannot tell which one missed it.
+    pub(crate) fn take_ring_wake_failed(&mut self) -> bool {
+        match self {
+            Driver::Uring(d) => d.take_ring_wake_failed(),
+            Driver::Epoll(_) => false,
         }
     }
 

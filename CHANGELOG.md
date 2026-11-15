@@ -8,6 +8,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **giong**: two optional io_uring features, listed in `DriverChoice::io_uring_features` and
+  turned off with `GIONG_IO_URING_OFF` like the others: `IoUringFeature::MessageRing`
+  (`msg-ring`, Linux 6.3+) wakes a sleeping worker with `IORING_OP_MSG_RING` from another
+  worker's ring instead of a `write` to its eventfd, and `IoUringFeature::RecvBundles`
+  (`recv-bundles`, Linux 6.18+) lets a stream receive take several packed buffers in one
+  completion. On the same VM, 8 bulk streams into one worker went from 2.7 to 6.6 GiB/s with
+  58% less CPU per GiB, and a cross-worker ping-pong used 4% less CPU per round trip.
+
 ### Changed
 
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the

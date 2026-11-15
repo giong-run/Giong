@@ -287,6 +287,12 @@ struct Ring {
     map: Mapping,
     /// Our private copy of the ring tail (the published copy lives in `map`).
     tail: Cell<u16>,
+    /// Where the kernel takes the next buffer from: the ring's head as the
+    /// kernel keeps it, which it does not show. Every buffer the kernel
+    /// takes out of the ring is named by a completion, in ring order, so
+    /// counting them keeps this in step; the entry here holds the buffer a
+    /// receive bundle starts with (see [`BufPool::received_bundle`]).
+    head: Cell<u16>,
     /// Buffers in the ring: the kernel may write to them.
     published: Cell<usize>,
     /// How many free buffers to keep in the ring. 0 until the ring is first
@@ -311,6 +317,7 @@ impl Ring {
         Ok(Self {
             map: Mapping::new(len)?,
             tail: Cell::new(0),
+            head: Cell::new(0),
             published: Cell::new(0),
             target: Cell::new(0),
             ran_dry: Cell::new(false),
@@ -643,7 +650,87 @@ impl BufPool {
     fn taken(&self, id: RingId, slot: &Slot) {
         let ring = self.ring(id);
         ring.published.set(ring.published.get().saturating_sub(1));
+        ring.head.set(ring.head.get().wrapping_add(1));
         slot.lent_to.set(None);
+    }
+
+    /// The buffer at the head of ring `id`: the next one the kernel takes.
+    fn head_bid(&self, id: RingId) -> u16 {
+        let ring = self.ring(id);
+        let idx = (ring.head.get() & (self.count - 1)) as usize;
+        // SAFETY: `idx < count`, inside the ring allocation. The kernel
+        // writes only `addr` and `len` of a packed ring's entries; `bid` was
+        // written by `push` and stays until the entry is reused, which needs
+        // the buffer back (it is in the ring, so it is not).
+        unsafe {
+            let entry = ring.entries().add(idx).cast::<RawEntry>();
+            ptr::addr_of!((*entry).bid).read_volatile()
+        }
+    }
+
+    /// Accounts for a receive bundle on the packed ring
+    /// ([`IoUringFeature::RecvBundles`](crate::IoUringFeature::RecvBundles)):
+    /// `res` bytes that the kernel put into buffer `bid`, from where the last
+    /// receive left off, then into the buffers after it in ring order, each
+    /// from its start, filling each before the next. Calls `piece` with
+    /// `(bid, off, len)` for each buffer the bytes landed in, in order; each
+    /// is then held by user space as one piece, as from
+    /// [`received`](Self::received).
+    ///
+    /// The layout follows from `res` and what the pool knows: the kernel
+    /// fills a packed ring's buffers in order and moves its head past every
+    /// buffer it filled to the end (`io_kbuf_inc_commit`). The completion's
+    /// `IORING_CQE_F_BUF_MORE` is not used: when the kernel appends a second
+    /// receive to a bundle, it keeps the flags of the first.
+    ///
+    /// Call it for every bundle completion, in the order the kernel posted
+    /// them, as for `received`.
+    pub(crate) fn received_bundle(&self, bid: u16, res: i32, mut piece: impl FnMut(u16, u32, u32)) {
+        let id = RingId::Packed;
+        if res <= 0 {
+            return;
+        }
+        let mut left = res as u32;
+        let mut bid = bid;
+        // The kernel names the buffer at the head of the ring. If it does
+        // not, the pool has lost track of what the kernel holds, and handing
+        // out the next buffers would give readers memory the kernel writes.
+        assert_eq!(
+            self.head_bid(id),
+            bid,
+            "giong: receive bundle does not start at the head of the buffer ring"
+        );
+        loop {
+            let slot = self.slot(bid);
+            assert_eq!(
+                slot.lent_to.get(),
+                Some(id),
+                "giong: receive bundle names a buffer the ring does not hold"
+            );
+            let off = slot.filled.get();
+            let room = self.buf_len as u32 - off;
+            // A buffer filled to the end has left the ring, so `room > 0`.
+            debug_assert!(room > 0);
+            let len = left.min(room);
+            slot.filled.set(off + len);
+            let pieces = slot.pieces.get().checked_add(1);
+            slot.pieces
+                .set(pieces.expect("giong: pieces of a receive buffer overflowed"));
+            left -= len;
+            if len == room {
+                // Filled to the end: the kernel moved on to the next buffer.
+                self.taken(id, slot);
+            }
+            piece(bid, off, len);
+            if left == 0 {
+                return;
+            }
+            assert!(
+                self.ring(id).published.get() > 0,
+                "giong: receive bundle is longer than the buffers in the ring"
+            );
+            bid = self.head_bid(id);
+        }
     }
 
     /// The epoll driver: the buffer to receive into next (the most recently
@@ -877,6 +964,65 @@ mod tests {
             Received::Data { bid, off, len } => (bid, off, len),
             Received::Nothing => panic!("expected data"),
         }
+    }
+
+    fn bundle(pool: &BufPool, bid: u16, res: i32) -> Vec<(u16, u32, u32)> {
+        let mut got = Vec::new();
+        pool.received_bundle(bid, res, |b, o, l| got.push((b, o, l)));
+        got
+    }
+
+    /// A bundle continues where the last receive left off, fills each
+    /// buffer to the end in ring order, and leaves the last one part-filled
+    /// at the head of the ring, as the kernel's `io_kbuf_inc_commit` does.
+    #[test]
+    fn a_receive_bundle_fills_buffers_in_ring_order() {
+        let pool = pool(4, 100);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        // Ring order: 0, 1, 2, 3.
+        assert_eq!(data(pool.received(RingId::Packed, 0, 30, true)), (0, 0, 30));
+        assert_eq!(
+            bundle(&pool, 0, 250),
+            [(0, 30, 70), (1, 0, 100), (2, 0, 80)]
+        );
+        assert_eq!(pool.free(), 2, "0 and 1 were filled to the end");
+        // Ends exactly at the end of a buffer: the kernel moved past it.
+        assert_eq!(bundle(&pool, 2, 20), [(2, 80, 20)]);
+        assert_eq!(pool.free(), 1);
+        // Pieces of 0 come back; 0 returns to the tail of the ring.
+        pool.release(0);
+        pool.release(0);
+        assert_eq!(pool.free(), 2);
+        assert_eq!(bundle(&pool, 3, 150), [(3, 0, 100), (0, 0, 50)]);
+        for bid in [1, 2, 2, 3, 0] {
+            pool.release(bid);
+        }
+        assert_eq!(pool.free(), 4);
+        // An empty or failed receive commits nothing.
+        assert!(bundle(&pool, 0, 0).is_empty());
+        assert!(bundle(&pool, 0, -104).is_empty());
+        assert_eq!(bundle(&pool, 0, 10), [(0, 50, 10)]);
+    }
+
+    /// A bundle that does not start at the head of the ring means the pool
+    /// lost track of the kernel: stop rather than hand out a buffer the
+    /// kernel may be writing.
+    #[test]
+    #[should_panic(expected = "does not start at the head of the buffer ring")]
+    fn a_receive_bundle_out_of_step_with_the_ring_stops() {
+        let pool = pool(4, 100);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        bundle(&pool, 1, 10);
+    }
+
+    /// A bundle longer than the buffers in the ring cannot come from a
+    /// correct kernel.
+    #[test]
+    #[should_panic(expected = "longer than the buffers in the ring")]
+    fn a_receive_bundle_longer_than_the_ring_stops() {
+        let pool = pool(2, 100);
+        assert!(pool.ensure_published(Some(RingId::Packed)));
+        bundle(&pool, 0, 201);
     }
 
     #[test]
