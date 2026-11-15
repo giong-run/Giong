@@ -1,0 +1,68 @@
+name: CI on main
+
+# A push to main. A pull request reaches main through the merge queue, and the
+# queue's CI run (ci.yml, on `merge_group`) tested the very commit that main
+# then moves to: the same tree, the same parent, the same workflow file. The
+# same jobs on that commit once more tell nothing new, and take two runner
+# hours from the pull requests that wait for runners.
+#
+# So this workflow first asks whether a run of ci.yml in the merge queue
+# passed for exactly this commit, and runs the jobs of ci.yml only if none
+# did: a push that went around the queue, a run that cannot be found, or a
+# question that failed. When in doubt, the jobs run.
+#
+# A push that changes ci.yml or this file runs the jobs in any case. That run
+# puts the kernel images of the `kernels` jobs into the cache of main, where
+# every pull request finds them (what a run in the merge queue saves, no other
+# run can read), and it is the run that shows the two files still work
+# together.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  already-tested:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      # The merge queue's run that passed for this commit, or nothing.
+      by: ${{ steps.ask.outputs.by }}
+    steps:
+      - id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          by=
+          # 300 files is all the answer lists: with that many, ci.yml may be
+          # among those it left out.
+          workflows_changed="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" |
+              jq '(.files | length) >= 300 or any(.files[]; .filename == ".github/workflows/ci.yml"
+                  or .filename == ".github/workflows/main.yml")')" || workflows_changed=unknown
+          if [ "$workflows_changed" = false ]; then
+              by="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+                      -f head_sha="$GITHUB_SHA" -f event=merge_group -f status=success |
+                  jq -r --arg sha "$GITHUB_SHA" '[.workflow_runs[] | select(.head_sha == $sha
+                      and .event == "merge_group" and .conclusion == "success")][0].html_url // empty')" || by=
+          fi
+          echo "by=$by" >> "$GITHUB_OUTPUT"
+          if [ -n "$by" ]; then
+              echo "This commit passed every job in the merge queue: $by. The jobs do not run again." >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$workflows_changed" = false ]; then
+              echo "No run in the merge queue passed for this commit: the jobs run." >> "$GITHUB_STEP_SUMMARY"
+          else
+              echo "This push changes the CI workflows (or what it changes could not be read): the jobs run." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # Runs when the job above found no such run, and when it failed.
+  ci:
+    needs: already-tested
+    if: ${{ !cancelled() && needs.already-tested.outputs.by == '' }}
+    uses: ./.github/workflows/ci.yml

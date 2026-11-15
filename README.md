@@ -8,7 +8,7 @@
 <p align="center"><b>A thread-per-core async runtime for Linux, built on io_uring, with an epoll driver wherever io_uring is blocked.</b></p>
 
 <p align="center">
-  <a href="https://github.com/giong-run/Giong/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/giong-run/Giong/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/giong-run/Giong/actions/workflows/main.yml"><img alt="CI" src="https://github.com/giong-run/Giong/actions/workflows/main.yml/badge.svg"></a>
   <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
   <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-informational">
 </p>
