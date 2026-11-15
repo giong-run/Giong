@@ -4,8 +4,8 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI agent look insi
 
 ```toml
 [dependencies]
-giong = "0.6"
-giong-mcp = "0.6"
+giong = "0.7"
+giong-mcp = "0.7"
 ```
 
 ```rust

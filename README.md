@@ -17,7 +17,7 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 0.6.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
+> **Status: 0.7.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server and client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
@@ -58,7 +58,7 @@ load arrives.
   under gVisor or on a kernel older than 6.0, a worker switches to an epoll driver by
   itself: same API, same tests, and as fast as raw Tokio there. See
   [Two drivers](#two-drivers-io_uring-and-epoll).
-- **Small enough to read.** About 11,100 lines of code for the runtime, both drivers
+- **Small enough to read.** About 11,300 lines of code for the runtime, both drivers
   included, three dependencies, and a comment on every `unsafe` block.
 
 What it is **not**: faster than everything at everything. On the classic 50-connection
@@ -811,7 +811,7 @@ request with callgrind instead, which repeats within 0.1%.
 
 ## Testing and safety
 
-1,051 tests across the nine crates and the example API (`cargo test --workspace
+1,062 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
 database clients, giong-web, giong-mcp, giong-compat and the example API describe theirs
@@ -821,9 +821,9 @@ in their READMEs.
 |---|---|
 | `tests/executor.rs` (16) | spawn and join, panics, abort, teardown, runtimes run back to back; I/O completes while another task keeps yielding; giong called outside a runtime, or `block_on` inside one, panics with its code |
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
-| `tests/net.rs` (24) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound) |
+| `tests/net.rs` (27) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
-| `tests/udp.rs` (19) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram |
+| `tests/udp.rs` (22) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
 | `tests/fs.rs` (25) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll), one stuck operation not holding up the others, offsets above `i64::MAX` and open options that cannot work refused with their codes, a pipe on standard input left blocking |
 | `tests/cancel.rs` (17) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; a dropped `send_file` leaves nothing behind; **a dropped open closes the descriptor it produced**; a stream or operation dropped by code the driver runs is still closed and cancelled; connections accepted for a listener that outlives its runtime are closed; teardown with everything in flight |
 | `tests/multi.rs` (16) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM (also after worker 0 returned), work sent to a stopped runtime cancelled, a panicking worker |
@@ -831,8 +831,8 @@ in their READMEs.
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
 | `tests/driver.rs` (9), `tests/blocked.rs` (4) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; with the locked-memory limit used up, the same with GIONG-E0010; the optional io_uring features found are the kernel's; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (10) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time, which counts a sleep in progress and never goes down; poll profiles by spawn location; sources reported until dropped |
-| `giong-http` (205) | HTTP/1.1: 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 24 end-to-end server tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 of bodies streamed both ways; 12 over HTTPS with a rustls client. HTTP/2: 41 unit tests of the server's streams, flow control, memory budgets, HPACK and frames; 15 client tests against the server and against servers that misbehave on purpose (refused and reset streams, overdrawn windows, malformed responses, over kernel TLS). 8 fuzz-style tests: 500,000 random inputs for the parser and the chunked decoder, HPACK header blocks, HTTP/2 connections from each side, compressed bodies, response heads and 100,000 responses read by the client in random pieces; 54 other unit tests; 15 documentation examples |
-| `giong-tls` (75) | 14 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two and three tasks sending on one connection with every write arriving whole, **a TLS 1.2 write past the record limit failing instead of vanishing**, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 31 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, a peer that cuts its records to 32 bytes, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
+| `giong-http` (206) | HTTP/1.1: 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 24 end-to-end server tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 of bodies streamed both ways; 12 over HTTPS with a rustls client. HTTP/2: 41 unit tests of the server's streams, flow control, memory budgets, HPACK and frames; 15 client tests against the server and against servers that misbehave on purpose (refused and reset streams, overdrawn windows, malformed responses, over kernel TLS). 8 fuzz-style tests: 500,000 random inputs for the parser and the chunked decoder, HPACK header blocks, HTTP/2 connections from each side, compressed bodies, response heads and 100,000 responses read by the client in random pieces; 55 other unit tests; 15 documentation examples |
+| `giong-tls` (76) | 15 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two and three tasks sending on one connection with every write arriving whole, **a TLS 1.2 write past the record limit failing instead of vanishing**, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 31 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, a peer that cuts its records to 32 bytes, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
@@ -909,7 +909,7 @@ Not verified, and you should know it:
 
 ## Compared with Monoio and Glommio
 
-| | giong 0.6 | Monoio 0.2.4 | Glommio 0.9.0 |
+| | giong 0.7 | Monoio 0.2.4 | Glommio 0.9.0 |
 |---|---|---|---|
 | Platforms | Linux: io_uring on ≥ 6.0, an epoll driver elsewhere | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
 | Receiving | multishot, kernel-provided buffers | one submission per read, caller's buffer | direct `recv`, io_uring to wait |
@@ -922,7 +922,7 @@ Not verified, and you should know it:
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
 | Ecosystem | its own HTTP/1.1 and HTTP/2 server and client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
-| Size | ~15,900 lines, plus ~22,900 for HTTP and TLS and ~22,900 for the database clients | ~25,000 lines | ~40,500 lines |
+| Size | ~16,400 lines, plus ~23,000 for HTTP and TLS and ~22,900 for the database clients | ~25,000 lines | ~40,500 lines |
 
 Monoio is the mature choice and runs in production at ByteDance; if you need
 Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and

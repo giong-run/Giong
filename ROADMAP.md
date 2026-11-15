@@ -287,17 +287,35 @@ The reviewers were the project's AI agents. A review by an outside person is sti
 
 **Exit criteria:** no open finding rated critical or high. Met.
 
+## 0.7 — API settled (done)
+
+The second gate on the way to 1.0: the API that 1.0 keeps, decided item by item, with the
+breaking changes made now rather than after 1.0.
+
+- [x] Every public item weighed against the [Agent-first](#agent-first) principles, with
+      the items the 0.6 reviews and the [portability check](docs/reviews/2026-11-api-portability.md)
+      left for it: each one changed, kept on purpose, or left for 1.x as an addition, with
+      its reason ([decisions](docs/reviews/2026-11-api-freeze.md)).
+- [x] A service built by an AI agent from the 0.6.0 documentation alone. The gaps it found
+      in the documentation are filled, and the API changes it called for are among the
+      decisions.
+- [x] The breaking changes made, in the 0.7.0 [changelog](CHANGELOG.md), each with how to
+      migrate.
+
+**Exit criteria:** no item left for the freeze undecided. Met. The freeze is declared once
+real use in a service has reported back, which may still add items before 1.0.0-rc.1.
+
 ## 1.0
 
 A stable API. No features are added between 0.6 and 1.0; what is left is a series of
 gates, and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass them all.
 
 - [x] A review of every crate, the `unsafe` code and security (0.6).
-- [ ] Real use: giong in a production service, with its user reporting back, and a service
-      built by an AI agent from the documentation alone.
-- [ ] The API freeze: every public item reviewed against the [Agent-first](#agent-first)
-      principles, with the items the 0.6 reviews left for it, and `cargo-semver-checks`
-      in CI.
+- [x] The API settled: every public item reviewed against the [Agent-first](#agent-first)
+      principles, with the items the 0.6 reviews left for it, and a service built by an AI
+      agent from the documentation alone (0.7).
+- [ ] `cargo-semver-checks` in CI, checking every change against 0.7.0.
+- [ ] Real use: giong in a production service, with its user reporting back.
 - [ ] Documentation: every public item documented, and the limitations section of the
       README reduced to deliberate non-goals.
 - [ ] Verification as the release gate: a 72-hour soak, fuzzing, fault injection, speed

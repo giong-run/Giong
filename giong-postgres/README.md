@@ -4,8 +4,8 @@ A PostgreSQL client and connection pool for the [giong](../README.md) runtime. I
 
 ```toml
 [dependencies]
-giong = "0.6"
-giong-postgres = "0.6"
+giong = "0.7"
+giong-postgres = "0.7"
 ```
 
 ```rust

@@ -466,12 +466,63 @@ Merging this pull request tags `v{new}` and runs the release: crates.io (Trusted
 
 
 # ------------------------------------------------------------------ notes
+def github_list(generated):
+    """GitHub's generated list, with headings at the level of the notes' own sections.
+
+    GitHub writes "## What's Changed", the categories of .github/release.yml as "### "
+    headings under it, then "## New Contributors". Every category already names what it
+    lists, so the "What's Changed" line goes and the categories become "## " sections
+    beside "## Install" and "## Contributors" (0.6.0's notes showed "### What's Changed"
+    right on top of "### Pull requests").
+    """
+    out, in_changes = [], False
+    for line in generated.splitlines():
+        if re.match(r"^## What's Changed\s*$", line):
+            in_changes = True
+            continue
+        if line.startswith("## "):
+            in_changes = False
+        elif in_changes and line.startswith("### "):
+            line = line[1:]
+        out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def unwrap(text):
+    """Join the lines of each paragraph and list item into one.
+
+    CHANGELOG.md is wrapped at 90 columns, but a GitHub Release keeps every line break
+    (0.6.0's notes showed each wrapped line as a line of its own). Code blocks, headings,
+    tables and quotes are left as they are.
+    """
+    block = re.compile(r"^(#|\||>|```|[-*+] |\d+[.)] )")
+    out, fence = [], False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("```"):
+            fence = not fence
+            out.append(line)
+            continue
+        prev = out[-1].strip() if out else ""
+        if (not fence and s and prev and not block.match(s)
+                and not prev.startswith(("#", "|", ">", "```"))):
+            out[-1] = out[-1].rstrip() + " " + s
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def cmd_notes(args):
     version = args.version
     section = changelog_section(read(CHANGELOG), version)
     if section is None:
         fail(f"{CHANGELOG} has no '## [{version}]' section")
     section = re.sub(r"<!--.*?-->\s*", "", section, flags=re.S).strip()
+    # A link relative to the repository root works in CHANGELOG.md and on the site, but on
+    # the Release page it would resolve against /releases/tag/; point it at the tag.
+    section = re.sub(r"\]\((?![a-z][a-z0-9+.-]*:|#|/)([^)\s]+)\)",
+                     lambda m: f"]({REPO_URL}/blob/v{version}/{m.group(1)})", section)
+    section = unwrap(section)
     generated = Path(args.github_notes).read_text(encoding="utf-8").strip() if args.github_notes else ""
 
     # A handle is thanked only where prose names it: `@@server_uuid` in a code span is
@@ -494,8 +545,7 @@ def cmd_notes(args):
         joined = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
         parts.append(f"## Contributors\n\nThank you to {joined} for contributing to this release.")
     if generated:
-        # GitHub's own headings sit one level below ours.
-        parts.append(re.sub(r"^## ", "### ", generated, flags=re.M))
+        parts.append(github_list(generated))
     else:
         parts.append(f"**Full changelog**: {REPO_URL}/blob/v{version}/CHANGELOG.md")
     print("\n\n".join(parts))
