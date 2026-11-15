@@ -24,11 +24,16 @@
 //!
 //! ## When to use it, and when not
 //!
-//! **Use the native crate when there is one.** giong-http (HTTP/1.1 and
+//! **Use the giong crate when there is one.** giong-http (HTTP/1.1 and
 //! HTTP/2, server and client), giong-web, giong-tls, giong-postgres,
 //! giong-mysql and giong-redis are built on giong's owned buffers and
-//! batching and are faster than the same protocol through this adapter.
-//! `Compat` is the bridge for protocols giong has no crate for yet.
+//! batched system calls; measured against the Tokio crates they replace on
+//! Tokio, they serve 1.2 to 4.7 times the requests or statements per core
+//! on the workloads measured (the "Choosing crates" table in giong's
+//! README). A Tokio crate run through `Compat` keeps its own design and
+//! adds a copy per byte written, and per byte read through `AsyncRead`
+//! ("What it costs" in this crate's README). `Compat` is the bridge for
+//! protocols giong has no crate for yet.
 //!
 //! **It works for crates that take the stream from you and are driven by
 //! you:** a function such as `tokio_rustls::TlsConnector::connect(name,
