@@ -506,6 +506,10 @@ fn is_open(inode: &str) -> bool {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "finds sockets by inode in /proc/self/fd"
+)]
 fn dropping_a_socket_closes_it() {
     giong::block_on(async {
         // Never received on, received on with `read_from`, and with an armed

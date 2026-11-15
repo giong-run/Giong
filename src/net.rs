@@ -411,7 +411,7 @@ impl StreamSocket {
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             msg: msg.as_ptr(),
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: hold.is_some(),
         };
         // The header, the iovec array (on the heap) and the buffers all stay
@@ -513,7 +513,7 @@ impl StreamSocket {
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             msg: msg.as_ptr(),
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
         // The header, the iovec and both buffers stay where they are until the
@@ -552,12 +552,11 @@ impl StreamSocket {
         let (mut offset, mut left) = (offset, len);
         let mut since_yield = 0;
         while left > 0 {
-            let mut off = offset as libc::off_t;
             let count = left.min(SENDFILE_MAX) as usize;
-            // SAFETY: plain system call on descriptors the caller keeps open;
-            // `off` is a valid `off_t` the kernel reads and advances. The
-            // socket is non-blocking, so the call never waits.
-            let n = unsafe { libc::sendfile64(fd, file, &mut off, count) };
+            // The socket is non-blocking, so the call never waits; `offset`
+            // moves past what was sent.
+            let mut moved = offset;
+            let n = crate::sys::sendfile(fd, file, &mut moved, count);
             match n {
                 n if n > 0 => {
                     let n = n as u64;
@@ -623,7 +622,7 @@ impl StreamSocket {
             fd: self.sock.as_raw_fd(),
             buf: ptr,
             len,
-            flags: libc::MSG_NOSIGNAL,
+            flags: crate::sys::MSG_NOSIGNAL,
             zero_copy: hold.is_some(),
         };
         // The hold moves into the send, and a zero-copy send the socket

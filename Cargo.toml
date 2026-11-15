@@ -17,15 +17,17 @@ members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "gio
 exclude = ["bench"]
 
 [dependencies]
-io-uring = "0.7"
 libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
 
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.
 # `fuzzing` is set by cargo fuzz for the targets in fuzz/.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(loom)', 'cfg(fuzzing)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(giong_libkqueue)', 'cfg(loom)', 'cfg(fuzzing)'] }
 
 [profile.release]
 opt-level = 3

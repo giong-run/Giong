@@ -142,6 +142,8 @@ fn dropping_an_in_flight_write_keeps_its_buffer_alive() {
     });
 }
 
+// The control message is Linux's SO_TIMESTAMPING.
+#[cfg(target_os = "linux")]
 #[test]
 fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
     giong::block_on(async {
@@ -521,11 +523,36 @@ fn a_completed_but_uncollected_operation_releases_its_buffer() {
 
 /// How many descriptors of this process refer to `path`. (Counting all
 /// descriptors would see those of tests running in parallel.)
+#[cfg(target_os = "linux")]
 fn open_fds(path: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
         .filter(|target| target == path)
+        .count()
+}
+
+/// How many descriptors of this process refer to `path`. macOS has no
+/// `/proc`: the descriptors are listed in `/dev/fd` and `F_GETPATH` names
+/// their file, with symbolic links resolved (`/var` is `/private/var`).
+#[cfg(target_os = "macos")]
+fn open_fds(path: &std::path::Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.into_iter()
+        .filter(|&fd| {
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+                return false;
+            }
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            std::ffi::OsStr::from_bytes(&buf[..len]) == path.as_os_str()
+        })
         .count()
 }
 

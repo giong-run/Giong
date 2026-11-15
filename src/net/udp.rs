@@ -410,7 +410,7 @@ impl UdpSocket {
             // SAFETY: `msg` owns a live `Message`; the field pointer is taken
             // without making a reference.
             msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
         // SAFETY: the header is in a `KernelBox` and points at its own fields
@@ -431,7 +431,7 @@ impl UdpSocket {
             fd: self.sock.as_raw_fd(),
             buf: buf.as_ptr(),
             len,
-            flags: libc::MSG_NOSIGNAL,
+            flags: crate::sys::MSG_NOSIGNAL,
             zero_copy: false,
         };
         // SAFETY: an `IoBuf`'s bytes stay put when it moves.

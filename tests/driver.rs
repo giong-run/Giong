@@ -11,6 +11,12 @@ use giong::error::{self, Code};
 use giong::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
 use giong::{ChosenBy, DriverKind, IoUringFeature};
 
+/// The readiness driver of this platform: epoll on Linux, kqueue on macOS.
+#[cfg(target_os = "linux")]
+const READINESS: DriverKind = DriverKind::Epoll;
+#[cfg(not(target_os = "linux"))]
+const READINESS: DriverKind = DriverKind::Kqueue;
+
 /// `true` if io_uring works here (it is blocked, for instance, under
 /// `scripts/no-io-uring.py` or in a container). Where CI says it must work
 /// (`GIONG_TEST_EXPECT_DRIVER=io_uring`), not working is a failure instead
@@ -31,7 +37,7 @@ fn io_uring_available() -> bool {
 
 #[test]
 fn a_named_driver_is_the_one_every_worker_gets() {
-    let mut kinds = vec![DriverKind::Epoll];
+    let mut kinds = vec![READINESS];
     if io_uring_available() {
         kinds.push(DriverKind::IoUring);
     }
@@ -57,6 +63,7 @@ fn a_named_driver_is_the_one_every_worker_gets() {
 fn driver_names_are_what_giong_driver_accepts() {
     assert_eq!(DriverKind::IoUring.name(), "io_uring");
     assert_eq!(DriverKind::Epoll.to_string(), "epoll");
+    assert_eq!(DriverKind::Kqueue.to_string(), "kqueue");
 }
 
 const CHILD: &str = "GIONG_TEST_DRIVER_CHILD";
@@ -88,19 +95,20 @@ fn giong_driver_chooses_when_the_builder_does_not() {
         println!("got: {got}");
         // A driver named in code wins over the variable.
         let named = giong::Builder::new()
-            .driver(DriverKind::Epoll)
+            .driver(READINESS)
             .block_on(async { giong::driver_kind() })
             .unwrap();
         println!("named: {named}");
         return;
     }
-    let out = child_with_env("giong_driver_chooses_when_the_builder_does_not", "epoll");
-    assert!(out.contains("got: epoll"), "{out}");
-    assert!(out.contains("named: epoll"), "{out}");
+    let r = READINESS.name();
+    let out = child_with_env("giong_driver_chooses_when_the_builder_does_not", r);
+    assert!(out.contains(&format!("got: {r}")), "{out}");
+    assert!(out.contains(&format!("named: {r}")), "{out}");
     if io_uring_available() {
         let out = child_with_env("giong_driver_chooses_when_the_builder_does_not", "io_uring");
         assert!(out.contains("got: io_uring"), "{out}");
-        assert!(out.contains("named: epoll"), "{out}");
+        assert!(out.contains(&format!("named: {r}")), "{out}");
     }
 }
 
@@ -117,7 +125,7 @@ fn an_unknown_giong_driver_is_an_error() {
         println!("block_on: {err}");
         return;
     }
-    let out = child_with_env("an_unknown_giong_driver_is_an_error", "kqueue");
+    let out = child_with_env("an_unknown_giong_driver_is_an_error", "devpoll");
     assert!(out.contains("code: Some(InvalidConfig)"), "{out}");
     for call in ["build", "block_on"] {
         let line = out
@@ -125,7 +133,7 @@ fn an_unknown_giong_driver_is_an_error() {
             .find(|l| l.starts_with(&format!("{call}: ")))
             .unwrap_or_else(|| panic!("no {call} line in {out}"));
         assert!(line.contains("GIONG-E0004"), "{line}");
-        assert!(line.contains("\"kqueue\""), "{line}");
+        assert!(line.contains("\"devpoll\""), "{line}");
         assert!(line.contains("io_uring or epoll"), "{line}");
     }
     let _ = Code::InvalidConfig;
@@ -135,7 +143,7 @@ fn an_unknown_giong_driver_is_an_error() {
 /// must still let the other tasks on the worker run.
 #[test]
 fn a_task_whose_io_never_waits_still_lets_others_run() {
-    for kind in [DriverKind::Epoll, DriverKind::IoUring] {
+    for kind in [READINESS, DriverKind::IoUring] {
         if kind == DriverKind::IoUring && !io_uring_available() {
             continue;
         }
@@ -224,17 +232,18 @@ fn driver_choice_says_who_chose() {
         return;
     }
     let named = giong::Builder::new()
-        .driver(DriverKind::Epoll)
+        .driver(READINESS)
         .block_on(async { giong::driver_choice() })
         .unwrap();
-    assert_eq!(named.kind, DriverKind::Epoll);
+    assert_eq!(named.kind, READINESS);
     assert_eq!(named.chosen_by, ChosenBy::Builder);
     assert_eq!(named.io_uring_error, None);
-    assert_eq!(named.to_string(), "epoll (named by Builder::driver)");
+    let r = READINESS.name();
+    assert_eq!(named.to_string(), format!("{r} (named by Builder::driver)"));
 
-    let out = child_with_env("driver_choice_says_who_chose", "epoll");
+    let out = child_with_env("driver_choice_says_who_chose", r);
     assert!(out.contains("chosen by: Environment"), "{out}");
-    assert!(out.contains("kind: epoll"), "{out}");
+    assert!(out.contains(&format!("kind: {r}")), "{out}");
 
     if io_uring_available() && std::env::var_os("GIONG_DRIVER").is_none() {
         let rt = giong::Builder::new().workers(2).build().unwrap();
@@ -307,7 +316,7 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
     // A connect that fails gives its descriptor number back, and the next
     // socket usually gets the same number. The epoll driver once kept the
     // old registration on record, so the new socket was never woken.
-    let mut kinds = vec![DriverKind::Epoll];
+    let mut kinds = vec![READINESS];
     if io_uring_available() {
         kinds.push(DriverKind::IoUring);
     }
@@ -411,7 +420,7 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         return;
     }
     let epoll = giong::Builder::new()
-        .driver(DriverKind::Epoll)
+        .driver(READINESS)
         .block_on(async { giong::driver_choice() })
         .unwrap();
     assert!(epoll.io_uring_features.is_empty());

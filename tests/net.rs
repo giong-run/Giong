@@ -269,6 +269,7 @@ fn read_and_recv_cannot_be_mixed() {
 
 /// One control message: `level`, `kind`, then `data`, laid out the way
 /// `CMSG_SPACE` says.
+#[cfg(target_os = "linux")]
 fn control_message(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
     // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
     let (space, len) = unsafe {
@@ -288,6 +289,8 @@ fn control_message(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
     buf
 }
 
+// Linux cmsghdr layout and SO_TIMESTAMPING.
+#[cfg(target_os = "linux")]
 #[test]
 fn send_with_control_hands_the_control_message_to_the_kernel() {
     giong::block_on(async {

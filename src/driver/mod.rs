@@ -1,4 +1,5 @@
-//! The I/O drivers: io_uring, and epoll where io_uring cannot be used.
+//! The I/O drivers: io_uring, and epoll where io_uring cannot be used, on
+//! Linux; kqueue on macOS.
 //!
 //! Callers describe an operation with [`Io`] (or [`MultiIo`] for the
 //! multishot ones) and never see which driver runs it:
@@ -6,10 +7,11 @@
 //! * [`uring`] submits it to the worker's io_uring and the kernel completes
 //!   it. Everything a tick produces reaches the kernel in one
 //!   `io_uring_enter`.
-//! * [`epoll`] tries the system call at once, without blocking. If the
-//!   descriptor is not ready it waits for readiness through epoll and tries
-//!   again. File operations, for which a regular file is never "ready", run
-//!   on a small pool of blocking threads ([`blocking`]).
+//! * [`readiness`] tries the system call at once, without blocking. If the
+//!   descriptor is not ready it waits for readiness through epoll (Linux)
+//!   or kqueue (macOS) and tries again. File operations, for which a regular
+//!   file is never "ready", run on a small pool of blocking threads
+//!   ([`blocking`]).
 //!
 //! Both keep the same contract towards [`Op`](crate::op::Op): the memory an
 //! operation points at stays with the driver until the operation can no
@@ -21,7 +23,12 @@
 //! the socket code above has a single path.
 
 mod blocking;
+#[cfg(target_os = "linux")]
 mod epoll;
+#[cfg(any(target_os = "macos", giong_libkqueue))]
+mod kqueue;
+mod readiness;
+#[cfg(target_os = "linux")]
 mod uring;
 
 use std::any::Any;
@@ -29,6 +36,7 @@ use std::cell::Cell;
 use std::io;
 use std::os::fd::RawFd;
 use std::rc::Rc;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Poll, Waker};
 use std::time::Duration;
@@ -36,7 +44,7 @@ use std::time::Duration;
 use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 
-pub(crate) use epoll::refill_budget;
+pub(crate) use readiness::refill_budget;
 
 /// Which I/O driver a worker uses: io_uring, the default, or epoll where
 /// io_uring is not available (see [`Builder::driver`](crate::Builder::driver)).
@@ -52,14 +60,20 @@ pub enum DriverKind {
     /// kernel older than 6.0. File operations run on a pool of blocking
     /// threads. Every API behaves the same; it costs more system calls.
     Epoll,
+    /// Readiness-based I/O through one kqueue per worker: the driver on
+    /// macOS, which is supported for development, not for speed. It is the
+    /// epoll driver's logic over kqueue; file operations run on a pool of
+    /// blocking threads.
+    Kqueue,
 }
 
 impl DriverKind {
-    /// `"io_uring"` or `"epoll"`, as accepted by `GIONG_DRIVER`.
+    /// `"io_uring"`, `"epoll"` or `"kqueue"`, as accepted by `GIONG_DRIVER`.
     pub const fn name(self) -> &'static str {
         match self {
             DriverKind::IoUring => "io_uring",
             DriverKind::Epoll => "epoll",
+            DriverKind::Kqueue => "kqueue",
         }
     }
 }
@@ -184,6 +198,7 @@ impl std::fmt::Display for IoUringFeature {
 /// `false` if `GIONG_IO_URING_OFF` turns `feature` off. A test and benchmark
 /// hook, like `GIONG_RING_TIER`: a comma-separated list of feature names
 /// ([`IoUringFeature::name`]), or `all`. Unknown names are ignored.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // io_uring only
 pub(crate) fn feature_enabled(feature: IoUringFeature) -> bool {
     match std::env::var("GIONG_IO_URING_OFF") {
         Err(_) => true,
@@ -198,9 +213,11 @@ pub(crate) fn feature_enabled(feature: IoUringFeature) -> bool {
 /// [`IoUringFeature::ZeroCopySend`] is in use. Below it, copying the data is
 /// cheaper than pinning its pages and waiting for the kernel to let go of
 /// them. `GIONG_ZERO_COPY_MIN` (bytes) changes it for benchmarks.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // io_uring only
 const ZERO_COPY_MIN: usize = 16 * 1024;
 
 /// [`ZERO_COPY_MIN`], or `GIONG_ZERO_COPY_MIN` where it is set.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // io_uring only
 pub(crate) fn zero_copy_min() -> usize {
     std::env::var("GIONG_ZERO_COPY_MIN")
         .ok()
@@ -223,6 +240,7 @@ pub(crate) struct ZeroCopyHold {
 /// Set by the io_uring driver in the flags of a zero-copy send whose data
 /// the kernel copied after all (`IORING_NOTIF_USAGE_ZC_COPIED`). Bit 31 of a
 /// CQE's flags is part of the buffer id, which sends never have.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // io_uring only
 pub(crate) const ZC_COPIED: u32 = 1 << 31;
 
 /// Which I/O driver a worker runs on, who chose it, and why io_uring is not
@@ -328,6 +346,7 @@ const BUFFER_SHIFT: u32 = 16;
 
 /// The packed buffer ring keeps the rest of the buffer this completion
 /// names for the next receive (`IORING_CQE_F_BUF_MORE`, Linux 6.12).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // io_uring only
 const F_BUF_MORE: u32 = 1 << 4;
 
 /// The pool buffer a receive completion names, if any.
@@ -400,13 +419,13 @@ pub(crate) enum Io {
     },
     /// `close(2)`, reporting its result.
     Close { fd: RawFd },
-    /// `statx(2)`.
+    /// `statx(2)` on Linux, `fstatat(2)` elsewhere (see `sys::stat_at`).
     Statx {
         dir: RawFd,
         path: *const libc::c_char,
         flags: i32,
         mask: u32,
-        out: *mut libc::statx,
+        out: *mut crate::sys::StatBuf,
     },
     /// `fsync(2)`, or `fdatasync(2)` when `datasync`.
     Fsync { fd: RawFd, datasync: bool },
@@ -491,6 +510,7 @@ impl Io {
 #[track_caller]
 pub(crate) fn event_loop_failed(call: &str, err: io::Error) -> ! {
     let fix = match err.raw_os_error() {
+        #[cfg(target_os = "linux")]
         Some(libc::EBADR) => {
             "the kernel dropped completions because it could not allocate memory for them \
              (EBADR): the machine ran out of memory. Give the process more memory, or run \
@@ -531,8 +551,48 @@ pub(crate) enum MultiIo {
 // would only add an indirection to every operation.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Driver {
+    #[cfg(target_os = "linux")]
     Uring(uring::Uring),
-    Epoll(epoll::Epoll),
+    #[cfg(target_os = "linux")]
+    Epoll(readiness::Readiness<epoll::Epoll>),
+    #[cfg(any(target_os = "macos", giong_libkqueue))]
+    Kqueue(readiness::Readiness<kqueue::Kqueue>),
+}
+
+/// Expands to a `match` on a [`Driver`] that runs the same expression for
+/// every variant, binding the driver to `$d`.
+macro_rules! each {
+    ($self:expr, $d:ident => $body:expr) => {
+        match $self {
+            #[cfg(target_os = "linux")]
+            Driver::Uring($d) => $body,
+            #[cfg(target_os = "linux")]
+            Driver::Epoll($d) => $body,
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue($d) => $body,
+        }
+    };
+}
+
+/// Like [`each`], but the io_uring driver runs `$uring` and the readiness
+/// drivers run `$ready`.
+macro_rules! split {
+    ($self:expr, $d:ident => $uring:expr, $ready:expr) => {
+        match $self {
+            #[cfg(target_os = "linux")]
+            Driver::Uring($d) => $uring,
+            #[cfg(target_os = "linux")]
+            Driver::Epoll($d) => {
+                let _ = &$d;
+                $ready
+            }
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue($d) => {
+                let _ = &$d;
+                $ready
+            }
+        }
+    };
 }
 
 /// `GIONG_DRIVER` when the builder did not choose: `None` if unset or
@@ -544,16 +604,19 @@ pub(crate) fn kind_from_env() -> io::Result<Option<DriverKind>> {
             "" | "auto" => Ok(None),
             "io_uring" | "io-uring" | "uring" => Ok(Some(DriverKind::IoUring)),
             "epoll" => Ok(Some(DriverKind::Epoll)),
+            "kqueue" => Ok(Some(DriverKind::Kqueue)),
             other => Err(crate::error::raise(
                 Code::InvalidConfig,
                 format!("GIONG_DRIVER is {other:?}, which is not a driver"),
-                "set GIONG_DRIVER to io_uring or epoll, or unset it to use io_uring where the \
-                 kernel allows it and epoll elsewhere.",
+                "set GIONG_DRIVER to io_uring or epoll (Linux) or kqueue (macOS), or unset it \
+                 to use io_uring where the kernel allows it, epoll elsewhere on Linux, and \
+                 kqueue on macOS.",
             )),
         },
     }
 }
 
+#[cfg(target_os = "linux")]
 /// `true` if an io_uring setup error means "io_uring cannot be used here",
 /// rather than a mistake in the configuration: the automatic choice then
 /// falls back to epoll. That includes a used-up locked-memory limit, which
@@ -574,6 +637,7 @@ fn io_uring_unusable(e: &io::Error) -> bool {
     )
 }
 
+#[cfg(target_os = "linux")]
 /// Says once per process, on stderr, that giong fell back to epoll and why:
 /// the fallback costs speed, and nobody would know otherwise. Naming a
 /// driver takes the choice away from giong, and the line with it.
@@ -588,9 +652,20 @@ fn report_fallback(e: &io::Error) {
     }
 }
 
+/// The error for a driver this operating system does not have.
+fn unsupported(kind: DriverKind) -> io::Error {
+    crate::error::raise(
+        Code::InvalidConfig,
+        format!("the {kind} driver does not exist on this operating system"),
+        "name io_uring or epoll on Linux and kqueue on macOS (Builder::driver or \
+         GIONG_DRIVER), or name none to let giong choose.",
+    )
+}
+
 impl Driver {
-    /// Sets up the driver `choice` names, or io_uring with epoll as the
-    /// fallback when it is `None`. `chosen_by` says where `choice` came from.
+    /// Sets up the driver `choice` names, or the platform's best when it is
+    /// `None`: io_uring with epoll as the fallback on Linux, kqueue on
+    /// macOS. `chosen_by` says where `choice` came from.
     pub(crate) fn new(
         choice: Option<DriverKind>,
         chosen_by: ChosenBy,
@@ -598,52 +673,59 @@ impl Driver {
         pool: Rc<BufPool>,
         wake_fd: RawFd,
     ) -> io::Result<(Self, DriverChoice)> {
-        let mut io_uring_error = None;
+        let _ = entries;
+        #[allow(unused_mut)]
+        let mut io_uring_error: Option<io::Error> = None;
         let driver = match choice {
+            #[cfg(target_os = "linux")]
             Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool, wake_fd)?),
-            Some(DriverKind::Epoll) => Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?),
+            #[cfg(target_os = "linux")]
+            Some(DriverKind::Epoll) => Driver::Epoll(readiness::Readiness::new(pool, wake_fd)?),
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Some(DriverKind::Kqueue) => Driver::Kqueue(readiness::Readiness::new(pool, wake_fd)?),
+            // Reachable for the drivers this build does not have.
+            #[allow(unreachable_patterns)]
+            Some(other) => return Err(unsupported(other)),
+            #[cfg(target_os = "linux")]
             None => match uring::Uring::new(entries, pool.clone(), wake_fd) {
                 Ok(ring) => Driver::Uring(ring),
                 Err(e) if io_uring_unusable(&e) => {
-                    let driver = Driver::Epoll(epoll::Epoll::new(pool, wake_fd)?);
+                    let driver = Driver::Epoll(readiness::Readiness::new(pool, wake_fd)?);
                     report_fallback(&e);
                     io_uring_error = Some(e);
                     driver
                 }
                 Err(e) => return Err(e),
             },
+            #[cfg(target_os = "macos")]
+            None => Driver::Kqueue(readiness::Readiness::new(pool, wake_fd)?),
         };
         let choice = DriverChoice {
             kind: driver.kind(),
             chosen_by,
             io_uring_error_code: io_uring_error.as_ref().and_then(crate::error::code),
             io_uring_error: io_uring_error.map(|e| e.to_string()),
-            kernel_workarounds: match &driver {
-                Driver::Uring(d) => d.workarounds().to_vec(),
-                Driver::Epoll(_) => Vec::new(),
-            },
-            io_uring_features: match &driver {
-                Driver::Uring(d) => d.features().to_vec(),
-                Driver::Epoll(_) => Vec::new(),
-            },
+            kernel_workarounds: split!(&driver, d => d.workarounds().to_vec(), Vec::new()),
+            io_uring_features: split!(&driver, d => d.features().to_vec(), Vec::new()),
         };
         Ok((driver, choice))
     }
 
     pub(crate) fn kind(&self) -> DriverKind {
         match self {
+            #[cfg(target_os = "linux")]
             Driver::Uring(_) => DriverKind::IoUring,
+            #[cfg(target_os = "linux")]
             Driver::Epoll(_) => DriverKind::Epoll,
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue(_) => DriverKind::Kqueue,
         }
     }
 
     /// Starts a single-shot operation; `waker` is woken when it can be
     /// polled again.
     pub(crate) fn start(&mut self, io: &Io, waker: &Waker) -> Start {
-        match self {
-            Driver::Uring(d) => Start::Submitted(d.submit_op(io, waker)),
-            Driver::Epoll(d) => d.start(io, waker),
-        }
+        split!(self, d => Start::Submitted(d.submit_op(io, waker)), d.start(io, waker))
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
@@ -655,10 +737,10 @@ impl Driver {
         waker: &Waker,
         hold: &mut Option<Box<ZeroCopyHold>>,
     ) -> Poll<(i32, u32)> {
-        match self {
-            Driver::Uring(d) => d.poll_op(key, waker, hold),
-            Driver::Epoll(d) => d.poll_op(key, waker),
-        }
+        split!(self, d => d.poll_op(key, waker, hold), {
+            let _ = &hold;
+            d.poll_op(key, waker)
+        })
     }
 
     /// The future of a single-shot operation was dropped before its result
@@ -668,44 +750,30 @@ impl Driver {
     /// `result_is_fd` says the result will be a descriptor nobody owns (see
     /// [`Io::result_is_fd`]), which the driver then closes.
     pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
-        match self {
-            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd),
-            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd),
-        }
+        each!(self, d => d.cancel_op(key, data, result_is_fd))
     }
 
     pub(crate) fn new_multi(&mut self, kind: MultiKind) -> usize {
-        match self {
-            Driver::Uring(d) => d.new_multi(kind),
-            Driver::Epoll(d) => d.new_multi(kind),
-        }
+        each!(self, d => d.new_multi(kind))
     }
 
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
-        match self {
-            Driver::Uring(d) => d.arm_multi(key, io),
-            Driver::Epoll(d) => d.arm_multi(key, io),
-        }
+        each!(self, d => d.arm_multi(key, io))
     }
 
     pub(crate) fn poll_multi(&mut self, key: usize, waker: &Waker) -> MultiPoll {
-        match self {
-            Driver::Uring(d) => d.poll_multi(key, waker),
-            Driver::Epoll(d) => d.poll_multi(key, waker),
-        }
+        each!(self, d => d.poll_multi(key, waker))
     }
 
     /// The owner of a multishot operation (listener, stream) goes away.
     pub(crate) fn drop_multi(&mut self, key: usize) {
-        match self {
-            Driver::Uring(d) => d.drop_multi(key),
-            Driver::Epoll(d) => d.drop_multi(key),
-        }
+        each!(self, d => d.drop_multi(key))
     }
 
     /// Moves received-but-unread data out of the buffer pool (io_uring; the
     /// epoll driver never queues pool buffers).
     pub(crate) fn evacuate(&mut self) {
+        #[cfg(target_os = "linux")]
         if let Driver::Uring(d) = self {
             d.evacuate();
         }
@@ -713,104 +781,71 @@ impl Driver {
 
     /// Closes a descriptor the caller gives up.
     pub(crate) fn close_fd(&mut self, fd: RawFd) {
-        match self {
-            Driver::Uring(d) => d.close_fd(fd),
-            Driver::Epoll(d) => d.close_fd(fd),
-        }
+        each!(self, d => d.close_fd(fd))
     }
 
     /// Hands queued SQEs to the kernel now (see `Uring::submit_queued`).
     #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
-        match self {
-            Driver::Uring(d) => d.submit_queued(),
-            Driver::Epoll(_) => {}
-        }
+        split!(self, d => d.submit_queued(), {})
     }
 
     pub(crate) fn pool(&self) -> &Rc<BufPool> {
-        match self {
-            Driver::Uring(d) => d.pool(),
-            Driver::Epoll(d) => d.pool(),
-        }
+        each!(self, d => d.pool())
     }
 
     /// Makes sure a receive of this kind can get a pool buffer before it is
     /// armed (a datagram receive, or a stream one). `false` if none is free.
     pub(crate) fn ensure_recv_buffer(&self, datagram: bool) -> bool {
-        match self {
-            Driver::Uring(d) => d.ensure_recv_buffer(datagram),
-            Driver::Epoll(d) => d.pool().ensure_published(None),
-        }
+        split!(self, d => d.ensure_recv_buffer(datagram), {
+            let _ = datagram;
+            d.pool().ensure_published(None)
+        })
     }
 
     /// The smallest send that goes out without a copy, or `None` where
     /// sends are always copied (epoll, or io_uring without
     /// [`IoUringFeature::ZeroCopySend`]).
     pub(crate) fn zero_copy_min(&self) -> Option<usize> {
-        match self {
-            Driver::Uring(d) => d.zero_copy_min(),
-            Driver::Epoll(_) => None,
-        }
+        split!(self, d => d.zero_copy_min(), None)
     }
 
     /// `true` if there is something to collect without waiting.
     pub(crate) fn has_completions(&mut self) -> bool {
-        match self {
-            Driver::Uring(d) => d.has_completions(),
-            Driver::Epoll(d) => d.has_completions(),
-        }
+        each!(self, d => d.has_completions())
     }
 
     /// Enters the kernel, then wakes the tasks whose operations can make
     /// progress. Returns resources that must be dropped outside the driver.
     pub(crate) fn park(&mut self, mode: Park) -> Vec<Box<dyn Any>> {
-        match self {
-            Driver::Uring(d) => d.park(mode),
-            Driver::Epoll(d) => d.park(mode),
-        }
+        each!(self, d => d.park(mode))
     }
 
     /// Cancels what is left and waits for it. `false` means something may
     /// still use the driver's memory: the caller must leak it.
     pub(crate) fn shutdown(&mut self) -> bool {
-        match self {
-            Driver::Uring(d) => d.shutdown(),
-            Driver::Epoll(d) => d.shutdown(),
-        }
+        each!(self, d => d.shutdown())
     }
 
     pub(crate) fn take_graveyard(&mut self) -> Vec<Box<dyn Any>> {
-        match self {
-            Driver::Uring(d) => d.take_graveyard(),
-            Driver::Epoll(d) => d.take_graveyard(),
-        }
+        each!(self, d => d.take_graveyard())
     }
 
     /// Operations whose final completion is still outstanding.
     pub(crate) fn inflight(&self) -> usize {
-        match self {
-            Driver::Uring(d) => d.inflight(),
-            Driver::Epoll(d) => d.inflight(),
-        }
+        each!(self, d => d.inflight())
     }
 
     /// Number of tracked operations (used by tests to detect leaks).
     pub(crate) fn tracked_ops(&self) -> usize {
-        match self {
-            Driver::Uring(d) => d.tracked_ops(),
-            Driver::Epoll(d) => d.tracked_ops(),
-        }
+        each!(self, d => d.tracked_ops())
     }
 
     /// Received bytes moved from pool buffers to the heap so far, because
     /// their reader fell behind while the pool ran low, or the pool ran out.
     /// The epoll driver reads only when asked, so it never does.
     pub(crate) fn recv_copied(&self) -> u64 {
-        match self {
-            Driver::Uring(d) => d.recv_copied(),
-            Driver::Epoll(_) => 0,
-        }
+        split!(self, d => d.recv_copied(), 0)
     }
 }
 
@@ -828,12 +863,17 @@ mod tests {
             .unwrap_err();
             err.downcast_ref::<String>().cloned().unwrap()
         };
-        let lost = message(libc::EBADR);
-        assert!(
-            lost.starts_with("GIONG-E0005: io_uring_enter failed"),
-            "{lost}"
-        );
-        assert!(lost.contains("ran out of memory"), "{lost}");
+        #[cfg(target_os = "linux")]
+        {
+            let lost = message(libc::EBADR);
+            assert!(
+                lost.starts_with("GIONG-E0005: io_uring_enter failed"),
+                "{lost}"
+            );
+            assert!(lost.contains("ran out of memory"), "{lost}");
+        }
+        let oom = message(libc::ENOMEM);
+        assert!(oom.contains("out of memory"), "{oom}");
         let other = message(libc::EINVAL);
         assert!(other.contains("report it"), "{other}");
     }

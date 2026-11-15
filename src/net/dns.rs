@@ -586,9 +586,7 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 
 fn random_id() -> u16 {
     let mut id = [0u8; 2];
-    // SAFETY: getrandom writes at most `id.len()` bytes into `id`.
-    let n = unsafe { libc::getrandom(id.as_mut_ptr().cast(), id.len(), 0) };
-    if n != 2 {
+    if !crate::sys::random_bytes(&mut id) {
         // Not cryptographic, but never the same twice in a row.
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)

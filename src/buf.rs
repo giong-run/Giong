@@ -1,6 +1,10 @@
 //! Buffers: the ownership-passing buffer traits used by single-shot I/O, and the
 //! kernel-shared buffer ring ("provided buffers") used by multishot receive.
 
+// The buffer rings are io_uring's: elsewhere the pool only lends buffers
+// to the readiness driver, and the ring bookkeeping goes unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -10,8 +14,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
-
-use io_uring::types::BufRingEntry;
 
 use crate::error::{raise, Code};
 
@@ -307,7 +309,7 @@ impl Ring {
         // and fails with EFAULT unless that page happens to be mapped.
         // Fixed in 6.1 ("io_uring: fix size calculation when registering buf
         // ring"); found by running the tests on a real 6.0 kernel.
-        let len = count as usize * std::mem::size_of::<BufRingEntry>() + page_size();
+        let len = count as usize * std::mem::size_of::<RawEntry>() + page_size();
         Ok(Self {
             map: Mapping::new(len)?,
             tail: Cell::new(0),
@@ -318,16 +320,16 @@ impl Ring {
         })
     }
 
-    fn entries(&self) -> *mut BufRingEntry {
-        self.map.ptr.as_ptr() as *mut BufRingEntry
+    fn entries(&self) -> *mut RawEntry {
+        self.map.ptr.as_ptr() as *mut RawEntry
     }
 }
 
 /// The layout of the kernel's `struct io_uring_buf`, one entry of a buffer
 /// ring, for writing an entry field by field through raw pointers. `resv` of
 /// entry 0 is the ring's tail, which the kernel reads at any time, so a
-/// reference to an entry (which `BufRingEntry`'s setters take) would claim
-/// memory the kernel shares.
+/// reference to an entry (which `io_uring::types::BufRingEntry`'s setters
+/// take) would claim memory the kernel shares.
 #[repr(C)]
 struct RawEntry {
     addr: u64,
@@ -336,7 +338,10 @@ struct RawEntry {
     resv: u16,
 }
 
-const _: () = assert!(std::mem::size_of::<RawEntry>() == std::mem::size_of::<BufRingEntry>());
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    std::mem::size_of::<RawEntry>() == std::mem::size_of::<io_uring::types::BufRingEntry>()
+);
 
 /// What the pool knows about one of its buffers.
 struct Slot {
@@ -727,7 +732,7 @@ impl BufPool {
         // fields are written through raw pointers, never through a reference
         // to the entry, and `resv` (the ring tail in entry 0) is not touched.
         unsafe {
-            let entry = ring.entries().add(idx).cast::<RawEntry>();
+            let entry = ring.entries().add(idx);
             let addr = self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) as u64;
             ptr::addr_of_mut!((*entry).addr).write(addr);
             ptr::addr_of_mut!((*entry).len).write(self.buf_len as u32);
@@ -745,7 +750,7 @@ impl BufPool {
         // SAFETY: the tail lives inside the ring allocation and is only ever
         // accessed atomically (the kernel reads it concurrently).
         unsafe {
-            let tail = BufRingEntry::tail(ring.entries()) as *mut u16;
+            let tail = std::ptr::addr_of_mut!((*ring.entries()).resv);
             AtomicU16::from_ptr(tail).store(ring.tail.get(), Ordering::Release);
         }
     }

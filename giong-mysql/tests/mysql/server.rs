@@ -13,6 +13,7 @@
 //! [`server`] is the one most tests use. [`odd`] starts a second one, set up
 //! the way some production servers are and the defaults are not.
 
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -530,6 +531,9 @@ fn start(bins: Bins, role: Role) -> Server {
         .stderr(Stdio::null());
     let server_gone = gone.clone();
     std::thread::spawn(move || {
+        // Linux only: elsewhere a killed test binary leaves the server running
+        // until the test's own cleanup or the CI job ends.
+        #[cfg(target_os = "linux")]
         // SAFETY: prctl is async-signal-safe and touches only this process.
         unsafe {
             cmd.pre_exec(|| {

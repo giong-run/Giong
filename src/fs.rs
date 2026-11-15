@@ -54,6 +54,7 @@ use crate::error::{raise, Code};
 use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime;
+use crate::sys;
 
 fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
@@ -485,7 +486,7 @@ impl File {
         statx(
             self.fd,
             KernelBox::path(CString::default()),
-            libc::AT_EMPTY_PATH,
+            crate::sys::AT_EMPTY_PATH,
         )
         .await
     }
@@ -604,7 +605,7 @@ impl Metadata {
 
     /// The type of the file.
     pub fn file_type(&self) -> FileType {
-        FileType(self.mode & libc::S_IFMT)
+        FileType(self.mode & sys::mode::S_IFMT)
     }
 
     /// File type and permission bits, as in `st_mode`.
@@ -619,9 +620,9 @@ impl Metadata {
 }
 
 async fn statx(dir: RawFd, path: KernelBox<CString>, flags: i32) -> io::Result<Metadata> {
-    // SAFETY: all-zero is a valid `statx` (plain integers).
-    let out: KernelBox<libc::statx> = KernelBox::new(unsafe { mem::zeroed() });
-    let mask = libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_SIZE | libc::STATX_MTIME;
+    // SAFETY: all-zero is a valid stat buffer (plain integers).
+    let out: KernelBox<sys::StatBuf> = KernelBox::new(unsafe { mem::zeroed() });
+    let mask = sys::STAT_MASK;
     let io = Io::Statx {
         dir,
         path: path.c_ptr(),
@@ -634,17 +635,17 @@ async fn statx(dir: RawFd, path: KernelBox<CString>, flags: i32) -> io::Result<M
     if res < 0 {
         return Err(os_err(res));
     }
-    let out = out.get();
-    let since_epoch = Duration::new(out.stx_mtime.tv_sec.unsigned_abs(), out.stx_mtime.tv_nsec);
-    let modified = if out.stx_mtime.tv_sec >= 0 {
+    let (len, mode, mtime_sec, mtime_nsec) = sys::stat_fields(out.get());
+    let since_epoch = Duration::new(mtime_sec.unsigned_abs(), mtime_nsec);
+    let modified = if mtime_sec >= 0 {
         SystemTime::UNIX_EPOCH + since_epoch
     } else {
-        SystemTime::UNIX_EPOCH - Duration::from_secs(out.stx_mtime.tv_sec.unsigned_abs())
-            + Duration::from_nanos(out.stx_mtime.tv_nsec.into())
+        SystemTime::UNIX_EPOCH - Duration::from_secs(mtime_sec.unsigned_abs())
+            + Duration::from_nanos(mtime_nsec.into())
     };
     Ok(Metadata {
-        len: out.stx_size,
-        mode: out.stx_mode.into(),
+        len,
+        mode,
         modified,
     })
 }
@@ -763,17 +764,17 @@ pub struct FileType(u32);
 impl FileType {
     /// `true` for a regular file.
     pub fn is_file(&self) -> bool {
-        self.0 == libc::S_IFREG
+        self.0 == sys::mode::S_IFREG
     }
 
     /// `true` for a directory.
     pub fn is_dir(&self) -> bool {
-        self.0 == libc::S_IFDIR
+        self.0 == sys::mode::S_IFDIR
     }
 
     /// `true` for a symbolic link.
     pub fn is_symlink(&self) -> bool {
-        self.0 == libc::S_IFLNK
+        self.0 == sys::mode::S_IFLNK
     }
 
     /// The type as the `S_IFMT` bits of `st_mode` (`S_IFREG`, `S_IFDIR`, ...).
@@ -784,13 +785,13 @@ impl FileType {
     /// The type a directory entry reports, if the filesystem reports one.
     fn from_dirent(d_type: u8) -> Option<Self> {
         let mode = match d_type {
-            libc::DT_REG => libc::S_IFREG,
-            libc::DT_DIR => libc::S_IFDIR,
-            libc::DT_LNK => libc::S_IFLNK,
-            libc::DT_FIFO => libc::S_IFIFO,
-            libc::DT_SOCK => libc::S_IFSOCK,
-            libc::DT_CHR => libc::S_IFCHR,
-            libc::DT_BLK => libc::S_IFBLK,
+            libc::DT_REG => sys::mode::S_IFREG,
+            libc::DT_DIR => sys::mode::S_IFDIR,
+            libc::DT_LNK => sys::mode::S_IFLNK,
+            libc::DT_FIFO => sys::mode::S_IFIFO,
+            libc::DT_SOCK => sys::mode::S_IFSOCK,
+            libc::DT_CHR => sys::mode::S_IFCHR,
+            libc::DT_BLK => sys::mode::S_IFBLK,
             _ => return None,
         };
         Some(Self(mode))
@@ -839,6 +840,7 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
         pos: 0,
         yield_first: false,
         done: false,
+        state: sys::DirState::default(),
     })
 }
 
@@ -854,6 +856,8 @@ pub struct ReadDir {
     yield_first: bool,
     /// The last batch was empty: the end of the directory.
     done: bool,
+    /// What the system keeps between batches (a directory stream on macOS).
+    state: sys::DirState,
 }
 
 impl ReadDir {
@@ -904,20 +908,7 @@ impl ReadDir {
     fn read_batch(&mut self) -> io::Result<()> {
         self.buf.clear();
         self.buf.reserve(DIR_BATCH);
-        // SAFETY: the kernel writes at most `capacity` bytes into the buffer.
-        let n = unsafe {
-            libc::syscall(
-                libc::SYS_getdents64,
-                self.dir.fd,
-                self.buf.as_mut_ptr(),
-                self.buf.capacity(),
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the kernel wrote `n` bytes, no more than the capacity.
-        unsafe { self.buf.set_len(n as usize) };
+        let n = sys::read_dir_batch(&mut self.state, self.dir.fd, &mut self.buf)?;
         self.pos = 0;
         self.yield_first = true;
         self.done = n == 0;
