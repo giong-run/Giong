@@ -37,6 +37,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-http** (performance): HTTP/2 requests allocate less, and idle HTTPS connections hold
+  less memory. An HTTP/2 request made 20 heap allocations in the server besides its
+  handler's, now 2 (the request's head and its shared handle). An HTTP/2 connection used to
+  give back the memory for its streams (their slots, wakers and queues) each time its last
+  stream closed, and allocate it again for the next request. It now keeps it until the
+  connection has been idle for a second. The header fields of each request are decoded into
+  a buffer the connection reuses, and `content-length` is written without an allocation.
+  Measured with `bench/instr` (a giong-http client and server, `GET /json` over HTTP/2):
+  66 allocations per request for both ends, now 48, and about 10% fewer instructions. Over
+  TLS, the handshake now runs on the heap for its length only, and the connection's task
+  no longer holds the TLS stream twice: an idle HTTPS connection holds 10,784 bytes
+  instead of 12,400 (rustls, in the process, `idle-https` case). Method, raw rounds and
+  where each allocation went: `bench/results/h2-allocs/`.
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
   READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are now compiled by
   `cargo test -p rest-api --doc`, and run where they need no server; 11 of the 34 did not
