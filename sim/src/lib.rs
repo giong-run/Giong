@@ -358,9 +358,13 @@ pub fn sweep(seeds: std::ops::Range<u64>, faults: Faults, f: impl Fn(u64) + Sync
 /// The first time in a process, one run of `f` whose report is thrown away
 /// (see [`sweep`]).
 fn warm_up(seed: u64, faults: &Faults, f: impl FnOnce() + Send) {
-    static WARM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARM.swap(true, std::sync::atomic::Ordering::SeqCst) {
+    // A lock, not a flag: a test running beside this one (tests share the
+    // process) must not start its runs before the warm-up has finished.
+    static WARM: Mutex<bool> = Mutex::new(false);
+    let mut warm = WARM.lock().unwrap_or_else(|e| e.into_inner());
+    if !*warm {
         Sim::new(seed).faults(faults.clone()).run(f);
+        *warm = true;
     }
 }
 
