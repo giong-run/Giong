@@ -245,6 +245,21 @@ fn initialize_and_list_the_tools() {
     });
 }
 
+/// Workers with nothing to do sleep without waking, and their sleep counts as
+/// idle time while it lasts: a quiet service is not a busy one.
+#[test]
+fn an_idle_service_is_not_busy() {
+    with_service(open(), |addr, _| {
+        // Let the watcher take a few samples.
+        thread::sleep(Duration::from_millis(450));
+        let o = tool(addr, "overview", json!({}));
+        for w in o["workers"].as_array().unwrap() {
+            let busy = w["busy"].as_f64().expect("busy");
+            assert!(busy < 0.5, "busy {busy}: {o}");
+        }
+    });
+}
+
 #[test]
 fn overview_workers_tasks_and_sources() {
     with_service(open(), |addr, handle| {

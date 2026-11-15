@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -91,6 +91,10 @@ pub(crate) struct WorkerShared {
     /// Tells the worker that `injector` has items, and wakes it if it sleeps.
     bell: Doorbell,
     closed: AtomicBool,
+    /// The most idle time [`Handle::pulse`] has reported for this worker, in
+    /// nanoseconds, so that its readings never go down. Written by the
+    /// threads that read, never by the worker, and away from `counters`.
+    idle_seen: AtomicU64,
     eventfd: OwnedFd,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
@@ -116,6 +120,7 @@ impl WorkerShared {
             injector: Mutex::new(Vec::new()),
             bell: Doorbell::new(),
             closed: AtomicBool::new(false),
+            idle_seen: AtomicU64::new(0),
             // SAFETY: a fresh descriptor we own.
             eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
             driver_choice: OnceLock::new(),
@@ -661,12 +666,16 @@ impl Worker {
                 wait
             };
             // Time spent asleep, for `Handle::pulse`: two clock reads per
-            // sleep, which costs a system call anyway.
-            let slept = matches!(mode, Park::Wait(_)).then(Instant::now);
+            // sleep, which costs a system call anyway. Said before the sleep
+            // as well as after, so that a reader sees a sleep in progress.
+            let sleeps = matches!(mode, Park::Wait(_));
+            if sleeps {
+                self.shared.counters.sleeping();
+            }
             let graveyard = self.driver.borrow_mut().park(mode);
             self.shared.bell.unpark();
-            if let Some(start) = slept {
-                self.shared.counters.parked(start.elapsed());
+            if sleeps {
+                self.shared.counters.woke();
             }
             // Buffers of cancelled operations: dropped outside the driver borrow.
             drop(graveyard);
@@ -1636,6 +1645,14 @@ impl Handle {
             );
         };
         let (ticks, polls, parks, idle, spawned, polling) = shared.counters.read();
+        // Idle time includes the sleep in progress, measured on this thread's
+        // clock, which may be read a moment after the sleep ended: keep the
+        // highest value given out, so that a later reading is never lower.
+        let idle = shared
+            .idle_seen
+            .fetch_max(idle, Ordering::Relaxed)
+            .max(idle);
+        let idle = Duration::from_nanos(idle);
         let state = if shared.closed.load(Ordering::Acquire) || ticks == 0 {
             WorkerState::Stopped
         } else if shared.bell.looks_asleep() {
