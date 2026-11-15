@@ -248,10 +248,7 @@ the repository, and a benchmark of it against the same API on axum.
 Met: Chromium 153 loads the page of `giong-http`'s `h2` example and eight downloads beside
 it over HTTP/2, chosen through ALPN, and `h2spec` passes all 147 cases in CI.
 
-## 0.6 — Speed
-
-Each item lands only with a benchmark showing what it buys. The items checked
-below shipped early, in 0.5.0.
+Speed work shipped in 0.5.0 too, each item with a benchmark showing what it buys:
 
 - [x] Registered ring fd: about 11 ns saved of ~130 per `io_uring_enter`, which no
   benchmark of a whole server can see (neutral on bare metal); on by default from 5.18.
@@ -262,27 +259,53 @@ below shipped early, in 0.5.0.
   request rate (the link is full); bytes that cannot change only.
 - [x] Receive buffers filled piece by piece (Linux 6.12): memory at 20 workers 49.9 → 23.4
   MiB, requests per second unchanged.
-- [ ] Receive bundles (several buffers per completion).
 - [x] Optional `SQPOLL` mode: tried and not merged. With its threads on CPUs of their own it
   lost on bare metal (8 workers and 8 kernel threads: 2.32M req/s against 2.41M for 8
   workers alone, 73% more CPU per request, since the threads spin).
-- [ ] Optional NAPI busy polling.
 - [x] Kernel TLS (kTLS) for `giong-tls`: +36% serving 1 MiB files over HTTPS with `sendfile`
   on bare metal; slower than rustls from memory, so off by default
   ([numbers](giong-tls/README.md#when-it-pays-off)).
 
-**Exit criteria:** a documented, reproducible gain for every option that is merged.
+## 0.6 — Reviewed (done)
+
+The first gate on the way to 1.0. No new features: everything written so far was reviewed,
+and what the reviews found was fixed.
+
+- [x] A review of every crate by a reviewer that had not written it: the drivers and the
+      runtime; sockets, files and channels; `giong-http`; `giong-web`; `giong-tls`;
+      `giong-compat`; `giong-postgres`; `giong-mysql`; `giong-redis`; `giong-mcp`.
+- [x] A review of all `unsafe` code and of the workspace's security, the release workflow
+      included. Miri runs the tests it can in CI, and clippy checks that every `unsafe`
+      block says why it is sound.
+- [x] The findings fixed, in the 0.6.0 [changelog](CHANGELOG.md). Those that need a
+      decision about the API wait for the API freeze.
+- [x] Fuzz targets where the reviews found none: DNS answers and `resolv.conf`, the HTTP
+      client reading a response, whole PostgreSQL, MySQL and Redis sessions, the records
+      kernel TLS reads, and `giong-mcp`'s requests.
+
+The reviewers were the project's AI agents. A review by an outside person is still wanted.
+
+**Exit criteria:** no open finding rated critical or high. Met.
 
 ## 1.0
 
-A stable API. Requires: a review of every public item against the
-[Agent-first](#agent-first) principles, `cargo-semver-checks` in CI, every public item
-documented, the limitations section of the README reduced to deliberate non-goals, and at
-least one production user reporting back.
+A stable API. No features are added between 0.6 and 1.0; what is left is a series of
+gates, and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass them all.
 
-The review also makes sure that nothing public ties the API to Linux or to HTTP/2 in a way
-that the releases below would have to break. A first pass over `main` found nothing that
-forces a 2.0, and a short list to settle before the freeze
+- [x] A review of every crate, the `unsafe` code and security (0.6).
+- [ ] Real use: giong in a production service, with its user reporting back, and a service
+      built by an AI agent from the documentation alone.
+- [ ] The API freeze: every public item reviewed against the [Agent-first](#agent-first)
+      principles, with the items the 0.6 reviews left for it, and `cargo-semver-checks`
+      in CI.
+- [ ] Documentation: every public item documented, and the limitations section of the
+      README reduced to deliberate non-goals.
+- [ ] Verification as the release gate: a 72-hour soak, fuzzing, fault injection, speed
+      and memory thresholds checked in CI, and a run on bare metal.
+
+The API freeze also makes sure that nothing public ties the API to Linux or to HTTP/2 in a
+way that the releases below would have to break. A first pass over `main` found nothing
+that forces a 2.0, and a short list to settle before the freeze
 ([findings](docs/reviews/2026-11-api-portability.md)).
 
 After 1.0, each minor release adds one thing and breaks nothing: code written for 1.0 keeps
@@ -290,6 +313,10 @@ compiling. gRPC comes first because it builds on HTTP/2, which is done; macOS ne
 its kqueue driver follows the path the epoll driver opened; HTTP/3 after that, the largest
 piece of protocol work, once UDP has been measured on bare metal; Windows last, the largest
 change of platform. WebSocket comes later, when someone needs it.
+
+Two speed items once planned for 0.6 also wait until after 1.0, and land only with a
+benchmark showing what they buy: receive bundles (several buffers per completion) and
+optional NAPI busy polling.
 
 ## 1.1 — gRPC
 
