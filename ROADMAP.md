@@ -318,7 +318,7 @@ The verification that needs no machines of its own, run on every change. No new 
 features.
 
 - [x] `cargo-semver-checks` in CI, checking every change against 0.7.0.
-- [ ] Speed and memory thresholds checked in CI: instructions per request, counted so the
+- [x] Speed and memory thresholds checked in CI: instructions per request, counted so the
       result is the same on every run of a shared runner, heap allocations per request, and
       memory per idle connection over HTTP/1.1, HTTP/2 and HTTPS, each with its raw data in
       `bench/`.
@@ -330,6 +330,9 @@ features.
       addition.
 - [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
 - [ ] The remaining code fixes from the service built from the documentation alone.
+- [x] Memory bounded under attack: the requests a worker receives in full share a budget
+      (`max_buffered_request_bytes`), and CI runs hundreds of slow uploads against a server
+      in a 128 MiB container on every change.
 
 **Exit criteria:** all of the above green on `main`.
 

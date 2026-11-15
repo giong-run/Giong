@@ -8,6 +8,33 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Security
+
+- **giong-http** (hardening, **behaviour change**): the requests a worker is receiving in
+  full now share a memory budget, `Server::max_buffered_request_bytes`. Before, each
+  connection was bounded (`max_head_size`, `max_body_size`) and so was the number of
+  connections, but not the sum: with the defaults about 11 GiB per worker, and 130 clients
+  each sending a 1 MB body one byte short got a one-worker server in a 128 MiB container
+  OOM-killed (axum with a `Bytes` route dies at the same point). The budget is 64 MiB per
+  worker by default, or a quarter of the process's cgroup memory limit divided among the
+  workers if that is less (32 MiB for one worker in 128 MiB), and never less than one
+  request at `max_head_size` plus `max_body_size`. Bytes count as they arrive, not as
+  announced, from HTTP/1.1 heads and bodies (the first 4 KiB of each request excepted, so
+  ordinary requests keep being served) and HTTP/2 bodies, until the request is dropped. A
+  request that does not fit is refused without calling its handler: over HTTP/1.1 with `503
+  Service Unavailable`, `Retry-After: 1` and `Connection: close`, before its body is read
+  when its `Content-Length` already does not fit; over HTTP/2 with `REFUSED_STREAM`, which
+  clients retry and which does not count against the client's reset budget. A request larger
+  than the whole budget gets `413`. New code `GIONG-E1120` (`Code::HttpServerBusy`), named
+  in the `503`'s body and in a line on stderr at most once a minute per worker. What changes
+  for a running service: under many large uploads at once, requests past the budget get
+  `503` instead of being buffered; streamed bodies (`Handler::stream_body`) are not counted.
+  With the fix, 450 such uploads (300 over HTTP/1.1, 150 over HTTP/2) leave a one-worker
+  server in a 128 MiB container at a 35 MiB peak. CI runs the attack in a 128 MiB container
+  on every change (`slow-uploads` job, `scripts/slow-uploads.sh`). The `max_connections`
+  documentation no longer says that the connection limit alone keeps memory bounded;
+  `docs/DEPLOYMENT.md` has a section on sizing a container.
+
 ### Changed
 
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
@@ -23,6 +50,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `llms.txt` states the address and connection-limit rules. The 0.7.0 migration notes
   below say what implements `net::ToSocketAddrs`, what replaces `version_minor()`, how to
   raise `max_connections`, and that a `match` on giong-redis's `Value` needs a `_` arm.
+- **Docs**: a "Choosing crates" section in the README says which crate to reach for: the
+  giong crate for the job first, with a table of each one, the Tokio crates it replaces
+  and how it measured against them; then crates that need no runtime; then a Tokio crate
+  over `giong_compat::Compat` only for a protocol giong has no crate for; and how to spot a
+  crate that needs the Tokio runtime. `AGENTS.md`, `llms.txt` and giong-compat's README
+  and crate docs say the same, and no longer call the giong crates faster than the same
+  protocol through `Compat`, which was never measured.
 
 ## [0.7.0] - 2026-11-15
 

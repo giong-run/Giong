@@ -29,13 +29,13 @@ fn main() -> std::io::Result<()> {
 
 ## When to use it, and when not
 
-Use the native crate when there is one. It is built on giong's owned buffers and batched system calls, and is faster than the same protocol through this adapter.
+**Use the giong crate when there is one; `Compat` is the bridge for a protocol giong has no crate for yet.** The giong crates are built on giong's owned buffers and batched system calls, and measured against the Tokio crates they replace on Tokio they serve 1.2 to 4.7 times the requests or statements per core on the workloads measured, with the exceptions listed there ([the table in giong's README](../README.md#choosing-crates)). A Tokio crate run on giong through `Compat` keeps its own design and adds the copies described under [What it costs](#what-it-costs). No crate over `Compat` has been measured against the giong crate for the same protocol.
 
 | You need | Use |
 |---|---|
-| An HTTP/1.1 or HTTP/2 server or client | [`giong-http`](../giong-http/README.md); [`giong-web`](../giong-web/README.md) for routing and JSON |
-| TLS | [`giong-tls`](../giong-tls/README.md) |
-| PostgreSQL, MySQL, Redis | [`giong-postgres`](../giong-postgres/README.md), [`giong-mysql`](../giong-mysql/README.md), [`giong-redis`](../giong-redis/README.md) |
+| An HTTP/1.1 or HTTP/2 server or client (not hyper or reqwest) | [`giong-http`](../giong-http/README.md); [`giong-web`](../giong-web/README.md) for routing and JSON |
+| TLS (tokio-rustls over `Compat` works too, with `Compat`'s copies added) | [`giong-tls`](../giong-tls/README.md) |
+| PostgreSQL, MySQL, Redis (not sqlx, tokio-postgres or redis-rs, which need the Tokio runtime) | [`giong-postgres`](../giong-postgres/README.md), [`giong-mysql`](../giong-mysql/README.md), [`giong-redis`](../giong-redis/README.md) |
 | h2's own API (HTTP/2 frames and streams, or a library built on h2) | [h2](https://docs.rs/h2) over `Compat`, plain or over `giong-tls` with ALPN `h2` |
 | WebSocket | [tokio-tungstenite](https://docs.rs/tokio-tungstenite) (`accept_async`, `client_async`) over `Compat` |
 | A protocol framed by length or by line | [tokio-util](https://docs.rs/tokio-util)'s `Framed` with a codec over `Compat` |

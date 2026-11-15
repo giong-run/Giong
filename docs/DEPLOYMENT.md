@@ -136,6 +136,48 @@ half of the first one's connections. What that means for a restart:
   the load balancer stop sending to the old process first, and give it a
   `Builder::shutdown_grace` to answer what it already has.
 
+## Sizing memory
+
+What a giong-http server holds is bounded by its settings, per worker (each worker runs its
+own `serve`):
+
+```text
+memory per worker  ≈  max_buffered_request_bytes
+                    + open connections × (idle cost + up to 4 KiB while a request arrives)
+                    + what the handlers hold
+```
+
+- `max_buffered_request_bytes` bounds the requests the worker is receiving in full: by
+  default 64 MiB, or a quarter of the cgroup memory limit divided among the workers if that
+  is less, so that one worker in a 128 MiB container takes 32 MiB at most. Past it, requests
+  are refused with `503` (HTTP/1.1) or `REFUSED_STREAM` (HTTP/2) instead of being buffered
+  ([GIONG-E1120](errors/E1120.md)). Bodies read as a stream (`Handler::stream_body`) hold
+  one piece at a time and are not counted.
+- An idle connection costs about 2 KiB over HTTP/1.1, 4.5 KiB over HTTP/2 and 12.5 KiB over
+  HTTPS in the process, and the kernel about 4 KiB more per socket (charged to the
+  container's memory under cgroup v2). `max_connections` (10,000 per `serve` call by
+  default) bounds the count.
+
+The defaults fit the budget to the container, but not the number of connections: 10,000
+idle HTTPS connections take about 165 MiB with the kernel's share. In a small container,
+lower `max_connections` to what fits next to the budget:
+
+```rust
+use giong_http::Server;
+
+// One worker in a 256 MiB container, serving HTTPS: 64 MiB for requests being
+// received, 5,000 connections x ~17 KiB = 83 MiB, and the rest for the program.
+let server = Server::new()
+    .max_buffered_request_bytes(64 << 20)
+    .max_connections(5_000);
+```
+
+CI checks the bound: the `slow-uploads` job runs a server with one worker and with four in
+a Docker container limited to 128 MiB, sends it hundreds of uploads that stop one byte short
+of their announced length, over HTTP/1.1 and HTTP/2, and fails if the container is
+OOM-killed or a well-behaved client mixed in stops getting answers
+([scripts/slow-uploads.sh](../scripts/slow-uploads.sh)).
+
 ## Docker
 
 Docker's default seccomp profile does not allow the io_uring system calls, so in a

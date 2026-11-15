@@ -65,6 +65,7 @@ use super::hpack::{Decoder, Encoder, Index, TABLE_SIZE};
 use super::request::{Builder, Built, Trailers};
 use super::wake::Wakers;
 use crate::body::{Failure, Next, Pipe, StreamBody};
+use crate::budget::{self, Charge};
 use crate::heap::HeapFuture;
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, FileBody, Response};
@@ -261,6 +262,9 @@ struct Stream {
     /// Body bytes held for this stream: the buffered body (until the
     /// stream ends) or what its handler has not taken yet.
     held: u64,
+    /// A body received in full before the handler runs, against the
+    /// worker's budget for requests (`max_buffered_request_bytes`).
+    charge: Charge,
     recv: Recv,
     send_window: i64,
     send: Send,
@@ -708,6 +712,7 @@ impl Session {
             return Ok(());
         };
         let limit = self.cfg.max_body_size as u64;
+        let buffered_limit = self.cfg.buffered_limit();
         let Some(st) = self.stream(slot) else {
             return Ok(());
         };
@@ -752,6 +757,15 @@ impl Session {
         }
         match &mut st.recv {
             Recv::Buffer(req) => {
+                let charged = st.charge.bytes() + data.len() as u64;
+                if !st.charge.grow_to(charged, buffered_limit) {
+                    // The worker holds as many request bytes as it may.
+                    st.recv = Recv::Done;
+                    st.unacked += data.len() as u32;
+                    budget::note_refused(buffered_limit);
+                    self.refuse(slot);
+                    return Ok(());
+                }
                 if let Some(buf) = Rc::get_mut(&mut req.buf) {
                     buf.extend_from_slice(data);
                 }
@@ -1027,6 +1041,7 @@ impl Session {
             content_length,
             received: 0,
             held: 0,
+            charge: Charge::none(),
             recv: Recv::Done,
             send_window: self.peer_window,
             send: Send::Waiting,
@@ -1098,6 +1113,19 @@ impl Session {
             None => {
                 if content_length.is_some_and(|cl| cl > max_body) {
                     let _ = self.answer_status(slot, 413);
+                    return;
+                }
+                // Refused before its body is read if the worker's budget for
+                // requests cannot take it (at least one byte of it, when no
+                // length is announced).
+                let buffered_limit = self.cfg.buffered_limit();
+                if content_length.is_some_and(|cl| cl > buffered_limit) {
+                    let _ = self.answer_status(slot, 413);
+                    return;
+                }
+                if !budget::fits(content_length.unwrap_or(1), buffered_limit) {
+                    budget::note_refused(buffered_limit);
+                    self.refuse(slot);
                     return;
                 }
                 let st = self.stream(slot).expect("just opened");
@@ -1347,6 +1375,20 @@ impl Session {
         self.reset_budget()
     }
 
+    /// Refuses the stream in `slot`, whose handler has not run, with
+    /// `REFUSED_STREAM`: the worker holds as many request bytes as it may.
+    /// The client may send the request again. Not counted against the
+    /// client's budget for resets: the refusal is the server's doing.
+    fn refuse(&mut self, slot: usize) {
+        let Some(st) = self.stream(slot) else {
+            return;
+        };
+        let id = st.id;
+        self.reserve_out();
+        frame::write_rst(&mut self.out, id, Reason::RefusedStream);
+        self.remove(slot, Failure::Abandoned, true);
+    }
+
     /// Resets a stream that has no slot (refused, or closed already).
     fn reset_closed(&mut self, id: u32, reason: Reason) -> Result<(), ConnError> {
         self.reserve_out();
@@ -1420,6 +1462,7 @@ impl Session {
     /// The body bytes of the stream in `slot` are no longer held.
     fn drop_held(&mut self, slot: usize) {
         if let Some(st) = self.stream(slot) {
+            st.charge.shrink_to(0);
             let held = mem::take(&mut st.held);
             self.held -= held;
             self.grant_due |= held > 0;

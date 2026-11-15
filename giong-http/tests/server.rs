@@ -1034,3 +1034,132 @@ fn file_bodies_are_copied_over_a_unix_socket() {
     thread.join().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+thread_local! {
+    /// Requests the `/hoard` route keeps until `/release`.
+    static HOARD: RefCell<Vec<Request>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Echoes the body's length; `/hoard` keeps the request, `/release` drops
+/// the kept ones.
+async fn budgeted(req: Request) -> Response {
+    let len = req.body().len();
+    match req.path() {
+        "/hoard" => HOARD.with(|kept| kept.borrow_mut().push(req)),
+        "/release" => HOARD.with(|kept| kept.borrow_mut().clear()),
+        _ => {}
+    }
+    Response::text(format!("got {len}"))
+}
+
+/// Sends the head of a `POST` of `len` bytes with `Expect: 100-continue`
+/// and returns the first answer: `100` if the server would take the body.
+fn probe(server: &TestServer, len: usize) -> Reply {
+    let mut c = server.client();
+    c.send(format!(
+        "POST / HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: {len}\r\n\r\n"
+    ));
+    c.reply()
+}
+
+/// Probes until the server refuses a body of `len` bytes: the bytes sent
+/// before have arrived and been counted.
+fn wait_until_refused(server: &TestServer, len: usize) -> Reply {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let reply = probe(server, len);
+        if reply.status != 100 {
+            return reply;
+        }
+        assert!(Instant::now() < until, "a {len}-byte body is still taken");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn requests_being_received_share_a_budget_per_worker() {
+    let server = TestServer::start(
+        Server::new().max_buffered_request_bytes(64 * 1024),
+        budgeted,
+    );
+
+    // A slow upload holds 40,000 bytes of its 50,000.
+    let mut slow = server.client();
+    slow.send("POST /a HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n");
+    slow.send(vec![b'a'; 40_000]);
+
+    // Another 40,000 bytes do not fit next to it: refused before the body
+    // is read, with a code and a time to retry.
+    let refused = wait_until_refused(&server, 40_000);
+    assert_eq!(refused.status, 503);
+    assert_eq!(refused.header("retry-after"), Some("1"));
+    assert_eq!(refused.header("connection"), Some("close"));
+    assert!(
+        refused.text().starts_with("GIONG-E1120"),
+        "{}",
+        refused.text()
+    );
+
+    // Small requests still get through, and so does a body that fits.
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(c.reply().text(), "got 0");
+    c.send(format!(
+        "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 20000\r\n\r\n{}",
+        "b".repeat(20_000)
+    ));
+    assert_eq!(c.reply().text(), "got 20000");
+
+    // A body whose length is not announced is refused once it grows past
+    // what is left; chunked, the decoded copy counts too.
+    let mut chunked = server.client();
+    chunked.send("POST / HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n");
+    for _ in 0..10 {
+        if chunked
+            .stream
+            .write_all(format!("1000\r\n{}\r\n", "c".repeat(4096)).as_bytes())
+            .is_err()
+        {
+            break;
+        }
+    }
+    let cut = chunked.reply();
+    assert_eq!(cut.status, 503);
+    assert!(cut.text().starts_with("GIONG-E1120"));
+
+    // The slow upload finishes; its bytes go back once it is answered, and
+    // the refused upload now fits.
+    slow.send(vec![b'a'; 10_000]);
+    assert_eq!(slow.reply().text(), "got 50000");
+    assert_eq!(probe(&server, 40_000).status, 100);
+
+    // Larger than the whole budget: no retry can help.
+    assert_eq!(probe(&server, 70_000).status, 413);
+}
+
+#[test]
+fn a_request_kept_by_its_handler_keeps_its_share_of_the_budget() {
+    let server = TestServer::start(
+        Server::new().max_buffered_request_bytes(64 * 1024),
+        budgeted,
+    );
+    let mut c = server.client();
+    c.send(format!(
+        "POST /hoard HTTP/1.1\r\nHost: t\r\nContent-Length: 50000\r\n\r\n{}",
+        "h".repeat(50_000)
+    ));
+    assert_eq!(c.reply().text(), "got 50000");
+    // The handler still holds those bytes.
+    assert_eq!(probe(&server, 30_000).status, 503);
+    c.send("GET /release HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(c.reply().text(), "got 0");
+    assert_eq!(probe(&server, 30_000).status, 100);
+}
+
+#[test]
+fn the_budget_shows_in_debug_and_defaults_to_auto() {
+    let text = format!("{:?}", Server::new());
+    assert!(text.contains("max_buffered_request_bytes: auto"), "{text}");
+    let text = format!("{:?}", Server::new().max_buffered_request_bytes(1234));
+    assert!(text.contains("max_buffered_request_bytes: 1234"), "{text}");
+}
