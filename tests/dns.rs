@@ -43,12 +43,15 @@ impl FakeDns {
             .collect();
         let table = Arc::new(table);
         // A UDP port whose TCP twin is free too (another test may hold it).
+        // Linux 6.0.16 to 6.0.19 answer a TCP bind to a busy address with
+        // success and leave the socket unbound, and `listen` then picks
+        // another port: check where the listener really is.
         let (udp, tcp, addr) = (0..100)
             .find_map(|_| {
                 let udp = StdUdpSocket::bind("127.0.0.1:0").unwrap();
                 let addr = udp.local_addr().unwrap();
                 let tcp = StdTcpListener::bind(addr).ok()?;
-                Some((udp, tcp, addr))
+                (tcp.local_addr().ok()? == addr).then_some((udp, tcp, addr))
             })
             .expect("no free UDP and TCP port pair");
         let queries = Arc::new(Mutex::new(Vec::new()));

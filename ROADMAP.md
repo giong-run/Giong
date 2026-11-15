@@ -311,7 +311,7 @@ The verification that needs no machines of its own, run on every change. No new 
 features.
 
 - [x] `cargo-semver-checks` in CI, checking every change against 0.7.0.
-- [ ] Speed and memory thresholds checked in CI: instructions per request, counted so the
+- [x] Speed and memory thresholds checked in CI: instructions per request, counted so the
       result is the same on every run of a shared runner, heap allocations per request, and
       memory per idle connection over HTTP/1.1, HTTP/2 and HTTPS, each with its raw data in
       `bench/`.
