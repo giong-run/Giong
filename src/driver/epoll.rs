@@ -245,6 +245,7 @@ unsafe fn run_blocking(io: Io) -> i32 {
         | Io::Recv { .. }
         | Io::Send { .. }
         | Io::Writable { .. }
+        | Io::Readable { .. }
         | Io::SendMsg { .. }
         | Io::RecvMsg { .. }
         | Io::ReadReady { .. } => unreachable!("socket operations never block a thread"),
@@ -476,6 +477,7 @@ impl Epoll {
             | Io::Recv { fd, .. }
             | Io::Send { fd, .. }
             | Io::Writable { fd }
+            | Io::Readable { fd }
             | Io::SendMsg { fd, .. }
             | Io::RecvMsg { fd, .. }
             | Io::ReadReady { fd, .. }
@@ -517,6 +519,24 @@ impl Epoll {
                     }
                     *connecting = true;
                     return Attempt::Wait(fd, Dir::Write);
+                }
+                Io::Readable { fd } => {
+                    // As for `Writable`, on the "readable" edge. Readiness
+                    // is edge-triggered, and an edge that came while
+                    // nothing waited is gone: look first, without waiting.
+                    if *connecting {
+                        return Attempt::Done(0);
+                    }
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if libc::poll(&mut pfd, 1, 0) > 0 {
+                        return Attempt::Done(0);
+                    }
+                    *connecting = true;
+                    return Attempt::Wait(fd, Dir::Read);
                 }
                 Io::Recv { fd, buf, len } => (
                     retry(|| libc::recv(fd, buf.cast(), len as usize, libc::MSG_DONTWAIT)),
@@ -617,6 +637,7 @@ impl Epoll {
             | Io::Recv { .. }
             | Io::Send { .. }
             | Io::Writable { .. }
+            | Io::Readable { .. }
             | Io::SendMsg { .. }
             | Io::RecvMsg { .. }
             | Io::ReadReady { .. } => false,

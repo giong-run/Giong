@@ -38,7 +38,7 @@ Where the code is:
 | `src/driver/epoll.rs` | the epoll driver: readiness, edge-triggered registration, the per-task budget |
 | `src/driver/blocking.rs` | the thread pool the epoll driver runs file operations on |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
-| `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
+| `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced`, `src/net/splice.rs` for `splice_to` (stream to stream inside the kernel) |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
 | `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |

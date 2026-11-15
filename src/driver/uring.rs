@@ -408,6 +408,7 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
             .flags(flags)
             .build(),
         Io::Writable { fd } => opcode::PollAdd::new(types::Fd(fd), libc::POLLOUT as u32).build(),
+        Io::Readable { fd } => opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as u32).build(),
         Io::SendMsg {
             fd,
             msg,

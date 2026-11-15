@@ -384,6 +384,10 @@ pub(crate) enum Io {
     /// that writes to it itself and got `EAGAIN`. Completes with a
     /// non-negative value when the caller should try again.
     Writable { fd: RawFd },
+    /// Waits until a socket has data to read or reached its end (`POLLIN`),
+    /// for a caller that reads from it itself and got `EAGAIN`. Completes
+    /// with a non-negative value when the caller should try again.
+    Readable { fd: RawFd },
     /// `sendmsg(2)`; `zero_copy` as for [`Io::Send`].
     SendMsg {
         fd: RawFd,

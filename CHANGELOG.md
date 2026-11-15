@@ -10,6 +10,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **giong**: `TcpStream::splice_to` and `UnixStream::splice_to` move bytes from one stream to
+  another inside the kernel (`splice(2)` through a pipe), for proxies and tunnels, on both
+  drivers; `net::SpliceStream` names the streams they take. On a cloud VM (4 vCPU, Linux
+  6.18, loopback, `bench/pipelines`), a proxy forwarding 8 streams used 24% less CPU per GiB
+  than `read` and `write_all` with its own buffer (53% less than `recv` plus a copy into a
+  `Vec`), and moved 24% more; on epoll 27% less CPU.
 - **giong**: two optional io_uring features, listed in `DriverChoice::io_uring_features` and
   turned off with `GIONG_IO_URING_OFF` like the others: `IoUringFeature::MessageRing`
   (`msg-ring`, Linux 6.3+) wakes a sleeping worker with `IORING_OP_MSG_RING` from another

@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
-use super::{ListenSocket, StreamSocket};
+use super::{ListenSocket, SpliceStream, StreamSocket};
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
 
 /// Lets the standard library read an address of `sock`: it knows how to
@@ -167,6 +167,50 @@ impl UnixStream {
     /// [`TcpStream::write_all_vectored`](super::TcpStream::write_all_vectored).
     pub async fn write_all_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
         self.inner.write_all_vectored(bufs).await
+    }
+
+    /// Moves bytes from this stream to `to` inside the kernel, until this
+    /// stream reaches its end or `limit` bytes have moved, and returns how
+    /// many moved. The bytes never enter the program: `splice(2)` hands the
+    /// kernel's own buffers from one socket to the other through a pipe,
+    /// which saves the two copies a `recv` and `write_all` make. Use it to
+    /// forward a body or a tunnel in a proxy; pass `u64::MAX` as `limit` to
+    /// move everything until the peer closes its side.
+    ///
+    /// `to` is a [`UnixStream`] or a [`TcpStream`](super::TcpStream). The call keeps a pipe
+    /// (two descriptors, up to 1 MiB of the kernel's memory while bytes are
+    /// in flight) for its duration. To forward both directions, run one
+    /// call per direction in two tasks.
+    ///
+    /// Fails with [`MixedReads`](crate::error::Code::MixedReads) on a
+    /// stream that [`recv`](Self::recv) has read from: what `recv` took in
+    /// already would be skipped. Errors from either socket are returned as
+    /// the kernel gave them; as with [`send_file`](super::TcpStream::send_file),
+    /// writing to a peer that has gone fails with `BrokenPipe` unless the
+    /// program has changed how Rust ignores `SIGPIPE`.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes that left this
+    /// stream may not have reached `to`. After the first call, both sockets
+    /// are non-blocking.
+    ///
+    /// ```no_run
+    /// # use giong::net::{TcpStream, UnixStream};
+    /// # async fn proxy(client: TcpStream, upstream: UnixStream) -> std::io::Result<()> {
+    /// let (client, upstream) = (std::rc::Rc::new(client), std::rc::Rc::new(upstream));
+    /// let (c, u) = (client.clone(), upstream.clone());
+    /// let up = giong::spawn(async move { c.splice_to(&*u, u64::MAX).await });
+    /// let down = upstream.splice_to(&*client, u64::MAX).await?;
+    /// let up = up.await.expect("task")?;
+    /// println!("{up} bytes up, {down} bytes down");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn splice_to<S: SpliceStream>(&self, to: &S, limit: u64) -> io::Result<u64> {
+        self.inner.splice_to(to.stream(), limit).await
+    }
+
+    pub(crate) fn stream_socket(&self) -> &StreamSocket {
+        &self.inner
     }
 
     /// Shuts down the read half, the write half, or both.

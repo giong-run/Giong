@@ -29,7 +29,7 @@ cd "$(dirname "$0")/.."
 command -v valgrind >/dev/null || { echo "valgrind is not installed" >&2; exit 2; }
 
 SUITES=("$@")
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix splice
   giong-compat:compat giong-compat:memory)
 SKIP="interoperates_with_blocking_std_clients"
 SKIP+=" works_with_the_standard_library_on_the_other_side"

@@ -1152,6 +1152,10 @@ def llms():
              "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
              "  connection from `pool.get().await?`; it comes back with its session reset.\n"
              ) if "giong-postgres" in names else ""
+    splice = ("- To forward bytes between two streams in a proxy, `from.splice_to(&to, u64::MAX)` moves\n"
+              "  them inside the kernel (`splice(2)`) instead of `recv` and `write_all`; one call per\n"
+              "  direction, in two tasks. Not on a stream `recv` has read from (`GIONG-E0006`).\n"
+              ) if "fn splice_to" in (released("src/net.rs") or "") else ""
     return f"""# giong
 
 > A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
@@ -1195,7 +1199,7 @@ Facts that are easy to get wrong:
 - On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
-{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
+{pools}{mcp}{splice}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs
 
