@@ -161,6 +161,8 @@ plan or a limit of macOS itself):
 | `allocate` | `fallocate` | `F_PREALLOCATE` + `ftruncate` | emulated; same visible result |
 | Ports shared by workers | `SO_REUSEPORT` spreads connections | `SO_REUSEPORT` binds but sends every connection to one socket | **gap**; plan S2: one listening socket shared by the workers |
 | Port guard against a second process | a probe socket without `SO_REUSEPORT` (`src/net/share.rs`) | no probe: on macOS it would refuse the process's own workers | **gap**; macOS needs `SO_REUSEPORT` on both sockets, so another process of the user can bind the port too |
+| Largest UDP datagram | 65507 bytes | 9216 by default (`net.inet.udp.maxdgram`) | macOS limit |
+| Listen backlog | `net.core.somaxconn` (4096) | `kern.ipc.somaxconn` (128) | macOS limit; bursts of connections are refused sooner |
 | Append-mode writes | `pwrite` appends on `O_APPEND` | `write(2)` when the descriptor has `O_APPEND` | emulated; same visible result |
 | UDP truncated datagram | true length reported (`MSG_TRUNC` in) | truncation flagged, true length unknown | macOS limit |
 | UDP GSO/GRO, `IP_PKTINFO`, ECN | not in the API yet | not in the API yet | later 1.x, Linux first |
@@ -226,23 +228,39 @@ channels, driver, error_docs, executor, fs, observe, spin, time, udp). The
 multi-worker, large-transfer and shutdown tests hang there, as libkqueue's
 thread-based emulation does; the macOS runners are the verdict for those.
 
-**macOS 15, Apple Silicon, first run** (commit 9112aa4). Clippy and the
-build of every test pass. In the `giong` crate, by binary:
+**macOS, Apple Silicon runners.** Clippy and the build of every test pass
+on both. The first run (commit 9112aa4, macOS 15) found a sockaddr layout
+bug, a port probe that refused the workers' own binds, append writes and
+`allocate` on read-only files; those are fixed. The second run (commit
+0275ab4) ran every test binary of the workspace under a time limit:
 
-| Binary | Passed | Failed | Cause |
-|---|---|---|---|
-| unit tests | 36 | 2 | sockaddr family read as Linux's `u16` (fixed); port probe (fixed) |
-| balance | 4 | 3 (1 ignored) | port probe refused the workers' own binds (fixed) |
-| cancel, channels, driver, error_docs, executor | 60 | 0 | |
-| dns | 6 | 11 | 10 from the sockaddr family (fixed); 1 from a test helper whose bound, non-listening port macOS does not refuse (fixed) |
-| fs | 21 | 4 | append writes (fixed), `allocate` on a read-only file (fixed), a non-UTF-8 name APFS refuses (test, fixed), a pseudo-terminal read that returns at once (open) |
-| multi | 15 | hung 1 | `SO_REUSEPORT` does not spread connections (the gap above, plan S2) |
+| | Passed | Failed | Ignored | Hung (> 60 s) |
+|---|---|---|---|---|
+| macOS 15 | 934 | 18 | 6 | 1 |
+| macOS 26 | 934 | 17 | 6 | 2 |
 
-The run stopped at the job's 60-minute limit inside `multi`, so the later
-binaries and crates did not run. The workflow now runs every test binary
-under a time limit and names hung tests, so the next run covers the whole
-workspace. (`macos-14` is no longer offered by GitHub; the matrix is
-`macos-15` and `macos-26`.)
+Whole binaries that pass on both: in `giong`, the unit tests, dns, multi,
+balance, driver, cancel, channels, executor, observe, shutdown, time, spin;
+all of giong-web, giong-postgres, giong-mysql and giong-redis; giong-tls
+except one kTLS test on macOS 26; giong-http except three tests.
+
+What fails, by cause:
+
+| Cause | Tests | Kind |
+|---|---|---|
+| Another process can join a port (`SO_REUSEPORT` without the Linux probe) | net `a_port_shared_by_another_process_is_refused`, udp `a_port_held_by_another_process_is_refused` | **gap** (section 4) |
+| UDP datagrams above 9216 bytes refused (`net.inet.udp.maxdgram`) | udp `larger_pool_buffers_carry_larger_datagrams`, `long_datagrams_are_truncated_by_recv_from_and_whole_with_read_from` | macOS limit; the API should report it with a coded error |
+| Truncation flag set on a whole datagram | udp `datagrams_roundtrip_with_their_sender` | **bug**, in the readiness `recvmsg` emulation |
+| A worker's UDP bind to a shared port fails with `EADDRNOTAVAIL` | udp `every_worker_can_bind_the_same_port` | **bug**, to investigate |
+| Small listen backlog for Unix and TCP sockets | unix `many_connections_at_once`, net `accept_backlog_is_bounded_and_no_connection_is_lost` | macOS limit (`kern.ipc.somaxconn`); tests to adapt |
+| A hang talking to a std Unix socket | unix `works_with_the_standard_library_on_the_other_side` | **bug**, to investigate |
+| `sendfile` to a closed peer gives `ENOTCONN` | net `send_file_to_a_closed_peer_is_an_error_not_a_signal` | error mapping |
+| A pseudo-terminal read returns at once | fs `a_file_is_closed_only_once_a_blocking_thread_is_done_with_it` | **bug** or pty difference, to investigate |
+| `/proc` readers in giong-mcp have no macOS source | giong-mcp: 3 tests | plan S4 (`proc_pidinfo`) |
+| Elapsed-time bounds tuned on Linux | giong-http server/tls shutdown tests (230 ms) | test timing |
+| A SYN to a full backlog waits instead of failing | giong-http `a_server_that_does_not_answer_hits_the_timeout` | test assumption |
+| `kTLS` auto mode hangs on macOS 26 only | giong-tls `auto_stays_in_the_process_when_the_kernel_cannot_take_connections` | **bug**, to investigate |
+| `TCP_NODELAY` read back as 4, a non-UTF-8 name APFS refuses | 2 tests | tests fixed after the run |
 
 ## 8. Next steps (1.2 plan items)
 

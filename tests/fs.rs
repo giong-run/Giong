@@ -956,17 +956,11 @@ fn directories_list_like_the_standard_library() {
             .iter()
             .map(|entry| entry.file_name().as_bytes())
             .collect();
-        assert_eq!(
-            names,
-            [
-                &b"caf\xe9"[..],
-                b"dangling",
-                b"file",
-                b"link",
-                b"socket",
-                b"sub"
-            ]
-        );
+        let mut expected = vec![&b"dangling"[..], b"file", b"link", b"socket", b"sub"];
+        if cfg!(target_os = "linux") {
+            expected.insert(0, b"caf\xe9");
+        }
+        assert_eq!(names, expected);
         assert_eq!(ours.len(), theirs.len());
         for (ours, theirs) in ours.iter().zip(&theirs) {
             assert_eq!(ours.file_name(), theirs.file_name());
