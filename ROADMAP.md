@@ -305,21 +305,51 @@ breaking changes made now rather than after 1.0.
 **Exit criteria:** no item left for the freeze undecided. Met. The freeze is declared once
 real use in a service has reported back, which may still add items before 1.0.0-rc.1.
 
+## 0.8 — Verified in CI
+
+The verification that needs no machines of its own, run on every change. No new public
+features.
+
+- [x] `cargo-semver-checks` in CI, checking every change against 0.7.0.
+- [ ] Speed and memory thresholds checked in CI: instructions per request, counted so the
+      result is the same on every run of a shared runner, and memory per connection, each
+      with its raw data in `bench/`.
+- [ ] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
+      boxes, the lifetimes of operations), run in CI.
+- [ ] Fault injection through an internal simulation driver: lost, reordered and delayed
+      packets, reset connections, failing disks and jumping clocks, chosen by a seed, and a
+      failing run replayed exactly from its seed. Internal only; a public form is a 1.x
+      addition.
+- [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
+- [ ] The remaining code fixes from the service built from the documentation alone.
+
+**Exit criteria:** all of the above green on `main`.
+
+## 0.9 — Bare metal and real use
+
+What only real machines and a real service can show. No new public features.
+
+- [ ] A 72-hour soak on bare metal.
+- [ ] Benchmarks on bare metal against Tokio and the other runtimes, compared with 0.5.0's
+      pass, with method and raw data in the repository; the README and giong.run take their
+      numbers from them.
+- [ ] UDP segmentation offload measured in the same rental, as input for HTTP/3 (no API).
+- [ ] Real use: giong in a production service, with its user reporting back.
+
+**Exit criteria:** the soak ends with no leak, crash or stall, and the service's user
+reports no blocker.
+
 ## 1.0
 
 A stable API. No features are added between 0.6 and 1.0; what is left is a series of
-gates, and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass them all.
+gates (0.6, 0.7, 0.8, 0.9), and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass
+them all.
 
-- [x] A review of every crate, the `unsafe` code and security (0.6).
-- [x] The API settled: every public item reviewed against the [Agent-first](#agent-first)
-      principles, with the items the 0.6 reviews left for it, and a service built by an AI
-      agent from the documentation alone (0.7).
-- [ ] `cargo-semver-checks` in CI, checking every change against 0.7.0.
-- [ ] Real use: giong in a production service, with its user reporting back.
 - [ ] Documentation: every public item documented, and the limitations section of the
       README reduced to deliberate non-goals.
-- [ ] Verification as the release gate: a 72-hour soak, fuzzing, fault injection, speed
-      and memory thresholds checked in CI, and a run on bare metal.
+- [ ] 0.8 and 0.9 passed.
+- [ ] `1.0.0-rc.N`: release candidates that change nothing but fixes, until one passes
+      every gate; that one becomes 1.0.0.
 
 The API freeze also makes sure that nothing public ties the API to Linux or to HTTP/2 in a
 way that the releases below would have to break. A first pass over `main` found nothing
