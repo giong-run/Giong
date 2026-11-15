@@ -1,0 +1,12 @@
+/json
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                   342754     +0.0%        5.43     +0.0%     44.5
+  no-recv-bundles          324271     -5.4%        5.80     +6.8%     42.1
+  no-msg-ring              336906     -1.7%        5.50     +1.2%     43.7
+
+/static?size=16384
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                   225348     +0.0%        8.04     +0.0%   3581.4
+  no-recv-bundles          226365     +0.5%        8.08     +0.5%   3586.6
+  no-msg-ring              220539     -2.1%        8.46     +5.2%   3493.1
+
