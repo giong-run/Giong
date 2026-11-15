@@ -290,6 +290,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**: `TcpListener::bind` to an address in use fails with `AddrInUse` on Linux 6.0.16
+  to 6.0.19 too. Those kernels return 1 instead of -1 from bind(2) on a TCP socket whose
+  address is taken and leave the socket unbound, which read as success: the listener then
+  came up on a free port of every interface (`0.0.0.0:43289` when asked for a busy
+  `127.0.0.1:40079`). giong now checks the port the socket ended up on. Other kernels, UDP
+  and Unix sockets never had this.
 - **giong**, epoll driver: file operations no longer queue behind one that blocks. A burst
   of file operations started while one blocking thread was idle all went to that thread, so
   one open of a FIFO without a writer (or a read from a hung network filesystem) stalled

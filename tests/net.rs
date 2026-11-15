@@ -732,6 +732,34 @@ fn interoperates_with_blocking_std_clients() {
     server.join().unwrap();
 }
 
+/// A port held by a listener that shares it with nobody. Linux 6.0.16 to
+/// 6.0.19 answer 1, not -1, to the bind(2) of a second TCP socket there,
+/// which reads as success and would leave the listener on some other port.
+#[test]
+fn binding_a_busy_address_fails_and_says_so() {
+    giong::block_on(async {
+        for any in ["127.0.0.1:0", "[::1]:0"] {
+            let Ok(holder) = std::net::TcpListener::bind(any) else {
+                assert!(any.starts_with('['), "cannot bind {any}");
+                continue; // no IPv6 here
+            };
+            let addr = holder.local_addr().unwrap();
+            match TcpListener::bind(addr) {
+                Ok(l) => panic!(
+                    "bound {addr}, which is in use, and listens on {:?}",
+                    l.local_addr()
+                ),
+                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{addr}: {e}"),
+            }
+            // Listeners of this runtime still share a port with each other.
+            let first = TcpListener::bind(any).unwrap();
+            let shared = first.local_addr().unwrap();
+            let second = TcpListener::bind(shared).unwrap();
+            assert_eq!(second.local_addr().unwrap(), shared);
+        }
+    });
+}
+
 #[test]
 fn from_std_listener_and_stream() {
     giong::block_on(async {
