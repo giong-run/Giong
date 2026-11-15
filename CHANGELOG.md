@@ -8,6 +8,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **Testing**: a deterministic simulation (`sim/`, not published) that runs giong's epoll
+  driver on a simulated kernel: virtual sockets, epoll, eventfds, clocks, threads and
+  disk faults, all chosen by a seed, so a failing run replays exactly with
+  `GIONG_SIM_SEED`. It runs the core crate's own tests, HTTP/1, TLS and HTTP/2, Redis,
+  PostgreSQL and file scenarios under lost, split, delayed and reset connections, refused
+  and dropped connects, reordered datagrams, spurious wake-ups, failing disks and jumping
+  clocks, and long runs of months of simulated uptime that check nothing grows per
+  request. It needs no change to the crate itself and covers the epoll driver only, not
+  io_uring, the kernel or the NIC. `scripts/check.sh sim` runs it; see `sim/README.md`.
+
 ### Changed
 
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the

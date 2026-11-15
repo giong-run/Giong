@@ -316,10 +316,11 @@ features.
       with its raw data in `bench/`.
 - [ ] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
       boxes, the lifetimes of operations), run in CI.
-- [ ] Fault injection through an internal simulation driver: lost, reordered and delayed
+- [x] Fault injection through an internal simulation (`sim/`): lost, reordered and delayed
       packets, reset connections, failing disks and jumping clocks, chosen by a seed, and a
-      failing run replayed exactly from its seed. Internal only; a public form is a 1.x
-      addition.
+      failing run replayed exactly from its seed; long runs in simulated time, months of
+      uptime on every CI run. It covers Gióng's own code on the epoll driver, not io_uring,
+      the kernel or the NIC. Internal only; a public form is a 1.x addition.
 - [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
 - [ ] The remaining code fixes from the service built from the documentation alone.
 

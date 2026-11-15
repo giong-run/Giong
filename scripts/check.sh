@@ -26,7 +26,11 @@
 #                               epoll driver, under Miri, which checks the unsafe
 #                               code against Rust's memory and aliasing rules
 #                               (needs nightly with the miri component)
-#   scripts/check.sh all        everything above except seccomp, soak and miri
+#   scripts/check.sh sim        the deterministic simulation (sim/README.md): its
+#                               scenarios, months of simulated uptime, and this
+#                               crate's tests on it without faults and then with
+#                               loopback faults for SIM_SEEDS seeds (default 3)
+#   scripts/check.sh all        everything above except seccomp, soak, miri and sim
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -131,6 +135,29 @@ run_miri() {
     cargo +nightly miri test --quiet --test cancel -- --exact a_dropped_open_closes_the_descriptor_it_produced
 }
 
+run_sim() {
+    (
+        cd sim
+        echo "== sim: fmt and clippy"
+        cargo fmt --check
+        cargo clippy --quiet --release --all-targets -- -D warnings
+        echo "== sim: scenarios, long runs, this crate's tests without faults"
+        local log
+        log="$(mktemp)"
+        if ! cargo test --release -- --nocapture >"$log" 2>&1; then
+            tail -n 200 "$log"
+            exit 1
+        fi
+        # How much simulated time this run covered.
+        grep -E '^soak:' "$log"
+        rm -f "$log"
+        for seed in $(seq 1 "${SIM_SEEDS:-3}"); do
+            echo "== sim: this crate's tests with loopback faults, seed $seed"
+            GIONG_SIM_FAULTS=loopback GIONG_SIM_SEED="$seed" cargo test --release --quiet --test suite
+        done
+    )
+}
+
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback "${2:-all}" ;;
@@ -140,7 +167,8 @@ case "${1:-all}" in
     loom) run_loom ;;
     soak) run_soak ;;
     miri) run_miri ;;
+    sim) run_sim ;;
     all) run_test; run_fallback all; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|sim|all]" >&2; exit 2 ;;
 esac
 echo "ok"

@@ -493,6 +493,20 @@ jobs:
           toolchain: stable
       - run: scripts/check.sh loom
 
+  # The deterministic simulation (sim/README.md): the epoll driver on a
+  # simulated kernel, with faults chosen by a seed; scenarios for HTTP, TLS,
+  # HTTP/2, Redis, PostgreSQL and files, months of simulated uptime, and the
+  # core crate's tests with and without faults. A failure prints its seed.
+  sim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: scripts/check.sh sim
+
   # The core crate's tests with each of its direct dependencies at the lowest
   # version its Cargo.toml allows, so that the floors there are checked, not
   # assumed: io-uring 0.7.0 to 0.7.14 once hung a busy worker's I/O, which a
@@ -602,10 +616,10 @@ jobs:
 
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, the kernels, Docker,
-  # the other server versions, loom, h2spec, the lowest dependency versions)
-  # hold a merge back as well.
+  # the other server versions, loom, h2spec, the lowest dependency versions,
+  # the simulation) hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver, sim]
     if: always()
     runs-on: ubuntu-24.04
     steps:
