@@ -2,15 +2,13 @@
 # tested on Apple Silicon runners. This workflow lives on the prototype
 # branch only; nothing of it lands on main before 1.0.0.
 #
-# Every crate's tests run, each in its own step that may fail, so one run
-# shows the whole picture: the counts of passed, failed and ignored tests
-# per crate go to the job summary and, as notices, to the run's annotations.
+# Every test binary runs on its own under a time limit (.github/macos-tests.sh),
+# so one run shows the whole picture: passed, failed, ignored and hung tests
+# per binary go to the job summary and, as notices, to the run's annotations.
 
 name: macOS
 
 on:
-  push:
-    branches: ["feat/kqueue-prototype"]
   pull_request:
   workflow_dispatch:
 
@@ -30,9 +28,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 150
     env:
       GIONG_TEST_EXPECT_DRIVER: kqueue
     steps:
@@ -46,33 +44,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Build the tests
         run: cargo test --workspace --all-features --no-run
-      - name: Tests, crate by crate
-        # Each crate runs on its own and may fail; the step fails at the end
-        # if any did. The log of each run is kept for the artifact.
-        run: |
-          mkdir -p logs
-          status=0
-          echo "| crate | passed | failed | ignored | result |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          for crate in giong giong-http giong-tls giong-web giong-compat giong-mcp giong-redis giong-postgres giong-mysql rest-api; do
-            set +e
-            cargo test -p "$crate" --all-features --no-fail-fast -- --test-threads=4 > "logs/$crate.log" 2>&1
-            code=$?
-            set -e
-            passed=$(grep -E '^test result:' "logs/$crate.log" | sed -E 's/.* ([0-9]+) passed.*/\1/' | paste -sd+ - | bc)
-            failed=$(grep -E '^test result:' "logs/$crate.log" | sed -E 's/.* ([0-9]+) failed.*/\1/' | paste -sd+ - | bc)
-            ignored=$(grep -E '^test result:' "logs/$crate.log" | sed -E 's/.* ([0-9]+) ignored.*/\1/' | paste -sd+ - | bc)
-            result=$([ "$code" = 0 ] && echo ok || echo "FAILED ($code)")
-            echo "| $crate | ${passed:-0} | ${failed:-0} | ${ignored:-0} | $result |" >> "$GITHUB_STEP_SUMMARY"
-            echo "::notice title=${{ matrix.os }} $crate::passed ${passed:-0}, failed ${failed:-0}, ignored ${ignored:-0}: $result"
-            if [ "$code" != 0 ]; then
-              status=1
-              # The names of the failed tests, in one annotation per crate.
-              names=$(grep -E '^    [a-zA-Z0-9_:]+$' "logs/$crate.log" | sed 's/^ *//' | sort -u | head -40 | paste -sd' ' -)
-              echo "::warning title=${{ matrix.os }} $crate failed tests::${names:-see the log (build failure or crash)}"
-            fi
-          done
-          exit $status
+      - name: Tests, binary by binary
+        # Each test binary runs under a time limit; one that runs out of
+        # time is run again test by test, so a hung test is named. Doc tests
+        # are not run here.
+        run: .github/macos-tests.sh "${{ matrix.os }}"
       - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

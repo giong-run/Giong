@@ -72,8 +72,9 @@ The 1,182-line epoll driver was 90% portable POSIX: the non-blocking
 attempts, the per-task budget, the blocking pool for files, the
 cancellation and graveyard rules, the multishot emulation, the descriptor
 table with generations. Only registration and waiting were epoll's. It is
-now `Readiness<P: Poller>` (`src/driver/readiness.rs`, a `git mv` of
-`epoll.rs` so history and rebases follow it), with a five-method trait:
+now `Readiness<P: Poller>` (`src/driver/readiness.rs`, the old `epoll.rs`;
+most lines changed, so git shows a new file, and `git log --follow -M30%`
+finds the history), with a five-method trait:
 
 ```rust
 trait Poller {
@@ -193,7 +194,7 @@ RUSTFLAGS="--cfg giong_libkqueue" GIONG_DRIVER=kqueue \
 ```
 
 It is a test aid for the poller's logic only: libkqueue's own edge cases
-are not macOS's. The real test is the `macos-14` and `macos-15` runners
+are not macOS's. The real test is the `macos-15` and `macos-26` runners
 (`.github/workflows/macos.yml`, on the branch only).
 
 Cross-checking the whole workspace for macOS from Linux also works for
