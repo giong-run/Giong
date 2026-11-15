@@ -1,0 +1,87 @@
+# scripts/instr.py, 5 rounds, 2000 operations after 500 of warm-up, 2000 idle connections
+# rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+# valgrind: valgrind-3.22.0
+# kernel: 6.18.44-fc-v470
+# driver io_uring: io_uring (named by GIONG_DRIVER), using packed-buffers, registered-ring, zero-copy-send
+# driver epoll: epoll (named by GIONG_DRIVER)
+# cpu: Intel(R) Xeon(R) Processor @ 2.10GHz
+# The median of the rounds; a measurement more than tolerance_pct away from
+# value, either way, fails `scripts/instr.py check`. Raw rounds:
+# bench/results/instr/raw.csv. Refresh: bench/instr/README.md.
+driver,case,metric,value,tolerance_pct
+io_uring,spawn,instructions,1707.4,1
+io_uring,spawn,allocations,3.000,1
+io_uring,yield,instructions,481.3,1
+io_uring,yield,allocations,0.000,1
+io_uring,oneshot,instructions,386.2,1
+io_uring,oneshot,allocations,1.000,1
+io_uring,channel,instructions,1757.5,1
+io_uring,channel,allocations,0.000,1
+io_uring,timeout,instructions,99.2,1
+io_uring,timeout,allocations,0.000,1
+io_uring,tcp-echo,instructions,4884.6,1
+io_uring,tcp-echo,allocations,1.000,1
+io_uring,udp-echo,instructions,5357.5,1
+io_uring,udp-echo,allocations,2.000,1
+io_uring,file-read,instructions,1478.2,1
+io_uring,file-read,allocations,0.000,1
+io_uring,http1,instructions,11143.7,1
+io_uring,http1,allocations,3.000,1
+io_uring,http1-client,instructions,33946.6,1
+io_uring,http1-client,allocations,33.016,1
+io_uring,h2,instructions,54765.2,1
+io_uring,h2,allocations,66.001,1
+io_uring,https,instructions,46788.8,1
+io_uring,https,allocations,39.069,1
+io_uring,web,instructions,15259.7,1
+io_uring,web,allocations,5.000,1
+io_uring,redis-get,instructions,9617.2,1
+io_uring,redis-get,allocations,2.000,1
+io_uring,postgres-query,instructions,12692.9,1
+io_uring,postgres-query,allocations,16.000,1
+io_uring,mysql-query,instructions,18073.5,1
+io_uring,mysql-query,allocations,27.000,1
+io_uring,idle-http1,heap_bytes,1940.4,2
+io_uring,idle-http1,rss_bytes,1994.8,10
+io_uring,idle-http1,allocations,4.030,1
+io_uring,idle-h2,heap_bytes,4165.8,2
+io_uring,idle-h2,rss_bytes,4306.9,10
+io_uring,idle-h2,allocations,8.040,1
+epoll,spawn,instructions,1837.4,1
+epoll,spawn,allocations,3.000,1
+epoll,yield,instructions,546.2,1
+epoll,yield,allocations,0.000,1
+epoll,oneshot,instructions,386.1,1
+epoll,oneshot,allocations,1.000,1
+epoll,channel,instructions,1887.4,1
+epoll,channel,allocations,0.000,1
+epoll,timeout,instructions,99.1,1
+epoll,timeout,allocations,0.000,1
+epoll,tcp-echo,instructions,4279.4,1
+epoll,tcp-echo,allocations,1.000,1
+epoll,udp-echo,instructions,5031.4,1
+epoll,udp-echo,allocations,2.000,1
+epoll,file-read,instructions,2938.2,3
+epoll,file-read,allocations,2.000,1
+epoll,http1,instructions,10021.5,1
+epoll,http1,allocations,3.000,1
+epoll,http1-client,instructions,32653.6,1
+epoll,http1-client,allocations,33.000,1
+epoll,h2,instructions,53041.6,1
+epoll,h2,allocations,66.001,1
+epoll,https,instructions,45184.7,1
+epoll,https,allocations,39.000,1
+epoll,web,instructions,14135.6,1
+epoll,web,allocations,5.000,1
+epoll,redis-get,instructions,9095.8,1
+epoll,redis-get,allocations,2.000,1
+epoll,postgres-query,instructions,12177.9,1
+epoll,postgres-query,allocations,16.000,1
+epoll,mysql-query,instructions,17534.7,1
+epoll,mysql-query,allocations,27.000,1
+epoll,idle-http1,heap_bytes,2102.1,2
+epoll,idle-http1,rss_bytes,2168.8,10
+epoll,idle-http1,allocations,5.030,1
+epoll,idle-h2,heap_bytes,4231.6,2
+epoll,idle-h2,rss_bytes,4337.7,10
+epoll,idle-h2,allocations,8.040,1

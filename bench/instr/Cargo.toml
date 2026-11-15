@@ -1,0 +1,26 @@
+[package]
+name = "bench-instr"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+giong = { path = "../.." }
+giong-http = { path = "../../giong-http", features = ["tls", "client"] }
+giong-tls = { path = "../../giong-tls" }
+giong-web = { path = "../../giong-web" }
+giong-redis = { path = "../../giong-redis" }
+giong-postgres = { path = "../../giong-postgres" }
+giong-mysql = { path = "../../giong-mysql" }
+libc = "0.2.172"
+rcgen = "0.13"
+
+# The same settings as the libraries' own release builds, so the counts
+# measure what users ship.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = false
+
+[workspace]

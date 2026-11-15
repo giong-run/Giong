@@ -600,12 +600,43 @@ jobs:
         run: cargo install --locked cargo-semver-checks --version 0.51.0
       - run: scripts/semver.sh
 
+  # Speed and memory thresholds: instructions per operation on the hot paths
+  # (runtime, TCP/UDP/files, HTTP/1.1, HTTP/2, TLS, giong-web, the database
+  # clients), counted by callgrind, and heap per idle connection, on both
+  # drivers, against bench/instr/baseline.csv (scripts/instr.py). The counts
+  # repeat within 0.1% on a shared runner, so a hot path made 1% slower fails.
+  instr:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          # The compiler of the baseline: bench/instr/rust-toolchain.toml
+          # (scripts/instr.py refuses to run with another).
+          toolchain: 1.97.0
+      - name: Install valgrind
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q valgrind
+      - run: uname -r
+      - run: scripts/instr.py check
+      # The counts of this run and a baseline.csv made from them, to commit
+      # when a change is meant to move the counts.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: instr
+          path: target/instr/
+          if-no-files-found: ignore
+          retention-days: 14
+          overwrite: true
+
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, the kernels, Docker,
   # the other server versions, loom, h2spec, the lowest dependency versions)
   # hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver, instr]
     if: always()
     runs-on: ubuntu-24.04
     steps:
