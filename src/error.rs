@@ -261,6 +261,12 @@ codes! {
     /// control character, or a status outside `200..=599`. Raised by
     /// `Response::try_header` and `Response::try_new`.
     HttpInvalidResponse = 1119, InvalidInput, "invalid HTTP response";
+    /// The server refused a request without calling its handler: the
+    /// requests its worker was receiving in full already held
+    /// `Server::max_buffered_request_bytes`. Answered with `503 Service
+    /// Unavailable` and `Retry-After: 1` over HTTP/1.1 (this code in the
+    /// body), `REFUSED_STREAM` over HTTP/2.
+    HttpServerBusy = 1120, Other, "request refused: the server's memory budget for requests is full";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with

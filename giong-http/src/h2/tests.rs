@@ -1278,3 +1278,64 @@ fn file_bodies_are_read_in_pieces_and_a_short_file_resets_its_stream() {
     assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
     let _ = std::fs::remove_file(file_path());
 }
+
+#[test]
+fn bodies_received_in_full_share_the_workers_budget_with_other_connections() {
+    let server = TestServer::start(Server::new().max_buffered_request_bytes(100 * 1024));
+    // One connection holds 60,000 bytes of a 60,001-byte body.
+    let mut a = server.client();
+    let held = a.open("POST", "/echo", &[("content-length", "60001")], false);
+    let body = pattern(60_001);
+    a.send_body(held, &body[..60_000], false);
+    a.frames_within(Duration::from_millis(100));
+
+    // Another 60,000 do not fit next to it, on another connection: refused
+    // before the body is sent. The client may retry it.
+    let mut b = server.client();
+    let until = Instant::now() + READ_TIMEOUT;
+    loop {
+        let id = b.open("POST", "/echo", &[("content-length", "60000")], false);
+        let frames = b.frames_within(Duration::from_millis(50));
+        if b.resets.get(&id) == Some(&(Reason::RefusedStream as u32)) {
+            break;
+        }
+        // Not counted yet: give the stream up and try again.
+        assert!(Instant::now() < until, "not refused: {frames:?}");
+        b.send(
+            frame::RST_STREAM,
+            0,
+            id,
+            &(Reason::Cancel as u32).to_be_bytes(),
+        );
+    }
+    // Requests without a body still get through, on both connections.
+    assert_eq!(b.request("GET", "/", &[], &[]).text(), "hello");
+
+    // A body without a length is refused once it would go past the budget.
+    let open = b.open("POST", "/echo", &[], false);
+    let mut sent = 0;
+    while !b.resets.contains_key(&open) && sent < 60_000 {
+        let window = b.send_conn.min(b.send_windows[&open]).max(0) as usize;
+        if window == 0 {
+            b.frames_within(Duration::from_millis(20));
+            continue;
+        }
+        let n = window.min(4096);
+        b.send(frame::DATA, 0, open, &pattern(n));
+        b.send_conn -= n as i64;
+        *b.send_windows.get_mut(&open).unwrap() -= n as i64;
+        sent += n;
+        b.frames_within(Duration::from_millis(5));
+    }
+    assert_eq!(
+        b.reply(open).unwrap_err(),
+        Ended::Reset(Reason::RefusedStream as u32)
+    );
+    assert!(sent < 60_000, "{sent} bytes taken");
+
+    // The first body completes and goes back; then the refused one fits.
+    a.send_body(held, &body[60_000..], true);
+    assert_eq!(a.reply(held).unwrap().body, body);
+    let again = pattern(60_000);
+    assert_eq!(b.request("POST", "/echo", &[], &again).body, again);
+}

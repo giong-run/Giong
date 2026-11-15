@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::ops::Range;
 use std::rc::Rc;
 
+use crate::budget::Charge;
 use crate::parse::{is_field_value, is_token_str, same_authority, Head};
 use crate::request::{BodyBytes, Request};
 
@@ -314,6 +315,7 @@ impl Builder {
             head,
             body: BodyBytes::InBuffer(len..len),
             peer,
+            charge: Charge::none(),
         })
     }
 }

@@ -420,6 +420,31 @@ jobs:
                 "$t" -q
               done'
 
+  # giong-http with its defaults, in a container limited to 128 MiB, under
+  # hundreds of uploads that stop one byte short: it must not be OOM-killed,
+  # and a well-behaved client mixed in must keep getting answers. One and four
+  # workers, on epoll and on io_uring (scripts/slow-uploads.sh).
+  slow-uploads:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      # Built with the test binaries already (`cargo test` builds examples),
+      # with the same features, so this finds it up to date.
+      - run: cargo build --release --workspace --all-features --example defaults
+      - run: scripts/slow-uploads.sh target/release/examples/defaults
+
   # ThreadSanitizer over every test: twice on io_uring and once on the epoll
   # driver, which hands file operations to threads of its own. Three jobs side
   # by side, each with its own build (the standard library included).
@@ -605,7 +630,7 @@ jobs:
   # the other server versions, loom, h2spec, the lowest dependency versions)
   # hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver]
     if: always()
     runs-on: ubuntu-24.04
     steps:
