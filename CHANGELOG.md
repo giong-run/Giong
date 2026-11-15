@@ -62,6 +62,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `llms.txt` states the address and connection-limit rules. The 0.7.0 migration notes
   below say what implements `net::ToSocketAddrs`, what replaces `version_minor()`, how to
   raise `max_connections`, and that a `match` on giong-redis's `Value` needs a `_` arm.
+- **Docs**: a "Choosing crates" section in the README says which crate to reach for: the
+  giong crate for the job first, with a table of each one, the Tokio crates it replaces
+  and how it measured against them; then crates that need no runtime; then a Tokio crate
+  over `giong_compat::Compat` only for a protocol giong has no crate for; and how to spot a
+  crate that needs the Tokio runtime. `AGENTS.md`, `llms.txt` and giong-compat's README
+  and crate docs say the same, and no longer call the giong crates faster than the same
+  protocol through `Compat`, which was never measured.
 
 ## [0.7.0] - 2026-11-15
 
