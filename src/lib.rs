@@ -110,4 +110,10 @@ pub use runtime::{
 #[doc(hidden)]
 pub mod fuzzing {
     pub use crate::net::dns::fuzzing::{dns_response, resolv_conf};
+
+    /// The control messages of a UDP receive (GRO segment size, ECN): must
+    /// never panic or read past the end.
+    pub fn udp_control(data: &[u8]) -> (u16, u8) {
+        crate::net::udp::parse_control(data)
+    }
 }
