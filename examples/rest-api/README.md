@@ -4,7 +4,8 @@ A complete REST API on giong: users kept in PostgreSQL, read through a Redis cac
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-  -keyout key.pem -out cert.pem -days 30 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost"
+  -keyout key.pem -out cert.pem -days 30 -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost" -addext "basicConstraints=critical,CA:FALSE"
 DATABASE_URL=postgres://app:secret@localhost/app REDIS_URL=redis://127.0.0.1:6379 \
   TLS_CERT=cert.pem TLS_KEY=key.pem cargo run --release -p rest-api
 

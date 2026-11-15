@@ -243,6 +243,27 @@ Five things to remember:
    `append(true)`, writes go to the end whatever the offset.
 5. Timers have 1 ms resolution and never fire early.
 
+## Coming from Tokio
+
+giong has no macros and no `spawn_blocking`, and a worker's state is never shared with
+another thread, so some everyday Tokio code is written another way. Every row was run on
+giong 0.6.0.
+
+| With Tokio | On giong |
+|---|---|
+| `#[tokio::main]` | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` runs the closure's future on every worker |
+| `tokio::spawn(fut)` | `giong::spawn(fut)`: the task stays on the worker that spawned it, so the future need not be `Send`. From another thread or for another worker: `Handle::spawn_on`, `Handle::spawn_balanced` |
+| `JoinHandle`, `abort()` | the same: `handle.await` is `Err` for a task that panicked or was aborted |
+| `tokio::join!`, `tokio::select!` | `futures::join!` and `futures::select!` from the `futures` crate, which need no runtime |
+| `spawn_blocking(f).await` | nothing built in yet: `std::thread::spawn`, and a `giong::sync::oneshot` channel to await the result. A worker that blocks holds up every connection it owns |
+| `Arc<Mutex<T>>` shared by handlers | state per worker in an `Rc<RefCell<T>>`, built inside `run(\|_\| async { .. })` and not borrowed across an `.await`. What every worker must see goes through atomics or a channel |
+| `tokio::sync::{Semaphore, Notify, watch, broadcast, Mutex}` | `giong::sync` has `mpsc` (unbounded and bounded) and `oneshot`. Tokio's `sync` module needs no Tokio runtime and works on giong as it is: `tokio = { version = "1", default-features = false, features = ["sync"] }` |
+| `tokio::time::{sleep, sleep_until, timeout}` | `giong::time::{sleep, sleep_until, timeout}` |
+| `tokio::time::interval` | a loop around `sleep_until(next)` |
+| `tokio::signal::ctrl_c()` | `Builder::shutdown_on_signals(true)`, then `giong::shutdown_signal().await`, or `giong::until_shutdown(fut)` around a wait |
+| `stream.read(&mut buf)`, `stream.write_all(&buf)` | `stream.recv().await?` lends a buffer from the worker's pool; a write takes its buffer by value and hands it back: `let (result, buf) = stream.write_all(buf).await;` |
+| sqlx, tokio-postgres, redis-rs, reqwest, axum | `giong-postgres`, `giong-mysql`, `giong-redis`, `giong-http`'s client, `giong-web`. Crates that are handed a stream (h2, tokio-rustls, tokio-tungstenite) run through `giong_compat::Compat::new(stream)` |
+
 ## Design
 
 ```
@@ -790,7 +811,7 @@ request with callgrind instead, which repeats within 0.1%.
 
 ## Testing and safety
 
-1,050 tests across the nine crates and the example API (`cargo test --workspace
+1,051 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure. The runtime's, HTTP's and TLS's main suites are below; the
 database clients, giong-web, giong-mcp, giong-compat and the example API describe theirs

@@ -46,7 +46,7 @@ CRATES = {
                "and gzip behind `client`"],
         fact="`h2spec`: all 147 cases pass"),
     "giong-tls": dict(
-        layer="protocols", tests=75,
+        layer="protocols", tests=76,
         short="TLS 1.2 and 1.3 for servers and clients on rustls. No OpenSSL.",
         lede="TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
         items=["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
@@ -495,6 +495,13 @@ EXAMPLES = [
     ("cat", "Prints files to standard output, reading them through io_uring with positional reads.",
      "cargo run --release --example cat -- Cargo.toml", ""),
 ]
+
+# The example that is a crate of its own, in a folder: (folder, what it is, how to run it).
+SERVICE = ("rest-api", "A whole service on `giong-web`: users kept in PostgreSQL, read through a Redis "
+                       "cache, served over HTTPS, with request ids, a JSON access log, "
+                       "readiness, a streamed export and graceful shutdown. Its README has the routes, "
+                       "the configuration and how it is tested.",
+           "cargo run --release -p rest-api")
 
 LIMITS = [
     ("Linux only", "io_uring on 6.0 or newer, epoll elsewhere. On epoll giong is as fast as other "

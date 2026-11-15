@@ -41,6 +41,24 @@ fn main() -> std::io::Result<()> {
 - An optional cap on open connections (`Server::max_connections`): at the cap the server stops accepting, and new clients wait in the kernel's listen queue until a connection closes.
 - Handlers that keep a worker busy (heavy computation, long responses) leave the kernel's even spread of connections uneven. Bind each worker's listener with `giong::net::TcpListener::bind_balanced` instead of `bind` and a busy worker hands new connections to a quieter one; `Server::serve` takes either.
 - A handler is an `async fn(Request) -> Response`, a closure that returns a future (write its argument's type: `|req: Request| async move { .. }`), or a type of your own that implements `Handler` and borrows from itself while it answers. [`giong-web`](../giong-web/README.md) builds routing, middleware and JSON on it.
+- `Server::serve` takes its handler by value. To serve one handler on two listeners (plain HTTP and HTTPS, a public port and an internal one), share it through a small type of your own; `Handler` is not implemented for `Rc<H>`:
+
+  ```rust
+  #[derive(Clone)]
+  struct Shared<H>(Rc<H>);
+
+  impl<H: Handler> Handler for Shared<H> {
+      async fn call(&self, req: Request) -> Response {
+          self.0.call(req).await
+      }
+      fn stream_body(&self, req: &Request) -> Option<u64> {
+          self.0.stream_body(req)
+      }
+  }
+  ```
+
+  Forward `stream_body` too. A closure that calls the shared handler compiles as well, but a closure never streams: every route that reads its body as it arrives would get it whole, or a `413`.
+- **When a handler is dropped.** A handler's future can be dropped at any `.await`, so work that must finish once started (a charge, then its record) belongs in a task of its own (`giong::spawn`), not after an `.await` in the handler. It is dropped when the client resets its HTTP/2 stream (`RST_STREAM`, which giong-http's own client sends when its timeout runs out), when a timeout around it runs out (giong-web's `Timeout`), and at the end of the grace period of a shutdown. It is *not* dropped when the client closes the connection, over HTTP/1.1 or HTTP/2: the handler runs to its end and the answer is thrown away, so a slow query for a client that has gone still runs. A body from `Body::channel()` learns that the client has gone at its next `send`.
 - `Request::from_bytes` makes a request from its bytes and `Response::headers`, `get_header` and `body_bytes` read an answer back, so handlers are tested without a socket.
 - `Request::peer_addr` gives the client's address (`None` over a Unix socket).
 - Graceful shutdown: a request in progress is answered with `Connection: close`, an idle connection is closed at once.
@@ -230,7 +248,7 @@ let created = client
 - **Redirects** (301, 302, 303, 307, 308) are followed, up to 10. 303, and 301 or 302 after a `POST`, become a `GET` without the body; 307 and 308 repeat the request as it was. `Authorization`, `Cookie` and a `Host` set by hand are not sent to another origin.
 - **Finite limits.** A request has 30 s in all (`ClientBuilder::timeout`, or `RequestBuilder::timeout` for one): waiting for a connection, connecting (10 s of it at most), sending, reading the response, redirects. A response body may have 16 MiB, its head 64 KiB. An unused connection is closed after 60 s.
 - **Strict reading.** Bodies by `Content-Length`, chunked, or up to the end of the connection; 1xx responses are skipped. A response that could be read in two ways (two lengths, bare line feeds, folded headers, bytes after the body) is an error or keeps its connection out of the pool, so one response is never read as part of another. The code that reads a response on a connection, and decides whether the connection can carry the next request, is fuzzed every night (`response_body`): the body must end exactly where its framing says, whatever pieces the bytes arrive in, and a connection that received a byte past the body is never reused.
-- **Proxies.** `ClientBuilder::proxy(Proxy::all("http://user:pass@proxy:3128")?.no_proxy(".svc.cluster.local, 10.0.0.0/8")?)`, or `Proxy::from_env()` for `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` the way curl reads them (never read unless asked). `https` goes through a `CONNECT` tunnel, so the proxy sees only the host name; the credentials go to the proxy, never to the server. Plain `http://` proxies only, for now (no SOCKS, no TLS to the proxy itself).
+- **Proxies.** `ClientBuilder::proxy(Proxy::all("http://user:pass@proxy:3128")?.no_proxy(".svc.cluster.local, 10.0.0.0/8")?)`, or `Proxy::from_env()` for `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` the way curl reads them (never read unless asked). It returns `Result<Option<Proxy>, Error>`, `None` when the environment names no proxy: `if let Some(proxy) = Proxy::from_env()? { builder = builder.proxy(proxy); }`. `https` goes through a `CONNECT` tunnel, so the proxy sees only the host name; the credentials go to the proxy, never to the server. Plain `http://` proxies only, for now (no SOCKS, no TLS to the proxy itself).
 - **Compression.** Responses are asked for with `Accept-Encoding: gzip, deflate` and decompressed as they arrive (`ClientBuilder::decompress(false)` turns it off; a request with its own `Accept-Encoding` gets the bytes as sent). The size limit applies to the decompressed body, so 32 KiB that would expand to gigabytes fails at the limit instead of filling memory; the gzip checksum is checked, and a body cut short is an error, not a shorter body.
 - **Streaming.** `RequestBuilder::send_streaming()` returns once the head has arrived; `StreamingResponse::chunk()` gives the body piece by piece (64 KiB at most, decompressed), with no limit on its size and the timeout applying to each piece. Read to its end, the connection goes back to the pool; dropped before, it is closed (over HTTP/2, only its stream is reset).
 - **Errors that say what to do.** `Error::kind` is one of `Request`, `Connect`, `Timeout`, `TooLarge`, `Redirect`, `Closed`, `Protocol`, `Status`, `Decode` and `Proxy`, each with a giong code (GIONG-E1101 to E1110) and a page in [docs/errors](../docs/errors/README.md); `Error::is_transient` says whether retrying can help. Any status is a `Response`; `error_for_status` turns 4xx and 5xx into an error with the start of the body.
