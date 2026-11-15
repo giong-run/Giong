@@ -960,6 +960,9 @@ def roadmap():
         return found[-1] if found else None
 
     def label(m):
+        # A track that spans several 1.x releases ("... (track R, after 1.0)") is not a crate.
+        if not m["ver"] and m["title"].endswith("after 1.0)"):
+            return "1.x"
         return m["ver"] or "crates"
 
     def name(m):
