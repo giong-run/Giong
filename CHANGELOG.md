@@ -47,8 +47,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   Measured with `bench/instr` (a giong-http client and server, `GET /json` over HTTP/2):
   66 allocations per request for both ends, now 48, and about 10% fewer instructions. Over
   TLS, the handshake now runs on the heap for its length only, and the connection's task
-  no longer holds the TLS stream twice: an idle HTTPS connection costs 10.7 KiB instead of
-  12.3 KiB (rustls, in the process). Raw rounds: `bench/results/instr/raw.csv`.
+  no longer holds the TLS stream twice: an idle HTTPS connection holds 10,784 bytes
+  instead of 12,400 (rustls, in the process, `idle-https` case). Method, raw rounds and
+  where each allocation went: `bench/results/h2-allocs/`.
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
   READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are now compiled by
   `cargo test -p rest-api --doc`, and run where they need no server; 11 of the 34 did not

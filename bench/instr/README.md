@@ -21,7 +21,10 @@ On a shared CI runner the time a request takes moves by tens of percent from one
 next, so a time threshold would be either noise or blind. The number of instructions it
 executes does not depend on the machine's load: in five runs of every case, and three more
 with every core kept busy, no count moved by more than 0.07%, except one case on epoll
-(file reads go through a blocking thread there, 1.2%). The limit is 1% either way (3% for that
+(file reads go through a blocking thread there, 1.2%) and, since HTTP/2 connections keep
+their streams' memory between requests, `h2` (up to 0.6%, inside glibc's malloc, whose
+merging of free blocks depends on the order buffers come back; see
+[`bench/results/h2-allocs`](../results/h2-allocs/summary.txt)). The limit is 1% either way (3% for that
 case), so a change that costs a hundred instructions per HTTP request fails. The measurements
 behind these numbers, and a planted regression that the check caught, are in
 [`bench/results/instr/conditions.txt`](../results/instr/conditions.txt); every round of the
@@ -54,7 +57,7 @@ instructions per request.
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 1,478 | 2,938 |
 | `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 11,144 | 10,022 |
 | `http1-client` | giong-http client and server, HTTP/1.1 | 33,947 | 32,654 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 54,765 | 53,042 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 49,178 | 47,805 |
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 46,789 | 45,185 |
 | `web` | a giong-web router with a path parameter, raw client | 15,260 | 14,136 |
 | `redis-get` | giong-redis `GET` against a fake server | 9,617 | 9,096 |
@@ -82,7 +85,7 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 |---|---:|---:|
 | `idle-http1` (io_uring / epoll) | 1,940 / 2,102 bytes | 1,995 / 2,169 bytes |
 | `idle-h2` (io_uring / epoll) | 4,166 / 4,232 bytes | 4,307 / 4,338 bytes |
-| `idle-https` (io_uring / epoll) | 12,400 / 12,437 bytes | 12,739 / 12,698 bytes |
+| `idle-https` (io_uring / epoll) | 10,784 / 10,821 bytes | 11,123 / 11,086 bytes |
 
 The numbers above were measured on a 4-vCPU Xeon VM (Linux 6.18) on 2026-11-15; what CI
 compares against is `baseline.csv`, whose header names the machine it came from.

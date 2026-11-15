@@ -1,0 +1,68 @@
+HTTP/2 allocations and idle HTTPS memory, before and after (perf/h2-allocs)
+==========================================================================
+
+Machine: 4-vCPU Xeon VM (Intel Xeon @ 2.30GHz), Linux 6.18, Rust 1.97.0, valgrind 3.22.
+Before: main 535411b (0.7.0 + the request budget). After: this branch.
+
+1. bench/instr (scripts/instr.py check --rounds 5; median of 5 rounds; every round of the
+   "after" run is in instr-after.csv, the "before" values are bench/instr/baseline.csv)
+
+   case                     metric          before     after    change
+   h2 (io_uring)            instructions    54,765    49,178    -10.2%
+   h2 (epoll)               instructions    53,042    47,805     -9.9%
+   h2 (both drivers)        allocations         66        48    -18 per request
+   https (io_uring)         instructions    46,789    46,836    +0.1% (noise; no change on this path)
+   idle-https (io_uring)    heap bytes      12,400    10,784    -1,616 per connection (-13.0%)
+   idle-https (epoll)       heap bytes      12,436    10,821    -1,615 per connection (-13.0%)
+   idle-https (io_uring)    RSS bytes       12,739    11,123    -12.7%
+
+   `h2` is a giong-http client and server in one thread, GET /json over HTTP/2: its counts
+   are of both ends. The server's own share, from dhat (below), went from 23 allocations
+   per request to 5, of which 3 are the handler's (`Response::header`, three headers), as
+   over HTTP/1.1.
+
+   The h2 instruction count now moves by up to 0.6% between rounds (io_uring 49,160 to
+   49,371, epoll 47,728 to 48,026; before, 0.03%). The difference is inside glibc malloc
+   (malloc_consolidate, _int_malloc): with the stream memory kept, which free chunks
+   glibc merges depends on the order in which buffers come back, which depends on
+   timing. The allocation count does not move (48.000 / 48.001), and the median of the
+   rounds stays well inside the 1% limit.
+
+2. Where the server's HTTP/2 allocations went (valgrind --tool=dhat on
+   `bench-instr run h2 4000 500`, blocks per request, server side only)
+
+   before                                                         after
+    4  h2::request::Builder::field (header lines Vec growing)      0  (buffer reused)
+    3  h2::request::Builder::set_pseudo (pseudo-header Vec)         0  (same buffer)
+    2  h2::request::Builder::finish (head Vec + Rc)                 2
+    2  Session::open (stream slots, ids, after release)             0
+    1  Session::open_request (starts queue)                         0
+    2  Session::remove (free list, events)                          0
+    1  Session::enqueue (send queue)                                0
+    2  Wakers::get (slot waker Arc + slots Vec)                     0
+    2  Session::respond (content-length String, header name Vec)    0
+    1  serve (handlers' Vec)                                        0
+    3  the handler's three Response::header calls                   3
+   --                                                              --
+   23                                                               5
+
+   The connection gave back the memory for its streams every time its last stream
+   closed (`Session::release`), so with one request at a time, the usual case for a
+   keep-alive client, every request allocated it again. It is now kept until the
+   connection has been idle for one second (`KEEP_STREAMS`), then given back from the
+   timer the connection already has: an idle connection holds what it held before.
+
+3. The connection task of serve_tls (rustc -Zprint-type-sizes, nightly, debug build of
+   bench-instr)
+
+   before: 4,528 bytes. The task kept the TLS stream (1,336 bytes) as a local even while
+   the HTTP state that owns a moved copy of it ran (a local that is borrowed keeps its
+   storage in the coroutine), plus the acceptor and TCP stream it captured.
+   after: 2,968 bytes. The handshake runs in a HeapFuture that owns the acceptor, the TCP
+   stream and what the connection needs afterwards, reads the protocol and peer address,
+   and returns them; the task captures only that future. The handshake's own state
+   (3,576 bytes) is on the heap for the length of the handshake only.
+
+   The rest of an idle HTTPS connection is rustls's: the 4 KiB receive buffer it keeps
+   while idle, its write buffer and connection state. Releasing those needs rustls's
+   unbuffered API (ROADMAP 1.5), not part of this change.
