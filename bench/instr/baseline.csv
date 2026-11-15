@@ -29,8 +29,8 @@ io_uring,http1,instructions,11143.7,1
 io_uring,http1,allocations,3.000,1
 io_uring,http1-client,instructions,33946.6,1
 io_uring,http1-client,allocations,33.016,1
-io_uring,h2,instructions,54765.2,1
-io_uring,h2,allocations,66.001,1
+io_uring,h2,instructions,49178.1,1
+io_uring,h2,allocations,48.000,1
 io_uring,https,instructions,46788.8,1
 io_uring,https,allocations,39.069,1
 io_uring,web,instructions,15259.7,1
@@ -47,8 +47,8 @@ io_uring,idle-http1,allocations,4.030,1
 io_uring,idle-h2,heap_bytes,4165.8,2
 io_uring,idle-h2,rss_bytes,4306.9,10
 io_uring,idle-h2,allocations,8.040,1
-io_uring,idle-https,heap_bytes,12399.8,2
-io_uring,idle-https,rss_bytes,12738.6,10
+io_uring,idle-https,heap_bytes,10783.8,2
+io_uring,idle-https,rss_bytes,11122.7,10
 io_uring,idle-https,allocations,217.210,1
 epoll,spawn,instructions,1837.4,1
 epoll,spawn,allocations,3.000,1
@@ -70,8 +70,8 @@ epoll,http1,instructions,10021.5,1
 epoll,http1,allocations,3.000,1
 epoll,http1-client,instructions,32653.6,1
 epoll,http1-client,allocations,33.000,1
-epoll,h2,instructions,53041.6,1
-epoll,h2,allocations,66.001,1
+epoll,h2,instructions,47805.4,1
+epoll,h2,allocations,48.001,1
 epoll,https,instructions,45184.7,1
 epoll,https,allocations,39.000,1
 epoll,web,instructions,14135.6,1
@@ -88,6 +88,6 @@ epoll,idle-http1,allocations,5.030,1
 epoll,idle-h2,heap_bytes,4231.6,2
 epoll,idle-h2,rss_bytes,4337.7,10
 epoll,idle-h2,allocations,8.040,1
-epoll,idle-https,heap_bytes,12436.1,2
-epoll,idle-https,rss_bytes,12697.6,10
+epoll,idle-https,heap_bytes,10821.1,2
+epoll,idle-https,rss_bytes,11085.8,10
 epoll,idle-https,allocations,217.120,1

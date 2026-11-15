@@ -19,6 +19,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   clocks, and long runs of months of simulated uptime that check nothing grows per
   request. It needs no change to the crate itself and covers the epoll driver only, not
   io_uring, the kernel or the NIC. `scripts/check.sh sim` runs it; see `sim/README.md`.
+- **CI**: Kani proofs of the `unsafe` core, in a new `kani` job and
+  `scripts/check.sh kani` (docs/kani.md): the slab (any state up to 5 slots), the receive
+  buffer pool against a model of the kernel's buffer rings (any state of 2 buffers, on
+  epoll, the whole ring and the packed ring: no buffer both lent to the kernel and held,
+  lent twice or lost), the lifetime of an io_uring single-shot operation across cancel,
+  completion and a zero-copy notification (every order of events), and `KernelBox`. No bug
+  found; each proof caught a planted one. The driver's single-shot lifecycle functions now
+  take the slab and the graveyard as arguments and are generic over the entry and leftover
+  types, so the proofs run the driver's own code; no behaviour change, and the instruction
+  counts are unchanged.
 
 ### Security
 
@@ -49,6 +59,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-http** (performance): HTTP/2 requests allocate less, and idle HTTPS connections hold
+  less memory. An HTTP/2 request made 20 heap allocations in the server besides its
+  handler's, now 2 (the request's head and its shared handle). An HTTP/2 connection used to
+  give back the memory for its streams (their slots, wakers and queues) each time its last
+  stream closed, and allocate it again for the next request. It now keeps it until the
+  connection has been idle for a second. The header fields of each request are decoded into
+  a buffer the connection reuses, and `content-length` is written without an allocation.
+  Measured with `bench/instr` (a giong-http client and server, `GET /json` over HTTP/2):
+  66 allocations per request for both ends, now 48, and about 10% fewer instructions. Over
+  TLS, the handshake now runs on the heap for its length only, and the connection's task
+  no longer holds the TLS stream twice: an idle HTTPS connection holds 10,784 bytes
+  instead of 12,400 (rustls, in the process, `idle-https` case). Method, raw rounds and
+  where each allocation went: `bench/results/h2-allocs/`.
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
   READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are now compiled by
   `cargo test -p rest-api --doc`, and run where they need no server; 11 of the 34 did not

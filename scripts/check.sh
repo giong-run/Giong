@@ -19,6 +19,11 @@
 #                               with the rust-src component)
 #   scripts/check.sh loom       model-check the wake-up handshakes (src/notify.rs)
 #                               with loom, then run the same race on this CPU
+#   scripts/check.sh kani       prove the unsafe core with the Kani model checker
+#                               (`cargo install --locked kani-verifier --version
+#                               0.68.0 && cargo kani setup`): the slab, the
+#                               receive buffer pool, KernelBox and the lifetime
+#                               of an io_uring operation (docs/kani.md)
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
 #                               driver state (tests/soak.rs)
@@ -30,7 +35,7 @@
 #                               scenarios, months of simulated uptime, and this
 #                               crate's tests on it without faults and then with
 #                               loopback faults for SIM_SEEDS seeds (default 3)
-#   scripts/check.sh all        everything above except seccomp, soak, miri and sim
+#   scripts/check.sh all        everything above except seccomp, soak, miri, kani and sim
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -158,6 +163,18 @@ run_sim() {
     )
 }
 
+run_kani() {
+    # Every `#[kani::proof]` in the core crate; each one's module docs say
+    # what it proves and within which bounds. Kani compiles with its own
+    # nightly and sets `cfg(kani)`, which the proofs live under.
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/kani"
+    # The operation lifecycle proof alone: next to another proof it can
+    # exhaust a 16 GB machine. The others in parallel with KANI_JOBS.
+    cargo kani --lib -p giong --output-format terse --harness driver::uring::proofs
+    cargo kani --lib -p giong --output-format terse ${KANI_JOBS:+-j "$KANI_JOBS"} \
+        --harness slab::proofs --harness kbox::proofs --harness buf::proofs
+}
+
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback "${2:-all}" ;;
@@ -167,8 +184,9 @@ case "${1:-all}" in
     loom) run_loom ;;
     soak) run_soak ;;
     miri) run_miri ;;
+    kani) run_kani ;;
     sim) run_sim ;;
     all) run_test; run_fallback all; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|sim|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|kani|sim|all]" >&2; exit 2 ;;
 esac
 echo "ok"

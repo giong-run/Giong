@@ -104,6 +104,10 @@ const WINDOW_UPDATES_PER_DATA: u32 = 10;
 /// After an error, how long the connection keeps reading (and discarding)
 /// so that the client sees the GOAWAY rather than a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
+/// How long an idle connection keeps the memory for its streams (slots,
+/// wakers, queues, the header buffer) after its last stream closed, so that
+/// requests following one another allocate none of it again.
+const KEEP_STREAMS: Duration = Duration::from_secs(1);
 
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
 /// request bodies, and of responses not sent yet.
@@ -401,7 +405,8 @@ pub(crate) struct Session {
     pub(crate) wakers: Wakers,
     /// Since when no stream has been open.
     idle_since: Instant,
-    /// Lowercased header names, reused.
+    /// A buffer reused for lowercased response header names, and for the
+    /// fields of a request header block while it is decoded.
     name: Vec<u8>,
 }
 
@@ -475,8 +480,9 @@ impl Session {
         }
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<Event> {
-        mem::take(&mut self.events)
+    /// The next handler to drop, in no particular order.
+    pub(crate) fn pop_event(&mut self) -> Option<Event> {
+        self.events.pop()
     }
 
     /// Handlers wait: the connection holds as many response bytes as it
@@ -969,10 +975,12 @@ impl Session {
                 self.remote_end(slot)
             }
             Purpose::Open { refuse } => {
-                let mut builder = Builder::new(self.cfg.max_head_size);
-                self.decoder
-                    .decode(fragment, |n, v| builder.field(n, v))
-                    .map_err(compression)?;
+                let mut builder =
+                    Builder::with_scratch(self.cfg.max_head_size, mem::take(&mut self.name));
+                let decoded = self.decoder.decode(fragment, |n, v| builder.field(n, v));
+                let built = builder.finish(self.peer);
+                self.name = builder.into_scratch();
+                decoded.map_err(compression)?;
                 if refuse {
                     return self.reset_closed(id, Reason::Protocol);
                 }
@@ -983,7 +991,7 @@ impl Session {
                     // Not processed: the client sends it again later.
                     return self.reset_closed(id, Reason::RefusedStream);
                 }
-                match builder.finish(self.peer) {
+                match built {
                     Built::Malformed(_) => self.reset_closed(id, Reason::Protocol),
                     Built::Status(status) => {
                         let slot = self.open(id, end_stream, None, false);
@@ -1538,10 +1546,10 @@ impl Session {
         self.encoder
             .field(b"date", &crate::date::now(), Index::Yes, &mut block);
         if !bodiless && !streaming {
-            let mut digits = itoa(body.len());
+            let mut digits = [0; 20];
+            let digits = itoa(body.len(), &mut digits);
             self.encoder
-                .field(b"content-length", digits.as_bytes(), Index::No, &mut block);
-            digits.clear();
+                .field(b"content-length", digits, Index::No, &mut block);
         }
         let mut name = mem::take(&mut self.name);
         for (n, v) in resp.headers() {
@@ -1880,8 +1888,13 @@ impl Session {
         if let Some(block) = &self.block {
             at(block.deadline);
         }
-        if self.ids.is_empty() && self.goaway.is_none() {
-            at(self.idle_since + self.cfg.idle_timeout);
+        if self.ids.is_empty() {
+            if self.goaway.is_none() {
+                at(self.idle_since + self.cfg.idle_timeout);
+            }
+            if self.keeps_streams() {
+                at(self.idle_since + KEEP_STREAMS);
+            }
         }
         for &(_, slot) in &self.ids {
             if let Some(st) = &self.streams[slot] {
@@ -1903,6 +1916,9 @@ impl Session {
                 "a header block was not finished within the request timeout",
             ));
             return;
+        }
+        if self.ids.is_empty() && self.keeps_streams() && self.idle_since + KEEP_STREAMS <= now {
+            self.release_streams();
         }
         if self.ids.is_empty()
             && self.goaway.is_none()
@@ -1955,13 +1971,24 @@ impl Session {
             + self.streams.capacity() * mem::size_of::<Option<Stream>>()
     }
 
-    /// With no stream open: gives back the output buffer if it is empty,
-    /// and the memory kept for streams, so that an idle connection holds
-    /// little more than its HPACK tables.
+    /// With no stream open: gives back the output buffer if it is empty.
     pub(crate) fn release(&mut self) {
         if self.out.is_empty() && self.out.capacity() > 0 {
             give_buffer(mem::take(&mut self.out));
         }
+    }
+
+    /// Memory for streams is kept: the connection has had streams, and has
+    /// not been idle for `KEEP_STREAMS` yet.
+    pub(crate) fn keeps_streams(&self) -> bool {
+        self.streams.capacity() > 0
+    }
+
+    /// With no stream open: gives back the memory kept for streams, so that
+    /// an idle connection holds little more than its HPACK tables. Kept
+    /// while requests follow one another, which then allocate nothing for
+    /// it; given back once the connection has been idle for `KEEP_STREAMS`.
+    fn release_streams(&mut self) {
         if self.ids.is_empty() && self.events.is_empty() && self.streams.capacity() > 0 {
             self.streams = Vec::new();
             self.free = Vec::new();
@@ -2031,13 +2058,22 @@ fn poll_file(
     }
 }
 
-fn itoa(n: usize) -> String {
-    n.to_string()
+/// The decimal digits of `n`, written at the end of `buf`.
+fn itoa(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return &buf[at..];
+        }
+    }
 }
 
 /// Drops the handlers of the streams that are gone.
 fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
-    for event in s.take_events() {
+    while let Some(event) = s.pop_event() {
         let Event::Stop(slot) = event;
         if let Some(task) = tasks.get_mut(slot) {
             drop_quietly(task.take());
@@ -2181,9 +2217,10 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             break;
         }
         if write.is_none() && s.open_streams() == 0 {
-            // Idle: hand the buffers back.
+            // Idle: hand the buffers back, and the memory for streams once
+            // the session has (see `release_streams`).
             s.release();
-            if tasks.capacity() > 0 {
+            if !s.keeps_streams() && tasks.capacity() > 0 {
                 tasks = Vec::new();
             }
         }
@@ -2300,6 +2337,44 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         match giong::time::timeout(left, io.recv()).await {
             Ok(Ok(chunk)) if !chunk.is_empty() => {}
             _ => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_memory_is_kept_while_requests_follow_and_released_when_idle() {
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        let slot = s.open(1, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        let idle = s.idle_since;
+        // The next request reuses the slot: nothing is allocated for it.
+        assert!(s.keeps_streams());
+        assert_eq!(s.next_deadline(), Some(idle + KEEP_STREAMS));
+        let streams = s.streams.as_ptr();
+        let slot = s.open(3, true, None, false);
+        assert_eq!(s.streams.as_ptr(), streams);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        let idle = s.idle_since;
+        s.on_timer(idle + KEEP_STREAMS / 2);
+        assert!(s.keeps_streams());
+        // Idle long enough: given back, and no wake-up is due for it.
+        s.on_timer(idle + KEEP_STREAMS);
+        assert!(!s.keeps_streams());
+        assert_eq!(s.streams.capacity(), 0);
+        assert_eq!(s.next_deadline(), Some(idle + s.cfg.idle_timeout));
+    }
+
+    #[test]
+    fn content_lengths_are_written_in_decimal() {
+        let mut buf = [0; 20];
+        for n in [0, 7, 10, 1234, 4096, usize::MAX] {
+            assert_eq!(itoa(n, &mut buf), n.to_string().as_bytes());
         }
     }
 }

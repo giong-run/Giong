@@ -670,12 +670,32 @@ jobs:
           retention-days: 14
           overwrite: true
 
+  # Proofs with the Kani model checker for the unsafe core: the slab, the
+  # receive buffer pool against a model of the kernel's buffer rings,
+  # KernelBox, and the lifetime of an io_uring operation across cancel and
+  # completion (docs/kani.md says what each proves and within which bounds).
+  # Kani's version is pinned: it brings its own nightly compiler and CBMC.
+  kani:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      # Two proofs at a time where they fit the runner's 16 GB (check.sh runs
+      # the largest alone).
+      - run: KANI_JOBS=2 scripts/check.sh kani
+
   # Every job of this workflow passed. One name to require on main, so that
-  # the jobs that are not required by themselves (Miri, the kernels, Docker,
-  # the other server versions, loom, h2spec, the lowest dependency versions,
-  # the simulation) hold a merge back as well.
+  # the jobs that are not required by themselves (Miri, Kani, the kernels,
+  # Docker, the other server versions, loom, h2spec, the lowest dependency
+  # versions, the simulation) hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, sim]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim]
     if: always()
     runs-on: ubuntu-24.04
     steps:
