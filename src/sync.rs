@@ -9,8 +9,12 @@ mod bounded;
 pub mod oneshot;
 
 pub mod mpsc {
-    //! Multi-producer, single-consumer channels: [`channel`] is unbounded,
-    //! [`bounded`] holds a fixed number of values and makes senders wait.
+    //! Multi-producer, single-consumer channels: [`unbounded`] takes every
+    //! value it is sent, [`bounded`] holds a fixed number of values and makes
+    //! senders wait.
+    //!
+    //! Tokio's `mpsc::channel(n)` is [`bounded`]`(n)` here, and its
+    //! `unbounded_channel()` is [`unbounded`]`()`.
 
     pub use super::bounded::{bounded, BoundedReceiver, BoundedSender, TrySendError};
 
@@ -35,8 +39,10 @@ pub mod mpsc {
         }
     }
 
-    /// Creates an unbounded channel.
-    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    /// Creates an unbounded channel: [`Sender::send`] never waits, and
+    /// values queue up until the receiver takes them. Use [`bounded`] when
+    /// the senders can outrun the receiver.
+    pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         let shared = Arc::new(Shared(Mutex::new(State {
             queue: VecDeque::new(),
             rx_waker: None,
@@ -49,6 +55,16 @@ pub mod mpsc {
             },
             Receiver { shared },
         )
+    }
+
+    /// Creates an unbounded channel.
+    #[deprecated(
+        since = "0.9.0",
+        note = "renamed unbounded(), so that it is not taken for Tokio's bounded \
+                channel(n), which is bounded(n) here; it goes in 1.0.0"
+    )]
+    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+        unbounded()
     }
 
     /// The sending half. Cheap to clone; `Send` when `T` is.

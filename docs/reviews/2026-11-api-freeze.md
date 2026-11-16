@@ -129,7 +129,7 @@ release pull request of 1.0.0-rc.1 removes every deprecated item.
 | giong-postgres's `Config::dbname`, `database` in giong-mysql and giong-redis | **Changed** to `database`; `dbname` deprecated. The URL parameter stays `dbname`, as in libpq. |
 | giong-http's client `RequestBuilder::header` took `&str` for the value, the server's `Response::header` takes `impl AsRef<str>` | **Changed** to `impl AsRef<str>`; a call passing `&str` or `&String` compiles as before (`cargo-semver-checks` reports no break), one that relied on `&str` to infer a type (`.as_ref()`, `.into()`) has to name it. |
 | giong-web's middleware order is the reverse of axum's, which code ported from axum gets wrong silently | **Kept** (first added is outermost reads in order), and **documented** on `Router::layer` and in the README. |
-| giong's `sync::mpsc::channel()` is unbounded under the name every other runtime gives a bounded channel | **Changed**: `unbounded()` added and `channel()` deprecated, in a pull request held until the 72-hour soak ends, because it is in the core crate. |
+| giong's `sync::mpsc::channel()` is unbounded under the name Tokio gives its bounded channel, `channel(n)`, so code ported from Tokio or written from memory of it reaches for the wrong one | **Changed**: `unbounded()` added and `channel()` deprecated, in a pull request held until the 72-hour soak ends, because it is in the core crate. |
 
 ## Still open
 

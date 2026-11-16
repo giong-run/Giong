@@ -49,6 +49,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
   giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
   server).
+- **giong**: `sync::mpsc::unbounded()`, the new name of `sync::mpsc::channel()`. Tokio's
+  `mpsc::channel(n)` is bounded, so code ported from Tokio, or written from memory of it,
+  took giong's `channel()` for a bounded channel; `bounded(n)` is that one here.
 - **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
   parameter is still `dbname`, as libpq spells it.
 
@@ -72,6 +75,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
   giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
   that names the new method, and go in 1.0.0-rc.1.
+- **giong**: `sync::mpsc::channel()`, renamed `unbounded()`; it goes in 1.0.0-rc.1 too.
 
 ### Fixed
 

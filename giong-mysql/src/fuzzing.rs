@@ -366,7 +366,7 @@ type Job = ((VecDeque<Vec<u8>>, [u8; 2]), mpsc::Sender<()>);
 fn runtime() -> &'static Mutex<giong::sync::mpsc::Sender<Job>> {
     static JOBS: OnceLock<Mutex<giong::sync::mpsc::Sender<Job>>> = OnceLock::new();
     JOBS.get_or_init(|| {
-        let (tx, mut rx) = giong::sync::mpsc::channel::<Job>();
+        let (tx, mut rx) = giong::sync::mpsc::unbounded::<Job>();
         std::thread::spawn(move || {
             giong::Builder::new()
                 .workers(1)
