@@ -29,24 +29,39 @@ pub struct Server {
 /// An ACL user with every permission.
 pub const APP: (&str, &str) = ("app", "app-secret");
 
-static SERVER: OnceLock<Option<Server>> = OnceLock::new();
+static SERVER: OnceLock<Option<Result<Server, String>>> = OnceLock::new();
 static PID: AtomicI32 = AtomicI32::new(0);
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The server, or `None` (after saying why) when Redis is not installed.
+///
+/// It is started once. If that fails, every test fails with the reason:
+/// a panic inside `get_or_init` would leave it unset, and the next test
+/// would start a second server (and fail on something unrelated).
 pub fn server() -> Option<&'static Server> {
-    SERVER
-        .get_or_init(|| {
-            let Some(bin) = find_bin() else {
-                if std::env::var_os("GIONG_REDIS_REQUIRED").is_some_and(|v| v == "1") {
-                    panic!("GIONG_REDIS_REQUIRED=1 but redis-server was not found; set GIONG_REDIS_BIN");
-                }
-                eprintln!("skipping: redis-server not found (set GIONG_REDIS_BIN)");
-                return None;
-            };
-            Some(start(bin))
-        })
-        .as_ref()
+    let started = SERVER.get_or_init(|| {
+        let Some(bin) = find_bin() else {
+            if std::env::var_os("GIONG_REDIS_REQUIRED").is_some_and(|v| v == "1") {
+                panic!(
+                    "GIONG_REDIS_REQUIRED=1 but redis-server was not found; set GIONG_REDIS_BIN"
+                );
+            }
+            eprintln!("skipping: redis-server not found (set GIONG_REDIS_BIN)");
+            return None;
+        };
+        Some(std::panic::catch_unwind(|| start(bin)).map_err(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_default()
+        }))
+    });
+    match started {
+        None => None,
+        Some(Ok(server)) => Some(server),
+        Some(Err(why)) => panic!("the test server failed to start: {why}"),
+    }
 }
 
 impl Server {
@@ -103,6 +118,7 @@ extern "C" fn stop_server() {
     }
 }
 
+/// A port nothing listens on now (from the kernel's ephemeral range).
 pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -110,6 +126,43 @@ pub fn free_port() -> u16 {
         .unwrap()
         .port()
 }
+
+/// A port for the server that nothing listens on now, below the kernel's
+/// ephemeral range.
+///
+/// Redis cannot be told to pick a port itself and say which (`--port 0`
+/// turns TCP off), so the test picks one and the server binds it a moment
+/// later. A port from the ephemeral range, as `free_port` gives, can be
+/// taken in that moment by any socket of the tests or of another job on
+/// the machine: Valkey 8.0 then failed to bind its TLS port and aborted, in
+/// a merge-queue run. Ports below the range are given out only on request,
+/// and the server is started again on other ports if one is taken anyway.
+fn server_port(taken: &[u16]) -> u16 {
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse::<u16>().ok())
+        .unwrap_or(32768);
+    let (from, to) = (10_000u16, low.max(11_000));
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos()
+        ^ std::process::id().wrapping_mul(2_654_435_761);
+    loop {
+        // xorshift: any spread will do.
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let port = from + (seed % u32::from(to - from)) as u16;
+        if !taken.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// Times the server is started on new ports when one of its ports was
+/// taken before it could bind it.
+const START_ATTEMPTS: usize = 5;
 
 fn start(bin: PathBuf) -> Server {
     let stamp = std::time::SystemTime::now()
@@ -120,7 +173,8 @@ fn start(bin: PathBuf) -> Server {
     // Short: the socket's path must fit in 107 bytes.
     let dir = std::env::temp_dir().join(format!("giong-rd-{}-{stamp}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    DIR.set(dir.clone()).unwrap();
+    DIR.set(dir.clone())
+        .expect("the test server is started once per binary");
     // SAFETY: registering a plain function to run at exit.
     unsafe { libc::atexit(stop_server) };
 
@@ -141,11 +195,57 @@ fn start(bin: PathBuf) -> Server {
     std::fs::write(dir.join("server.pem"), server_cert.pem()).unwrap();
     std::fs::write(dir.join("server.key"), server_key.serialize_pem()).unwrap();
 
-    let port = free_port();
-    let tls_port = free_port();
     let socket = dir.join("redis.sock");
-    let log = std::fs::File::create(dir.join("server.log")).unwrap();
-    let mut cmd = Command::new(&bin);
+    let debug = major_version(&bin) >= 7;
+    let mut taken = Vec::new();
+    let (port, tls_port, name, version) = loop {
+        let port = server_port(&taken);
+        let tls_port = server_port(&[&taken[..], &[port]].concat());
+        taken.extend([port, tls_port]);
+        match launch(&bin, &dir, &socket, port, tls_port, debug) {
+            Ok((name, version)) => break (port, tls_port, name, version),
+            Err(log)
+                if log.contains("Address already in use") && taken.len() < 2 * START_ATTEMPTS =>
+            {
+                eprintln!("redis-server: port {port} or {tls_port} was taken; trying others");
+            }
+            Err(log) => panic!("redis-server did not start: {log}"),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "redis-server made no Unix socket"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Server {
+        port,
+        tls_port,
+        socket,
+        ca_pem: ca.pem().into_bytes(),
+        name,
+        version,
+        dir,
+    }
+}
+
+/// Starts `redis-server` on `port` and `tls_port` and waits until it
+/// answers, giving its name and version; or, if it exits first, its log.
+fn launch(
+    bin: &std::path::Path,
+    dir: &std::path::Path,
+    socket: &std::path::Path,
+    port: u16,
+    tls_port: u16,
+    debug: bool,
+) -> Result<(String, String), String> {
+    // A failed attempt may leave its socket behind.
+    let _ = std::fs::remove_file(socket);
+    let log_path = dir.join("server.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut cmd = Command::new(bin);
     cmd.args(["--port", &port.to_string()])
         .args(["--bind", "127.0.0.1"])
         .args(["--tls-port", &tls_port.to_string()])
@@ -157,10 +257,10 @@ fn start(bin: PathBuf) -> Server {
         .arg(dir.join("ca.pem"))
         .args(["--tls-auth-clients", "no"])
         .arg("--unixsocket")
-        .arg(&socket)
+        .arg(socket)
         .args(["--unixsocketperm", "700"])
         .arg("--dir")
-        .arg(&dir)
+        .arg(dir)
         .args(["--save", ""])
         .args(["--appendonly", "no"])
         .args(["--databases", "16"])
@@ -179,12 +279,14 @@ fn start(bin: PathBuf) -> Server {
         .stderr(Stdio::from(log));
     // DEBUG (for DEBUG SLEEP) is off by default since Redis 7.0, which added
     // this setting; Redis 6.2 does not know it, and allows DEBUG anyway.
-    if major_version(&bin) >= 7 {
+    if debug {
         cmd.args(["--enable-debug-command", "yes"]);
     }
     // The server dies with the thread that started it, even when the test
-    // binary is killed; the thread waits for it, so lives as long as it.
-    let (tx, rx) = std::sync::mpsc::channel();
+    // binary is killed; the thread waits for it, so lives as long as it, and
+    // says when it exits.
+    let (started_tx, started) = std::sync::mpsc::channel();
+    let (exited_tx, exited) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::os::unix::process::CommandExt;
         // SAFETY: prctl is async-signal-safe and touches only this process.
@@ -195,16 +297,19 @@ fn start(bin: PathBuf) -> Server {
             });
         }
         let mut child = cmd.spawn().expect("start redis-server");
-        tx.send(child.id()).unwrap();
+        started_tx.send(child.id()).unwrap();
         let _ = child.wait();
+        let _ = exited_tx.send(());
     });
-    PID.store(rx.recv().unwrap() as i32, Ordering::SeqCst);
+    PID.store(started.recv().unwrap() as i32, Ordering::SeqCst);
 
     let deadline = Instant::now() + Duration::from_secs(20);
-    // Valkey keeps `redis_version` at the Redis release it is compatible with
-    // (7.2.4 for Valkey 8.0) and adds `server_name` and `valkey_version`,
-    // which are what its `HELLO` reports. Redis has neither.
-    let (name, version) = loop {
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    loop {
+        // Valkey keeps `redis_version` at the Redis release it is compatible
+        // with (7.2.4 for Valkey 8.0) and adds `server_name` and
+        // `valkey_version`, which are what its `HELLO` reports. Redis has
+        // neither.
         if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
             use std::io::{Read, Write};
             s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -218,36 +323,22 @@ fn start(bin: PathBuf) -> Server {
                             .map(|v| v.trim().to_owned())
                     };
                     if let Some(redis_version) = field("redis_version:") {
-                        break (
+                        return Ok((
                             field("server_name:").unwrap_or_else(|| "redis".to_owned()),
                             field("valkey_version:").unwrap_or(redis_version),
-                        );
+                        ));
                     }
                 }
             }
         }
-        assert!(
-            Instant::now() < deadline,
-            "redis-server did not start: {}",
-            std::fs::read_to_string(dir.join("server.log")).unwrap_or_default()
-        );
+        if exited.try_recv().is_ok() {
+            PID.store(0, Ordering::SeqCst);
+            return Err(log());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("no answer within 20 s: {}", log()));
+        }
         std::thread::sleep(Duration::from_millis(50));
-    };
-    while !socket.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "redis-server made no Unix socket"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    Server {
-        port,
-        tls_port,
-        socket,
-        ca_pem: ca.pem().into_bytes(),
-        name,
-        version,
-        dir,
     }
 }
 
