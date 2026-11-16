@@ -150,7 +150,12 @@ fn soak(days: u64, jumps: bool) -> Outcome {
                                 );
                                 true
                             }
-                            Err(_) => false,
+                            // Benign faults never show as errors: fail at
+                            // once, so that the trace shows how it came.
+                            Err(e) => {
+                                assert!(jumps, "{path} at {:?}: {e}", start.elapsed());
+                                false
+                            }
                         }
                     })
                 })

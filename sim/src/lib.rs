@@ -56,6 +56,11 @@ pub struct Faults {
     pub connect_refuse: f64,
     /// A SYN is lost (retried after 1, 2, 4 ... s, as Linux does).
     pub connect_drop: f64,
+    /// At most this many SYNs of one connection attempt are lost. Four
+    /// losses in a row already take 15 s, past any sensible connect
+    /// timeout, so a correct program would report an error: `benign`
+    /// allows 3 (at most 7 s late), `hostile` 7 (the connect times out).
+    pub connect_drop_max: u32,
     /// `accept` finds the connection already reset (ECONNABORTED).
     pub accept_abort: f64,
     pub udp_loss: f64,
@@ -93,6 +98,7 @@ impl Faults {
             tcp_reset: 0.0,
             connect_refuse: 0.0,
             connect_drop: 0.0,
+            connect_drop_max: 3,
             accept_abort: 0.0,
             udp_loss: 0.0,
             udp_dup: 0.0,
@@ -128,7 +134,7 @@ impl Faults {
 
     /// Faults a real network shows to a correct program without any
     /// operation failing: delays, split and lost segments (retransmitted),
-    /// lost SYNs, duplicated and reordered datagrams, short reads and
+    /// lost SYNs (at most three in a row), duplicated and reordered datagrams, short reads and
     /// writes, plus everything in [`Faults::loopback`].
     pub fn benign() -> Self {
         Faults {
@@ -153,6 +159,7 @@ impl Faults {
         Faults {
             tcp_reset: 0.01,
             connect_refuse: 0.02,
+            connect_drop_max: 7,
             accept_abort: 0.02,
             udp_loss: 0.05,
             clock_jump: 0.0005,
@@ -191,12 +198,19 @@ pub struct Report {
 }
 
 impl Report {
-    /// The first step where two runs differ, if any.
+    /// The first step where two runs differ, if any. Steps are known only
+    /// for runs with [`Sim::full_trace`]; without it, two runs that differ
+    /// report the first step after what both recorded.
     pub fn first_difference(&self, other: &Report) -> Option<u64> {
         let n = self.step_hashes.len().min(other.step_hashes.len());
         (0..n)
             .find(|i| self.step_hashes[*i] != other.step_hashes[*i])
-            .or_else(|| (self.step_hashes.len() != other.step_hashes.len()).then_some(n))
+            .or_else(|| {
+                (self.step_hashes.len() != other.step_hashes.len()
+                    || self.hash != other.hash
+                    || self.steps != other.steps)
+                    .then_some(n)
+            })
             .map(|i| i as u64)
     }
 }

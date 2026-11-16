@@ -75,6 +75,36 @@ fn disk(g: Guard, me: Tid, fd: c_int, what: &str, writes: bool) -> (Guard, Optio
     (g, inject, id)
 }
 
+/// Files that tell a process how much memory is left (giong-http's
+/// low-memory refusal reads them). Inside a run they do not exist: what the
+/// host has free must not decide a simulated run, which would then differ
+/// from machine to machine, and could be refused because the simulation
+/// itself takes the host's memory.
+fn hides(path: &[u8]) -> bool {
+    path == b"/proc/meminfo"
+        || path == b"/proc/self/cgroup"
+        || path == b"/sys/fs/cgroup"
+        || path.starts_with(b"/sys/fs/cgroup/")
+}
+
+/// `open` and `open64` (what the standard library's `File::open` calls):
+/// the memory files are hidden inside a run, everything else is opened as
+/// usual, without a step.
+pub(crate) unsafe fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    if world::enter().is_some() && hides(CStr::from_ptr(path).to_bytes()) {
+        return fail(libc::ENOENT) as c_int;
+    }
+    libc_ret(syscall6(
+        libc::SYS_openat,
+        libc::AT_FDCWD as i64,
+        path as i64,
+        flags as i64,
+        mode as i64,
+        0,
+        0,
+    )) as c_int
+}
+
 pub(crate) unsafe fn openat(dir: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     let real = || {
         libc_ret(syscall6(
@@ -91,6 +121,9 @@ pub(crate) unsafe fn openat(dir: c_int, path: *const c_char, flags: c_int, mode:
         return real();
     };
     let w = g.as_mut().unwrap();
+    if hides(CStr::from_ptr(path).to_bytes()) {
+        return fail(libc::ENOENT) as c_int;
+    }
     let p = CStr::from_ptr(path).to_string_lossy();
     let matches = match &w.faults.disk_prefix {
         Some(prefix) => p.starts_with(prefix.as_str()),

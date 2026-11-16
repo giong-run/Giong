@@ -1882,6 +1882,18 @@ pub unsafe extern "C" fn openat(
     files::openat(dir, path, flags, mode)
 }
 
+// `open` is variadic in C; on x86-64 the mode arrives in the third
+// argument register either way, and is only read with O_CREAT/O_TMPFILE.
+#[no_mangle]
+pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    files::open(path, flags, mode)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn open64(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    files::open(path, flags, mode)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pread64(
     fd: c_int,

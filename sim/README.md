@@ -46,7 +46,7 @@ compares runs; `Report::first_difference` finds where two runs part.
 |---|---|---|
 | `none` | nothing | passes |
 | `loopback` | jittery delivery, spurious `EAGAIN` on non-blocking calls, spurious wake-ups of `epoll_wait` and futex waits, preemption | passes: this is what a real loopback interface can show |
-| `benign` | `loopback` plus split, lost (retransmitted) and delayed segments, lost SYNs (retried), short reads and writes, duplicated and reordered datagrams | passes, with no error showing |
+| `benign` | `loopback` plus split, lost (retransmitted) and delayed segments, lost SYNs (retried, at most three in a row), short reads and writes, duplicated and reordered datagrams | passes, with no error showing |
 | `hostile` | `benign` plus resets, refused connects, aborted accepts, lost datagrams, the monotonic clock jumping forward (a stalled host) | reports errors; never hangs, panics, leaks or gives a wrong answer |
 
 `Faults::disk(prefix, error, full, slow)` adds disk faults for files under
@@ -102,6 +102,10 @@ long runs replays with `GIONG_SIM_SEED=<seed> GIONG_SIM_SOAK_DAYS=3650`.
 - **Signals, control messages, FIFOs and pipes, and real blocking calls.**
   The tests that need them are skipped in `suite`, each with its reason.
 - **The wall clock.** `CLOCK_REALTIME` starts at 2030-01-01 in every run.
+- **Memory pressure.** Inside a run `/proc/meminfo`, `/proc/self/cgroup`
+  and `/sys/fs/cgroup` do not exist, so giong-http's low-memory refusal
+  (`Server::min_free_memory`) never refuses: what the host has free must not
+  decide a simulated run. The refusal has its own tests and CI job.
 - **Process-wide state.** Something set up on first use in a process (a
   `OnceLock` that reads the clock) makes its calls in the first run only; a
   sweep therefore starts with one run whose report it drops, so that every
@@ -123,6 +127,11 @@ runs under `loopback`.
 - A spurious `EAGAIN` must come with a new readiness edge: with
   edge-triggered epoll, real Linux never leaves queued data without one, and
   a runtime would wait forever.
+- Nothing may grow per step or per connection: a run of decades takes
+  billions of steps and millions of connections. Per-step hashes are kept
+  only with `full_trace`, and a connection is dropped once both of its
+  sockets have closed. The soak's memory stays at about 5 MB whatever its
+  length.
 - A deadlock aborts the process after its report, so `suite` runs each test
   in a child process.
 - Internal calls use raw `syscall` instructions, never libc, so the
