@@ -139,7 +139,7 @@ fn cache_key(id: i64) -> String {
 
 /// A user already taken: PostgreSQL's unique violation, as a `409`.
 fn conflict_or(err: giong_postgres::Error, email: &str) -> Error {
-    if err.code() == Some("23505") {
+    if err.server_code() == Some("23505") {
         Error::conflict(
             "email_taken",
             format!("a user with the email {email:?} exists already"),

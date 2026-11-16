@@ -182,7 +182,7 @@ impl<S: 'static> Middleware<S> for RequireAuth {
 }
 ```
 
-`next.run(req)` returns the `Response`, with an error from further in already turned into its problem+json answer, so a middleware sees and can change every response. Add them in this order, outermost first:
+`next.run(req)` returns the `Response`, with an error from further in already turned into its problem+json answer, so a middleware sees and can change every response. The first layer added is the outermost, the reverse of axum's `Router::layer` (where the last one added is): code ported from axum lists its layers the other way round. Add them in this order, outermost first:
 
 | Middleware | What it does | Defaults |
 |---|---|---|

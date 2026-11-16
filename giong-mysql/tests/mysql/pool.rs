@@ -136,7 +136,7 @@ fn connect_errors_are_reported_and_counted() {
     run(|s| async move {
         let pool = Pool::new(s.local().database("missing_db"), 2);
         let e = pool.query("SELECT 1", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some(1049), "{e}");
+        assert_eq!(e.server_code(), Some(1049), "{e}");
         assert_eq!(pool.stats().connect_errors, 1);
         assert_eq!(pool.stats().connections, 0);
     });

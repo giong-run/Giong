@@ -37,7 +37,7 @@ impl Bouncer {
             .host("127.0.0.1")
             .port(self.port)
             .user("postgres")
-            .dbname("postgres")
+            .database("postgres")
     }
 }
 
@@ -170,7 +170,7 @@ fn through_pgbouncer_the_statement_timeout_must_not_be_sent() {
         // PgBouncer refuses startup parameters it does not track.
         let e = Client::connect(&bouncer.config()).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
-        assert_eq!(e.code(), Some("08P01"), "{e}");
+        assert_eq!(e.server_code(), Some("08P01"), "{e}");
         let shown = e.to_string();
         assert!(shown.contains("statement_timeout(None)"), "{shown}");
         assert!(shown.contains("ALTER ROLE"), "{shown}");
@@ -226,7 +226,7 @@ fn through_pgbouncer_the_statement_timeout_comes_from_the_role() {
             assert_eq!(row.get::<&str>(0).unwrap(), "300ms");
         }
         let e = pool.query("SELECT pg_sleep(5)", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some("57014"), "{e}");
+        assert_eq!(e.server_code(), Some("57014"), "{e}");
         let errors = workload(&pool, "bouncer_role_log").await;
         assert!(errors.is_empty(), "{errors:?}");
         sleep(Duration::from_millis(1)).await;

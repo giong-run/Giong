@@ -59,7 +59,7 @@ impl Server {
             .host(self.socket_dir.to_str().unwrap())
             .port(self.port)
             .user("postgres")
-            .dbname("postgres")
+            .database("postgres")
     }
 
     /// A user over TCP to 127.0.0.1, without TLS.
@@ -69,7 +69,7 @@ impl Server {
             .port(self.port)
             .user(user)
             .password(password)
-            .dbname("postgres")
+            .database("postgres")
     }
 
     /// A user over TCP with TLS, trusting the test authority.
@@ -79,7 +79,7 @@ impl Server {
             .port(self.port)
             .user(user)
             .password(password)
-            .dbname("postgres")
+            .database("postgres")
             .tls(Tls::Verify(
                 TlsConnector::with_root_pem(&self.ca_pem).unwrap(),
             ))

@@ -42,13 +42,36 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   the pool's sweep, which runs every quarter of the shorter of the two settings (at most
   every 30 seconds), turns the mark into a time. `observe` snapshots and giong-mcp report
   `recycled` for the two pools.
+- **giong-postgres**, **giong-mysql**: `Error::server_code()`, the name giong-redis already
+  used for the code the server sent (`code()` named a different thing in each crate), and
+  `Error::is_transient()`, as giong-redis and giong-http's client have: true for a failed
+  connect, a closed connection, a pool timeout, and the server errors a retry can cure
+  (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
+  giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
+  server).
+- **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
+  parameter is still `dbname`, as libpq spells it.
 
 ### Changed
 
+- **giong-http**: the client's `RequestBuilder::header` takes `impl AsRef<str>` for the value,
+  as the server's `Response::header` does, so `.header("X-Id", id.to_string())` needs no `&`.
+  A call that passed a `&str` or `&String` compiles as before; one that relied on the
+  parameter being `&str` to infer a type (`value.as_ref()`, `.into()`) now needs `&str` written
+  out. `cargo-semver-checks` reports no break.
+- **Docs**: giong-web's `Router::layer` and README say that the first middleware added is
+  the outermost, the reverse of axum's `Router::layer`, so code ported from axum lists its
+  layers the other way round.
 - **Docs**: CONTRIBUTING.md lists every fuzz target (`response_body`, the PostgreSQL and
   MySQL `session` targets and the resolver's two were missing); giong-http's
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
+
+### Deprecated
+
+- **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
+  giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
+  that names the new method, and go in 1.0.0-rc.1.
 
 ### Fixed
 

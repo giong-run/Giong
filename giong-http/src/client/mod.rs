@@ -1306,7 +1306,12 @@ impl RequestBuilder {
     /// the headers that frame the message (`Content-Length`,
     /// `Transfer-Encoding`, `Connection`...) are the client's to set, and
     /// setting one is an error.
-    pub fn header(mut self, name: &str, value: &str) -> Self {
+    ///
+    /// The value is anything that reads as text, as for the server's
+    /// [`Response::header`](crate::Response::header): a `&str`, a `String`,
+    /// or `format!(..)` without `&`.
+    pub fn header(mut self, name: &str, value: impl AsRef<str>) -> Self {
+        let value = value.as_ref();
         if self.error.is_some() {
             return self;
         }

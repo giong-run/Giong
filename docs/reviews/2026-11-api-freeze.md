@@ -107,6 +107,30 @@ out; they are the rows added under giong-web, the database clients and giong-com
 only public API added since 0.7.0, giong-http's `Server::min_free_memory` and
 `GIONG-E1121`, follows the rules above (a byte count as `usize`, like `max_body_size`).
 
+## Tidied after 0.8.0
+
+A second pass on 2026-11-16 read the public API of all nine crates side by side (every
+public item, the 114 error codes, every `Default` and every exhaustive type), looking for
+names that differ between sibling crates, defaults that 1.x could only change by
+breaking someone, and anything the 1.1 to 1.5 plans would have to break. It found six
+items. Exhaustive enums and structs are only the ones decided above; every default is
+bounded but one; every error code has its page; nothing in the 1.x plans needs a break
+(`DriverKind`, `Version` and `Body` are `#[non_exhaustive]`, `Transport`'s methods have
+defaults).
+
+A rename is made by adding the new name and deprecating the old one in the 0.9 line, so
+code written against 0.8 keeps compiling and the warning names the new method; the
+release pull request of 1.0.0-rc.1 removes every deprecated item.
+
+| Item | Decision |
+|---|---|
+| `Error::code()` is the server's code in giong-postgres and giong-mysql, but giong-redis calls it `server_code()` (its `code()` is on `ServerError`, the counterpart of the other two's `DbError`) | **Changed**: `server_code()` in all three; `code()` deprecated in giong-postgres and giong-mysql. `DbError::code()` and redis's `ServerError::code()` keep their names. |
+| `Error::is_transient()` existed in giong-redis and giong-http's client only | **Added** to giong-postgres and giong-mysql, with the lists of retryable server codes in the docs. |
+| giong-postgres's `Config::dbname`, `database` in giong-mysql and giong-redis | **Changed** to `database`; `dbname` deprecated. The URL parameter stays `dbname`, as in libpq. |
+| giong-http's client `RequestBuilder::header` took `&str` for the value, the server's `Response::header` takes `impl AsRef<str>` | **Changed** to `impl AsRef<str>`; a call passing `&str` or `&String` compiles as before (`cargo-semver-checks` reports no break), one that relied on `&str` to infer a type (`.as_ref()`, `.into()`) has to name it. |
+| giong-web's middleware order is the reverse of axum's, which code ported from axum gets wrong silently | **Kept** (first added is outermost reads in order), and **documented** on `Router::layer` and in the README. |
+| giong's `sync::mpsc::channel()` is unbounded under the name every other runtime gives a bounded channel | **Changed**: `unbounded()` added and `channel()` deprecated, in a pull request held until the 72-hour soak ends, because it is in the core crate. |
+
 ## Still open
 
 The freeze is declared once real use in a service has reported back: what that turns up
