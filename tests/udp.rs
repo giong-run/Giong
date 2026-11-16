@@ -342,15 +342,12 @@ fn many_tasks_send_on_one_socket() {
 
 #[test]
 fn every_worker_can_bind_the_same_port() {
-    // A socket that a test running at the same time binds to 127.0.0.1 could
-    // get this port once the probe below has let it go, and the workers could
-    // not bind it. No other test binds to 127.0.0.2.
+    // No other test binds to 127.0.0.2, and the port is one the kernel never
+    // hands out for port 0: a socket of a test running at the same time,
+    // bound to port 0 of any address (0.0.0.0 included), cannot take it
+    // before the workers bind it.
     const ADDR: &str = "127.0.0.2";
-    // Reserve a port, then let three workers share it.
-    let port = {
-        let probe = std::net::UdpSocket::bind((ADDR, 0)).unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let port = port_outside_ephemeral_range([127, 0, 0, 2]).port();
     let received = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
     let rt = giong::Builder::new().workers(3).build().unwrap();
@@ -649,12 +646,13 @@ fn a_port_held_by_another_process_is_refused() {
     });
 }
 
-/// A UDP port on loopback that is free now and that the kernel never hands
-/// out for port 0, so the other tests of this binary, which bind port 0 in
-/// parallel, cannot take it while a test has let go of it. Picked at random
+/// A UDP port on `ip` (a loopback address) that is free now and that the
+/// kernel never hands out for port 0, so the other tests of this binary,
+/// which bind port 0 in parallel, cannot take it while a test has let go of
+/// it. Picked at random
 /// below the ephemeral range rather than always the highest such port, which
 /// is the obvious pick for anything else on the machine doing the same.
-fn port_outside_ephemeral_range() -> std::net::SocketAddr {
+fn port_outside_ephemeral_range(ip: [u8; 4]) -> std::net::SocketAddr {
     use std::hash::{BuildHasher, Hasher};
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
     let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
@@ -668,7 +666,7 @@ fn port_outside_ephemeral_range() -> std::net::SocketAddr {
     let span = u64::from(low - 1024);
     (0..span)
         .map(|i| 1024 + ((start + i) % span) as u16)
-        .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .map(|port| std::net::SocketAddr::from((ip, port)))
         .find(|addr| std::net::UdpSocket::bind(addr).is_ok())
         .expect("no free UDP port below the ephemeral range")
 }
@@ -795,7 +793,7 @@ fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
     giong::block_on(async {
         // Not a port from port 0: between the drops and the binds below,
         // another test's socket could be given the same port (seen in CI).
-        let addr = port_outside_ephemeral_range();
+        let addr = port_outside_ephemeral_range([127, 0, 0, 1]);
         let first = UdpSocket::bind(addr).unwrap();
         let second = UdpSocket::bind(addr).unwrap();
         drop(first);
