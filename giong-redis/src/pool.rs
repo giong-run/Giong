@@ -187,7 +187,7 @@ struct Member {
     client: Rc<Client>,
     /// Lent to a shared command since the last sweep with a clock.
     lent: bool,
-    /// When it was last seen lent, or came back.
+    /// When it was last seen lent or in use, or came back.
     used: Instant,
     /// When it is to be closed, however busy it is.
     expires: Instant,
@@ -247,7 +247,10 @@ impl State {
             }
             let mut idle = false;
             if let Some(now) = now {
-                if std::mem::take(&mut m.lent) {
+                // A command still in flight counts as use: one that takes
+                // longer than the idle timeout leaves no mark after the
+                // sweep that cleared it.
+                if std::mem::take(&mut m.lent) || !m.is_free() {
                     m.used = now;
                 }
                 m.retiring |= now >= m.expires;

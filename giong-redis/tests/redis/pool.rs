@@ -446,9 +446,12 @@ fn idle_connections_are_closed() {
 #[test]
 fn a_shared_connection_in_use_is_not_idle() {
     run(|server| async move {
-        let pool = Pool::new(server.tcp(), 1).idle_timeout(Duration::from_millis(300));
+        // Commands every 20 ms against an idle timeout of a second: wide
+        // enough for ThreadSanitizer on a busy CI runner, where 300 ms
+        // without a command happened.
+        let pool = Pool::new(server.tcp(), 1).idle_timeout(Duration::from_secs(1));
         let started = giong::time::Instant::now();
-        while started.elapsed() < Duration::from_millis(900) {
+        while started.elapsed() < Duration::from_millis(2500) {
             let _: Value = pool.query(&cmd("PING")).await.unwrap();
             giong::time::sleep(Duration::from_millis(20)).await;
         }
@@ -475,7 +478,7 @@ fn old_connections_are_replaced_even_under_load() {
         let id =
             |pool: Pool| async move { pool.query::<i64>(&cmd("CLIENT").arg("ID")).await.unwrap() };
         let first = id(pool.clone()).await;
-        giong::time::sleep(Duration::from_millis(600)).await;
+        giong::time::sleep(Duration::from_millis(1000)).await;
         let stats = pool.stats();
         assert!(stats.recycled >= 2, "{stats:?}");
         assert!(stats.connections <= 2, "{stats:?}");
