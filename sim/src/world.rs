@@ -298,8 +298,10 @@ impl World {
             h = h.wrapping_mul(0x100_0000_01b3);
         }
         self.hash = (self.hash ^ h).wrapping_mul(0x100_0000_01b3);
-        self.step_hashes.push(h);
+        // Per-step hashes only with the full trace (`first_difference`):
+        // 8 bytes a step add up to gigabytes over simulated years.
         if let Some(full) = &mut self.full {
+            self.step_hashes.push(h);
             full.push(line.clone());
         }
         if self.keep > 0 {

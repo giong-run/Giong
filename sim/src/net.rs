@@ -141,12 +141,50 @@ pub(crate) struct Obj {
     pub(crate) ev: u64,
 }
 
+/// The stream connections by id. A connection is dropped once both of its
+/// sockets have closed: segments and resets still on their way to it are
+/// then lost, which nobody could observe. Kept in a vector instead, they
+/// took about 40 KB per simulated day in the soak, gigabytes over decades.
+#[derive(Default)]
+pub(crate) struct Conns {
+    map: BTreeMap<usize, Conn>,
+    next: usize,
+}
+
+impl Conns {
+    fn push(&mut self, c: Conn) -> usize {
+        let id = self.next;
+        self.next += 1;
+        self.map.insert(id, c);
+        id
+    }
+
+    fn contains(&self, id: usize) -> bool {
+        self.map.contains_key(&id)
+    }
+}
+
+impl std::ops::Index<usize> for Conns {
+    type Output = Conn;
+    fn index(&self, id: usize) -> &Conn {
+        &self.map[&id]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Conns {
+    fn index_mut(&mut self, id: usize) -> &mut Conn {
+        self.map
+            .get_mut(&id)
+            .expect("giong-sim: connection already dropped")
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Net {
     next_id: ObjId,
     pub(crate) objs: BTreeMap<ObjId, Obj>,
     pub(crate) fds: HashMap<i32, ObjId>,
-    pub(crate) conns: Vec<Conn>,
+    pub(crate) conns: Conns,
     /// Bound addresses (TCP and UDP kept apart) and the sockets on them.
     bound: BTreeMap<(bool, Addr), Vec<ObjId>>,
     next_port: u16,
@@ -615,7 +653,7 @@ impl World {
         let from = self.net.sock(client).and_then(|s| s.local.clone()).unwrap();
         let unix = matches!(to, Addr::Unix(_));
         let lost = !unix && self.net.partitioned(&from, &to)
-            || !unix && {
+            || !unix && attempt < self.faults.connect_drop_max && {
                 let p = self.faults.connect_drop;
                 self.fault(p, "syn-lost")
             };
@@ -692,19 +730,18 @@ impl World {
             }
             _ => server_addr.clone(),
         };
-        let conn = self.net.conns.len();
         let server = self.net.add(sock_kind(domain, true), true);
-        {
-            let s = self.net.sock_mut(server).unwrap();
-            s.local = Some(server_local.clone());
-            s.state = State::Connected { conn, side: 1 };
-        }
-        self.net.conns.push(Conn {
+        let conn = self.net.conns.push(Conn {
             socks: [Some(client), Some(server)],
             flows: [Flow::default(), Flow::default()],
             reset: [false, false],
-            addrs: [from, server_local],
+            addrs: [from, server_local.clone()],
         });
+        {
+            let s = self.net.sock_mut(server).unwrap();
+            s.local = Some(server_local);
+            s.state = State::Connected { conn, side: 1 };
+        }
         self.net.sock_mut(client).unwrap().state = State::Connected { conn, side: 0 };
         if let Some(State::Listening { queue, .. }) = self.net.sock_mut(pick).map(|s| &mut s.state)
         {
@@ -830,6 +867,9 @@ impl World {
     }
 
     fn deliver(&mut self, conn: usize, dir: usize) {
+        if !self.net.conns.contains(conn) {
+            return;
+        }
         let now = self.now;
         let to_side = 1 - dir;
         let mut arrived = false;
@@ -883,6 +923,9 @@ impl World {
     }
 
     fn rst_arrives(&mut self, conn: usize, side: usize) {
+        if !self.net.conns.contains(conn) {
+            return;
+        }
         let c = &mut self.net.conns[conn];
         if c.reset[side] {
             return;
@@ -1121,8 +1164,7 @@ impl World {
     pub(crate) fn socketpair(&mut self, domain: i32, nonblock: bool) -> (ObjId, ObjId) {
         let a = self.net.add(sock_kind(domain, true), nonblock);
         let b = self.net.add(sock_kind(domain, true), nonblock);
-        let conn = self.net.conns.len();
-        self.net.conns.push(Conn {
+        let conn = self.net.conns.push(Conn {
             socks: [Some(a), Some(b)],
             flows: [Flow::default(), Flow::default()],
             reset: [false, false],
@@ -1169,6 +1211,9 @@ impl World {
                         let (conn, side) = (*conn, *side);
                         self.net.conns[conn].socks[side] = None;
                         self.reset_conn(conn, Some(side));
+                        if self.net.conns[conn].socks == [None, None] {
+                            self.net.conns.map.remove(&conn);
+                        }
                     }
                     self.net.objs.remove(&server);
                 }
@@ -1183,6 +1228,9 @@ impl World {
                     self.reset_conn(conn, Some(side));
                 } else if !self.net.conns[conn].flows[side].fin_sent {
                     self.push_seg(conn, side, Seg::Fin);
+                }
+                if self.net.conns[conn].socks == [None, None] {
+                    self.net.conns.map.remove(&conn);
                 }
             }
             _ => {}
