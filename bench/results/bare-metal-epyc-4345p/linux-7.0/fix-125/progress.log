@@ -1,0 +1,9 @@
+2026-11-16T08:37:58Z at 674c42c709d27f2a8ee707d9d4fe3c844cdb9c17 + bench/bare-metal-0.9 (e9078c4) = d4f5605
+2026-11-16T08:45:57Z small-box exit 0
+2026-11-16T08:47:25Z h2 b6d9b4b round 1: giong-http           6.78        7.10        1.58
+2026-11-16T08:49:39Z h2 674c42c round 1: giong-http           4.23        5.57        1.46
+2026-11-16T08:51:06Z h2 b6d9b4b round 2: giong-http           6.78        7.10        1.58
+2026-11-16T08:52:32Z h2 674c42c round 2: giong-http           4.23        5.57        1.46
+2026-11-16T08:53:58Z h2 b6d9b4b round 3: giong-http           6.78        7.10        1.58
+2026-11-16T08:55:24Z h2 674c42c round 3: giong-http           4.23        5.57        1.46
+2026-11-16T08:55:24Z all done

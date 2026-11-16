@@ -1,0 +1,2 @@
+[ 5541.403803] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=sbx-axum-tls.scope,mems_allowed=0,oom_memcg=/system.slice/sbx-axum-tls.scope,task_memcg=/system.slice/sbx-axum-tls.scope,task=bench-axum-tls,pid=53500,uid=0
+[ 5541.403809] Memory cgroup out of memory: Killed process 53500 (bench-axum-tls) total-vm:768832kB, anon-rss:455124kB, file-rss:4896kB, shmem-rss:0kB, UID:0 pgtables:1360kB oom_score_adj:0

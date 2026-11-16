@@ -1,0 +1,60 @@
+2026-11-16T07:17:36.727Z,0.820,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:17:45.008Z,0.833,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:17:49.103Z,0.811,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:17:57.377Z,0.836,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:18:01.462Z,0.840,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:18:09.739Z,0.836,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:18:13.833Z,0.144,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:18:22.111Z,0.145,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:18:26.326Z,0.144,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:18:34.605Z,0.148,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:18:38.694Z,0.150,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:18:46.969Z,0.141,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:18:51.058Z,0.803,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:18:59.333Z,0.827,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:19:03.418Z,0.814,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:19:11.700Z,0.812,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:19:15.785Z,0.823,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:19:24.063Z,0.830,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:19:28.267Z,0.149,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:19:36.545Z,0.139,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:19:40.632Z,0.142,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:19:48.907Z,0.141,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:19:52.996Z,0.147,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:20:01.271Z,0.143,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:20:05.358Z,0.831,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:20:13.641Z,0.839,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:20:17.726Z,0.833,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:20:26.002Z,0.842,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:20:30.204Z,0.840,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:20:38.478Z,0.837,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:20:42.568Z,0.152,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:20:50.841Z,0.144,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:20:54.929Z,0.154,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:21:03.202Z,0.144,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:21:07.289Z,0.143,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:21:15.564Z,0.147,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:21:19.652Z,0.836,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:21:27.928Z,0.826,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:21:32.135Z,0.844,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:21:40.417Z,0.817,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:21:44.510Z,0.819,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:21:52.786Z,0.830,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:21:56.876Z,0.146,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:22:05.150Z,0.141,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:22:09.236Z,0.149,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:22:17.511Z,0.145,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:22:21.599Z,0.142,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:22:29.880Z,0.147,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:22:34.081Z,0.825,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:22:42.361Z,0.821,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:22:46.455Z,0.832,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:22:54.728Z,0.831,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:22:58.814Z,0.815,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/json
+2026-11-16T07:23:07.088Z,0.826,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/json
+2026-11-16T07:23:11.181Z,0.150,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:23:19.457Z,0.144,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:23:23.552Z,0.148,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:23:31.825Z,0.149,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:23:36.046Z,0.149,-t16 -c256 -d2s --timeout 5s http://10.40.96.4:3009/static?size=16384
+2026-11-16T07:23:44.325Z,0.144,-t16 -c256 -d8s --timeout 5s --latency http://10.40.96.4:3009/static?size=16384

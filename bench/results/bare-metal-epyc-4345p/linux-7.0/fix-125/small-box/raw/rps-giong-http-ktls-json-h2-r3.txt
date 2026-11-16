@@ -1,0 +1,47 @@
+starting benchmark...
+spawning thread #0: 8 total client(s). Timing-based test with 0s of warm-up time and 10s of main duration for measurements.
+spawning thread #1: 8 total client(s). Timing-based test with 0s of warm-up time and 10s of main duration for measurements.
+spawning thread #2: 8 total client(s). Timing-based test with 0s of warm-up time and 10s of main duration for measurements.
+spawning thread #3: 8 total client(s). Timing-based test with 0s of warm-up time and 10s of main duration for measurements.
+Warm-up started for thread #1.
+Warm-up started for thread #2.
+Warm-up started for thread #0.
+Warm-up started for thread #3.
+progress: 12% of clients started
+progress: 25% of clients started
+progress: 37% of clients started
+progress: 50% of clients started
+Warm-up phase is over for thread #1.
+Main benchmark duration is started for thread #1.
+progress: 62% of clients started
+Warm-up phase is over for thread #2.
+Main benchmark duration is started for thread #2.
+progress: 75% of clients started
+Warm-up phase is over for thread #3.
+Main benchmark duration is started for thread #3.
+progress: 87% of clients started
+progress: 100% of clients started
+Warm-up phase is over for thread #0.
+Main benchmark duration is started for thread #0.
+TLS Protocol: TLSv1.3
+Cipher: TLS_AES_128_GCM_SHA256
+Server Temp Key: X25519 253 bits
+Application protocol: h2
+Main benchmark duration is over for thread #2. Stopping all clients.
+Stopped all clients for thread #2
+Main benchmark duration is over for thread #3. Stopping all clients.
+Stopped all clients for thread #3
+Main benchmark duration is over for thread #Main benchmark duration is over for thread #1. Stopping all clients.
+0. Stopping all clients.
+Stopped all clients for thread #Stopped all clients for thread #0
+1
+
+finished in 10.00s, 1253025.30 req/s, 63.33MB/s
+requests: 12530253 total, 12530765 started, 12530253 done, 12530253 succeeded, 0 failed, 0 errored, 0 timeout
+status codes: 12530253 2xx, 0 3xx, 0 4xx, 0 5xx
+traffic: 633.35MB (664113649) total, 95.61MB (100250504) headers (space savings 90.80%), 322.64MB (338316831) data
+                     min         max         mean         sd        +/- sd
+time for request:       60us      2.65ms       397us        86us    70.07%
+time for connect:      853us      4.20ms      2.94ms       772us    65.63%
+time to 1st byte:     3.51ms      4.80ms      4.16ms       438us    40.63%
+req/s           :   38440.16    40393.22    39156.55      464.33    75.00%

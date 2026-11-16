@@ -1,0 +1,14 @@
+2026/11/16 06:29:38 http: TLS handshake error from 127.0.0.1:45988: EOF
+2026/11/16 06:29:39 http: TLS handshake error from 10.40.96.3:55754: EOF
+2026/11/16 06:29:41 http: TLS handshake error from 10.40.96.3:48840: EOF
+Terminated
+2026/11/16 06:33:16 http: TLS handshake error from 127.0.0.1:34686: EOF
+2026/11/16 06:33:17 http: TLS handshake error from 10.40.96.3:47538: EOF
+2026/11/16 06:33:19 http: TLS handshake error from 10.40.96.3:48628: EOF
+Terminated
+2026/11/16 06:36:54 http: TLS handshake error from 127.0.0.1:51624: EOF
+2026/11/16 06:36:55 http: TLS handshake error from 10.40.96.3:33360: EOF
+2026/11/16 06:36:57 http: TLS handshake error from 10.40.96.3:34490: EOF
+Terminated
+2026/11/16 06:40:41 http: TLS handshake error from 127.0.0.1:36020: EOF
+./small-box.sh: line 136: 53530 Killed                  systemd-run --quiet --scope --unit=sbx-go-tls -p CPUQuota=100% -p AllowedCPUs=2 -p MemoryMax=512M -p MemorySwapMax=0 -- taskset -c 2 env BENCH_HOST=0.0.0.0 TLS_CERT=/tmp/tmp.VK6Ol8PKRX/cert.pem TLS_KEY=/tmp/tmp.VK6Ol8PKRX/key.pem go-http/bench-go-http

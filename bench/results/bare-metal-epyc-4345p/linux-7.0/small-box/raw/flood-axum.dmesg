@@ -1,0 +1,2 @@
+[ 6441.889620] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=sbx-axum.scope,mems_allowed=0,oom_memcg=/system.slice/sbx-axum.scope,task_memcg=/system.slice/sbx-axum.scope,task=bench-axum,pid=54522,uid=0
+[ 6441.889627] Memory cgroup out of memory: Killed process 54522 (bench-axum) total-vm:1196096kB, anon-rss:518696kB, file-rss:3444kB, shmem-rss:0kB, UID:0 pgtables:2268kB oom_score_adj:0

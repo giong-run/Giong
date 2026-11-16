@@ -1,0 +1,4 @@
+Terminated
+Terminated
+Terminated
+./small-box.sh: line 136: 54522 Killed                  systemd-run --quiet --scope --unit=sbx-axum -p CPUQuota=100% -p AllowedCPUs=2 -p MemoryMax=512M -p MemorySwapMax=0 -- taskset -c 2 env BENCH_HOST=0.0.0.0 axum/target/release/bench-axum

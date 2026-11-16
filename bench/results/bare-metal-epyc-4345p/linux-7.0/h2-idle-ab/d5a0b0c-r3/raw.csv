@@ -1,0 +1,13 @@
+server,endpoint,round,rps,mean_ms,cpu,failed
+giong-http-tls,json,1,1040810.00,422us,99,0
+giong-http-tls,users,1,111844.50,4.23ms,100,0
+giong-http-tls,json-mux,1,1504700.00,186us,100,0
+axum-tls,json,1,352977.50,1.35ms,100,0
+axum-tls,users,1,46793.50,10.20ms,100,0
+axum-tls,json-mux,1,348319.50,855us,100,0
+giong-http,json,1,1073604.50,432us,99,0
+giong-http,users,1,125196.00,3.83ms,100,0
+giong-http,json-mux,1,1570719.50,184us,100,0
+axum,json,1,367621.50,1.30ms,100,0
+axum,users,1,48372.00,9.88ms,99,0
+axum,json-mux,1,362635.50,822us,100,0
