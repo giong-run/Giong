@@ -673,3 +673,16 @@ fn a_connection_carries_at_most_1024_statements_at_a_time() {
         assert_eq!(pool.stats().timeouts, 0);
     });
 }
+
+#[test]
+fn timeouts_too_long_for_the_clock_mean_no_limit() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1)
+            .idle_timeout(Duration::MAX)
+            .max_lifetime(Duration::MAX);
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        drop(pool.get().await.unwrap());
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        assert_eq!(pool.stats().opened, 1);
+    });
+}

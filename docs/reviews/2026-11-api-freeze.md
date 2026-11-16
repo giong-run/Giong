@@ -58,6 +58,8 @@ What is frozen after 0.7.0 is guarded by `cargo-semver-checks` in CI.
 | `Error::from_status` falls back to `502` | **Kept**: a status from upstream that is not an error status is a bad gateway. |
 | The strict query rule, `401` under a nested auth layer, 32-hex request ids, refusing a catch-all that starts with `/` | **Kept**, as settled in 0.6.0. |
 | `json()` panicked on a status outside `200..=599` | **Changed** to an internal error. |
+| `Sink` was an exhaustive enum | Changed in 0.6.0 to `#[non_exhaustive]`, kept. |
+| Two `json`s: `giong_web::json` serializes, giong-http's `Response::json` takes bytes that are JSON already | **Kept**: both are documented as such, each pointing at the other. |
 | `Router::merge`, forms, per-route body limits | **Later**, additions. |
 
 ## giong-tls
@@ -80,6 +82,12 @@ What is frozen after 0.7.0 is guarded by `cargo-semver-checks` in CI.
 | giong-redis's `mget` needed two type arguments | **Changed** to one. |
 | giong-redis's `ToArg` | Changed in 0.6.0 (`write_arg`), and kept. |
 | Pool settings (`wait_timeout` after `new`, panicking once cloned) | **Kept**, the same in all three pools; new settings are new methods. |
+| Only giong-postgres's pool closed idle and old connections (`idle_timeout`, `max_lifetime`, `PoolStats::recycled`) | **Added** after 0.8.0 to giong-mysql and giong-redis, with the same names, defaults (10 and 30 minutes) and meaning, before 1.0 rather than after, because the defaults change what a running service does. |
+| The pools' other counters differ (giong-mysql has `draining`, `resets`, `statement_limit_errors`) | **Kept**: `PoolStats` is `#[non_exhaustive]` in all three, and a pool reports what it does; a counter another pool gains later takes the same name. |
+| giong-mysql's `Config::statement_timeout` takes a `Duration` and cannot be turned off, giong-postgres's takes `impl Into<Option<Duration>>` | **Kept**. giong-postgres needs `None` because PgBouncer refuses a connection that sends the setting; giong-mysql has no such case reported, and a long timeout turns it off in effect. Should a proxy need it, a way to send no limit is a new method, which breaks nobody. That it bounds `SELECT`s only on MySQL and every statement on MariaDB is documented on the method. |
+| giong-mysql's `Tls::verify_ca` returns `Tls::Verify` with a connector that skips the host name | **Kept**: `Tls` is `#[non_exhaustive]`, so a variant of its own can be added. |
+| giong-mysql reads impossible dates (31 February, under `ALLOW_INVALID_DATES`) by rolling them over | **Later**: refusing them is behaviour, not API. |
+| giong-redis's TCP keepalive and user timeout are fixed at 60 seconds | **Later**: settings for them are additions. |
 
 ## giong-mcp and giong-compat
 
@@ -89,6 +97,15 @@ What is frozen after 0.7.0 is guarded by `cargo-semver-checks` in CI.
 | `McpServer::url` returned `unix:/path/mcp` for a socket | **Changed** to `Option<String>`. |
 | `Compat`'s name clashes with `tokio_util::compat::Compat` | **Kept**; import it under another name where both are used. |
 | `Compat::with_unread` | **Later**, an addition. |
+| `Compat::write_buffer` panics outside 1 byte to 1 GiB | **Kept**: a limit outside that range is a mistake in the code, and the panic carries `GIONG-E1403` with the range, as the other builders' settings do. |
+
+## Checked again after 0.8.0
+
+On 2026-11-16 (`main` at `d2631ae`) every item marked **changed** above was checked to be
+in the code, and the reviews of every crate were read again for items this record had left
+out; they are the rows added under giong-web, the database clients and giong-compat. The
+only public API added since 0.7.0, giong-http's `Server::min_free_memory` and
+`GIONG-E1121`, follows the rules above (a byte count as `usize`, like `max_body_size`).
 
 ## Still open
 

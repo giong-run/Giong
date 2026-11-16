@@ -411,3 +411,116 @@ fn a_connection_to_a_server_that_became_a_replica_is_replaced() {
         }
     });
 }
+
+#[test]
+fn idle_connections_are_closed() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 3).idle_timeout(Duration::from_millis(200));
+        // A burst opens all three.
+        let mut conns = Vec::new();
+        for _ in 0..3 {
+            conns.push(pool.take().await.unwrap());
+        }
+        for conn in &conns {
+            let _: Value = conn.query(&cmd("PING")).await.unwrap();
+        }
+        drop(conns);
+        assert_eq!(pool.stats().connections, 3);
+        let started = giong::time::Instant::now();
+        while pool.stats().connections > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                pool.stats()
+            );
+            giong::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stats = pool.stats();
+        assert_eq!(stats.recycled, stats.opened);
+        // And opened again when needed.
+        let _: Value = pool.query(&cmd("PING")).await.unwrap();
+        assert_eq!(pool.stats().connections, 1);
+    });
+}
+
+#[test]
+fn a_shared_connection_in_use_is_not_idle() {
+    run(|server| async move {
+        // Commands every 20 ms against an idle timeout of a second: wide
+        // enough for ThreadSanitizer on a busy CI runner, where 300 ms
+        // without a command happened.
+        let pool = Pool::new(server.tcp(), 1).idle_timeout(Duration::from_secs(1));
+        let started = giong::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(2500) {
+            let _: Value = pool.query(&cmd("PING")).await.unwrap();
+            giong::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stats = pool.stats();
+        assert_eq!((stats.opened, stats.recycled), (1, 0), "{stats:?}");
+    });
+}
+
+#[test]
+fn old_connections_are_replaced_even_under_load() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 2).max_lifetime(Duration::from_millis(200));
+        let stop = Rc::new(std::cell::Cell::new(false));
+        let done = Rc::new(std::cell::Cell::new(0u64));
+        for _ in 0..16 {
+            let (pool, stop, done) = (pool.clone(), stop.clone(), done.clone());
+            giong::spawn(async move {
+                while !stop.get() {
+                    let _: Value = pool.query(&cmd("PING")).await.unwrap();
+                    done.set(done.get() + 1);
+                }
+            });
+        }
+        let id =
+            |pool: Pool| async move { pool.query::<i64>(&cmd("CLIENT").arg("ID")).await.unwrap() };
+        let first = id(pool.clone()).await;
+        giong::time::sleep(Duration::from_millis(1000)).await;
+        let stats = pool.stats();
+        assert!(stats.recycled >= 2, "{stats:?}");
+        assert!(stats.connections <= 2, "{stats:?}");
+        let before = done.get();
+        giong::time::sleep(Duration::from_millis(50)).await;
+        assert!(done.get() > before, "commands go on");
+        let mut later = Vec::new();
+        for _ in 0..10 {
+            later.push(id(pool.clone()).await);
+        }
+        assert!(!later.contains(&first), "{first} still in use: {later:?}");
+        stop.set(true);
+        assert_eq!(pool.stats().timeouts, 0);
+    });
+}
+
+#[test]
+fn a_taken_connection_past_its_lifetime_is_closed_when_it_comes_back() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 1).max_lifetime(Duration::from_millis(100));
+        let conn = pool.take().await.unwrap();
+        let first: i64 = conn.query(&cmd("CLIENT").arg("ID")).await.unwrap();
+        giong::time::sleep(Duration::from_millis(150)).await;
+        // Still usable while taken: the lifetime never cuts a task off.
+        let _: Value = conn.query(&cmd("PING")).await.unwrap();
+        drop(conn);
+        let stats = pool.stats();
+        assert_eq!((stats.connections, stats.recycled), (0, 1), "{stats:?}");
+        let id: i64 = pool.query(&cmd("CLIENT").arg("ID")).await.unwrap();
+        assert_ne!(id, first);
+    });
+}
+
+#[test]
+fn timeouts_too_long_for_the_clock_mean_no_limit() {
+    run(|server| async move {
+        let pool = Pool::new(server.tcp(), 1)
+            .idle_timeout(Duration::MAX)
+            .max_lifetime(Duration::MAX);
+        let _: Value = pool.query(&cmd("PING")).await.unwrap();
+        drop(pool.take().await.unwrap());
+        let _: Value = pool.query(&cmd("PING")).await.unwrap();
+        assert_eq!(pool.stats().opened, 1);
+    });
+}

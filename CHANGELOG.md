@@ -30,9 +30,33 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 - **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
   (`Code::HttpServerLowMemory`) in giong.
+- **giong-mysql**, **giong-redis** (**behaviour change**): `Pool::idle_timeout`,
+  `Pool::max_lifetime` and `PoolStats::recycled`, with giong-postgres's defaults and
+  meaning, so the three pools are configured the same way before the 1.0 API freeze. A
+  pooled connection unused for 10 minutes is now closed, and one older than 30 minutes (less
+  up to a tenth at random) takes no new statement or command and is closed once the ones on
+  it are answered, or when it comes back from `get()` or `take()`; the pool opens another
+  when needed. Before, a connection stayed open until the server or the network closed it,
+  so a pool kept talking to the old primary after a DNS failover. giong-redis reads no
+  clock on the path of a shared command for this: a command marks its connection used, and
+  the pool's sweep, which runs every quarter of the shorter of the two settings (at most
+  every 30 seconds), turns the mark into a time. `observe` snapshots and giong-mcp report
+  `recycled` for the two pools.
+
+### Changed
+
+- **Docs**: CONTRIBUTING.md lists every fuzz target (`response_body`, the PostgreSQL and
+  MySQL `session` targets and the resolver's two were missing); giong-http's
+  `Response::json` says it sends bytes that are already JSON; the API freeze record
+  (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
 ### Fixed
 
+- **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
+  pool opened its first connection (the random part of the lifetime was computed as a tenth
+  of it times up to 999); a lifetime too long for the clock now means none, as
+  `wait_timeout(Duration::MAX)` does in giong-redis. Found while adding the same setting to
+  the other two pools.
 - **giong-http**: an idle HTTP/2 connection took 61% more resident memory in 0.8.0 than in
   0.5.0 (6.78 KiB against 4.21 on bare metal, `bench/h2.sh`, 5,000 connections that made
   one request each). Since 0.8.0 a connection kept the memory for its streams for a second
