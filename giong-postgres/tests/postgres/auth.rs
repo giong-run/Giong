@@ -63,7 +63,7 @@ fn scram_sha_256_with_the_right_and_the_wrong_password() {
             .await
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
-        assert_eq!(e.code(), Some("28P01"), "{e}");
+        assert_eq!(e.server_code(), Some("28P01"), "{e}");
         assert!(
             e.to_string().contains("password authentication failed"),
             "{e}"
@@ -79,7 +79,7 @@ fn md5_and_clear_text_passwords() {
         let e = Client::connect(&s.tcp((MD5_USER.0, "wrong")))
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some("28P01"), "{e}");
+        assert_eq!(e.server_code(), Some("28P01"), "{e}");
 
         // Clear text is allowed to a loopback address.
         let client = Client::connect(&s.tcp(CLEAR_USER)).await.unwrap();
@@ -125,7 +125,7 @@ fn a_server_that_requires_tls_refuses_a_plain_connection() {
     run(|s| async move {
         let e = Client::connect(&s.tcp(TLS_USER)).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
-        assert_eq!(e.code(), Some("28000"), "{e}");
+        assert_eq!(e.server_code(), Some("28000"), "{e}");
     });
 }
 
@@ -134,13 +134,13 @@ fn startup_errors_say_what_is_missing() {
     run(|s| async move {
         let e = Client::connect(
             &s.tcp((SCRAM_USER.0, "x"))
-                .dbname("no_such_db")
+                .database("no_such_db")
                 .password(SCRAM_USER.1),
         )
         .await
         .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
-        assert_eq!(e.code(), Some("3D000"), "{e}");
+        assert_eq!(e.server_code(), Some("3D000"), "{e}");
 
         let e = Client::connect(
             &Config::new()

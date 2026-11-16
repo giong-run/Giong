@@ -35,7 +35,9 @@ request; everything else is automated and safe to re-run.
 2. **Polish it.** Push to the release branch or edit on GitHub until the `CHANGELOG.md`
    section reads well for users: one line on what the release is about, then the
    entries under *Added*, *Changed*, *Deprecated*, *Removed*, *Fixed*, *Security*. Mark
-   breaking changes **Breaking:** and say how to migrate. Thank outside contributors in
+   breaking changes **Breaking:** and say how to migrate. The release pull request of
+   1.0.0-rc.1 also removes every `#[deprecated]` item and lists each under *Removed*
+   with the name that replaces it. Thank outside contributors in
    the entry for their change: `([#4](…/issues/4), thanks to [@name](https://github.com/name))`.
    CI runs on the branch as on any pull request.
 

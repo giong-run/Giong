@@ -954,7 +954,7 @@ impl Conn {
     /// are closed and the prepare tried once more.
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
         let e = match self.statement_once(sql).await {
-            Err(e) if e.code() == Some(code::PREPARED_LIMIT) => e,
+            Err(e) if e.server_code() == Some(code::PREPARED_LIMIT) => e,
             other => return other,
         };
         if let Some(counters) = &*self.counters.borrow() {
@@ -1480,7 +1480,7 @@ impl Conn {
     /// knows it (1243), or it no longer fits the schema (1615). The next run
     /// prepares it afresh.
     fn forget_if_stale(&self, stmt: &Statement, e: &Error) {
-        let code = e.code();
+        let code = e.server_code();
         if !matches!(code, Some(code::UNKNOWN_STMT | code::NEED_REPREPARE)) {
             return;
         }

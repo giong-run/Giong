@@ -59,7 +59,7 @@ impl Server {
             .host(self.socket_dir.to_str().unwrap())
             .port(self.port)
             .user("postgres")
-            .dbname("postgres")
+            .database("postgres")
     }
 
     /// A user over TCP to 127.0.0.1, without TLS.
@@ -69,7 +69,7 @@ impl Server {
             .port(self.port)
             .user(user)
             .password(password)
-            .dbname("postgres")
+            .database("postgres")
     }
 
     /// A user over TCP with TLS, trusting the test authority.
@@ -79,7 +79,7 @@ impl Server {
             .port(self.port)
             .user(user)
             .password(password)
-            .dbname("postgres")
+            .database("postgres")
             .tls(Tls::Verify(
                 TlsConnector::with_root_pem(&self.ca_pem).unwrap(),
             ))
@@ -187,12 +187,45 @@ extern "C" fn stop_server() {
     }
 }
 
+/// A port for a server this test starts, free on 127.0.0.1 now.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    server_port(&["127.0.0.1"])
+}
+
+/// A TCP port free now on every one of `addrs`, from below the kernel's
+/// ephemeral range, for a server this test starts.
+///
+/// The server cannot be told to pick a port itself and say which, so the
+/// test picks one and the server binds it a moment later. A port from the
+/// ephemeral range (what binding port 0 gives) can be taken in that moment
+/// by any socket of the tests or of anything else on the machine: a
+/// connect's source port, or another port-0 bind. The kernel hands out
+/// ports below the range only on request. The same rule as giong-redis's
+/// test server (#128).
+fn server_port(addrs: &[&str]) -> u16 {
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse::<u16>().ok())
+        .unwrap_or(32768);
+    let (from, to) = (10_000u16, low.max(11_000));
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+        .subsec_nanos()
+        ^ std::process::id().wrapping_mul(2_654_435_761);
+    loop {
+        // xorshift: any spread will do.
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let port = from + (seed % u32::from(to - from)) as u16;
+        if addrs
+            .iter()
+            .all(|addr| std::net::TcpListener::bind((*addr, port)).is_ok())
+        {
+            return port;
+        }
+    }
 }
 
 fn start(bin: &Path) -> Server {
@@ -249,7 +282,8 @@ fn start(bin: &Path) -> Server {
     std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let port = free_port();
+    // The server listens on both addresses.
+    let port = server_port(&["127.0.0.1", "127.0.0.2"]);
     let mut conf = std::fs::OpenOptions::new()
         .append(true)
         .open(data.join("postgresql.conf"))

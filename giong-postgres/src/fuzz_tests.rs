@@ -287,7 +287,7 @@ fn the_session_seed_is_a_conversation_that_works() {
     for (i, outcome) in outcomes.iter().enumerate() {
         match i {
             // The transaction's statement.
-            4 => assert_eq!(outcome.as_ref().unwrap_err().code(), Some("23505")),
+            4 => assert_eq!(outcome.as_ref().unwrap_err().server_code(), Some("23505")),
             _ => assert!(outcome.is_ok(), "{outcomes:?}"),
         }
     }

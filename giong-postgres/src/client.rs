@@ -705,7 +705,7 @@ impl Conn {
                 Ok(_) => unreachable!("a prepare slot ends with a statement"),
                 // The task that sent this prepare tries another name (see
                 // `prepare`); look in the cache again.
-                Err(e) if again && e.code() == Some("42P05") => again = false,
+                Err(e) if again && e.server_code() == Some("42P05") => again = false,
                 Err(e) => return Err(e),
             }
         }
@@ -716,7 +716,7 @@ impl Conn {
             // A statement of that name exists already: prepared by the
             // application with SQL-level PREPARE, or by another client behind
             // a connection pooler. The next name will do.
-            Err(e) if e.code() == Some("42P05") => self.prepare_once(sql).await,
+            Err(e) if e.server_code() == Some("42P05") => self.prepare_once(sql).await,
             result => result,
         }
     }

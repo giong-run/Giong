@@ -83,7 +83,7 @@ fn caching_sha2_with_the_right_and_the_wrong_password() {
             .await
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
-        assert_eq!(e.code(), Some(1045), "{e}");
+        assert_eq!(e.server_code(), Some(1045), "{e}");
         let e = Client::connect(&s.tcp(("nobody", "x"))).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Auth, "{e}");
     });
@@ -201,7 +201,7 @@ fn startup_errors_say_what_is_missing() {
         let e = Client::connect(&s.local().database("missing_db"))
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some(1049), "{e}");
+        assert_eq!(e.server_code(), Some(1049), "{e}");
         assert!(e.to_string().contains("missing_db"), "{e}");
 
         let e = Client::connect(&Config::new().host("127.0.0.1").port(s.port))
@@ -212,7 +212,7 @@ fn startup_errors_say_what_is_missing() {
         let e = Client::connect(&s.local().session_variable("no_such_variable", "1"))
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some(1193), "{e}");
+        assert_eq!(e.server_code(), Some(1193), "{e}");
     });
 }
 

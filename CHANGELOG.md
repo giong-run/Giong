@@ -30,6 +30,48 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 - **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
   (`Code::HttpServerLowMemory`) in giong.
+- **giong-mysql**, **giong-redis** (**behaviour change**): `Pool::idle_timeout`,
+  `Pool::max_lifetime` and `PoolStats::recycled`, with giong-postgres's defaults and
+  meaning, so the three pools are configured the same way before the 1.0 API freeze. A
+  pooled connection unused for 10 minutes is now closed, and one older than 30 minutes (less
+  up to a tenth at random) takes no new statement or command and is closed once the ones on
+  it are answered, or when it comes back from `get()` or `take()`; the pool opens another
+  when needed. Before, a connection stayed open until the server or the network closed it,
+  so a pool kept talking to the old primary after a DNS failover. giong-redis reads no
+  clock on the path of a shared command for this: a command marks its connection used, and
+  the pool's sweep, which runs every quarter of the shorter of the two settings (at most
+  every 30 seconds), turns the mark into a time. `observe` snapshots and giong-mcp report
+  `recycled` for the two pools.
+- **giong-postgres**, **giong-mysql**: `Error::server_code()`, the name giong-redis already
+  used for the code the server sent (`code()` named a different thing in each crate), and
+  `Error::is_transient()`, as giong-redis and giong-http's client have: true for a failed
+  connect, a closed connection, a pool timeout, and the server errors a retry can cure
+  (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
+  giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
+  server).
+- **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
+  parameter is still `dbname`, as libpq spells it.
+
+### Changed
+
+- **giong-http**: the client's `RequestBuilder::header` takes `impl AsRef<str>` for the value,
+  as the server's `Response::header` does, so `.header("X-Id", id.to_string())` needs no `&`.
+  A call that passed a `&str` or `&String` compiles as before; one that relied on the
+  parameter being `&str` to infer a type (`value.as_ref()`, `.into()`) now needs `&str` written
+  out. `cargo-semver-checks` reports no break.
+- **Docs**: giong-web's `Router::layer` and README say that the first middleware added is
+  the outermost, the reverse of axum's `Router::layer`, so code ported from axum lists its
+  layers the other way round.
+- **Docs**: CONTRIBUTING.md lists every fuzz target (`response_body`, the PostgreSQL and
+  MySQL `session` targets and the resolver's two were missing); giong-http's
+  `Response::json` says it sends bytes that are already JSON; the API freeze record
+  (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
+
+### Deprecated
+
+- **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
+  giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
+  that names the new method, and go in 1.0.0-rc.1.
 
 ### Fixed
 
@@ -43,7 +85,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   the bind. `TcpListener::bind` takes the same path (it was not affected). Seen as the
   rare `AddrInUse` of the UDP rebind test on CI; reproduced without giong at 8 to 105
   refused binds in about 119,000 with two threads reading `/proc/self/fd`, none without.
-
+- **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
+  pool opened its first connection (the random part of the lifetime was computed as a tenth
+  of it times up to 999); a lifetime too long for the clock now means none, as
+  `wait_timeout(Duration::MAX)` does in giong-redis. Found while adding the same setting to
+  the other two pools.
 - **giong-http**: an idle HTTP/2 connection took 61% more resident memory in 0.8.0 than in
   0.5.0 (6.78 KiB against 4.21 on bare metal, `bench/h2.sh`, 5,000 connections that made
   one request each). Since 0.8.0 a connection kept the memory for its streams for a second

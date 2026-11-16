@@ -58,6 +58,8 @@ What is frozen after 0.7.0 is guarded by `cargo-semver-checks` in CI.
 | `Error::from_status` falls back to `502` | **Kept**: a status from upstream that is not an error status is a bad gateway. |
 | The strict query rule, `401` under a nested auth layer, 32-hex request ids, refusing a catch-all that starts with `/` | **Kept**, as settled in 0.6.0. |
 | `json()` panicked on a status outside `200..=599` | **Changed** to an internal error. |
+| `Sink` was an exhaustive enum | Changed in 0.6.0 to `#[non_exhaustive]`, kept. |
+| Two `json`s: `giong_web::json` serializes, giong-http's `Response::json` takes bytes that are JSON already | **Kept**: both are documented as such, each pointing at the other. |
 | `Router::merge`, forms, per-route body limits | **Later**, additions. |
 
 ## giong-tls
@@ -80,6 +82,12 @@ What is frozen after 0.7.0 is guarded by `cargo-semver-checks` in CI.
 | giong-redis's `mget` needed two type arguments | **Changed** to one. |
 | giong-redis's `ToArg` | Changed in 0.6.0 (`write_arg`), and kept. |
 | Pool settings (`wait_timeout` after `new`, panicking once cloned) | **Kept**, the same in all three pools; new settings are new methods. |
+| Only giong-postgres's pool closed idle and old connections (`idle_timeout`, `max_lifetime`, `PoolStats::recycled`) | **Added** after 0.8.0 to giong-mysql and giong-redis, with the same names, defaults (10 and 30 minutes) and meaning, before 1.0 rather than after, because the defaults change what a running service does. |
+| The pools' other counters differ (giong-mysql has `draining`, `resets`, `statement_limit_errors`) | **Kept**: `PoolStats` is `#[non_exhaustive]` in all three, and a pool reports what it does; a counter another pool gains later takes the same name. |
+| giong-mysql's `Config::statement_timeout` takes a `Duration` and cannot be turned off, giong-postgres's takes `impl Into<Option<Duration>>` | **Kept**. giong-postgres needs `None` because PgBouncer refuses a connection that sends the setting; giong-mysql has no such case reported, and a long timeout turns it off in effect. Should a proxy need it, a way to send no limit is a new method, which breaks nobody. That it bounds `SELECT`s only on MySQL and every statement on MariaDB is documented on the method. |
+| giong-mysql's `Tls::verify_ca` returns `Tls::Verify` with a connector that skips the host name | **Kept**: `Tls` is `#[non_exhaustive]`, so a variant of its own can be added. |
+| giong-mysql reads impossible dates (31 February, under `ALLOW_INVALID_DATES`) by rolling them over | **Later**: refusing them is behaviour, not API. |
+| giong-redis's TCP keepalive and user timeout are fixed at 60 seconds | **Later**: settings for them are additions. |
 
 ## giong-mcp and giong-compat
 
@@ -89,6 +97,39 @@ What is frozen after 0.7.0 is guarded by `cargo-semver-checks` in CI.
 | `McpServer::url` returned `unix:/path/mcp` for a socket | **Changed** to `Option<String>`. |
 | `Compat`'s name clashes with `tokio_util::compat::Compat` | **Kept**; import it under another name where both are used. |
 | `Compat::with_unread` | **Later**, an addition. |
+| `Compat::write_buffer` panics outside 1 byte to 1 GiB | **Kept**: a limit outside that range is a mistake in the code, and the panic carries `GIONG-E1403` with the range, as the other builders' settings do. |
+
+## Checked again after 0.8.0
+
+On 2026-11-16 (`main` at `d2631ae`) every item marked **changed** above was checked to be
+in the code, and the reviews of every crate were read again for items this record had left
+out; they are the rows added under giong-web, the database clients and giong-compat. The
+only public API added since 0.7.0, giong-http's `Server::min_free_memory` and
+`GIONG-E1121`, follows the rules above (a byte count as `usize`, like `max_body_size`).
+
+## Tidied after 0.8.0
+
+A second pass on 2026-11-16 read the public API of all nine crates side by side (every
+public item, the 114 error codes, every `Default` and every exhaustive type), looking for
+names that differ between sibling crates, defaults that 1.x could only change by
+breaking someone, and anything the 1.1 to 1.5 plans would have to break. It found six
+items. Exhaustive enums and structs are only the ones decided above; every default is
+bounded but one; every error code has its page; nothing in the 1.x plans needs a break
+(`DriverKind`, `Version` and `Body` are `#[non_exhaustive]`, `Transport`'s methods have
+defaults).
+
+A rename is made by adding the new name and deprecating the old one in the 0.9 line, so
+code written against 0.8 keeps compiling and the warning names the new method; the
+release pull request of 1.0.0-rc.1 removes every deprecated item.
+
+| Item | Decision |
+|---|---|
+| `Error::code()` is the server's code in giong-postgres and giong-mysql, but giong-redis calls it `server_code()` (its `code()` is on `ServerError`, the counterpart of the other two's `DbError`) | **Changed**: `server_code()` in all three; `code()` deprecated in giong-postgres and giong-mysql. `DbError::code()` and redis's `ServerError::code()` keep their names. |
+| `Error::is_transient()` existed in giong-redis and giong-http's client only | **Added** to giong-postgres and giong-mysql, with the lists of retryable server codes in the docs. |
+| giong-postgres's `Config::dbname`, `database` in giong-mysql and giong-redis | **Changed** to `database`; `dbname` deprecated. The URL parameter stays `dbname`, as in libpq. |
+| giong-http's client `RequestBuilder::header` took `&str` for the value, the server's `Response::header` takes `impl AsRef<str>` | **Changed** to `impl AsRef<str>`; a call passing `&str` or `&String` compiles as before (`cargo-semver-checks` reports no break), one that relied on `&str` to infer a type (`.as_ref()`, `.into()`) has to name it. |
+| giong-web's middleware order is the reverse of axum's, which code ported from axum gets wrong silently | **Kept** (first added is outermost reads in order), and **documented** on `Router::layer` and in the README. |
+| giong's `sync::mpsc::channel()` is unbounded under the name every other runtime gives a bounded channel | **Changed**: `unbounded()` added and `channel()` deprecated, in a pull request held until the 72-hour soak ends, because it is in the core crate. |
 
 ## Still open
 
