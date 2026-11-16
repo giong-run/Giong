@@ -28,6 +28,9 @@ pub(crate) struct PoolConfig {
     /// The nice value its threads take on start (0 leaves it alone). On
     /// Linux the nice value belongs to each thread.
     pub(crate) nice: i32,
+    /// Put its threads in `SCHED_IDLE` (see [`crate::sched`]); `nice` is
+    /// the fallback where the kernel refuses.
+    pub(crate) idle_class: bool,
     /// Stack size of its threads; `None` for the standard library's default.
     pub(crate) stack_size: Option<usize>,
     /// When no thread can be started and none exists: `true` runs the
@@ -144,7 +147,9 @@ impl Pool {
     }
 
     fn work(self: Arc<Self>) {
-        if self.cfg.nice != 0 {
+        if self.cfg.idle_class && crate::sched::set_idle_class() {
+            // A waking worker now preempts this thread at once.
+        } else if self.cfg.nice != 0 {
             // SAFETY: plain syscall with integer arguments. `who == 0` is the
             // calling thread on Linux, where each thread has its own nice
             // value. Raising it needs no privilege; failure leaves the

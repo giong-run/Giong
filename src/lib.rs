@@ -88,6 +88,7 @@ mod notify;
 mod op;
 mod pool;
 mod runtime;
+mod sched;
 mod slab;
 
 pub mod error;

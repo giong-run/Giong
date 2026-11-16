@@ -22,7 +22,7 @@ cd "$(dirname "$0")"
 ROUNDS=${1:-5}
 SECS=${2:-10}
 OUT=${OUT:-results/lanes}
-SCENARIOS=${SCENARIOS:-"idle lane lane-nice0 inline tokio-idle tokio"}
+SCENARIOS=${SCENARIOS:-"idle lane-old lane-slice lane-idle lane inline tokio-idle tokio hog-old hog tokio-hog"}
 mkdir -p "$OUT"
 CSV="$OUT/raw.csv"
 

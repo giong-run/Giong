@@ -41,12 +41,34 @@ fn a_blocking_closure_runs_on_a_lane_thread_and_gives_its_value() {
 #[test]
 fn a_compute_closure_runs_below_the_workers_priority() {
     giong::block_on(async {
-        let (name, prio) = giong::spawn_compute(|| (thread_name(), nice()))
+        let (name, policy) = giong::spawn_compute(|| (thread_name(), policy()))
             .await
             .unwrap();
         assert_eq!(name, "giong-lane-cpu");
-        assert_eq!(prio, nice() + 10);
+        assert_eq!(
+            policy,
+            libc::SCHED_IDLE,
+            "compute threads run in SCHED_IDLE"
+        );
     });
+}
+
+#[test]
+fn without_the_idle_class_a_compute_closure_runs_at_nice_plus_10() {
+    giong::Builder::new()
+        .workers(1)
+        .compute_idle_class(false)
+        .block_on(async {
+            let (policy, prio) = giong::spawn_compute(|| (policy(), nice())).await.unwrap();
+            assert_eq!(policy, libc::SCHED_OTHER);
+            assert_eq!(prio, nice() + 10);
+        })
+        .unwrap();
+}
+
+fn policy() -> i32 {
+    // SAFETY: plain syscall on the calling thread.
+    unsafe { libc::sched_getscheduler(0) }
 }
 
 #[test]

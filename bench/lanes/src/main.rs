@@ -16,6 +16,17 @@
 //!   tokio-idle    Tokio multi-thread runtime, no CPU jobs
 //!   tokio         Tokio, jobs through spawn_blocking
 //!
+//! Scheduler contract (src/sched.rs). `lane` above runs with the defaults:
+//! workers ask for a 100 us slice, compute threads run in SCHED_IDLE.
+//!   lane-old      the lane as draft #118 shipped it: kernel slice, nice +10
+//!   lane-slice    100 us worker slice, compute threads at nice +10
+//!   lane-idle     kernel slice, compute threads in SCHED_IDLE
+//!   hog-old       giong with the kernel slice, no jobs, while another
+//!                 "program" (one spinning thread per CPU at nice 0, outside
+//!                 the runtime) keeps every CPU busy: a noisy neighbour
+//!   hog           the same with the 100 us worker slice (default)
+//!   tokio-hog     Tokio with the same neighbour
+//!
 //! Every scenario keeps one job in flight per CPU, so the CPU work offered is
 //! the same. Prints one CSV line:
 //!   scenario,pings,p50_us,p99_us,p999_us,max_us,jobs_per_s
@@ -58,8 +69,23 @@ fn main() {
 
     let server = {
         let (scenario, stop, jobs) = (scenario.clone(), stop.clone(), jobs.clone());
+        if scenario.contains("hog") {
+            for _ in 0..cpus() {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        for _ in 0..10_000 {
+                            x = black_box(x.wrapping_mul(31).wrapping_add(7));
+                        }
+                    }
+                });
+            }
+        }
         std::thread::spawn(move || match scenario.as_str() {
-            "tokio" | "tokio-idle" => tokio_server(addr, scenario == "tokio", stop, jobs),
+            "tokio" | "tokio-idle" | "tokio-hog" => {
+                tokio_server(addr, scenario == "tokio", stop, jobs)
+            }
             _ => giong_server(addr, scenario, stop, jobs),
         })
     };
@@ -77,7 +103,10 @@ fn main() {
     let clients: Vec<_> = (0..CLIENTS)
         .map(|_| std::thread::spawn(move || client(addr, until)))
         .collect();
-    let mut rtts: Vec<u32> = clients.into_iter().flat_map(|c| c.join().unwrap()).collect();
+    let mut rtts: Vec<u32> = clients
+        .into_iter()
+        .flat_map(|c| c.join().unwrap())
+        .collect();
     let elapsed = t0.elapsed().as_secs_f64();
     let done = jobs.load(Ordering::Relaxed) - start_jobs;
     rtts.sort_unstable();
@@ -121,8 +150,14 @@ fn client(addr: SocketAddr, until: Instant) -> Vec<u32> {
 
 fn giong_server(addr: SocketAddr, scenario: String, stop: Arc<AtomicBool>, jobs: Arc<AtomicU64>) {
     let workers = cpus();
-    giong::Builder::new()
-        .workers(workers)
+    let mut builder = giong::Builder::new().workers(workers);
+    if matches!(scenario.as_str(), "lane-old" | "lane-idle" | "hog-old") {
+        builder = builder.worker_slice(Duration::ZERO);
+    }
+    if matches!(scenario.as_str(), "lane-old" | "lane-slice") {
+        builder = builder.compute_idle_class(false);
+    }
+    builder
         .build()
         .unwrap()
         .run(move |_| {
@@ -130,7 +165,7 @@ fn giong_server(addr: SocketAddr, scenario: String, stop: Arc<AtomicBool>, jobs:
             async move {
                 // One job in flight per worker = one per CPU.
                 match scenario.as_str() {
-                    "idle" => {}
+                    "idle" | "hog" | "hog-old" => {}
                     "inline" => {
                         let (stop, jobs) = (stop.clone(), jobs.clone());
                         giong::spawn(async move {
@@ -141,7 +176,7 @@ fn giong_server(addr: SocketAddr, scenario: String, stop: Arc<AtomicBool>, jobs:
                             }
                         });
                     }
-                    "lane" | "lane-nice0" => {
+                    "lane" | "lane-nice0" | "lane-old" | "lane-slice" | "lane-idle" => {
                         let undo = scenario == "lane-nice0";
                         let (stop, jobs) = (stop.clone(), jobs.clone());
                         giong::spawn(async move {
@@ -149,7 +184,8 @@ fn giong_server(addr: SocketAddr, scenario: String, stop: Arc<AtomicBool>, jobs:
                                 let r = giong::spawn_compute(move || {
                                     if undo {
                                         // SAFETY: plain syscall on the calling thread.
-                                        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 0) };
+                                        let rc =
+                                            unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 0) };
                                         assert_eq!(rc, 0, "lane-nice0 needs root or CAP_SYS_NICE");
                                     }
                                     job()
@@ -178,7 +214,9 @@ fn giong_server(addr: SocketAddr, scenario: String, stop: Arc<AtomicBool>, jobs:
                     let _ = stream.set_nodelay(true);
                     giong::spawn(async move {
                         loop {
-                            let Ok(data) = stream.recv().await else { return };
+                            let Ok(data) = stream.recv().await else {
+                                return;
+                            };
                             if data.is_empty() {
                                 return;
                             }

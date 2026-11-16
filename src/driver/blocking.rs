@@ -38,6 +38,7 @@ fn pool() -> &'static Arc<Pool> {
             max_threads: MAX_THREADS,
             idle: IDLE,
             nice: 0,
+            idle_class: false,
             stack_size: None,
             run_inline_on_failure: true,
         })

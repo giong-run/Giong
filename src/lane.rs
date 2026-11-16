@@ -12,7 +12,7 @@
 //! | Lane | For | Threads | Priority |
 //! |---|---|---|---|
 //! | [`spawn_blocking`] | Work that **waits**: blocking system calls and libraries | Grow on demand up to [`Builder::max_blocking_threads`](crate::Builder::max_blocking_threads) (default 128), end after 10 s idle | Normal |
-//! | [`spawn_compute`] | Work that **computes**: CPU-bound jobs | Up to [`Builder::compute_threads`](crate::Builder::compute_threads), by default the CPU budget of the process (its CPUs, or its cgroup CPU quota) | Lower than the workers (nice +10) |
+//! | [`spawn_compute`] | Work that **computes**: CPU-bound jobs | Up to [`Builder::compute_threads`](crate::Builder::compute_threads), by default the CPU budget of the process (its CPUs, or its cgroup CPU quota) | Lower than the workers (`SCHED_IDLE`, or nice +10) |
 //!
 //! Both return a [`BlockingHandle`]; awaiting it gives the closure's value,
 //! or a [`JoinError`] if the closure panicked or never ran.
@@ -36,12 +36,15 @@
 //!
 //! By default the workers already take every CPU the process may use, so a
 //! compute thread always shares a core with a worker. The compute threads
-//! run at nice +10, which the kernel's scheduler weighs at about a tenth of
-//! a worker: while a worker has work it gets its core back within the
-//! scheduler's time slice, and while the workers are idle the compute lane
-//! uses all of the CPU. Compute jobs still progress under full network load,
-//! more slowly. `bench/lanes.sh` measures what this buys; its results are in
-//! `bench/results/lanes/`.
+//! run in the kernel's `SCHED_IDLE` class: a worker that wakes up takes its
+//! core back at once, and while the workers are idle the compute lane uses
+//! all of the CPU. The cost is that while the workers keep every CPU busy,
+//! compute jobs barely progress; [`Builder::compute_idle_class(false)`](crate::Builder::compute_idle_class)
+//! runs them at nice +10 instead (about a tenth of a worker's weight, but a
+//! waking worker may wait up to a scheduler slice for its core). Workers
+//! also ask for a short slice ([`Builder::worker_slice`](crate::Builder::worker_slice)).
+//! `bench/lanes.sh` measures what this buys; its results are in
+//! `bench/results/lanes/` and `bench/results/sched-contract/`.
 //!
 //! Under a cgroup CPU quota (a container's CPU limit), every thread of the
 //! process draws on the same quota, whatever its priority: a busy compute
@@ -101,6 +104,7 @@ pub(crate) struct LaneConfig {
     pub(crate) max_blocking: usize,
     pub(crate) compute_threads: usize,
     pub(crate) compute_backlog: usize,
+    pub(crate) compute_idle_class: bool,
 }
 
 /// A runtime's two lanes. No thread starts until the first job.
@@ -118,6 +122,7 @@ impl Lanes {
                 max_threads: cfg.max_blocking,
                 idle: IDLE,
                 nice: 0,
+                idle_class: false,
                 stack_size: None,
                 run_inline_on_failure: false,
             }),
@@ -126,6 +131,7 @@ impl Lanes {
                 max_threads: cfg.compute_threads,
                 idle: IDLE,
                 nice: COMPUTE_NICE,
+                idle_class: cfg.compute_idle_class,
                 stack_size: None,
                 run_inline_on_failure: false,
             }),

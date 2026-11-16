@@ -880,6 +880,9 @@ impl Worker {
 ///     })?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
+/// See [`Builder::worker_slice`].
+const DEFAULT_WORKER_SLICE: Duration = Duration::from_micros(100);
+
 #[derive(Clone, Debug)]
 pub struct Builder {
     workers: Option<usize>,
@@ -898,6 +901,9 @@ pub struct Builder {
     compute_threads: Option<usize>,
     /// `None`: four per compute thread.
     compute_backlog: Option<usize>,
+    /// `None`: leave the kernel's default slice (see [`Builder::worker_slice`]).
+    worker_slice: Option<Duration>,
+    compute_idle_class: bool,
 }
 
 impl Default for Builder {
@@ -925,7 +931,38 @@ impl Builder {
             max_blocking_threads: crate::lane::DEFAULT_MAX_BLOCKING,
             compute_threads: None,
             compute_backlog: None,
+            worker_slice: Some(DEFAULT_WORKER_SLICE),
+            compute_idle_class: true,
         }
+    }
+
+    /// The CPU scheduler slice each worker asks the kernel for (default:
+    /// 100 µs, the shortest Linux accepts; `Duration::ZERO` keeps the
+    /// kernel's default, about 3 ms).
+    ///
+    /// When every CPU is busy, a worker woken by the network waits until the
+    /// thread on its CPU has used up its slice, whatever their nice values.
+    /// A short slice gives a waking worker an early deadline in the fair
+    /// scheduler (EEVDF), so it runs first and, from Linux 6.13, preempts at
+    /// once. It does not give the workers more CPU time over a second: that
+    /// still follows their weight. Needs Linux 6.12 or later and no
+    /// privilege; older kernels ignore it.
+    pub fn worker_slice(mut self, slice: Duration) -> Self {
+        self.worker_slice = (!slice.is_zero()).then_some(slice);
+        self
+    }
+
+    /// Whether compute lane threads run in the kernel's `SCHED_IDLE` class
+    /// (default: `true`) or at nice +10.
+    ///
+    /// A worker that wakes preempts a `SCHED_IDLE` thread on its CPU at once;
+    /// against a nice +10 thread it may wait for that thread's slice. The
+    /// cost: while the workers keep every CPU busy, `SCHED_IDLE` jobs get
+    /// almost no CPU (nice +10 gets about a tenth), so bound the wait with
+    /// [`try_spawn_compute`](crate::try_spawn_compute) or a timeout.
+    pub fn compute_idle_class(mut self, idle: bool) -> Self {
+        self.compute_idle_class = idle;
+        self
     }
 
     /// Number of worker threads.
@@ -1094,7 +1131,8 @@ impl Builder {
     /// Defaults to the CPU budget of the process, the same number
     /// [`workers`](Self::workers) defaults to: its CPUs, or its cgroup CPU
     /// quota when that is lower. More threads than CPUs only add switching.
-    /// Compute threads run at a lower priority than the workers (nice +10),
+    /// Compute threads run at a lower priority than the workers
+    /// (`SCHED_IDLE`, see [`compute_idle_class`](Self::compute_idle_class)),
     /// so they use the CPU time the workers leave; see the
     /// [lane docs](crate::lane) for what that means under a CPU quota.
     pub fn compute_threads(mut self, n: usize) -> Self {
@@ -1124,6 +1162,7 @@ impl Builder {
             compute_backlog: self
                 .compute_backlog
                 .unwrap_or(compute_threads * crate::lane::BACKLOG_PER_THREAD),
+            compute_idle_class: self.compute_idle_class,
         }
     }
 
@@ -1271,6 +1310,7 @@ impl Runtime {
             .builder
             .pin_cores
             .unwrap_or_else(|| pin_by_default(cpus.len(), parallelism()));
+        let slice = self.builder.worker_slice;
         let f = Arc::new(f);
         let gate = Arc::new(Gate {
             state: Mutex::new(None),
@@ -1295,6 +1335,9 @@ impl Runtime {
                 .spawn(move || {
                     if let Some(cpu) = cpu {
                         pin_to_cpu(cpu);
+                    }
+                    if let Some(slice) = slice {
+                        crate::sched::set_slice(slice);
                     }
                     let worker = match Worker::new(index, rt.clone(), &cfg) {
                         Ok(worker) => {
