@@ -62,7 +62,7 @@ compares runs; `Report::first_difference` finds where two runs part.
 | `http` | giong-http over plain TCP, TLS and HTTP/2: a response never goes to the wrong request, benign faults never show as errors. |
 | `redis`, `postgres` | giong-redis and giong-postgres pools against small fake servers: never a wrong answer. |
 | `disk` | `giong::fs` under slow disks, `EIO`, `ENOSPC` and short transfers: data written and synced reads back unchanged or an error is reported. |
-| `soak` | Months of uptime in simulated time: an HTTP server and its client with an hourly burst of requests, quiet hours between, and timers that span days. Nothing grows per request (descriptors, tasks, timers, operations), timers are never early and do not drift. 90 days under benign faults and 10 runs of 12 days under hostile faults, about 210 simulated days, take about 3 s. |
+| `soak` | Months of uptime in simulated time: an HTTP server and its client with an hourly burst of requests, quiet hours between, and timers that span days. Nothing grows per request (descriptors, tasks, timers, operations), timers are never early and do not drift. 90 days under benign faults and 10 runs of 12 days under hostile faults, about 210 simulated days, take about 3 s. Every night `scripts/check.sh sim-long` runs the hostile soak for 1,200 new seeds of 521 days each (about 1,700 simulated years). |
 
 Every run of `sweep` fails if it leaves a descriptor open (`Report::open`).
 
@@ -86,8 +86,10 @@ Replay it with the same test and `GIONG_SIM_SEED=14`. More context:
 `GIONG_SIM_TAIL=<n>` shows the last n steps, `GIONG_SIM_DUMP=<file>` writes
 the whole trace of a run started with `full_trace(true)`,
 `GIONG_SIM_VERBOSE=1` prints each suite test's steps and virtual time.
-`GIONG_SIM_SEEDS=<n>` sets how many seeds the sweeps run, and
-`GIONG_SIM_SOAK_DAYS=<n>` how long the soak runs.
+`GIONG_SIM_SEEDS=<n>` sets how many seeds the sweeps run,
+`GIONG_SIM_SEED_FROM=<n>` the first seed of the hostile soak, and
+`GIONG_SIM_SOAK_DAYS=<n>` how long the soak runs. A seed found by the nightly
+long runs replays with `GIONG_SIM_SEED=<seed> GIONG_SIM_SOAK_DAYS=3650`.
 
 ## What it does not cover
 

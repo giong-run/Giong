@@ -14,8 +14,14 @@
 //! - a sleep for half the run wakes on time, and 10-minute ticks do not
 //!   drift.
 //!
+//! Under hostile faults the clock may jump forward by up to 30 s. A jump
+//! while a request is on its way can use up the server's request timeout,
+//! and then the server's 408 is the right answer, so it counts as an error,
+//! but only when the request really took that long on the client's clock.
+//!
 //! `GIONG_SIM_SOAK_DAYS` sets the length (default 90 days; the hostile runs
-//! take a seventh of that each, over `GIONG_SIM_SEEDS` seeds, default 10).
+//! take a seventh of that each, over `GIONG_SIM_SEEDS` seeds, default 10,
+//! starting at seed `GIONG_SIM_SEED_FROM`, default 0).
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -28,6 +34,8 @@ use giong_sim::{Faults, Sim};
 const BURST: usize = 12;
 const POOL: usize = 4;
 const HOUR: Duration = Duration::from_secs(3600);
+/// The server's request timeout: the most a request may take to arrive.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn echo(req: Request) -> Response {
     let mut body = req.path().as_bytes().to_vec();
@@ -69,7 +77,9 @@ struct Outcome {
 fn soak(days: u64, jumps: bool) -> Outcome {
     giong::block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
-        let server = Server::new().idle_timeout(Duration::from_secs(60));
+        let server = Server::new()
+            .idle_timeout(Duration::from_secs(60))
+            .request_timeout(REQUEST_TIMEOUT);
         giong::spawn(async move { server.serve(listener, echo).await });
         let client = Rc::new(
             Client::builder()
@@ -112,12 +122,23 @@ fn soak(days: u64, jumps: bool) -> Outcome {
                     giong::spawn(async move {
                         let path = format!("/h{hour}/t{t}");
                         let body = vec![b'a' + (t % 26) as u8; 50 + t * 211];
+                        let sent = Instant::now();
                         match client
                             .post(&format!("http://127.0.0.1:8080{path}"))
                             .body(body.clone())
                             .send()
                             .await
                         {
+                            // The request timed out on the server: right
+                            // only if a clock jump made it take that long.
+                            Ok(resp) if resp.status() == 408 => {
+                                let took = sent.elapsed();
+                                assert!(
+                                    jumps && took >= REQUEST_TIMEOUT,
+                                    "408 for {path} after only {took:?}"
+                                );
+                                false
+                            }
                             Ok(resp) => {
                                 assert_eq!(resp.status(), 200);
                                 let mut want = path.into_bytes();
@@ -223,9 +244,13 @@ fn days_of_uptime_under_hostile_faults() {
         .unwrap_or(10);
     let real = Instant::now();
     let mut simulated = Duration::ZERO;
+    let from: u64 = std::env::var("GIONG_SIM_SEED_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let seeds: Vec<u64> = match giong_sim::replay_seed() {
         Some(s) => vec![s],
-        None => (0..seeds).collect(),
+        None => (from..from + seeds).collect(),
     };
     for seed in seeds {
         let (out, r) = Sim::new(seed)
