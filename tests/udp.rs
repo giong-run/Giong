@@ -486,20 +486,31 @@ fn runtime_teardown_with_datagrams_in_flight() {
     }
 }
 
-/// The inode of a socket, to find out later whether any descriptor of this
-/// process still refers to it. (Descriptor numbers are reused by the tests
-/// running in parallel, inodes are not.)
+/// The inode of a socket, to find out later whether it is still open.
+/// (Descriptor numbers are reused by the tests running in parallel, inodes
+/// are not.)
 fn socket_inode(socket: &UdpSocket) -> String {
-    use std::os::fd::AsRawFd;
-    let link = std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
-    link.to_string_lossy().into_owned()
+    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: `socket` keeps the descriptor open while it is borrowed here.
+    let fd = unsafe { BorrowedFd::borrow_raw(socket.as_raw_fd()) };
+    let file = std::fs::File::from(fd.try_clone_to_owned().unwrap());
+    file.metadata().unwrap().ino().to_string()
 }
 
+/// Whether the socket with `inode` still exists, from the kernel's UDP
+/// tables. Not from /proc/self/fd: listing or reading those links takes a
+/// reference to every open file for a moment, and a socket that another test
+/// closes in that moment keeps its port until this thread is done. The
+/// rebind test then saw AddrInUse for a port nothing held.
 fn is_open(inode: &str) -> bool {
-    std::fs::read_dir("/proc/self/fd")
-        .unwrap()
-        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-        .any(|target| target.to_string_lossy() == inode)
+    ["/proc/net/udp", "/proc/net/udp6"].iter().any(|table| {
+        std::fs::read_to_string(table)
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(9) == Some(inode))
+    })
 }
 
 #[test]
@@ -672,7 +683,9 @@ fn port_outside_ephemeral_range(ip: [u8; 4]) -> std::net::SocketAddr {
 }
 
 /// The process that owns socket `inode`, when /proc lets this process see
-/// it (processes of other users hide their descriptors).
+/// it (processes of other users hide their descriptors). Only for a report
+/// after a failure: reading /proc/*/fd holds sockets that close meanwhile
+/// (see `is_open`).
 fn socket_owner(inode: &str) -> Option<String> {
     let target = format!("socket:[{inode}]");
     for proc in std::fs::read_dir("/proc").ok()?.flatten() {
