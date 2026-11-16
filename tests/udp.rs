@@ -486,31 +486,135 @@ fn runtime_teardown_with_datagrams_in_flight() {
     }
 }
 
-/// The inode of a socket, to find out later whether it is still open.
-/// (Descriptor numbers are reused by the tests running in parallel, inodes
-/// are not.)
-fn socket_inode(socket: &UdpSocket) -> String {
-    use std::os::fd::{AsRawFd, BorrowedFd};
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: `socket` keeps the descriptor open while it is borrowed here.
-    let fd = unsafe { BorrowedFd::borrow_raw(socket.as_raw_fd()) };
-    let file = std::fs::File::from(fd.try_clone_to_owned().unwrap());
-    file.metadata().unwrap().ino().to_string()
+/// What names one socket for good: its address and its cookie, a number the
+/// kernel never gives another socket. (Descriptor numbers are reused by the
+/// tests running in parallel.)
+#[derive(Clone, Copy, Debug)]
+struct SocketId {
+    addr: std::net::SocketAddrV4,
+    cookie: u64,
 }
 
-/// Whether the socket with `inode` still exists, from the kernel's UDP
-/// tables. Not from /proc/self/fd: listing or reading those links takes a
-/// reference to every open file for a moment, and a socket that another test
-/// closes in that moment keeps its port until this thread is done. The
-/// rebind test then saw AddrInUse for a port nothing held.
-fn is_open(inode: &str) -> bool {
-    ["/proc/net/udp", "/proc/net/udp6"].iter().any(|table| {
-        std::fs::read_to_string(table)
-            .unwrap_or_default()
-            .lines()
-            .skip(1)
-            .any(|line| line.split_whitespace().nth(9) == Some(inode))
-    })
+fn socket_id(socket: &UdpSocket) -> SocketId {
+    use std::os::fd::AsRawFd;
+    const SO_COOKIE: libc::c_int = 57;
+    let mut cookie = 0u64;
+    let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+    // SAFETY: `cookie` and `len` are valid for the kernel to write.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_COOKIE,
+            (&raw mut cookie).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(rc, 0, "SO_COOKIE: {}", std::io::Error::last_os_error());
+    let std::net::SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
+        panic!("not an IPv4 socket");
+    };
+    SocketId { addr, cookie }
+}
+
+/// Whether the socket `id` still exists, asked of the kernel by its address
+/// and cookie (sock_diag), in one request.
+///
+/// Not from /proc/self/fd: listing or reading those links holds every open
+/// file for a moment, and a socket another test closes in that moment keeps
+/// its port until this thread is done (the rebind test then saw AddrInUse
+/// for a port nothing held). Nor from /proc/net/udp: the kernel writes that
+/// table a page per read, and sockets that come and go in between (the
+/// thousand of `port_zero_gives_every_socket_a_port_of_its_own`) can make a
+/// live socket fall between two pages.
+fn is_open(id: SocketId) -> bool {
+    #[repr(C)]
+    struct Request {
+        len: u32,
+        kind: u16,
+        flags: u16,
+        seq: u32,
+        pid: u32,
+        family: u8,
+        protocol: u8,
+        ext: u8,
+        pad: u8,
+        states: u32,
+        sport: [u8; 2],
+        dport: [u8; 2],
+        src: [u8; 16],
+        dst: [u8; 16],
+        interface: u32,
+        cookie: [u32; 2],
+    }
+    const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    let mut src = [0u8; 16];
+    src[..4].copy_from_slice(&id.addr.ip().octets());
+    // A datagram from 127.0.0.1:1 to the socket's address finds it.
+    let mut from = [0u8; 16];
+    from[..4].copy_from_slice(&[127, 0, 0, 1]);
+    let request = Request {
+        len: std::mem::size_of::<Request>() as u32,
+        kind: SOCK_DIAG_BY_FAMILY,
+        flags: libc::NLM_F_REQUEST as u16,
+        seq: 1,
+        pid: 0,
+        family: libc::AF_INET as u8,
+        protocol: libc::IPPROTO_UDP as u8,
+        ext: 0,
+        pad: 0,
+        states: u32::MAX,
+        sport: 1u16.to_be_bytes(),
+        dport: id.addr.port().to_be_bytes(),
+        src: from,
+        dst: src,
+        interface: 0,
+        cookie: [id.cookie as u32, (id.cookie >> 32) as u32],
+    };
+    // SAFETY: plain system calls on a socket this function owns, with
+    // buffers that outlive them.
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            NETLINK_SOCK_DIAG,
+        );
+        assert!(fd >= 0, "netlink: {}", std::io::Error::last_os_error());
+        let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let sent = libc::send(
+            fd.as_raw_fd(),
+            (&raw const request).cast(),
+            std::mem::size_of::<Request>(),
+            0,
+        );
+        assert_eq!(sent, std::mem::size_of::<Request>() as isize);
+        let mut reply = [0u32; 1024];
+        let got = libc::recv(fd.as_raw_fd(), reply.as_mut_ptr().cast(), 4096, 0);
+        assert!(
+            got >= 20,
+            "sock_diag reply: {}",
+            std::io::Error::last_os_error()
+        );
+        // The header's type: the socket's description when it was found, an
+        // error when it was not: `ENOENT` when no socket has the address,
+        // `ESTALE` when another one does (a test running in parallel was
+        // given the port once this socket let it go; port-0 sockets do not
+        // share ports, so this one is closed).
+        let kind = reply[1] as u16;
+        if kind == SOCK_DIAG_BY_FAMILY {
+            return true;
+        }
+        assert_eq!(kind, libc::NLMSG_ERROR as u16);
+        let errno = -(reply[4] as i32);
+        assert!(
+            errno == libc::ENOENT || errno == libc::ESTALE,
+            "sock_diag: {}",
+            std::io::Error::from_raw_os_error(errno)
+        );
+        false
+    }
 }
 
 #[test]
@@ -527,12 +631,12 @@ fn dropping_a_socket_closes_it() {
         assert_eq!(res.unwrap(), (1, idle_addr));
         assert_eq!(&multishot.recv_from().await.unwrap().0[..], b"b");
 
-        let inodes = [&idle, &one_off, &multishot].map(socket_inode);
-        assert!(inodes.iter().all(|inode| is_open(inode)));
+        let ids = [&idle, &one_off, &multishot].map(socket_id);
+        assert!(ids.iter().all(|&id| is_open(id)));
         drop((idle, one_off, multishot));
         sleep(Duration::from_millis(20)).await;
-        for inode in &inodes {
-            assert!(!is_open(inode), "{inode} is still open");
+        for id in ids {
+            assert!(!is_open(id), "{id:?} is still open");
         }
     });
 }
