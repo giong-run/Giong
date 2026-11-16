@@ -993,6 +993,30 @@ fn at_the_connection_limit_new_clients_wait_their_turn() {
     }
 }
 
+/// Below `min_free_memory`, new connections are refused with a `503` that
+/// names the code, and closed. A reserve larger than any machine's memory
+/// stands in for a process near its memory limit (`scripts/idle-connections.sh`
+/// runs the real thing in a container in CI); `0` turns the check off.
+#[test]
+fn new_connections_are_refused_while_memory_is_low() {
+    let server = TestServer::start(Server::new().min_free_memory(usize::MAX), echo);
+    for _ in 0..3 {
+        let mut c = server.client();
+        c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        let r = c.reply();
+        assert_eq!(r.status, 503);
+        assert_eq!(r.header("retry-after"), Some("1"));
+        assert_eq!(r.header("connection"), Some("close"));
+        assert!(r.text().starts_with("GIONG-E1121"), "{}", r.text());
+        c.expect_closed();
+    }
+
+    let server = TestServer::start(Server::new().min_free_memory(0), echo);
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(c.reply().status, 200);
+}
+
 #[test]
 fn file_bodies_are_copied_over_a_unix_socket() {
     use std::os::unix::net::UnixStream;

@@ -159,8 +159,14 @@ memory per worker  ≈  max_buffered_request_bytes
   default) bounds the count.
 
 The defaults fit the budget to the container, but not the number of connections: 10,000
-idle HTTPS connections take about 145 MiB with the kernel's share. In a small container,
-lower `max_connections` to what fits next to the budget:
+idle HTTPS connections take about 145 MiB with the kernel's share. Past what fits, the
+server does not get killed: while less than `min_free_memory` is left to the process (a
+tenth of the container's limit by default, between 16 and 256 MiB), it refuses new
+connections with `503` and `Retry-After: 1`, or closes them before the TLS handshake
+([GIONG-E1121](errors/E1121.md)), and keeps serving the ones it holds. That is a last line
+of defence, which refuses clients the load balancer could have sent elsewhere. In a small
+container, lower `max_connections` to what fits next to the budget, so that the server
+stops accepting before memory runs low:
 
 ```rust
 use giong_http::Server;
@@ -176,7 +182,10 @@ CI checks the bound: the `slow-uploads` job runs a server with one worker and wi
 a Docker container limited to 128 MiB, sends it hundreds of uploads that stop one byte short
 of their announced length, over HTTP/1.1 and HTTP/2, and fails if the container is
 OOM-killed or a well-behaved client mixed in stops getting answers
-([scripts/slow-uploads.sh](../scripts/slow-uploads.sh)).
+([scripts/slow-uploads.sh](../scripts/slow-uploads.sh)). The same job then runs it in 48 MiB
+and opens idle connections until it refuses them, and fails if the container is
+OOM-killed, if the connections it holds stop being served, or if it does not take new ones
+once those close ([scripts/idle-connections.sh](../scripts/idle-connections.sh)).
 
 ## Docker
 

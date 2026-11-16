@@ -16,11 +16,8 @@
 //! it.
 
 use std::cell::Cell;
-use std::fs;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// What one HTTP/1.1 request may hold without being counted: the first
@@ -162,57 +159,10 @@ fn default_limit(cgroup: Option<u64>, workers: u64) -> u64 {
     }
 }
 
-/// The memory limit of the process's cgroup (the smallest along its path),
-/// read once. `None` without one.
+/// The memory limit of the process's cgroup (the smallest along its path).
+/// `None` without one.
 fn cgroup_memory_limit() -> Option<u64> {
-    static LIMIT: OnceLock<Option<u64>> = OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        let own = fs::read_to_string("/proc/self/cgroup").ok()?;
-        memory_limit_in(Path::new("/sys/fs/cgroup"), &own)
-    })
-}
-
-/// The memory limit for a process whose `/proc/self/cgroup` reads `own`,
-/// with the cgroup file systems mounted at `root`: cgroup v2's
-/// `memory.max`, or v1's `memory.limit_in_bytes` under `root/memory`. In a
-/// container the path in `own` may not exist (it names the host's cgroup)
-/// and the container's own cgroup is the mount's root: every directory from
-/// the path up to the root is read, and the smallest limit wins.
-fn memory_limit_in(root: &Path, own: &str) -> Option<u64> {
-    let mut found = None;
-    for line in own.lines() {
-        let mut fields = line.splitn(3, ':');
-        let (Some(_), Some(controllers), Some(path)) =
-            (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let (base, file) = if controllers.is_empty() {
-            (root.to_path_buf(), "memory.max")
-        } else if controllers.split(',').any(|c| c == "memory") {
-            (root.join("memory"), "memory.limit_in_bytes")
-        } else {
-            continue;
-        };
-        let mut dir: PathBuf = base.join(path.trim_start_matches('/'));
-        loop {
-            if let Some(limit) = read_limit(&dir.join(file)) {
-                found = Some(found.map_or(limit, |f: u64| f.min(limit)));
-            }
-            if dir == base || !dir.pop() || !dir.starts_with(&base) {
-                break;
-            }
-        }
-    }
-    found
-}
-
-/// A limit file: a number of bytes, or `max` (v2) or a number near
-/// `i64::MAX` (v1) for none.
-fn read_limit(file: &Path) -> Option<u64> {
-    let text = fs::read_to_string(file).ok()?;
-    let limit: u64 = text.trim().parse().ok()?;
-    (limit < 1 << 60).then_some(limit)
+    crate::memory::cgroup().map(|cgroup| cgroup.limit)
 }
 
 /// Notes a refused request; at most once a minute per worker, says so on
@@ -238,6 +188,8 @@ pub(crate) fn note_refused(limit: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
 
     #[test]
     fn charges_add_up_per_thread_and_never_pass_the_limit() {
@@ -280,6 +232,10 @@ mod tests {
         assert_eq!(default_limit(Some(128 << 20), 0), 32 << 20);
     }
 
+    fn limit_in(root: &Path, own: &str) -> Option<u64> {
+        crate::memory::cgroup_in(root, own).map(|cgroup| cgroup.limit)
+    }
+
     #[test]
     fn the_cgroup_limit_is_the_smallest_along_the_path() {
         let root = std::env::temp_dir().join(format!("giong-cgroup-{}", std::process::id()));
@@ -290,33 +246,33 @@ mod tests {
         fs::write(root.join("system.slice/memory.max"), "1073741824\n").unwrap();
         fs::write(service.join("memory.max"), "134217728\n").unwrap();
         assert_eq!(
-            memory_limit_in(&root, "0::/system.slice/app.service\n"),
+            limit_in(&root, "0::/system.slice/app.service\n"),
             Some(128 << 20)
         );
         // `max` is no limit.
         fs::write(service.join("memory.max"), "max\n").unwrap();
         assert_eq!(
-            memory_limit_in(&root, "0::/system.slice/app.service\n"),
+            limit_in(&root, "0::/system.slice/app.service\n"),
             Some(1 << 30)
         );
         // A container: the path names the host's cgroup, which is not
         // there; the mount's root is the container's.
         fs::write(root.join("memory.max"), "268435456\n").unwrap();
-        assert_eq!(memory_limit_in(&root, "0::/docker/abc\n"), Some(256 << 20));
+        assert_eq!(limit_in(&root, "0::/docker/abc\n"), Some(256 << 20));
         // v1, with the unlimited value.
         let v1 = root.join("memory");
         fs::create_dir_all(&v1).unwrap();
         fs::write(v1.join("memory.limit_in_bytes"), "9223372036854771712\n").unwrap();
         assert_eq!(
-            memory_limit_in(&root, "4:memory:/docker/abc\n2:cpu,cpuacct:/x\n"),
+            limit_in(&root, "4:memory:/docker/abc\n2:cpu,cpuacct:/x\n"),
             None
         );
         fs::write(v1.join("memory.limit_in_bytes"), "67108864\n").unwrap();
         assert_eq!(
-            memory_limit_in(&root, "4:cpuacct,memory:/docker/abc\n"),
+            limit_in(&root, "4:cpuacct,memory:/docker/abc\n"),
             Some(64 << 20)
         );
-        assert_eq!(memory_limit_in(&root, "garbage"), None);
+        assert_eq!(limit_in(&root, "garbage"), None);
         let _ = fs::remove_dir_all(&root);
     }
 }

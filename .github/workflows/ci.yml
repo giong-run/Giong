@@ -423,7 +423,10 @@ jobs:
   # giong-http with its defaults, in a container limited to 128 MiB, under
   # hundreds of uploads that stop one byte short: it must not be OOM-killed,
   # and a well-behaved client mixed in must keep getting answers. One and four
-  # workers, on epoll and on io_uring (scripts/slow-uploads.sh).
+  # workers, on epoll and on io_uring (scripts/slow-uploads.sh). Then in 48 MiB
+  # under idle connections until it refuses them for low memory: it must not
+  # be OOM-killed, and must keep serving the ones it holds
+  # (scripts/idle-connections.sh).
   slow-uploads:
     needs: build
     runs-on: ubuntu-24.04
@@ -444,6 +447,7 @@ jobs:
       # with the same features, so this finds it up to date.
       - run: cargo build --release --workspace --all-features --example defaults
       - run: scripts/slow-uploads.sh target/release/examples/defaults
+      - run: scripts/idle-connections.sh target/release/examples/defaults
 
   # ThreadSanitizer over every test: twice on io_uring and once on the epoll
   # driver, which hands file operations to threads of its own. Three jobs side

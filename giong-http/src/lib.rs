@@ -94,6 +94,7 @@ mod h2;
 mod heap;
 #[cfg(any(test, fuzzing))]
 mod invariants;
+mod memory;
 mod parse;
 mod request;
 mod response;
