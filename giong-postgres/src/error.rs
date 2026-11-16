@@ -14,7 +14,7 @@ use giong::error::Code;
 /// authentication failed for user "app". See https://…/E3003.md`.
 /// [`kind`](Self::kind) tells errors apart in code; errors the server
 /// reported carry its fields in [`db`](Self::db), with the SQLSTATE code in
-/// [`code`](Self::code).
+/// [`server_code`](Self::server_code).
 ///
 /// Errors are cheap to clone, and convert into [`std::io::Error`], so `?`
 /// works in functions that return `io::Result`; there,
@@ -47,7 +47,7 @@ pub enum ErrorKind {
     Auth,
     /// The server reported an error for the statement ([`Error::db`] has
     /// the details), or turned a `COMMIT` into a rollback because a statement
-    /// in the transaction failed earlier ([`Error::code`] is `25P02` and
+    /// in the transaction failed earlier ([`Error::server_code`] is `25P02` and
     /// [`Error::db`] is `None`).
     Db,
     /// A value could not be converted between Rust and PostgreSQL: a
@@ -200,7 +200,7 @@ impl Error {
 
     /// The giong error code, the one shown in front of the message: one
     /// for each [`ErrorKind`]. For the server's own code, see
-    /// [`code`](Self::code).
+    /// [`server_code`](Self::server_code).
     pub fn giong_code(&self) -> Code {
         self.0.kind.giong_code()
     }
@@ -214,11 +214,61 @@ impl Error {
     /// The SQLSTATE code of the server's error, such as `"23505"` for a
     /// unique violation. The codes are listed in the PostgreSQL manual,
     /// appendix A. A `COMMIT` that the server turned into a rollback has
-    /// `"25P02"` (in failed SQL transaction), with no [`db`](Self::db).
-    pub fn code(&self) -> Option<&str> {
+    /// `"25P02"` (in failed SQL transaction), with no [`db`](Self::db). For
+    /// giong's own code, see [`giong_code`](Self::giong_code).
+    pub fn server_code(&self) -> Option<&str> {
         match &self.0.db {
             Some(db) => Some(db.code()),
             None => self.0.sqlstate,
+        }
+    }
+
+    /// The SQLSTATE code: the old name of [`server_code`](Self::server_code).
+    #[deprecated(
+        since = "0.9.0",
+        note = "renamed server_code(), as in giong-redis: code() named a different thing in each \
+                giong crate; it goes in 1.0.0"
+    )]
+    pub fn code(&self) -> Option<&str> {
+        self.server_code()
+    }
+
+    /// Whether trying again may succeed: the connection could not be
+    /// opened or broke, no pooled connection became free in time, or the
+    /// server reported a serialization failure (`40001`), a deadlock
+    /// (`40P01`), a lock it could not take (`55P03`), too many connections
+    /// (`53300`), a connection error (class `08`), that it is shutting down
+    /// or starting (`57P01`, `57P02`, `57P03`), or that it is a standby
+    /// (`25006`, after a failover: a [`Pool`](crate::Pool) opens a new
+    /// connection for the next try).
+    ///
+    /// A statement that changes data may have run before a
+    /// [`Closed`](ErrorKind::Closed) error: retrying it may run it twice. A
+    /// transaction that failed with `40001` or `40P01` is retried from its
+    /// start, not from the failed statement. A statement stopped by the
+    /// statement timeout (`57014`) is not counted: it would most likely run
+    /// as long again.
+    pub fn is_transient(&self) -> bool {
+        match self.0.kind {
+            ErrorKind::Connect | ErrorKind::Closed | ErrorKind::PoolTimeout => true,
+            ErrorKind::Db => match self.server_code() {
+                Some(code) => {
+                    code.starts_with("08")
+                        || matches!(
+                            code,
+                            "40001"
+                                | "40P01"
+                                | "55P03"
+                                | "53300"
+                                | "57P01"
+                                | "57P02"
+                                | "57P03"
+                                | "25006"
+                        )
+                }
+                None => false,
+            },
+            _ => false,
         }
     }
 }
@@ -466,6 +516,53 @@ mod tests {
         let wrapped = wrapped.downcast_ref::<giong::error::Error>().unwrap();
         let back = wrapped.get_ref().unwrap().downcast_ref::<Error>().unwrap();
         assert_eq!(back.kind(), ErrorKind::PoolTimeout);
+    }
+
+    #[test]
+    fn transient_errors_are_the_ones_worth_retrying() {
+        let db = |code: &str| {
+            // An ErrorResponse body: severity, SQLSTATE, message.
+            let mut body = Vec::new();
+            for (tag, value) in [(b'S', "ERROR"), (b'C', code), (b'M', "it failed")] {
+                body.push(tag);
+                body.extend_from_slice(value.as_bytes());
+                body.push(0);
+            }
+            body.push(0);
+            Error::from_db(DbError::parse(&body).unwrap(), None)
+        };
+        for code in [
+            "40001", "40P01", "55P03", "53300", "57P01", "57P02", "57P03", "25006", "08006",
+        ] {
+            assert!(db(code).is_transient(), "{code}");
+            assert_eq!(db(code).server_code(), Some(code));
+        }
+        for code in ["23505", "22012", "42601", "57014", "25P02", "28P01"] {
+            assert!(!db(code).is_transient(), "{code}");
+        }
+        for kind in [
+            ErrorKind::Connect,
+            ErrorKind::Closed,
+            ErrorKind::PoolTimeout,
+        ] {
+            assert!(Error::new(kind, "x").is_transient(), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::Config,
+            ErrorKind::Auth,
+            ErrorKind::Type,
+            ErrorKind::Statement,
+        ] {
+            assert!(!Error::new(kind, "x").is_transient(), "{kind:?}");
+        }
+        assert!(!Error::with_sqlstate("25P02", "rolled back").is_transient());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn the_old_name_of_server_code_still_answers() {
+        let e = Error::with_sqlstate("25P02", "rolled back");
+        assert_eq!(e.code(), e.server_code());
     }
 
     #[test]

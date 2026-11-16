@@ -1290,7 +1290,7 @@ fn https_goes_through_a_tunnel_and_stays_encrypted() {
         for i in 0..3 {
             let r = client
                 .get(&url)
-                .header("X-Id", &i.to_string())
+                .header("X-Id", i.to_string())
                 .send()
                 .await
                 .unwrap();

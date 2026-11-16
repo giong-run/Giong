@@ -230,7 +230,7 @@ fn server_errors_carry_their_fields_and_leave_the_connection_usable() {
         table(&client, "errs", "id INT PRIMARY KEY").await;
         let e = client.query("SELEC 1", &[]).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Db, "{e}");
-        assert_eq!(e.code(), Some(1064));
+        assert_eq!(e.server_code(), Some(1064));
         let db = e.db().unwrap();
         assert_eq!(db.sqlstate(), "42000");
         assert!(db.message().contains("SQL syntax"), "{db}");
@@ -243,7 +243,7 @@ fn server_errors_carry_their_fields_and_leave_the_connection_usable() {
             .execute("INSERT INTO errs VALUES (?)", &[&1])
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some(1062), "{e}");
+        assert_eq!(e.server_code(), Some(1062), "{e}");
         assert_eq!(e.db().unwrap().sqlstate(), "23000");
         assert_eq!(count(&client, "errs").await, 1);
     });
@@ -326,7 +326,7 @@ fn batch_execute_runs_several_statements_and_stops_at_the_first_error() {
             )
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some(1146), "{e}");
+        assert_eq!(e.server_code(), Some(1146), "{e}");
         assert_eq!(count(&client, "batch").await, 3, "the first one stays");
     });
 }
@@ -394,7 +394,7 @@ fn a_failing_statement_in_a_pipeline_affects_only_itself() {
             }
         });
         assert_eq!(a.await.unwrap().unwrap(), 1);
-        assert_eq!(b.await.unwrap().unwrap_err().code(), Some(1146));
+        assert_eq!(b.await.unwrap().unwrap_err().server_code(), Some(1146));
         assert_eq!(c2.await.unwrap().unwrap(), 3);
     });
 }
@@ -526,7 +526,7 @@ fn the_statement_timeout_is_enforced_by_the_server() {
         let client = Client::connect(&config).await.unwrap();
         let started = std::time::Instant::now();
         let e = client.query(SLOW_SELECT, &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some(s.timeout_code()), "{e}");
+        assert_eq!(e.server_code(), Some(s.timeout_code()), "{e}");
         assert!(e.to_string().contains("Config::statement_timeout"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(
@@ -557,7 +557,7 @@ fn a_cancel_request_stops_the_running_statement() {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        assert_eq!(e.code(), Some(1317), "{e}");
+        assert_eq!(e.server_code(), Some(1317), "{e}");
         // The connection stays usable.
         let row = client.query_one("SELECT 2", &[]).await.unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 2);
@@ -781,7 +781,7 @@ fn a_deadlock_ends_the_transaction_and_says_to_retry() {
             (Ok(_), Err(e)) => (tb, ta, e),
             other => panic!("expected one deadlock: {other:?}"),
         };
-        assert_eq!(e.code(), Some(1213), "{e}");
+        assert_eq!(e.server_code(), Some(1213), "{e}");
         // The loser's transaction is gone: nothing more runs in it.
         let e = loser
             .execute("UPDATE deadlock SET v = 9 WHERE id = 1", &[])
@@ -890,7 +890,7 @@ fn a_lock_wait_timeout_leaves_the_transaction_open_where_the_server_does() {
             .execute("UPDATE lock_wait SET id = 2 WHERE id = 1", &[])
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some(1205), "{e}");
+        assert_eq!(e.server_code(), Some(1205), "{e}");
         tx_b.execute("INSERT INTO lock_wait VALUES (11)", &[])
             .await
             .unwrap();
@@ -930,7 +930,7 @@ fn a_write_waiting_for_a_table_lock_is_bounded_by_the_statement_timeout() {
         // lock_wait_timeout; on MariaDB, max_statement_time covers writes
         // too and may come first.
         assert!(
-            e.code() == Some(1205) || (s.mariadb && e.code() == Some(1969)),
+            e.server_code() == Some(1205) || (s.mariadb && e.server_code() == Some(1969)),
             "{e}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
