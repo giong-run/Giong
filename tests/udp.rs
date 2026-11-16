@@ -673,17 +673,40 @@ fn port_outside_ephemeral_range() -> std::net::SocketAddr {
         .expect("no free UDP port below the ephemeral range")
 }
 
-/// Every UDP socket on `port` in the system, and whether it is a descriptor
-/// of this process: what a failed bind of the port ran into.
-fn udp_holders(port: u16) -> String {
-    let ours: Vec<String> = std::fs::read_dir("/proc/self/fd")
-        .map(|dir| {
-            dir.filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-                .map(|link| link.to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut out = String::new();
+/// The process that owns socket `inode`, when /proc lets this process see
+/// it (processes of other users hide their descriptors).
+fn socket_owner(inode: &str) -> Option<String> {
+    let target = format!("socket:[{inode}]");
+    for proc in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = proc.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+            continue;
+        };
+        let owns = fds
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .any(|link| link.to_string_lossy() == target);
+        if owns {
+            let cmdline = std::fs::read(proc.path().join("cmdline")).unwrap_or_default();
+            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            let me = if pid == std::process::id().to_string() {
+                " (this process)"
+            } else {
+                ""
+            };
+            return Some(format!("pid {pid}{me}: {}", cmdline.trim()));
+        }
+    }
+    None
+}
+
+/// Every UDP socket on `port` in the system, by inode: local and remote
+/// address, uid, and the owning process when it can be seen.
+fn udp_holders(port: u16) -> Vec<(String, String)> {
+    let mut out = Vec::new();
     for table in ["/proc/net/udp", "/proc/net/udp6"] {
         let text = std::fs::read_to_string(table).unwrap_or_default();
         for line in text.lines().skip(1) {
@@ -694,23 +717,75 @@ fn udp_holders(port: u16) -> String {
                 continue;
             }
             let inode = f.get(9).copied().unwrap_or("?");
-            let mine = ours.iter().any(|l| *l == format!("socket:[{inode}]"));
-            out.push_str(&format!(
-                "\n  {table}: local {local} remote {} uid {} inode {inode} {}",
+            let holder = format!(
+                "{table}: local {local} remote {} uid {}, {}",
                 f.get(2).copied().unwrap_or("?"),
                 f.get(7).copied().unwrap_or("?"),
-                if mine {
-                    "(this process)"
-                } else {
-                    "(not this process)"
-                }
-            ));
+                socket_owner(inode).unwrap_or_else(|| "owner gone or not visible".into())
+            );
+            out.push((inode.to_string(), holder));
         }
     }
-    if out.is_empty() {
-        out.push_str(" none now");
-    }
     out
+}
+
+/// Which plain binds of `addr` the kernel refuses now: none of the options,
+/// `SO_REUSEADDR` only (giong's probe after a release) and `SO_REUSEPORT`
+/// only (giong's own sockets).
+fn refused_binds(addr: std::net::SocketAddr) -> String {
+    let try_bind = |reuse_addr: bool, reuse_port: bool| {
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        sock.set_reuse_address(reuse_addr).unwrap();
+        sock.set_reuse_port(reuse_port).unwrap();
+        match sock.bind(&addr.into()) {
+            Ok(()) => "free",
+            Err(_) => "refused",
+        }
+    };
+    format!(
+        "no options {}, SO_REUSEADDR {}, SO_REUSEPORT {}",
+        try_bind(false, false),
+        try_bind(true, false),
+        try_bind(false, true)
+    )
+}
+
+/// What a failed bind of `addr` ran into. A socket of another process that
+/// lives only for a moment is gone before a single look, so this looks for
+/// half a second and reports every socket seen on the port, when it was
+/// first seen, and which binds the port refused at each change.
+fn bind_failure_report(addr: std::net::SocketAddr) -> String {
+    let start = std::time::Instant::now();
+    let mut seen: Vec<String> = Vec::new();
+    let mut seen_inodes: Vec<String> = Vec::new();
+    // Which binds the port refuses right after the failure; later it
+    // changes hands.
+    let mut report = format!("\n  binds now: {}", refused_binds(addr));
+    while start.elapsed() < Duration::from_millis(500) {
+        let at = start.elapsed();
+        for (inode, holder) in udp_holders(addr.port()) {
+            if seen_inodes.contains(&inode) {
+                continue;
+            }
+            seen_inodes.push(inode);
+            // The same kind of socket again (another process binding the
+            // port over and over) is counted, not listed again.
+            if !seen.contains(&holder) && seen.len() < 10 {
+                report.push_str(&format!("\n  +{at:?} socket {holder}"));
+                seen.push(holder);
+            }
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    if seen.is_empty() {
+        report.push_str("\n  no socket on the port was seen in 500 ms");
+    } else {
+        report.push_str(&format!(
+            "\n  {} sockets on the port in 500 ms",
+            seen_inodes.len()
+        ));
+    }
+    report
 }
 
 /// Workers of one process share a port; a dropped socket's port can be
@@ -728,8 +803,8 @@ fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
         for round in 0..20 {
             let again = UdpSocket::bind(addr).unwrap_or_else(|e| {
                 panic!(
-                    "round {round}: binding {addr} again failed: {e}; sockets on the port:{}",
-                    udp_holders(addr.port())
+                    "round {round}: binding {addr} again failed: {e}; on the port since:{}",
+                    bind_failure_report(addr)
                 )
             });
             let (sender, _) = socket();
