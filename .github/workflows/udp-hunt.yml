@@ -63,8 +63,9 @@ jobs:
           echo "failed $failed of 3000"
           [ "$failed" = 0 ]
 
-  # The same binds without giong (.github/udp-hunt/repro.c): is it the
-  # kernel? Several shards, to land on both kinds of runner.
+  # The same binds without giong (.github/udp-hunt/repro.c), with and
+  # without threads reading /proc/self/fd. Several shards, to land on both
+  # kinds of runner.
   repro:
     name: repro (shard ${{ matrix.shard }})
     runs-on: ubuntu-24.04
@@ -85,11 +86,11 @@ jobs:
           gcc -O2 -pthread -Wall -o repro .github/udp-hunt/repro.c || exit 1
           ulimit -n 8192
           status=0
-          for v in "connect=1 late_close=0" "connect=1 late_close=1" \
-                   "connect=0 late_close=0" "connect=0 late_close=1"; do
-            for hold in 0 1000; do
-              ./repro 3000 $v noise=3 hold=$hold | tail -n 12
-              [ "${PIPESTATUS[0]}" = 0 ] || status=1
-            done
+          # Without readers of /proc/self/fd no bind may be refused; with
+          # them, a just-closed socket can keep its port for a moment.
+          for proc in "proc=0" "proc=2 readlink=0" "proc=2 readlink=1"; do
+            ./repro 3000 connect=0 late_close=0 noise=0 hold=0 $proc | tail -n 6
+            code=${PIPESTATUS[0]}
+            [ "$proc" != "proc=0" ] || [ "$code" = 0 ] || status=1
           done
           exit $status

@@ -13,6 +13,9 @@
 // hold=N: N sockets bound to port 0 stay open for the whole run, as in the
 // test that binds 1,000 of them (more sockets per slot of the kernel's
 // UDP hash table).
+// proc=N: N threads read every link in /proc/self/fd all the time, as the
+// test dropping_a_socket_closes_it did. readlink=0: only list the
+// directory, as a count of open descriptors does.
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,6 +28,7 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 
 static int opt_connect = 1, opt_late = 0;
 static atomic_int stop;
@@ -97,6 +101,28 @@ static void *noise(void *arg) {
     return NULL;
 }
 
+// What tests/udp.rs's is_open() does: read every link in /proc/self/fd.
+// Each readlink takes a reference to the file for a moment.
+static int readlink_too = 1;
+static void *proc_reader(void *arg) {
+    (void)arg;
+    char path[300], target[128];
+    while (!atomic_load(&stop)) {
+        DIR *d = opendir("/proc/self/fd");
+        if (!d) continue;
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (readlink_too) {
+                snprintf(path, sizeof path, "/proc/self/fd/%s", e->d_name);
+                ssize_t n = readlink(path, target, sizeof target);
+                (void)n;
+            }
+        }
+        closedir(d);
+    }
+    return NULL;
+}
+
 static int free_port(unsigned *seed) {
     for (;;) {
         int port = 1024 + rand_r(seed) % (32768 - 1024);
@@ -109,17 +135,21 @@ static int free_port(unsigned *seed) {
 
 int main(int argc, char **argv) {
     long iters = argc > 1 ? atol(argv[1]) : 1000;
-    int nnoise = 2, hold = 0;
+    int nnoise = 2, hold = 0, nproc_readers = 0;
     for (int i = 2; i < argc; i++) {
         if (!strncmp(argv[i], "connect=", 8)) opt_connect = atoi(argv[i] + 8);
         else if (!strncmp(argv[i], "late_close=", 11)) opt_late = atoi(argv[i] + 11);
         else if (!strncmp(argv[i], "noise=", 6)) nnoise = atoi(argv[i] + 6);
         else if (!strncmp(argv[i], "hold=", 5)) hold = atoi(argv[i] + 5);
+        else if (!strncmp(argv[i], "readlink=", 9)) readlink_too = atoi(argv[i] + 9);
+        else if (!strncmp(argv[i], "proc=", 5)) nproc_readers = atoi(argv[i] + 5);
     }
     for (int i = 0; i < hold; i++) try_bind(sock(0, 0), 0);
     pthread_t th[64], ct;
     for (int i = 0; i < nnoise && i < 64; i++) pthread_create(&th[i], NULL, noise, NULL);
     pthread_create(&ct, NULL, closer, NULL);
+    pthread_t pr[16];
+    for (int i = 0; i < nproc_readers && i < 16; i++) pthread_create(&pr[i], NULL, proc_reader, NULL);
     unsigned seed = (unsigned)time(NULL) ^ (unsigned)getpid();
     long fails = 0, binds = 0;
     for (long it = 0; it < iters; it++) {
@@ -160,7 +190,8 @@ int main(int argc, char **argv) {
     atomic_store(&stop, 1);
     for (int i = 0; i < nnoise && i < 64; i++) pthread_join(th[i], NULL);
     pthread_join(ct, NULL);
-    printf("refused %ld of %ld binds (connect=%d late_close=%d noise=%d hold=%d)\n", fails,
-           binds, opt_connect, opt_late, nnoise, hold);
+    for (int i = 0; i < nproc_readers && i < 16; i++) pthread_join(pr[i], NULL);
+    printf("refused %ld of %ld binds (connect=%d late_close=%d noise=%d hold=%d proc=%d)\n",
+           fails, binds, opt_connect, opt_late, nnoise, hold, nproc_readers);
     return fails ? 1 : 0;
 }
