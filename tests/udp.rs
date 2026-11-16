@@ -651,15 +651,66 @@ fn a_port_held_by_another_process_is_refused() {
 
 /// A UDP port on loopback that is free now and that the kernel never hands
 /// out for port 0, so the other tests of this binary, which bind port 0 in
-/// parallel, cannot take it while a test has let go of it.
+/// parallel, cannot take it while a test has let go of it. Picked at random
+/// below the ephemeral range rather than always the highest such port, which
+/// is the obvious pick for anything else on the machine doing the same.
 fn port_outside_ephemeral_range() -> std::net::SocketAddr {
+    use std::hash::{BuildHasher, Hasher};
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
     let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
-    (1024..low)
-        .rev()
+    assert!(
+        low > 2048,
+        "ephemeral range starts at {low}: no room below it"
+    );
+    let mut seed = std::collections::hash_map::RandomState::new().build_hasher();
+    seed.write_u32(std::process::id());
+    let start = seed.finish();
+    let span = u64::from(low - 1024);
+    (0..span)
+        .map(|i| 1024 + ((start + i) % span) as u16)
         .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
         .find(|addr| std::net::UdpSocket::bind(addr).is_ok())
         .expect("no free UDP port below the ephemeral range")
+}
+
+/// Every UDP socket on `port` in the system, and whether it is a descriptor
+/// of this process: what a failed bind of the port ran into.
+fn udp_holders(port: u16) -> String {
+    let ours: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .map(|dir| {
+            dir.filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+                .map(|link| link.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = String::new();
+    for table in ["/proc/net/udp", "/proc/net/udp6"] {
+        let text = std::fs::read_to_string(table).unwrap_or_default();
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let Some(local) = f.get(1) else { continue };
+            let hex_port = local.rsplit(':').next().unwrap_or("");
+            if u16::from_str_radix(hex_port, 16).ok() != Some(port) {
+                continue;
+            }
+            let inode = f.get(9).copied().unwrap_or("?");
+            let mine = ours.iter().any(|l| *l == format!("socket:[{inode}]"));
+            out.push_str(&format!(
+                "\n  {table}: local {local} remote {} uid {} inode {inode} {}",
+                f.get(2).copied().unwrap_or("?"),
+                f.get(7).copied().unwrap_or("?"),
+                if mine {
+                    "(this process)"
+                } else {
+                    "(not this process)"
+                }
+            ));
+        }
+    }
+    if out.is_empty() {
+        out.push_str(" none now");
+    }
+    out
 }
 
 /// Workers of one process share a port; a dropped socket's port can be
@@ -674,8 +725,13 @@ fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
         let second = UdpSocket::bind(addr).unwrap();
         drop(first);
         drop(second);
-        for _ in 0..20 {
-            let again = UdpSocket::bind(addr).unwrap();
+        for round in 0..20 {
+            let again = UdpSocket::bind(addr).unwrap_or_else(|e| {
+                panic!(
+                    "round {round}: binding {addr} again failed: {e}; sockets on the port:{}",
+                    udp_holders(addr.port())
+                )
+            });
             let (sender, _) = socket();
             sender.send_to(vec![7; 10], addr).await.0.unwrap();
             let got = timeout(Duration::from_secs(5), again.recv())

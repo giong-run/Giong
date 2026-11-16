@@ -329,8 +329,14 @@ features.
       failing run replayed exactly from its seed; long runs in simulated time, months of
       uptime on every CI run. It covers Gióng's own code on the epoll driver, not io_uring,
       the kernel or the NIC. Internal only; a public form is a 1.x addition.
-- [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
-- [ ] The remaining code fixes from the service built from the documentation alone.
+- [x] Every fuzz target run in the nightly fuzz workflow with no open crash.
+- [x] The remaining code fixes from the service built from the documentation alone: a log
+      line and a span event for a request dropped before its response (F16), plainer type
+      names and articles in messages, and a cause said once (F15), and giong-mcp saying
+      when a blocked task is a giong-http connection's request handler (F2; naming the
+      handler itself needs a request label, a 1.x addition). The other findings were
+      settled in 0.7 or left for 1.x as additions, in the
+      [decisions](docs/reviews/2026-11-api-freeze.md).
 - [x] Memory bounded under attack: the requests a worker receives in full share a budget
       (`max_buffered_request_bytes`), and CI runs hundreds of slow uploads against a server
       in a 128 MiB container on every change.

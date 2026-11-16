@@ -574,12 +574,20 @@ impl fmt::Display for Error {
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Error")
-            .field("code", &self.code)
-            .field("message", &self.message())
-            .field("fix", &self.fix)
-            .field("source", &self.source)
-            .finish()
+        // What `main` prints when it returns this error. A wrapped error's
+        // message already says how to fix it and is its own source, so
+        // neither is shown twice.
+        let mut d = f.debug_struct("Error");
+        d.field("code", &self.code)
+            .field("message", &self.message());
+        if !self.fix.is_empty() {
+            d.field("fix", &self.fix);
+        }
+        match (&self.source, self.wrapped) {
+            (Some(source), false) => d.field("source", source),
+            _ => &mut d,
+        };
+        d.finish()
     }
 }
 
@@ -689,6 +697,11 @@ mod tests {
         assert_eq!(e.to_string(), "GIONG-E3003: refused");
         assert!(e.get_ref().unwrap().downcast_ref::<Companion>().is_some());
         assert!(e.source().is_none());
+        // What `main` prints: the message once, no empty fix.
+        assert_eq!(
+            format!("{e:?}"),
+            "Error { code: PostgresAuth, message: \"GIONG-E3003: refused\" }"
+        );
         let io = io::Error::new(io::ErrorKind::PermissionDenied, e);
         assert_eq!(code(&io), Some(Code::PostgresAuth));
     }

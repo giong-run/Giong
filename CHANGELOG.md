@@ -92,6 +92,30 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   crate that needs the Tokio runtime. `AGENTS.md`, `llms.txt` and giong-compat's README
   and crate docs say the same, and no longer call the giong crates faster than the same
   protocol through `Compat`, which was never measured.
+- **giong-web** (**behaviour change**): `Logger` and `Trace` now record a request that is
+  dropped before its response is ready: the client reset its HTTP/2 stream, or a `Timeout`
+  layered outside them gave up. Before, such a request left no log line at all and its span
+  ended without an event. `Logger` writes a line with `"event":"request cancelled"`,
+  `"status":null`, `"bytes":null` and the time until the drop in `duration_us` (nginx logs
+  the same case as `499`); `Trace` ends the span with a `request cancelled` event at
+  `INFO`. Found by the service built from the documentation alone (F16).
+- **giong-mcp**: a worker blocked inside the task giong-http spawns for a connection is now
+  reported as a request handler on that connection, with what to look for, instead of only
+  the spawn location in giong-http's `src/server.rs`; `profile`'s note and the README say
+  that this location holds the time of every request handler. giong cannot yet name the
+  handler or route (F2; a request label in `giong::observe` is a 1.x addition).
+
+### Fixed
+
+- **giong-postgres**, **giong-mysql**: conversion errors name Rust types as they are
+  written in code (`String`, `Option<String>`), not as `alloc::string::String`, and put
+  `an` before a vowel sound (`an integer`, `an i32`; it was `a integer`, `a i32`) (F15).
+- **giong-web**: the `cause` of a logged error no longer repeats a source that the error
+  above it already shows: a PostgreSQL statement timeout printed the server's message twice
+  (F15).
+- **giong**: the `Debug` form of an error wrapped from a companion crate, which is what
+  `main` prints when it returns one, shows the message once and leaves out an empty `fix`
+  (F15).
 
 ## [0.7.0] - 2026-11-15
 

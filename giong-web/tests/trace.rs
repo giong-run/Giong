@@ -192,3 +192,30 @@ fn errors_carry_their_code_and_a_5xx_its_cause() {
         "{done:?}"
     );
 }
+
+#[test]
+fn a_request_dropped_before_its_response_ends_its_span_with_an_event() {
+    async fn slow(_req: Req) -> Result<Response, Error> {
+        giong::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(Response::text("late"))
+    }
+    let recorder = Recorder::default();
+    let req = Request::from_bytes(b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n").unwrap();
+    let resp = tracing::subscriber::with_default(recorder.clone(), || {
+        let app = Router::new()
+            .get("/slow", slow)
+            .layer(giong_web::middleware::Timeout::new(
+                std::time::Duration::from_millis(50),
+            ))
+            .layer(Trace::new())
+            .build(());
+        giong::block_on(app.handle(req))
+    });
+    assert_eq!(resp.status(), 503);
+    let log = recorder.0.lock().unwrap();
+    let done = log.events.last().unwrap();
+    assert_eq!((done.parent, done.level), (Some(1), Some(Level::INFO)));
+    assert_eq!(done.get("message"), Some("request cancelled"));
+    assert_eq!(done.get("status"), None);
+    assert!(done.get("duration_us").is_some());
+}
