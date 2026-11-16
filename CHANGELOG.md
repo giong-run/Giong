@@ -8,6 +8,46 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Security
+
+- **giong-http**: the server refuses new connections while the process is close to running
+  out of memory, instead of taking on connections until the kernel's out-of-memory killer
+  ends it with every connection it holds. Before each accept it checks what is left (the
+  smaller of what the process's cgroup allows, page cache aside, and the machine's
+  `MemAvailable`), and below a reserve it answers new connections without TLS with `503`,
+  `Retry-After: 1` and `GIONG-E1121`, and closes new TLS connections before their
+  handshake; the connections it holds keep being served. The reserve is
+  `Server::min_free_memory` (new), by default a tenth of the memory limit, between 16 and
+  256 MiB; `0` turns the check off. Found on bare metal in a container of 1 CPU and 512
+  MiB, where 0.8.0 was killed at 36,400 idle HTTPS connections (with `max_connections`
+  raised); the default limit of 10,000 connections per worker was enough to get it killed
+  in smaller containers too: 7,900 idle HTTPS connections in 96 MiB, or 9,100 plain ones in
+  32 MiB (cgroup v1, which leaves kernel socket memory out). With the check, the same runs
+  refuse at 6,500 and 6,600 connections and stay up. CI runs it in a container of 48 MiB
+  with one and four workers on both drivers (`scripts/idle-connections.sh`).
+
+### Added
+
+- **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
+  (`Code::HttpServerLowMemory`) in giong.
+
+### Fixed
+
+- **giong-http**: an idle HTTP/2 connection took 61% more resident memory in 0.8.0 than in
+  0.5.0 (6.78 KiB against 4.21 on bare metal, `bench/h2.sh`, 5,000 connections that made
+  one request each). Since 0.8.0 a connection kept the memory for its streams for a second
+  after each request, so that requests following one another allocate none of it: when
+  thousands of connections open together, all of them held it at once, and the allocator
+  kept the pages after it was freed. A connection now keeps it only once a request has
+  followed another within that second. Since 0.6.0 the queue of handlers to start also
+  reserved room for four requests (672 bytes) on its first use; it now starts with room for
+  one, as the slots for streams now do too (they took room for four, 1,408 bytes). Measured on a
+  4-vCPU VM (Linux 6.18, `bench/hold`, 5,000 connections, one worker), resident memory per
+  connection, 0.5.0 / 0.8.0 / now (raw data in `bench/results/low-memory/`): idle 4.56 / 7.09 / 4.54 KiB, one request in progress
+  6.68 / 7.42 / 5.88 KiB, ten requests in progress 19.09 / 21.65 / 19.09 KiB. The `instr`
+  job did not catch it: its `idle-h2` case opened connections without making a request.
+  It now makes one on each, as `bench/h2.sh` does.
+
 ## [0.8.0] - 2026-11-16
 
 Verified in CI: the checks on the way to 1.0 that need no machines of their own now run on

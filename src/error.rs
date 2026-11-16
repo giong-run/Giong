@@ -267,6 +267,12 @@ codes! {
     /// Unavailable` and `Retry-After: 1` over HTTP/1.1 (this code in the
     /// body), `REFUSED_STREAM` over HTTP/2.
     HttpServerBusy = 1120, Other, "request refused: the server's memory budget for requests is full";
+    /// The server refused a new connection: less memory was left to the
+    /// process than `Server::min_free_memory`. Answered with `503 Service
+    /// Unavailable` and `Retry-After: 1` (this code in the body) on a
+    /// connection without TLS; a TLS connection is closed before its
+    /// handshake.
+    HttpServerLowMemory = 1121, OutOfMemory, "connection refused: the server is low on memory";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
