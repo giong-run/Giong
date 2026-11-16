@@ -1,0 +1,2 @@
+[ 6283.079746] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=sbx-nginx-ktls.scope,mems_allowed=0,oom_memcg=/system.slice/sbx-nginx-ktls.scope,task_memcg=/system.slice/sbx-nginx-ktls.scope,task=nginx,pid=54339,uid=0
+[ 6283.079753] Memory cgroup out of memory: Killed process 54339 (nginx) total-vm:442340kB, anon-rss:430760kB, file-rss:6764kB, shmem-rss:4kB, UID:0 pgtables:904kB oom_score_adj:0

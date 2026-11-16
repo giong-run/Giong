@@ -1,0 +1,2 @@
+[ 6222.237624] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=sbx-go-tls.scope,mems_allowed=0,oom_memcg=/system.slice/sbx-go-tls.scope,task_memcg=/system.slice/sbx-go-tls.scope,task=bench-go-http,pid=53530,uid=0
+[ 6222.237637] Memory cgroup out of memory: Killed process 53530 (bench-go-http) total-vm:1861484kB, anon-rss:459148kB, file-rss:6396kB, shmem-rss:0kB, UID:0 pgtables:1020kB oom_score_adj:0
