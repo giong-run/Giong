@@ -24,31 +24,42 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - run: cargo test --release --all-features --test udp --no-run
-      - name: Run the udp tests 3000 times
+      - name: Build the udp test binary
+        # Its path from cargo itself: newer cargo keeps test binaries
+        # outside target/release/deps.
         run: |
-          bin=$(ls -t target/release/deps/udp-* | grep -v '\.d$' | head -n1)
+          cargo test --release --all-features --test udp --no-run --message-format=json \
+            | jq -r 'select(.executable != null and .target.name == "udp") | .executable' \
+            > "$RUNNER_TEMP/udp-bin"
+          cat "$RUNNER_TEMP/udp-bin"
+          test -x "$(cat "$RUNNER_TEMP/udp-bin")"
+      - name: Run the udp tests 3000 times
+        shell: bash
+        run: |
+          set +e
+          bin=$(cat "$RUNNER_TEMP/udp-bin")
           case "${{ matrix.tier }}" in
             no-features) export GIONG_IO_URING_OFF=all ;;
             coop) export GIONG_IO_URING_OFF=all GIONG_RING_TIER=coop ;;
             epoll) export GIONG_DRIVER=epoll ;;
           esac
-          run=""
-          [ "${{ matrix.user }}" = root ] && run="sudo -E"
+          run=()
+          [ "${{ matrix.user }}" = root ] && run=(sudo -E)
           uname -r
           cat /proc/sys/net/ipv4/ip_local_port_range
           failed=0
           for i in $(seq 1 3000); do
-            if ! out=$($run "$bin" -q 2>&1); then
+            out=$("${run[@]}" "$bin" -q 2>&1)
+            if [ $? -ne 0 ]; then
               failed=$((failed + 1))
               echo "::group::failure in run $i"
-              echo "$out" | grep -v '^\.*$'
+              echo "$out"
               echo "::endgroup::"
-              echo "$out" | grep -A20 panicked
+              echo "$out" | grep -A25 panicked
             fi
           done
           echo "failed $failed of 3000"
-          test "$failed" = 0
+          [ "$failed" = 0 ]
 
   # The whole suite, as the fallback jobs run it, more rounds.
   suite:
