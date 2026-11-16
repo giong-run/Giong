@@ -9,14 +9,18 @@ of them and then holds the connection, one byte short, so that a server that
 buffers bodies in memory holds almost all of it. A well-behaved client asks
 for `GET /json` on a fresh connection every 100 ms meanwhile.
 
-Every 25 uploads it prints one CSV line, read from the server's cgroup
+Every 25 uploads it waits a second, so that the server takes in what the
+kernel buffered for it, and prints one CSV line, read from the server's cgroup
 (CGROUP: its directory under /sys/fs/cgroup):
 
-    uploads,held,refused,mem_current_kib,mem_peak_kib,oom_kills,ok,bad
+    uploads,held,refused,mem_current_kib,mem_peak_kib,anon_kib,file_kib,oom_kills,ok,bad
 
 `held` counts uploads whose connection is still open and unanswered,
-`refused` those the server answered early (a 503, a 413) or closed. It stops
-at MAX, or when the cgroup reports an out-of-memory kill; the last line is
+`refused` those the server answered early (a 503, a 413) or closed. anon is
+the server's own memory, file the page cache charged to it (nginx writes
+large bodies to temporary files; the kernel can reclaim that memory). It
+stops at MAX, when the cgroup reports an out-of-memory kill, or when the
+server's cgroup is gone (its process died); the last line is
 
     end,<uploads>,<held>,<refused>,<reason>,<ok>,<bad>
 
@@ -105,7 +109,7 @@ class Checker(threading.Thread):
 
 
 def main():
-    print("uploads,held,refused,mem_current_kib,mem_peak_kib,oom_kills,ok,bad", flush=True)
+    print("uploads,held,refused,mem_current_kib,mem_peak_kib,anon_kib,file_kib,oom_kills,ok,bad", flush=True)
     oom0 = cg("memory.events", "oom_kill")
     checker = Checker()
     checker.start()
@@ -116,17 +120,25 @@ def main():
         except OSError:
             refused += 1
         if (i + 1) % 25 == 0 or i + 1 == MAX:
+            time.sleep(1)
             held = sum(1 for s in socks if still_held(s))
             oom = cg("memory.events", "oom_kill")
             print(f"{i + 1},{held},{i + 1 - held},{cg('memory.current') // 1024},"
-                  f"{cg('memory.peak') // 1024},{oom},{checker.ok},{checker.bad}", flush=True)
+                  f"{cg('memory.peak') // 1024},{cg('memory.stat', 'anon') // 1024},"
+                  f"{cg('memory.stat', 'file') // 1024},{oom},{checker.ok},{checker.bad}", flush=True)
             if oom > oom0:
                 reason = "oom-kill"
+                break
+            if oom < 0:
+                reason = "server-gone"
                 break
     time.sleep(3)
     checker.stop.set()
     checker.join()
     held = sum(1 for s in socks if still_held(s))
+    if reason == "max":
+        oom = cg("memory.events", "oom_kill")
+        reason = "oom-kill" if oom > oom0 else "server-gone" if oom < 0 else reason
     print(f"end,{i + 1},{held},{i + 1 - held},{reason},{checker.ok},{checker.bad}", flush=True)
     for s in socks:
         s.close()

@@ -131,6 +131,7 @@ CG=""
 start() { # variant
   local unit="sbx-$1"
   systemctl stop "$unit.scope" 2>/dev/null || true
+  systemctl reset-failed "$unit.scope" 2>/dev/null || true
   # shellcheck disable=SC2046
   eval systemd-run --quiet --scope --unit="$unit" -p CPUQuota=100% -p AllowedCPUs="$CPU" \
     -p MemoryMax="$MEM" -p MemorySwapMax=0 -- taskset -c "$CPU" $(cmd "$1") \
@@ -148,7 +149,21 @@ start() { # variant
   echo "$1 did not start" >&2
   return 1
 }
-stop() { systemctl stop "sbx-$1.scope" 2>/dev/null || true; sleep 1; }
+stop() {
+  systemctl stop "sbx-$1.scope" 2>/dev/null || true
+  systemctl reset-failed "sbx-$1.scope" 2>/dev/null || true
+  sleep 1
+}
+# Out-of-memory kills of a server's cgroup so far, from the kernel log: a
+# killed server's cgroup is gone before its client can read memory.events.
+oom_count() { dmesg | grep -c "oom_memcg=/system.slice/sbx-$1.scope" || true; }
+OOM0=0
+oom_log() { # test variant
+  local n
+  n=$(oom_count "$2")
+  echo $((n - OOM0)) >"$OUT/raw/$1.oom-kills"
+  dmesg | grep -A1 "oom_memcg=/system.slice/sbx-$2.scope" | tail -2 >"$OUT/raw/$1.dmesg" || true
+}
 cpu_usec() { awk '$1 == "usage_usec" { print $2 }' "$CG/cpu.stat"; }
 throttled_usec() { awk '$1 == "throttled_usec" { print $2 }' "$CG/cpu.stat"; }
 
@@ -183,7 +198,7 @@ else:
     rps = m.group(1) if m else ""
     m = re.search(r"^\s+99%\s+([\d.]+)(us|ms|s)", t, re.M)
     if m:
-        p99 = float(m.group(1)) * {"us": 1e-3, "ms": 1, "s": 1e3}[m.group(2)]
+        p99 = round(float(m.group(1)) * {"us": 1e-3, "ms": 1, "s": 1e3}[m.group(2)], 3)
     for m in re.finditer(r"Socket errors: connect (\d+), read (\d+), write (\d+), timeout (\d+)", t):
         errors += sum(int(x) for x in m.groups())
     m = re.search(r"Non-2xx or 3xx responses: (\d+)", t)
@@ -219,10 +234,12 @@ if [[ " $TESTS " == *" idle "* ]]; then
     for s in $SERVERS; do
       t=$(tls_of "$s")
       echo "idle $round: $t" >&2
+      OOM0=$(oom_count "$t")
       start "$t"
       taskset -c "$CLIENT_CPUS" python3 small-box/tlshold.py "$(port "$t")" "$CG" "$IDLE_MAX" \
         >"$OUT/idle-$t-r$round.csv" 2>"$OUT/raw/idle-$t-r$round.err" || true
       tail -1 "$OUT/idle-$t-r$round.csv" >&2
+      oom_log "idle-$t-r$round" "$t"
       stop "$t"
       sleep 5 # let TIME_WAIT and the kernel's socket memory settle
     done
@@ -234,10 +251,12 @@ if [[ " $TESTS " == *" flood "* ]]; then
     p=$(plain_of "$s")
     [ -n "$p" ] || continue
     echo "flood: $p" >&2
+    OOM0=$(oom_count "$p")
     start "$p"
     taskset -c "$CLIENT_CPUS" python3 small-box/flood.py "$(port "$p")" "$CG" "$FLOOD_MAX" \
       >"$OUT/flood-$p.csv" 2>"$OUT/raw/flood-$p.err" || true
     tail -1 "$OUT/flood-$p.csv" >&2
+    oom_log "flood-$p" "$p"
     stop "$p"
     sleep 5
   done
@@ -246,6 +265,13 @@ fi
 python3 - "$OUT" >"$OUT/summary.txt" <<'PY'
 import csv, glob, os, statistics, sys
 out = sys.argv[1]
+def oom_why(f, why):
+    # The kernel log says whether a server that went away was killed for memory.
+    p = os.path.join(out, "raw", os.path.basename(f)[:-4] + ".oom-kills")
+    try:
+        return "oom-kill" if int(open(p).read()) > 0 else why
+    except (OSError, ValueError):
+        return why
 print(open(os.path.join(out, "env.txt")).read().strip())
 rps = os.path.join(out, "rps.csv")
 if os.path.exists(rps):
@@ -266,36 +292,47 @@ if os.path.exists(rps):
               f"{sum(int(r['errors']) for r in rs):>8}")
 idle = sorted(glob.glob(os.path.join(out, "idle-*.csv")))
 if idle:
-    print("\nidle HTTPS connections: most held, why it stopped, KiB per connection at 20,000"
-          "\n(cgroup memory.current, which includes the kernel's socket and TLS memory; resident memory; kernel part)")
+    print("\nidle HTTPS connections: most held, why it stopped, KiB per connection at 20,000 (or at the"
+          "\nlast count before the server stopped): cgroup memory.current, which includes the kernel's"
+          "\nsocket and TLS memory; resident memory; the kernel part")
     for f in idle:
         lines = [l.strip() for l in open(f) if l.strip()]
         rows = [dict(zip(lines[0].split(","), l.split(","))) for l in lines[1:] if not l.startswith("end")]
+        rows = [r for r in rows if int(r["mem_current_kib"]) >= 0]
         end = [l for l in lines if l.startswith("end")]
         held, why = (end[0].split(",")[1:3] if end else ("?", "incomplete"))
+        why = oom_why(f, why)
         base = rows[0] if rows else None
-        at = next((r for r in rows if int(r["held"]) >= 20000), None)
+        at = next((r for r in rows if int(r["held"]) >= 20000), rows[-1] if rows else None)
         name = os.path.basename(f)[5:-4]
-        if base and at:
+        if base and at and int(at["held"]) > 0:
             n = int(at["held"])
             per = lambda k: (int(at[k]) - int(base[k])) / n
-            print(f"{name:<24} held {int(held):>7,} ({why:<8})  cgroup {per('mem_current_kib'):6.2f}  "
+            print(f"{name:<24} held {int(held):>7,} ({why:<11}) at {n:>6,}: cgroup {per('mem_current_kib'):6.2f}  "
                   f"rss {per('rss_kib'):6.2f}  kernel {per('kernel_kib'):6.2f}  sock {per('sock_kib'):6.2f}")
         else:
             print(f"{name:<24} held {held} ({why})")
 flood = sorted(glob.glob(os.path.join(out, "flood-*.csv")))
 if flood:
-    print("\nslow-upload flood (1 MB bodies one byte short): uploads sent, still held, refused, outcome,"
-          "\npeak cgroup memory, well-behaved /json requests answered / not")
+    print("\nslow-upload flood (1 MB bodies one byte short): uploads sent, held (if killed: the last count"
+          "\nbefore the kill), refused, outcome,"
+          "\npeak cgroup memory (page cache included), peak of the server's own (anon) memory,"
+          "\nwell-behaved /json requests answered / not")
     for f in flood:
         lines = [l.strip() for l in open(f) if l.strip()]
         end = [l for l in lines if l.startswith("end")]
         rows = [l.split(",") for l in lines[1:] if not l.startswith("end")]
         peak = max((int(r[4]) for r in rows), default=0) // 1024
+        anon = max((int(r[5]) for r in rows), default=0) // 1024
         name = os.path.basename(f)[6:-4]
         if end:
             _, sent, held, refused, why, ok, bad = end[0].split(",")
-            print(f"{name:<12} sent {sent:>5}  held {held:>5}  refused {refused:>5}  {why:<9} peak {peak:>4} MiB  ok {ok} bad {bad}")
+            why = oom_why(f, why)
+            killed_at = next((r[1] for r in reversed(rows) if int(r[3]) >= 0), "0")
+            if why == "oom-kill":
+                held = killed_at
+            print(f"{name:<12} sent {sent:>5}  held {held:>5}  refused {refused:>5}  {why:<11} "
+                  f"peak {peak:>4} MiB  anon {anon:>4} MiB  ok {ok} bad {bad}")
         else:
             print(f"{name:<12} incomplete")
 PY

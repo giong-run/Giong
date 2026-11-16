@@ -17,7 +17,8 @@ After each batch it prints one CSV line:
 read from the server's cgroup (CGROUP: its directory under /sys/fs/cgroup)
 and the resident memory of its processes. It stops at MAX connections, when a batch has
 failures (refused, reset, timed out: the server stopped taking connections),
-or when the cgroup reports an out-of-memory kill. The last line says which:
+when the cgroup reports an out-of-memory kill, or when the server's cgroup is
+gone (its process died). The last line says which:
 
     end,<held>,<reason>
 
@@ -142,8 +143,12 @@ def main():
                     break
         time.sleep(1)
         sample(len(held), failed)
-        if oom_kills() > oom0:
+        oom = oom_kills()
+        if oom > oom0:
             reason = "oom-kill"
+            break
+        if oom < 0:
+            reason = "server-gone"
             break
         if failed:
             reason = "refused"
