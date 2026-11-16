@@ -34,7 +34,7 @@ CRATES = {
                "`spawn_on`, `spawn_balanced` and `bind_balanced` to spread new work"],
         fact="3 dependencies: `io-uring`, `libc`, `socket2`"),
     "giong-http": dict(
-        layer="protocols", tests=206,
+        layer="protocols", tests=215,
         short="A strict HTTP/1.1 and HTTP/2 server, HTTPS behind a feature, and a pooled client.",
         lede="A small, strict HTTP/1.1 and HTTP/2 server with one async handler, and a client that speaks both.",
         items=["HTTP/2 through ALPN or with prior knowledge, for the same handlers",
@@ -56,7 +56,7 @@ CRATES = {
                "Kernel TLS after the handshake (`Ktls::Auto`), and files sent with `sendfile`"],
         fact="TLS costs 4% on `/json`"),
     "giong-postgres": dict(
-        layer="clients", tests=105,
+        layer="clients", tests=107,
         short="PostgreSQL client and pool; statements of every task pipeline together.",
         lede="A PostgreSQL client and pool. The statements of every task pipeline over a few connections.",
         items=["`Client::connect`, `query`, `execute`, `transaction`, `cancel_token`",
@@ -66,7 +66,7 @@ CRATES = {
                "A connection taken with `get()` comes back to the pool with its session reset"],
         fact="2.6× deadpool's statements per core"),
     "giong-mysql": dict(
-        layer="clients", tests=118,
+        layer="clients", tests=120,
         short="MySQL and MariaDB client and pool, built the same way as giong-postgres.",
         lede="A client and pool for MySQL 8 and MariaDB 10.6 or newer, built the same way as giong-postgres.",
         items=["`Client::connect`, `query`, `execute`, `transaction`",
@@ -85,7 +85,7 @@ CRATES = {
                "TLS; Redis 6 or newer (RESP3)"],
         fact="1.4× redis-rs's `GET`s per core"),
     "giong-web": dict(
-        layer="framework", tests=107,
+        layer="framework", tests=110,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
         lede="A router, middleware and JSON on giong-http. Handlers are plain `async fn`s; every "
              "error is a coded problem+json answer.",
@@ -96,7 +96,7 @@ CRATES = {
                "without a socket"],
         fact="1.3× axum's `/json` on one core"),
     "giong-mcp": dict(
-        layer="tooling", tests=33,
+        layer="tooling", tests=34,
         short="A read-only MCP server: an agent sees what each worker, task and pool is doing.",
         lede="A read-only MCP server that lets an AI agent look inside a running service: which "
              "task blocks a worker, which line spawned the tasks that leak, how full the pools are.",

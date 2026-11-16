@@ -312,7 +312,7 @@ breaking changes made now rather than after 1.0.
 **Exit criteria:** no item left for the freeze undecided. Met. The freeze is declared once
 real use in a service has reported back, which may still add items before 1.0.0-rc.1.
 
-## 0.8 — Verified in CI
+## 0.8 — Verified in CI (done)
 
 The verification that needs no machines of its own, run on every change. No new public
 features.
@@ -341,7 +341,7 @@ features.
       (`max_buffered_request_bytes`), and CI runs hundreds of slow uploads against a server
       in a 128 MiB container on every change.
 
-**Exit criteria:** all of the above green on `main`.
+**Exit criteria:** all of the above green on `main`. Met in 0.8.0.
 
 ## 0.9 — Bare metal and real use
 

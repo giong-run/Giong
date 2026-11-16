@@ -8,8 +8,35 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-16
+
+Verified in CI: the checks on the way to 1.0 that need no machines of their own now run on
+every change, and none of them found a bug in released code. `cargo-semver-checks` holds
+the public API to 0.7.0's. Callgrind counts the instructions and allocations of 16 hot
+paths on both drivers, and the memory per idle HTTP/1.1, HTTP/2 and HTTPS connection, and
+fails a change that moves any past its limit. Kani proves the small `unsafe` core for every
+input within stated bounds. A deterministic simulation runs the epoll driver under lost,
+reordered and reset connections, failing disks and jumping clocks, about 210 simulated days
+per CI run. Every fuzz target runs for 10 minutes each night, and none has an open crash.
+A slow-upload attack runs against a server in a 128 MiB container on every change, behind
+the one fix that changes behaviour for running services: the memory budget for requests
+being received (under Security). No public API changed; two log outputs did (`Logger`,
+`Trace`). This release has no benchmark run on bare metal (that is 0.9); the numbers below
+are instruction and allocation counts from `bench/instr`.
+
 ### Added
 
+- **CI**: `cargo-semver-checks` checks the public API of every change against the last
+  release (0.7.0), so a breaking change fails CI; a release pull request that bumps the
+  version may break, as semver allows.
+- **CI**: an `instr` job counts with callgrind the instructions and heap allocations of 16
+  operations on both drivers (spawn, yield, channels, timeouts, TCP and UDP echo, file
+  reads, the HTTP/1.1 server, HTTP/1.1, HTTP/2 and TLS client to server, a giong-web
+  route, Redis, PostgreSQL and MySQL queries against in-process fake servers) and the heap
+  and resident memory per idle HTTP/1.1, HTTP/2 and HTTPS connection, and fails when one
+  moves past its limit from `bench/instr/baseline.csv` (1% for instructions and
+  allocations, 2% for heap, 10% for resident memory). The counts repeat within 0.07% on a
+  shared runner; raw rounds in `bench/results/instr/`.
 - **Testing**: a deterministic simulation (`sim/`, not published) that runs giong's epoll
   driver on a simulated kernel: virtual sockets, epoll, eventfds, clocks, threads and
   disk faults, all chosen by a seed, so a failing run replays exactly with
@@ -2043,7 +2070,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/giong-run/Giong/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/giong-run/Giong/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/giong-run/Giong/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.5.0
