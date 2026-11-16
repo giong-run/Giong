@@ -6,6 +6,9 @@ name: Soak
 # Twice: on the runner's kernel, and on Linux 6.18 booted in QEMU, where
 # streams receive through packed buffer rings (6.12 and newer), which cut a
 # receive wherever a shared buffer fills up.
+# Then years of simulated uptime under hostile faults (sim/README.md), on new
+# seeds every night: rare fault combinations show up only after thousands of
+# seeds, more than the per-PR run can afford.
 
 on:
   schedule:
@@ -15,6 +18,9 @@ on:
       minutes:
         description: Minutes to run
         default: "120"
+      sim_from:
+        description: First seed of the simulated long runs (default changes every night)
+        default: ""
 
 permissions:
   contents: read
@@ -68,3 +74,20 @@ jobs:
         with:
           name: soak-linux-6.18.63-log
           path: target/kernels/linux-6.18.63.log
+
+  sim-long-runs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # 1200 seeds of 521 simulated days each (about 1,700 simulated years),
+      # starting where the previous night stopped. A failure prints its seed;
+      # replay it with GIONG_SIM_SEED=<seed> GIONG_SIM_SOAK_DAYS=3650.
+      - name: Hostile soak in simulated time
+        env:
+          SIM_FROM: ${{ inputs.sim_from }}
+          RUN: ${{ github.run_number }}
+        run: SIM_LONG_FROM="${SIM_FROM:-$(( RUN * 1200 ))}" scripts/check.sh sim-long
