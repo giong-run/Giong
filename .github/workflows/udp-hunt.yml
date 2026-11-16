@@ -47,6 +47,8 @@ jobs:
           [ "${{ matrix.user }}" = root ] && run=(sudo -E)
           uname -r
           cat /proc/sys/net/ipv4/ip_local_port_range
+          echo "udp_hash_entries $(cat /proc/sys/net/ipv4/udp_hash_entries) nproc $(nproc)"
+          grep -m1 'model name' /proc/cpuinfo
           failed=0
           for i in $(seq 1 3000); do
             out=$("${run[@]}" "$bin" -q 2>&1)
@@ -61,29 +63,33 @@ jobs:
           echo "failed $failed of 3000"
           [ "$failed" = 0 ]
 
-  # The whole suite, as the fallback jobs run it, more rounds.
-  suite:
-    name: suite (${{ matrix.tier }})
+  # The same binds without giong (.github/udp-hunt/repro.c): is it the
+  # kernel? Several shards, to land on both kinds of runner.
+  repro:
+    name: repro (shard ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        tier: [no-features, coop, epoll]
-    env:
-      GIONG_TEST_EXPECT_DRIVER: io_uring
-      GIONG_KTLS_REQUIRED: 1
-      GIONG_PG_REQUIRED: "1"
-      GIONG_MYSQL_REQUIRED: "1"
-      GIONG_REDIS_REQUIRED: "1"
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - name: Install redis-server
+      - name: Run the repro
+        shell: bash
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
-          sudo systemctl stop redis-server
-      - run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
-      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && ROUNDS=15 scripts/check.sh fallback ${{ matrix.tier }}
+          set +e
+          uname -a
+          echo "udp_hash_entries $(cat /proc/sys/net/ipv4/udp_hash_entries) nproc $(nproc)"
+          grep -m1 'model name' /proc/cpuinfo
+          free -m | head -2
+          gcc -O2 -pthread -Wall -o repro .github/udp-hunt/repro.c || exit 1
+          ulimit -n 8192
+          status=0
+          for v in "connect=1 late_close=0" "connect=1 late_close=1" \
+                   "connect=0 late_close=0" "connect=0 late_close=1"; do
+            for hold in 0 1000; do
+              ./repro 3000 $v noise=3 hold=$hold | tail -n 12
+              [ "${PIPESTATUS[0]}" = 0 ] || status=1
+            done
+          done
+          exit $status
