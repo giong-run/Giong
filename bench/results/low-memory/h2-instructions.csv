@@ -1,0 +1,37 @@
+# bench/instructions.sh, STREAMS=M (streams per connection), json-h2: 10 connections (CONNS=3 in the
+# rows marked c3, 30,000 requests), 20,000 measured requests, one worker; 4-vCPU VM, Linux 6.18.
+# old = 0.8.0 (b6d9b4b), merged = #125 (003d9e5), fixed = this change, fixed-keep-always = this
+# change without the first give-back (the queue kept from the first burst on).
+streams,build,run,instructions_per_request
+1,old,1,14479
+1,merged,1,14644
+1,old,2,14477
+1,merged,2,14651
+1,old,3,14480
+1,fixed,1,14528
+1,old,4,14470
+1,fixed,2,14539
+10,old,1,11267
+10,merged,1,11490
+10,old,2,11248
+10,merged,2,11460
+10,old,3,11207
+10,fixed,1,11268
+10,old,4,11238
+10,fixed,2,11287
+100,old,1,10895
+100,merged,1,11406
+100,old,2,10882
+100,merged,2,11348
+100,old,3,10893
+100,fixed,1,11005
+100,old,4,10886
+100,fixed,2,11011
+100c3,old,1,10816
+100c3,merged,1,11195
+100c3,fixed,1,10850
+100c3,fixed-keep-always,1,10858
+100c3,old,2,10818
+100c3,merged,2,11282
+100c3,fixed,2,10854
+100c3,fixed-keep-always,2,10846

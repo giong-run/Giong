@@ -84,6 +84,11 @@ pub const CASES: &[Case] = &[
         h2
     ),
     case!(
+        "h2-streams",
+        "giong-http client to giong-http server, ten HTTP/2 GET /json at once on one connection",
+        h2_streams
+    ),
+    case!(
         "https",
         "giong-http client to giong-http server over TLS (rustls), HTTP/1.1 GET /json",
         https
@@ -390,6 +395,44 @@ async fn h2(m: &Meter) {
     client_loop(m, client, &url).await;
 }
 
+/// Requests in flight together in `h2-streams`.
+const STREAMS: usize = 10;
+
+/// One operation is `STREAMS` requests sent together over one HTTP/2
+/// connection, as from a client with many streams in flight. Requests that
+/// arrive in one read queue up for their handlers, which `h2` (one request
+/// at a time) never does: 0.8.0's fix for idle memory gave the queue back
+/// each time it emptied, which cost 2% more instructions per request with
+/// ten streams and 4.5% with a hundred, unseen here until this case.
+async fn h2_streams(m: &Meter) {
+    let (listener, addr) = listen();
+    let _server = giong::spawn(async move { Server::new().serve(listener, json).await });
+    let client = giong_http::client::Client::builder()
+        .http2_prior_knowledge(true)
+        .build();
+    let url = std::rc::Rc::<str>::from(format!("http://{addr}/json"));
+    let first = client.get(&url).send().await.expect("a response");
+    assert_eq!(
+        first.version(),
+        giong_http::Version::Http2,
+        "HTTP/2 was used"
+    );
+    let mut tasks = Vec::with_capacity(STREAMS);
+    for _ in m.iter() {
+        for _ in 0..STREAMS {
+            let (client, url) = (client.clone(), url.clone());
+            tasks.push(giong::spawn(async move {
+                let resp = client.get(&url).send().await.expect("a response");
+                assert_eq!(resp.status(), 200);
+                resp.body().len()
+            }));
+        }
+        for task in tasks.drain(..) {
+            std::hint::black_box(task.await.expect("the request task"));
+        }
+    }
+}
+
 async fn https(m: &Meter) {
     let (listener, addr) = listen();
     // A fresh P-256 certificate: the handshake is not counted, and the
@@ -450,7 +493,6 @@ async fn web(m: &Meter) {
 /// the socket (the server cannot tell, nothing is sent), so the heap that
 /// stays is the server's. The allocation count covers both ends.
 async fn idle(name: &'static str, n: usize, proto: Proto) {
-    use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 

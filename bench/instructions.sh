@@ -21,6 +21,8 @@
 #   json-tls  GET /json over HTTPS (rustls; kernel TLS off), HTTP/1.1
 #   json      GET /json over plain HTTP/1.1
 #   json-h2   GET /json over HTTP/2 with prior knowledge
+#             (STREAMS requests in flight on each connection, default 1;
+#             CONNS connections, default 10, for every endpoint)
 #
 # To compare two commits, build bench/giong-http at each, copy the binaries
 # aside and pass both in BINS: the counts are only comparable between builds
@@ -54,7 +56,7 @@ declare -A URL=(
   [json]="http://127.0.0.1:3009/json"
   [json-h2]="http://127.0.0.1:3009/json"
 )
-declare -A FLAGS=([json-tls]="--h1" [json]="--h1" [json-h2]="")
+declare -A FLAGS=([json-tls]="--h1" [json]="--h1" [json-h2]="-m ${STREAMS:-1}")
 for ep in "${EPS[@]}"; do
   [ -n "${URL[$ep]:-}" ] || { echo "unknown endpoint $ep (known: ${!URL[*]})" >&2; exit 2; }
 done
@@ -73,10 +75,10 @@ for bin in "${BIN_LIST[@]}"; do
       sleep 0.2
     done
     # shellcheck disable=SC2086
-    h2load ${FLAGS[$ep]} -n 2000 -c 10 "${URL[$ep]}" >/dev/null 2>&1
+    h2load ${FLAGS[$ep]} -n 2000 -c "${CONNS:-10}" "${URL[$ep]}" >/dev/null 2>&1
     callgrind_control -z "$pid" >/dev/null 2>&1
     # shellcheck disable=SC2086
-    h2load ${FLAGS[$ep]} -n "$N" -c 10 "${URL[$ep]}" >"$TMP/h2load.log" 2>&1
+    h2load ${FLAGS[$ep]} -n "$N" -c "${CONNS:-10}" "${URL[$ep]}" >"$TMP/h2load.log" 2>&1
     callgrind_control -d "$pid" >/dev/null 2>&1
     sleep 1
     ok=$(awk '/^requests:/{print $8}' "$TMP/h2load.log")

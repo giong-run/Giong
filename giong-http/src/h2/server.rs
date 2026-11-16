@@ -416,6 +416,12 @@ pub(crate) struct Session {
     warm: bool,
     /// The memory for streams has been given back at least once.
     released: bool,
+    /// The queue of handlers to start (`starts`) has been given back once
+    /// after a burst of streams, since the memory for streams last was.
+    starts_shrunk: bool,
+    /// It grew past four again after that: bursts keep coming, and it is
+    /// kept until the memory for streams is given back.
+    keep_starts: bool,
     /// A buffer reused for lowercased response header names, and for the
     /// fields of a request header block while it is decoded.
     name: Vec<u8>,
@@ -461,6 +467,8 @@ impl Session {
             idle_since: Instant::now(),
             warm: false,
             released: false,
+            starts_shrunk: false,
+            keep_starts: false,
             name: Vec::new(),
         }
     }
@@ -514,7 +522,8 @@ impl Session {
     /// first allocation holds one request: Rust's would hold four (672
     /// bytes), kept with the stream memory while the connection is warm, and
     /// most connections have one request at a time. A queue grown past four
-    /// is given back once it is empty (see `next_start`).
+    /// is given back the first time it is empty, and kept from the second
+    /// on (see `next_start`).
     fn push_start(&mut self, slot: usize, req: Request) {
         if self.starts.capacity() == 0 {
             self.starts.reserve_exact(1);
@@ -527,11 +536,21 @@ impl Session {
             return None;
         }
         let next = self.starts.pop_front();
-        if next.is_none() && self.starts.capacity() > 4 {
-            // A burst of streams opened together grew the queue: its
-            // requests are large (168 bytes each), and the memory would stay
-            // with the connection for as long as it is busy.
-            self.starts = VecDeque::new();
+        if next.is_none() && self.starts.capacity() > 4 && !self.keep_starts {
+            // A burst of streams opened together grew the queue. Its
+            // requests are large (168 bytes each): after one burst, as when a
+            // client opens several long requests at once, the memory would
+            // stay with the connection for as long as they last, so it is
+            // given back. When bursts keep coming, as from a client with many
+            // streams in flight, giving it back each time cost up to 4.5%
+            // more instructions per request: from the second burst on it is
+            // kept, until the connection is idle (`release_streams`).
+            if self.starts_shrunk {
+                self.keep_starts = true;
+            } else {
+                self.starts = VecDeque::new();
+                self.starts_shrunk = true;
+            }
         }
         next
     }
@@ -2044,6 +2063,8 @@ impl Session {
         if self.ids.is_empty() && self.events.is_empty() && self.streams.capacity() > 0 {
             self.warm = false;
             self.released = true;
+            self.starts_shrunk = false;
+            self.keep_starts = false;
             self.streams = Vec::new();
             self.free = Vec::new();
             self.ids = Vec::new();
@@ -2438,6 +2459,38 @@ mod tests {
         while s.pop_event().is_some() {}
         s.release();
         assert!(!s.keeps_streams());
+    }
+
+    #[test]
+    fn the_handler_queue_is_given_back_after_one_burst_and_kept_while_bursts_follow() {
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        let req = || Request::from_bytes(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").expect("a request");
+        let burst = |s: &mut Session| {
+            for slot in 0..8 {
+                s.push_start(slot, req());
+            }
+            assert!(s.starts.capacity() > 4);
+            while s.next_start().is_some() {}
+        };
+        // One burst, as from a client opening several long requests at
+        // once: the queue is given back as soon as it is empty.
+        burst(&mut s);
+        assert_eq!(s.starts.capacity(), 0);
+        // Bursts keep coming: kept, so the next one allocates nothing.
+        burst(&mut s);
+        let kept = s.starts.capacity();
+        assert!(kept > 4);
+        burst(&mut s);
+        assert_eq!(s.starts.capacity(), kept);
+        // Given back with the memory for streams, and the next burst is a
+        // first one again.
+        let slot = s.open(1, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
+        assert_eq!(s.starts.capacity(), 0);
+        burst(&mut s);
+        assert_eq!(s.starts.capacity(), 0);
     }
 
     #[test]
