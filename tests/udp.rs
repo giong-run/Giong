@@ -493,6 +493,7 @@ fn runtime_teardown_with_datagrams_in_flight() {
 struct SocketId {
     addr: std::net::SocketAddrV4,
     cookie: u64,
+    inode: u64,
 }
 
 fn socket_id(socket: &UdpSocket) -> SocketId {
@@ -514,20 +515,55 @@ fn socket_id(socket: &UdpSocket) -> SocketId {
     let std::net::SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
         panic!("not an IPv4 socket");
     };
-    SocketId { addr, cookie }
+    // SAFETY: `socket` keeps the descriptor open while it is borrowed here.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(socket.as_raw_fd()) };
+    let file = std::fs::File::from(fd.try_clone_to_owned().unwrap());
+    let inode = std::os::unix::fs::MetadataExt::ino(&file.metadata().unwrap());
+    SocketId {
+        addr,
+        cookie,
+        inode,
+    }
 }
 
-/// Whether the socket `id` still exists, asked of the kernel by its address
-/// and cookie (sock_diag), in one request.
+/// Whether the socket `id` still exists.
 ///
 /// Not from /proc/self/fd: listing or reading those links holds every open
 /// file for a moment, and a socket another test closes in that moment keeps
 /// its port until this thread is done (the rebind test then saw AddrInUse
-/// for a port nothing held). Nor from /proc/net/udp: the kernel writes that
-/// table a page per read, and sockets that come and go in between (the
-/// thousand of `port_zero_gives_every_socket_a_port_of_its_own`) can make a
-/// live socket fall between two pages.
+/// for a port nothing held). The kernel is asked by address and cookie
+/// instead (sock_diag), in one request. Kernels that cannot answer for UDP
+/// (its sock_diag handler is a module, `udp_diag`, which the QEMU guests of
+/// CI do not have) fall back to the UDP table; the kernel writes that a page
+/// per read, and sockets that come and go in between (the thousand of
+/// `port_zero_gives_every_socket_a_port_of_its_own`) can make a live socket
+/// fall between two pages, so it counts as open when any of several reads
+/// lists it.
 fn is_open(id: SocketId) -> bool {
+    static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let diag = *DIAG.get_or_init(|| {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let probe = UdpSocket::from_std(probe);
+        found_by_sock_diag(socket_id(&probe))
+    });
+    if diag {
+        return found_by_sock_diag(id);
+    }
+    let inode = id.inode.to_string();
+    (0..20).any(|_| {
+        ["/proc/net/udp", "/proc/net/udp6"].iter().any(|table| {
+            std::fs::read_to_string(table)
+                .unwrap_or_default()
+                .lines()
+                .skip(1)
+                .any(|line| line.split_whitespace().nth(9) == Some(inode.as_str()))
+        })
+    })
+}
+
+/// Whether sock_diag finds the UDP socket bound to `id.addr` with
+/// `id.cookie`. Also false when the kernel has no sock_diag for UDP.
+fn found_by_sock_diag(id: SocketId) -> bool {
     #[repr(C)]
     struct Request {
         len: u32,
