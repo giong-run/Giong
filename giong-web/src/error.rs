@@ -307,8 +307,13 @@ impl Error {
         let mut out = first.to_string();
         let mut next = first.source();
         while let Some(e) = next {
-            out.push_str(": ");
-            out.push_str(&e.to_string());
+            // Many errors already show their source in their own message
+            // (giong-postgres shows the server's error): say it once.
+            let text = e.to_string();
+            if !out.contains(&text) {
+                out.push_str(": ");
+                out.push_str(&text);
+            }
             next = e.source();
         }
         Some(out)
@@ -494,6 +499,37 @@ mod tests {
         let resp = err.into_response(None);
         assert!(!body(&resp).contains("disk"));
         assert!(Error::of(&resp).unwrap().source().is_some());
+    }
+
+    #[test]
+    fn a_cause_that_repeats_its_source_is_said_once() {
+        // Like giong-postgres's errors: the message already ends with the
+        // server's error, which is also the source.
+        #[derive(Debug)]
+        struct Server;
+        impl std::fmt::Display for Server {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("ERROR 57014: canceling statement")
+            }
+        }
+        impl std::error::Error for Server {}
+        #[derive(Debug)]
+        struct Timeout(Server);
+        impl std::fmt::Display for Timeout {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "GIONG-E3004: too long: {}", self.0)
+            }
+        }
+        impl std::error::Error for Timeout {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let err: Error = io::Error::other(Timeout(Server)).into();
+        assert_eq!(
+            err.cause_chain().as_deref(),
+            Some("GIONG-E3004: too long: ERROR 57014: canceling statement")
+        );
     }
 
     #[test]
