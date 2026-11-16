@@ -102,10 +102,11 @@ long runs replays with `GIONG_SIM_SEED=<seed> GIONG_SIM_SOAK_DAYS=3650`.
 - **Signals, control messages, FIFOs and pipes, and real blocking calls.**
   The tests that need them are skipped in `suite`, each with its reason.
 - **The wall clock.** `CLOCK_REALTIME` starts at 2030-01-01 in every run.
-- **Memory pressure.** Inside a run `/proc/meminfo`, `/proc/self/cgroup`
-  and `/sys/fs/cgroup` do not exist, so giong-http's low-memory refusal
-  (`Server::min_free_memory`) never refuses: what the host has free must not
-  decide a simulated run. The refusal has its own tests and CI job.
+- **Memory pressure.** giong-http's low-memory refusal
+  (`Server::min_free_memory`) reads the host's `/proc/meminfo` and cgroup
+  files, which are real here; the scenarios turn it off (`0`) so that what
+  the host has free cannot decide a simulated run. The refusal has its own
+  tests and CI job.
 - **Process-wide state.** Something set up on first use in a process (a
   `OnceLock` that reads the clock) makes its calls in the first run only; a
   sweep therefore starts with one run whose report it drops, so that every
