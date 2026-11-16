@@ -126,7 +126,7 @@ pub const IDLE: &[IdleCase] = &[
     },
     IdleCase {
         name: "idle-h2",
-        what: "heap and RSS per idle HTTP/2 connection (after the preface and SETTINGS)",
+        what: "heap and RSS per idle HTTP/2 connection, after one request",
         run: |name, n| Box::pin(idle(name, n, Proto::Http2)),
     },
     IdleCase {
@@ -511,18 +511,7 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
                 let mut s = std::net::TcpStream::connect(addr).expect("connect");
                 match proto {
                     Proto::Http1 => {}
-                    Proto::Http2 => {
-                        s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
-                            .expect("write the preface");
-                        // The server's SETTINGS proves that it has taken the
-                        // preface. Waiting for it before the next connection
-                        // keeps the server from falling behind: with thousands
-                        // of prefaces queued, the receive buffer pool runs low
-                        // and the driver copies data to the heap, by timing.
-                        let mut buf = [0u8; 256];
-                        let got = s.read(&mut buf).expect("read the server's SETTINGS");
-                        assert!(got >= 9 && buf[3] == 4, "the server answers with SETTINGS");
-                    }
+                    Proto::Http2 => h2_request(&mut s),
                     Proto::Https => {
                         let config = tls_client.clone().expect("the client config");
                         tls_request(config, &mut s);
@@ -559,6 +548,56 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
     );
     stop.store(true, Ordering::Release);
     opener.join().expect("the opener thread");
+}
+
+/// The HTTP/2 preface, SETTINGS and one `GET /` over `sock` (prior
+/// knowledge), read to the end of the response, as `bench/h2.sh`'s `h2-idle`
+/// does: a connection that has made a request holds what a request leaves
+/// behind (an HTTP/2 connection kept the memory for its streams for a second
+/// after each request in 0.8.0, which only shows when the connection has
+/// had one). Waiting for the answer before the next connection also keeps
+/// the server from falling behind: with thousands of prefaces queued, the
+/// receive buffer pool runs low and the driver copies data to the heap, by
+/// timing.
+fn h2_request(sock: &mut std::net::TcpStream) {
+    use std::io::{Read, Write};
+    // HEADERS on stream 1, END_STREAM and END_HEADERS: :method GET,
+    // :scheme http, :path / (static table entries 2, 6 and 4) and
+    // :authority localhost (literal, not indexed, name from entry 1).
+    const HEADERS: &[u8] = b"\0\0\x0e\x01\x05\0\0\0\x01\x82\x86\x84\x01\x09localhost";
+    let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0".to_vec();
+    out.extend_from_slice(HEADERS);
+    sock.write_all(&out)
+        .expect("write the preface and the request");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // Every complete frame so far.
+        let mut at = 0;
+        while got.len() >= at + 9 {
+            let len = usize::from(got[at]) << 16
+                | usize::from(got[at + 1]) << 8
+                | usize::from(got[at + 2]);
+            if got.len() < at + 9 + len {
+                break;
+            }
+            let (kind, flags) = (got[at + 3], got[at + 4]);
+            let stream = u32::from_be_bytes([got[at + 5], got[at + 6], got[at + 7], got[at + 8]]);
+            if kind == 4 && flags & 1 == 0 {
+                sock.write_all(b"\0\0\0\x04\x01\0\0\0\0")
+                    .expect("acknowledge SETTINGS");
+            }
+            if (kind == 0 || kind == 1) && stream == 1 && flags & 1 == 1 {
+                return;
+            }
+            assert!(kind != 7, "the server sent GOAWAY");
+            at += 9 + len;
+        }
+        got.drain(..at);
+        let k = sock.read(&mut buf).expect("read the response");
+        assert!(k > 0, "the server closed");
+        got.extend_from_slice(&buf[..k]);
+    }
 }
 
 /// A TLS handshake and one keep-alive `GET /json` over `sock`, read to the

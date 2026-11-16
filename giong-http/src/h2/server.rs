@@ -106,7 +106,12 @@ const WINDOW_UPDATES_PER_DATA: u32 = 10;
 const ERROR_LINGER: Duration = Duration::from_secs(1);
 /// How long an idle connection keeps the memory for its streams (slots,
 /// wakers, queues, the header buffer) after its last stream closed, so that
-/// requests following one another allocate none of it again.
+/// requests following one another allocate none of it again. Only once
+/// requests have been seen to follow one another within this time (see
+/// `Session::warm`): a connection that makes one request and then sits idle,
+/// as thousands of them do when they open together, gives the memory back at
+/// once, or it would be held for all of them at the same time and stay in
+/// the process's resident memory after it was freed.
 const KEEP_STREAMS: Duration = Duration::from_secs(1);
 
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
@@ -405,6 +410,12 @@ pub(crate) struct Session {
     pub(crate) wakers: Wakers,
     /// Since when no stream has been open.
     idle_since: Instant,
+    /// Requests have followed one another within `KEEP_STREAMS`: the memory
+    /// for streams is kept between them, and given back once the connection
+    /// has been idle for that long.
+    warm: bool,
+    /// The memory for streams has been given back at least once.
+    released: bool,
     /// A buffer reused for lowercased response header names, and for the
     /// fields of a request header block while it is decoded.
     name: Vec<u8>,
@@ -448,6 +459,8 @@ impl Session {
             events: Vec::new(),
             wakers: Wakers::default(),
             idle_since: Instant::now(),
+            warm: false,
+            released: false,
             name: Vec::new(),
         }
     }
@@ -497,11 +510,30 @@ impl Session {
     }
 
     /// The next request whose handler may start, unless handlers wait.
+    /// Queues the handler of the stream in `slot` to start. The queue's
+    /// first allocation holds one request: Rust's would hold four (672
+    /// bytes), kept with the stream memory while the connection is warm, and
+    /// most connections have one request at a time. A queue grown past four
+    /// is given back once it is empty (see `next_start`).
+    fn push_start(&mut self, slot: usize, req: Request) {
+        if self.starts.capacity() == 0 {
+            self.starts.reserve_exact(1);
+        }
+        self.starts.push_back((slot, req));
+    }
+
     pub(crate) fn next_start(&mut self) -> Option<(usize, Request)> {
         if self.handlers_wait() {
             return None;
         }
-        self.starts.pop_front()
+        let next = self.starts.pop_front();
+        if next.is_none() && self.starts.capacity() > 4 {
+            // A burst of streams opened together grew the queue: its
+            // requests are large (168 bytes each), and the memory would stay
+            // with the connection for as long as it is busy.
+            self.starts = VecDeque::new();
+        }
+        next
     }
 
     /// The handler of the stream in `slot` panicked: the stream is
@@ -808,7 +840,7 @@ impl Session {
             Recv::Buffer(mut req) => {
                 let start = req.head.len;
                 req.body = BodyBytes::InBuffer(start..req.buf.len());
-                self.starts.push_back((slot, req));
+                self.push_start(slot, req);
             }
             pipe @ Recv::Pipe { .. } => {
                 st.recv = pipe;
@@ -1060,12 +1092,27 @@ impl Session {
             deadline: None,
             blocked_since: None,
         };
+        if self.streams.capacity() == 0
+            && self.released
+            && Instant::now() < self.idle_since + KEEP_STREAMS
+        {
+            // The memory for streams was given back, and a request follows
+            // soon after: keep it from now on.
+            self.warm = true;
+        }
         let slot = match self.free.pop() {
             Some(slot) => {
                 self.streams[slot] = Some(stream);
                 slot
             }
             None => {
+                // Room for one stream at first (352 bytes), not the four
+                // Rust's first allocation would make room for: most
+                // connections have one request at a time, and an idle one
+                // keeps this while it is warm.
+                if self.streams.capacity() == 0 {
+                    self.streams.reserve_exact(1);
+                }
                 self.streams.push(Some(stream));
                 self.streams.len() - 1
             }
@@ -1093,7 +1140,7 @@ impl Session {
                 let _ = self.reset(slot, Reason::Protocol);
                 return;
             }
-            self.starts.push_back((slot, req));
+            self.push_start(slot, req);
             return;
         }
         let Ok(stream_body) = catching(|| handler.stream_body(&req)) else {
@@ -1116,7 +1163,7 @@ impl Session {
                     taken: 0,
                 };
                 st.expect_continue = expect_continue;
-                self.starts.push_back((slot, req));
+                self.push_start(slot, req);
             }
             None => {
                 if content_length.is_some_and(|cl| cl > max_body) {
@@ -1971,15 +2018,20 @@ impl Session {
             + self.streams.capacity() * mem::size_of::<Option<Stream>>()
     }
 
-    /// With no stream open: gives back the output buffer if it is empty.
+    /// With no stream open: gives back the output buffer if it is empty,
+    /// and the memory for streams unless requests have been following one
+    /// another (then the timer does, after `KEEP_STREAMS`).
     pub(crate) fn release(&mut self) {
         if self.out.is_empty() && self.out.capacity() > 0 {
             give_buffer(mem::take(&mut self.out));
         }
+        if !self.warm {
+            self.release_streams();
+        }
     }
 
     /// Memory for streams is kept: the connection has had streams, and has
-    /// not been idle for `KEEP_STREAMS` yet.
+    /// not given it back yet.
     pub(crate) fn keeps_streams(&self) -> bool {
         self.streams.capacity() > 0
     }
@@ -1990,6 +2042,8 @@ impl Session {
     /// it; given back once the connection has been idle for `KEEP_STREAMS`.
     fn release_streams(&mut self) {
         if self.ids.is_empty() && self.events.is_empty() && self.streams.capacity() > 0 {
+            self.warm = false;
+            self.released = true;
             self.streams = Vec::new();
             self.free = Vec::new();
             self.ids = Vec::new();
@@ -2348,15 +2402,24 @@ mod tests {
     #[test]
     fn stream_memory_is_kept_while_requests_follow_and_released_when_idle() {
         let mut s = Session::new(crate::Server::new().cfg, None);
+        // One request, then idle: given back at once.
         let slot = s.open(1, true, None, false);
         s.remove(slot, Failure::Abandoned, false);
         while s.pop_event().is_some() {}
+        s.release();
+        assert!(!s.keeps_streams());
+        assert_eq!(s.next_deadline(), Some(s.idle_since + s.cfg.idle_timeout));
+        // Another soon after: from now on the memory is kept.
+        let slot = s.open(3, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
         let idle = s.idle_since;
         // The next request reuses the slot: nothing is allocated for it.
         assert!(s.keeps_streams());
         assert_eq!(s.next_deadline(), Some(idle + KEEP_STREAMS));
         let streams = s.streams.as_ptr();
-        let slot = s.open(3, true, None, false);
+        let slot = s.open(5, true, None, false);
         assert_eq!(s.streams.as_ptr(), streams);
         s.remove(slot, Failure::Abandoned, false);
         while s.pop_event().is_some() {}
@@ -2368,6 +2431,13 @@ mod tests {
         assert!(!s.keeps_streams());
         assert_eq!(s.streams.capacity(), 0);
         assert_eq!(s.next_deadline(), Some(idle + s.cfg.idle_timeout));
+        // A request after a long pause is a first request again.
+        s.idle_since -= KEEP_STREAMS;
+        let slot = s.open(7, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
+        assert!(!s.keeps_streams());
     }
 
     #[test]

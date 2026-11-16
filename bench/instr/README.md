@@ -77,14 +77,18 @@ the other cases', covers both ends, handshakes included. Leaving the client thre
 take a check in the counting allocator, and that alone moved the instruction counts of the
 other cases by up to 2% (inlining under LTO), so it was not done. The heap count is exact and
 repeats within a byte per connection; its limit is 2%. The resident set moves with the
-allocator's choices; its limit is 10%. HTTP/2 connections are opened one at a time, each after
-the server's SETTINGS: opened all at once, the receive buffer pool runs low and the driver
+allocator's choices; its limit is 10%. For `idle-h2` the thread sends the preface, SETTINGS and
+one `GET /` on each connection and reads the answer, as `bench/h2.sh` does: until 0.9 it sent no
+request, and missed that 0.8.0 kept each connection's memory for streams for a second after a
+request (6,852 heap and 7,371 resident bytes per connection on 0.8.0 with the request, against
+4,427 and 4,801 with the fix; 2026-11-16). HTTP/2 connections are opened one at a time, each
+after the server's answer: opened all at once, the receive buffer pool runs low and the driver
 moves bytes to the heap depending on timing, which made the heap per connection vary by 7%.
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
 | `idle-http1` (io_uring / epoll) | 1,940 / 2,102 bytes | 1,995 / 2,169 bytes |
-| `idle-h2` (io_uring / epoll) | 4,166 / 4,232 bytes | 4,307 / 4,338 bytes |
+| `idle-h2` (io_uring / epoll) | 4,427 / 4,492 bytes | 4,801 / 4,796 bytes |
 | `idle-https` (io_uring / epoll) | 10,784 / 10,821 bytes | 11,123 / 11,086 bytes |
 
 The numbers above were measured on a 4-vCPU Xeon VM (Linux 6.18) on 2026-11-15; what CI
