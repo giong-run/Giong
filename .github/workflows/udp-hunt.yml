@@ -1,0 +1,78 @@
+name: UDP rebind hunt
+
+# Temporary: runs the UDP rebind test many times on GitHub's runners, where
+# it failed three times with AddrInUse and never locally, to see what holds
+# the port. Removed before the pull request merges.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  loop:
+    name: udp loop (${{ matrix.tier }}, ${{ matrix.user }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [default, no-features, coop, epoll]
+        # As root, the report can name the process behind any socket.
+        user: [runner, root]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: cargo test --release --all-features --test udp --no-run
+      - name: Run the udp tests 3000 times
+        run: |
+          bin=$(ls -t target/release/deps/udp-* | grep -v '\.d$' | head -n1)
+          case "${{ matrix.tier }}" in
+            no-features) export GIONG_IO_URING_OFF=all ;;
+            coop) export GIONG_IO_URING_OFF=all GIONG_RING_TIER=coop ;;
+            epoll) export GIONG_DRIVER=epoll ;;
+          esac
+          run=""
+          [ "${{ matrix.user }}" = root ] && run="sudo -E"
+          uname -r
+          cat /proc/sys/net/ipv4/ip_local_port_range
+          failed=0
+          for i in $(seq 1 3000); do
+            if ! out=$($run "$bin" -q 2>&1); then
+              failed=$((failed + 1))
+              echo "::group::failure in run $i"
+              echo "$out" | grep -v '^\.*$'
+              echo "::endgroup::"
+              echo "$out" | grep -A20 panicked
+            fi
+          done
+          echo "failed $failed of 3000"
+          test "$failed" = 0
+
+  # The whole suite, as the fallback jobs run it, more rounds.
+  suite:
+    name: suite (${{ matrix.tier }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: [no-features, coop, epoll]
+    env:
+      GIONG_TEST_EXPECT_DRIVER: io_uring
+      GIONG_KTLS_REQUIRED: 1
+      GIONG_PG_REQUIRED: "1"
+      GIONG_MYSQL_REQUIRED: "1"
+      GIONG_REDIS_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install redis-server
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q redis-server
+          sudo systemctl stop redis-server
+      - run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && ROUNDS=15 scripts/check.sh fallback ${{ matrix.tier }}
