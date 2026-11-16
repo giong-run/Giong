@@ -662,8 +662,11 @@ impl Pool {
         let seed = std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish();
-        let jitter = life / 10 * u32::try_from(seed % 1000).unwrap_or(0) / 1000;
-        Instant::now() + (life - jitter)
+        let jitter = life / 10_000 * u32::try_from(seed % 1000).unwrap_or(0);
+        // A lifetime too long for the clock (`Duration::MAX`) means none.
+        Instant::now()
+            .checked_add(life - jitter)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(100 * 365 * 24 * 3600))
     }
 
     /// The least busy shared connection, or a new one if every open one is

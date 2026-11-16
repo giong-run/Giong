@@ -314,6 +314,10 @@ impl Response {
     }
 
     /// `200 OK` with an `application/json` body.
+    ///
+    /// The body is sent as given: bytes that are already JSON. To turn a
+    /// value into JSON, use a serializer (giong-web's `json` does it with
+    /// serde) rather than writing JSON by hand.
     pub fn json(body: impl Into<Body>) -> Self {
         Self::new(200)
             .header("Content-Type", "application/json")
