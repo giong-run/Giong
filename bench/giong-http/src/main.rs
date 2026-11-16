@@ -119,6 +119,9 @@ async fn handler(req: Request) -> Response {
         "/static" => Response::new(200)
             .header("content-type", "application/octet-stream")
             .body(giong_http::Body::Static(bytes(req.query().unwrap_or("")))),
+        // `POST /upload`: the server has received the whole body by now
+        // (bench/small-box.sh floods it with slow uploads).
+        "/upload" => Response::new(200),
         _ => Response::new(404),
     }
 }
@@ -199,14 +202,26 @@ fn main() -> std::io::Result<()> {
                 } else {
                     TcpListener::bind
                 };
+                // GIONG_MAX_CONNS=N: connections each worker serves at once
+                // instead of the default 10,000 (bench/small-box.sh measures
+                // how many idle connections fit in a memory limit).
+                let mut server = Server::new();
+                if let Some(n) = std::env::var("GIONG_MAX_CONNS").ok().and_then(|v| v.parse().ok()) {
+                    server = server.max_connections(n);
+                }
+                // GIONG_IDLE_TIMEOUT_SECS=N: how long a keep-alive connection
+                // may stay idle instead of the default 60 s (likewise).
+                if let Some(n) = std::env::var("GIONG_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()) {
+                    server = server.idle_timeout(std::time::Duration::from_secs(n));
+                }
                 match tls {
                     Some(acceptor) => {
                         let listener = bind(bench_addr(3010)).expect("bind");
-                        Server::new().serve_tls(listener, acceptor, handler).await;
+                        server.serve_tls(listener, acceptor, handler).await;
                     }
                     None => {
                         let listener = bind(bench_addr(3009)).expect("bind");
-                        Server::new().serve(listener, handler).await;
+                        server.serve(listener, handler).await;
                     }
                 }
             }

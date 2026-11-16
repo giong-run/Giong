@@ -1,4 +1,4 @@
-use axum::{extract::{Path, Query}, http::{HeaderName, StatusCode}, routing::get, Json, Router};
+use axum::{body::Bytes, extract::{Path, Query}, http::{HeaderName, StatusCode}, routing::{get, post}, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::hint::black_box;
 use std::time::Duration;
@@ -43,6 +43,18 @@ async fn wait(Query(q): Query<Ms>) -> Json<Msg> {
     Json(Msg { message: "Hello, World!" })
 }
 
+/// `POST /upload` reads the whole body before answering, as a handler that
+/// takes a JSON or form body does (bench/small-box.sh floods it with slow
+/// uploads).
+async fn upload(body: Bytes) -> String { body.len().to_string() }
+
+/// `BENCH_HOST` (default 127.0.0.1) lets a load generator on another machine
+/// reach the server (bench/small-box.sh).
+fn bench_addr(port: u16) -> String {
+    let host = std::env::var("BENCH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    format!("{host}:{port}")
+}
+
 #[tokio::main]
 async fn main() {
     let mut app = Router::new()
@@ -50,7 +62,8 @@ async fn main() {
         .route("/users", get(users))
         .route("/users/{id}", get(user))
         .route("/compute", get(compute))
-        .route("/wait", get(wait));
+        .route("/wait", get(wait))
+        .route("/upload", post(upload));
     // MIDDLEWARE=1: what bench/giong-web adds with RequestId, Compression
     // (gzip level 1 from 1 KiB) and Timeout, from tower-http. Layers listed
     // last run first.
@@ -62,7 +75,7 @@ async fn main() {
             .layer(PropagateRequestIdLayer::new(id.clone()))
             .layer(SetRequestIdLayer::new(id, MakeRequestUuid));
     }
-    let l = tokio::net::TcpListener::bind("127.0.0.1:3003").await.unwrap();
+    let l = tokio::net::TcpListener::bind(bench_addr(3003)).await.unwrap();
     // TCP_NODELAY=1 (bench/h2.sh): set it on each connection, as giong does.
     // Without it, over HTTP/2 the first answer on a new connection waits
     // about 40 ms for a delayed ACK (Nagle's algorithm).
