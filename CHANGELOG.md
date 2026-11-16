@@ -47,6 +47,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   6.68 / 7.42 / 5.88 KiB, ten requests in progress 19.09 / 21.65 / 19.09 KiB. The `instr`
   job did not catch it: its `idle-h2` case opened connections without making a request.
   It now makes one on each, as `bench/h2.sh` does.
+- **giong-http**: the first version of the fix above, merged in #125, gave the queue of
+  handlers to start back each time it emptied after growing past four. A client with many
+  streams in flight grows and empties it all the time, so every burst allocated it again: on
+  bare metal HTTP/2 served 4.6% fewer requests per second (1.519M against 1.593M, `bench/h2.sh`
+  json). The queue is now given back after the first burst only, which keeps ten long
+  requests opened at once from holding it, and kept from the second on until the connection
+  is idle. Instructions per request against 0.8.0 (callgrind, `h2load` with 10 connections,
+  4-vCPU VM; raw data in `bench/results/low-memory/`): one stream at a time +1.2% before,
+  +0.4% now; ten streams +2.1% / +0.3%; a hundred +4.5% / +1.1%. Memory stays as above. The
+  `instr` job sent one request at a time and missed it; its new `h2-streams` case sends ten
+  at once on one connection, with a limit of 0.5%.
 
 ## [0.8.0] - 2026-11-16
 

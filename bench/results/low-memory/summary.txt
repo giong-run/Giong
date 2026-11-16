@@ -54,3 +54,35 @@ memory regression of 0.8.0. Measured 2026-11-16 on the 4-vCPU Xeon VM
      fix                                   heap 4,427 / 4,492  rss 4,801 / 4,796
    The other cases of scripts/instr.py check stay within their limits; the
    h2 case's instructions moved +0.56% (epoll), allocations unchanged.
+
+4. HTTP/2 throughput after #125 (h2-instructions.csv, h2-throughput.csv)
+   Bare metal on #125 (003d9e5) served 4.6% fewer HTTP/2 requests per second
+   than 0.8.0 (bench/h2.sh json, 48 connections x 10 streams: 1.519M against
+   1.593M). Cause: next_start() gave the queue of handlers to start back each
+   time it emptied after growing past four, so with many streams in flight
+   every burst allocated it again. Now it is given back after the first burst
+   only (ten long requests opened at once do not keep it) and kept from the
+   second on, until the connection is idle.
+
+   Instructions per request, server only, callgrind (bench/instructions.sh
+   json-h2 with STREAMS and CONNS), medians of the runs in the file:
+
+     streams x conns     0.8.0    #125            this change
+     1 x 10              14,478   14,648 (+1.2%)  14,534 (+0.4%)
+     10 x 10             11,243   11,475 (+2.1%)  11,278 (+0.3%)
+     100 x 10            10,889   11,377 (+4.5%)  11,008 (+1.1%)
+     100 x 3             10,817   11,239 (+3.9%)  10,852 (+0.3%)
+
+   Keeping the queue from the first burst on (fixed-keep-always) costs the
+   same as this change, 10,852: the one give-back is not measurable.
+   Wall-clock rates on this VM move by up to 10% between rounds of one build
+   and cannot settle the difference (h2-throughput.csv); bare metal does.
+
+   Memory per connection with this change (bench/hold, as in 2): idle 4.53,
+   pending 5.88, pending10 19.09 KiB, three rounds, the same as #125. Keeping
+   the queue from the first burst on would have made pending10 21.68 KiB.
+
+   bench/instr gains a case, h2-streams: ten requests at once on one HTTP/2
+   connection, client and server. #125 costs 4 more allocations (500 against
+   496) and 0.7% more instructions per operation there; this change and 0.8.0
+   cost the same. Its limit is 0.5% on both (counts repeat within 0.1%).

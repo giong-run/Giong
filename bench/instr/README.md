@@ -58,6 +58,7 @@ instructions per request.
 | `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 11,144 | 10,022 |
 | `http1-client` | giong-http client and server, HTTP/1.1 | 33,947 | 32,654 |
 | `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 49,178 | 47,805 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 457,788 | 456,636 |
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 46,789 | 45,185 |
 | `web` | a giong-web router with a path parameter, raw client | 15,260 | 14,136 |
 | `redis-get` | giong-redis `GET` against a fake server | 9,617 | 9,096 |
@@ -66,6 +67,12 @@ instructions per request.
 
 Each case also records heap allocations per operation (counted by a global allocator in the
 benchmark), with the same 1% limit: one more allocation per request fails.
+
+`h2-streams` has a limit of 0.5% on both: its requests arrive in one read and queue up for
+their handlers, which `h2` never does, and the fix for idle HTTP/2 memory in 0.9 first gave
+that queue back each time it emptied. That cost four allocations and 0.7% more instructions per
+operation here (2% per request with ten streams and 4.5% with a hundred under `h2load`, and 4.6%
+fewer requests per second on bare metal), inside a 1% limit. Its counts repeat within 0.1%.
 
 Three more cases measure memory, outside valgrind: `idle-http1`, `idle-h2` and `idle-https`
 open 2,000 idle connections to a giong-http server in the process (from another thread, with

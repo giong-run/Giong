@@ -31,6 +31,8 @@ io_uring,http1-client,instructions,33946.6,1
 io_uring,http1-client,allocations,33.016,1
 io_uring,h2,instructions,49178.1,1
 io_uring,h2,allocations,48.000,1
+io_uring,h2-streams,instructions,457788.0,0.5
+io_uring,h2-streams,allocations,496.000,0.5
 io_uring,https,instructions,46788.8,1
 io_uring,https,allocations,39.069,1
 io_uring,web,instructions,15259.7,1
@@ -72,6 +74,8 @@ epoll,http1-client,instructions,32653.6,1
 epoll,http1-client,allocations,33.000,1
 epoll,h2,instructions,47805.4,1
 epoll,h2,allocations,48.001,1
+epoll,h2-streams,instructions,456635.7,0.5
+epoll,h2-streams,allocations,496.000,0.5
 epoll,https,instructions,45184.7,1
 epoll,https,allocations,39.000,1
 epoll,web,instructions,14135.6,1
