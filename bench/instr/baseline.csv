@@ -21,8 +21,8 @@ io_uring,timeout,instructions,99.2,1
 io_uring,timeout,allocations,0.000,1
 io_uring,tcp-echo,instructions,4884.6,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,5357.5,1
-io_uring,udp-echo,allocations,2.000,1
+io_uring,udp-echo,instructions,4082.5,1
+io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,1478.2,1
 io_uring,file-read,allocations,0.000,1
 io_uring,http1,instructions,11143.7,1
@@ -64,8 +64,8 @@ epoll,timeout,instructions,99.1,1
 epoll,timeout,allocations,0.000,1
 epoll,tcp-echo,instructions,4279.4,1
 epoll,tcp-echo,allocations,1.000,1
-epoll,udp-echo,instructions,5031.4,1
-epoll,udp-echo,allocations,2.000,1
+epoll,udp-echo,instructions,4722.4,1
+epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,2938.2,3
 epoll,file-read,allocations,2.000,1
 epoll,http1,instructions,10021.5,1

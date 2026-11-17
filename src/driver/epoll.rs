@@ -140,12 +140,13 @@ enum EOp {
         cancel: Arc<Cancel>,
         fd: RawFd,
     },
-    /// A multishot operation, armed once `io` is set. `ahead` holds
-    /// datagrams received in the same `recvmmsg` as one already handed out:
-    /// pool buffers and the length of what was written into each.
+    /// A multishot operation, armed once `io` is set. `batch`: datagrams
+    /// the next receive asks for; `streak`: receives in a row that found a
+    /// datagram (see [`Epoll::set_batch`]).
     Multi {
         io: Option<MultiIo>,
-        ahead: VecDeque<(u16, u32)>,
+        batch: u8,
+        streak: u8,
     },
 }
 
@@ -284,6 +285,11 @@ pub(crate) struct Epoll {
     wake_fd: RawFd,
     completions: Arc<Completions>,
     ops: Slab<EOp>,
+    /// By multishot operation: datagrams received in the same `recvmmsg` as
+    /// one already handed out, as pool buffers and the length of what was
+    /// written into each. Apart from the operations, which every stream
+    /// has, so that they stay small.
+    ahead: HashMap<usize, VecDeque<(u16, u32)>>,
     /// What is known about each descriptor, indexed by its number.
     fds: Vec<Option<Slot>>,
     next_gen: u32,
@@ -325,6 +331,7 @@ impl Epoll {
             done: Vec::new(),
             blocking: 0,
             busy: HashMap::new(),
+            ahead: HashMap::new(),
             graveyard: Vec::new(),
             pwait2: true,
         };
@@ -591,14 +598,13 @@ impl Epoll {
                     len,
                     addr,
                     addr_len,
-                    flags,
                 } => (
                     retry(|| {
                         libc::sendto(
                             fd,
                             buf.cast(),
                             len as usize,
-                            flags | libc::MSG_DONTWAIT,
+                            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
                             addr,
                             addr_len,
                         )
@@ -818,7 +824,8 @@ impl Epoll {
     pub(crate) fn new_multi(&mut self, _kind: MultiKind) -> usize {
         self.ops.insert(EOp::Multi {
             io: None,
-            ahead: VecDeque::new(),
+            batch: 1,
+            streak: 0,
         })
     }
 
@@ -830,36 +837,70 @@ impl Epoll {
     }
 
     pub(crate) fn poll_multi(&mut self, key: usize, waker: &Waker) -> MultiPoll {
-        let io = match self.ops.get_mut(key) {
-            Some(EOp::Multi { ahead, io }) => {
-                if let Some((bid, len)) = ahead.pop_front() {
-                    // Received earlier, in the same system call as another.
-                    let pool = self.pool.clone();
-                    return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
-                }
-                match io {
-                    Some(io) => *io,
-                    None => return MultiPoll::NeedArm,
-                }
-            }
+        let io = match self.ops.get(key) {
+            Some(EOp::Multi { io: Some(io), .. }) => *io,
+            Some(EOp::Multi { io: None, .. }) => return MultiPoll::NeedArm,
             _ => panic!("giong: polling an invalid multishot operation"),
         };
+        let (fd, hdr) = match io {
+            MultiIo::Accept { fd } | MultiIo::Recv { fd } => (fd, None),
+            MultiIo::RecvMsg { fd, hdr } => (fd, Some(hdr)),
+        };
+        if let Some(hdr) = hdr {
+            return self.poll_datagram(key, fd, hdr, waker);
+        }
         if !spend_budget() {
             waker.wake_by_ref();
             return MultiPoll::Pending;
         }
-        let fd = match io {
-            MultiIo::Accept { fd } | MultiIo::Recv { fd } | MultiIo::RecvMsg { fd, .. } => fd,
-        };
         if let Err(e) = self.register(fd) {
             self.disarm(key);
             return MultiPoll::Item(e);
         }
         let outcome = match io {
             MultiIo::Accept { fd } => self.accept(fd),
-            MultiIo::Recv { fd } => self.recv_into_pool(fd),
-            MultiIo::RecvMsg { fd, hdr } => self.recvmsg_into_pool(key, fd, hdr),
+            _ => self.recv_into_pool(fd),
         };
+        self.received(key, fd, outcome, waker)
+    }
+
+    /// [`poll_multi`](Self::poll_multi) for a datagram socket's receive:
+    /// first what an earlier `recvmmsg` brought. Out of line, so that the
+    /// path every stream takes stays as small as it was.
+    #[inline(never)]
+    fn poll_datagram(
+        &mut self,
+        key: usize,
+        fd: RawFd,
+        hdr: *const libc::msghdr,
+        waker: &Waker,
+    ) -> MultiPoll {
+        if let Some((bid, len)) = self.ahead.get_mut(&key).and_then(VecDeque::pop_front) {
+            // Received earlier, in the same system call as another.
+            let pool = self.pool.clone();
+            return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
+        }
+        if !spend_budget() {
+            waker.wake_by_ref();
+            return MultiPoll::Pending;
+        }
+        if let Err(e) = self.register(fd) {
+            self.disarm(key);
+            return MultiPoll::Item(e);
+        }
+        let outcome = self.recvmsg_into_pool(key, fd, hdr);
+        self.received(key, fd, outcome, waker)
+    }
+
+    /// What a receive on multishot operation `key` (on `fd`) came to.
+    #[inline(always)]
+    fn received(
+        &mut self,
+        key: usize,
+        fd: RawFd,
+        outcome: Option<Result<(i32, u32), i32>>,
+        waker: &Waker,
+    ) -> MultiPoll {
         match outcome {
             Some(Ok((res, flags))) => match super::buffer_id(flags) {
                 Some(bid) if res > 0 => {
@@ -929,16 +970,29 @@ impl Epoll {
         #[allow(clippy::unnecessary_cast)]
         let no_control = unsafe { (*hdr).msg_controllen as usize == 0 };
         // Several datagrams in one system call, like io_uring's multishot
-        // receive, while at least half the pool stays free for others.
+        // receive, while at least half the pool stays free for others. The
+        // number asked for doubles while each receive comes back full and
+        // drops to one when the socket runs dry, so that a socket that gets
+        // one datagram at a time does not set up a batch for each.
+        let batch = match self.ops.get(key) {
+            Some(EOp::Multi { batch, .. }) => usize::from(*batch),
+            _ => 1,
+        };
         let room = self
             .pool
             .free()
             .saturating_sub(usize::from(self.pool.count()) / 2)
-            .min(RECV_BATCH);
+            .min(batch);
         if no_control && room > 1 {
             // SAFETY: as above.
             let name_space = unsafe { (*hdr).msg_namelen as usize };
-            return self.recvmmsg_into_pool(key, fd, name_space, room);
+            let out = self.recvmmsg_into_pool(key, fd, name_space, room);
+            let got = match out {
+                Some(Ok(_)) => 1 + self.ahead.get(&key).map_or(0, VecDeque::len),
+                _ => 0,
+            };
+            self.set_batch(key, room, got);
+            return out;
         }
         let (bid, ptr, len) = self.pool.next_free()?;
         // SAFETY: `hdr` points at a `'static` template (see `MultiIo`).
@@ -988,6 +1042,9 @@ impl Epoll {
             } else {
                 retry(|| libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT | libc::MSG_TRUNC) as isize)
             };
+            if no_control {
+                self.set_batch(key, 1, usize::from(res >= 0));
+            }
             if res < 0 {
                 return Some(Err(res));
             }
@@ -1094,8 +1151,8 @@ impl Epoll {
             let total = (payload_at + res.min(len - payload_at)) as u32;
             if i == 0 {
                 first = Some((total as i32, pooled_flags(bid)));
-            } else if let Some(EOp::Multi { ahead, .. }) = self.ops.get_mut(key) {
-                ahead.push_back((bid, total));
+            } else if matches!(self.ops.get(key), Some(EOp::Multi { .. })) {
+                self.ahead.entry(key).or_default().push_back((bid, total));
             } else {
                 self.pool.release(bid);
             }
@@ -1103,10 +1160,40 @@ impl Epoll {
         first.map(Ok)
     }
 
+    /// After a receive that asked for `asked` datagrams and got `got`: the
+    /// next asks for twice as many if this one came back full, else for
+    /// what came (at least one). From one, it grows only after two
+    /// receives in a row found a datagram, so that a socket that gets one
+    /// datagram at a time (and finds nothing on every other try) never sets
+    /// up a batch.
+    fn set_batch(&mut self, key: usize, asked: usize, got: usize) {
+        if let Some(EOp::Multi { batch, streak, .. }) = self.ops.get_mut(key) {
+            if got == 0 {
+                *batch = 1;
+                *streak = 0;
+                return;
+            }
+            *streak = streak.saturating_add(1);
+            let next = if got < asked {
+                got
+            } else if asked > 1 || *streak >= 2 {
+                asked * 2
+            } else {
+                1
+            };
+            *batch = next.min(RECV_BATCH) as u8;
+        }
+    }
+
     pub(crate) fn drop_multi(&mut self, key: usize) {
-        if let Some(EOp::Multi { ahead, .. }) = self.ops.get(key) {
-            for &(bid, _) in ahead {
-                self.pool.release(bid);
+        if let Some(EOp::Multi { .. }) = self.ops.get(key) {
+            if let Some(ahead) = (!self.ahead.is_empty())
+                .then(|| self.ahead.remove(&key))
+                .flatten()
+            {
+                for (bid, _) in ahead {
+                    self.pool.release(bid);
+                }
             }
             self.ops.remove(key);
         }

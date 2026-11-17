@@ -465,7 +465,6 @@ impl UdpSocket {
                 // through the box, so it stays valid when `addr` moves.
                 addr: unsafe { (*addr.as_ptr()).as_ptr().cast() },
                 addr_len: addr.get().len(),
-                flags: libc::MSG_NOSIGNAL,
             };
             // SAFETY: the address is in a `KernelBox`; an `IoBuf`'s bytes
             // stay put when it moves.
