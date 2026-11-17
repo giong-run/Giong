@@ -656,7 +656,11 @@ impl Worker {
                 self.take_balanced_job();
             }
             self.publish_load();
-            let batch = self.queue.borrow().len();
+            let batch = if self.driver_kind == DriverKind::Epoll {
+                self.queue.borrow().len()
+            } else {
+                0
+            };
             self.run_tasks(&mut || done = poll_main());
             self.flush_sends(tick);
             self.publish_load();
@@ -670,13 +674,15 @@ impl Worker {
                 // small batches (tasks handing work to each other) it waits
                 // until IO_POLL_INTERVAL polls have run since the last look,
                 // as Tokio does. io_uring reads its completions from memory.
-                let polled = self.polled_since_io.get() + batch;
-                if polled < IO_POLL_INTERVAL && self.driver.borrow().kind() == DriverKind::Epoll {
-                    self.polled_since_io.set(polled);
-                    self.fire_timers();
-                    continue;
+                if self.driver_kind == DriverKind::Epoll {
+                    let polled = self.polled_since_io.get() + batch;
+                    if polled < IO_POLL_INTERVAL {
+                        self.polled_since_io.set(polled);
+                        self.fire_timers();
+                        continue;
+                    }
+                    self.polled_since_io.set(0);
                 }
-                self.polled_since_io.set(0);
                 // Just exchange work with the kernel.
                 let graveyard = self.driver.borrow_mut().park(Park::Poll);
                 drop(graveyard);
