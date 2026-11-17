@@ -77,7 +77,10 @@ struct Outcome {
 fn soak(days: u64, jumps: bool) -> Outcome {
     giong::block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:8080").unwrap();
+        // The low-memory refusal reads the host's free memory, which must
+        // not decide a simulated run.
         let server = Server::new()
+            .min_free_memory(0)
             .idle_timeout(Duration::from_secs(60))
             .request_timeout(REQUEST_TIMEOUT);
         giong::spawn(async move { server.serve(listener, echo).await });
@@ -150,7 +153,12 @@ fn soak(days: u64, jumps: bool) -> Outcome {
                                 );
                                 true
                             }
-                            Err(_) => false,
+                            // Benign faults never show as errors: fail at
+                            // once, so that the trace shows how it came.
+                            Err(e) => {
+                                assert!(jumps, "{path} at {:?}: {e}", start.elapsed());
+                                false
+                            }
                         }
                     })
                 })

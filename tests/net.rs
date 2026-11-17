@@ -950,8 +950,9 @@ fn bind_refuses_a_host_name_and_says_what_to_write() {
             );
         }
         // The address forms of `connect` work.
-        let (l, addr) = listener();
-        drop(l);
-        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, addr.port())).unwrap();
+        // On a port held for it: one taken from a listener closed at once
+        // can be taken by a connect of a test running at the same time.
+        let (_held, port) = common::shared_port();
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
     });
 }
