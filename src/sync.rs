@@ -47,7 +47,10 @@ pub mod mpsc {
             Sender {
                 shared: shared.clone(),
             },
-            Receiver { shared },
+            Receiver {
+                shared,
+                taken: Mutex::new(VecDeque::new()),
+            },
         )
     }
 
@@ -59,6 +62,13 @@ pub mod mpsc {
     /// The receiving half.
     pub struct Receiver<T> {
         shared: Arc<Shared<T>>,
+        /// Values already taken from the shared queue, oldest first. The
+        /// receiver empties the shared queue in one go when this runs dry,
+        /// so it takes the lock once per batch rather than once per value,
+        /// and senders on other threads rarely find the lock held. A
+        /// `Mutex` only for its auto traits: it is reached through
+        /// `&mut self` with `get_mut`, which never locks.
+        taken: Mutex<VecDeque<T>>,
     }
 
     /// Returned by [`Sender::send`] and [`BoundedSender::send`] when the receiver
@@ -151,9 +161,15 @@ pub mod mpsc {
         /// the channel is empty.
         pub async fn recv(&mut self) -> Option<T> {
             poll_fn(|cx| {
-                let mut state = self.shared.lock();
-                if let Some(value) = state.queue.pop_front() {
+                let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
+                if let Some(value) = taken.pop_front() {
                     return Poll::Ready(Some(value));
+                }
+                let mut state = self.shared.lock();
+                if !state.queue.is_empty() {
+                    std::mem::swap(&mut state.queue, taken);
+                    drop(state);
+                    return Poll::Ready(taken.pop_front());
                 }
                 if state.senders == 0 {
                     return Poll::Ready(None);
@@ -172,8 +188,13 @@ pub mod mpsc {
         /// [`TryRecvError::Closed`] once every sender is gone and the channel
         /// is empty, when [`recv`](Self::recv) would return `None`.
         pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+            let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
+            if let Some(value) = taken.pop_front() {
+                return Ok(value);
+            }
             let mut state = self.shared.lock();
-            match state.queue.pop_front() {
+            std::mem::swap(&mut state.queue, taken);
+            match taken.pop_front() {
                 Some(value) => Ok(value),
                 None if state.senders == 0 => Err(TryRecvError::Closed),
                 None => Err(TryRecvError::Empty),
