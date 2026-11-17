@@ -733,6 +733,7 @@ impl Driver {
     /// completion, which with one task per socket meant a turn of the event
     /// loop per datagram. Receives stay multishot, so an echo costs one
     /// system call, where a readiness runtime makes two.
+    #[inline(always)]
     pub(crate) fn try_send_to(
         &mut self,
         fd: RawFd,
@@ -753,6 +754,7 @@ impl Driver {
     }
 
     /// [`try_send_to`](Self::try_send_to) for a connected socket: `send(2)`.
+    #[inline(always)]
     pub(crate) fn try_send(&mut self, fd: RawFd, buf: &[u8]) -> Option<i32> {
         // SAFETY: `buf` is valid for the call; non-blocking.
         send_now(|| unsafe {
