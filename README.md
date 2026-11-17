@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>A thread-per-core async runtime for Linux, built on io_uring, with an epoll driver wherever io_uring is blocked.</b></p>
+<p align="center"><b>An async runtime for Rust services on Linux, built for code that AI agents write: a strict API meant to stay correct for years, errors that say how to fix them, and io_uring with one thread per core underneath.</b></p>
 
 <p align="center">
   <a href="https://github.com/giong-run/Giong/actions/workflows/main.yml"><img alt="CI" src="https://github.com/giong-run/Giong/actions/workflows/main.yml/badge.svg"></a>
@@ -35,6 +35,40 @@ load arrives.
 > HTTP/2 on both sides are fuzzed, `h2spec` passes, and a soak test churns connections for two
 > hours every night. It has **not** run in production. See [Limitations](#limitations).
 
+## What giong is for
+
+giong is a late entrant: Tokio has been Rust's default runtime for years, and giong does not
+try to be a smaller copy of it. It is built for the way services are written now, with more
+and more of the code coming from AI agents. So the API is designed to be used correctly on
+the first try, and to tell the one who got it wrong how to fix it, rather than to be short
+to type.
+
+- **The goal: the best async runtime for Rust, on technical merit.** A complete,
+  general-purpose runtime for any workload a service has, faster and leaner than Tokio. Every
+  claim comes from a benchmark in this repository, and where giong is not ahead the README
+  says so (see below).
+- **A whole service with no Tokio underneath.** HTTP/1.1 and HTTP/2 (server and client),
+  TLS, PostgreSQL, MySQL, Redis, DNS, routing and middleware are giong crates, written for
+  its buffer pool and its batched system calls, not adapters. [Choosing crates](#choosing-crates)
+  measures each one against the Tokio crate it replaces.
+- **Agent-first.** Every error giong raises carries a stable code, the cause and the fix,
+  and has a page of its own ([docs/errors](docs/errors/README.md)). [AGENTS.md](AGENTS.md)
+  and [giong.run/llms.txt](https://giong.run/llms.txt) tell a model how to work with it;
+  giong-web writes JSON-line logs and `tracing` spans; [`giong-mcp`](giong-mcp/README.md)
+  lets an agent look inside a running service.
+- **One major version for a long time.** After 1.0, giong grows through 1.x minor releases
+  for years rather than moving to a 2.0, so the API follows four rules:
+  1. One way to do each thing.
+  2. Misuse fails at compile time, or at run time with a coded error.
+  3. Every behaviour code relies on is documented.
+  4. Releases only add; they never change what existing code means.
+
+  The API was settled in 0.7 ([review](docs/reviews/2026-11-api-freeze.md)), and
+  `cargo-semver-checks` runs on every pull request.
+- **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
+  io_uring is blocked. macOS (for development) and Windows come after 1.0
+  ([ROADMAP.md](ROADMAP.md)).
+
 ## Why giong
 
 - **One system call per tick, not per operation.** Every read, write, accept, close and
@@ -49,8 +83,8 @@ load arrives.
   CPU per request (11% below the next runtime) and has the lowest p99. At 1,000 it is level
   with a hand-written epoll server and ahead of the rest.
 - **HTTP and HTTPS in the box.** [`giong-http`](giong-http/README.md) and
-  [`giong-tls`](giong-tls/README.md) serve HTTPS at **144.8k requests/s on one core,
-  against 81.0k for Axum** on the same rustls.
+  [`giong-tls`](giong-tls/README.md) serve HTTPS at **146.6k requests/s on one core,
+  against 81.2k for Axum** on the same rustls.
 - **Cancellation-safe by construction.** Dropping an I/O future never frees memory the
   kernel may still write to, and wrapping `recv`, `recv_from` or `accept` in a timeout
   loses neither data nor connections.
@@ -61,10 +95,13 @@ load arrives.
 - **Small enough to read.** About 12,100 lines of code for the runtime, both drivers
   included, three dependencies, and a comment on every `unsafe` block.
 
-What it is **not**: faster than everything at everything. On the classic 50-connection
-benchmark giong, a tuned Monoio and raw Tokio are within noise of each other, because the
-kernel's TCP stack, not the runtime, is most of the cost. The numbers below say where the
-design pays off and where it does not.
+What it is **not**, today: faster than everything at everything. On the classic
+50-connection benchmark giong, a tuned Monoio and raw Tokio are within noise of each other,
+because the kernel's TCP stack, not the runtime, is most of the cost. Over one PostgreSQL
+connection shared by every task, giong-postgres is 7–9% behind tokio-postgres; a blocking
+`std` read of a cached file beats every async one, giong's included; and a TLS handshake
+costs the same as Axum's once both prefer the same cipher suite. The numbers below say
+where the design pays off and where it does not.
 
 ## Results at a glance
 
@@ -1016,9 +1053,11 @@ Not verified, and you should know it:
 
 Monoio is the mature choice and runs in production at ByteDance; if you need
 Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
-priority scheduling are its strengths, not HTTP. giong's case is narrower: the receive
-path (multishot with provided buffers, cancel safe without a second API), good defaults,
-the latency dial, a strict HTTP server on top, and code small enough to audit.
+priority scheduling are its strengths, not HTTP. giong's case: the receive path
+(multishot with provided buffers, cancel safe without a second API), good defaults, the
+latency dial, its own crates for a whole service instead of a compatibility layer, an API
+held to the four rules [above](#what-giong-is-for), and code small enough to audit. It is
+younger than both and has not run in production.
 
 ## Limitations
 

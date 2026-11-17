@@ -8,7 +8,10 @@ disagree, CONTRIBUTING.md wins: report the difference.
 ## What this is
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
-driver where io_uring is blocked or the kernel is too old. One Cargo
+driver where io_uring is blocked or the kernel is too old. It aims to be the best Rust
+async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
+is built for code that agents write: strict types, coded errors with the cause and the
+fix, and an API that stays on major version 1 for many years. One Cargo
 workspace, nine crates and an example service:
 
 | Path | Crate | What it is |
@@ -173,6 +176,10 @@ is loaded.
    `fuzz/`, commands in CONTRIBUTING.md).
 8. **Performance claims need numbers**: before and after, the median of several runs with
    the spread, the machine and kernel. Never write a number you did not measure.
+9. **The API rules.** Every public addition follows four rules: one way to do each thing;
+   misuse fails at compile time, or at run time with a coded error; every behaviour code
+   relies on is documented; a release only adds, and never changes what existing code
+   means. Prefer a new item to a new meaning for an old one.
 
 ## Changes, commits and pull requests
 
