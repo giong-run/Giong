@@ -817,6 +817,17 @@ impl UdpSocket {
                 (*m).hdr.msg_controllen = at as _;
             }
         }
+        // At once where the socket has room (see `Driver::try_send_to`).
+        let fd = self.sock.as_raw_fd();
+        // SAFETY: as above; the header lives until the end of this function.
+        let hdr = unsafe { ptr::addr_of!((*m).hdr) };
+        if let Some(res) = runtime::with_worker(|w| w.driver.borrow_mut().try_sendmsg(fd, hdr)) {
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
+        }
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             // SAFETY: `msg` owns a live `Message`; the field pointer is taken
