@@ -55,7 +55,7 @@ to type.
   and has a page of its own ([docs/errors](docs/errors/README.md)). [AGENTS.md](AGENTS.md)
   and [giong.run/llms.txt](https://giong.run/llms.txt) tell a model how to work with it;
   giong-web writes JSON-line logs and `tracing` spans; [`giong-mcp`](giong-mcp/README.md)
-  lets an agent look inside a running service.
+  lets an agent look inside a running service ([below](#let-your-agent-look-inside-the-running-service)).
 - **One major version for a long time.** After 1.0, giong grows through 1.x minor releases
   for years rather than moving to a 2.0, so the API follows four rules:
   1. One way to do each thing.
@@ -68,6 +68,54 @@ to type.
 - **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
   io_uring is blocked. macOS (for development) and Windows come after 1.0
   ([ROADMAP.md](ROADMAP.md)).
+
+## Let your agent look inside the running service
+
+[`giong-mcp`](giong-mcp/README.md) is an MCP server built into your service. Connect your
+coding agent (Claude Code, or any client that speaks MCP's Streamable HTTP) and it can see
+what each worker is doing, which tasks are alive and which line of your code spawned them,
+what the database pools hold and where the time goes, instead of guessing from logs. The
+answer no other tool gives: **which task blocks a worker**, named by the line that spawned
+it.
+
+1. Add `giong-mcp` and start it next to the runtime. It starts only when `GIONG_MCP` is
+   set, and never stops the service from starting:
+
+   ```rust,no_run
+   fn main() -> std::io::Result<()> {
+       let rt = giong::Builder::new().shutdown_on_signals(true).build()?;
+       let _mcp = giong_mcp::start_from_env(&rt.handle()); // keep it: dropping it stops the server
+       rt.run(|_worker| async {
+           // ... the service ...
+           giong::shutdown_signal().await;
+       })
+   }
+   ```
+
+2. Run the service with an address and a token (16 characters or more):
+
+   ```sh
+   export GIONG_MCP=127.0.0.1:7777 GIONG_MCP_TOKEN=$(openssl rand -hex 16)
+   cargo run --release
+   ```
+
+3. Connect the agent, with the same token:
+
+   ```sh
+   claude mcp add --transport http giong http://127.0.0.1:7777/mcp \
+       --header "Authorization: Bearer $GIONG_MCP_TOKEN"
+   ```
+
+The agent then has five tools: `overview` (memory, threads, open descriptors against the
+limit, each worker's state, warnings such as a blocked worker), `workers` (each worker's
+counters, timers, I/O in flight and the task it is stuck in), `tasks` (live tasks grouped by
+the line that spawned them: a count that keeps growing is a leak), `sources` (the
+PostgreSQL, MySQL and Redis pools: open, taken, waiting, timeouts) and `profile` (times every
+poll for a window and lists where the workers spent it). Every tool only reads, apart from
+`profile` turning on poll timing for its window. The server listens on a loopback address
+or a Unix socket only, needs the token on TCP, and runs on a thread of its own, so it answers
+even when every worker is stuck. To reach a service on another machine, forward the port
+(`ssh -L`, `kubectl port-forward`).
 
 ## Why giong
 
