@@ -4,6 +4,9 @@
 #
 #   sudo bench/xdp.sh [rounds] [seconds]
 #
+# MODES picks the servers (kernel giong giong-epoll tokio xdp), TASKS the echo
+# tasks per giong or Tokio server (16 by default; 1 is a single receive loop).
+#
 # Needs root (network namespace, veth, XDP program), iproute2 and a kernel
 # with CONFIG_XDP_SOCKETS. CPU 1 runs the server, CPUs 2-3 the client.
 # Results: bench/results/xdp/<host>/.
@@ -19,8 +22,12 @@ CLIENT_CPUS=${CLIENT_CPUS:-2-3}
 CLIENT_THREADS=${CLIENT_THREADS:-2}
 mkdir -p "$OUT"
 
-(cd xdp && cargo build --release -q)
-BIN=$PWD/xdp/target/release/bench-xdp
+# BIN: a bench-xdp built elsewhere (for instance against another giong
+# revision); by default the one built here.
+if [ -z "${BIN:-}" ]; then
+    (cd xdp && cargo build --release -q)
+    BIN=$PWD/xdp/target/release/bench-xdp
+fi
 
 ip netns del xc 2>/dev/null || true
 ip link del xs 2>/dev/null || true
@@ -48,7 +55,7 @@ server_ticks() {
 
 CSV="$OUT/raw.csv"
 {
-    echo "# $(date -u +%FT%TZ) $(uname -r) $(nproc) CPUs: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs); veth, ${PAYLOAD:-64}-byte payload"
+    echo "# $(date -u +%FT%TZ) $(uname -r) $(nproc) CPUs: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs); veth, ${PAYLOAD:-64}-byte payload, ${TASKS:-16} tasks"
     echo "round,mode,echoes_per_s,machine_cpu_us_per_echo,server_process_us_per_echo,server_cpu_softirq_us_per_echo"
 } > "$CSV"
 for round in $(seq 1 "$ROUNDS"); do

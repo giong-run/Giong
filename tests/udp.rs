@@ -341,6 +341,108 @@ fn many_tasks_send_on_one_socket() {
 }
 
 #[test]
+fn many_tasks_receive_on_one_socket() {
+    // Each datagram wakes a waiting task of its own. Before 0.9 the tasks
+    // shared one wake-up slot on io_uring: only the last task to wait was
+    // woken, and the others never saw the datagrams queued for them.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        const TASKS: u32 = 8;
+        let receivers: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let b = b.clone();
+                giong::spawn(async move {
+                    let got = timeout(Duration::from_secs(5), b.recv())
+                        .await
+                        .expect("a waiting task was never woken")
+                        .unwrap();
+                    u32::from_be_bytes(got[..].try_into().unwrap())
+                })
+            })
+            .collect();
+        // Let every task start waiting.
+        sleep(Duration::from_millis(20)).await;
+        for i in 0..TASKS {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        let sent = std::time::Instant::now();
+        let mut seen = vec![false; TASKS as usize];
+        for r in receivers {
+            let i = r.await.unwrap() as usize;
+            assert!(!std::mem::replace(&mut seen[i], true), "datagram {i} twice");
+        }
+        // A task that is not woken still gets its datagram when its timeout
+        // polls it at the deadline: check that nobody waited for that.
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "tasks were woken late: {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn a_receiver_that_gave_up_does_not_take_the_next_datagram() {
+    // A task stops waiting (its receive timed out); the next datagram must
+    // wake the task that is waiting now, not the one that left.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        let b1 = b.clone();
+        giong::spawn(async move {
+            assert!(timeout(Duration::from_millis(10), b1.recv()).await.is_err());
+            // Keep this task alive, so that a wake-up meant for the other
+            // one would land here.
+            sleep(Duration::from_secs(10)).await;
+        });
+        sleep(Duration::from_millis(30)).await;
+        let b2 = b.clone();
+        let waiting = giong::spawn(async move {
+            timeout(Duration::from_secs(5), b2.recv())
+                .await
+                .expect("the waiting task was not woken")
+                .unwrap()
+                .to_vec()
+        });
+        sleep(Duration::from_millis(10)).await;
+        let sent = std::time::Instant::now();
+        a.send_to(&b"next"[..], b_addr).await.0.unwrap();
+        assert_eq!(waiting.await.unwrap(), b"next");
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the task was woken late: {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn a_task_that_only_sends_lets_the_others_run() {
+    // Sends of datagrams complete at once, so a task that does nothing else
+    // never waits; the runtime must still make it give way now and then.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (_b, b_addr) = socket();
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let r = ran.clone();
+        giong::spawn(async move { r.set(true) });
+        let mut first_seen = None;
+        for i in 0..5_000u32 {
+            a.send_to(&b"x"[..], b_addr).await.0.unwrap();
+            if ran.get() {
+                first_seen = Some(i);
+                break;
+            }
+        }
+        let i = first_seen.expect("the other task never ran during 5000 sends");
+        assert!(i < 1_000, "the other task first ran after {i} sends");
+    });
+}
+
+#[test]
 fn every_worker_can_bind_the_same_port() {
     // No other test binds to 127.0.0.2, and the port is one the kernel never
     // hands out for port 0: a socket of a test running at the same time,

@@ -130,7 +130,13 @@ struct Multi {
     ring: RingId,
     /// Completions not yet consumed.
     queue: VecDeque<Queued>,
-    waker: Option<Waker>,
+    /// The tasks waiting for a completion, oldest first: at most one unless
+    /// `shared`, where each is woken for a completion of its own.
+    waiters: VecDeque<Waker>,
+    /// Several tasks may wait at once (a datagram socket). Otherwise the
+    /// latest poll's waker replaces the one before, as one reader is
+    /// expected and a stale waker must not take the reader's wake-up.
+    shared: bool,
     /// An SQE is in flight and may still produce completions.
     armed: bool,
     /// We asked the kernel to stop (backpressure); the terminal CQE is pending.
@@ -178,6 +184,9 @@ pub(crate) struct Uring {
     /// The smallest send that goes out without a copy, with
     /// [`IoUringFeature::ZeroCopySend`].
     zero_copy_min: Option<usize>,
+    /// The kernel takes a destination address with `IORING_OP_SEND`
+    /// (Linux 6.1), so datagrams to an address need no message header.
+    send_to: bool,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -544,6 +553,18 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
         Io::SendMsg { fd, msg, flags, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),
+        Io::SendTo {
+            fd,
+            buf,
+            len,
+            addr,
+            addr_len,
+            flags,
+        } => opcode::Send::new(types::Fd(fd), buf, len)
+            .dest_addr(addr)
+            .dest_addr_len(addr_len)
+            .flags(flags)
+            .build(),
         Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
         Io::ReadReady { fd, buf, len } => opcode::Read::new(types::Fd(fd), buf, len).build(),
         Io::Read {
@@ -894,11 +915,15 @@ impl Uring {
             features.push(IoUringFeature::ZeroCopySend);
         }
         let recv_limit = recv_backlog_limit(&pool);
+        // Linux 6.0 refuses a destination address on `IORING_OP_SEND` with
+        // `EINVAL`, which cannot be told from a bad address: go by version.
+        let send_to = kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 1));
         Ok(Self {
             workarounds,
             features,
             registered_ring,
             zero_copy_min,
+            send_to,
             ring,
             ops: Slab::new(),
             inflight: 0,
@@ -997,7 +1022,8 @@ impl Uring {
             kind,
             ring: RingId::Whole,
             queue: VecDeque::new(),
-            waker: None,
+            waiters: VecDeque::new(),
+            shared: false,
             armed: false,
             pausing: false,
             orphan: false,
@@ -1027,6 +1053,7 @@ impl Uring {
 
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
         let stream_ring = self.stream_ring();
+        let shared = matches!(io, MultiIo::RecvMsg { .. });
         let (sqe, ring) = match io {
             MultiIo::Accept { fd } => (
                 opcode::AcceptMulti::new(types::Fd(fd))
@@ -1047,6 +1074,7 @@ impl Uring {
             Some(OpState::Multi(m)) if !m.armed => {
                 m.armed = true;
                 m.ring = ring;
+                m.shared = shared;
             }
             _ => panic!("giong: arming an invalid multishot operation"),
         }
@@ -1057,24 +1085,65 @@ impl Uring {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
             panic!("giong: polling an invalid multishot operation");
         };
-        match m.queue.pop_front() {
-            Some(Queued::Raw(res)) => return MultiPoll::Item(res),
+        let got = match m.queue.pop_front() {
+            Some(Queued::Raw(res)) => Some(MultiPoll::Item(res)),
             Some(Queued::Piece { bid, off, len, .. }) => {
                 self.pooled_queued -= 1;
                 let pool = self.pool.clone();
-                return MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len));
+                Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len)))
             }
-            Some(Queued::Heap(data)) => return MultiPoll::Data(RecvBuf::heap(data)),
-            None => {}
+            Some(Queued::Heap(data)) => Some(MultiPoll::Data(RecvBuf::heap(data))),
+            None => None,
+        };
+        if let Some(got) = got {
+            // This task is served; it is no longer waiting. If more is
+            // queued, the next waiting task takes it.
+            if let Some(i) = m.waiters.iter().position(|w| w.will_wake(waker)) {
+                m.waiters.remove(i);
+            }
+            if !m.queue.is_empty() {
+                if let Some(next) = m.waiters.pop_front() {
+                    next.wake();
+                }
+            }
+            return got;
         }
         if !m.armed {
             return MultiPoll::NeedArm;
         }
-        match &mut m.waker {
-            Some(w) if w.will_wake(waker) => {}
-            slot => *slot = Some(waker.clone()),
+        if !m.shared {
+            match m.waiters.front() {
+                Some(w) if w.will_wake(waker) => {}
+                _ => {
+                    m.waiters.clear();
+                    m.waiters.push_back(waker.clone());
+                }
+            }
+        } else if !m.waiters.iter().any(|w| w.will_wake(waker)) {
+            m.waiters.push_back(waker.clone());
         }
         MultiPoll::Pending
+    }
+
+    /// See [`Driver::leave_multi`](super::Driver::leave_multi).
+    pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            return;
+        };
+        match m.waiters.iter().position(|w| w.will_wake(waker)) {
+            // Still waiting: it was not woken, so it owes nothing.
+            Some(i) => {
+                m.waiters.remove(i);
+            }
+            // Woken, for a completion it will not take now: pass it on.
+            None => {
+                if !m.queue.is_empty() {
+                    if let Some(next) = m.waiters.pop_front() {
+                        next.wake();
+                    }
+                }
+            }
+        }
     }
 
     /// Called when the owner of a multishot operation (listener, stream) goes away.
@@ -1085,7 +1154,7 @@ impl Uring {
         let kind = m.kind;
         let armed = m.armed;
         let queued = mem::take(&mut m.queue);
-        m.waker = None;
+        m.waiters.clear();
         m.orphan = true;
         for item in queued {
             if let Queued::Piece { .. } = item {
@@ -1219,6 +1288,11 @@ impl Uring {
                 "giong: unable to make progress submitting to io_uring"
             );
         }
+    }
+
+    /// See [`Driver::sends_to`](super::Driver::sends_to).
+    pub(crate) fn sends_to(&self) -> bool {
+        self.send_to
     }
 
     pub(crate) fn pool(&self) -> &Rc<BufPool> {
@@ -1476,7 +1550,8 @@ impl Uring {
                                     self.to_pause.push(key);
                                 }
                             }
-                            if let Some(waker) = m.waker.take() {
+                            // One waiting task per completion.
+                            if let Some(waker) = m.waiters.pop_front() {
                                 waker.wake();
                             }
                             false

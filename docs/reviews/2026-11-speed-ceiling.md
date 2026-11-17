@@ -54,6 +54,9 @@ namespace over veth, 4-vCPU cloud VM, 5 rounds (`bench/results/xdp/vm/`):
 - **Found on the way:** giong's per-datagram UDP path is slower than Tokio's here
   (213,357 vs 278,849 echoes/s; 252,008 on giong's epoll driver in a single run). That is
   a fixable gap in the current runtime, independent of AF_XDP.
+  **Fixed since** (branch `perf/udp-path`, `bench/results/udp-echo/`): 330,254 echoes/s on
+  io_uring with 16 tasks and 350,457 with one, 302,000 on epoll, against Tokio's 286,618
+  and 276,996.
 
 ### 2.2 Latency when the CPU is contended (prototype on `feat/sched-contract`)
 

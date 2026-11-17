@@ -39,6 +39,10 @@ fn main() {
             match args[2].as_str() {
                 "kernel" => kernel_server(),
                 "giong" => giong_server(),
+                "giong-epoll" => {
+                    std::env::set_var("GIONG_DRIVER", "epoll");
+                    giong_server()
+                }
                 "tokio" => tokio_server(),
                 "xdp" => xdp::server(&args[3]),
                 m => panic!("unknown mode {m}"),
@@ -230,6 +234,11 @@ fn kernel_server() {
     }
 }
 
+/// Echo tasks per server (`TASKS`, 16 by default), all on one socket.
+fn tasks() -> usize {
+    std::env::var("TASKS").ok().and_then(|t| t.parse().ok()).unwrap_or(16)
+}
+
 fn giong_server() {
     giong::Builder::new()
         .workers(1)
@@ -238,7 +247,7 @@ fn giong_server() {
         .unwrap()
         .run(|_| async {
             let s = std::rc::Rc::new(giong::net::UdpSocket::bind(("0.0.0.0", PORT)).unwrap());
-            for _ in 0..15 {
+            for _ in 1..tasks() {
                 let s = s.clone();
                 giong::spawn(async move { giong_echo(&s).await });
             }
@@ -248,13 +257,17 @@ fn giong_server() {
 }
 
 async fn giong_echo(s: &giong::net::UdpSocket) {
+    // One buffer per task, handed to each send and back, as Tokio's tasks
+    // keep theirs.
+    let mut v = Vec::with_capacity(2048);
     loop {
         let Ok((d, from)) = s.recv_from().await else {
             continue;
         };
-        let v = d.as_slice().to_vec();
+        v.clear();
+        v.extend_from_slice(&d);
         drop(d);
-        let _ = s.send_to(v, from).await;
+        v = s.send_to(v, from).await.1;
     }
 }
 
@@ -269,10 +282,10 @@ fn tokio_server() {
                 .await
                 .unwrap(),
         );
-        let mut tasks = Vec::new();
-        for _ in 0..16 {
+        let mut handles = Vec::new();
+        for _ in 0..tasks() {
             let s = s.clone();
-            tasks.push(tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
                 loop {
                     let Ok((n, from)) = s.recv_from(&mut buf).await else {
@@ -282,7 +295,7 @@ fn tokio_server() {
                 }
             }));
         }
-        for t in tasks {
+        for t in handles {
             let _ = t.await;
         }
     });

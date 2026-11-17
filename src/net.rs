@@ -36,7 +36,7 @@ use std::mem::ManuallyDrop;
 use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -105,6 +105,54 @@ impl MultiSlot {
                 }
             }
         }
+    }
+}
+
+/// A task's place among those waiting on one [`MultiSlot`], for a future
+/// that polls it. Several tasks may wait on the same datagram socket; each
+/// completion wakes one of them. A future
+/// dropped while it waits gives its place up, and if it was woken for a
+/// completion it did not take, the next waiting task is woken for it, so
+/// that no completion is left with nobody woken for it.
+pub(crate) struct Waiting<'a> {
+    slot: &'a MultiSlot,
+    waker: Option<Waker>,
+}
+
+impl<'a> Waiting<'a> {
+    pub(crate) fn new(slot: &'a MultiSlot) -> Self {
+        Self { slot, waker: None }
+    }
+
+    /// Records the outcome of one poll of the slot.
+    pub(crate) fn polled<T>(&mut self, poll: &Poll<T>, cx: &Context<'_>) {
+        match poll {
+            Poll::Pending => match &self.waker {
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => self.waker = Some(cx.waker().clone()),
+            },
+            // Served: the driver took the waker off the list.
+            Poll::Ready(_) => self.waker = None,
+        }
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let Some(waker) = self.waker.take() else {
+            return;
+        };
+        runtime::try_with_worker(|w| {
+            if let Some((key, uid)) = self.slot.key.get() {
+                if uid == w.shared.uid {
+                    // Borrowed only while the driver itself drops futures,
+                    // which it does not do for these.
+                    if let Ok(mut driver) = w.driver.try_borrow_mut() {
+                        driver.leave_multi(key, &waker);
+                    }
+                }
+            }
+        });
     }
 }
 

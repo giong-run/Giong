@@ -172,8 +172,14 @@ impl std::fmt::Debug for Datagram {
 /// A UDP socket.
 ///
 /// All methods take `&self`, so a socket can be shared (e.g. in an `Rc`)
-/// between tasks; any number of them may send at the same time, one at a time
-/// may receive.
+/// between tasks; any number of them may send and receive at the same time.
+/// Each datagram goes to one of the tasks waiting in
+/// [`recv_from`](Self::recv_from), woken for it alone.
+///
+/// A send goes out within the call when the socket has room, as it nearly
+/// always does: datagrams wait for no peer. Receives stay queued in the
+/// kernel's ring on io_uring, so a datagram echoed back costs one system
+/// call.
 pub struct UdpSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
@@ -288,7 +294,13 @@ impl UdpSocket {
     /// in the meantime is returned by the next call. As always with UDP, the
     /// kernel drops datagrams when the socket is not read fast enough.
     pub async fn recv_from(&self) -> io::Result<(Datagram, SocketAddr)> {
-        poll_fn(|cx| self.poll_recv_from(cx)).await
+        let mut waiting = super::Waiting::new(&self.recv);
+        poll_fn(|cx| {
+            let poll = self.poll_recv_from(cx);
+            waiting.polled(&poll, cx);
+            poll
+        })
+        .await
     }
 
     /// Like [`recv_from`](Self::recv_from), without the sender's address.
@@ -404,18 +416,53 @@ impl UdpSocket {
     /// sent. The buffer is handed back so it can be reused.
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
         let addr = SockAddr::from(addr);
-        let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&addr));
-        let io = Io::SendMsg {
-            fd: self.sock.as_raw_fd(),
-            // SAFETY: `msg` owns a live `Message`; the field pointer is taken
-            // without making a reference.
-            msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
-            flags: libc::MSG_NOSIGNAL as u32,
-            zero_copy: false,
+        let fd = self.sock.as_raw_fd();
+        // At once where the socket has room (see `Driver::try_send_to`).
+        let (sent, sends_to) = runtime::with_worker(|w| {
+            let mut driver = w.driver.borrow_mut();
+            // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+            (driver.try_send_to(fd, bytes, &addr), driver.sends_to())
+        });
+        if let Some(res) = sent {
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
+        }
+        let (res, buf) = if sends_to {
+            let addr = KernelBox::new(addr);
+            let io = Io::SendTo {
+                fd,
+                buf: buf.as_ptr(),
+                len: buf.len().min(u32::MAX as usize) as u32,
+                // SAFETY: `addr` owns a live `SockAddr`; the pointer is taken
+                // through the box, so it stays valid when `addr` moves.
+                addr: unsafe { (*addr.as_ptr()).as_ptr().cast() },
+                addr_len: addr.get().len(),
+                flags: libc::MSG_NOSIGNAL,
+            };
+            // SAFETY: the address is in a `KernelBox`; an `IoBuf`'s bytes
+            // stay put when it moves.
+            let (res, _, (_addr, buf)) = unsafe { Op::new(io, (addr, buf)) }.await;
+            (res, buf)
+        } else {
+            let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&addr));
+            let io = Io::SendMsg {
+                fd,
+                // SAFETY: `msg` owns a live `Message`; the field pointer is
+                // taken without making a reference.
+                msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
+                flags: libc::MSG_NOSIGNAL as u32,
+                zero_copy: false,
+            };
+            // SAFETY: the header is in a `KernelBox` and points at its own
+            // fields and at `buf`'s bytes; an `IoBuf`'s bytes stay put when
+            // it moves.
+            let (res, _, (_msg, buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
+            (res, buf)
         };
-        // SAFETY: the header is in a `KernelBox` and points at its own fields
-        // and at `buf`'s bytes; an `IoBuf`'s bytes stay put when it moves.
-        let (res, _, (_msg, buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -426,6 +473,19 @@ impl UdpSocket {
     /// Sends `buf` as one datagram to the peer set with
     /// [`connect`](Self::connect).
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
+        let fd = self.sock.as_raw_fd();
+        let sent = runtime::with_worker(|w| {
+            // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+            w.driver.borrow_mut().try_send(fd, bytes)
+        });
+        if let Some(res) = sent {
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
+        }
         let len = buf.len().min(u32::MAX as usize) as u32;
         let io = Io::Send {
             fd: self.sock.as_raw_fd(),
