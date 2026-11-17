@@ -126,15 +126,25 @@ The nine crates are released together and carry the same version. A crate that d
 another depends on the same minor or newer. New crates (`giong-quic`, `giong-grpc` and the
 others on the roadmap) join at the current version when they are first published.
 
-## Changes made in 1.0.0-rc.1
+## Changes made before 1.0
 
 Breaking changes are refused between releases (`scripts/semver.sh`), so the few the API
-review left for 1.0 are made by the release pull request of 1.0.0-rc.1
-([RELEASING.md](RELEASING.md)). This list is its checklist:
+review left for 1.0 are made together by one release pull request, the first after the
+0.9 soak (0.9.0 or 1.0.0-rc.1, see [RELEASING.md](RELEASING.md)). Nothing uses giong in
+production yet, so no deprecated alias is kept: old names go outright. This list is that
+pull request's checklist:
 
 - every item deprecated during 0.9 is removed, each listed under *Removed* with the name
-  that replaces it;
-- `giong::sync::mpsc::Sender` and `Receiver` go to the bounded channel (the API freeze
-  record, [reviews/2026-11-api-freeze.md](reviews/2026-11-api-freeze.md));
+  that replaces it: `Error::code` in giong-postgres and giong-mysql (`server_code`),
+  `Config::dbname` in giong-postgres (`database`), `giong::sync::mpsc::channel`
+  (`unbounded`), `TlsAcceptor::new` and `TlsConnector::new` (`from_rustls`, or the stable
+  constructors), `TlsConnector::with_roots` (`with_root_pem`);
+- `giong::sync::mpsc::Sender` and `Receiver` go to the bounded channel, and
+  `BoundedSender` and `BoundedReceiver` are removed (the API freeze record,
+  [reviews/2026-11-api-freeze.md](reviews/2026-11-api-freeze.md)); the unbounded halves
+  stay `UnboundedSender` and `UnboundedReceiver`;
+- the tests of the old names go with them, and the README's test counts drop to match;
+- the texts that describe keeping aliases (the freeze record, RELEASING.md, the
+  *Deprecated* section of CHANGELOG.md) say what was done instead;
 - `giong_mcp::FromEnv` becomes `#[non_exhaustive]`, like every other enum that is not
   complete by nature.
