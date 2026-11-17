@@ -275,9 +275,9 @@ For each job a service has, try these in order and take the first that fits:
 | Routing, JSON, middleware | [`giong-web`](giong-web/README.md) | axum, tower-http | 1.3 times axum on `/json` and 1.8 times on 8 KB answers; with request ids, gzip and a timeout, 1.9 and 2.3 times ([Routing](#routing-json-and-middleware)) |
 | An HTTP client | `giong-http`, feature `client` | reqwest, hyper's client | 1.6 to 1.8 times reqwest over HTTP/1.1; over HTTP/2 2.0 to 2.2 times on small answers, 1.2 to 1.3 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
 | TLS | [`giong-tls`](giong-tls/README.md) | tokio-rustls | The same rustls underneath, so handshakes are level. Measured with `giong-http`: 1.8 times axum + rustls on `/json`, 2.5 times on 8 KB answers ([HTTPS](#https)) |
-| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 2.6 times tokio-postgres + deadpool at its best on one row by key ([PostgreSQL](#postgresql)) |
-| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 4.7 times SQLx at its best on one row by key, 3.4 times on 100 rows ([MySQL](#mysql)) |
-| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.3 to 1.9 times redis-rs, at half its CPU per command or less ([Redis](#redis)) |
+| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 3.3 times tokio-postgres + deadpool at its best on one row by key, 2.5 times on 100 rows; 7–9% behind tokio-postgres on one shared connection ([PostgreSQL](#postgresql)) |
+| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 5.1 times SQLx at its best on one row by key, 3.7 times on 100 rows ([MySQL](#mysql)) |
+| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.1 to 1.8 times redis-rs on small commands, 1.25 to 2.5 times on 8 KiB values, at half its CPU per command or less ([Redis](#redis)) |
 | Files | `giong::fs` | `tokio::fs` | 5.5 to 8 times Tokio on reads at an offset, 1.5 to 2.5 times on whole small files ([File I/O](#file-io)) |
 | Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | Not measured |
 | Timers, channels | `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::time`, `tokio::sync::mpsc` | Not measured on their own |
@@ -764,14 +764,14 @@ per second:
 
 | Client, connections | One row by key | p99 | 100 rows | p99 |
 |---|---|---|---|---|
-| **giong-postgres, 3** | **240.7k** | **0.52 ms** | **54.8k** | **2.0 ms** |
+| **giong-postgres, 3** | **311.4k** | **0.43 ms** | **71.3k** | **2.0 ms** |
 | tokio-postgres + deadpool, 4 | 53.1k | 1.9 ms | 21.7k | 4.4 ms |
 | tokio-postgres + deadpool, 64 (its best) | 93.8k | 1.5 ms | 28.6k | 4.1 ms |
 
 Statements from every task share the pool's connections and are pipelined, so one client
-core does 2.6 times the work of deadpool at its best. Over one shared connection both
-libraries pipeline and the server's single backend is the limit; there the two are within
-the spread of the rounds, giong-postgres 8–11% lower at the median. The crate's README has the full table, including what happens with more
+core does 3.3 and 2.5 times the work of deadpool at its best. Over one shared connection
+both libraries pipeline and the server's single backend is the limit; there giong-postgres
+is 7–9% behind tokio-postgres at the median (47.7k against 51.4k by key). The crate's README has the full table, including what happens with more
 connections than the server has cores.
 
 ### MySQL
@@ -782,12 +782,12 @@ other three, 64 tasks issuing statements back to back. Medians, statements per s
 
 | Client, connections | One row by key | p99 | 100 rows | p99 |
 |---|---|---|---|---|
-| **giong-mysql, 3** | **138.7k** | **0.91 ms** | **35.1k** | **3.2 ms** |
+| **giong-mysql, 3** | **150.7k** | **0.81 ms** | **38.9k** | **3.4 ms** |
 | SQLx, 64 (its best) | 29.3k | 3.9 ms | 10.4k | 9.1 ms |
 | mysql_async, 4 (its best) | 19.0k | 5.5 ms | 8.9k | 10.6 ms |
 
 Statements from every task share the pool's connections and are pipelined, so one client
-core does 4.7 and 3.4 times the work of SQLx at its best, and the server becomes the limit.
+core does 5.1 and 3.7 times the work of SQLx at its best, and the server becomes the limit.
 One connection shared by every task does about what SQLx does with 64. The crate's README
 has the full table, including mysql_async's default pool settings and more connections
 than the server has cores.
@@ -801,15 +801,15 @@ per second, and the client core's time per command:
 
 | Client, connections | `GET` 64 B | µs/op | `SET` 64 B | µs/op | `MGET` of 10 | µs/op |
 |---|---|---|---|---|---|---|
-| **giong-redis, 1** | **618k** | **0.78** | **557k** | **0.77** | **219k** | **2.29** |
-| redis-rs, 1 | 448k | 1.76 | 442k | 1.67 | 140k | 4.84 |
-| fred, 1 | 314k | 2.42 | 287k | 2.58 | 110k | 6.91 |
-| **giong-redis, 4** | **881k** | **0.98** | **779k** | **0.99** | **313k** | **2.30** |
-| redis-rs, 4 | 475k | 2.04 | 491k | 1.97 | 198k | 4.96 |
+| **giong-redis, 1** | **640k** | **0.80** | **565k** | **0.83** | **268k** | **1.75** |
+| redis-rs, 1 | 492k | 1.59 | 493k | 1.52 | 166k | 4.16 |
+| fred, 1 | 351k | 2.22 | 316k | 2.37 | 117k | 6.17 |
+| **giong-redis, 4** | **848k** | **1.06** | **842k** | **1.03** | **375k** | **2.03** |
+| redis-rs, 4 | 483k | 2.01 | 516k | 1.88 | 209k | 4.68 |
 
-1.3 to 1.9 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
-where about half of every client's core is time in the kernel, giong-redis does twice
-redis-rs on one connection and the same on four. The crate's README has the full tables
+1.1 to 1.8 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
+where about half of every client's core is time in the kernel, giong-redis does 2.5 times
+redis-rs on one connection and 1.25 times on four. The crate's README has the full tables
 and how many connections to use.
 
 ### Routing, JSON and middleware

@@ -848,7 +848,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
             break e;
         }
         let received = {
-            let mut recv = pin!(conn.stream.recv());
+            let mut recv = pin!(conn.stream.read_into(&mut buf));
             poll_fn(|cx| {
                 if let Poll::Ready(r) = recv.as_mut().poll(cx) {
                     return Poll::Ready(r);
@@ -859,7 +859,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
             .await
         };
         match received {
-            Ok(chunk) if chunk.is_empty() => {
+            Ok(0) => {
                 let closing = conn.state.borrow().closing;
                 break Error::closed(if closing {
                     "the connection was closed".to_owned()
@@ -870,7 +870,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
                     )
                 });
             }
-            Ok(chunk) => buf.extend(&chunk),
+            Ok(_) => {}
             Err(e) => {
                 break Error::io(
                     ErrorKind::Closed,

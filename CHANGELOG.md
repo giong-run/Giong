@@ -54,6 +54,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-postgres**, **giong-mysql**, **giong-redis**: on plain TCP and Unix sockets a
+  connection has the kernel write what the server sends straight into its read buffer (a
+  one-off receive of up to 64 KiB) instead of copying it there from the runtime's pooled
+  buffers, so each byte is copied once on the way in instead of twice. Measured with
+  `bench/redis.sh`, `bench/postgres.sh` and `bench/mysql.sh` (medians of 5 rounds,
+  `bench/results/`): giong-redis `GET` of 8 KiB values with four connections went from
+  level with redis-rs (259k against 269k per second) to 345k against 276k, and with one
+  connection from about 240k to 375k (redis-rs 151k); giong-postgres's pool of 4 from 243.9k to
+  303.8k point lookups and 53.9k to 72.9k 100-row reads; giong-mysql's from 138.1k to 152.1k
+  and 34.3k to 38.3k; with pools of 3 (the size the READMEs advise for a 3-core server), 240.7k to
+  311.4k and 138.7k to 150.7k point lookups. Small Redis commands are unchanged. Each connection's read buffer now
+  keeps 64 KiB of room (it was 8 or 16 KiB, with the received bytes in the runtime's shared
+  pool). TLS connections read as before. giong-postgres with one connection shared by every
+  task stays 7–9% behind tokio-postgres (47.7k against 51.4k point lookups): the server is
+  the limit there and spends half its time sending one reply per statement; the
+  giong-postgres README says why it does not merge statements under one `Sync`.
 - **giong-http**: the client's `RequestBuilder::header` takes `impl AsRef<str>` for the value,
   as the server's `Response::header` does, so `.header("X-Id", id.to_string())` needs no `&`.
   A call that passed a `&str` or `&String` compiles as before; one that relied on the
