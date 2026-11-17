@@ -116,7 +116,8 @@ The release test binaries are built once per run (the `build` job, with
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
 CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the last
-release, so no breaking change lands between releases), `instr` (`scripts/instr.py`:
+release, so no breaking change lands between releases; what the 1.x promise covers, and the
+rules for growing the API without breaking it, are in `docs/STABILITY.md`), `instr` (`scripts/instr.py`:
 instructions per operation on the hot paths, counted by callgrind, and heap per idle
 connection, within 1% and 2% of `bench/instr/baseline.csv`; a change meant to move them
 commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
