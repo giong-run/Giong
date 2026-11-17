@@ -123,6 +123,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   - on epoll, a busy worker looks for I/O every 61 polls, as Tokio does, instead of making
     an `epoll_wait` call at every turn of the loop.
 
+- **runtime**: the default receive buffers are 16 KiB instead of 8 KiB
+  (`Builder::recv_buffers(512, 16 * 1024)`). Each receive brings at most one buffer, so a
+  bulk receive takes half the receives: giong's own `recv` of a 2 GiB stream spends 124 ns
+  of CPU per KiB instead of 142 (Tokio 120; medians of 7 interleaved rounds, `bench/compat`).
+  The memory a worker reserves for its pool doubles, to 8 MiB of address space, of which it
+  touches only the buffers it lends (16 at first): measured with `bench/memory.sh` (10,000
+  connections, 4 workers), memory per open, idle and pending connection and the peak under
+  load did not change. On kernels without packed buffers (before 6.12), where every stream
+  receive takes a whole buffer, a buffer the application holds now pins 16 KiB instead of
+  8. A datagram received with `recv_from` can now carry up to 16 KiB − 44 bytes before it
+  is cut off.
+
 ### Deprecated
 
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and

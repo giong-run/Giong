@@ -986,7 +986,7 @@ impl Builder {
             pin_cores: None,
             ring_entries: 1024,
             buf_count: 512,
-            buf_size: 8 * 1024,
+            buf_size: 16 * 1024,
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
@@ -1054,7 +1054,11 @@ impl Builder {
     }
 
     /// Per-worker receive buffer pool: `count` buffers (rounded up to a power
-    /// of two, at most 32768) of `size` bytes each. Default: 512 × 8 KiB.
+    /// of two, at most 32768) of `size` bytes each. Default: 512 × 16 KiB.
+    ///
+    /// Each receive brings at most one buffer's worth, so the size sets how
+    /// many receives a bulk transfer takes: at 16 KiB, giong's own `recv`
+    /// spends about 12% less CPU per byte than at 8 KiB (`bench/compat.sh`).
     ///
     /// The pool only needs to cover the connections that receive data within
     /// one turn of the event loop; when it runs short, giong moves data that

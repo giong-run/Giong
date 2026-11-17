@@ -239,7 +239,7 @@ Five things to remember:
    a pipe) are not: one that is dropped mid-flight can still take data that arrives before
    the kernel has processed the cancellation.
 3. A datagram received with `recv_from()` lives in a pool buffer, so its longest payload is
-   the buffer size minus 44 bytes (8 KiB − 44 by default). Longer ones are cut off and
+   the buffer size minus 44 bytes (16 KiB − 44 by default). Longer ones are cut off and
    `is_truncated()` says so; raise `.recv_buffers(count, size)` or use `read_from()` with a
    buffer of your own. Do not mix the two kinds on one socket.
 4. A `File` has no cursor: every read and write names its offset. Opened with
@@ -547,7 +547,7 @@ others are from 0.4's run on the same kind of VM.
   1 MiB (it rose by 40 MiB when every worker lent all 512 buffers at once).
 - **Small reads share a buffer.** On Linux 6.12 and newer the kernel fills a receive
   buffer piece by piece (`IOU_PBUF_RING_INC`), so a hundred connections that each send a
-  short request use one or two 8 KiB buffers rather than a hundred. Before, each receive
+  short request use one or two buffers rather than a hundred. Before, each receive
   took a whole buffer, and under load a worker cycled through all it had lent: with 20
   workers and 5,000 busy connections giong-http peaked 50 MiB above idle, now 23 MiB
   (epoll 15 MiB, raw Tokio 64 MiB, Axum 124 MiB, Go 184 MiB; `WORKERS=20

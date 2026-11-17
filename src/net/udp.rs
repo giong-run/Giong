@@ -298,7 +298,7 @@ impl UdpSocket {
     ///
     /// The datagram borrows a buffer from the worker's pool, so the longest
     /// payload that fits is the pool's buffer size
-    /// ([`Builder::recv_buffers`](crate::Builder::recv_buffers), 8 KiB by
+    /// ([`Builder::recv_buffers`](crate::Builder::recv_buffers), 16 KiB by
     /// default) minus 44 bytes. Longer datagrams are cut off and marked
     /// [`is_truncated`](Datagram::is_truncated); use
     /// [`read_from`](Self::read_from) with a buffer of your own for those.
