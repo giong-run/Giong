@@ -376,14 +376,14 @@ pub(crate) enum Io {
     /// `sendto(2)`: one datagram to `addr` from a socket that need not be
     /// connected. The io_uring driver submits it only where
     /// [`Driver::sends_to`] says the kernel takes it (`IORING_OP_SEND` with
-    /// a destination address, Linux 6.1).
+    /// a destination address, Linux 6.1). Sent with `MSG_NOSIGNAL`; no
+    /// other flags, so that every operation stays as small as before.
     SendTo {
         fd: RawFd,
         buf: *const u8,
         len: u32,
         addr: *const libc::sockaddr,
         addr_len: libc::socklen_t,
-        flags: i32,
     },
     /// A one-off `recvmsg(2)`.
     RecvMsg { fd: RawFd, msg: *mut libc::msghdr },
@@ -458,7 +458,7 @@ impl Io {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
             Io::Send { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
             Io::SendMsg { flags, .. } => flags & libc::MSG_DONTWAIT as u32 == 0,
-            Io::SendTo { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
+            Io::SendTo { .. } => true,
             _ => false,
         }
     }
