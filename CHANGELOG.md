@@ -32,6 +32,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
   what `TlsStream::peer_certificates` returns) is re-exported.
+- **giong-tls**: the server side without rustls' types. `Certificates` holds one or
+  several certificate chains: `TlsAcceptor::with_certificates` presents the one valid for
+  the name the client asks for (SNI), and `Certificates::replace_pem` swaps the set while
+  the server runs, for renewed certificates. `TlsAcceptor::require_client_cert` and
+  `request_client_cert` turn on mutual TLS. The `post-quantum` feature uses aws-lc-rs and
+  offers the X25519MLKEM768 key exchange first. New error code `GIONG-E2013`
+  (`Code::TlsConfig`) in giong.
 
 - **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
   (`Code::HttpServerLowMemory`) in giong.
