@@ -473,10 +473,12 @@ impl<F: Future> Runnable for LocalTask<F> {
     }
 
     fn cancel(&self) {
-        // Taken out of the cell first, so that a destructor which reaches
-        // this task again (through its handle) finds it already gone.
-        let fut = self.fut.borrow_mut().take();
-        drop(fut);
+        // Dropped in place, never moved out (see `run`): an `async` block
+        // that holds a borrow of its own locals across an `.await` would
+        // otherwise run its destructors against the copy it was moved from.
+        // The handle reaches only `join`, so no destructor of the future can
+        // come back to this cell while it is borrowed here.
+        *self.fut.borrow_mut() = None;
         self.join.complete(Err(JoinError::Cancelled));
     }
 }

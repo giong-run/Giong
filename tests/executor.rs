@@ -164,6 +164,46 @@ fn detached_tasks_are_dropped_when_the_runtime_ends() {
     assert!(dropped.get());
 }
 
+/// An `async` block that borrows its own local across an `.await` is pinned
+/// in its task: a cancelled task drops it where it was polled, so the borrow
+/// still points at the local when the destructors run.
+#[test]
+fn a_cancelled_task_drops_its_future_where_it_was_pinned() {
+    struct Local(Rc<Cell<usize>>);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            self.0.set(self as *const Local as usize);
+        }
+    }
+    struct Borrow<'a>(&'a Local, Rc<Cell<usize>>);
+    impl Drop for Borrow<'_> {
+        fn drop(&mut self) {
+            self.1.set(self.0 as *const Local as usize);
+        }
+    }
+    async fn task(local_at: Rc<Cell<usize>>, borrowed: Rc<Cell<usize>>) {
+        let local = Local(local_at);
+        let _borrow = Borrow(&local, borrowed);
+        sleep(Duration::from_secs(3600)).await;
+    }
+
+    // Cancelled by `abort`, and by the end of the runtime.
+    for abort in [true, false] {
+        let (local_at, borrowed) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let (l, b) = (local_at.clone(), borrowed.clone());
+        giong::block_on(async move {
+            let handle = giong::spawn(task(l, b));
+            giong::yield_now().await;
+            if abort {
+                handle.abort();
+                assert!(handle.await.unwrap_err().is_cancelled());
+            }
+        });
+        assert_ne!(local_at.get(), 0);
+        assert_eq!(borrowed.get(), local_at.get(), "abort: {abort}");
+    }
+}
+
 #[test]
 fn yield_now_lets_other_tasks_run() {
     let order = giong::block_on(async {
