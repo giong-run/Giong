@@ -1078,7 +1078,9 @@ fn allocations_dropped_mid_flight_are_cleaned_up() {
             }
         }
         assert!(abandoned > 0, "expected some allocations to be in flight");
-        timeout(Duration::from_secs(5), async {
+        // Under Miri the blocking threads run each fallocate far slower.
+        let wait = Duration::from_secs(if cfg!(miri) { 300 } else { 5 });
+        timeout(wait, async {
             while giong::observe::worker_stats().tracked_ops > 0 {
                 giong::time::sleep(Duration::from_millis(1)).await;
             }
@@ -1096,6 +1098,10 @@ fn allocations_dropped_mid_flight_are_cleaned_up() {
 /// Reads served from the page cache within the call still let the other
 /// tasks of the worker run: a task reading a cached file in a loop yields.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "2,000 reads through the blocking threads take too long under Miri"
+)]
 fn cached_reads_in_a_loop_let_other_tasks_run() {
     let dir = TempDir::new("cached-loop");
     let path = dir.path("data");
