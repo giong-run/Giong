@@ -53,7 +53,7 @@ instructions per request.
 | `channel` | a round trip between two tasks over two bounded channels | 1,758 | 1,887 |
 | `timeout` | a timeout around a future that is ready at once | 99 | 99 |
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 4,885 | 4,279 |
-| `udp-echo` | a 64-byte datagram to an echo task and back | 4,083 | 4,722 |
+| `udp-echo` | a 64-byte datagram to an echo task and back | 4,083 | 4,783 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 1,478 | 2,938 |
 | `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 11,144 | 10,022 |
 | `http1-client` | giong-http client and server, HTTP/1.1 | 33,947 | 32,654 |
@@ -62,7 +62,7 @@ instructions per request.
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 46,789 | 45,185 |
 | `web` | a giong-web router with a path parameter, raw client | 15,260 | 14,136 |
 | `redis-get` | giong-redis `GET` against a fake server | 9,704 | 9,179 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 12,884 | 12,679 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 12,896 | 12,380 |
 | `mysql-query` | giong-mysql query, one parameter, one row, fake server | 18,796 | 17,885 |
 
 The three database cases went up when the clients started reading straight into their own
@@ -77,11 +77,12 @@ shows on bigger replies, and measured against real servers it is faster on small
 (a pool of four: 243.9k to 303.8k PostgreSQL point lookups a second; see
 [`bench/results/postgres`](../results/postgres)).
 
-The UDP changes (#139) moved `postgres-query` again, by -2.5% on io_uring and +2.7% on
-epoll, the same way: the allocations per query are the same (16), the difference is in
+The UDP changes (#139, #142) moved `postgres-query` again, by -2.4% on io_uring and +0.3%
+on epoll (+2.7% with #139 alone), the same way: the allocations per query are the same (16), the difference is in
 glibc's `malloc` (`_int_malloc`, `malloc_consolidate`), and with the heap trimming setting
 above both drivers are within 0.2% of the count before. `udp-echo` went down: 5,358 to 4,083
-on io_uring and 5,031 to 4,722 on epoll, with one allocation per echo instead of two.
+on io_uring and 5,031 to 4,783 on epoll (4,722 with #139 alone; the send queue and the busy-socket count
+add the rest), with one allocation per echo instead of two.
 
 Each case also records heap allocations per operation (counted by a global allocator in the
 benchmark), with the same 1% limit: one more allocation per request fails.

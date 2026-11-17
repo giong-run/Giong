@@ -39,7 +39,7 @@ io_uring,web,instructions,15259.7,1
 io_uring,web,allocations,5.000,1
 io_uring,redis-get,instructions,9703.9,1
 io_uring,redis-get,allocations,2.000,1
-io_uring,postgres-query,instructions,12884.3,1
+io_uring,postgres-query,instructions,12896.3,1
 io_uring,postgres-query,allocations,16.000,1
 io_uring,mysql-query,instructions,18795.9,1
 io_uring,mysql-query,allocations,27.000,1
@@ -82,7 +82,7 @@ epoll,web,instructions,14135.6,1
 epoll,web,allocations,5.000,1
 epoll,redis-get,instructions,9178.8,1
 epoll,redis-get,allocations,2.000,1
-epoll,postgres-query,instructions,12679.3,1
+epoll,postgres-query,instructions,12379.7,1
 epoll,postgres-query,allocations,16.000,1
 epoll,mysql-query,instructions,17884.8,1
 epoll,mysql-query,allocations,27.000,1
