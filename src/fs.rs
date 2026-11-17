@@ -220,6 +220,9 @@ impl OpenOptions {
     /// it may still produce is closed. What the open did to the file stays
     /// done: a dropped `create` or `truncate` may have created or emptied
     /// the file, in any runtime.
+    ///
+    /// Not cancel safe when the options create or truncate (see above); cancel
+    /// safe otherwise: a dropped open leaves no descriptor behind.
     pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         let flags = self.flags()?;
         let path = c_path(path.as_ref())?;
@@ -282,12 +285,18 @@ pub struct File {
 
 impl File {
     /// Opens an existing file for reading.
+    ///
+    /// Cancel safe: if the future is dropped, the descriptor the open may still
+    /// produce is closed, and nothing else changes.
     pub async fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         OpenOptions::new().read(true).open(path).await
     }
 
     /// Opens a file for writing, creating it if needed and emptying it if it
     /// exists.
+    ///
+    /// Not cancel safe: if the future is dropped, the file may have been
+    /// created or emptied (the descriptor is closed either way).
     pub async fn create<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         OpenOptions::new()
             .write(true)
@@ -327,6 +336,9 @@ impl File {
     ///
     /// Fails with `GIONG-E0202` if `offset` is above `i64::MAX`, the largest
     /// file offset Linux has.
+    ///
+    /// Cancel safe for a regular file, as said above; not for a pipe or a
+    /// device.
     pub async fn read_at<B: IoBufMut>(&self, mut buf: B, offset: u64) -> (io::Result<usize>, B) {
         if let Err(e) = check_offset(offset) {
             return (Err(e), buf);
@@ -359,12 +371,18 @@ impl File {
     ///
     /// Fails with `GIONG-E0202` if `offset` is above `i64::MAX`, the largest
     /// file offset Linux has.
+    ///
+    /// Not cancel safe: if the future is dropped, some bytes may have been
+    /// written without the caller learning how many.
     pub async fn write_at<B: IoBuf>(&self, buf: B, offset: u64) -> (io::Result<usize>, B) {
         self.write_from(buf, 0, offset).await
     }
 
     /// Writes all of `buf` at `offset`. The buffer is handed back so it can be
     /// reused.
+    ///
+    /// Not cancel safe: if the future is dropped, part of the data may have
+    /// been written.
     pub async fn write_all_at<B: IoBuf>(&self, mut buf: B, offset: u64) -> (io::Result<()>, B) {
         let mut written = 0;
         while written < buf.len() {
@@ -413,12 +431,17 @@ impl File {
     }
 
     /// Flushes data and metadata to the storage device (`fsync`).
+    ///
+    /// Cancel safe: if the future is dropped, the flush may or may not have
+    /// happened, and calling again does it.
     pub async fn sync_all(&self) -> io::Result<()> {
         self.fsync(false).await
     }
 
     /// Flushes data, and only the metadata needed to read it back
     /// (`fdatasync`).
+    ///
+    /// Cancel safe, like [`sync_all`](Self::sync_all).
     pub async fn sync_data(&self) -> io::Result<()> {
         self.fsync(true).await
     }
@@ -434,6 +457,9 @@ impl File {
     ///
     /// Fails with `Unsupported` on a filesystem without `fallocate` (some
     /// network filesystems).
+    ///
+    /// Cancel safe: if the future is dropped, the space may or may not have
+    /// been reserved, and calling again reserves it.
     pub async fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
         if len == 0 {
             return Ok(());
@@ -486,6 +512,8 @@ impl File {
     }
 
     /// Size, type and modification time of the file.
+    ///
+    /// Cancel safe: it changes nothing.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         // An empty path with AT_EMPTY_PATH means "the descriptor itself".
         statx(
@@ -514,6 +542,11 @@ impl File {
 
     /// Closes the file and reports the result. Dropping a `File` closes it
     /// too, but cannot report an error.
+    ///
+    /// Not cancel safe: if the future is dropped, the result is lost, and on
+    /// io_uring a close the kernel had handed to a worker thread (some network
+    /// filesystems) can be cancelled and leave the descriptor open. Await it to
+    /// the end.
     pub async fn close(self) -> io::Result<()> {
         let fd = self.fd;
         mem::forget(self);
@@ -657,12 +690,16 @@ async fn statx(dir: RawFd, path: KernelBox<CString>, flags: i32) -> io::Result<M
 
 /// Size, type and modification time of the file at `path`, following
 /// symbolic links.
+///
+/// Cancel safe: it changes nothing.
 pub async fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     statx(libc::AT_FDCWD, c_path(path.as_ref())?, 0).await
 }
 
 /// Like [`metadata`], but describes a symbolic link itself instead of what it
 /// points at.
+///
+/// Cancel safe: it changes nothing.
 pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     statx(
         libc::AT_FDCWD,
@@ -673,6 +710,9 @@ pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 }
 
 /// Reads a whole file.
+///
+/// Cancel safe for a regular file: if the future is dropped, nothing changes
+/// and the file is closed.
 pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     let file = File::open(path).await?;
     // The size is only a hint: files in /proc report 0, and a file may grow
@@ -711,6 +751,9 @@ pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 ///
 /// The data is not synced to the storage device; open the file yourself and
 /// call [`File::sync_all`] where that matters.
+///
+/// Not cancel safe: if the future is dropped, the file may have been created or
+/// emptied and only part of `data` written.
 pub async fn write<P: AsRef<Path>, B: IoBuf>(path: P, data: B) -> io::Result<()> {
     let file = File::create(path).await?;
     file.write_all_at(data, 0).await.0?;
@@ -718,6 +761,9 @@ pub async fn write<P: AsRef<Path>, B: IoBuf>(path: P, data: B) -> io::Result<()>
 }
 
 /// Removes a file.
+///
+/// Not cancel safe: if the future is dropped, the file may have been removed,
+/// and calling again then fails with `NotFound`.
 pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::UnlinkAt {
@@ -728,6 +774,8 @@ pub async fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 /// Removes an empty directory.
+///
+/// Not cancel safe, like [`remove_file`].
 pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::UnlinkAt {
@@ -738,6 +786,9 @@ pub async fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 /// Creates a directory (permissions `0o777` before the umask).
+///
+/// Not cancel safe: if the future is dropped, the directory may have been
+/// created, and calling again then fails with `AlreadyExists`.
 pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = c_path(path.as_ref())?;
     let io = Io::MkDirAt {
@@ -748,6 +799,9 @@ pub async fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 /// Renames a file or directory, replacing `to` if it exists.
+///
+/// Not cancel safe: if the future is dropped, the rename may have happened, and
+/// calling again then fails with `NotFound`.
 pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> {
     let paths = (c_path(from.as_ref())?, c_path(to.as_ref())?);
     let io = Io::RenameAt {
@@ -833,6 +887,9 @@ const DIR_BATCH: usize = 8 * 1024;
 /// filesystem with the directory cached, a batch takes some tens of
 /// microseconds; on a network filesystem it can hold up the worker for a
 /// round trip.
+///
+/// Cancel safe: if the future is dropped, nothing changes and the directory is
+/// closed.
 pub async fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     let path = path.as_ref();
     let dir = OpenOptions::new()
@@ -865,8 +922,9 @@ pub struct ReadDir {
 }
 
 impl ReadDir {
-    /// The next entry, or `None` when there are no more. Cancel safe: if the
-    /// future is dropped, no entry is lost.
+    /// The next entry, or `None` when there are no more.
+    ///
+    /// Cancel safe: if the future is dropped, no entry is lost.
     pub async fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
         loop {
             while let Some(entry) = self.parse() {
@@ -968,6 +1026,8 @@ impl DirEntry {
     /// The type of the entry itself (a symbolic link is not followed). Most
     /// filesystems report it with the name, so no system call is needed; for
     /// the others it is looked up through the ring.
+    ///
+    /// Cancel safe: it changes nothing.
     pub async fn file_type(&self) -> io::Result<FileType> {
         match self.file_type {
             Some(file_type) => Ok(file_type),
@@ -977,6 +1037,8 @@ impl DirEntry {
 
     /// Metadata of the entry itself, like [`symlink_metadata`] on
     /// [`path`](Self::path).
+    ///
+    /// Cancel safe: it changes nothing.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         symlink_metadata(self.path()).await
     }

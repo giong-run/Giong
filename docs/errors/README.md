@@ -145,6 +145,7 @@ when it is no longer raised.
 | [GIONG-E2010](E2010.md) | `KtlsSetup` | the kernel refused the TLS keys |
 | [GIONG-E2011](E2011.md) | `KtlsKeyUpdate` | the kernel cannot change TLS keys |
 | [GIONG-E2012](E2012.md) | `TlsKeysExhausted` | TLS keys used up |
+| [GIONG-E2013](E2013.md) | `TlsConfig` | TLS setting not possible here |
 
 ## giong-postgres
 

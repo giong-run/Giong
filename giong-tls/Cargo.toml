@@ -15,14 +15,31 @@ categories = ["network-programming", "cryptography"]
 # `TlsConnector::with_webpki_roots`: Mozilla's root certificates compiled in,
 # for machines without a CA bundle (container images built `FROM scratch`).
 webpki-roots = ["dep:webpki-roots"]
+# `TlsAcceptor::from_rustls`, `TlsConnector::from_rustls`,
+# `KtlsSupport::supports` and the `rustls` re-export: the rustls types
+# themselves, for what the rest of the API does not cover. Outside the semver
+# promise: these follow the rustls version giong-tls uses, which a minor
+# release may raise (see docs/STABILITY.md).
+unstable-rustls = []
+# Post-quantum key exchange: aws-lc-rs as the cryptography instead of *ring*,
+# and X25519MLKEM768 offered first, on the server and the client. Building
+# aws-lc-rs needs a C compiler and CMake.
+post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
 giong = { path = "..", version = "0.8.0" }
 libc = "0.2.172"
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "tls12"] }
+# `CertificateDer`, the one type from outside the crate in the stable API:
+# rustls-pki-types stays at 1.x whatever rustls does.
+rustls-pki-types = { version = "1.12", features = ["std"] }
 webpki-roots = { version = "1", optional = true }
+# Which of several certificates is valid for the name a client asks for.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# The tests build rustls configurations of their own.
+giong-tls = { path = ".", features = ["unstable-rustls"] }
 rcgen = "0.13"
 
 [lints.rust]
