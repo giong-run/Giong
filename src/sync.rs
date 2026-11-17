@@ -15,6 +15,11 @@ pub mod mpsc {
     //!
     //! Tokio's `mpsc::channel(n)` is [`bounded`]`(n)` here, and its
     //! `unbounded_channel()` is [`unbounded`]`()`.
+    //!
+    //! The halves are [`UnboundedSender`] and [`UnboundedReceiver`], and
+    //! [`BoundedSender`] and [`BoundedReceiver`]. In 1.0.0 the bounded ones
+    //! also take the short names `Sender` and `Receiver`, as in Tokio, so the
+    //! short name is the channel that holds its memory to a bound.
 
     pub use super::bounded::{bounded, BoundedReceiver, BoundedSender, TrySendError};
 
@@ -39,10 +44,10 @@ pub mod mpsc {
         }
     }
 
-    /// Creates an unbounded channel: [`Sender::send`] never waits, and
+    /// Creates an unbounded channel: [`UnboundedSender::send`] never waits, and
     /// values queue up until the receiver takes them. Use [`bounded`] when
     /// the senders can outrun the receiver.
-    pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    pub fn unbounded<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
         let shared = Arc::new(Shared(Mutex::new(State {
             queue: VecDeque::new(),
             rx_waker: None,
@@ -50,10 +55,10 @@ pub mod mpsc {
             rx_alive: true,
         })));
         (
-            Sender {
+            UnboundedSender {
                 shared: shared.clone(),
             },
-            Receiver { shared },
+            UnboundedReceiver { shared },
         )
     }
 
@@ -63,21 +68,37 @@ pub mod mpsc {
         note = "renamed unbounded(), so that it is not taken for Tokio's bounded \
                 channel(n), which is bounded(n) here; it goes in 1.0.0"
     )]
-    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    pub fn channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
         unbounded()
     }
 
     /// The sending half. Cheap to clone; `Send` when `T` is.
-    pub struct Sender<T> {
+    pub struct UnboundedSender<T> {
         shared: Arc<Shared<T>>,
     }
 
     /// The receiving half.
-    pub struct Receiver<T> {
+    pub struct UnboundedReceiver<T> {
         shared: Arc<Shared<T>>,
     }
 
-    /// Returned by [`Sender::send`] and [`BoundedSender::send`] when the receiver
+    /// The old name of [`UnboundedSender`].
+    #[deprecated(
+        since = "0.9.0",
+        note = "renamed UnboundedSender; in 1.0.0 Sender names the bounded channel's \
+                sender, as in Tokio"
+    )]
+    pub type Sender<T> = UnboundedSender<T>;
+
+    /// The old name of [`UnboundedReceiver`].
+    #[deprecated(
+        since = "0.9.0",
+        note = "renamed UnboundedReceiver; in 1.0.0 Receiver names the bounded channel's \
+                receiver, as in Tokio"
+    )]
+    pub type Receiver<T> = UnboundedReceiver<T>;
+
+    /// Returned by [`UnboundedSender::send`] and [`BoundedSender::send`] when the receiver
     /// is gone; holds the value.
     pub struct SendError<T>(pub T);
 
@@ -95,7 +116,7 @@ pub mod mpsc {
 
     impl<T> std::error::Error for SendError<T> {}
 
-    /// Why [`Receiver::try_recv`] or [`BoundedReceiver::try_recv`] returned
+    /// Why [`UnboundedReceiver::try_recv`] or [`BoundedReceiver::try_recv`] returned
     /// no value.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum TryRecvError {
@@ -117,7 +138,7 @@ pub mod mpsc {
 
     impl std::error::Error for TryRecvError {}
 
-    impl<T> Sender<T> {
+    impl<T> UnboundedSender<T> {
         /// Sends a value without blocking. Fails if the receiver was dropped.
         pub fn send(&self, value: T) -> Result<(), SendError<T>> {
             let waker = {
@@ -136,7 +157,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Clone for Sender<T> {
+    impl<T> Clone for UnboundedSender<T> {
         fn clone(&self) -> Self {
             self.shared.lock().senders += 1;
             Self {
@@ -145,7 +166,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Drop for Sender<T> {
+    impl<T> Drop for UnboundedSender<T> {
         fn drop(&mut self) {
             let waker = {
                 let mut state = self.shared.lock();
@@ -162,7 +183,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Receiver<T> {
+    impl<T> UnboundedReceiver<T> {
         /// Receives the next value, or `None` once every sender is gone and
         /// the channel is empty.
         pub async fn recv(&mut self) -> Option<T> {
@@ -197,7 +218,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Drop for Receiver<T> {
+    impl<T> Drop for UnboundedReceiver<T> {
         fn drop(&mut self) {
             let leftover = {
                 let mut state = self.shared.lock();

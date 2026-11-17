@@ -389,12 +389,12 @@ fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_rec
 }
 
 #[test]
-fn the_old_name_of_unbounded_still_makes_one() {
+fn the_old_names_of_unbounded_and_its_halves_still_work() {
     giong::block_on(async {
         // On the statement, not the function: sim/build.rs moves a test's
         // attributes to its wrapper.
         #[allow(deprecated)]
-        let (tx, mut rx) = mpsc::channel::<u32>();
+        let (tx, mut rx): (mpsc::Sender<u32>, mpsc::Receiver<u32>) = mpsc::channel();
         tx.send(7).unwrap();
         drop(tx);
         assert_eq!(rx.recv().await, Some(7));

@@ -363,8 +363,8 @@ type Job = ((VecDeque<Vec<u8>>, [u8; 2]), mpsc::Sender<()>);
 
 /// One runtime for the whole fuzzing process: setting up an io_uring per
 /// input would take most of the time.
-fn runtime() -> &'static Mutex<giong::sync::mpsc::Sender<Job>> {
-    static JOBS: OnceLock<Mutex<giong::sync::mpsc::Sender<Job>>> = OnceLock::new();
+fn runtime() -> &'static Mutex<giong::sync::mpsc::UnboundedSender<Job>> {
+    static JOBS: OnceLock<Mutex<giong::sync::mpsc::UnboundedSender<Job>>> = OnceLock::new();
     JOBS.get_or_init(|| {
         let (tx, mut rx) = giong::sync::mpsc::unbounded::<Job>();
         std::thread::spawn(move || {
