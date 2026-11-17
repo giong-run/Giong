@@ -1,7 +1,7 @@
 //! The giong streams `Compat` can wrap, and how it drives each of them.
 
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::Shutdown;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -50,6 +50,14 @@ pub(crate) mod sealed {
         /// Sends all of `buf`.
         fn send(this: Rc<Self>, buf: Vec<u8>) -> SendFuture;
 
+        /// Sends what the socket takes of `bufs` at once, straight from the
+        /// caller's memory, without waiting: `None` if it takes nothing now
+        /// (or the type cannot do that). Called only while nothing else is
+        /// being sent.
+        fn send_now(&self, _bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
+            None
+        }
+
         /// Closes the sending direction: `None` when that is done at once.
         fn close(this: &Rc<Self>) -> io::Result<Option<CloseFuture>>;
 
@@ -81,6 +89,28 @@ fn not_connected_is_closed(res: io::Result<()>) -> io::Result<()> {
     }
 }
 
+/// One `sendmsg(2)` that does not wait, for a large write that nothing is
+/// buffered before: the kernel copies straight from the caller's slices, as
+/// Tokio's streams do, instead of `Compat` copying them into its buffer
+/// first and the kernel copying them again.
+fn send_now(fd: std::os::fd::RawFd, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
+    // SAFETY: zeroed is a valid `msghdr` (no address, no control data).
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    // `IoSlice` is ABI compatible with `iovec`; `sendmsg` only reads them.
+    msg.msg_iov = bufs.as_ptr() as *mut libc::iovec;
+    msg.msg_iovlen = bufs.len().min(libc::UIO_MAXIOV as usize) as _;
+    // SAFETY: `msg` points at `bufs`, which outlive the call.
+    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    if n >= 0 {
+        return Some(Ok(n as usize));
+    }
+    let e = io::Error::last_os_error();
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => None,
+        _ => Some(Err(e)),
+    }
+}
+
 macro_rules! socket_transport {
     ($ty:ident, $no_delay:expr) => {
         impl Transport for $ty {}
@@ -105,6 +135,10 @@ macro_rules! socket_transport {
 
             fn close(this: &Rc<Self>) -> io::Result<Option<CloseFuture>> {
                 not_connected_is_closed(this.shutdown(Shutdown::Write)).map(|()| None)
+            }
+
+            fn send_now(&self, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
+                send_now(std::os::fd::AsRawFd::as_raw_fd(self), bufs)
             }
 
             fn no_delay(&self) {

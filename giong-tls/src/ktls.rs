@@ -1101,7 +1101,9 @@ pub(crate) enum Outcome {
 
 /// The server or client connection, before the handshake.
 pub(crate) enum Start {
-    Server(Arc<ServerConfig>),
+    /// The configuration, and the one for clients that list ChaCha20
+    /// first if it differs (see `TlsAcceptor::from_pem`).
+    Server(Arc<ServerConfig>, Option<Arc<ServerConfig>>),
     Client(Arc<ClientConfig>, ServerName<'static>),
 }
 
@@ -1125,9 +1127,23 @@ pub(crate) async fn handshake(
     }
     let run = async {
         match start {
-            Start::Server(config) => {
+            Start::Server(config, chacha) => {
+                let mut handshake = Handshake::new(&tcp);
+                let config = match chacha {
+                    // The configuration depends on the ClientHello: read its
+                    // start first, as the handshake would.
+                    Some(chacha) => {
+                        handshake.read(MAX_RECORD).await?;
+                        if crate::prefers_chacha(&handshake.incoming) {
+                            chacha
+                        } else {
+                            config
+                        }
+                    }
+                    None => config,
+                };
                 let conn = UnbufferedServerConnection::new(config).map_err(tls_error)?;
-                Handshake::new(&tcp).run(conn).await
+                handshake.run(conn).await
             }
             Start::Client(config, name) => {
                 let conn = UnbufferedClientConnection::new(config, name).map_err(tls_error)?;
@@ -2253,7 +2269,11 @@ impl TlsStream {
                 // Close the TCP side anyway, so the peer is not left waiting.
                 sending.done();
                 let _ = self.tcp.shutdown(std::net::Shutdown::Write);
-                return Err(kernel_error(e));
+                return if self.peer_gone(&e) {
+                    Ok(())
+                } else {
+                    Err(kernel_error(e))
+                };
             }
         }
         sending.done();

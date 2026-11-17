@@ -461,6 +461,20 @@ impl<S: Transport> Compat<S> {
         }
         // A finished send hands back its buffer (or its error) first.
         let _ = self.poll_send(cx);
+        if self.write.buf.is_empty() && self.write.sending.is_none() && len >= self.write.limit {
+            // Nothing to keep in order before it, and too large to gather
+            // with others: straight to the socket, as `BufWriter` does,
+            // if the socket takes it now.
+            match S::send_now(&self.stream, bufs) {
+                Some(Ok(n)) => return Poll::Ready(Ok(n)),
+                Some(Err(e)) => {
+                    let text = e.to_string();
+                    self.write.state = WriteStatus::Failed(None, text);
+                    return Poll::Ready(Err(e));
+                }
+                None => {}
+            }
+        }
         if self.write.buf.len() >= self.write.limit {
             // Full: wait for the send before it. `Pending` here comes from
             // that send, which holds the waker. (Polling a send can finish
