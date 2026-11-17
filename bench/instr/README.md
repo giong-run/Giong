@@ -53,7 +53,7 @@ instructions per request.
 | `channel` | a round trip between two tasks over two bounded channels | 1,758 | 1,887 |
 | `timeout` | a timeout around a future that is ready at once | 99 | 99 |
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 4,885 | 4,279 |
-| `udp-echo` | a 64-byte datagram to an echo task and back | 4,083 | 4,783 |
+| `udp-echo` | a 64-byte datagram to an echo task and back | 4,137 | 4,783 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 1,478 | 2,938 |
 | `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 11,144 | 10,022 |
 | `http1-client` | giong-http client and server, HTTP/1.1 | 33,947 | 32,654 |
@@ -80,9 +80,11 @@ shows on bigger replies, and measured against real servers it is faster on small
 The UDP changes (#139, #142) moved `postgres-query` again, by -2.4% on io_uring and +0.3%
 on epoll (+2.7% with #139 alone), the same way: the allocations per query are the same (16), the difference is in
 glibc's `malloc` (`_int_malloc`, `malloc_consolidate`), and with the heap trimming setting
-above both drivers are within 0.2% of the count before. `udp-echo` went down: 5,358 to 4,083
+above both drivers are within 0.2% of the count before. `udp-echo` went down: 5,358 to 4,137
 on io_uring and 5,031 to 4,783 on epoll (4,722 with #139 alone; the send queue and the busy-socket count
-add the rest), with one allocation per echo instead of two.
+add the rest), with one allocation per echo instead of two. On io_uring it is 4,137 with the
+check that keeps a direct send from overtaking queued submissions (Linux 6.0 lost the reply
+to a datagram sent past a queued cancellation).
 
 Each case also records heap allocations per operation (counted by a global allocator in the
 benchmark), with the same 1% limit: one more allocation per request fails.

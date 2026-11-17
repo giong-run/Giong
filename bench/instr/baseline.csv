@@ -21,7 +21,7 @@ io_uring,timeout,instructions,99.2,1
 io_uring,timeout,allocations,0.000,1
 io_uring,tcp-echo,instructions,4884.6,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,4082.5,1
+io_uring,udp-echo,instructions,4137.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,1478.2,1
 io_uring,file-read,allocations,0.000,1

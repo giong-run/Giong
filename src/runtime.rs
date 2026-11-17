@@ -612,6 +612,12 @@ impl Worker {
                 return;
             }
             self.sends_waiting.set(false);
+            // Behind what the ring holds, as with a send made at once.
+            let mut driver = self.driver.borrow_mut();
+            if driver.has_queued_submissions() {
+                driver.submit_queued();
+            }
+            drop(driver);
             q.flush()
         };
         for waker in wakers {

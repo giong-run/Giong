@@ -1332,15 +1332,24 @@ impl Uring {
         unsafe { libc::close(fd) };
     }
 
+    /// `true` if SQEs wait in the submission queue for the next
+    /// `io_uring_enter`: a system call made directly now would reach the
+    /// kernel before them (see [`Driver::try_send_to`](super::Driver::try_send_to)).
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        !self.ring.submission().is_empty()
+    }
+
     /// Hands every queued SQE to the kernel now. TSan builds call it before
-    /// each close(2).
+    /// each close(2), and the send queue before its `sendmmsg(2)` (see
+    /// `net::sendq`), for the reason given at
+    /// [`Driver::try_send_to`](super::Driver::try_send_to).
     ///
     /// Queued SQEs name descriptors by number, and the kernel looks the
     /// number up only when it takes the SQE. Once close(2) returns, another
     /// thread can get the same number for a new socket, and a receive still
     /// in the queue would take that socket's data. (A close through the ring
     /// comes after those SQEs in the same queue, so it needs no such step.)
-    #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
         let mut attempts = 0u32;
         while !self.ring.submission().is_empty() {
