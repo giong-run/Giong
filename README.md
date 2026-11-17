@@ -284,7 +284,7 @@ For each job a service has, try these in order and take the first that fits:
 | Runtime state for an AI agent | [`giong-mcp`](giong-mcp/README.md) | | |
 
 Where a giong crate is not ahead, the sections linked above say so: over one shared
-connection giong-postgres is 8–11% below tokio-postgres at the median, a blocking `std`
+connection giong-postgres is 7–9% below tokio-postgres at the median, a blocking `std`
 read of a cached file beats every async one, and TLS handshakes cost the same on both once
 axum's rustls is set to the cipher suite giong-tls prefers.
 
