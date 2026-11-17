@@ -130,6 +130,7 @@ dependencies = [
  "giong",
  "libc",
  "rustls",
+ "rustls-pki-types",
 ]
 
 [[package]]
