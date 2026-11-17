@@ -230,6 +230,10 @@ fn handshake_eof() -> io::Error {
 /// connection's whole life (about 64 KiB per idle connection otherwise).
 const WIRE_KEPT: usize = 16 * 1024;
 
+/// Encrypted records of one write that are sent as soon as this many have
+/// gathered, even if more pieces of the write follow.
+const SEND_AT: usize = 64 * 1024;
+
 /// `true` if `records`, whole TLS records as rustls writes them, hold one
 /// of application data (content type 23; under TLS 1.3 every encrypted
 /// record says so).
@@ -288,12 +292,91 @@ fn ring() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// `ring` with AES-128-GCM first, then ChaCha20-Poly1305, then AES-256-GCM,
+/// in each protocol version: the order of [`TlsAcceptor::from_pem`].
+///
+/// AES-128-GCM is as safe in practice and cheaper: its suites hash with
+/// SHA-256, which processors run in hardware, where AES-256-GCM's TLS 1.3
+/// suite and TLS 1.2 ECDHE suites hash with SHA-384 (about a sixth of a
+/// resumed handshake's CPU time goes to SHA-384 otherwise). Go's and
+/// BoringSSL's servers prefer it the same way. Browsers list it first
+/// already; OpenSSL clients (curl, wrk, Python) list AES-256-GCM first.
+fn ring_aes128_first() -> Arc<rustls::crypto::CryptoProvider> {
+    use rustls::CipherSuite as S;
+    let mut provider = rustls::crypto::ring::default_provider();
+    // A stable sort: TLS 1.3 suites stay ahead of TLS 1.2 ones, and the
+    // signature algorithms keep their order.
+    provider.cipher_suites.sort_by_key(|suite| {
+        let rank = match suite.suite() {
+            S::TLS13_AES_128_GCM_SHA256
+            | S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            | S::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => 0,
+            S::TLS13_CHACHA20_POLY1305_SHA256
+            | S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            | S::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => 1,
+            _ => 2,
+        };
+        (
+            suite.version().version != rustls::ProtocolVersion::TLSv1_3,
+            rank,
+        )
+    });
+    Arc::new(provider)
+}
+
+/// `true` if a ClientHello lists a ChaCha20-Poly1305 suite before every
+/// AES-GCM one: a client without AES instructions (a low-end phone) says
+/// so, and then gets ChaCha20, which it runs several times faster. (The
+/// same test as Go's server.) OpenSSL's clients list AES-256-GCM, then
+/// ChaCha20, then AES-128-GCM, and get AES-128-GCM.
+/// `hello` is the start of what the client sent; `false` if it is not a
+/// ClientHello or ends before the list of cipher suites does.
+fn prefers_chacha(hello: &[u8]) -> bool {
+    // Record header (5), handshake header (4), version (2), random (32).
+    const SESSION_ID: usize = 5 + 4 + 2 + 32;
+    if hello.first() != Some(&22) || hello.get(5) != Some(&1) {
+        return false;
+    }
+    let Some(&id_len) = hello.get(SESSION_ID) else {
+        return false;
+    };
+    let at = SESSION_ID + 1 + usize::from(id_len);
+    let Some(len) = hello.get(at..at + 2) else {
+        return false;
+    };
+    let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+    let Some(suites) = hello.get(at + 2..at + 2 + len) else {
+        return false;
+    };
+    for suite in suites.chunks_exact(2) {
+        match [suite[0], suite[1]] {
+            // TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384,
+            // ECDHE_ECDSA_/ECDHE_RSA_WITH_AES_128_GCM_SHA256 and _256_GCM_SHA384
+            [0x13, 0x01]
+            | [0x13, 0x02]
+            | [0xc0, 0x2b]
+            | [0xc0, 0x2f]
+            | [0xc0, 0x2c]
+            | [0xc0, 0x30] => return false,
+            // TLS_CHACHA20_POLY1305_SHA256, ECDHE_ECDSA_/ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+            [0x13, 0x03] | [0xcc, 0xa9] | [0xcc, 0xa8] => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Turns accepted TCP connections into TLS connections.
 ///
 /// Cheap to clone; share one between all workers.
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
+    /// From [`from_pem`](Self::from_pem): `config` picks the server's
+    /// favourite cipher suite (AES-128-GCM), and this copy of it the
+    /// client's, for clients that list ChaCha20 first (see
+    /// [`prefers_chacha`]).
+    chacha: Option<Arc<ServerConfig>>,
     handshake_timeout: Duration,
     ktls: ktls::Plan,
 }
@@ -303,6 +386,7 @@ impl TlsAcceptor {
     pub fn new(config: Arc<ServerConfig>) -> Self {
         Self {
             config,
+            chacha: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             ktls: ktls::Plan::Off,
         }
@@ -312,16 +396,46 @@ impl TlsAcceptor {
     /// format. TLS 1.2 and 1.3 with rustls' default cipher suites, no client
     /// authentication, and no protocol offered through ALPN: set them with
     /// [`alpn`](Self::alpn). (giong-http's `Server::serve_tls` sets its own.)
+    ///
+    /// Of the suites both sides allow, the server picks AES-128-GCM first,
+    /// as Go's and BoringSSL's servers do: it costs less than AES-256-GCM,
+    /// whose suites hash with SHA-384. A client that lists ChaCha20-Poly1305
+    /// before AES-128-GCM, as clients without AES instructions do, gets
+    /// ChaCha20. An acceptor made with [`new`](Self::new) follows its
+    /// configuration as given.
     pub fn from_pem(cert_chain: &[u8], private_key: &[u8]) -> io::Result<Self> {
         let certs = pem_certs(cert_chain)?;
         let key = PrivateKeyDer::from_pem_slice(private_key).map_err(bad_key)?;
-        let config = ServerConfig::builder_with_provider(ring())
+        let mut config = ServerConfig::builder_with_provider(ring_aes128_first())
             .with_safe_default_protocol_versions()
             .map_err(tls_error)?
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(mismatched_key)?;
-        Ok(Self::new(Arc::new(config)))
+        // The client's order, for the clients `prefers_chacha` picks out.
+        let chacha = Arc::new(config.clone());
+        config.ignore_client_order = true;
+        Ok(Self {
+            chacha: Some(chacha),
+            ..Self::new(Arc::new(config))
+        })
+    }
+
+    /// The configuration for a client whose ClientHello starts with
+    /// `hello`.
+    fn config_for(&self, hello: &[u8]) -> Arc<ServerConfig> {
+        match &self.chacha {
+            Some(chacha) if prefers_chacha(hello) => chacha.clone(),
+            _ => self.config.clone(),
+        }
+    }
+
+    /// Applies `change` to every configuration this acceptor holds.
+    fn change_config(&mut self, change: impl Fn(&mut ServerConfig)) {
+        change(Arc::make_mut(&mut self.config));
+        if let Some(chacha) = &mut self.chacha {
+            change(Arc::make_mut(chacha));
+        }
     }
 
     /// The protocols to accept through ALPN, most preferred first, for
@@ -332,8 +446,8 @@ impl TlsAcceptor {
     /// giong-http's `Server::serve_tls` sets this itself, to the protocols
     /// the server speaks.
     pub fn alpn(mut self, protocols: &[&[u8]]) -> Self {
-        Arc::make_mut(&mut self.config).alpn_protocols =
-            protocols.iter().map(|p| p.to_vec()).collect();
+        let protocols: Vec<Vec<u8>> = protocols.iter().map(|p| p.to_vec()).collect();
+        self.change_config(|config| config.alpn_protocols = protocols.clone());
         self
     }
 
@@ -375,7 +489,7 @@ impl TlsAcceptor {
         // Extractable secrets only where they will be handed to the kernel.
         let extract = self.ktls.tries();
         if self.config.enable_secret_extraction != extract {
-            Arc::make_mut(&mut self.config).enable_secret_extraction = extract;
+            self.change_config(|config| config.enable_secret_extraction = extract);
         }
         Ok(self)
     }
@@ -397,7 +511,7 @@ impl TlsAcceptor {
         let tcp = match &self.ktls {
             ktls::Plan::Off => tcp,
             ktls::Plan::Try { required } => {
-                let start = ktls::Start::Server(self.config.clone());
+                let start = ktls::Start::Server(self.config.clone(), self.chacha.clone());
                 match ktls::handshake(tcp, start, self.handshake_timeout).await? {
                     ktls::Outcome::Kernel(tls) => return Ok(*tls),
                     ktls::Outcome::Declined(_, e) if *required => return Err(e),
@@ -412,9 +526,25 @@ impl TlsAcceptor {
                 tcp
             }
         };
-        let conn = ServerConnection::new(self.config.clone()).map_err(tls_error)?;
+        let Some(_) = &self.chacha else {
+            let conn = ServerConnection::new(self.config.clone()).map_err(tls_error)?;
+            return TlsStream::new(tcp, conn.into())
+                .handshake(self.handshake_timeout, Duration::ZERO, None)
+                .await;
+        };
+        // The configuration depends on the ClientHello: wait for its start,
+        // within the handshake's time.
+        let started = std::time::Instant::now();
+        let first = match timeout(self.handshake_timeout, tcp.recv()).await {
+            Ok(first) => first?,
+            Err(_) => return Err(handshake_timed_out(self.handshake_timeout)),
+        };
+        if first.is_empty() {
+            return Err(handshake_eof());
+        }
+        let conn = ServerConnection::new(self.config_for(&first)).map_err(tls_error)?;
         TlsStream::new(tcp, conn.into())
-            .handshake(self.handshake_timeout)
+            .handshake(self.handshake_timeout, started.elapsed(), Some(first))
             .await
     }
 }
@@ -627,7 +757,7 @@ impl TlsConnector {
         };
         let conn = ClientConnection::new(self.config.clone(), name).map_err(tls_error)?;
         TlsStream::new(tcp, conn.into())
-            .handshake(self.handshake_timeout)
+            .handshake(self.handshake_timeout, Duration::ZERO, None)
             .await
     }
 }
@@ -781,6 +911,10 @@ pub struct TlsStream {
     /// Scratch buffer for outgoing TLS records, reused between writes while
     /// it is small (see [`WIRE_KEPT`]).
     wire: RefCell<Vec<u8>>,
+    /// The handshake has returned. From then on, records rustls queues in
+    /// answer to what arrives (TLS 1.3 key updates) may wait for the next
+    /// send instead of going out alone (see [`hold_output`](Self::hold_output)).
+    established: Cell<bool>,
     /// The peer closed the connection (with or without `close_notify`).
     eof: Cell<bool>,
     /// The peer ended its side with a `close_notify` alert, so nothing it
@@ -858,6 +992,7 @@ impl TlsStream {
             engine: RefCell::new(engine),
             plain: RefCell::new(plain),
             wire: RefCell::new(Vec::new()),
+            established: Cell::new(false),
             eof: Cell::new(peer_closed),
             close_notify: Cell::new(peer_closed),
             sending: Cell::new(false),
@@ -913,9 +1048,19 @@ impl TlsStream {
         }
     }
 
-    /// Runs the handshake, either side, within `limit`.
-    async fn handshake(self, limit: Duration) -> io::Result<Self> {
+    /// Runs the handshake, either side, within what is left of `limit`
+    /// after `spent`. `first` is what the peer sent first, if the caller
+    /// has received it already.
+    async fn handshake(
+        self,
+        limit: Duration,
+        spent: Duration,
+        first: Option<giong::RecvBuf>,
+    ) -> io::Result<Self> {
         let handshake = async {
+            if let Some(first) = first {
+                self.absorb(first).await?;
+            }
             while self.conn().is_handshaking() {
                 self.flush_tls().await?;
                 if !self.conn().is_handshaking() {
@@ -926,9 +1071,13 @@ impl TlsStream {
                 }
                 self.pump().await?;
             }
-            self.flush_tls().await
+            if !self.hold_output() {
+                self.flush_tls().await?;
+            }
+            self.established.set(true);
+            Ok(())
         };
-        match timeout(limit, handshake).await {
+        match timeout(limit.saturating_sub(spent), handshake).await {
             Ok(Ok(())) => Ok(self),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(handshake_timed_out(limit)),
@@ -942,6 +1091,33 @@ impl TlsStream {
         for waker in waiters {
             waker.wake();
         }
+    }
+
+    /// `true` if the records rustls has queued may wait for this stream's
+    /// next send, or for a receive that has to wait (see
+    /// [`pump`](Self::pump)), instead of going out alone now.
+    ///
+    /// That is the case once the handshake is over on a TLS 1.3 server,
+    /// whose only records then are session tickets, and on either side after
+    /// the handshake has returned, where they can only be key updates
+    /// answering the peer's (which TLS 1.3 asks to be sent before the next
+    /// data, not at once). A server's tickets then share a segment with its
+    /// first response, the way most clients send their `Finished` with
+    /// their first request. Never while handshaking, and never on TLS 1.2,
+    /// whose server sends its last flight after the client's `Finished`:
+    /// the peer waits for those records.
+    fn hold_output(&self) -> bool {
+        if self.established.get() {
+            // TLS 1.3 has no second handshake, and rustls refuses TLS 1.2
+            // renegotiation.
+            return true;
+        }
+        let conn = self.conn();
+        if conn.is_handshaking() {
+            return false;
+        }
+        (matches!(*conn, Connection::Server(_))
+            && conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3))
     }
 
     /// Takes the scratch buffer for outgoing records.
@@ -1029,7 +1205,13 @@ impl TlsStream {
     ///
     /// rustls takes up to its buffer limit (64 KiB) per call. Records a
     /// receive queued in the meantime (a key update, an alert) go out first.
-    async fn send_plain(&self, wire: &mut Vec<u8>, data: &[u8]) -> io::Result<()> {
+    ///
+    /// With `last` false, the records of the end of `data` may stay in
+    /// `wire` for the next piece of the same write to join them, so that a
+    /// response's head and body share one send; the caller passes `last`
+    /// true for the final piece. Records the caller found queued (`carried`)
+    /// are followed by a send in the same call.
+    async fn send_plain(&self, wire: &mut Vec<u8>, data: &[u8], last: bool) -> io::Result<()> {
         let mut sent = 0;
         while sent < data.len() {
             let (carried, refused) = {
@@ -1050,7 +1232,8 @@ impl TlsStream {
                 // instead and drops everything it is given from then on.
                 (carried, n > 0 && !has_application_data(&wire[start..]))
             };
-            if !wire.is_empty() {
+            let more = sent < data.len() || !last;
+            if !wire.is_empty() && (carried || refused || !more || wire.len() >= SEND_AT) {
                 self.send_wire(wire).await?;
             }
             if carried {
@@ -1076,11 +1259,17 @@ impl TlsStream {
         }
         let mut wire = self.take_wire();
         let mut res = Ok(());
-        for piece in pieces {
-            res = self.send_plain(&mut wire, piece).await;
+        for (i, piece) in pieces.iter().enumerate() {
+            res = self
+                .send_plain(&mut wire, piece, i + 1 == pieces.len())
+                .await;
             if res.is_err() {
                 break;
             }
+        }
+        if res.is_ok() && !wire.is_empty() {
+            // Records of pieces that came before empty last ones.
+            res = self.send_wire(&mut wire).await;
         }
         self.keep_wire(wire);
         // A failure on the socket has marked the stream broken already; one
@@ -1093,8 +1282,33 @@ impl TlsStream {
     /// Receives one chunk of TLS data, decrypts it into `plain`, and sends
     /// whatever the protocol wants to send in response.
     async fn pump(&self) -> io::Result<()> {
-        // Cancelling here loses nothing: `recv` is cancel safe.
-        let chunk = self.tcp.recv().await?;
+        // Records held back for the next send (see `hold_output`) go out
+        // now if the receive has to wait: the peer may be waiting for them.
+        let ready = if !self.broken.get() && self.conn().wants_write() {
+            poll_fn(|cx| Poll::Ready(self.tcp.poll_recv(cx))).await
+        } else {
+            Poll::Pending
+        };
+        let chunk = match ready {
+            Poll::Ready(chunk) => chunk?,
+            Poll::Pending => {
+                if !self.broken.get() && self.conn().wants_write() {
+                    // A failure marks the stream broken, for the next write
+                    // to report; it is no reason to withhold what arrives
+                    // (the peer may have sent its last data and gone).
+                    let _ = self.flush_tls().await;
+                }
+                // Cancelling here loses nothing: `recv` is cancel safe.
+                self.tcp.recv().await?
+            }
+        };
+        self.absorb(chunk).await
+    }
+
+    /// Decrypts a received `chunk` into `plain`, and sends whatever the
+    /// protocol wants to send in response (unless it may wait, see
+    /// [`hold_output`](Self::hold_output)).
+    async fn absorb(&self, chunk: giong::RecvBuf) -> io::Result<()> {
         if chunk.is_empty() {
             self.eof.set(true);
             return Ok(());
@@ -1153,7 +1367,7 @@ impl TlsStream {
         // Handshake messages, key updates, or the alert describing `result`.
         // Not being able to send them is no reason to withhold what was
         // received, if sending has failed before.
-        if self.broken.get() {
+        if self.broken.get() || (result.is_ok() && self.hold_output()) {
             return result;
         }
         let flushed = self.flush_tls().await;
@@ -1324,11 +1538,52 @@ impl TlsStream {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             };
-            self.send_plain(wire, &buf[..n]).await?;
+            self.send_plain(wire, &buf[..n], true).await?;
             at += n as u64;
             left -= n as u64;
         }
         Ok(())
+    }
+
+    /// Sends the records `shutdown` queued (`close_notify`, and any held
+    /// back before it) so that they share a segment with the FIN that
+    /// follows: one `send(2)` with `MSG_MORE` holds them in the socket until
+    /// `shutdown(2)` adds the FIN and pushes both. What that call cannot
+    /// take at once goes the usual way. The caller holds the send lock, so
+    /// no other send is in flight.
+    async fn send_closing(&self, wire: &mut Vec<u8>) -> io::Result<()> {
+        {
+            let mut conn = self.conn();
+            while conn.wants_write() {
+                conn.write_tls(wire)?;
+            }
+        }
+        // SAFETY: `wire` is valid for `wire.len()` bytes for the call.
+        let n = unsafe {
+            libc::send(
+                std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
+                wire.as_ptr().cast(),
+                wire.len(),
+                libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n >= 0 {
+            wire.drain(..n as usize);
+        } else {
+            let e = io::Error::last_os_error();
+            if !matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                self.broken.set(true);
+                wire.clear();
+                return Err(e);
+            }
+        }
+        if !wire.is_empty() {
+            self.send_wire(wire).await?;
+        }
+        self.send_queued(wire).await
     }
 
     /// Sends the TLS `close_notify` alert and closes the sending direction.
@@ -1337,6 +1592,14 @@ impl TlsStream {
     /// `TlsBroken` (`GIONG-E2008`). On a stream that can no longer send (a
     /// failed or cancelled write, keys used up, a second `shutdown`), only
     /// the TCP sending direction is closed, with no alert.
+    ///
+    /// If the peer has closed its socket already, so that the alert cannot
+    /// be delivered (`EPIPE`, `ECONNRESET`: a client that sent its own
+    /// `close_notify` and left, which the stream may not have read yet),
+    /// this returns `Ok`: the sending direction is closed either way, and
+    /// nobody is left to tell (Tokio's `TcpStream::shutdown` likewise
+    /// returns `Ok` for `ENOTCONN` after a reset). A failure of an earlier
+    /// write is still reported by that write.
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_ktls() {
             return self.kernel_shutdown().await;
@@ -1346,17 +1609,26 @@ impl TlsStream {
             self.conn().send_close_notify();
             self.closed.set(Some(Code::TlsBroken));
             let mut wire = self.take_wire();
-            let res = self.send_queued(&mut wire).await;
+            let res = self.send_closing(&mut wire).await;
             self.keep_wire(wire);
             if let Err(e) = res {
                 // Close the TCP side anyway, so the peer is not left waiting.
                 sending.done();
                 let _ = self.tcp.shutdown(Shutdown::Write);
-                return Err(e);
+                return if self.peer_gone(&e) { Ok(()) } else { Err(e) };
             }
         }
         sending.done();
         self.tcp.shutdown(Shutdown::Write)
+    }
+
+    /// `true` if `e`, from sending `close_notify`, only says that the peer
+    /// has closed its socket.
+    fn peer_gone(&self, e: &io::Error) -> bool {
+        matches!(
+            e.kind(),
+            io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+        )
     }
 
     /// `true` once the peer has ended the connection with a TLS
@@ -1419,6 +1691,57 @@ impl std::fmt::Debug for TlsStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The start of a ClientHello record listing `suites`, with a session
+    /// id of `id_len` bytes, cut after `keep` bytes.
+    fn client_hello(suites: &[u16], id_len: u8, keep: usize) -> Vec<u8> {
+        let mut hello = vec![22, 3, 1, 0, 0, 1, 0, 0, 0, 3, 3];
+        hello.extend_from_slice(&[7; 32]);
+        hello.push(id_len);
+        hello.extend(std::iter::repeat(9).take(id_len.into()));
+        hello.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
+        for suite in suites {
+            hello.extend_from_slice(&suite.to_be_bytes());
+        }
+        hello.extend_from_slice(&[1, 0]); // no compression
+        hello.truncate(keep);
+        hello
+    }
+
+    #[test]
+    fn chacha20_first_clients_are_told_apart() {
+        let all = usize::MAX;
+        // OpenSSL: AES-256-GCM, ChaCha20, AES-128-GCM.
+        assert!(!prefers_chacha(&client_hello(
+            &[0x1302, 0x1303, 0x1301],
+            32,
+            all
+        )));
+        // Browsers: AES-128-GCM first.
+        assert!(!prefers_chacha(&client_hello(
+            &[0x1301, 0x1302, 0x1303],
+            0,
+            all
+        )));
+        // A phone without AES instructions, after a GREASE value.
+        assert!(prefers_chacha(&client_hello(
+            &[0x0a0a, 0x1303, 0x1301],
+            32,
+            all
+        )));
+        // TLS 1.2 only.
+        assert!(prefers_chacha(&client_hello(&[0xcca9, 0xc02b], 0, all)));
+        assert!(!prefers_chacha(&client_hello(&[0xc02c, 0xcca9], 0, all)));
+        // Neither, cut short, or not a ClientHello: the server's order.
+        assert!(!prefers_chacha(&client_hello(&[0x009c], 0, all)));
+        let cut = client_hello(&[0x1303, 0x1301], 32, all).len() - 3;
+        assert!(!prefers_chacha(&client_hello(&[0x1303, 0x1301], 32, cut)));
+        assert!(!prefers_chacha(&client_hello(&[0x1303], 32, 40)));
+        assert!(!prefers_chacha(&[]));
+        let mut alert = client_hello(&[0x1303], 0, all);
+        alert[0] = 21;
+        assert!(!prefers_chacha(&alert));
+    }
 
     fn ca_pem(name: &str) -> String {
         let key = rcgen::KeyPair::generate().unwrap();

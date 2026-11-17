@@ -54,6 +54,35 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-tls** (**behaviour change**): `TlsAcceptor::from_pem` picks AES-128-GCM first of
+  the cipher suites both sides allow, whatever order the client lists, as Go's and
+  BoringSSL's servers do; a client that lists ChaCha20-Poly1305 before every AES-GCM suite
+  (one without AES instructions) still gets ChaCha20. OpenSSL's clients (wrk, curl, Python)
+  list AES-256-GCM first, whose TLS 1.3 suite hashes with SHA-384, about a sixth of a
+  resumed handshake's CPU time. With `bench/tls.sh` (4-vCPU VM, 7 rounds, raw data in
+  `bench/results/tls/`), new connections went from 6.8k to 8.4k per second (142 to 116 µs
+  of CPU each) together with the next entry, against 7.1k for axum + rustls; axum set to
+  the same order reaches the same 8.4k, so the suite is most of the gain. 64 KiB responses
+  went from 26.3k to 31.9k per second. An acceptor made with `TlsAcceptor::new` uses its
+  configuration as given.
+- **giong-tls**: fewer TCP segments per connection. A TLS 1.3 server's session tickets
+  wait for its first response, or for a receive that has to wait, instead of going out
+  alone; later key updates answering the peer's wait the same way; `shutdown` sends
+  `close_notify` with `MSG_MORE`, so it shares the FIN's segment; and the pieces of one
+  vectored write share one send. Per `Connection: close` request, both directions: 14.4
+  segments against 16.5 (axum + rustls: 14.0), and p99 latency 4.2 ms against 5.8.
+- **giong-compat**: a write at least as large as the write buffer's limit (64 KiB by
+  default), with nothing buffered or being sent before it, goes straight from the caller's
+  memory to the socket in one `sendmsg(2)` that does not wait, as `BufWriter` and Tokio's
+  streams do, instead of being copied into the buffer first; what the socket cannot take
+  at once is still buffered. `bench/compat.sh` (raw data in `bench/results/compat/`): CPU
+  per KiB sent 378 ns against 400 for 0.8.0's `Compat`, and within 2–9% of Tokio over two
+  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged: 30% more CPU per byte than Tokio
+  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive.
+- **giong-tls** (**behaviour change**): `TlsStream::shutdown` returns `Ok` when the
+  `close_notify` cannot be sent because the peer has closed its socket already (`EPIPE`,
+  `ECONNRESET`): the sending direction is closed either way and nobody is left to tell.
+  An h2 server over `Compat` reported such a client's clean departure as an error.
 - **giong-postgres**, **giong-mysql**, **giong-redis**: on plain TCP and Unix sockets a
   connection has the kernel write what the server sends straight into its read buffer (a
   one-off receive of up to 64 KiB) instead of copying it there from the runtime's pooled
