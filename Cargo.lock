@@ -328,9 +328,11 @@ name = "giong-tls"
 version = "0.8.0"
 dependencies = [
  "giong",
+ "giong-tls",
  "libc",
  "rcgen",
  "rustls",
+ "rustls-pki-types",
  "webpki-roots",
 ]
 
