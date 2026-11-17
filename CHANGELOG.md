@@ -67,6 +67,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
+- **net**: UDP is faster than Tokio's on both drivers. A UDP echo server on one core (64-byte
+  datagrams, veth, `bench/udp-echo.sh`, 5 rounds, `bench/results/udp-echo/`) answers 330,000
+  datagrams a second with 16 tasks on one socket on io_uring (266,000 before, Tokio 287,000)
+  and 350,000 with one task (265,000 before, Tokio 277,000); on epoll 302,000 in both cases
+  (262,000 and 242,000 before). `UdpSocket::send_to` and `send` send within the call when the
+  socket has room, instead of through an operation that waited a turn of the event loop
+  (io_uring) or allocated a message header (both), and use `sendto(2)` rather than
+  `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
+  now costs one system call on either driver where Tokio makes two. Immediate sends count
+  against the task's budget, so a task that only sends still gives way to the others.
+
 ### Deprecated
 
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
@@ -75,6 +86,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **net**: tasks that share a `UdpSocket` and wait in `recv_from` at the same time are each
+  woken for a datagram of their own. On io_uring they shared one wake-up slot: only the
+  last task to wait was woken, the others saw their datagrams only when something else
+  woke them, and a server of 16 tasks on one socket made one kernel entry per datagram. A
+  task that stops waiting (its receive timed out) no longer takes the wake-up of the next
+  datagram.
 - **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
   pool opened its first connection (the random part of the lifetime was computed as a tenth
   of it times up to 999); a lifetime too long for the clock now means none, as
