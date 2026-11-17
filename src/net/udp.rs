@@ -486,10 +486,11 @@ impl UdpSocket {
                 return;
             }
             let key = self.recv.key(w);
+            let space = if self.control.get() { CONTROL_SPACE } else { 0 };
             let mut driver = w.driver.borrow_mut();
             while n < max {
                 match driver.take_ready_multi(key) {
-                    Some(MultiPoll::Data(buf)) => match Datagram::parse(buf) {
+                    Some(MultiPoll::Data(buf)) => match Datagram::parse(buf, space) {
                         Ok(d) => {
                             out.push(d);
                             n += 1;
@@ -890,6 +891,17 @@ impl UdpSocket {
                 (*m).hdr.msg_control = control.cast();
                 (*m).hdr.msg_controllen = at as _;
             }
+        }
+        // At once where the socket has room (see `Driver::try_send_to`).
+        let fd = self.sock.as_raw_fd();
+        // SAFETY: as above; the header lives until the end of this function.
+        let hdr = unsafe { ptr::addr_of!((*m).hdr) };
+        if let Some(res) = runtime::with_worker(|w| w.driver.borrow_mut().try_sendmsg(fd, hdr)) {
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
         }
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),

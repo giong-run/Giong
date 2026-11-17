@@ -800,6 +800,13 @@ impl Driver {
         }
     }
 
+    /// [`try_send_to`](Self::try_send_to) for a prepared message (control
+    /// data such as `UDP_SEGMENT`): `sendmsg(2)`.
+    pub(crate) fn try_sendmsg(&mut self, fd: RawFd, msg: *const libc::msghdr) -> Option<i32> {
+        // SAFETY: the caller's header points at live buffers.
+        send_now(|| unsafe { libc::sendmsg(fd, msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) })
+    }
+
     /// Sends the datagrams in `msgs` with one `sendmmsg(2)`, without
     /// blocking: how many went (the first error if none did), or `None`
     /// when the socket is full or the task's budget is spent.
