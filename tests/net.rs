@@ -956,3 +956,39 @@ fn bind_refuses_a_host_name_and_says_what_to_write() {
         TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
     });
 }
+
+/// A write dropped while its send waits in the driver may still send its
+/// bytes later; a write after it must not overtake them. The server sees
+/// the dropped write's bytes (all, some or none) strictly before the next
+/// write's.
+#[test]
+fn a_write_after_a_dropped_write_is_not_reordered() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let server = giong::spawn(async move {
+            let s = l.accept().await.unwrap();
+            // Let the client fill the socket before reading.
+            sleep(Duration::from_millis(50)).await;
+            let mut all = Vec::new();
+            loop {
+                let (res, buf) = s.read(Vec::with_capacity(64 * 1024)).await;
+                if res.unwrap() == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf);
+            }
+            all
+        });
+        let c = TcpStream::connect(addr).await.unwrap();
+        // Far more than the socket buffers hold: the send stays in the driver.
+        let big = vec![b'a'; 32 << 20];
+        let dropped = timeout(Duration::from_millis(5), c.write_all(big)).await;
+        assert!(dropped.is_err(), "32 MiB went out in 5 ms");
+        let (res, _) = c.write_all(b"END".to_vec()).await;
+        res.unwrap();
+        c.shutdown(Shutdown::Write).unwrap();
+        let all = server.await.unwrap();
+        assert!(all.ends_with(b"END"), "the last write was overtaken");
+        assert!(all[..all.len() - 3].iter().all(|&b| b == b'a'));
+    });
+}

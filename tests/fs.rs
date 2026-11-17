@@ -1092,3 +1092,59 @@ fn allocations_dropped_mid_flight_are_cleaned_up() {
         file.close().await.unwrap();
     });
 }
+
+/// Reads served from the page cache within the call still let the other
+/// tasks of the worker run: a task reading a cached file in a loop yields.
+#[test]
+fn cached_reads_in_a_loop_let_other_tasks_run() {
+    let dir = TempDir::new("cached-loop");
+    let path = dir.path("data");
+    std::fs::write(&path, payload(64 * 1024, 7)).unwrap();
+    giong::block_on(async move {
+        let ticks = Rc::new(std::cell::Cell::new(0u32));
+        let ticker = giong::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.set(ticks.get() + 1);
+                    giong::yield_now().await;
+                }
+            }
+        });
+        let file = File::open(&path).await.unwrap();
+        let mut buf = Vec::with_capacity(4096);
+        for i in 0..2_000u64 {
+            let (res, b) = file.read_at(buf, (i % 16) * 4096).await;
+            assert_eq!(res.unwrap(), 4096);
+            buf = b;
+        }
+        ticker.abort();
+        assert!(
+            ticks.get() >= 5,
+            "only {} ticks during 2,000 reads",
+            ticks.get()
+        );
+    });
+}
+
+/// A read whose bytes are cached returns them, and reads past the end of
+/// the file still return 0.
+#[test]
+fn cached_reads_return_the_right_bytes_and_end_of_file() {
+    let dir = TempDir::new("cached-bytes");
+    let path = dir.path("data");
+    let data = payload(10_000, 3);
+    std::fs::write(&path, &data).unwrap();
+    giong::block_on(async move {
+        let file = File::open(&path).await.unwrap();
+        for offset in [0u64, 1, 4095, 4096, 9_999] {
+            let (res, buf) = file.read_at(Vec::with_capacity(4096), offset).await;
+            let n = res.unwrap();
+            assert!(n > 0);
+            assert_eq!(&buf[..], &data[offset as usize..offset as usize + n]);
+        }
+        let (res, _) = file.read_at(Vec::with_capacity(16), 10_000).await;
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(fs::read(&path).await.unwrap(), data);
+    });
+}

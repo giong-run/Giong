@@ -283,3 +283,26 @@ fn block_on_inside_a_runtime_panics_with_its_code() {
         sleep(Duration::from_millis(1)).await;
     });
 }
+
+/// Many spawns in a row reuse waker states, and every task still gets its
+/// own wake-ups.
+#[test]
+fn reused_task_states_wake_the_right_task() {
+    giong::block_on(async {
+        for round in 0..50u64 {
+            let mut handles = Vec::new();
+            for i in 0..20u64 {
+                handles.push(giong::spawn(async move {
+                    for _ in 0..(i % 3) {
+                        giong::yield_now().await;
+                    }
+                    sleep(Duration::from_millis(i % 2)).await;
+                    round * 100 + i
+                }));
+            }
+            for (i, h) in handles.into_iter().enumerate() {
+                assert_eq!(h.await.unwrap(), round * 100 + i as u64);
+            }
+        }
+    });
+}
