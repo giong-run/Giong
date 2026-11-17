@@ -1893,6 +1893,17 @@ pub unsafe extern "C" fn pread64(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn preadv2(
+    fd: c_int,
+    iov: *const libc::iovec,
+    count: c_int,
+    off: libc::off_t,
+    flags: c_int,
+) -> ssize_t {
+    files::preadv2(fd, iov, count, off, flags)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pwrite64(
     fd: c_int,
     buf: *const c_void,

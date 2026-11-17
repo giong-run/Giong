@@ -332,6 +332,12 @@ impl File {
             return (Err(e), buf);
         }
         let len = buf.capacity().min(u32::MAX as usize) as u32;
+        // From the page cache at once when it is there (see `read_cached`).
+        if let Some(res) = crate::driver::read_cached(self.fd, buf.as_mut_ptr(), len, offset) {
+            // SAFETY: the kernel wrote `res` bytes at the start of the buffer.
+            unsafe { buf.set_init(res as usize) };
+            return (Ok(res as usize), buf);
+        }
         let io = Io::Read {
             fd: self.fd,
             buf: buf.as_mut_ptr(),
@@ -671,7 +677,9 @@ pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     let file = File::open(path).await?;
     // The size is only a hint: files in /proc report 0, and a file may grow
     // while it is being read.
-    let hint = file.metadata().await.map_or(0, |m| m.len()) as usize;
+    // Read with a plain `fstat` (see `File::len`): one system call instead
+    // of a trip through the ring for a number that is only a hint.
+    let hint = file.len().unwrap_or(0) as usize;
     let mut data = Vec::with_capacity(hint.saturating_add(1));
     let mut chunk = Vec::new();
     loop {
