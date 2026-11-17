@@ -291,12 +291,13 @@ rustls is set to the cipher suite giong-tls prefers.
 
 What `Compat` adds is measured on its own, on one TCP stream with no protocol on top
 ([giong-compat](giong-compat/README.md#what-it-costs)): large writes go straight from the
-caller's memory to the socket, within 2–9% of Tokio's CPU per byte sent (until 0.8.0 they
-were copied first: 25% above Tokio in a session the same day); against giong's own `recv`, 6–16% more CPU per byte read
-with `read`, and no measurable difference through `AsyncBufRead`; 1–5% more CPU per small
-request and reply. Receiving costs more CPU per byte than Tokio's own (17% through
-`AsyncBufRead`, 30% with `read`, in the latest session), most of it in giong's own receive
-into 8 KiB pool buffers.
+caller's memory to the socket, from 9% above to 6% below Tokio's CPU per byte sent over the
+last two sessions (until 0.8.0 they were copied first: 25% above Tokio in a session the same
+day); against giong's own `recv`, 6–16% more CPU per byte read with `read`, and no measurable
+difference through `AsyncBufRead`; up to 5% more CPU per small request and reply, and level
+with Tokio there. Receiving costs more CPU per byte than Tokio's own (14% through
+`AsyncBufRead`, 19% with `read`, in the latest session, with 16 KiB receive buffers; 17% and
+30% with 8 KiB), most of it in giong's own receive (12% above Tokio).
 A protocol crate over `Compat` brings its own design on top of that, and none has been
 measured against the giong crate for the same protocol. The reason to prefer the giong
 crate is its design (step 1) and the gaps in the table, measured against these Tokio

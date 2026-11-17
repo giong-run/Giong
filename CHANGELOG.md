@@ -77,8 +77,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   streams do, instead of being copied into the buffer first; what the socket cannot take
   at once is still buffered. `bench/compat.sh` (raw data in `bench/results/compat/`): CPU
   per KiB sent 378 ns against 400 for 0.8.0's `Compat`, and within 2–9% of Tokio over two
-  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged: 30% more CPU per byte than Tokio
-  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive.
+  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged by it: 30% more CPU per byte than Tokio
+  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive; 19% and 14% with
+  the 16 KiB receive buffers below, where `Compat` sends at 6% less CPU per KiB than Tokio.
 - **giong-tls** (**behaviour change**): `TlsStream::shutdown` returns `Ok` when the
   `close_notify` cannot be sent because the peer has closed its socket already (`EPIPE`,
   `ECONNRESET`): the sending direction is closed either way and nobody is left to tell.

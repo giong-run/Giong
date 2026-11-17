@@ -145,24 +145,26 @@ giong reads into buffers from the worker's pool and writes buffers it owns until
 - **Reading:** each byte once more than giong's own `recv`, from the pool buffer into the caller's buffer. Through `AsyncBufRead` (`fill_buf`, then `consume` of the whole chunk) there is no extra copy. When a caller takes only part of a chunk, the rest moves to a heap buffer at once, so that a slow reader never holds on to the worker's pool.
 - **Writing:** small writes are copied into the write buffer, which giong's `write_all` sends at a flush or when it fills; one small allocation per send (the future that sends it). A write at least as large as the buffer's limit (64 KiB by default), with nothing buffered or being sent before it, goes straight from the caller's memory to the socket in one `sendmsg(2)` that does not wait, as `BufWriter` and Tokio's streams do; only what the socket cannot take at once is copied.
 
-Measured with [`bench/compat.sh`](../bench/compat.sh): one TCP stream over loopback, the measured side on one pinned core and the other end on another, the same peer for every variant, 9 runs interleaved. Median, with the range of the 9 runs in brackets. The machine is a 4-vCPU cloud VM (Xeon at 2.1 GHz, Linux 6.18), where bulk transfers over loopback vary from run to run and from one session to the next: read the medians, the spread, and the sessions below. This session (2026-11-17, [`bench/results/compat/`](../bench/results/compat/README.md)) ran this version and, interleaved, `Compat` from 0.8.0.
+Measured with [`bench/compat.sh`](../bench/compat.sh): one TCP stream over loopback, the measured side on one pinned core and the other end on another, the same peer for every variant, 9 runs interleaved. Median, with the range of the 9 runs in brackets. The machine is a 4-vCPU cloud VM (Xeon at 2.1 GHz, Linux 6.18), where bulk transfers over loopback vary from run to run and from one session to the next: read the medians, the spread, and the sessions below. This session (2026-11-17, [`bench/results/compat/`](../bench/results/compat/README.md)) ran this version, with giong's default receive buffers of 16 KiB (8 KiB until 0.8.0), and, interleaved, `Compat` from 0.8.0 on giong 0.8.0.
 
 | Workload | giong's own API | `Compat` | `Compat` 0.8.0 | `Compat`, `AsyncBufRead` | Tokio |
 |---|---|---|---|---|---|
-| Receive 2 GiB (peer writes 256 KiB at a time), MiB/s | 3156 [2935–3541] | 3191 [2826–3339] | 3183 [2823–3310] | 3148 [2929–3275] | 2908 [2726–3028] |
-| CPU per KiB received | 167 ns | 192 ns | 188 ns | 173 ns | 148 ns |
-| Send 2 GiB from a 64 KiB buffer, MiB/s | 2927 [2513–3102] | 2496 [2274–3015] | 2401 [2132–2635] | | 2749 [2242–2969] |
-| CPU per KiB sent | 331 ns | 378 ns | 400 ns | | 347 ns |
-| 64-byte request and reply, round trips/s | 29,649 [27,983–31,331] | 29,356 [27,258–31,375] | 28,684 [27,791–29,825] | | 28,402 [27,586–30,747] |
-| CPU per round trip | 16.0 µs | 16.6 µs | 16.5 µs | | 16.3 µs |
+| Receive 2 GiB (peer writes 256 KiB at a time), MiB/s | 3124 [2876–3506] | 3197 [2946–3677] | 3503 [2703–4034] | 3280 [3045–3493] | 3041 [2479–3695] |
+| CPU per KiB received | 139 ns | 147 ns | 170 ns | 141 ns | 124 ns |
+| Send 2 GiB from a 64 KiB buffer, MiB/s | 2737 [2069–3196] | 2535 [2255–4642] | 2381 [2201–2553] | | 2404 [2266–3100] |
+| CPU per KiB sent | 351 ns | 379 ns | 407 ns | | 404 ns |
+| 64-byte request and reply, round trips/s | 33,815 [30,808–35,058] | 34,331 [31,586–35,290] | 33,159 [31,855–34,394] | | 34,194 [32,267–35,948] |
+| CPU per round trip | 13.8 µs | 13.7 µs | 14.8 µs | | 14.0 µs |
 
 Where `Compat` is behind Tokio, and why:
 
-- **Receiving**, 30% more CPU per KiB with `read` and 17% with `AsyncBufRead`. Most of it is giong's own receive (13% above Tokio here): it receives into the worker's 8 KiB pool buffers, so 2 GiB take eight times as many completions as Tokio's 64 KiB reads; with 64 KiB pool buffers (`Builder::recv_buffers`) giong's own receive measured 166 ns against 188 in a shorter run. `read` then copies each byte once more into the caller's buffer, which `AsyncBufRead` avoids. Reading from the socket straight into the caller's buffer, as Tokio does, is not safe while giong's multishot receive is armed: data it has already taken could be handed out after data read later.
-- **Sending**, 9% more CPU per KiB than Tokio in this session (5% less than 0.8.0's `Compat`); an earlier session of the same build measured 376 against 368 ns (2%).
+- **Receiving**, 19% more CPU per KiB with `read` and 14% with `AsyncBufRead` (30% and 17% in the session before, with 8 KiB receive buffers). Most of it is giong's own receive (12% above Tokio here): it receives into the worker's 16 KiB pool buffers, so 2 GiB take four times as many completions as Tokio's 64 KiB reads; 32 and 64 KiB pool buffers (`Builder::recv_buffers`) measured no better than 16 KiB. `read` then copies each byte once more into the caller's buffer, which `AsyncBufRead` avoids. Reading from the socket straight into the caller's buffer, as Tokio does, is not safe while giong's multishot receive is armed: data it has already taken could be handed out after data read later.
+
+Where it is ahead: **sending**, 6% less CPU per KiB than Tokio in this session (7% less than 0.8.0's `Compat`; 9% and 2% more than Tokio in the two sessions before, on 8 KiB receive buffers, so read it as level), and **request and reply**, 2% less CPU per round trip than Tokio.
+
 CPU is the measured thread's own (user and system, `CLOCK_THREAD_CPUTIME_ID`).
 
-The cost of `Compat` moves from one session of 9 runs to the next by more than the difference it measures. Seven sessions on the same machine type, each the medians of 9 runs, `Compat` against giong's own API:
+The cost of `Compat` moves from one session of 9 runs to the next by more than the difference it measures. Eight sessions on the same machine type, each the medians of 9 runs, `Compat` against giong's own API:
 
 | Session (commit) | Send, MiB/s | Send, CPU per KiB | Receive with `read`, CPU per KiB | Receive with `AsyncBufRead`, CPU per KiB | Request and reply, round trips/s | CPU per round trip |
 |---|---|---|---|---|---|---|
@@ -172,14 +174,15 @@ The cost of `Compat` moves from one session of 9 runs to the next by more than t
 | 4 (`8632eb7`) | −10.3% | +14.6% | +13.1% | −4.6% | −1.9% | +1.4% |
 | 5 (0.5.0 with #83) | +5.9% | −4.4% | +6.8% | −6.0% | +0.7% | +1.7% |
 | 6 (0.5.0 with #83) | −4.3% | +4.6% | +15.8% | +4.4% | +0.7% | +1.9% |
-| 7 (this version, the table above) | −14.7% | +14.2% | +15.5% | +3.7% | −1.0% | +3.6% |
+| 7 (`8606db1` with #146) | −14.7% | +14.2% | +15.5% | +3.7% | −1.0% | +3.6% |
+| 8 (this version, 16 KiB receive buffers, the table above) | −7.4% | +7.8% | +5.7% | +1.7% | +1.5% | −0.7% |
 
 What the numbers say:
 
-- **Sending** large writes now goes straight from the caller's memory to the socket (session 7). Until 0.8.0 each byte was copied into the write buffer first (under callgrind, `memcpy` was 96% of the user-space instructions `Compat` ran on this workload), which cost 10–20% of throughput and 14–25% more CPU per byte against giong's own `write_all` in sessions 1–4. In session 7 `Compat` sends at 5% less CPU per byte than 0.8.0's, within 2–9% of Tokio over the two sessions of this build. giong's own `write_all` measured faster than both in session 7 (331 ns per KiB against Tokio's 347), which is why the column against it still shows +14%. Small writes are still gathered and copied: that is what lets `Compat` send one segment per flush.
-- **Receiving** through `read` costs 6–16% more CPU per byte than giong's own `recv`, for the copy into the caller's buffer, at the same throughput. Through `AsyncBufRead` (`fill_buf`, then `consume`) there is no copy: the seven sessions put it between 6% below and 9% above giong's own cost, which is the noise between sessions.
-- **Request and reply** differ by less than the noise in throughput; the CPU per round trip is 1–5% higher. Callgrind counts about 1,000 more user-space instructions per round trip (the boxed send, the flush, one more poll), against roughly 16 µs spent mostly in the kernel.
-- **Tokio's own receive spends less CPU per KiB** than giong's `recv` on this benchmark, 6–20% less across the sessions. That gap is giong's own, not `Compat`'s.
+- **Sending** large writes now goes straight from the caller's memory to the socket (sessions 7 and 8). Until 0.8.0 each byte was copied into the write buffer first (under callgrind, `memcpy` was 96% of the user-space instructions `Compat` ran on this workload), which cost 10–20% of throughput and 14–25% more CPU per byte against giong's own `write_all` in sessions 1–4. In sessions 7 and 8 `Compat` sends at 5–7% less CPU per byte than 0.8.0's, from 9% above to 6% below Tokio. giong's own `write_all` measured faster than both (331 and 351 ns per KiB against Tokio's 347 and 404), which is why the column against it still shows +8% to +14%. Small writes are still gathered and copied: that is what lets `Compat` send one segment per flush.
+- **Receiving** through `read` costs 6–16% more CPU per byte (5.7% in session 8) than giong's own `recv`, for the copy into the caller's buffer, at the same throughput. Through `AsyncBufRead` (`fill_buf`, then `consume`) there is no copy: the eight sessions put it between 6% below and 9% above giong's own cost, which is the noise between sessions.
+- **Request and reply** differ by less than the noise in throughput; the CPU per round trip is up to 5% higher (0.7% lower in session 8). Callgrind counts about 1,000 more user-space instructions per round trip (the boxed send, the flush, one more poll), against 14 to 16 µs spent mostly in the kernel.
+- **Tokio's own receive spends less CPU per KiB** than giong's `recv` on this benchmark: 11% less in session 8, with 16 KiB receive buffers, and 6–20% less in the sessions before, with 8 KiB. Each receive brings at most one buffer, so Tokio's 64 KiB reads take fewer system calls. That gap is giong's own, not `Compat`'s.
 
 Run it with `bench/compat.sh` (the method is at the top of the script, and in [`bench/compat/src/main.rs`](../bench/compat/src/main.rs)); the raw numbers of the latest session are in [`bench/results/compat/`](../bench/results/compat/), the earlier ones in its `sessions/` folder.
 
