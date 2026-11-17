@@ -39,6 +39,7 @@ const SLOT_MASK: u64 = (SLOTS as u64) - 1;
 const MAX_TICKS: u64 = 1 << (6 * LEVELS);
 const NIL: usize = usize::MAX;
 const NANOS_PER_TICK: u128 = 1_000_000;
+const TICK: Duration = Duration::from_millis(1);
 
 pub(crate) type TimerKey = (usize, u64);
 
@@ -325,7 +326,22 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if Instant::now() >= self.deadline {
+        // The worker's clock of this turn of its loop: one clock read shared
+        // by every timer polled in the turn. It is never ahead of the real
+        // time, so a sleep never ends early. A deadline within a tick of it
+        // may already have passed in real time (a zero timeout, a sleep
+        // polled late in a long turn): those check the real clock, so they
+        // end now rather than a tick later.
+        let now = runtime::try_with_worker(|w| {
+            let now = w.clock();
+            if self.deadline > now && self.deadline - now <= TICK {
+                w.refresh_clock()
+            } else {
+                now
+            }
+        })
+        .unwrap_or_else(Instant::now);
+        if now >= self.deadline {
             self.unregister();
             return Poll::Ready(());
         }

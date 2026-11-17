@@ -420,6 +420,8 @@ pub(crate) struct Worker {
     /// Turns of the event loop so far (wraps).
     pub(crate) turn: Cell<u32>,
     pub(crate) timers: RefCell<Timers>,
+    /// The time read in this turn of the loop, if any (see [`Worker::clock`]).
+    now: Cell<Option<Instant>>,
     pub(crate) pool: Rc<BufPool>,
     pub(crate) next_task_uid: Cell<u64>,
     /// How long to busy-poll for new work before blocking in the kernel.
@@ -507,6 +509,7 @@ impl Worker {
             sends: RefCell::new(crate::net::SendQueue::new()),
             turn: Cell::new(0),
             timers: RefCell::new(Timers::new()),
+            now: Cell::new(None),
             pool,
             next_task_uid: Cell::new(1),
             spin: cfg.spin,
@@ -846,11 +849,33 @@ impl Worker {
         }
     }
 
+    /// The current time, read at most once per turn of the event loop: the
+    /// first timer polled in a turn reads the clock and the others reuse it.
+    pub(crate) fn clock(&self) -> Instant {
+        match self.now.get() {
+            Some(now) => now,
+            None => {
+                let now = Instant::now();
+                self.now.set(Some(now));
+                now
+            }
+        }
+    }
+
+    /// Reads the clock again and keeps the new time for the rest of the turn.
+    pub(crate) fn refresh_clock(&self) -> Instant {
+        let now = Instant::now();
+        self.now.set(Some(now));
+        now
+    }
+
     fn fire_timers(&self) {
+        // Time has passed in the kernel: the next read is a fresh one.
+        self.now.set(None);
         if self.timers.borrow().len() == 0 {
             return;
         }
-        let expired = self.timers.borrow_mut().expired(Instant::now());
+        let expired = self.timers.borrow_mut().expired(self.clock());
         for waker in expired {
             waker.wake();
         }
