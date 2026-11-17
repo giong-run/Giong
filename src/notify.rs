@@ -28,6 +28,12 @@ impl RunFlag {
         Self(AtomicBool::new(queued))
     }
 
+    /// Sets the flag on a waker state that nobody else can see yet (a
+    /// retired task's state about to serve a new task).
+    pub(crate) fn reset(&self, queued: bool) {
+        self.0.store(queued, Ordering::Relaxed);
+    }
+
     /// Called by a waker after it has published the task's new state.
     /// Returns `true` if the caller must put the task in the run queue.
     pub(crate) fn try_enqueue(&self) -> bool {

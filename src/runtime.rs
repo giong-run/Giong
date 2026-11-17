@@ -413,6 +413,8 @@ pub(crate) struct Worker {
     deferred: RefCell<Deferred>,
     pub(crate) tasks: RefCell<Slab<TaskSlot>>,
     pub(crate) queue: RefCell<VecDeque<usize>>,
+    /// Waker states of finished tasks, reused by the next spawns.
+    pub(crate) spare_wakers: RefCell<Vec<Arc<crate::executor::TaskWaker>>>,
     /// Datagrams sent in this turn of the loop, for one `sendmmsg` at its end.
     pub(crate) sends: RefCell<crate::net::SendQueue>,
     /// Turns of the event loop so far (wraps).
@@ -501,6 +503,7 @@ impl Worker {
             deferred: RefCell::new(Deferred::default()),
             tasks: RefCell::new(Slab::new()),
             queue: RefCell::new(VecDeque::with_capacity(256)),
+            spare_wakers: RefCell::new(Vec::new()),
             sends: RefCell::new(crate::net::SendQueue::new()),
             turn: Cell::new(0),
             timers: RefCell::new(Timers::new()),
