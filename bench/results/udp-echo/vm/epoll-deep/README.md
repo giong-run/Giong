@@ -2,32 +2,37 @@
 
 Same harness and machine as `../README.md` (`bench/udp-echo.sh`, one server core, 64-byte
 datagrams over veth, 5 rounds of 8 seconds, medians with the range in `summary.txt`, every
-round in `raw.csv`). `before-*` is branch perf/udp-faster (168d0f7); `after-*` is this
-branch. Both were run in the same session, one after the other.
+round in `raw.csv`). `before-*` is branch perf/udp-faster (19450d1); `after-*` is this
+branch (7fc2c8a). Both were run in the same session, one after the other.
 
 Echoes per second (median):
 
 | | 16 tasks | 1 task |
 |---|---:|---:|
-| giong epoll, before | 331,931 | 358,820 |
-| giong epoll, after | **394,104** | **368,732** |
-| giong io_uring, before | 362,904 | 355,954 |
-| giong io_uring, after | 355,204 | 347,126 |
-| Tokio | 295,484 | 300,844 |
-| kernel `recvmmsg`/`sendmmsg` × 32 | 421,493 | 431,274 |
+| giong epoll, before | 284,118 | 284,248 |
+| giong epoll, after | **335,535** | **351,241** |
+| giong io_uring, before | 328,288 | 299,703 |
+| giong io_uring, after | 319,380 | 346,643 |
+| Tokio | 270,672 | 307,195 |
+| kernel `recvmmsg`/`sendmmsg` × 32 | 389,686 | 366,291 |
+
+Tokio ran in both sessions: 277,780 and 258,803 next to `before`, 270,672 and 307,195 next
+to `after` (the row above).
 
 Server CPU per echo (its process plus softirq on its core), µs:
 
 | | 16 tasks | 1 task |
 |---|---:|---:|
-| giong epoll, before | 4.21 | 3.81 |
-| giong epoll, after | **3.26** | **3.68** |
-| giong io_uring, after | 3.72 | 3.92 |
-| Tokio | 4.78 | 4.65 |
-| kernel × 32 | 3.14 | 3.08 |
+| giong epoll, before | 5.07 | 5.07 |
+| giong epoll, after | **4.08** | **3.89** |
+| giong io_uring, after | 4.37 | 4.10 |
+| Tokio | 5.33 | 4.68 |
+| kernel × 32 | 3.55 | 3.81 |
 
 This VM varies by about 15% between runs (see the ranges); the CPU per echo moves less
-than the rate.
+than the rate. An earlier run of this branch, in a faster session, measured 394,104 echoes
+per second with 16 tasks on epoll against a kernel ceiling of 421,493 (94%); this one is
+86% of the ceiling.
 
 ## What was left, and what changed
 
@@ -47,11 +52,11 @@ things the kernel-only server does not pay.
    (`sock_wfree`, through `sock_def_write_space`) takes the queue's lock and calls epoll's
    callback: 7.1% of the server's CPU in `sock_wfree` against 1.5% for the kernel-only
    server, plus 2.4% more in `sock_def_readable`. A datagram socket that has received 64
-   datagrams since it was added now leaves the set at its next event, and comes back
+   datagrams since it was added now leaves the set at the end of that turn of the event loop, and comes back
    (`EPOLL_CTL_ADD`, which reports readiness already there) only when a task has to wait
    for it. A socket that stays busy pays for no wake-ups at all; one that goes quiet pays
-   at most two `epoll_ctl` per 64 datagrams. Streams never leave the set. This took the
-   16-task run from 337,000 to about 395,000.
+   at most two `epoll_ctl` per 64 datagrams. Streams never leave the set. With both
+   changes the 16-task run goes from 284,000 to 336,000 in the session above.
 
 What is left against the kernel-only server is giong's own code (about 6% of the CPU:
 the tasks, the waker queue, copying each datagram into the task's buffer) and the epoll

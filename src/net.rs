@@ -765,9 +765,9 @@ impl StreamSocket {
             }
             let mut driver = w.driver.try_borrow_mut().ok()?;
             // The epoll driver already sends within the operation's first poll.
-            // Operations still queued for the kernel go first: a send made
-            // directly would overtake them, cancellations included.
-            if driver.kind() != crate::DriverKind::IoUring || driver.has_queued_submissions() {
+            // `try_send` declines while operations wait for the kernel: a send
+            // made directly would overtake them, cancellations included.
+            if driver.kind() != crate::DriverKind::IoUring {
                 return None;
             }
             driver.try_send(self.sock.as_raw_fd(), bytes)

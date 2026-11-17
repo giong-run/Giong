@@ -1,16 +1,21 @@
+builds: old = main 8606db1 (giong-compat 0.8.0), new = this change; 9 interleaved runs
 
-recv: MiB/s and CPU ns/KiB, median [min-max] of 9 runs
-  giong                3278 [2968-3407]      134.30 [122.10-149.10]
-  compat               3290 [2703-3854]      153.90 [138.20-172.50]
-  compat-bufread       3415 [3221-3536]      136.90 [130.30-157.50]
-  tokio                3098 [2765-7263]      120.00 [102.50-133.20]
+recv: MiB/s and CPU ns/KiB, median [min-max]
+  new  giong                3156 [2935-3541]      166.60 [159.10-184.20]
+  old  compat               3183 [2823-3310]      188.30 [178.70-209.10]
+  new  compat               3191 [2826-3339]      192.40 [173.90-218.50]
+  old  compat-bufread       3163 [3019-4402]      168.90 [157.90-178.60]
+  new  compat-bufread       3148 [2929-3275]      172.70 [152.70-181.80]
+  new  tokio                2908 [2726-3028]      147.90 [141.20-156.30]
 
-send: MiB/s and CPU ns/KiB, median [min-max] of 9 runs
-  giong                2325 [1763-2679]      406.30 [362.60-551.40]
-  compat               2291 [2134-2588]      414.60 [373.90-454.50]
-  tokio                2333 [2053-3034]      412.70 [320.00-462.50]
+send: MiB/s and CPU ns/KiB, median [min-max]
+  new  giong                2927 [2513-3102]      330.70 [311.20-381.50]
+  old  compat               2401 [2132-2635]      399.50 [365.80-440.10]
+  new  compat               2496 [2274-3015]      377.60 [323.30-418.80]
+  new  tokio                2749 [2242-2969]      346.70 [323.00-426.40]
 
-rr: round trips/s and CPU us/round trip, median [min-max] of 9 runs
-  giong               33379 [28768-35372]       13.99 [13.10-15.43]
-  compat              32862 [30677-34003]       14.46 [13.84-15.36]
-  tokio               33257 [32789-35681]       13.72 [13.27-14.53]
+rr: round trips/s and CPU us/round trip, median [min-max]
+  new  giong               29649 [27983-31331]       15.97 [15.16-16.60]
+  old  compat              28684 [27791-29825]       16.51 [16.11-17.36]
+  new  compat              29356 [27258-31375]       16.55 [15.27-17.69]
+  new  tokio               28402 [27586-30747]       16.28 [15.45-17.02]

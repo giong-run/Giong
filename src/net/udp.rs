@@ -431,23 +431,28 @@ impl UdpSocket {
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
         let addr = SockAddr::from(addr);
         let fd = self.sock.as_raw_fd();
-        // With the other datagrams of this turn, if other tasks may send too
-        // (see `sendq`).
-        let queued = {
-            // SAFETY: an `IoBuf`'s bytes stay put, and `buf` is held until
-            // the future is done.
-            unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), Some(&addr)) }
-        };
-        if let Sent::Done(res) = queued.await {
-            return (sent_result(res), buf);
-        }
-        // At once where the socket has room (see `Driver::try_send_to`).
-        let (sent, sends_to) = runtime::with_worker(|w| {
+        // At once where the socket has room (see `Driver::try_send_to`),
+        // unless other tasks may send in this turn too: then with their
+        // datagrams (see `sendq`).
+        let try_now = |w: &runtime::Worker| {
             let mut driver = w.driver.borrow_mut();
             // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
             let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
             (driver.try_send_to(fd, bytes, &addr), driver.sends_to())
-        });
+        };
+        let mut now = runtime::with_worker(|w| (!sendq::wanted(w)).then(|| try_now(w)));
+        if now.is_none() {
+            let queued = {
+                // SAFETY: an `IoBuf`'s bytes stay put, and `buf` is held
+                // until the future is done.
+                unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), Some(&addr)) }
+            };
+            if let Sent::Done(res) = queued.await {
+                return (sent_result(res), buf);
+            }
+            now = Some(runtime::with_worker(try_now));
+        }
+        let (sent, sends_to) = now.expect("tried");
         if let Some(res) = sent {
             return if res < 0 {
                 (Err(os_err(res)), buf)
@@ -465,7 +470,6 @@ impl UdpSocket {
                 // through the box, so it stays valid when `addr` moves.
                 addr: unsafe { (*addr.as_ptr()).as_ptr().cast() },
                 addr_len: addr.get().len(),
-                flags: libc::MSG_NOSIGNAL,
             };
             // SAFETY: the address is in a `KernelBox`; an `IoBuf`'s bytes
             // stay put when it moves.
@@ -498,18 +502,24 @@ impl UdpSocket {
     /// [`connect`](Self::connect).
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         let fd = self.sock.as_raw_fd();
-        let queued = {
-            // SAFETY: as in `send_to`.
-            unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), None) }
-        };
-        if let Sent::Done(res) = queued.await {
-            return (sent_result(res), buf);
-        }
-        let sent = runtime::with_worker(|w| {
+        let try_now = |w: &runtime::Worker| {
             // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
             let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
             w.driver.borrow_mut().try_send(fd, bytes)
-        });
+        };
+        // As in `send_to`.
+        let mut now = runtime::with_worker(|w| (!sendq::wanted(w)).then(|| try_now(w)));
+        if now.is_none() {
+            let queued = {
+                // SAFETY: as in `send_to`.
+                unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), None) }
+            };
+            if let Sent::Done(res) = queued.await {
+                return (sent_result(res), buf);
+            }
+            now = Some(runtime::with_worker(try_now));
+        }
+        let sent = now.expect("tried");
         if let Some(res) = sent {
             return if res < 0 {
                 (Err(os_err(res)), buf)

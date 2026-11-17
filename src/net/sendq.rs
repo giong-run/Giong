@@ -54,8 +54,9 @@ pub(crate) struct SendQueue {
     entries: Slab<Entry>,
     /// Keys of queued entries, oldest first.
     order: Vec<usize>,
-    /// The loop turn in which the oldest queued entry was queued.
-    since: u32,
+    /// The loop turn in which the oldest queued entry was queued: `None`
+    /// until the end of that turn names it (see [`due`](Self::due)).
+    since: Option<u32>,
 }
 
 impl SendQueue {
@@ -63,15 +64,19 @@ impl SendQueue {
         SendQueue {
             entries: Slab::new(),
             order: Vec::new(),
-            since: 0,
+            since: None,
         }
     }
 
     /// `true` if the queue should go to the kernel after the turn `tick`:
     /// no other task is runnable (`idle`), or its oldest datagram was queued
     /// in an earlier turn.
-    pub(crate) fn due(&self, tick: u32, idle: bool) -> bool {
-        !self.order.is_empty() && (idle || self.since != tick || self.order.len() >= CHUNK * 4)
+    pub(crate) fn due(&mut self, tick: u32, idle: bool) -> bool {
+        if self.order.is_empty() {
+            return false;
+        }
+        let since = *self.since.get_or_insert(tick);
+        idle || since != tick || self.order.len() >= CHUNK * 4
     }
 
     fn holds(&self, fd: RawFd) -> bool {
@@ -198,6 +203,14 @@ impl Drop for Guard {
     }
 }
 
+/// `true` if a send now may go to the worker's queue (see [`send`]): other
+/// tasks are runnable, or datagrams already wait. Cheap, for the callers'
+/// fast path.
+#[inline]
+pub(crate) fn wanted(w: &runtime::Worker) -> bool {
+    w.sends_waiting.get() || !w.queue.borrow().is_empty()
+}
+
 /// What [`send`] did.
 pub(crate) enum Sent {
     /// Bytes sent, or a negative errno, as from `sendto(2)`.
@@ -231,7 +244,7 @@ pub(crate) async unsafe fn send(
                     return Poll::Ready(Sent::NotQueued);
                 }
                 if q.order.is_empty() {
-                    q.since = w.turn.get();
+                    q.since = None;
                 }
                 let key = q.entries.insert(Entry {
                     fd,
@@ -241,6 +254,7 @@ pub(crate) async unsafe fn send(
                     state: State::Queued(cx.waker().clone()),
                 });
                 q.order.push(key);
+                w.sends_waiting.set(true);
                 guard.0 = Some(key);
                 return Poll::Pending;
             };

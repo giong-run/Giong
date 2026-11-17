@@ -20,7 +20,7 @@
 //! sockets, provided buffers) is released by the driver itself.
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
@@ -130,9 +130,9 @@ struct Multi {
     ring: RingId,
     /// Completions not yet consumed.
     queue: VecDeque<Queued>,
-    /// The tasks waiting for a completion, oldest first: at most one unless
-    /// `shared`, where each is woken for a completion of its own.
-    waiters: VecDeque<Waker>,
+    /// The task waiting for a completion; with `shared`, the one that has
+    /// waited longest (the others wait in [`Uring::more_waiters`]).
+    waker: Option<Waker>,
     /// Several tasks may wait at once (a datagram socket). Otherwise the
     /// latest poll's waker replaces the one before, as one reader is
     /// expected and a stale waker must not take the reader's wake-up.
@@ -145,6 +145,63 @@ struct Multi {
     orphan: bool,
 }
 
+/// The tasks waiting on a shared multishot operation `key` after `m.waker`,
+/// oldest first; each is woken for a completion of its own. Kept apart from
+/// [`Multi`], which every stream has, so that operations stay small.
+type MoreWaiters = HashMap<usize, VecDeque<Waker>>;
+
+/// Takes the task that has waited longest on `m` (operation `key`).
+fn next_waiter(m: &mut Multi, more: &mut MoreWaiters, key: usize) -> Option<Waker> {
+    let next = m.waker.take();
+    if next.is_some() && m.shared {
+        m.waker = pop_more(more, key);
+    }
+    next
+}
+
+fn pop_more(more: &mut MoreWaiters, key: usize) -> Option<Waker> {
+    let queue = more.get_mut(&key)?;
+    let w = queue.pop_front();
+    if queue.is_empty() {
+        more.remove(&key);
+    }
+    w
+}
+
+/// Adds `waker`'s task to those waiting on shared `m`, unless it waits.
+fn wait_shared(m: &mut Multi, more: &mut MoreWaiters, key: usize, waker: &Waker) {
+    match &m.waker {
+        None => m.waker = Some(waker.clone()),
+        Some(w) if w.will_wake(waker) => {}
+        Some(_) => {
+            let queue = more.entry(key).or_default();
+            if !queue.iter().any(|w| w.will_wake(waker)) {
+                queue.push_back(waker.clone());
+            }
+        }
+    }
+}
+
+/// Stops waiting on shared `m` for `waker`'s task; `false` if it was not
+/// waiting.
+fn forget(m: &mut Multi, more: &mut MoreWaiters, key: usize, waker: &Waker) -> bool {
+    if m.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        m.waker = pop_more(more, key);
+        return true;
+    }
+    let Some(queue) = more.get_mut(&key) else {
+        return false;
+    };
+    let Some(i) = queue.iter().position(|w| w.will_wake(waker)) else {
+        return false;
+    };
+    queue.remove(i);
+    if queue.is_empty() {
+        more.remove(&key);
+    }
+    true
+}
+
 enum OpState {
     Single(Lifecycle),
     Multi(Multi),
@@ -155,6 +212,7 @@ pub(crate) struct Uring {
     /// Kernel bugs worked around while setting the ring up.
     workarounds: Vec<KernelWorkaround>,
     ops: Slab<OpState>,
+    more_waiters: MoreWaiters,
     /// SQEs pushed whose final CQE has not been seen yet.
     inflight: usize,
     /// Batched closes whose CQE has not been seen yet.
@@ -559,11 +617,10 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
             len,
             addr,
             addr_len,
-            flags,
         } => opcode::Send::new(types::Fd(fd), buf, len)
             .dest_addr(addr)
             .dest_addr_len(addr_len)
-            .flags(flags)
+            .flags(libc::MSG_NOSIGNAL)
             .build(),
         Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
         Io::ReadReady { fd, buf, len } => opcode::Read::new(types::Fd(fd), buf, len).build(),
@@ -926,6 +983,7 @@ impl Uring {
             send_to,
             ring,
             ops: Slab::new(),
+            more_waiters: HashMap::new(),
             inflight: 0,
             pending_closes: 0,
             pool,
@@ -947,11 +1005,6 @@ impl Uring {
     // ---------------------------------------------------------------- submit
 
     /// Queues an SQE. The kernel sees it at the next `park`.
-    /// See [`Driver::has_queued_submissions`](super::Driver::has_queued_submissions).
-    pub(crate) fn has_queued_submissions(&mut self) -> bool {
-        !self.ring.submission().is_empty()
-    }
-
     fn push(&mut self, sqe: squeue::Entry) {
         let mut attempts = 0u32;
         loop {
@@ -1027,7 +1080,7 @@ impl Uring {
             kind,
             ring: RingId::Whole,
             queue: VecDeque::new(),
-            waiters: VecDeque::new(),
+            waker: None,
             shared: false,
             armed: false,
             pausing: false,
@@ -1090,6 +1143,37 @@ impl Uring {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
             panic!("giong: polling an invalid multishot operation");
         };
+        if m.shared {
+            return self.poll_shared(key, waker);
+        }
+        match m.queue.pop_front() {
+            Some(Queued::Raw(res)) => return MultiPoll::Item(res),
+            Some(Queued::Piece { bid, off, len, .. }) => {
+                self.pooled_queued -= 1;
+                let pool = self.pool.clone();
+                return MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len));
+            }
+            Some(Queued::Heap(data)) => return MultiPoll::Data(RecvBuf::heap(data)),
+            None => {}
+        }
+        if !m.armed {
+            return MultiPoll::NeedArm;
+        }
+        match &mut m.waker {
+            Some(w) if w.will_wake(waker) => {}
+            slot => *slot = Some(waker.clone()),
+        }
+        MultiPoll::Pending
+    }
+
+    /// [`poll_multi`](Self::poll_multi) for an operation several tasks wait
+    /// on (a datagram socket). Out of line, so that the path every stream
+    /// takes stays as small as it was.
+    #[inline(never)]
+    fn poll_shared(&mut self, key: usize, waker: &Waker) -> MultiPoll {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            panic!("giong: polling an invalid multishot operation");
+        };
         let got = match m.queue.pop_front() {
             Some(Queued::Raw(res)) => Some(MultiPoll::Item(res)),
             Some(Queued::Piece { bid, off, len, .. }) => {
@@ -1103,11 +1187,9 @@ impl Uring {
         if let Some(got) = got {
             // This task is served; it is no longer waiting. If more is
             // queued, the next waiting task takes it.
-            if let Some(i) = m.waiters.iter().position(|w| w.will_wake(waker)) {
-                m.waiters.remove(i);
-            }
+            forget(m, &mut self.more_waiters, key, waker);
             if !m.queue.is_empty() {
-                if let Some(next) = m.waiters.pop_front() {
+                if let Some(next) = next_waiter(m, &mut self.more_waiters, key) {
                     next.wake();
                 }
             }
@@ -1116,17 +1198,7 @@ impl Uring {
         if !m.armed {
             return MultiPoll::NeedArm;
         }
-        if !m.shared {
-            match m.waiters.front() {
-                Some(w) if w.will_wake(waker) => {}
-                _ => {
-                    m.waiters.clear();
-                    m.waiters.push_back(waker.clone());
-                }
-            }
-        } else if !m.waiters.iter().any(|w| w.will_wake(waker)) {
-            m.waiters.push_back(waker.clone());
-        }
+        wait_shared(m, &mut self.more_waiters, key, waker);
         MultiPoll::Pending
     }
 
@@ -1135,18 +1207,11 @@ impl Uring {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
             return;
         };
-        match m.waiters.iter().position(|w| w.will_wake(waker)) {
-            // Still waiting: it was not woken, so it owes nothing.
-            Some(i) => {
-                m.waiters.remove(i);
-            }
-            // Woken, for a completion it will not take now: pass it on.
-            None => {
-                if !m.queue.is_empty() {
-                    if let Some(next) = m.waiters.pop_front() {
-                        next.wake();
-                    }
-                }
+        // Still waiting: it was not woken, so it owes nothing. Woken, for a
+        // completion it will not take now: pass it on.
+        if !forget(m, &mut self.more_waiters, key, waker) && !m.queue.is_empty() {
+            if let Some(next) = next_waiter(m, &mut self.more_waiters, key) {
+                next.wake();
             }
         }
     }
@@ -1159,7 +1224,8 @@ impl Uring {
         let kind = m.kind;
         let armed = m.armed;
         let queued = mem::take(&mut m.queue);
-        m.waiters.clear();
+        m.waker = None;
+        self.more_waiters.remove(&key);
         m.orphan = true;
         for item in queued {
             if let Queued::Piece { .. } = item {
@@ -1266,15 +1332,24 @@ impl Uring {
         unsafe { libc::close(fd) };
     }
 
+    /// `true` if SQEs wait in the submission queue for the next
+    /// `io_uring_enter`: a system call made directly now would reach the
+    /// kernel before them (see [`Driver::try_send_to`](super::Driver::try_send_to)).
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        !self.ring.submission().is_empty()
+    }
+
     /// Hands every queued SQE to the kernel now. TSan builds call it before
-    /// each close(2).
+    /// each close(2), and the send queue before its `sendmmsg(2)` (see
+    /// `net::sendq`), for the reason given at
+    /// [`Driver::try_send_to`](super::Driver::try_send_to).
     ///
     /// Queued SQEs name descriptors by number, and the kernel looks the
     /// number up only when it takes the SQE. Once close(2) returns, another
     /// thread can get the same number for a new socket, and a receive still
     /// in the queue would take that socket's data. (A close through the ring
     /// comes after those SQEs in the same queue, so it needs no such step.)
-    #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
         let mut attempts = 0u32;
         while !self.ring.submission().is_empty() {
@@ -1556,7 +1631,7 @@ impl Uring {
                                 }
                             }
                             // One waiting task per completion.
-                            if let Some(waker) = m.waiters.pop_front() {
+                            if let Some(waker) = next_waiter(m, &mut self.more_waiters, key) {
                                 waker.wake();
                             }
                             false

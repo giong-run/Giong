@@ -54,6 +54,51 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-tls** (**behaviour change**): `TlsAcceptor::from_pem` picks AES-128-GCM first of
+  the cipher suites both sides allow, whatever order the client lists, as Go's and
+  BoringSSL's servers do; a client that lists ChaCha20-Poly1305 before every AES-GCM suite
+  (one without AES instructions) still gets ChaCha20. OpenSSL's clients (wrk, curl, Python)
+  list AES-256-GCM first, whose TLS 1.3 suite hashes with SHA-384, about a sixth of a
+  resumed handshake's CPU time. With `bench/tls.sh` (4-vCPU VM, 7 rounds, raw data in
+  `bench/results/tls/`), new connections went from 6.8k to 8.4k per second (142 to 116 µs
+  of CPU each) together with the next entry, against 7.1k for axum + rustls; axum set to
+  the same order reaches the same 8.4k, so the suite is most of the gain. 64 KiB responses
+  went from 26.3k to 31.9k per second. An acceptor made with `TlsAcceptor::new` uses its
+  configuration as given.
+- **giong-tls**: fewer TCP segments per connection. A TLS 1.3 server's session tickets
+  wait for its first response, or for a receive that has to wait, instead of going out
+  alone; later key updates answering the peer's wait the same way; `shutdown` sends
+  `close_notify` with `MSG_MORE`, so it shares the FIN's segment; and the pieces of one
+  vectored write share one send. Per `Connection: close` request, both directions: 14.4
+  segments against 16.5 (axum + rustls: 14.0), and p99 latency 4.2 ms against 5.8.
+- **giong-compat**: a write at least as large as the write buffer's limit (64 KiB by
+  default), with nothing buffered or being sent before it, goes straight from the caller's
+  memory to the socket in one `sendmsg(2)` that does not wait, as `BufWriter` and Tokio's
+  streams do, instead of being copied into the buffer first; what the socket cannot take
+  at once is still buffered. `bench/compat.sh` (raw data in `bench/results/compat/`): CPU
+  per KiB sent 378 ns against 400 for 0.8.0's `Compat`, and within 2–9% of Tokio over two
+  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged: 30% more CPU per byte than Tokio
+  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive.
+- **giong-tls** (**behaviour change**): `TlsStream::shutdown` returns `Ok` when the
+  `close_notify` cannot be sent because the peer has closed its socket already (`EPIPE`,
+  `ECONNRESET`): the sending direction is closed either way and nobody is left to tell.
+  An h2 server over `Compat` reported such a client's clean departure as an error.
+- **giong-postgres**, **giong-mysql**, **giong-redis**: on plain TCP and Unix sockets a
+  connection has the kernel write what the server sends straight into its read buffer (a
+  one-off receive of up to 64 KiB) instead of copying it there from the runtime's pooled
+  buffers, so each byte is copied once on the way in instead of twice. Measured with
+  `bench/redis.sh`, `bench/postgres.sh` and `bench/mysql.sh` (medians of 5 rounds,
+  `bench/results/`): giong-redis `GET` of 8 KiB values with four connections went from
+  level with redis-rs (259k against 269k per second) to 345k against 276k, and with one
+  connection from about 240k to 375k (redis-rs 151k); giong-postgres's pool of 4 from 243.9k to
+  303.8k point lookups and 53.9k to 72.9k 100-row reads; giong-mysql's from 138.1k to 152.1k
+  and 34.3k to 38.3k; with pools of 3 (the size the READMEs advise for a 3-core server), 240.7k to
+  311.4k and 138.7k to 150.7k point lookups. Small Redis commands are unchanged. Each connection's read buffer now
+  keeps 64 KiB of room (it was 8 or 16 KiB, with the received bytes in the runtime's shared
+  pool). TLS connections read as before. giong-postgres with one connection shared by every
+  task stays 7–9% behind tokio-postgres (47.7k against 51.4k point lookups): the server is
+  the limit there and spends half its time sending one reply per statement; the
+  giong-postgres README says why it does not merge statements under one `Sync`.
 - **giong-http**: the client's `RequestBuilder::header` takes `impl AsRef<str>` for the value,
   as the server's `Response::header` does, so `.header("X-Id", id.to_string())` needs no `&`.
   A call that passed a `&str` or `&String` compiles as before; one that relied on the
@@ -67,21 +112,21 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
-- **net**: UDP is faster than Tokio's on both drivers. A UDP echo server on one core (64-byte
-  datagrams, veth, `bench/udp-echo.sh`, 5 rounds, `bench/results/udp-echo/`) answers 330,000
-  datagrams a second with 16 tasks on one socket on io_uring (266,000 before, Tokio 287,000)
-  and 350,000 with one task (265,000 before, Tokio 277,000); on epoll 302,000 in both cases
-  (262,000 and 242,000 before). `UdpSocket::send_to` and `send` send within the call when the
+- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll. A UDP echo
+  server on one core (64-byte datagrams, veth, `bench/udp-echo.sh`, 5 rounds,
+  `bench/results/udp-echo/`) answers 328,000 datagrams a second with 16 tasks on one socket
+  on io_uring (259,000 before, Tokio 278,000) and 300,000 with one task (286,000 before,
+  Tokio 259,000); on epoll 284,000 in both cases (239,000 and 258,000 before). `UdpSocket::send_to` and `send` send within the call when the
   socket has room, instead of through an operation that waited a turn of the event loop
   (io_uring) or allocated a message header (both), and use `sendto(2)` rather than
   `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
   now costs one system call on either driver where Tokio makes two. Immediate sends count
   against the task's budget, so a task that only sends still gives way to the others.
-- **net**: the epoll driver's UDP path is at the kernel's ceiling. The same echo server
-  answers 394,000 datagrams a second with 16 tasks on epoll (332,000 before, Tokio 295,000,
-  the kernel-only `recvmmsg`/`sendmmsg` server 421,000) at 3.26 µs of server CPU per echo
-  (4.21 before, Tokio 4.78, kernel 3.14), and 369,000 with one task
-  (`bench/results/udp-echo/vm/epoll-deep/`). Two changes: datagrams that tasks send while
+- **net**: the epoll driver's UDP path is close to the kernel's ceiling. The same echo
+  server answers 336,000 datagrams a second with 16 tasks on epoll (284,000 before, Tokio
+  271,000, the kernel-only `recvmmsg`/`sendmmsg` server 390,000) at 4.08 µs of server CPU per
+  echo (5.07 before, Tokio 5.33, kernel 3.55), and 351,000 with one task (284,000 before,
+  Tokio 307,000) (`bench/results/udp-echo/vm/epoll-deep/`). Two changes: datagrams that tasks send while
   other tasks of the worker are runnable go to the kernel at the end of that turn of the
   event loop, in one `sendmmsg(2)` per socket, each sender still getting its own result and
   datagrams of one socket keeping their order (both drivers; a lone sender sends at once);

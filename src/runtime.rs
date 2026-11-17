@@ -417,8 +417,8 @@ pub(crate) struct Worker {
     pub(crate) spare_wakers: RefCell<Vec<Arc<crate::executor::TaskWaker>>>,
     /// Datagrams sent in this turn of the loop, for one `sendmmsg` at its end.
     pub(crate) sends: RefCell<crate::net::SendQueue>,
-    /// Turns of the event loop so far (wraps).
-    pub(crate) turn: Cell<u32>,
+    /// `sends` may hold datagrams: read on every turn instead of borrowing it.
+    pub(crate) sends_waiting: Cell<bool>,
     pub(crate) timers: RefCell<Timers>,
     /// The time read in this turn of the loop, if any (see [`Worker::clock`]).
     now: Cell<Option<Instant>>,
@@ -512,7 +512,7 @@ impl Worker {
             queue: RefCell::new(VecDeque::with_capacity(256)),
             spare_wakers: RefCell::new(Vec::new()),
             sends: RefCell::new(crate::net::SendQueue::new()),
-            turn: Cell::new(0),
+            sends_waiting: Cell::new(false),
             timers: RefCell::new(Timers::new()),
             now: Cell::new(None),
             polled_since_io: Cell::new(0),
@@ -616,12 +616,20 @@ impl Worker {
     /// Hands the datagrams queued in this turn to the kernel (see
     /// [`crate::net::SendQueue`]) once no other task is runnable, or once
     /// they have waited a whole turn.
+    #[inline(never)]
     fn flush_sends(&self, tick: u32) {
         let wakers = {
             let mut q = self.sends.borrow_mut();
             if !q.due(tick, self.queue.borrow().is_empty()) {
                 return;
             }
+            self.sends_waiting.set(false);
+            // Behind what the ring holds, as with a send made at once.
+            let mut driver = self.driver.borrow_mut();
+            if driver.has_queued_submissions() {
+                driver.submit_queued();
+            }
+            drop(driver);
             q.flush()
         };
         for waker in wakers {
@@ -648,7 +656,6 @@ impl Worker {
             self.close_deferred();
             self.drain_injected();
             tick = tick.wrapping_add(1);
-            self.turn.set(tick);
             // A balanced job goes to a worker with nothing else to run, and
             // now and then to a busy one, so that jobs are not left waiting
             // while every worker stays busy.
@@ -662,7 +669,9 @@ impl Worker {
                 0
             };
             self.run_tasks(&mut || done = poll_main());
-            self.flush_sends(tick);
+            if self.sends_waiting.get() {
+                self.flush_sends(tick);
+            }
             self.publish_load();
             if done || idle() {
                 break;

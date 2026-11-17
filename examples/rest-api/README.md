@@ -67,11 +67,11 @@ Measured with `bench/rest-api.sh`: this example against the same API on axum 0.8
 
 | | `get` (cache) | p99 | `list` (PostgreSQL) | p99 | `create` | p99 |
 |---|---|---|---|---|---|---|
-| **giong** | **69.9k** (69.6–74.7k) | **1.77 ms** | **35.9k** (32.4–38.0k) | **4.47 ms** | **54.1k** (51.3–55.5k) | **4.37 ms** |
-| axum | 47.2k (45.1–50.0k) | 3.23 ms | 19.5k (17.3–21.5k) | 5.39 ms | 25.8k (24.4–27.2k) | 4.85 ms |
+| **giong** | **65.7k** (60.0–71.6k) | **2.22 ms** | **28.2k** (25.8–36.1k) | **4.11 ms** | **47.7k** (46.9–48.5k) | **3.78 ms** |
+| axum | 43.6k (41.8–44.6k) | 3.39 ms | 18.1k (16.9–18.8k) | 7.74 ms | 23.6k (21.2–26.6k) | 5.91 ms |
 
-- **1.5 times axum on cached reads, 1.8 times on pages from PostgreSQL, 2.1 times on inserts.**
-- The server's core was what limited every run: 95 to 98% busy for both. On `list`, giong also kept the two database cores 190% busy out of 200, so it is close to what this PostgreSQL gives on this machine; axum kept them 168% busy.
-- Resident memory, read after each measurement: 11.6 to 13.9 MB for giong, 9.1 to 9.5 MB for axum.
+- **1.5 times axum on cached reads, 1.6 times on pages from PostgreSQL, 2.0 times on inserts.**
+- The server's core was what limited every run: 94 to 97% busy for both. On `list`, giong kept the two database cores 179% busy out of 200, axum 171%.
+- Resident memory, read after each measurement: 8.1 to 8.4 MiB for giong, 9.2 to 9.5 MiB for axum. Of giong's 8.4 MiB, about 3.1 MiB are the pages of its own code, 2.2 MiB those of libc and the other shared libraries, and 2.9 MiB its data; heaptrack puts the peak of the heap under this load at 2.2 MiB, of which about 0.5 MiB are buffers and future blocks kept for reuse.
 
 Not measured yet: several workers, `PUT`, `DELETE` and the export, and the access log on. Results are in `bench/results/rest-api/`.

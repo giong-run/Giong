@@ -12,28 +12,32 @@ every round.
 - `tokio`: `tokio::net::UdpSocket` on a current-thread runtime.
 - `TASKS`: echo tasks sharing the one socket (16, or 1 receive loop).
 
-`before-*` is the runtime of main 4e7df8b (the same as 8606db1 for this code), built with
-the same benchmark; `after-*` is this branch. Both were run in the same session.
+`before-*` is the runtime of main 8606db1, built with the same benchmark; `after-*` is this
+branch (19450d1). They were run one after the other in one session; Tokio and the kernel-only
+server ran in both, and the table shows them from the `after` run (`before`: Tokio 289,303
+and 303,678, kernel 367,574 and 390,034).
 
 Echoes per second (median):
 
 | | 16 tasks | 1 task |
 |---|---:|---:|
-| giong io_uring, before | 265,836 | 265,181 |
-| giong io_uring, after | **330,254** | **350,457** |
-| giong epoll, before | 261,906 | 241,574 |
-| giong epoll, after | **302,277** | **301,907** |
-| Tokio | 286,618 | 276,996 |
-| kernel `recvmmsg`/`sendmmsg` × 32 | 395,495 | 386,937 |
+| giong io_uring, before | 258,680 | 285,536 |
+| giong io_uring, after | **328,288** | **299,703** |
+| giong epoll, before | 239,361 | 258,380 |
+| giong epoll, after | **284,118** | **284,248** |
+| Tokio | 277,780 | 258,803 |
+| kernel `recvmmsg`/`sendmmsg` × 32 | 386,042 | 357,388 |
 
 Server CPU per echo (its process plus softirq on its core), µs:
 
 | | 16 tasks | 1 task |
 |---|---:|---:|
-| giong io_uring, after | 4.31 | 4.04 |
-| giong epoll, after | 4.79 | 4.75 |
-| Tokio | 5.10 | 5.27 |
-| kernel × 32 | 3.54 | 3.68 |
+| giong io_uring, before | 5.28 | 4.64 |
+| giong io_uring, after | 4.24 | 4.79 |
+| giong epoll, before | 5.90 | 5.43 |
+| giong epoll, after | 5.07 | 5.07 |
+| Tokio | 5.24 | 5.74 |
+| kernel × 32 | 3.62 | 3.92 |
 
 What changed, and what each part was worth on the way (2-3 round runs, same machine):
 
@@ -50,10 +54,12 @@ What changed, and what each part was worth on the way (2-3 round runs, same mach
 4. epoll receives up to 16 datagrams per `recvmmsg` while half the buffer pool stays free:
    one task 274k → 321k.
 
-Variation between rounds on this VM is about ±8%. giong io_uring is ahead of Tokio in every
-round. giong epoll is ahead in the medians, but its range overlaps Tokio's (16 tasks:
-295-341k against 274-300k), so on epoll the lead is about 5% (16 tasks) to 9% (1 task),
-not more.
+Variation between rounds on this VM is about ±10%. giong io_uring is ahead of Tokio in every
+round. giong epoll is level with Tokio: ahead in the medians (2% with 16 tasks, 10% with one),
+behind in two of five 16-task rounds. The epoll driver passes Tokio clearly with the next
+change (sends of one turn in one `sendmmsg`, busy sockets out of the epoll set; see
+`vm/epoll-deep/`).
+
 To reproduce:
 
     sudo TASKS=16 bench/udp-echo.sh 5 8

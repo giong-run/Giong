@@ -376,14 +376,14 @@ pub(crate) enum Io {
     /// `sendto(2)`: one datagram to `addr` from a socket that need not be
     /// connected. The io_uring driver submits it only where
     /// [`Driver::sends_to`] says the kernel takes it (`IORING_OP_SEND` with
-    /// a destination address, Linux 6.1).
+    /// a destination address, Linux 6.1). Sent with `MSG_NOSIGNAL`; no
+    /// other flags, so that every operation stays as small as before.
     SendTo {
         fd: RawFd,
         buf: *const u8,
         len: u32,
         addr: *const libc::sockaddr,
         addr_len: libc::socklen_t,
-        flags: i32,
     },
     /// A one-off `recvmsg(2)`.
     RecvMsg { fd: RawFd, msg: *mut libc::msghdr },
@@ -458,7 +458,7 @@ impl Io {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
             Io::Send { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
             Io::SendMsg { flags, .. } => flags & libc::MSG_DONTWAIT as u32 == 0,
-            Io::SendTo { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
+            Io::SendTo { .. } => true,
             _ => false,
         }
     }
@@ -761,12 +761,23 @@ impl Driver {
     /// completion, which with one task per socket meant a turn of the event
     /// loop per datagram. Receives stay multishot, so an echo costs one
     /// system call, where a readiness runtime makes two.
+    ///
+    /// Not while SQEs wait for the next `io_uring_enter`: the datagram would
+    /// reach the kernel before them. One of them may cancel a receive on this
+    /// socket, and on kernels that run completions before taking new
+    /// submissions (Linux 6.0) the answer to this datagram would go to the
+    /// receive being cancelled and be lost. The operation the caller submits
+    /// instead goes in behind them.
+    #[inline(always)]
     pub(crate) fn try_send_to(
         &mut self,
         fd: RawFd,
         buf: &[u8],
         addr: &socket2::SockAddr,
     ) -> Option<i32> {
+        if self.has_queued_submissions() {
+            return None;
+        }
         // SAFETY: `buf` and `addr` are valid for the call; non-blocking.
         send_now(|| unsafe {
             libc::sendto(
@@ -780,20 +791,12 @@ impl Driver {
         })
     }
 
-    /// `true` if operations wait in io_uring's submission queue for the next
-    /// `io_uring_enter`. A stream send made directly then waits for the
-    /// driver too: it would reach the kernel before them, ahead of a
-    /// cancellation still queued there (the cancelled read on the peer's end
-    /// of a loopback connection would then take the bytes).
-    pub(crate) fn has_queued_submissions(&mut self) -> bool {
-        match self {
-            Driver::Uring(d) => d.has_queued_submissions(),
-            Driver::Epoll(_) => false,
-        }
-    }
-
     /// [`try_send_to`](Self::try_send_to) for a connected socket: `send(2)`.
+    #[inline(always)]
     pub(crate) fn try_send(&mut self, fd: RawFd, buf: &[u8]) -> Option<i32> {
+        if self.has_queued_submissions() {
+            return None;
+        }
         // SAFETY: `buf` is valid for the call; non-blocking.
         send_now(|| unsafe {
             libc::send(
@@ -863,8 +866,17 @@ impl Driver {
         }
     }
 
+    /// `true` if operations wait to be handed to the kernel (io_uring's
+    /// submission queue); never with epoll, which has no queue.
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        match self {
+            Driver::Uring(d) => d.has_queued_submissions(),
+            Driver::Epoll(_) => false,
+        }
+    }
+
     /// Hands queued SQEs to the kernel now (see `Uring::submit_queued`).
-    #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
         match self {
             Driver::Uring(d) => d.submit_queued(),
