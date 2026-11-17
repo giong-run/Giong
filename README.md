@@ -861,14 +861,15 @@ another network namespace over veth keeping 256 datagrams in flight, five rounds
 
 | Echoes per second | 16 tasks on one socket | 1 task |
 |---|---:|---:|
-| giong, io_uring | **330,254** | **350,457** |
-| giong, epoll | **302,277** | **301,907** |
-| Tokio | 286,618 | 276,996 |
-| Kernel × 32 | 395,495 | 386,937 |
+| giong, io_uring | **328,288** | **299,703** |
+| giong, epoll | 284,118 | 284,248 |
+| Tokio | 277,780 | 258,803 |
+| Kernel × 32 | 386,042 | 357,388 |
 
 An echo costs giong one system call on either driver (Tokio two). Server CPU per echo with
-16 tasks: 4.31 µs on io_uring and 4.79 µs on epoll against Tokio's 5.10 (kernel × 32:
-3.54). epoll's lead over Tokio is within this VM's spread between rounds.
+16 tasks: 4.24 µs on io_uring and 5.07 µs on epoll against Tokio's 5.24 (kernel × 32:
+3.62). io_uring is ahead of Tokio in every round; epoll is level with it (ahead in the
+medians, behind in two of five 16-task rounds), within this VM's spread between rounds.
 
 ### What has not been measured
 

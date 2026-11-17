@@ -67,11 +67,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
-- **net**: UDP is faster than Tokio's on both drivers. A UDP echo server on one core (64-byte
-  datagrams, veth, `bench/udp-echo.sh`, 5 rounds, `bench/results/udp-echo/`) answers 330,000
-  datagrams a second with 16 tasks on one socket on io_uring (266,000 before, Tokio 287,000)
-  and 350,000 with one task (265,000 before, Tokio 277,000); on epoll 302,000 in both cases
-  (262,000 and 242,000 before). `UdpSocket::send_to` and `send` send within the call when the
+- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll. A UDP echo
+  server on one core (64-byte datagrams, veth, `bench/udp-echo.sh`, 5 rounds,
+  `bench/results/udp-echo/`) answers 328,000 datagrams a second with 16 tasks on one socket
+  on io_uring (259,000 before, Tokio 278,000) and 300,000 with one task (286,000 before,
+  Tokio 259,000); on epoll 284,000 in both cases (239,000 and 258,000 before). `UdpSocket::send_to` and `send` send within the call when the
   socket has room, instead of through an operation that waited a turn of the event loop
   (io_uring) or allocated a message header (both), and use `sendto(2)` rather than
   `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
