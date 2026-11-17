@@ -128,17 +128,17 @@ fn rearm(epfd: RawFd, reg: &mut Registration, fd: RawFd, waker: &Waker) -> bool 
 
 /// Takes busy datagram socket `fd` out of the epoll set if no task waits on
 /// it (see [`Registration::armed`]).
-#[cold]
-#[inline(never)]
-fn leave_set(epfd: RawFd, reg: &mut Registration, fd: RawFd) {
+/// `true` once it is out (or cannot be taken out).
+fn leave_set(epfd: RawFd, reg: &mut Registration, fd: RawFd) -> bool {
     if !reg.readers.is_empty() || !reg.writers.is_empty() {
-        return;
+        return false;
     }
     let mut ev = libc::epoll_event { events: 0, u64: 0 };
     // SAFETY: valid descriptors; the event is ignored.
     if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_DEL, fd, &mut ev) } == 0 {
         reg.armed = false;
     }
+    true
 }
 
 /// Events collected per `epoll_wait`.
@@ -345,6 +345,9 @@ pub(crate) struct Epoll {
     /// written into each. Apart from the operations, which every stream
     /// has, so that they stay small.
     ahead: HashMap<usize, VecDeque<(u16, u32)>>,
+    /// Busy datagram sockets (descriptor, generation) to take out of the
+    /// epoll set once no task waits on them (see [`QUIET_AFTER`]).
+    quieting: Vec<(RawFd, u32)>,
     /// What is known about each descriptor, indexed by its number.
     fds: Vec<Option<Slot>>,
     next_gen: u32,
@@ -387,6 +390,7 @@ impl Epoll {
             blocking: 0,
             busy: HashMap::new(),
             ahead: HashMap::new(),
+            quieting: Vec::new(),
             graveyard: Vec::new(),
             pwait2: true,
         };
@@ -1234,13 +1238,31 @@ impl Epoll {
     /// freed wakes the set's wait queue, which costs about as much as the
     /// receive.
     fn note_datagrams(&mut self, fd: RawFd, n: usize) {
-        let epfd = self.epfd.as_raw_fd();
         if let Some(Some(Slot::Pollable(reg))) = self.fds.get_mut(fd as usize) {
-            reg.datagrams = reg.datagrams.saturating_add(n as u32);
-            if reg.armed && reg.datagrams >= QUIET_AFTER {
-                leave_set(epfd, reg, fd);
+            let before = reg.datagrams;
+            reg.datagrams = before.saturating_add(n as u32);
+            if reg.armed && before < QUIET_AFTER && reg.datagrams >= QUIET_AFTER {
+                // Leaves at the end of a turn's events, once the tasks
+                // waiting on it have been woken (see `leave_busy_sets`).
+                self.quieting.push((fd, reg.gen));
             }
         }
+    }
+
+    /// Takes the busy datagram sockets that no task waits on out of the
+    /// epoll set; the others stay listed for the next turn.
+    #[cold]
+    #[inline(never)]
+    fn leave_busy_sets(&mut self) {
+        let epfd = self.epfd.as_raw_fd();
+        let mut quieting = mem::take(&mut self.quieting);
+        quieting.retain(|&(fd, gen)| match self.fds.get_mut(fd as usize) {
+            Some(Some(Slot::Pollable(reg))) if reg.gen == gen && reg.armed => {
+                !leave_set(epfd, reg, fd)
+            }
+            _ => false,
+        });
+        self.quieting = quieting;
     }
 
     pub(crate) fn drop_multi(&mut self, key: usize) {
@@ -1280,6 +1302,9 @@ impl Epoll {
             self.wait_events(timeout)
         };
         self.dispatch(n);
+        if !self.quieting.is_empty() {
+            self.leave_busy_sets();
+        }
         self.collect_blocking();
         mem::take(&mut self.graveyard)
     }
