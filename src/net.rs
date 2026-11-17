@@ -753,7 +753,8 @@ impl StreamSocket {
     /// tasks are runnable, sends go through the driver instead, where those
     /// of the whole turn reach the kernel together. `None` when the driver
     /// must take it: other tasks to run, a send of this socket still in the
-    /// driver, a full socket, or the budget spent (see `Driver::try_send`).
+    /// driver, operations queued for the kernel that it would overtake, a
+    /// full socket, or the budget spent (see `Driver::try_send`).
     fn send_now(&self, bytes: &[u8]) -> Option<i32> {
         if bytes.is_empty() || self.sends_in_flight.get() != 0 || self.send_abandoned.get() {
             return None;
@@ -764,7 +765,9 @@ impl StreamSocket {
             }
             let mut driver = w.driver.try_borrow_mut().ok()?;
             // The epoll driver already sends within the operation's first poll.
-            if driver.kind() != crate::DriverKind::IoUring {
+            // Operations still queued for the kernel go first: a send made
+            // directly would overtake them, cancellations included.
+            if driver.kind() != crate::DriverKind::IoUring || driver.has_queued_submissions() {
                 return None;
             }
             driver.try_send(self.sock.as_raw_fd(), bytes)

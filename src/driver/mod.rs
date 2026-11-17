@@ -36,7 +36,7 @@ use std::time::Duration;
 use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 
-pub(crate) use epoll::refill_budget;
+pub(crate) use epoll::{refill_budget, spend_budget};
 
 /// Which I/O driver a worker uses: io_uring, the default, or epoll where
 /// io_uring is not available (see [`Builder::driver`](crate::Builder::driver)).
@@ -584,7 +584,8 @@ fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
 /// other way (the driver's operation then reports the error as before), or
 /// the task's budget is spent, so a loop over cached reads still yields.
 pub(crate) fn read_cached(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Option<i32> {
-    if len == 0 || offset > i64::MAX as u64 || !epoll::spend_budget() {
+    // Miri cannot run `preadv2`: every read goes through the driver there.
+    if cfg!(miri) || len == 0 || offset > i64::MAX as u64 || !epoll::spend_budget() {
         return None;
     }
     let iov = libc::iovec {
@@ -777,6 +778,18 @@ impl Driver {
                 addr.len(),
             )
         })
+    }
+
+    /// `true` if operations wait in io_uring's submission queue for the next
+    /// `io_uring_enter`. A stream send made directly then waits for the
+    /// driver too: it would reach the kernel before them, ahead of a
+    /// cancellation still queued there (the cancelled read on the peer's end
+    /// of a loopback connection would then take the bytes).
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        match self {
+            Driver::Uring(d) => d.has_queued_submissions(),
+            Driver::Epoll(_) => false,
+        }
     }
 
     /// [`try_send_to`](Self::try_send_to) for a connected socket: `send(2)`.

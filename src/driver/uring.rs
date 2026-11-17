@@ -947,6 +947,11 @@ impl Uring {
     // ---------------------------------------------------------------- submit
 
     /// Queues an SQE. The kernel sees it at the next `park`.
+    /// See [`Driver::has_queued_submissions`](super::Driver::has_queued_submissions).
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        !self.ring.submission().is_empty()
+    }
+
     fn push(&mut self, sqe: squeue::Entry) {
         let mut attempts = 0u32;
         loop {
