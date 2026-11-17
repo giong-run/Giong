@@ -28,6 +28,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **All crates**: every public async fn says in its documentation whether it is cancel
+  safe and, when it is not, what a dropped future leaves behind (a statement that may
+  still run, a datagram that may be sent, a file that may be created).
+  `tests/cancel_docs.rs` fails a public async fn without it.
 - **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,

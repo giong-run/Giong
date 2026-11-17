@@ -6,6 +6,7 @@ from the root one. The API reference is on [docs.rs](https://docs.rs/giong).
 
 | Page | For |
 |---|---|
+| [STABILITY.md](STABILITY.md) | What the 1.x promise covers: the API with its documented behaviour (cancel safety included), error codes, environment variables, log format; what it leaves out; the MSRV and kernel rules. |
 | [errors/](errors/README.md) | Every `GIONG-Exxxx` code: what went wrong and how to fix it. An error message names its page. |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Running a giong service: checking a machine, the locked-memory limit, kernel quirks, restarting on the same port, sizing memory, io_uring in Docker, Kubernetes and sandboxes. |
 | [kani.md](kani.md) | The Kani proofs of the `unsafe` core and how to run them. |

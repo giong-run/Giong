@@ -979,7 +979,7 @@ cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,110 tests across the nine crates and the example API (`cargo test --workspace
+1,111 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and

@@ -737,6 +737,9 @@ impl Server {
     /// ends, and the other requests on the connection go on. A handler
     /// whose answer had begun when it panicked (a streamed body's producer
     /// runs elsewhere, so this is rare) has its stream reset instead.
+    ///
+    /// Cancel safe: if the future is dropped, the listener is closed;
+    /// connections already accepted go on as their own tasks.
     pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
@@ -767,6 +770,8 @@ impl Server {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Cancel safe, like [`serve`](Self::serve).
     pub async fn serve_unix<H: Handler>(&self, listener: UnixListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
@@ -800,6 +805,8 @@ impl Server {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Cancel safe, like [`serve`](Self::serve).
     #[cfg(feature = "tls")]
     pub async fn serve_tls<H: Handler>(
         &self,
