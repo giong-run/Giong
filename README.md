@@ -861,14 +861,18 @@ another network namespace over veth keeping 256 datagrams in flight, five rounds
 
 | Echoes per second | 16 tasks on one socket | 1 task |
 |---|---:|---:|
-| giong, io_uring | **330,254** | **350,457** |
-| giong, epoll | **302,277** | **301,907** |
-| Tokio | 286,618 | 276,996 |
-| Kernel × 32 | 395,495 | 386,937 |
+| giong, epoll | **335,535** | **351,241** |
+| giong, io_uring | **319,380** | **346,643** |
+| Tokio | 270,672 | 307,195 |
+| Kernel × 32 | 389,686 | 366,291 |
 
-An echo costs giong one system call on either driver (Tokio two). Server CPU per echo with
-16 tasks: 4.31 µs on io_uring and 4.79 µs on epoll against Tokio's 5.10 (kernel × 32:
-3.54). epoll's lead over Tokio is within this VM's spread between rounds.
+Server CPU per echo with 16 tasks: 4.08 µs on epoll and 4.37 µs on io_uring against
+Tokio's 5.33 (kernel × 32: 3.55); with one task 3.89 and 4.10 against 4.68 (3.81). Datagrams
+that tasks send in one turn of the event loop go to the kernel in one `sendmmsg(2)`, and on
+epoll a busy datagram socket leaves the epoll set, so it pays no wake-ups for the datagrams
+it sends and receives (`bench/results/udp-echo/vm/epoll-deep/`). This VM varies by about 15%
+between rounds: giong on either driver is ahead of Tokio in every round with one task and in
+four of five with 16 (in the other, Tokio's 324,148 beat both, also on CPU per echo).
 
 ### What has not been measured
 

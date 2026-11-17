@@ -77,11 +77,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
   now costs one system call on either driver where Tokio makes two. Immediate sends count
   against the task's budget, so a task that only sends still gives way to the others.
-- **net**: the epoll driver's UDP path is at the kernel's ceiling. The same echo server
-  answers 394,000 datagrams a second with 16 tasks on epoll (332,000 before, Tokio 295,000,
-  the kernel-only `recvmmsg`/`sendmmsg` server 421,000) at 3.26 µs of server CPU per echo
-  (4.21 before, Tokio 4.78, kernel 3.14), and 369,000 with one task
-  (`bench/results/udp-echo/vm/epoll-deep/`). Two changes: datagrams that tasks send while
+- **net**: the epoll driver's UDP path is close to the kernel's ceiling. The same echo
+  server answers 336,000 datagrams a second with 16 tasks on epoll (284,000 before, Tokio
+  271,000, the kernel-only `recvmmsg`/`sendmmsg` server 390,000) at 4.08 µs of server CPU per
+  echo (5.07 before, Tokio 5.33, kernel 3.55), and 351,000 with one task (284,000 before,
+  Tokio 307,000) (`bench/results/udp-echo/vm/epoll-deep/`). Two changes: datagrams that tasks send while
   other tasks of the worker are runnable go to the kernel at the end of that turn of the
   event loop, in one `sendmmsg(2)` per socket, each sender still getting its own result and
   datagrams of one socket keeping their order (both drivers; a lone sender sends at once);
