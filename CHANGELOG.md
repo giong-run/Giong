@@ -28,6 +28,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
+  without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
+  instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
+  what `TlsStream::peer_certificates` returns) is re-exported.
+
 - **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
   (`Code::HttpServerLowMemory`) in giong.
 - **giong-mysql**, **giong-redis** (**behaviour change**): `Pool::idle_timeout`,
@@ -53,6 +58,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   parameter is still `dbname`, as libpq spells it.
 
 ### Changed
+
+- **giong-tls** (breaking): rustls' types are out of the stable API, so that a new rustls
+  version, which giong-tls will take up during 1.x, breaks nothing. The rustls
+  configurations that `TlsAcceptor::new` and `TlsConnector::new` took go to the new
+  `TlsAcceptor::from_rustls` and `TlsConnector::from_rustls`, which need the new
+  `unstable-rustls` feature, as do `KtlsSupport::supports` and the `rustls` re-export (no
+  longer there without it). That feature is outside the semver promise: it follows the
+  rustls version giong-tls uses.
 
 - **giong-tls** (**behaviour change**): `TlsAcceptor::from_pem` picks AES-128-GCM first of
   the cipher suites both sides allow, whatever order the client lists, as Go's and
@@ -113,6 +126,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
 ### Deprecated
+
+- **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and `TlsConnector::with_roots`, which
+  take rustls' types; they go in 1.0.0. Use `from_pem`, `with_root_pem` or
+  `with_root_pem_any_name`, or `from_rustls` with the `unstable-rustls` feature.
 
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
   giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning

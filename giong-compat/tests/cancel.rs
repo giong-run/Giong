@@ -316,7 +316,7 @@ fn random_split_echo_tls() {
         for seed in 0..25u64 {
             let mut rng = Rng::new(seed);
             let (c, s) = pair().await;
-            let acceptor = TlsAcceptor::new(server_config(&pki, &[]));
+            let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &[]));
             let server = giong::spawn(async move {
                 let tls = acceptor.accept(s).await.unwrap();
                 loop {
@@ -328,7 +328,7 @@ fn random_split_echo_tls() {
                     tls.write_all(d).await.0.unwrap();
                 }
             });
-            let connector = TlsConnector::new(client_config(&pki, &[]));
+            let connector = TlsConnector::from_rustls(client_config(&pki, &[]));
             let tls = connector.connect("localhost", c).await.unwrap();
             let limit = BUFFERS[rng.below(BUFFERS.len() as u64) as usize];
             let total = rng.below(if limit < 4096 { 40_000 } else { 2 << 20 }) + 1;
@@ -373,7 +373,7 @@ fn split_echo_tls_with_key_updates() {
                     tls.flush().await.unwrap();
                 }
             });
-            let connector = TlsConnector::new(client_config(&pki, &[]));
+            let connector = TlsConnector::from_rustls(client_config(&pki, &[]));
             let tls = connector.connect("localhost", c).await.unwrap();
             let limit = BUFFERS[2 + rng.below(4) as usize];
             let total = rng.below(2 << 20) + 100_000;

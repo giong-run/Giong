@@ -245,7 +245,12 @@ fn from_pem_prefers_aes_128_gcm_unless_the_client_lists_chacha20_first() {
     c2.roots
         .add(CertificateDer::from(key.cert.der().to_vec()))
         .unwrap();
-    let got = negotiated(TlsAcceptor::new(Arc::new(config)), &c2, tls13, &openssl13);
+    let got = negotiated(
+        TlsAcceptor::from_rustls(Arc::new(config)),
+        &c2,
+        tls13,
+        &openssl13,
+    );
     assert_eq!(got, S::TLS13_AES_256_GCM_SHA384);
 }
 

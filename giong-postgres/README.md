@@ -197,7 +197,7 @@ Not measured: a server on another machine (network latency, where pipelining sho
 
 ## Not there yet
 
-`COPY`, `LISTEN`/`NOTIFY`, streaming a result one row at a time (a result is collected in full, up to `max_result_size`), arrays, `numeric`, `uuid`, `date` and the other types not listed above in binary form (read them as strings), channel binding (`SCRAM-SHA-256-PLUS`), client certificates in the URL (`sslcert` and `sslkey` are refused; in code, pass a `rustls::ClientConfig` with the certificate to `TlsConnector::new`), several hosts with failover, running through PgBouncer without `max_prepared_statements`, and SASLprep normalization of non-ASCII passwords. The crate has had one independent review before 1.0, whose findings are fixed, but no security audit.
+`COPY`, `LISTEN`/`NOTIFY`, streaming a result one row at a time (a result is collected in full, up to `max_result_size`), arrays, `numeric`, `uuid`, `date` and the other types not listed above in binary form (read them as strings), channel binding (`SCRAM-SHA-256-PLUS`), client certificates in the URL (`sslcert` and `sslkey` are refused; in code, give the connector one with `TlsConnector::client_auth`), several hosts with failover, running through PgBouncer without `max_prepared_statements`, and SASLprep normalization of non-ASCII passwords. The crate has had one independent review before 1.0, whose findings are fixed, but no security audit.
 
 ## Tests
 
