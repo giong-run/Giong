@@ -92,6 +92,9 @@ impl PubSub {
     /// # Panics
     ///
     /// Panics when called outside of a giong runtime.
+    ///
+    /// Cancel safe: if the future is dropped, the connection being opened is
+    /// closed.
     pub async fn connect(config: &Config) -> Result<PubSub, Error> {
         let startup = connect::connect(config).await?;
         Ok(PubSub {
@@ -111,24 +114,36 @@ impl PubSub {
 
     /// Subscribes to a channel (`SUBSCRIBE`); returns once the server has
     /// confirmed it.
+    ///
+    /// Not cancel safe: if the future is dropped while the command is being
+    /// written, the connection is given up (later calls fail with
+    /// [`ErrorKind::Closed`](crate::ErrorKind::Closed): connect again); once it
+    /// is written, the subscription takes effect without the caller learning
+    /// it.
     pub async fn subscribe(&mut self, channel: impl ToArg) -> Result<(), Error> {
         self.call(cmd("SUBSCRIBE").arg(channel), "subscribe").await
     }
 
     /// Subscribes to every channel whose name matches a glob-style pattern
     /// (`PSUBSCRIBE`), such as `news.*`.
+    ///
+    /// Not cancel safe, like [`subscribe`](Self::subscribe).
     pub async fn psubscribe(&mut self, pattern: impl ToArg) -> Result<(), Error> {
         self.call(cmd("PSUBSCRIBE").arg(pattern), "psubscribe")
             .await
     }
 
     /// Ends a subscription made with [`subscribe`](Self::subscribe).
+    ///
+    /// Not cancel safe, like [`subscribe`](Self::subscribe).
     pub async fn unsubscribe(&mut self, channel: impl ToArg) -> Result<(), Error> {
         self.call(cmd("UNSUBSCRIBE").arg(channel), "unsubscribe")
             .await
     }
 
     /// Ends a subscription made with [`psubscribe`](Self::psubscribe).
+    ///
+    /// Not cancel safe, like [`subscribe`](Self::subscribe).
     pub async fn punsubscribe(&mut self, pattern: impl ToArg) -> Result<(), Error> {
         self.call(cmd("PUNSUBSCRIBE").arg(pattern), "punsubscribe")
             .await
@@ -136,6 +151,8 @@ impl PubSub {
 
     /// The next message, waiting as long as it takes. It can be cancelled
     /// (with a timeout, or in a `select`) without losing a message.
+    ///
+    /// Cancel safe, as said above.
     pub async fn next_message(&mut self) -> Result<Message, Error> {
         loop {
             if let Some(m) = self.pending.pop_front() {

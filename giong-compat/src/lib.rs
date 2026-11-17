@@ -273,8 +273,10 @@ impl<S: Transport> Compat<S> {
     /// Sends everything written so far, then hands back the stream and the
     /// bytes received but not yet read, to carry on with giong's own API.
     ///
-    /// A shutdown that has started is abandoned. Not cancel safe: if the
-    /// future is dropped, the `Compat` is dropped with it.
+    /// A shutdown that has started is abandoned.
+    ///
+    /// Not cancel safe: if the future is dropped, the `Compat` is dropped
+    /// with it.
     pub async fn into_inner(mut self) -> io::Result<(S, Vec<u8>)> {
         poll_fn(|cx| self.poll_flush_buffered(cx)).await?;
         let unread = self.read.unread.bytes().to_vec();

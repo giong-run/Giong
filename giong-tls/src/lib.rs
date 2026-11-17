@@ -78,11 +78,16 @@
 
 #![warn(missing_docs)]
 
+mod certs;
 mod ktls;
 mod received;
 
+pub use certs::Certificates;
 pub use ktls::{ktls_stats, ktls_support, Ktls, KtlsStats, KtlsSupport};
 pub use received::Received;
+/// A certificate in DER form, as [`TlsStream::peer_certificates`] returns
+/// it: from `rustls-pki-types` 1.x, which stays at 1.x whatever rustls does.
+pub use rustls_pki_types::CertificateDer;
 
 /// Entry points for the fuzz targets in `giong-tls/fuzz`. Only built by
 /// `cargo fuzz` (`--cfg fuzzing`); not part of the API.
@@ -109,13 +114,19 @@ use giong::net::TcpStream;
 use giong::time::timeout;
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{PrivateKeyDer, ServerName};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection,
     SignatureScheme,
 };
 
+/// The rustls crate, for building the configurations that
+/// [`TlsAcceptor::from_rustls`] and [`TlsConnector::from_rustls`] take.
+///
+/// Needs the `unstable-rustls` feature. Outside the semver promise: it is
+/// the rustls version giong-tls uses, which a minor release may raise.
+#[cfg(feature = "unstable-rustls")]
 pub use rustls;
 
 fn coded(
@@ -143,7 +154,7 @@ fn file_too_short(offset: u64, len: u64, at: u64) -> io::Error {
 }
 
 /// PEM data or a certificate file that cannot be used.
-fn bad_certificate_data(e: impl std::fmt::Display) -> io::Error {
+pub(crate) fn bad_certificate_data(e: impl std::fmt::Display) -> io::Error {
     coded(
         Code::BadCertificateData,
         e.to_string(),
@@ -153,7 +164,7 @@ fn bad_certificate_data(e: impl std::fmt::Display) -> io::Error {
 }
 
 /// A private key that cannot be read.
-fn bad_key(e: impl std::fmt::Display) -> io::Error {
+pub(crate) fn bad_key(e: impl std::fmt::Display) -> io::Error {
     coded(
         Code::BadCertificateData,
         format!("cannot read the private key: {e}"),
@@ -163,7 +174,7 @@ fn bad_key(e: impl std::fmt::Display) -> io::Error {
 }
 
 /// A certificate and a key that cannot be used together.
-fn mismatched_key(e: rustls::Error) -> io::Error {
+pub(crate) fn mismatched_key(e: rustls::Error) -> io::Error {
     coded(
         Code::BadCertificateData,
         format!("the certificate and the private key cannot be used together: {e}"),
@@ -192,7 +203,7 @@ fn tls_error(e: rustls::Error) -> io::Error {
             Code::TlsCertificate,
             format!("the peer's certificate was rejected: {e}"),
             "check the name you connect to, the certificate's expiry and its chain; a \
-             private authority has to be trusted with TlsConnector::with_roots.",
+             private authority has to be trusted with TlsConnector::with_root_pem.",
         ),
         e => coded(
             Code::TlsProtocol,
@@ -278,7 +289,7 @@ fn broken() -> io::Error {
 }
 
 /// Every certificate in `pem`, or an error if there is none.
-fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(bad_certificate_data)?;
@@ -288,11 +299,24 @@ fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn ring() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(rustls::crypto::ring::default_provider())
+/// The cryptography every configuration giong-tls builds uses: *ring*, or
+/// aws-lc-rs with the `post-quantum` feature, whose key exchange offers
+/// X25519MLKEM768 (a post-quantum hybrid) first.
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(base_provider())
 }
 
-/// `ring` with AES-128-GCM first, then ChaCha20-Poly1305, then AES-256-GCM,
+#[cfg(not(feature = "post-quantum"))]
+fn base_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+#[cfg(feature = "post-quantum")]
+fn base_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::aws_lc_rs::default_provider()
+}
+
+/// [`provider`] with AES-128-GCM first, then ChaCha20-Poly1305, then AES-256-GCM,
 /// in each protocol version: the order of [`TlsAcceptor::from_pem`].
 ///
 /// AES-128-GCM is as safe in practice and cheaper: its suites hash with
@@ -301,9 +325,9 @@ fn ring() -> Arc<rustls::crypto::CryptoProvider> {
 /// resumed handshake's CPU time goes to SHA-384 otherwise). Go's and
 /// BoringSSL's servers prefer it the same way. Browsers list it first
 /// already; OpenSSL clients (curl, wrk, Python) list AES-256-GCM first.
-fn ring_aes128_first() -> Arc<rustls::crypto::CryptoProvider> {
+fn provider_aes128_first() -> Arc<rustls::crypto::CryptoProvider> {
     use rustls::CipherSuite as S;
-    let mut provider = rustls::crypto::ring::default_provider();
+    let mut provider = base_provider();
     // A stable sort: TLS 1.3 suites stay ahead of TLS 1.2 ones, and the
     // signature algorithms keep their order.
     provider.cipher_suites.sort_by_key(|suite| {
@@ -366,6 +390,24 @@ fn prefers_chacha(hello: &[u8]) -> bool {
     false
 }
 
+/// The two configurations of a [`TlsAcceptor`] built from `certificates`:
+/// the server's cipher suite order (AES-128-GCM first), and a copy in the
+/// client's order, for clients that list ChaCha20 first (see
+/// [`prefers_chacha`]).
+fn server_configs(
+    certificates: &Certificates,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> io::Result<(ServerConfig, ServerConfig)> {
+    let mut config = ServerConfig::builder_with_provider(provider_aes128_first())
+        .with_safe_default_protocol_versions()
+        .map_err(tls_error)?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(certificates.resolver());
+    let chacha = config.clone();
+    config.ignore_client_order = true;
+    Ok((config, chacha))
+}
+
 /// Turns accepted TCP connections into TLS connections.
 ///
 /// Cheap to clone; share one between all workers.
@@ -379,16 +421,42 @@ pub struct TlsAcceptor {
     chacha: Option<Arc<ServerConfig>>,
     handshake_timeout: Duration,
     ktls: ktls::Plan,
+    /// From [`with_certificates`](Self::with_certificates): what the
+    /// configurations were built from, to build them again with client
+    /// authentication. `None` for [`from_rustls`](Self::from_rustls).
+    certificates: Option<Certificates>,
 }
 
 impl TlsAcceptor {
     /// An acceptor using an existing rustls configuration.
+    #[deprecated(
+        since = "0.9.0",
+        note = "goes in 1.0.0: use `from_pem`, or `from_rustls` with the `unstable-rustls` \
+                feature, which keeps rustls' types out of the stable API"
+    )]
     pub fn new(config: Arc<ServerConfig>) -> Self {
+        Self::with_config(config)
+    }
+
+    /// An acceptor using an existing rustls configuration, for what
+    /// [`with_certificates`](Self::with_certificates) and the methods below
+    /// do not cover. The acceptor follows the configuration as given.
+    ///
+    /// Needs the `unstable-rustls` feature. Outside the semver promise: the
+    /// configuration is the rustls version giong-tls uses
+    /// ([`rustls`]), which a minor release may raise.
+    #[cfg(feature = "unstable-rustls")]
+    pub fn from_rustls(config: Arc<ServerConfig>) -> Self {
+        Self::with_config(config)
+    }
+
+    fn with_config(config: Arc<ServerConfig>) -> Self {
         Self {
             config,
             chacha: None,
             handshake_timeout: HANDSHAKE_TIMEOUT,
             ktls: ktls::Plan::Off,
+            certificates: None,
         }
     }
 
@@ -401,24 +469,92 @@ impl TlsAcceptor {
     /// as Go's and BoringSSL's servers do: it costs less than AES-256-GCM,
     /// whose suites hash with SHA-384. A client that lists ChaCha20-Poly1305
     /// before AES-128-GCM, as clients without AES instructions do, gets
-    /// ChaCha20. An acceptor made with [`new`](Self::new) follows its
+    /// ChaCha20. An acceptor made with `from_rustls` follows its
     /// configuration as given.
     pub fn from_pem(cert_chain: &[u8], private_key: &[u8]) -> io::Result<Self> {
-        let certs = pem_certs(cert_chain)?;
-        let key = PrivateKeyDer::from_pem_slice(private_key).map_err(bad_key)?;
-        let mut config = ServerConfig::builder_with_provider(ring_aes128_first())
-            .with_safe_default_protocol_versions()
-            .map_err(tls_error)?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(mismatched_key)?;
-        // The client's order, for the clients `prefers_chacha` picks out.
-        let chacha = Arc::new(config.clone());
-        config.ignore_client_order = true;
+        Self::with_certificates(&Certificates::from_pem(cert_chain, private_key)?)
+    }
+
+    /// An acceptor presenting `certificates`: one chain, or several chosen
+    /// by the name the client asks for (SNI), replaceable while the server
+    /// runs (see [`Certificates`]). Otherwise as [`from_pem`](Self::from_pem).
+    ///
+    /// ```no_run
+    /// use giong_tls::{Certificates, TlsAcceptor};
+    ///
+    /// # fn main() -> std::io::Result<()> {
+    /// let certs = Certificates::from_pem(&std::fs::read("cert.pem")?, &std::fs::read("key.pem")?)?;
+    /// let acceptor = TlsAcceptor::with_certificates(&certs)?.alpn(&[b"h2", b"http/1.1"]);
+    /// # let _ = acceptor;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_certificates(certificates: &Certificates) -> io::Result<Self> {
+        let verifier = rustls::server::WebPkiClientVerifier::no_client_auth();
+        let (config, chacha) = server_configs(certificates, verifier)?;
         Ok(Self {
-            chacha: Some(chacha),
-            ..Self::new(Arc::new(config))
+            chacha: Some(Arc::new(chacha)),
+            certificates: Some(certificates.clone()),
+            ..Self::with_config(Arc::new(config))
         })
+    }
+
+    /// Requires every client to present a certificate issued by one of the
+    /// authorities in `ca_pem` (mutual TLS): a client without one, or with
+    /// another, fails the handshake. The accepted client's certificates are
+    /// [`TlsStream::peer_certificates`], the client's own first.
+    ///
+    /// For acceptors made with [`from_pem`](Self::from_pem) or
+    /// [`with_certificates`](Self::with_certificates); one made with
+    /// `from_rustls` sets client authentication in its configuration, and
+    /// gets `GIONG-E2013` here.
+    pub fn require_client_cert(self, ca_pem: &[u8]) -> io::Result<Self> {
+        self.client_auth(ca_pem, true)
+    }
+
+    /// Asks clients for a certificate issued by one of the authorities in
+    /// `ca_pem`, and accepts clients that send none:
+    /// [`TlsStream::peer_certificates`] then says which did. A client that
+    /// sends a certificate the authorities did not issue still fails the
+    /// handshake. Otherwise as
+    /// [`require_client_cert`](Self::require_client_cert).
+    pub fn request_client_cert(self, ca_pem: &[u8]) -> io::Result<Self> {
+        self.client_auth(ca_pem, false)
+    }
+
+    fn client_auth(mut self, ca_pem: &[u8], required: bool) -> io::Result<Self> {
+        let Some(certificates) = &self.certificates else {
+            return Err(coded(
+                Code::TlsConfig,
+                "client certificates cannot be set on an acceptor made with from_rustls",
+                "set client authentication in the rustls configuration given to from_rustls \
+                 (ServerConfig::builder().with_client_cert_verifier), or make the acceptor \
+                 with from_pem or with_certificates.",
+            ));
+        };
+        let mut roots = RootCertStore::empty();
+        for cert in pem_certs(ca_pem)? {
+            roots.add(cert).map_err(bad_certificate_data)?;
+        }
+        let builder = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            self.config.crypto_provider().clone(),
+        );
+        let builder = if required {
+            builder
+        } else {
+            builder.allow_unauthenticated()
+        };
+        let verifier = builder.build().map_err(bad_certificate_data)?;
+        let (mut config, mut chacha) = server_configs(certificates, verifier)?;
+        // What the other builder methods set: ALPN, and kTLS's secrets.
+        for new in [&mut config, &mut chacha] {
+            new.alpn_protocols = self.config.alpn_protocols.clone();
+            new.enable_secret_extraction = self.config.enable_secret_extraction;
+        }
+        self.config = Arc::new(config);
+        self.chacha = Some(Arc::new(chacha));
+        Ok(self)
     }
 
     /// The configuration for a client whose ClientHello starts with
@@ -507,6 +643,9 @@ impl TlsAcceptor {
     /// With kernel TLS (see [`ktls`](Self::ktls)), the keys go to the kernel
     /// once the handshake is done. Under [`Ktls::Required`], a stream that
     /// cannot take them fails with `GIONG-E2009` before anything is sent.
+    ///
+    /// Cancel safe: if the future is dropped, the TCP connection it took is
+    /// closed; nothing else changes.
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<TlsStream> {
         let tcp = match &self.ktls {
             ktls::Plan::Off => tcp,
@@ -587,7 +726,29 @@ pub struct TlsConnector {
 
 impl TlsConnector {
     /// A connector using an existing rustls configuration.
+    #[deprecated(
+        since = "0.9.0",
+        note = "goes in 1.0.0: use `with_system_roots`, `with_root_pem` or \
+                `with_root_pem_any_name`, or `from_rustls` with the `unstable-rustls` feature, \
+                which keeps rustls' types out of the stable API"
+    )]
     pub fn new(config: Arc<ClientConfig>) -> Self {
+        Self::with_config(config)
+    }
+
+    /// A connector using an existing rustls configuration, for what the
+    /// other constructors do not cover (a certificate verifier of its own,
+    /// other protocol versions).
+    ///
+    /// Needs the `unstable-rustls` feature. Outside the semver promise: the
+    /// configuration is the rustls version giong-tls uses
+    /// ([`rustls`]), which a minor release may raise.
+    #[cfg(feature = "unstable-rustls")]
+    pub fn from_rustls(config: Arc<ClientConfig>) -> Self {
+        Self::with_config(config)
+    }
+
+    fn with_config(config: Arc<ClientConfig>) -> Self {
         Self {
             config,
             handshake_timeout: HANDSHAKE_TIMEOUT,
@@ -597,7 +758,16 @@ impl TlsConnector {
 
     /// A connector that trusts the given certificate authorities. TLS 1.2
     /// and 1.3 with rustls' default cipher suites.
+    #[deprecated(
+        since = "0.9.0",
+        note = "goes in 1.0.0: use `with_root_pem`, which keeps rustls' types out of the \
+                stable API"
+    )]
     pub fn with_roots(roots: RootCertStore) -> io::Result<Self> {
+        Self::from_roots(roots)
+    }
+
+    fn from_roots(roots: RootCertStore) -> io::Result<Self> {
         if roots.is_empty() {
             return Err(coded(
                 Code::NoTrustedRoots,
@@ -605,12 +775,12 @@ impl TlsConnector {
                 "pass at least one certificate, or use TlsConnector::with_system_roots.",
             ));
         }
-        let config = ClientConfig::builder_with_provider(ring())
+        let config = ClientConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()
             .map_err(tls_error)?
             .with_root_certificates(roots)
             .with_no_client_auth();
-        Ok(Self::new(Arc::new(config)))
+        Ok(Self::with_config(Arc::new(config)))
     }
 
     /// A connector that trusts the certificate authorities in `pem`: a
@@ -626,7 +796,46 @@ impl TlsConnector {
         for cert in pem_certs(pem)? {
             roots.add(cert).map_err(bad_certificate_data)?;
         }
-        Self::with_roots(roots)
+        Self::from_roots(roots)
+    }
+
+    /// A connector that trusts the certificate authorities in `pem` and
+    /// accepts a certificate they signed **whatever host name it is for**:
+    /// the chain, the validity period and the key usage are checked, the
+    /// name is not.
+    ///
+    /// For servers whose certificates name no host, such as the ones MySQL
+    /// generates when it is installed (`ssl-mode=VERIFY_CA`): pass the
+    /// server's own authority. Use it only with an authority that signs for
+    /// this server alone; with a public one, any certificate it issued, for
+    /// any name, would pass. Where the certificate names the host, use
+    /// [`with_root_pem`](Self::with_root_pem), which checks both.
+    pub fn with_root_pem_any_name(pem: &[u8]) -> io::Result<Self> {
+        let mut roots = RootCertStore::empty();
+        for cert in pem_certs(pem)? {
+            roots.add(cert).map_err(bad_certificate_data)?;
+        }
+        if roots.is_empty() {
+            return Err(coded(
+                Code::NoTrustedRoots,
+                "no trusted certificate authority given",
+                "pass at least one certificate authority in PEM form.",
+            ));
+        }
+        let provider = provider();
+        let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .map_err(bad_certificate_data)?;
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(tls_error)?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyName(webpki)))
+            .with_no_client_auth();
+        Ok(Self::with_config(Arc::new(config)))
     }
 
     /// A connector that trusts the certificate authorities installed on this
@@ -653,7 +862,7 @@ impl TlsConnector {
             SYSTEM_CA_BUNDLES,
             SYSTEM_CA_DIR,
         )?;
-        Self::with_roots(roots)
+        Self::from_roots(roots)
     }
 
     /// A connector that trusts the certificate authorities in Mozilla's root
@@ -667,7 +876,7 @@ impl TlsConnector {
         let roots = RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
         };
-        Self::with_roots(roots).expect("the webpki-roots crate provides roots")
+        Self::from_roots(roots).expect("the webpki-roots crate provides roots")
     }
 
     /// The protocols to offer through ALPN, most preferred first, for example
@@ -735,6 +944,9 @@ impl TlsConnector {
     /// A certificate that is not valid for the name, expired, or not issued
     /// by a trusted authority fails the handshake with
     /// [`io::ErrorKind::InvalidData`] and a message saying which it was.
+    ///
+    /// Cancel safe: if the future is dropped, the TCP connection it took is
+    /// closed; nothing else changes.
     pub async fn connect(&self, server_name: &str, tcp: TcpStream) -> io::Result<TlsStream> {
         let name = parse_server_name(server_name)?;
         let tcp = match &self.ktls {
@@ -768,6 +980,64 @@ impl std::fmt::Debug for TlsConnector {
             .field("handshake_timeout", &self.handshake_timeout)
             .field("ktls", &self.ktls)
             .finish_non_exhaustive()
+    }
+}
+
+/// The verifier of [`TlsConnector::with_root_pem_any_name`]: checks the
+/// chain like rustls' own, and accepts a certificate whose only fault is that
+/// it does not name the host.
+struct AnyName(Arc<rustls::client::WebPkiServerVerifier>);
+
+impl std::fmt::Debug for AnyName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AnyName")
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for AnyName {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::CertificateError;
+        match self
+            .0
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            // rustls checks the name only once the chain, the validity
+            // period and the key usage have passed (the test
+            // `any_name_still_checks_the_chain` makes sure of it).
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
+            )) => Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
     }
 }
 
@@ -1600,6 +1870,9 @@ impl TlsStream {
     /// nobody is left to tell (Tokio's `TcpStream::shutdown` likewise
     /// returns `Ok` for `ENOTCONN` after a reset). A failure of an earlier
     /// write is still reported by that write.
+    ///
+    /// Not cancel safe: if the future is dropped, the `close_notify` alert may
+    /// have been sent in part, and the stream can send nothing more.
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_ktls() {
             return self.kernel_shutdown().await;
@@ -1691,6 +1964,95 @@ impl std::fmt::Debug for TlsStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authority(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        (params.self_signed(&key).unwrap(), key)
+    }
+
+    fn signed_by(
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+        names: &[&str],
+        expired: bool,
+    ) -> CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let mut params = rcgen::CertificateParams::new(names).unwrap();
+        // As MySQL names its own: in the common name only.
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            "MySQL_Server_8.0.46_Auto_Generated_Server_Certificate",
+        );
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        }
+        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        CertificateDer::from(cert.der().to_vec())
+    }
+
+    /// `with_root_pem_any_name` skips the name and nothing else.
+    #[test]
+    fn any_name_still_checks_the_chain() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::UnixTime;
+        use rustls::CertificateError;
+
+        let (ca, ca_key) = authority("ours");
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+        let webpki = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider(),
+        )
+        .build()
+        .unwrap();
+        let verifier = AnyName(webpki);
+        let name = ServerName::try_from("db.internal").unwrap();
+        let check = |cert: &CertificateDer<'_>| {
+            verifier.verify_server_cert(cert, &[], &name, &[], UnixTime::now())
+        };
+        // Signed by the authority: accepted, whatever names it has.
+        for names in [&[][..], &["localhost"], &["db.internal"]] {
+            check(&signed_by(&ca, &ca_key, names, false)).unwrap();
+        }
+        // Expired: refused.
+        let e = check(&signed_by(&ca, &ca_key, &[], true)).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                rustls::Error::InvalidCertificate(
+                    CertificateError::Expired | CertificateError::ExpiredContext { .. }
+                )
+            ),
+            "{e:?}"
+        );
+        // Another authority's, or self-signed: refused, even with the
+        // right name.
+        let (other, other_key) = authority("theirs");
+        for cert in [
+            signed_by(&other, &other_key, &["db.internal"], false),
+            CertificateDer::from(other.der().to_vec()),
+        ] {
+            let e = check(&cert).unwrap_err();
+            assert!(matches!(e, rustls::Error::InvalidCertificate(_)), "{e:?}");
+        }
+        // The authority itself, offered as the server's certificate.
+        assert!(check(&CertificateDer::from(ca.der().to_vec())).is_err());
+        // PEM that holds no certificate, or a broken one.
+        assert!(TlsConnector::with_root_pem_any_name(b"").is_err());
+        assert!(TlsConnector::with_root_pem_any_name(
+            b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"
+        )
+        .is_err());
+        assert!(TlsConnector::with_root_pem_any_name(ca.pem().as_bytes()).is_ok());
+    }
 
     /// The start of a ClientHello record listing `suites`, with a session
     /// id of `id_len` bytes, cut after `keep` bytes.
@@ -1894,5 +2256,13 @@ mod tests {
     #[test]
     fn mozillas_roots_are_compiled_in() {
         TlsConnector::with_webpki_roots();
+    }
+
+    #[test]
+    fn the_key_exchange_offers_post_quantum_first_with_the_feature() {
+        let first = provider().kx_groups[0].name();
+        let pq = rustls::NamedGroup::X25519MLKEM768;
+        assert_eq!(first == pq, cfg!(feature = "post-quantum"), "{first:?}");
+        assert_eq!(provider_aes128_first().kx_groups[0].name(), first);
     }
 }

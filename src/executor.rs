@@ -679,6 +679,8 @@ where
 }
 
 /// Yields to the executor, letting other tasks and pending I/O make progress.
+///
+/// Cancel safe: it changes nothing.
 pub async fn yield_now() {
     let mut yielded = false;
     poll_fn(|cx| {

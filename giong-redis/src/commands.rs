@@ -18,6 +18,8 @@ macro_rules! commands {
         /// let hits: Option<i64> = client.get("hits").await?;
         /// # Ok(()) }
         /// ```
+        ///
+        /// Cancel safe: it changes nothing.
         pub async fn get<T: $crate::FromValue>(
             &self,
             key: impl $crate::ToArg,
@@ -26,6 +28,9 @@ macro_rules! commands {
         }
 
         /// `SET key value`: sets a key, removing any time to live it had.
+        ///
+        /// Not cancel safe: if the future is dropped, the command may still run
+        /// on the server; the connection stays usable.
         pub async fn set(
             &self,
             key: impl $crate::ToArg,
@@ -36,6 +41,8 @@ macro_rules! commands {
 
         /// `SET key value PX ms`: sets a key that expires after `ttl`
         /// (to the millisecond; 0 is refused by the server).
+        ///
+        /// Not cancel safe, like [`set`](Self::set).
         pub async fn set_ex(
             &self,
             key: impl $crate::ToArg,
@@ -48,6 +55,9 @@ macro_rules! commands {
 
         /// `SET key value NX`: sets a key only if it does not exist;
         /// returns whether it was set.
+        ///
+        /// Not cancel safe: if the future is dropped, the key may have been set
+        /// without the caller learning it.
         pub async fn set_nx(
             &self,
             key: impl $crate::ToArg,
@@ -59,17 +69,24 @@ macro_rules! commands {
         }
 
         /// `DEL key`: removes a key; returns whether it existed.
+        ///
+        /// Not cancel safe, like [`set`](Self::set).
         pub async fn del(&self, key: impl $crate::ToArg) -> Result<bool, $crate::Error> {
             self.query_raw("DEL", &[&key]).await
         }
 
         /// `EXISTS key`: whether a key exists.
+        ///
+        /// Cancel safe: it changes nothing.
         pub async fn exists(&self, key: impl $crate::ToArg) -> Result<bool, $crate::Error> {
             self.query_raw("EXISTS", &[&key]).await
         }
 
         /// `PEXPIRE key ms`: makes a key expire after `ttl`; returns whether
         /// the key exists.
+        ///
+        /// Cancel safe: if the future is dropped, the time to live may or may
+        /// not have been set, and calling again sets it.
         pub async fn expire(
             &self,
             key: impl $crate::ToArg,
@@ -81,6 +98,9 @@ macro_rules! commands {
 
         /// `INCRBY key by`: adds `by` (which may be negative) to a counter,
         /// starting from 0; returns the new value.
+        ///
+        /// Not cancel safe: if the future is dropped, the counter may have been
+        /// changed, and calling again changes it twice.
         pub async fn incr(&self, key: impl $crate::ToArg, by: i64) -> Result<i64, $crate::Error> {
             self.query_raw("INCRBY", &[&key, &by]).await
         }
@@ -88,6 +108,8 @@ macro_rules! commands {
         /// `MGET key...`: the values of several keys, in order, with `None`
         /// for those that do not exist: read as `Vec<Option<T>>`, as in
         /// `mget::<Vec<Option<String>>>(&["a", "b"])`.
+        ///
+        /// Cancel safe: it changes nothing.
         pub async fn mget<T: $crate::FromValue>(
             &self,
             keys: &[impl $crate::ToArg],
@@ -97,6 +119,8 @@ macro_rules! commands {
 
         /// `HGET key field`: one field of a hash, `None` (with `Option<T>`)
         /// when it or the hash does not exist.
+        ///
+        /// Cancel safe: it changes nothing.
         pub async fn hget<T: $crate::FromValue>(
             &self,
             key: impl $crate::ToArg,
@@ -107,6 +131,8 @@ macro_rules! commands {
 
         /// `HSET key field value`: sets one field of a hash; returns whether
         /// the field is new.
+        ///
+        /// Not cancel safe, like [`set`](Self::set).
         pub async fn hset(
             &self,
             key: impl $crate::ToArg,
@@ -118,6 +144,8 @@ macro_rules! commands {
 
         /// `HGETALL key`: every field of a hash, read as a
         /// `HashMap<String, T>` (empty when the hash does not exist).
+        ///
+        /// Cancel safe: it changes nothing.
         pub async fn hgetall<T: $crate::FromValue>(
             &self,
             key: impl $crate::ToArg,
@@ -127,6 +155,9 @@ macro_rules! commands {
 
         /// `PUBLISH channel message`: returns how many subscribers received
         /// it (on this node).
+        ///
+        /// Not cancel safe: if the future is dropped, the message may have been
+        /// published, and calling again publishes it twice.
         pub async fn publish(
             &self,
             channel: impl $crate::ToArg,
@@ -136,6 +167,8 @@ macro_rules! commands {
         }
 
         /// `PING`: checks that the server answers.
+        ///
+        /// Cancel safe: it changes nothing.
         pub async fn ping(&self) -> Result<(), $crate::Error> {
             self.query_raw("PING", &[]).await
         }
