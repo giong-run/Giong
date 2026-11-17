@@ -198,6 +198,8 @@ pub(crate) fn resolved<A: ToSocketAddrs>(addr: &A, what: &str) -> io::Result<Vec
 /// # Ok::<_, std::io::Error>(())
 /// # }).unwrap();
 /// ```
+///
+/// Cancel safe: it changes nothing.
 pub async fn lookup_host<A: ToSocketAddrs>(addr: A) -> io::Result<Vec<SocketAddr>> {
     match addr.target()? {
         Target::Resolved(addrs) => Ok(addrs),

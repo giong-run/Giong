@@ -139,6 +139,10 @@ pub struct Next<'a, S = ()> {
 impl<S: 'static> Next<'_, S> {
     /// Runs the rest of the chain and returns its response. An error from
     /// further in comes back as the response it was turned into.
+    ///
+    /// Cancel safe as far as the handlers are: if the future is dropped, the
+    /// middleware and handler futures are dropped where they stand, and what
+    /// they had done stays done.
     pub async fn run(self, req: Req<S>) -> Response {
         let id = req.id_buf();
         let result = match self.chain.split_first() {

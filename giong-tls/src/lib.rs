@@ -643,6 +643,9 @@ impl TlsAcceptor {
     /// With kernel TLS (see [`ktls`](Self::ktls)), the keys go to the kernel
     /// once the handshake is done. Under [`Ktls::Required`], a stream that
     /// cannot take them fails with `GIONG-E2009` before anything is sent.
+    ///
+    /// Cancel safe: if the future is dropped, the TCP connection it took is
+    /// closed; nothing else changes.
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<TlsStream> {
         let tcp = match &self.ktls {
             ktls::Plan::Off => tcp,
@@ -941,6 +944,9 @@ impl TlsConnector {
     /// A certificate that is not valid for the name, expired, or not issued
     /// by a trusted authority fails the handshake with
     /// [`io::ErrorKind::InvalidData`] and a message saying which it was.
+    ///
+    /// Cancel safe: if the future is dropped, the TCP connection it took is
+    /// closed; nothing else changes.
     pub async fn connect(&self, server_name: &str, tcp: TcpStream) -> io::Result<TlsStream> {
         let name = parse_server_name(server_name)?;
         let tcp = match &self.ktls {
@@ -1864,6 +1870,9 @@ impl TlsStream {
     /// nobody is left to tell (Tokio's `TcpStream::shutdown` likewise
     /// returns `Ok` for `ENOTCONN` after a reset). A failure of an earlier
     /// write is still reported by that write.
+    ///
+    /// Not cancel safe: if the future is dropped, the `close_notify` alert may
+    /// have been sent in part, and the stream can send nothing more.
     pub async fn shutdown(&self) -> io::Result<()> {
         if self.is_ktls() {
             return self.kernel_shutdown().await;
