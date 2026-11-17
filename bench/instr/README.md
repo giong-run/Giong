@@ -52,18 +52,18 @@ instructions per request.
 | `oneshot` | a oneshot channel: create, send, receive | 386 | 386 |
 | `channel` | a round trip between two tasks over two bounded channels | 1,826 | 1,553 |
 | `timeout` | a timeout around a future that is ready at once | 99 | 99 |
-| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,769 | 4,640 |
+| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,768 | 4,640 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 4,286 | 13,868 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 190 | 245 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,685 | 10,522 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 32,322 | 33,241 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 47,246 | 48,221 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 451,994 | 452,149 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 44,877 | 45,763 |
-| `web` | a giong-web router with a path parameter, raw client | 13,815 | 14,667 |
-| `redis-get` | giong-redis `GET` against a fake server | 8,649 | 9,193 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 11,630 | 12,187 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 16,979 | 17,556 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,683 | 10,528 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 32,300 | 33,247 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 47,342 | 48,268 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 448,651 | 448,787 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 44,834 | 45,763 |
+| `web` | a giong-web router with a path parameter, raw client | 13,786 | 14,665 |
+| `redis-get` | giong-redis `GET` against a fake server | 8,642 | 9,193 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 11,626 | 12,187 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 16,973 | 17,556 |
 
 Each case also records heap allocations per operation (counted by a global allocator in the
 benchmark), with the same 1% limit: one more allocation per request fails.
@@ -94,9 +94,9 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
-| `idle-http1` (io_uring / epoll) | 2,068 / 2,182 bytes | 2,122 / 2,234 bytes |
-| `idle-h2` (io_uring / epoll) | 4,578 / 4,596 bytes | 4,860 / 4,796 bytes |
-| `idle-https` (io_uring / epoll) | 10,888 / 10,878 bytes | 11,213 / 11,121 bytes |
+| `idle-http1` (io_uring / epoll) | 2,068 / 2,182 bytes | 2,120 / 2,234 bytes |
+| `idle-h2` (io_uring / epoll) | 4,578 / 4,596 bytes | 4,891 / 4,829 bytes |
+| `idle-https` (io_uring / epoll) | 10,875 / 10,877 bytes | 11,264 / 11,121 bytes |
 
 The numbers above were measured on a 4-vCPU Xeon VM (Linux 6.18) on 2026-11-15; what CI
 compares against is `baseline.csv`, whose header names the machine it came from.
