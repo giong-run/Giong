@@ -136,6 +136,9 @@ enum EOp {
     Multi {
         io: Option<MultiIo>,
         ahead: VecDeque<(u16, u32)>,
+        /// An error met while taking a batch's rest, reported by the next
+        /// poll (a socket error is cleared once read, so it must not be lost).
+        error: Option<i32>,
     },
 }
 
@@ -788,6 +791,7 @@ impl Epoll {
         self.ops.insert(EOp::Multi {
             io: None,
             ahead: VecDeque::new(),
+            error: None,
         })
     }
 
@@ -800,11 +804,14 @@ impl Epoll {
 
     pub(crate) fn poll_multi(&mut self, key: usize, waker: &Waker) -> MultiPoll {
         let io = match self.ops.get_mut(key) {
-            Some(EOp::Multi { ahead, io }) => {
+            Some(EOp::Multi { ahead, io, error }) => {
                 if let Some((bid, len)) = ahead.pop_front() {
                     // Received earlier, in the same system call as another.
                     let pool = self.pool.clone();
                     return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
+                }
+                if let Some(res) = error.take() {
+                    return MultiPoll::Item(res);
                 }
                 match io {
                     Some(io) => *io,
@@ -852,6 +859,56 @@ impl Epoll {
                 self.disarm(key);
                 MultiPoll::NeedArm
             }
+        }
+    }
+
+    /// See [`Driver::take_ready_multi`](super::Driver::take_ready_multi):
+    /// a datagram received ahead, else one more non-blocking batch.
+    pub(crate) fn take_ready_multi(&mut self, key: usize) -> Option<MultiPoll> {
+        let (io, ahead_empty) = match self.ops.get_mut(key) {
+            Some(EOp::Multi { ahead, io, error }) => {
+                if let Some((bid, len)) = ahead.pop_front() {
+                    let pool = self.pool.clone();
+                    return Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len)));
+                }
+                if error.is_some() {
+                    return None;
+                }
+                ((*io)?, true)
+            }
+            _ => return None,
+        };
+        let MultiIo::RecvMsg { fd, hdr } = io else {
+            return None;
+        };
+        debug_assert!(ahead_empty);
+        if !spend_budget() {
+            return None;
+        }
+        match self.recvmsg_into_pool(key, fd, hdr)? {
+            Ok((res, flags)) => match super::buffer_id(flags) {
+                Some(bid) if res > 0 => {
+                    let pool = self.pool.clone();
+                    Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, res as u32)))
+                }
+                // A datagram without a buffer cannot happen here; keep the
+                // result for the next poll like an error.
+                _ => {
+                    self.keep_error(key, res);
+                    None
+                }
+            },
+            Err(res) if is_would_block(res) => None,
+            Err(res) => {
+                self.keep_error(key, res);
+                None
+            }
+        }
+    }
+
+    fn keep_error(&mut self, key: usize, res: i32) {
+        if let Some(EOp::Multi { error, .. }) = self.ops.get_mut(key) {
+            *error = Some(res);
         }
     }
 

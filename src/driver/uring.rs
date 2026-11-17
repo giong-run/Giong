@@ -1125,6 +1125,27 @@ impl Uring {
         MultiPoll::Pending
     }
 
+    /// See [`Driver::take_ready_multi`](super::Driver::take_ready_multi).
+    pub(crate) fn take_ready_multi(&mut self, key: usize) -> Option<MultiPoll> {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            return None;
+        };
+        // A result without data (an error) stays for the next poll, which
+        // reports it on its own.
+        if matches!(m.queue.front()?, Queued::Raw(_)) {
+            return None;
+        }
+        match m.queue.pop_front()? {
+            Queued::Raw(_) => unreachable!(),
+            Queued::Piece { bid, off, len, .. } => {
+                self.pooled_queued -= 1;
+                let pool = self.pool.clone();
+                Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len)))
+            }
+            Queued::Heap(data) => Some(MultiPoll::Data(RecvBuf::heap(data))),
+        }
+    }
+
     /// See [`Driver::leave_multi`](super::Driver::leave_multi).
     pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {

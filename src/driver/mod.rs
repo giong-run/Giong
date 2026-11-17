@@ -789,6 +789,32 @@ impl Driver {
         }
     }
 
+    /// A completion of multishot operation `key` that is already there, if
+    /// any, without waiting for one or registering a waker: for a caller
+    /// that has just taken one and wants the rest of a batch. The epoll
+    /// driver may make one non-blocking receive for it.
+    pub(crate) fn take_ready_multi(&mut self, key: usize) -> Option<MultiPoll> {
+        match self {
+            Driver::Uring(d) => d.take_ready_multi(key),
+            Driver::Epoll(d) => d.take_ready_multi(key),
+        }
+    }
+
+    /// Sends the datagrams in `msgs` with one `sendmmsg(2)`, without
+    /// blocking: how many went (the first error if none did), or `None`
+    /// when the socket is full or the task's budget is spent.
+    pub(crate) fn try_send_mmsg(&mut self, fd: RawFd, msgs: &mut [libc::mmsghdr]) -> Option<i32> {
+        // SAFETY: the caller's headers point at live buffers and addresses.
+        send_now(|| unsafe {
+            libc::sendmmsg(
+                fd,
+                msgs.as_mut_ptr(),
+                msgs.len().min(u32::MAX as usize) as libc::c_uint,
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            ) as isize
+        })
+    }
+
     /// A future that waited on multishot operation `key` with `waker` was
     /// dropped (see `net::Waiting`).
     pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {

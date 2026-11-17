@@ -28,6 +28,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **net**: `UdpSocket::recv_many` takes every datagram that has already arrived (waiting for
+  the first) and `UdpSocket::send_many` sends a batch with `sendmmsg(2)`, borrowing the
+  bytes only for the call. A server that answers in batches answers 408,000 to 415,000
+  datagrams a second on one core on io_uring and 384,000 to 419,000 on epoll, against
+  304,000 to 309,000 for Tokio (`bench/udp-echo.sh`, modes `giong-many`,
+  `bench/results/udp-echo/vm/batch-api/`).
 - **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
   (`Code::HttpServerLowMemory`) in giong.
 - **giong-mysql**, **giong-redis** (**behaviour change**): `Pool::idle_timeout`,

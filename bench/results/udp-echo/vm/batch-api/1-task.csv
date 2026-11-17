@@ -1,0 +1,26 @@
+# 2026-11-17T05:24:44Z 6.18.44-fc-v553 4 CPUs: Intel(R) Xeon(R) Processor @ 2.10GHz; veth, 64-byte payload, 1 tasks
+round,mode,echoes_per_s,machine_cpu_us_per_echo,server_process_us_per_echo,server_cpu_softirq_us_per_echo
+1,giong,427834,4.460,2.322,0.721
+1,giong-many,415264,4.551,2.396,0.939
+1,giong-epoll,349639,5.314,2.846,1.144
+1,giong-epoll-many,428110,4.522,2.324,0.903
+1,tokio,309939,5.678,3.205,1.339
+1,kernel,449715,4.327,2.213,0.726
+2,giong,370919,5.025,2.665,1.033
+2,giong-many,411030,4.656,2.417,0.941
+2,giong-epoll,347861,5.226,2.851,1.179
+2,giong-epoll-many,410057,4.741,2.422,0.817
+2,tokio,339774,5.409,2.919,1.182
+2,kernel,439042,4.368,2.266,0.793
+3,giong,406204,4.643,2.445,0.853
+3,giong-many,431442,4.343,2.306,0.827
+3,giong-epoll,334350,5.419,2.961,1.286
+3,giong-epoll-many,432417,4.514,2.301,0.767
+3,tokio,298007,6.107,3.339,1.437
+3,kernel,465101,4.201,2.136,0.692
+4,giong,381678,4.967,2.581,0.961
+4,giong-many,414745,4.706,2.387,0.932
+4,giong-epoll,373289,5.031,2.648,0.978
+4,giong-epoll-many,388815,4.928,2.559,1.024
+4,tokio,277488,6.184,3.592,1.538
+4,kernel,487460,3.980,2.034,0.592

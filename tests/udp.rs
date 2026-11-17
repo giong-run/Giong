@@ -443,6 +443,97 @@ fn a_task_that_only_sends_lets_the_others_run() {
 }
 
 #[test]
+fn recv_many_takes_what_has_arrived_and_send_many_answers_it() {
+    giong::block_on(async {
+        let (a, a_addr) = socket();
+        let (b, b_addr) = socket();
+        for i in 0..20u32 {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        // Let them all arrive.
+        sleep(Duration::from_millis(20)).await;
+        let mut got = Vec::new();
+        while got.len() < 20 {
+            let before = got.len();
+            let n = timeout(Duration::from_secs(5), b.recv_many(&mut got, 64))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.len(), before + n);
+            assert!(n >= 1);
+        }
+        let numbers: Vec<u32> = got
+            .iter()
+            .map(|(d, from)| {
+                assert_eq!(*from, a_addr);
+                u32::from_be_bytes(d[..].try_into().unwrap())
+            })
+            .collect();
+        assert_eq!(numbers, (0..20).collect::<Vec<_>>());
+
+        // Answer them all at once.
+        let answers: Vec<(Vec<u8>, SocketAddr)> =
+            got.iter().map(|(d, from)| (d.to_vec(), *from)).collect();
+        drop(got);
+        assert_eq!(b.send_many(&answers).await.unwrap(), 20);
+        for i in 0..20u32 {
+            let d = timeout(Duration::from_secs(5), a.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(u32::from_be_bytes(d[..].try_into().unwrap()), i);
+        }
+        // `max` caps a batch; 0 takes nothing.
+        for i in 0..5u32 {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        sleep(Duration::from_millis(20)).await;
+        let mut few = Vec::new();
+        assert_eq!(b.recv_many(&mut few, 0).await.unwrap(), 0);
+        assert!(b.recv_many(&mut few, 2).await.unwrap() <= 2);
+    });
+}
+
+#[test]
+fn send_many_reports_how_far_it_got() {
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let v6: SocketAddr = "[::1]:9".parse().unwrap();
+        let batch = [
+            (&b"one"[..], b_addr),
+            (&b"bad"[..], v6),
+            (&b"three"[..], b_addr),
+        ];
+        // The second cannot go from an IPv4 socket: the first went.
+        assert_eq!(a.send_many(&batch).await.unwrap(), 1);
+        assert_eq!(&*b.recv().await.unwrap(), b"one");
+        // Failing on the first is an error.
+        assert!(a.send_many(&batch[1..]).await.is_err());
+        assert_eq!(a.send_many::<&[u8]>(&[]).await.unwrap(), 0);
+        // Many more than one system call takes.
+        let lots: Vec<(Vec<u8>, SocketAddr)> = (0..200u32)
+            .map(|i| (i.to_be_bytes().to_vec(), b_addr))
+            .collect();
+        assert_eq!(a.send_many(&lots).await.unwrap(), 200);
+        let mut got = Vec::new();
+        let mut numbers = Vec::new();
+        while numbers.len() < 200 {
+            timeout(Duration::from_secs(5), b.recv_many(&mut got, 256))
+                .await
+                .unwrap()
+                .unwrap();
+            // Copy out and give the pool buffers back as we go.
+            numbers.extend(
+                got.drain(..)
+                    .map(|(d, _)| u32::from_be_bytes(d[..].try_into().unwrap())),
+            );
+        }
+        assert_eq!(numbers, (0..200).collect::<Vec<_>>());
+    });
+}
+
+#[test]
 fn every_worker_can_bind_the_same_port() {
     // No other test binds to 127.0.0.2, and the port is one the kernel never
     // hands out for port 0: a socket of a test running at the same time,

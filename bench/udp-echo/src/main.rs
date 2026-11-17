@@ -42,6 +42,11 @@ fn main() {
                     giong_server()
                 }
                 "tokio" => tokio_server(),
+                "giong-many" => giong_server_with(true),
+                "giong-epoll-many" => {
+                    std::env::set_var("GIONG_DRIVER", "epoll");
+                    giong_server_with(true)
+                }
                 m => panic!("unknown mode {m}"),
             }
         }
@@ -237,18 +242,33 @@ fn tasks() -> usize {
 }
 
 fn giong_server() {
+    giong_server_with(false)
+}
+
+/// `many`: each task answers in batches, with `recv_many` and `send_many`.
+fn giong_server_with(many: bool) {
     giong::Builder::new()
         .workers(1)
         .pin_cores(false)
         .build()
         .unwrap()
-        .run(|_| async {
+        .run(move |_| async move {
             let s = std::rc::Rc::new(giong::net::UdpSocket::bind(("0.0.0.0", PORT)).unwrap());
             for _ in 1..tasks() {
                 let s = s.clone();
-                giong::spawn(async move { giong_echo(&s).await });
+                giong::spawn(async move {
+                    if many {
+                        giong_echo_many(&s).await
+                    } else {
+                        giong_echo(&s).await
+                    }
+                });
             }
-            giong_echo(&s).await;
+            if many {
+                giong_echo_many(&s).await
+            } else {
+                giong_echo(&s).await
+            }
         })
         .unwrap();
 }
@@ -265,6 +285,25 @@ async fn giong_echo(s: &giong::net::UdpSocket) {
         v.extend_from_slice(&d);
         drop(d);
         v = s.send_to(v, from).await.1;
+    }
+}
+
+async fn giong_echo_many(s: &giong::net::UdpSocket) {
+    let mut got = Vec::with_capacity(BATCH);
+    let mut answers: Vec<(Vec<u8>, std::net::SocketAddr)> = Vec::with_capacity(BATCH);
+    let mut spare: Vec<Vec<u8>> = Vec::new();
+    loop {
+        if s.recv_many(&mut got, BATCH).await.is_err() {
+            continue;
+        }
+        for (d, from) in got.drain(..) {
+            let mut v = spare.pop().unwrap_or_else(|| Vec::with_capacity(2048));
+            v.clear();
+            v.extend_from_slice(&d);
+            answers.push((v, from));
+        }
+        let _ = s.send_many(&answers).await;
+        spare.extend(answers.drain(..).map(|(v, _)| v));
     }
 }
 

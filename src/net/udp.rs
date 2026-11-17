@@ -338,6 +338,123 @@ impl UdpSocket {
         })
     }
 
+    /// Receives every datagram that is already waiting, up to `max`, into
+    /// `out` (appended), waiting for the first one if none is. Returns how
+    /// many were added: at least one, unless `max` is 0.
+    ///
+    /// The datagrams are the same as [`recv_from`](Self::recv_from)'s, with
+    /// the same limits, and the two can be mixed. A server that answers in
+    /// batches takes what has arrived with one call and sends the answers
+    /// with one [`send_many`](Self::send_many): on io_uring the datagrams
+    /// were received by the kernel's multishot receive already, on epoll up
+    /// to 16 come in each system call.
+    ///
+    /// Cancel safe, like `recv_from`. An error that arrives after the first
+    /// datagram is returned by the next call.
+    pub async fn recv_many(
+        &self,
+        out: &mut Vec<(Datagram, SocketAddr)>,
+        max: usize,
+    ) -> io::Result<usize> {
+        if max == 0 {
+            return Ok(0);
+        }
+        let first = self.recv_from().await?;
+        out.push(first);
+        let mut n = 1;
+        runtime::with_worker(|w| {
+            if !self.recv.is_active(w) {
+                return;
+            }
+            let key = self.recv.key(w);
+            let mut driver = w.driver.borrow_mut();
+            while n < max {
+                match driver.take_ready_multi(key) {
+                    Some(MultiPoll::Data(buf)) => match Datagram::parse(buf) {
+                        Ok(d) => {
+                            out.push(d);
+                            n += 1;
+                        }
+                        // Malformed: cannot happen; stop the batch here.
+                        Err(_) => break,
+                    },
+                    _ => break,
+                }
+            }
+        });
+        Ok(n)
+    }
+
+    /// Sends each datagram of `datagrams` to its address, with as few system
+    /// calls as the kernel allows (`sendmmsg(2)`, up to 64 per call).
+    /// Returns how many were sent: all of them, or, if datagram `i` failed
+    /// after others went, `i` (send it alone to see its error). An error on
+    /// the first datagram is returned as the error.
+    ///
+    /// The bytes are borrowed only for the call: the datagrams leave within
+    /// it when the socket has room, and when it is full the call waits until
+    /// it has room and tries again.
+    pub async fn send_many<B: AsRef<[u8]>>(
+        &self,
+        datagrams: &[(B, SocketAddr)],
+    ) -> io::Result<usize> {
+        const CHUNK: usize = 64;
+        let fd = self.sock.as_raw_fd();
+        let mut sent = 0;
+        let mut yielded = false;
+        while sent < datagrams.len() {
+            let chunk = &datagrams[sent..datagrams.len().min(sent + CHUNK)];
+            let addrs: Vec<SockAddr> = chunk.iter().map(|(_, a)| SockAddr::from(*a)).collect();
+            let mut iov: Vec<libc::iovec> = chunk
+                .iter()
+                .map(|(b, _)| libc::iovec {
+                    iov_base: b.as_ref().as_ptr().cast_mut().cast(),
+                    iov_len: b.as_ref().len(),
+                })
+                .collect();
+            let mut msgs: Vec<libc::mmsghdr> = (0..chunk.len())
+                .map(|i| {
+                    // SAFETY: all-zero is a valid `mmsghdr`.
+                    let mut m: libc::mmsghdr = unsafe { mem::zeroed() };
+                    m.msg_hdr.msg_iov = &mut iov[i];
+                    m.msg_hdr.msg_iovlen = 1;
+                    m.msg_hdr.msg_name = addrs[i].as_ptr().cast_mut().cast();
+                    m.msg_hdr.msg_namelen = addrs[i].len();
+                    m
+                })
+                .collect();
+            let res = runtime::with_worker(|w| w.driver.borrow_mut().try_send_mmsg(fd, &mut msgs));
+            match res {
+                Some(n) if n > 0 => sent += n as usize,
+                Some(n) if n < 0 => {
+                    return if sent == 0 { Err(os_err(n)) } else { Ok(sent) };
+                }
+                Some(_) => {}
+                // The task's budget is spent, or the socket is full. Let the
+                // other tasks run first; if it is still full after that
+                // (with a fresh budget), wait until it has room.
+                None if !yielded => {
+                    yielded = true;
+                    crate::yield_now().await;
+                    continue;
+                }
+                None => {
+                    // SAFETY: the operation has no pointers.
+                    let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
+                    if res < 0 {
+                        return if sent == 0 {
+                            Err(os_err(res))
+                        } else {
+                            Ok(sent)
+                        };
+                    }
+                }
+            }
+            yielded = false;
+        }
+        Ok(sent)
+    }
+
     /// Receives one datagram into `buf` (from its start, up to its capacity),
     /// returning the buffer with its length set to the bytes received, and the
     /// sender's address. A datagram longer than the buffer is cut off.
