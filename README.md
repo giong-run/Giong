@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>A thread-per-core async runtime for Linux, built on io_uring, with an epoll driver wherever io_uring is blocked.</b></p>
+<p align="center"><b>An async runtime for Rust services on Linux, built for code that AI agents write: a strict API meant to stay correct for years, errors that say how to fix them, and io_uring with one thread per core underneath.</b></p>
 
 <p align="center">
   <a href="https://github.com/giong-run/Giong/actions/workflows/main.yml"><img alt="CI" src="https://github.com/giong-run/Giong/actions/workflows/main.yml/badge.svg"></a>
@@ -35,6 +35,88 @@ load arrives.
 > HTTP/2 on both sides are fuzzed, `h2spec` passes, and a soak test churns connections for two
 > hours every night. It has **not** run in production. See [Limitations](#limitations).
 
+## What giong is for
+
+giong is a late entrant: Tokio has been Rust's default runtime for years, and giong does not
+try to be a smaller copy of it. It is built for the way services are written now, with more
+and more of the code coming from AI agents. So the API is designed to be used correctly on
+the first try, and to tell the one who got it wrong how to fix it, rather than to be short
+to type.
+
+- **The goal: the best async runtime for Rust, on technical merit.** A complete,
+  general-purpose runtime for any workload a service has, faster and leaner than Tokio. Every
+  claim comes from a benchmark in this repository, and where giong is not ahead the README
+  says so (see below).
+- **A whole service with no Tokio underneath.** HTTP/1.1 and HTTP/2 (server and client),
+  TLS, PostgreSQL, MySQL, Redis, DNS, routing and middleware are giong crates, written for
+  its buffer pool and its batched system calls, not adapters. [Choosing crates](#choosing-crates)
+  measures each one against the Tokio crate it replaces.
+- **Agent-first.** Every error giong raises carries a stable code, the cause and the fix,
+  and has a page of its own ([docs/errors](docs/errors/README.md)). [AGENTS.md](AGENTS.md)
+  and [giong.run/llms.txt](https://giong.run/llms.txt) tell a model how to work with it;
+  giong-web writes JSON-line logs and `tracing` spans; [`giong-mcp`](giong-mcp/README.md)
+  lets an agent look inside a running service ([below](#let-your-agent-look-inside-the-running-service)).
+- **One major version for a long time.** After 1.0, giong grows through 1.x minor releases
+  for years rather than moving to a 2.0, so the API follows four rules:
+  1. One way to do each thing.
+  2. Misuse fails at compile time, or at run time with a coded error.
+  3. Every behaviour code relies on is documented.
+  4. Releases only add; they never change what existing code means.
+
+  The API was settled in 0.7 ([review](docs/reviews/2026-11-api-freeze.md)), and
+  `cargo-semver-checks` runs on every pull request.
+- **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
+  io_uring is blocked. macOS (for development) and Windows come after 1.0
+  ([ROADMAP.md](ROADMAP.md)).
+
+## Let your agent look inside the running service
+
+[`giong-mcp`](giong-mcp/README.md) is an MCP server built into your service. Connect your
+coding agent (Claude Code, or any client that speaks MCP's Streamable HTTP) and it can see
+what each worker is doing, which tasks are alive and which line of your code spawned them,
+what the database pools hold and where the time goes, instead of guessing from logs. The
+answer no other tool gives: **which task blocks a worker**, named by the line that spawned
+it.
+
+1. Add `giong-mcp` and start it next to the runtime. It starts only when `GIONG_MCP` is
+   set, and never stops the service from starting:
+
+   ```rust,no_run
+   fn main() -> std::io::Result<()> {
+       let rt = giong::Builder::new().shutdown_on_signals(true).build()?;
+       let _mcp = giong_mcp::start_from_env(&rt.handle()); // keep it: dropping it stops the server
+       rt.run(|_worker| async {
+           // ... the service ...
+           giong::shutdown_signal().await;
+       })
+   }
+   ```
+
+2. Run the service with an address and a token (16 characters or more):
+
+   ```sh
+   export GIONG_MCP=127.0.0.1:7777 GIONG_MCP_TOKEN=$(openssl rand -hex 16)
+   cargo run --release
+   ```
+
+3. Connect the agent, with the same token:
+
+   ```sh
+   claude mcp add --transport http giong http://127.0.0.1:7777/mcp \
+       --header "Authorization: Bearer $GIONG_MCP_TOKEN"
+   ```
+
+The agent then has five tools: `overview` (memory, threads, open descriptors against the
+limit, each worker's state, warnings such as a blocked worker), `workers` (each worker's
+counters, timers, I/O in flight and the task it is stuck in), `tasks` (live tasks grouped by
+the line that spawned them: a count that keeps growing is a leak), `sources` (the
+PostgreSQL, MySQL and Redis pools: open, taken, waiting, timeouts) and `profile` (times every
+poll for a window and lists where the workers spent it). Every tool only reads, apart from
+`profile` turning on poll timing for its window. The server listens on a loopback address
+or a Unix socket only, needs the token on TCP, and runs on a thread of its own, so it answers
+even when every worker is stuck. To reach a service on another machine, forward the port
+(`ssh -L`, `kubectl port-forward`).
+
 ## Why giong
 
 - **One system call per tick, not per operation.** Every read, write, accept, close and
@@ -49,8 +131,8 @@ load arrives.
   CPU per request (11% below the next runtime) and has the lowest p99. At 1,000 it is level
   with a hand-written epoll server and ahead of the rest.
 - **HTTP and HTTPS in the box.** [`giong-http`](giong-http/README.md) and
-  [`giong-tls`](giong-tls/README.md) serve HTTPS at **144.8k requests/s on one core,
-  against 81.0k for Axum** on the same rustls.
+  [`giong-tls`](giong-tls/README.md) serve HTTPS at **146.6k requests/s on one core,
+  against 81.2k for Axum** on the same rustls.
 - **Cancellation-safe by construction.** Dropping an I/O future never frees memory the
   kernel may still write to, and wrapping `recv`, `recv_from` or `accept` in a timeout
   loses neither data nor connections.
@@ -61,10 +143,13 @@ load arrives.
 - **Small enough to read.** About 12,100 lines of code for the runtime, both drivers
   included, three dependencies, and a comment on every `unsafe` block.
 
-What it is **not**: faster than everything at everything. On the classic 50-connection
-benchmark giong, a tuned Monoio and raw Tokio are within noise of each other, because the
-kernel's TCP stack, not the runtime, is most of the cost. The numbers below say where the
-design pays off and where it does not.
+What it is **not**, today: faster than everything at everything. On the classic
+50-connection benchmark giong, a tuned Monoio and raw Tokio are within noise of each other,
+because the kernel's TCP stack, not the runtime, is most of the cost. Over one PostgreSQL
+connection shared by every task, giong-postgres is 7–9% behind tokio-postgres; a blocking
+`std` read of a cached file beats every async one, giong's included; and a TLS handshake
+costs the same as Axum's once both prefer the same cipher suite. The numbers below say
+where the design pays off and where it does not.
 
 ## Results at a glance
 
@@ -94,7 +179,8 @@ connection, the same as the others.
   containerd's default ones), under gVisor, or with the `kernel.io_uring_disabled` sysctl.
   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow io_uring in Docker, Docker
   Compose and Kubernetes.
-- Rust 1.80 or newer.
+- Rust 1.80 or newer. How this minimum, the kernel minimums and the API move during 1.x:
+  [docs/STABILITY.md](docs/STABILITY.md).
 - giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
   `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
   are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
@@ -913,7 +999,7 @@ cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,095 tests across the nine crates and the example API (`cargo test --workspace
+1,111 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and
@@ -935,7 +1021,7 @@ the example API describe theirs in their READMEs.
 | `tests/driver.rs` (9), `tests/blocked.rs` (4) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; with the locked-memory limit used up, the same with GIONG-E0010; the optional io_uring features found are the kernel's; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (10) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time, which counts a sleep in progress and never goes down; poll profiles by spawn location; sources reported until dropped |
 | `giong-http` (215) | HTTP/1.1: 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 27 end-to-end server tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit, the memory budget for requests being received); 14 of bodies streamed both ways; 12 over HTTPS with a rustls client. HTTP/2: 41 unit tests of the server's streams, flow control, memory budgets, HPACK and frames; 15 client tests against the server and against servers that misbehave on purpose (refused and reset streams, overdrawn windows, malformed responses, over kernel TLS). 8 fuzz-style tests: 500,000 random inputs for the parser and the chunked decoder, HPACK header blocks, HTTP/2 connections from each side, compressed bodies, response heads and 100,000 responses read by the client in random pieces; 61 other unit tests; 15 documentation examples |
-| `giong-tls` (76) | 15 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two and three tasks sending on one connection with every write arriving whole, **a TLS 1.2 write past the record limit failing instead of vanishing**, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 31 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, a peer that cuts its records to 32 bytes, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
+| `giong-tls` (90) | certificates chosen by SNI and replaced while serving, client certificates required or requested on the server; 15 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two and three tasks sending on one connection with every write arriving whole, **a TLS 1.2 write past the record limit failing instead of vanishing**, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 31 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, a peer that cuts its records to 32 bytes, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
@@ -1036,9 +1122,11 @@ Not verified, and you should know it:
 
 Monoio is the mature choice and runs in production at ByteDance; if you need
 Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
-priority scheduling are its strengths, not HTTP. giong's case is narrower: the receive
-path (multishot with provided buffers, cancel safe without a second API), good defaults,
-the latency dial, a strict HTTP server on top, and code small enough to audit.
+priority scheduling are its strengths, not HTTP. giong's case: the receive path
+(multishot with provided buffers, cancel safe without a second API), good defaults, the
+latency dial, its own crates for a whole service instead of a compatibility layer, an API
+held to the four rules [above](#what-giong-is-for), and code small enough to audit. It is
+younger than both and has not run in production.
 
 ## Limitations
 

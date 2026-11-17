@@ -157,7 +157,10 @@ epoll driver, a file operation running on a blocking thread does the same.
   `miniz_oxide` for gzip, and `tls` or `client` giong-tls).
 - Public items need documentation. The API was settled for 1.0 in 0.7.0
   ([docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md)): add rather
-  than break. A breaking change needs an issue first and an entry in the changelog that
+  than break. giong means to stay on major version 1 for many years, so every addition
+  follows four rules: one way to do each thing; misuse fails at compile time, or at run
+  time with a coded error; every behaviour code relies on is documented; a release only
+  adds, and never changes what existing code means. A breaking change needs an issue first and an entry in the changelog that
   says how to migrate.
 - The Rust samples in the READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are
   compiled by `cargo test -p rest-api --doc`, and run unless marked `no_run`; a change to

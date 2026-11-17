@@ -154,7 +154,7 @@ async fn recv_exact(tls: &TlsStream, n: usize) -> Vec<u8> {
 
 fn roundtrip(versions: &[&'static rustls::SupportedProtocolVersion]) {
     let pki = pki();
-    let acceptor = TlsAcceptor::new(server_config(&pki, versions, false));
+    let acceptor = TlsAcceptor::from_rustls(server_config(&pki, versions, false));
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -362,7 +362,7 @@ fn alpn_settles_on_a_protocol_both_sides_speak() {
 fn a_client_certificate_is_presented_when_the_server_asks_for_one() {
     let pki = pki();
     let versions = [&rustls::version::TLS13, &rustls::version::TLS12];
-    let acceptor = TlsAcceptor::new(server_config(&pki, &versions, true));
+    let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &versions, true));
     let anonymous = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     let identified = anonymous
         .clone()
@@ -525,6 +525,7 @@ fn trust_roots_must_be_certificates() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
     // The same kind as when the machine has none (`with_system_roots`).
+    #[allow(deprecated)] // `with_roots` goes in 1.0.0; the error stays.
     let err = TlsConnector::with_roots(RootCertStore::empty()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     assert_eq!(code(&err), Some(Code::NoTrustedRoots), "{err}");

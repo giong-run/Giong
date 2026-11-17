@@ -307,7 +307,10 @@ impl<T> Drop for BoundedSender<T> {
 
 impl<T> BoundedReceiver<T> {
     /// Receives the next value, or `None` once every sender is gone and the
-    /// channel is empty. Cancel safe.
+    /// channel is empty.
+    ///
+    /// Cancel safe: if the future is dropped, no value is lost; the next call
+    /// returns it.
     pub async fn recv(&mut self) -> Option<T> {
         let mut wake = Vec::new();
         let value = poll_fn(|cx| {

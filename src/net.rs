@@ -994,6 +994,10 @@ impl TcpStream {
     /// # Ok::<_, std::io::Error>(())
     /// # }).unwrap();
     /// ```
+    ///
+    /// Cancel safe: if the future is dropped, every socket it opened is closed,
+    /// so no connection is left behind (the server may have seen one open and
+    /// close).
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let addrs = lookup_host(addr).await?;
         addr::connect_first(addrs, Self::connect_addr).await

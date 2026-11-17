@@ -125,6 +125,8 @@ impl<T> Sender<T> {
 
     /// Waits until the receiver is dropped. Useful to abandon work whose
     /// result nobody will read, for example with a `select` on both.
+    ///
+    /// Cancel safe: it changes nothing.
     pub async fn closed(&self) {
         poll_fn(|cx| {
             let mut state = self.shared.lock();
