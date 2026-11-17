@@ -13,6 +13,7 @@ use std::task::{Context, Poll};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::addr::{resolved, ToSocketAddrs};
+use super::sendq::{self, Sent};
 use super::{
     close_socket, inet_addr, no_addresses, os_err, share, unexpected, wait_for_pool, MultiSlot,
 };
@@ -176,10 +177,14 @@ impl std::fmt::Debug for Datagram {
 /// Each datagram goes to one of the tasks waiting in
 /// [`recv_from`](Self::recv_from), woken for it alone.
 ///
-/// A send goes out within the call when the socket has room, as it nearly
-/// always does: datagrams wait for no peer. Receives stay queued in the
-/// kernel's ring on io_uring, so a datagram echoed back costs one system
-/// call.
+/// A send returns once the kernel has taken the datagram, with the result
+/// `sendto(2)` gives. When other tasks of the worker are waiting to run, the
+/// datagram waits for the end of that turn of the event loop and goes to the
+/// kernel with the others sent in it, in one `sendmmsg(2)`; a task that is
+/// the only one with work sends at once. Datagrams of one socket leave in
+/// the order they were sent. Receives stay queued in the kernel's ring on
+/// io_uring and come up to 16 per `recvmmsg(2)` on epoll, so a busy server
+/// makes a fraction of a system call per datagram.
 pub struct UdpSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
@@ -187,6 +192,15 @@ pub struct UdpSocket {
     /// made on a port of the caller's choice (see `share`).
     held: Option<share::Held>,
     _not_send: PhantomData<*const ()>,
+}
+
+/// A send's answer (bytes, or a negative errno) as an `io::Result`.
+fn sent_result(res: isize) -> io::Result<usize> {
+    if res < 0 {
+        Err(io::Error::from_raw_os_error(-res as i32))
+    } else {
+        Ok(res as usize)
+    }
 }
 
 impl UdpSocket {
@@ -417,6 +431,16 @@ impl UdpSocket {
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
         let addr = SockAddr::from(addr);
         let fd = self.sock.as_raw_fd();
+        // With the other datagrams of this turn, if other tasks may send too
+        // (see `sendq`).
+        let queued = {
+            // SAFETY: an `IoBuf`'s bytes stay put, and `buf` is held until
+            // the future is done.
+            unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), Some(&addr)) }
+        };
+        if let Sent::Done(res) = queued.await {
+            return (sent_result(res), buf);
+        }
         // At once where the socket has room (see `Driver::try_send_to`).
         let (sent, sends_to) = runtime::with_worker(|w| {
             let mut driver = w.driver.borrow_mut();
@@ -474,6 +498,13 @@ impl UdpSocket {
     /// [`connect`](Self::connect).
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         let fd = self.sock.as_raw_fd();
+        let queued = {
+            // SAFETY: as in `send_to`.
+            unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), None) }
+        };
+        if let Sent::Done(res) = queued.await {
+            return (sent_result(res), buf);
+        }
         let sent = runtime::with_worker(|w| {
             // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
             let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };

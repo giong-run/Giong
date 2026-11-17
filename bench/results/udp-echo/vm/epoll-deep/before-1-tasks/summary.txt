@@ -1,0 +1,5 @@
+# 2026-11-17T06:53:15Z 6.18.44-fc-v553 4 CPUs: Intel(R) Xeon(R) Processor @ 2.10GHz; veth, 64-byte payload, 1 tasks
+mode                          echoes/s           machine CPU us/echo        server process us/echo    server-CPU softirq us/echo
+giong           355954 (353974-372975)           5.448 (5.335-5.590)           2.781 (2.654-2.800)           1.008 (0.924-1.080)
+giong-epoll        358820 (311678-367202)           5.528 (5.378-6.148)           2.759 (2.705-3.180)           1.047 (0.950-1.280)
+rounds: 5

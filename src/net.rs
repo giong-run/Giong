@@ -19,12 +19,14 @@
 mod addr;
 mod balance;
 pub(crate) mod dns;
+mod sendq;
 mod share;
 mod udp;
 mod unix;
 
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
+pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
 pub use unix::{UnixListener, UnixStream};
 

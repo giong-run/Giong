@@ -1,0 +1,12 @@
+# 2026-11-17T06:47:14Z 6.18.44-fc-v553 4 CPUs: Intel(R) Xeon(R) Processor @ 2.10GHz; veth, 64-byte payload, 16 tasks
+round,mode,echoes_per_s,machine_cpu_us_per_echo,server_process_us_per_echo,server_cpu_softirq_us_per_echo
+1,giong,401918,4.982,2.471,0.827
+1,giong-epoll,306248,6.180,3.225,1.379
+2,giong,380215,5.079,2.607,0.950
+2,giong-epoll,331931,5.765,2.996,1.198
+3,giong,350578,5.583,2.827,1.068
+3,giong-epoll,336465,5.762,2.942,1.215
+4,giong,349832,5.617,2.836,0.997
+4,giong-epoll,319541,6.028,3.112,1.252
+5,giong,362904,5.439,2.731,0.949
+5,giong-epoll,356746,5.683,2.784,1.031

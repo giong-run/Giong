@@ -81,6 +81,11 @@ const WAKE: u64 = u64::MAX;
 /// epoll `data` of the eventfd the blocking threads poke.
 const DONE: u64 = u64::MAX - 1;
 
+/// Datagrams a socket receives while in the epoll set before it may leave
+/// it (see [`Registration::armed`]): a socket that stays busy pays for no
+/// wake-ups, and one that is not pays at most two `epoll_ctl` per this many.
+const QUIET_AFTER: u32 = 64;
+
 /// Events collected per `epoll_wait`.
 const MAX_EVENTS: usize = 1024;
 
@@ -107,6 +112,11 @@ struct Registration {
     gen: u32,
     readers: Vec<Waker>,
     writers: Vec<Waker>,
+    /// In the epoll set. A busy datagram socket leaves it (see
+    /// [`QUIET_AFTER`]) and comes back when a task has to wait for it.
+    armed: bool,
+    /// Datagrams received since the descriptor was last added to the set.
+    datagrams: u32,
 }
 
 enum Lifecycle {
@@ -381,6 +391,8 @@ impl Epoll {
                 gen,
                 readers: Vec::new(),
                 writers: Vec::new(),
+                armed: true,
+                datagrams: 0,
             }),
         );
         Ok(())
@@ -442,6 +454,25 @@ impl Epoll {
             waker.wake_by_ref();
             return;
         };
+        if !reg.armed {
+            let mut ev = libc::epoll_event {
+                events: (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32,
+                u64: (u64::from(reg.gen) << 32) | u64::from(fd as u32),
+            };
+            // SAFETY: valid descriptors and a valid event. Adding reports
+            // readiness that is already there, so nothing is missed while
+            // the descriptor was out of the set.
+            if unsafe { libc::epoll_ctl(self.epfd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) }
+                < 0
+            {
+                // Cannot be watched: try again on the next turn rather than
+                // hang.
+                waker.wake_by_ref();
+                return;
+            }
+            reg.armed = true;
+            reg.datagrams = 0;
+        }
         let list = match dir {
             Dir::Read => &mut reg.readers,
             Dir::Write => &mut reg.writers,
@@ -1037,6 +1068,9 @@ impl Epoll {
             ) as isize
         });
         let got = n.max(0) as usize;
+        if let Some(Some(Slot::Pollable(reg))) = self.fds.get_mut(fd as usize) {
+            reg.datagrams = reg.datagrams.saturating_add(got as u32);
+        }
         for &(bid, ..) in &bufs[got..] {
             self.pool.release(bid);
         }
@@ -1195,6 +1229,28 @@ impl Epoll {
                     if events & WRITABLE != 0 {
                         for waker in reg.writers.drain(..) {
                             waker.wake();
+                        }
+                    }
+                    // A busy datagram socket leaves the set until a task has
+                    // to wait for it again: in the set, every datagram that
+                    // arrives and every one sent and freed wakes the set's
+                    // wait queue, which costs about as much as the receive.
+                    if reg.datagrams >= QUIET_AFTER
+                        && reg.readers.is_empty()
+                        && reg.writers.is_empty()
+                    {
+                        let mut ev = libc::epoll_event { events: 0, u64: 0 };
+                        // SAFETY: valid descriptors; the event is ignored.
+                        if unsafe {
+                            libc::epoll_ctl(
+                                self.epfd.as_raw_fd(),
+                                libc::EPOLL_CTL_DEL,
+                                fd as RawFd,
+                                &mut ev,
+                            )
+                        } == 0
+                        {
+                            reg.armed = false;
                         }
                     }
                 }
