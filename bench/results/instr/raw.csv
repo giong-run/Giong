@@ -5,6 +5,8 @@
 # driver io_uring: io_uring (named by GIONG_DRIVER), using packed-buffers, registered-ring, zero-copy-send
 # driver epoll: epoll (named by GIONG_DRIVER)
 # cpu: Intel(R) Xeon(R) Processor @ 2.10GHz
+# redis-get, postgres-query, mysql-query instructions: re-measured for the database
+# clients' read-in-place change (#144), same rustc and valgrind, kernel 6.18.44-fc-v553.
 round,driver,case,metric,value
 1,io_uring,spawn,instructions,1707.370
 1,io_uring,spawn,allocations,3.000
@@ -32,11 +34,11 @@ round,driver,case,metric,value
 1,io_uring,https,allocations,39.069
 1,io_uring,web,instructions,15259.732
 1,io_uring,web,allocations,5.000
-1,io_uring,redis-get,instructions,9617.174
+1,io_uring,redis-get,instructions,9703.897
 1,io_uring,redis-get,allocations,2.000
-1,io_uring,postgres-query,instructions,12692.891
+1,io_uring,postgres-query,instructions,13213.999
 1,io_uring,postgres-query,allocations,16.000
-1,io_uring,mysql-query,instructions,18073.464
+1,io_uring,mysql-query,instructions,18795.928
 1,io_uring,mysql-query,allocations,27.000
 1,io_uring,idle-http1,heap_bytes,1940.400
 1,io_uring,idle-http1,rss_bytes,1994.800
@@ -70,11 +72,11 @@ round,driver,case,metric,value
 1,epoll,https,allocations,39.000
 1,epoll,web,instructions,14129.479
 1,epoll,web,allocations,5.000
-1,epoll,redis-get,instructions,9095.776
+1,epoll,redis-get,instructions,9172.754
 1,epoll,redis-get,allocations,2.000
-1,epoll,postgres-query,instructions,12177.916
+1,epoll,postgres-query,instructions,12344.694
 1,epoll,postgres-query,allocations,16.000
-1,epoll,mysql-query,instructions,17534.686
+1,epoll,mysql-query,instructions,17884.754
 1,epoll,mysql-query,allocations,27.000
 1,epoll,idle-http1,heap_bytes,2102.100
 1,epoll,idle-http1,rss_bytes,2168.800
@@ -108,11 +110,11 @@ round,driver,case,metric,value
 2,io_uring,https,allocations,39.069
 2,io_uring,web,instructions,15259.727
 2,io_uring,web,allocations,5.000
-2,io_uring,redis-get,instructions,9617.171
+2,io_uring,redis-get,instructions,9703.915
 2,io_uring,redis-get,allocations,2.000
-2,io_uring,postgres-query,instructions,12692.891
+2,io_uring,postgres-query,instructions,13213.999
 2,io_uring,postgres-query,allocations,16.000
-2,io_uring,mysql-query,instructions,18073.464
+2,io_uring,mysql-query,instructions,18795.928
 2,io_uring,mysql-query,allocations,27.000
 2,io_uring,idle-http1,heap_bytes,1943.200
 2,io_uring,idle-http1,rss_bytes,1996.800
@@ -146,11 +148,11 @@ round,driver,case,metric,value
 2,epoll,https,allocations,39.000
 2,epoll,web,instructions,14135.609
 2,epoll,web,allocations,5.000
-2,epoll,redis-get,instructions,9095.762
+2,epoll,redis-get,instructions,9178.790
 2,epoll,redis-get,allocations,2.000
-2,epoll,postgres-query,instructions,12177.916
+2,epoll,postgres-query,instructions,12344.694
 2,epoll,postgres-query,allocations,16.000
-2,epoll,mysql-query,instructions,17534.686
+2,epoll,mysql-query,instructions,17884.754
 2,epoll,mysql-query,allocations,27.000
 2,epoll,idle-http1,heap_bytes,2102.100
 2,epoll,idle-http1,rss_bytes,2168.800
@@ -184,11 +186,11 @@ round,driver,case,metric,value
 3,io_uring,https,allocations,39.069
 3,io_uring,web,instructions,15259.718
 3,io_uring,web,allocations,5.000
-3,io_uring,redis-get,instructions,9617.174
+3,io_uring,redis-get,instructions,9709.905
 3,io_uring,redis-get,allocations,2.000
-3,io_uring,postgres-query,instructions,12692.891
+3,io_uring,postgres-query,instructions,13213.999
 3,io_uring,postgres-query,allocations,16.000
-3,io_uring,mysql-query,instructions,18073.464
+3,io_uring,mysql-query,instructions,18795.928
 3,io_uring,mysql-query,allocations,27.000
 3,io_uring,idle-http1,heap_bytes,1940.400
 3,io_uring,idle-http1,rss_bytes,1994.800
@@ -222,11 +224,11 @@ round,driver,case,metric,value
 3,epoll,https,allocations,39.000
 3,epoll,web,instructions,14129.483
 3,epoll,web,allocations,5.000
-3,epoll,redis-get,instructions,9089.763
+3,epoll,redis-get,instructions,9178.757
 3,epoll,redis-get,allocations,2.000
-3,epoll,postgres-query,instructions,12177.916
+3,epoll,postgres-query,instructions,12344.694
 3,epoll,postgres-query,allocations,16.000
-3,epoll,mysql-query,instructions,17534.686
+3,epoll,mysql-query,instructions,17884.754
 3,epoll,mysql-query,allocations,27.000
 3,epoll,idle-http1,heap_bytes,2102.100
 3,epoll,idle-http1,rss_bytes,2168.800
@@ -260,11 +262,11 @@ round,driver,case,metric,value
 4,io_uring,https,allocations,39.069
 4,io_uring,web,instructions,15265.824
 4,io_uring,web,allocations,5.000
-4,io_uring,redis-get,instructions,9617.172
+4,io_uring,redis-get,instructions,9703.893
 4,io_uring,redis-get,allocations,2.000
-4,io_uring,postgres-query,instructions,12692.891
+4,io_uring,postgres-query,instructions,13213.999
 4,io_uring,postgres-query,allocations,16.000
-4,io_uring,mysql-query,instructions,18073.464
+4,io_uring,mysql-query,instructions,18795.928
 4,io_uring,mysql-query,allocations,27.000
 4,io_uring,idle-http1,heap_bytes,1940.900
 4,io_uring,idle-http1,rss_bytes,1994.800
@@ -298,11 +300,11 @@ round,driver,case,metric,value
 4,epoll,https,allocations,39.000
 4,epoll,web,instructions,14135.585
 4,epoll,web,allocations,5.000
-4,epoll,redis-get,instructions,9095.749
+4,epoll,redis-get,instructions,9178.760
 4,epoll,redis-get,allocations,2.000
-4,epoll,postgres-query,instructions,12177.916
+4,epoll,postgres-query,instructions,12344.694
 4,epoll,postgres-query,allocations,16.000
-4,epoll,mysql-query,instructions,17534.686
+4,epoll,mysql-query,instructions,17884.754
 4,epoll,mysql-query,allocations,27.000
 4,epoll,idle-http1,heap_bytes,2102.100
 4,epoll,idle-http1,rss_bytes,2168.800
@@ -336,11 +338,11 @@ round,driver,case,metric,value
 5,io_uring,https,allocations,39.070
 5,io_uring,web,instructions,15265.719
 5,io_uring,web,allocations,5.000
-5,io_uring,redis-get,instructions,9617.176
+5,io_uring,redis-get,instructions,9709.898
 5,io_uring,redis-get,allocations,2.000
-5,io_uring,postgres-query,instructions,12692.891
+5,io_uring,postgres-query,instructions,13213.999
 5,io_uring,postgres-query,allocations,16.000
-5,io_uring,mysql-query,instructions,18073.464
+5,io_uring,mysql-query,instructions,18795.928
 5,io_uring,mysql-query,allocations,27.000
 5,io_uring,idle-http1,heap_bytes,1940.400
 5,io_uring,idle-http1,rss_bytes,1994.800
@@ -374,11 +376,11 @@ round,driver,case,metric,value
 5,epoll,https,allocations,39.000
 5,epoll,web,instructions,14135.577
 5,epoll,web,allocations,5.000
-5,epoll,redis-get,instructions,9095.768
+5,epoll,redis-get,instructions,9178.762
 5,epoll,redis-get,allocations,2.000
-5,epoll,postgres-query,instructions,12177.916
+5,epoll,postgres-query,instructions,12344.694
 5,epoll,postgres-query,allocations,16.000
-5,epoll,mysql-query,instructions,17534.686
+5,epoll,mysql-query,instructions,17884.754
 5,epoll,mysql-query,allocations,27.000
 5,epoll,idle-http1,heap_bytes,2102.100
 5,epoll,idle-http1,rss_bytes,2170.900

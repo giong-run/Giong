@@ -29,7 +29,7 @@ fn main() -> std::io::Result<()> {
 
 ## When to use it, and when not
 
-**Use the giong crate when there is one; `Compat` is the bridge for a protocol giong has no crate for yet.** The giong crates are built on giong's owned buffers and batched system calls, and measured against the Tokio crates they replace on Tokio they serve 1.2 to 4.7 times the requests or statements per core on the workloads measured, with the exceptions listed there ([the table in giong's README](../README.md#choosing-crates)). A Tokio crate run on giong through `Compat` keeps its own design and adds the copies described under [What it costs](#what-it-costs). No crate over `Compat` has been measured against the giong crate for the same protocol.
+**Use the giong crate when there is one; `Compat` is the bridge for a protocol giong has no crate for yet.** The giong crates are built on giong's owned buffers and batched system calls, and measured against the Tokio crates they replace on Tokio they serve 1.1 to 5.1 times the requests or statements per core on the workloads measured, with the exceptions listed there ([the table in giong's README](../README.md#choosing-crates)). A Tokio crate run on giong through `Compat` keeps its own design and adds the copies described under [What it costs](#what-it-costs). No crate over `Compat` has been measured against the giong crate for the same protocol.
 
 | You need | Use |
 |---|---|
