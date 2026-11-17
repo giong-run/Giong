@@ -21,6 +21,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn every_public_async_fn_says_whether_it_is_cancel_safe() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !root.join("src").is_dir() {
+        // The kernel jobs run the built test in a VM without the sources.
+        return;
+    }
     let mut dirs = vec![root.join("src")];
     for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
