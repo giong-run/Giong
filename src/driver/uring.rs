@@ -1332,6 +1332,14 @@ impl Uring {
         unsafe { libc::close(fd) };
     }
 
+    /// `true` if SQEs wait in the submission queue for the next
+    /// `io_uring_enter`: a system call made directly now would reach the
+    /// kernel before them (see [`Driver::try_send_to`](super::Driver::try_send_to)).
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        !self.ring.submission().is_empty()
+    }
+
     /// Hands every queued SQE to the kernel now. TSan builds call it before
     /// each close(2).
     ///

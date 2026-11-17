@@ -803,6 +803,50 @@ fn a_cancelled_read_from_leaves_the_socket_usable() {
     });
 }
 
+/// A `read_from` given up on leaves a cancellation queued for the kernel. A
+/// datagram sent right after it, and answered at once, must reach the next
+/// `read_from`, not the receive being cancelled: a send made within the call
+/// must not overtake the cancellation (seen with Linux 6.0's io_uring, which
+/// runs completions before the next submission).
+#[test]
+fn a_reply_to_a_send_after_a_cancelled_read_from_is_not_lost() {
+    let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    echo.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                    echo.send_to(&buf[..n], from).unwrap();
+                }
+            }
+        })
+    };
+    giong::block_on(async {
+        let (a, _) = socket();
+        for i in 0..200u32 {
+            let read = a.read_from(Vec::with_capacity(64));
+            assert!(timeout(Duration::from_micros(200), read).await.is_err());
+            a.send_to(i.to_be_bytes().to_vec(), echo_addr)
+                .await
+                .0
+                .unwrap();
+            let read = a.read_from(Vec::with_capacity(64));
+            let (res, buf) = timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap_or_else(|_| panic!("the reply to datagram {i} was lost"));
+            assert_eq!(res.unwrap().0, 4);
+            assert_eq!(buf, i.to_be_bytes());
+        }
+    });
+    stop.store(true, Ordering::Relaxed);
+    peer.join().unwrap();
+}
+
 #[test]
 fn a_new_socket_with_a_closed_sockets_number_is_left_alone() {
     // A receive that the runtime has queued but not yet handed to the kernel
