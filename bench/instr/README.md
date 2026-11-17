@@ -61,9 +61,21 @@ instructions per request.
 | `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 457,788 | 456,636 |
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 46,789 | 45,185 |
 | `web` | a giong-web router with a path parameter, raw client | 15,260 | 14,136 |
-| `redis-get` | giong-redis `GET` against a fake server | 9,617 | 9,096 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 12,693 | 12,178 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 18,074 | 17,535 |
+| `redis-get` | giong-redis `GET` against a fake server | 9,704 | 9,179 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 13,214 | 12,345 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 18,796 | 17,885 |
+
+The three database cases went up when the clients started reading straight into their own
+buffer (0.9, #144). The client's part is 80 to 130 instructions per query (0.5% to 1.0%): on
+io_uring each read is a one-off receive with its own submission instead of a multishot
+completion. The rest, 380 more for `postgres-query` and 640 for `mysql-query` on io_uring,
+is glibc's `malloc` and `realloc` in the fake server's reply buffers, which the client's larger
+read buffer moves to a different place in the heap; with heap trimming turned off
+(`GLIBC_TUNABLES=glibc.malloc.trim_threshold=1073741824:glibc.malloc.top_pad=16777216`) it
+disappears and every database case is within 1% of the old count. The copy the change saves
+shows on bigger replies, and measured against real servers it is faster on small queries too
+(a pool of four: 243.9k to 303.8k PostgreSQL point lookups a second; see
+[`bench/results/postgres`](../results/postgres)).
 
 Each case also records heap allocations per operation (counted by a global allocator in the
 benchmark), with the same 1% limit: one more allocation per request fails.
