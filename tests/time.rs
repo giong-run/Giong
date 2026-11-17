@@ -1,6 +1,7 @@
 //! Timers.
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,32 @@ fn zero_and_past_deadlines_complete_immediately() {
         sleep(Duration::ZERO).await;
         sleep_until(Instant::now() - Duration::from_secs(1)).await;
         assert!(start.elapsed() < Duration::from_millis(50));
+    });
+}
+
+/// The worker reads the clock once per turn of its loop and shares it with
+/// the timers polled in that turn. A zero timeout made late in a long turn
+/// must still end at its first poll, not a turn later.
+#[test]
+fn a_zero_timeout_late_in_a_long_turn_ends_at_once() {
+    giong::block_on(async {
+        // A timer polled early in the turn: the worker reads its clock.
+        let mut early = std::pin::pin!(sleep(Duration::from_secs(60)));
+        std::future::poll_fn(|cx| {
+            let _ = early.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // The turn goes on for longer than a timer tick.
+        let busy = Instant::now();
+        while busy.elapsed() < Duration::from_millis(5) {
+            std::hint::spin_loop();
+        }
+        // Not ready at its first poll: only the timeout can end it then.
+        assert_eq!(
+            timeout(Duration::ZERO, giong::yield_now()).await,
+            Err(Elapsed)
+        );
     });
 }
 

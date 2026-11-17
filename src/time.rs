@@ -331,10 +331,12 @@ impl Future for Sleep {
         // time, so a sleep never ends early. A deadline within a tick of it
         // may already have passed in real time (a zero timeout, a sleep
         // polled late in a long turn): those check the real clock, so they
-        // end now rather than a tick later.
+        // end now rather than a tick later. So does a first poll: the turn
+        // may have run for longer than a tick since the clock was read, and
+        // a sleep made in it (a zero timeout) must not wait for the next one.
         let now = runtime::try_with_worker(|w| {
             let now = w.clock();
-            if self.deadline > now && self.deadline - now <= TICK {
+            if self.deadline > now && (self.key.is_none() || self.deadline - now <= TICK) {
                 w.refresh_clock()
             } else {
                 now
@@ -342,6 +344,14 @@ impl Future for Sleep {
         })
         .unwrap_or_else(Instant::now);
         if now >= self.deadline {
+            // A sleep already over when first polled ends without the task
+            // having waited, so it counts against the task's budget, as an
+            // immediate send does: a loop of such sleeps (short ones, polled
+            // late) still lets the other tasks and the event loop run.
+            if self.key.is_none() && !crate::driver::spend_budget() {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             self.unregister();
             return Poll::Ready(());
         }
