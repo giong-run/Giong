@@ -94,7 +94,8 @@ connection, the same as the others.
   containerd's default ones), under gVisor, or with the `kernel.io_uring_disabled` sysctl.
   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow io_uring in Docker, Docker
   Compose and Kubernetes.
-- Rust 1.80 or newer.
+- Rust 1.80 or newer. How this minimum, the kernel minimums and the API move during 1.x:
+  [docs/STABILITY.md](docs/STABILITY.md).
 - giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
   `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
   are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
