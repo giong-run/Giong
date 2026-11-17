@@ -444,6 +444,39 @@ fn reconnecting_resumes_the_session() {
 }
 
 #[test]
+fn a_server_that_only_reads_still_sends_its_session_tickets() {
+    // giong's server holds its TLS 1.3 session tickets back for its first
+    // response; with no response, they go out once its receive has to wait.
+    let pki = pki();
+    let acceptor =
+        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
+    giong::block_on(async move {
+        let addr = serve(acceptor, |tls: io::Result<TlsStream>| async move {
+            let Ok(tls) = tls else { return };
+            while let Ok(data) = tls.recv().await {
+                if data.is_empty() {
+                    break;
+                }
+            }
+            let _ = tls.shutdown().await;
+        });
+        let first = connect(&connector, addr, "localhost").await.unwrap();
+        first.write_all(b"only read".to_vec()).await.0.unwrap();
+        first.shutdown().await.unwrap();
+        // The tickets, then the server's close_notify.
+        let end = giong::time::timeout(Duration::from_secs(10), first.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(end.is_empty());
+        assert!(first.received_close_notify());
+        let second = connect(&connector, addr, "localhost").await.unwrap();
+        assert!(second.resumed());
+    });
+}
+
+#[test]
 fn a_server_that_never_answers_times_out() {
     // Connections queue in the backlog; nobody ever accepts them.
     let listener = StdListener::bind("127.0.0.1:0").unwrap();
