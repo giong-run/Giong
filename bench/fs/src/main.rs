@@ -1,7 +1,8 @@
-//! File I/O: giong (io_uring) against Tokio (`tokio::fs` and `spawn_blocking`,
-//! which run on a pool of blocking threads) and plain blocking `std`.
+//! File I/O: giong against Tokio (`tokio::fs` and `spawn_blocking`, which
+//! run on a pool of blocking threads), the io_uring runtimes monoio and
+//! compio, and plain blocking `std`.
 //!
-//!   bench-fs <giong|tokio|std> <small-files|random-read> <tasks> <operations> <dir>
+//!   bench-fs <giong|tokio|monoio|compio|std> <small-files|random-read> <tasks> <operations> <dir>
 //!
 //! * `small-files`: read a whole 4 KiB file (open, stat, read, close).
 //! * `random-read`: read 4 KiB at a random offset of one open 256 MiB file.
@@ -144,10 +145,74 @@ fn run_tokio(mode: &'static str, tasks: usize, ops: usize, dir: PathBuf) {
     });
 }
 
+fn run_monoio(mode: &'static str, tasks: usize, ops: usize, dir: PathBuf) {
+    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let big = Rc::new(monoio::fs::File::open(dir.join("big")).await.unwrap());
+        let dir = Rc::new(dir);
+        let handles: Vec<_> = (0..tasks)
+            .map(|t| {
+                let (big, dir) = (big.clone(), dir.clone());
+                monoio::spawn(async move {
+                    let mut rng = Rng(42 + t as u64);
+                    let mut buf = Vec::with_capacity(BLOCK);
+                    for i in 0..ops / tasks {
+                        if mode == "small-files" {
+                            let path = small(&dir, t * 7919 + i);
+                            assert_eq!(monoio::fs::read(path).await.unwrap().len(), BLOCK);
+                        } else {
+                            let (res, b) = big.read_at(buf, rng.offset()).await;
+                            assert_eq!(res.unwrap(), BLOCK);
+                            buf = b;
+                            buf.clear();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await;
+        }
+    });
+}
+
+fn run_compio(mode: &'static str, tasks: usize, ops: usize, dir: PathBuf) {
+    use compio::io::AsyncReadAt;
+    compio::runtime::Runtime::new().unwrap().block_on(async move {
+        let big = Rc::new(compio::fs::File::open(dir.join("big")).await.unwrap());
+        let dir = Rc::new(dir);
+        let handles: Vec<_> = (0..tasks)
+            .map(|t| {
+                let (big, dir) = (big.clone(), dir.clone());
+                compio::runtime::spawn(async move {
+                    let mut rng = Rng(42 + t as u64);
+                    let mut buf = Vec::with_capacity(BLOCK);
+                    for i in 0..ops / tasks {
+                        if mode == "small-files" {
+                            let path = small(&dir, t * 7919 + i);
+                            assert_eq!(compio::fs::read(path).await.unwrap().len(), BLOCK);
+                        } else {
+                            let compio::BufResult(res, b) = big.read_at(buf, rng.offset()).await;
+                            assert_eq!(res.unwrap(), BLOCK);
+                            buf = b;
+                            buf.clear();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.unwrap();
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 6 {
-        eprintln!("usage: bench-fs <giong|tokio|std> <small-files|random-read> <tasks> <operations> <dir>");
+        eprintln!("usage: bench-fs <giong|tokio|monoio|compio|std> <small-files|random-read> <tasks> <operations> <dir>");
         std::process::exit(2);
     }
     let mode: &'static str = match args[2].as_str() {
@@ -163,6 +228,8 @@ fn main() {
     match args[1].as_str() {
         "giong" => run_giong(mode, tasks, ops, dir),
         "tokio" => run_tokio(mode, tasks, ops, dir),
+        "monoio" => run_monoio(mode, tasks, ops, dir),
+        "compio" => run_compio(mode, tasks, ops, dir),
         "std" => run_std(mode, ops, &dir),
         other => panic!("unknown runtime {other}"),
     }
