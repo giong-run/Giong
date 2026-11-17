@@ -1557,8 +1557,8 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
         if let Err(e) = conn.process(&mut buf) {
             break e;
         }
-        match conn.stream.recv().await {
-            Ok(chunk) if chunk.is_empty() => {
+        match conn.stream.read_into(&mut buf).await {
+            Ok(0) => {
                 let closing = conn.state.borrow().closing;
                 break Error::closed(if closing {
                     "the connection was closed"
@@ -1566,7 +1566,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
                     "the server closed the connection"
                 });
             }
-            Ok(chunk) => buf.extend(&chunk),
+            Ok(_) => {}
             Err(e) => break Error::io(ErrorKind::Closed, "reading from the server failed", e),
         }
     };

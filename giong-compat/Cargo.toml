@@ -23,6 +23,7 @@ tls = ["dep:giong-tls"]
 
 [dependencies]
 giong = { path = "..", version = "0.8.0" }
+libc = "0.2.172"
 giong-tls = { path = "../giong-tls", version = "0.8.0", optional = true }
 # The trait definitions only; the crate's default features (the runtime) stay
 # off.

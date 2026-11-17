@@ -274,24 +274,28 @@ For each job a service has, try these in order and take the first that fits:
 | An HTTP/2 server | `giong-http` (on by default) | hyper, axum | 3.8 to 4.4 times axum on small answers, 2.5 to 3.0 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
 | Routing, JSON, middleware | [`giong-web`](giong-web/README.md) | axum, tower-http | 1.3 times axum on `/json` and 1.8 times on 8 KB answers; with request ids, gzip and a timeout, 1.9 and 2.3 times ([Routing](#routing-json-and-middleware)) |
 | An HTTP client | `giong-http`, feature `client` | reqwest, hyper's client | 1.6 to 1.8 times reqwest over HTTP/1.1; over HTTP/2 2.0 to 2.2 times on small answers, 1.2 to 1.3 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
-| TLS | [`giong-tls`](giong-tls/README.md) | tokio-rustls | The same rustls underneath, so handshakes are level. Measured with `giong-http`: 1.8 times axum + rustls on `/json`, 2.5 times on 8 KB answers ([HTTPS](#https)) |
-| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 2.6 times tokio-postgres + deadpool at its best on one row by key ([PostgreSQL](#postgresql)) |
-| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 4.7 times SQLx at its best on one row by key, 3.4 times on 100 rows ([MySQL](#mysql)) |
-| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.3 to 1.9 times redis-rs, at half its CPU per command or less ([Redis](#redis)) |
+| TLS | [`giong-tls`](giong-tls/README.md) | tokio-rustls | The same rustls underneath. Measured with `giong-http`: 1.8 times axum + rustls on `/json`, 2.6 times on 8 KB answers, 1.18 times the new connections per second (level with axum set to prefer AES-128-GCM as giong does) ([HTTPS](#https)) |
+| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 3.3 times tokio-postgres + deadpool at its best on one row by key, 2.5 times on 100 rows; 7–9% behind tokio-postgres on one shared connection ([PostgreSQL](#postgresql)) |
+| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 5.1 times SQLx at its best on one row by key, 3.7 times on 100 rows ([MySQL](#mysql)) |
+| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.1 to 1.8 times redis-rs on small commands, 1.25 to 2.5 times on 8 KiB values, at half its CPU per command or less ([Redis](#redis)) |
 | Files | `giong::fs` | `tokio::fs` | 5.5 to 8 times Tokio on reads at an offset, 1.5 to 2.5 times on whole small files ([File I/O](#file-io)) |
 | Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | Not measured |
 | Timers, channels | `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::time`, `tokio::sync::mpsc` | Not measured on their own |
 | Runtime state for an AI agent | [`giong-mcp`](giong-mcp/README.md) | | |
 
 Where a giong crate is not ahead, the sections linked above say so: over one shared
-connection giong-postgres is 8–11% below tokio-postgres at the median, a blocking `std`
-read of a cached file beats every async one, and TLS handshakes cost the same on both.
+connection giong-postgres is 7–9% below tokio-postgres at the median, a blocking `std`
+read of a cached file beats every async one, and TLS handshakes cost the same on both once
+axum's rustls is set to the cipher suite giong-tls prefers.
 
 What `Compat` adds is measured on its own, on one TCP stream with no protocol on top
-([giong-compat](giong-compat/README.md#what-it-costs)): against giong's own `write_all`,
-up to 20% less throughput and up to 25% more CPU per byte sent, for the copy into its
-write buffer; against giong's own `recv`, 6–16% more CPU per byte read with `read`, and no
-measurable difference through `AsyncBufRead`; 1–5% more CPU per small request and reply.
+([giong-compat](giong-compat/README.md#what-it-costs)): large writes go straight from the
+caller's memory to the socket, within 2–9% of Tokio's CPU per byte sent (until 0.8.0 they
+were copied first: 25% above Tokio in a session the same day); against giong's own `recv`, 6–16% more CPU per byte read
+with `read`, and no measurable difference through `AsyncBufRead`; 1–5% more CPU per small
+request and reply. Receiving costs more CPU per byte than Tokio's own (17% through
+`AsyncBufRead`, 30% with `read`, in the latest session), most of it in giong's own receive
+into 8 KiB pool buffers.
 A protocol crate over `Compat` brings its own design on top of that, and none has been
 measured against the giong crate for the same protocol. The reason to prefer the giong
 crate is its design (step 1) and the gaps in the table, measured against these Tokio
@@ -721,24 +725,38 @@ shows the one-worker numbers (giong 218.9k, Monoio 214.2k, giong-http 186.1k, Gl
 ### HTTPS
 
 `bench/tls.sh`: `giong-http` + `giong-tls` against Axum + `axum-server`, both on rustls with
-`ring`, so the TLS library and the cryptography are the same and only the runtime and the
-HTTP layer differ. The server gets one core and `wrk` three (the load generator has to
-encrypt too); 50 connections, TLS 1.3 with AES-256-GCM, an ECDSA P-256 certificate, five
-rounds. The server's core was 98–101% busy in every row, so the server was the limit.
+`ring`, so the TLS library and the cryptography are the same and only the runtime, the
+HTTP layer and the TLS settings differ. The server gets one core and `wrk` three (the load
+generator has to encrypt too); 50 connections, TLS 1.3, an ECDSA P-256 certificate, seven
+interleaved rounds on a 4-vCPU VM (2026-11-17, [`bench/results/tls/`](bench/results/tls/README.md)).
+The server's core was 97–100% busy in every row, so the server was the limit. The plain
+HTTP rows are from the earlier session of five rounds (`bench/results/tls/2026-11-12/`).
 
-| Server | `/json` | `/users` (8 KB) | New handshake per request |
-|---|---|---|---|
-| Axum, plain HTTP | 94.0k (86–97k) | 19.5k | |
-| giong-http, plain HTTP | 150.3k (140–158k) | 55.3k (54–59k) | |
-| Axum + rustls | 81.0k (80–83k) | 19.2k | 7.3k (6.9–7.6k) |
-| **giong-http + giong-tls** | **144.8k (142–153k)** | **47.8k (43–49k)** | 7.1k (6.7–7.5k) |
+| Server | `/json` | `/users` (8 KB) | New connection per request | CPU per new connection |
+|---|---|---|---|---|
+| Axum, plain HTTP | 94.0k (86–97k) | 19.5k | | |
+| giong-http, plain HTTP | 150.3k (140–158k) | 55.3k (54–59k) | | |
+| Axum + rustls | 81.2k (80–85k) | 18.5k (17–19k) | 7.1k (6.3–7.6k) | 136 µs |
+| Axum + rustls, set to pick AES-128-GCM first | 80.5k (78–83k) | 19.4k (19–20k) | 8.4k (7.7–8.6k) | 116 µs |
+| giong-http + giong-tls 0.8.0 | 145.1k (129–150k) | 47.7k (46–50k) | 6.8k (6.3–7.1k) | 142 µs |
+| **giong-http + giong-tls** | **146.6k (136–155k)** | **48.7k (47–50k)** | **8.4k (7.9–9.1k)** | **116 µs** |
 
-- **On kept-alive connections giong's HTTPS is 1.8 times Axum + rustls on `/json` and 2.5
+- **On kept-alive connections giong's HTTPS is 1.8 times Axum + rustls on `/json` and 2.6
   times on `/users`.** Most of the `/users` factor is there without TLS (see above).
-- **TLS costs giong 4% on `/json` and 14% on `/users`**, where there are more bytes to
+- **TLS costs giong 2% on `/json` and 12% on `/users`**, where there are more bytes to
   encrypt.
-- **Handshakes are level** (7.1k against 7.3k per second): a handshake is almost all
-  cryptography, and both use the same library for it.
+- **New connections: 18% more per second than Axum + rustls, at 15% less CPU each, and
+  lower latency (p99 4.2 ms against 7.1).** wrk resumes sessions, so these are resumed TLS
+  1.3 handshakes. Two changes since 0.8.0 (which was 5% behind Axum here): giong-tls sends
+  its session tickets with the first response and its `close_notify` with the FIN (14.4
+  TCP segments per connection, both directions, against 16.5 before and Axum's 14.0), and
+  `TlsAcceptor::from_pem` picks AES-128-GCM first, as Go's and BoringSSL's servers do,
+  where wrk (OpenSSL) lists AES-256-GCM first and its suite hashes with SHA-384. **The
+  suite is most of the gain: Axum set up the same way matches giong's rate** (8.4k), with
+  higher latency (p99 6.2 ms against 4.2). A handshake is almost all cryptography, and
+  both use the same library for it.
+- With 64 KiB responses giong-http + giong-tls serves 31.9k req/s against 26.3k for 0.8.0
+  (+21%), from AES-128-GCM.
 - Axum is lower here than in the first table (94k against 161k) because `wrk` runs three
   threads: requests arrive less bunched and Tokio gets less work out of each `epoll_wait`.
   giong hardly depends on the shape of the load.
@@ -764,14 +782,14 @@ per second:
 
 | Client, connections | One row by key | p99 | 100 rows | p99 |
 |---|---|---|---|---|
-| **giong-postgres, 3** | **240.7k** | **0.52 ms** | **54.8k** | **2.0 ms** |
+| **giong-postgres, 3** | **311.4k** | **0.43 ms** | **71.3k** | **2.0 ms** |
 | tokio-postgres + deadpool, 4 | 53.1k | 1.9 ms | 21.7k | 4.4 ms |
 | tokio-postgres + deadpool, 64 (its best) | 93.8k | 1.5 ms | 28.6k | 4.1 ms |
 
 Statements from every task share the pool's connections and are pipelined, so one client
-core does 2.6 times the work of deadpool at its best. Over one shared connection both
-libraries pipeline and the server's single backend is the limit; there the two are within
-the spread of the rounds, giong-postgres 8–11% lower at the median. The crate's README has the full table, including what happens with more
+core does 3.3 and 2.5 times the work of deadpool at its best. Over one shared connection
+both libraries pipeline and the server's single backend is the limit; there giong-postgres
+is 7–9% behind tokio-postgres at the median (47.7k against 51.4k by key). The crate's README has the full table, including what happens with more
 connections than the server has cores.
 
 ### MySQL
@@ -782,12 +800,12 @@ other three, 64 tasks issuing statements back to back. Medians, statements per s
 
 | Client, connections | One row by key | p99 | 100 rows | p99 |
 |---|---|---|---|---|
-| **giong-mysql, 3** | **138.7k** | **0.91 ms** | **35.1k** | **3.2 ms** |
+| **giong-mysql, 3** | **150.7k** | **0.81 ms** | **38.9k** | **3.4 ms** |
 | SQLx, 64 (its best) | 29.3k | 3.9 ms | 10.4k | 9.1 ms |
 | mysql_async, 4 (its best) | 19.0k | 5.5 ms | 8.9k | 10.6 ms |
 
 Statements from every task share the pool's connections and are pipelined, so one client
-core does 4.7 and 3.4 times the work of SQLx at its best, and the server becomes the limit.
+core does 5.1 and 3.7 times the work of SQLx at its best, and the server becomes the limit.
 One connection shared by every task does about what SQLx does with 64. The crate's README
 has the full table, including mysql_async's default pool settings and more connections
 than the server has cores.
@@ -801,15 +819,15 @@ per second, and the client core's time per command:
 
 | Client, connections | `GET` 64 B | µs/op | `SET` 64 B | µs/op | `MGET` of 10 | µs/op |
 |---|---|---|---|---|---|---|
-| **giong-redis, 1** | **618k** | **0.78** | **557k** | **0.77** | **219k** | **2.29** |
-| redis-rs, 1 | 448k | 1.76 | 442k | 1.67 | 140k | 4.84 |
-| fred, 1 | 314k | 2.42 | 287k | 2.58 | 110k | 6.91 |
-| **giong-redis, 4** | **881k** | **0.98** | **779k** | **0.99** | **313k** | **2.30** |
-| redis-rs, 4 | 475k | 2.04 | 491k | 1.97 | 198k | 4.96 |
+| **giong-redis, 1** | **640k** | **0.80** | **565k** | **0.83** | **268k** | **1.75** |
+| redis-rs, 1 | 492k | 1.59 | 493k | 1.52 | 166k | 4.16 |
+| fred, 1 | 351k | 2.22 | 316k | 2.37 | 117k | 6.17 |
+| **giong-redis, 4** | **848k** | **1.06** | **842k** | **1.03** | **375k** | **2.03** |
+| redis-rs, 4 | 483k | 2.01 | 516k | 1.88 | 209k | 4.68 |
 
-1.3 to 1.9 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
-where about half of every client's core is time in the kernel, giong-redis does twice
-redis-rs on one connection and the same on four. The crate's README has the full tables
+1.1 to 1.8 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
+where about half of every client's core is time in the kernel, giong-redis does 2.5 times
+redis-rs on one connection and 1.25 times on four. The crate's README has the full tables
 and how many connections to use.
 
 ### Routing, JSON and middleware
