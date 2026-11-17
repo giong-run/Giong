@@ -422,6 +422,8 @@ pub(crate) struct Worker {
     pub(crate) timers: RefCell<Timers>,
     /// The time read in this turn of the loop, if any (see [`Worker::clock`]).
     now: Cell<Option<Instant>>,
+    /// Tasks polled since the event loop last looked for I/O.
+    polled_since_io: Cell<usize>,
     pub(crate) pool: Rc<BufPool>,
     pub(crate) next_task_uid: Cell<u64>,
     /// How long to busy-poll for new work before blocking in the kernel.
@@ -482,6 +484,9 @@ fn not_in_runtime() -> ! {
     )
 }
 
+/// Polls after which a busy worker on epoll looks for I/O again.
+const IO_POLL_INTERVAL: usize = 61;
+
 impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
@@ -510,6 +515,7 @@ impl Worker {
             turn: Cell::new(0),
             timers: RefCell::new(Timers::new()),
             now: Cell::new(None),
+            polled_since_io: Cell::new(0),
             pool,
             next_task_uid: Cell::new(1),
             spin: cfg.spin,
@@ -650,6 +656,7 @@ impl Worker {
                 self.take_balanced_job();
             }
             self.publish_load();
+            let batch = self.queue.borrow().len();
             self.run_tasks(&mut || done = poll_main());
             self.flush_sends(tick);
             self.publish_load();
@@ -658,7 +665,19 @@ impl Worker {
             }
 
             if !self.queue.borrow().is_empty() {
-                // More tasks are runnable: just exchange work with the kernel.
+                // More tasks are runnable. On epoll, looking for I/O costs an
+                // `epoll_wait` system call however little is ready, so with
+                // small batches (tasks handing work to each other) it waits
+                // until IO_POLL_INTERVAL polls have run since the last look,
+                // as Tokio does. io_uring reads its completions from memory.
+                let polled = self.polled_since_io.get() + batch;
+                if polled < IO_POLL_INTERVAL && self.driver.borrow().kind() == DriverKind::Epoll {
+                    self.polled_since_io.set(polled);
+                    self.fire_timers();
+                    continue;
+                }
+                self.polled_since_io.set(0);
+                // Just exchange work with the kernel.
                 let graveyard = self.driver.borrow_mut().park(Park::Poll);
                 drop(graveyard);
                 self.fire_timers();
@@ -703,6 +722,7 @@ impl Worker {
                 self.shared.counters.sleeping();
             }
             let graveyard = self.driver.borrow_mut().park(mode);
+            self.polled_since_io.set(0);
             self.shared.bell.unpark();
             if sleeps {
                 self.shared.counters.woke();
