@@ -823,20 +823,17 @@ fn a_reply_to_a_batched_send_after_a_cancelled_read_from_is_not_lost() {
 fn reply_after_cancelled_read_from(busy: bool) {
     let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    echo.set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let peer = {
-        let stop = stop.clone();
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            while !stop.load(Ordering::Relaxed) {
-                if let Ok((n, from)) = echo.recv_from(&mut buf) {
-                    echo.send_to(&buf[..n], from).unwrap();
-                }
+    // Echoes until it gets an empty datagram.
+    let peer = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, from) = echo.recv_from(&mut buf).unwrap();
+            if n == 0 {
+                break;
             }
-        })
-    };
+            echo.send_to(&buf[..n], from).unwrap();
+        }
+    });
     giong::block_on(async {
         let running = Rc::new(std::cell::Cell::new(true));
         if busy {
@@ -863,8 +860,8 @@ fn reply_after_cancelled_read_from(busy: bool) {
             assert_eq!(buf, i.to_be_bytes());
         }
         running.set(false);
+        a.send_to(Vec::new(), echo_addr).await.0.unwrap();
     });
-    stop.store(true, Ordering::Relaxed);
     peer.join().unwrap();
 }
 
