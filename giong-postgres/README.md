@@ -184,14 +184,14 @@ A pool, on one client core:
 
 | Client | Connections | `point` statements/s | p99 | `list` statements/s | p99 |
 |---|---|---|---|---|---|
-| **giong-postgres** | 3 | **240.7k** (241–249k) | **0.52 ms** | **54.8k** (54–57k) | **2.0 ms** |
-| giong-postgres | 4 | 243.9k (211–265k) | 4.2 ms | 53.9k (46–63k) | 5.3 ms |
-| tokio-postgres + deadpool | 4 | 53.1k (51–55k) | 1.9 ms | 21.7k (21–25k) | 4.4 ms |
+| **giong-postgres** | 3 | **311.4k** (308–322k) | **0.43 ms** | **71.3k** (70–74k) | **2.0 ms** |
+| giong-postgres | 4 | 303.8k (277–317k) | 2.9 ms | 72.9k (64–76k) | 4.9 ms |
+| tokio-postgres + deadpool | 4 | 55.4k (53–56k) | 1.7 ms | 25.4k (24–26k) | 3.9 ms |
 | tokio-postgres + deadpool | 64, its best | 93.8k (91–97k) | 1.5 ms | 28.6k (27–29k) | 4.1 ms |
 
-- **Against deadpool at its best: 2.6× the point lookups and 1.9× the 100-row reads, at a third to a half of the p99.** deadpool's client core is the limit (98–99% busy): every statement is a pool checkout, a round trip and a wake-up. giong-postgres sends the statements of all 64 tasks in a few writes and reads their answers in a few reads.
-- **Size the pool to the database's cores.** With more connections than the server has cores (4 on 3 here), one backend at a time waits for a core, and the statements pipelined on its connection, about 16 of them, wait with it: the same throughput, but a p99 of 4 ms. 8 connections give 208.6k with the same p99; 2 connections leave a server core idle, 172.9k. With several workers, the connections of all their pools add up. Statements that wait on disk or on locks need more connections than this.
-- **One connection shared by every task** (both libraries pipeline): the single backend process is the limit, one server core at 100%, and the two are within the spread of the rounds of each other. giong-postgres's medians are 8–11% lower (point 47.6k against 53.6k, list 15.7k against 17.0k) and it uses less of its core (46% against 53%, 42% against 61%).
+- **Against deadpool at its best: 3.3× the point lookups and 2.5× the 100-row reads, at a third to a half of the p99.** deadpool's client core is the limit (98–99% busy): every statement is a pool checkout, a round trip and a wake-up. giong-postgres sends the statements of all 64 tasks in a few writes and reads their answers in a few reads.
+- **Size the pool to the database's cores.** With more connections than the server has cores (4 on 3 here), one backend at a time waits for a core, and the statements pipelined on its connection, about 16 of them, wait with it: the same throughput, but a p99 of 2.9 ms instead of 0.43. 8 connections give 253.8k at a p99 of 1.4 ms (8.6 ms for 100 rows); 2 connections leave a server core idle, 183.9k. With several workers, the connections of all their pools add up. Statements that wait on disk or on locks need more connections than this.
+- **One connection shared by every task** (both libraries pipeline): the single backend process is the limit, one server core at 100%, and here giong-postgres is behind: its medians are 7–9% lower (point 47.7k against 51.4k, list 18.7k against 20.5k; the same with the two run in the other order), though the ranges of the rounds overlap, and it uses less of its core (50% against 52%, 43% against 64%). Both send the same messages, one `Sync` per statement, and the server spends half of its time in `send()`, writing one reply per statement and waking the client for it, and the gap is in that part (a quarter of the server's time with giong-postgres, against slightly less with tokio-postgres, whose busier client needs waking less often). Sending several statements under one `Sync` would cut the server's work, but it runs them in one transaction, so a failing statement would roll back its neighbours: giong-postgres does not do it. Use a `Pool`, where the client is the limit and giong-postgres does 5.5 times as much.
 
 Not measured: a server on another machine (network latency, where pipelining should matter more), writes, more than one client core, PostgreSQL versions other than 16. Results are in `bench/results/postgres/`; pool sizes other than 4 in `pool-size/`.
 

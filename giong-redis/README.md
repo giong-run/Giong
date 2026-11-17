@@ -224,20 +224,20 @@ One connection shared by the 64 tasks:
 
 | Client | `GET` | p99 | µs/op | `SET` | µs/op | `GET` 8 KiB | µs/op | `MGET` ×10 | µs/op |
 |---|---|---|---|---|---|---|---|---|---|
-| **giong-redis** | **618k** | **184 µs** | **0.78** | **557k** | **0.77** | **304k** | **2.96** | **219k** | **2.29** |
-| redis-rs | 448k | 250 µs | 1.76 | 442k | 1.67 | 155k | 5.24 | 140k | 4.84 |
-| fred | 314k | 323 µs | 2.42 | 287k | 2.58 | 129k | 5.97 | 110k | 6.91 |
+| **giong-redis** | **640k** | **186 µs** | **0.80** | **565k** | **0.83** | **375k** | **2.38** | **268k** | **1.75** |
+| redis-rs | 492k | 248 µs | 1.59 | 493k | 1.52 | 151k | 5.42 | 166k | 4.16 |
+| fred | 351k | 347 µs | 2.22 | 316k | 2.37 | 126k | 5.95 | 117k | 6.17 |
 
 Four connections (giong-redis's `Pool` of 4; four of the others', task `t` on number `t % 4`):
 
 | Client | `GET` | p99 | µs/op | `SET` | µs/op | `GET` 8 KiB | µs/op | `MGET` ×10 | µs/op |
 |---|---|---|---|---|---|---|---|---|---|
-| **giong-redis** | **881k** | **160 µs** | **0.98** | **779k** | **0.99** | 272k | 3.49 | **313k** | **2.30** |
-| redis-rs | 475k | 239 µs | 2.04 | 491k | 1.97 | 269k | 3.61 | 198k | 4.96 |
-| fred | 329k | 328 µs | 2.98 | 308k | 3.18 | 169k | 5.74 | 143k | 6.84 |
+| **giong-redis** | **848k** | **159 µs** | **1.06** | **842k** | **1.03** | **345k** | **2.67** | **375k** | **2.03** |
+| redis-rs | 483k | 278 µs | 2.01 | 516k | 1.88 | 276k | 3.52 | 209k | 4.68 |
+| fred | 345k | 344 µs | 2.84 | 328k | 2.99 | 181k | 5.40 | 158k | 6.20 |
 
-- **Small commands: 1.3 to 1.9 times redis-rs, at half its CPU time per command or less.** With one connection none of the clients is held back by its core (giong-redis uses about half of it): the round trip is the limit, and giong-redis's is shorter, so its tasks send more. With four connections, redis-rs and fred use all of their core (97–98%), and giong-redis does 1.6 to 1.9 times redis-rs.
-- **Large values are mostly the kernel's work.** For 8 KiB values about half of the client's core is time in the kernel, receiving the data, whatever the client. With four connections giong-redis and redis-rs are level (272k and 269k): giong-redis spends less time in its own code (3.1 s against 3.8 s of user time in a 7-second run) and more in the kernel (3.6 s against 3.1 s). With one connection giong-redis does twice what redis-rs does.
+- **Small commands: 1.1 to 1.8 times redis-rs, at half its CPU time per command or less.** With one connection none of the clients is held back by its core (giong-redis uses about half of it): the round trip is the limit, and giong-redis's is shorter, so its tasks send more. With four connections, redis-rs and fred use all of their core (97–98%), and giong-redis does 1.6 to 1.8 times redis-rs.
+- **Large values are mostly the kernel's work.** For 8 KiB values about half of the client's core is time in the kernel, receiving the data, whatever the client. giong-redis has the kernel write replies straight into the connection's read buffer (up to 64 KiB per receive), so each byte is copied once on its way in, where reading through the runtime's pooled buffers copied it twice; that took four connections from level with redis-rs (259k against 269k) to 1.25 times it (345k against 276k), and one connection to 2.5 times it.
 - **How many connections.** The server above has I/O threads; most run without them, as Redis does by default. Against Redis without I/O threads (`bench/results/redis/no-io-threads.txt`), giong-redis reads 645k `GET`s per second with one connection, 925k with two, and 845k with four; the server's single thread is then the limit. So a `Pool` of one or two connections per worker is enough for one Redis server, and more only add to its work. redis-rs does best with two too, 542k.
 
 Cutting the client's own cost per command took the profile further than the first version: the command methods write their command straight into the connection's buffer, with no allocation; a reply is not kept in a `Vec` of its own; the read buffer moves what is left of a reply only when it is short of room, instead of on every read; and each connection has one timer, set for the oldest command waiting, instead of one per command (a test checks that every command still times out on its own deadline, and never early). Together they took `GET` with four connections from 660k to 881k per second.
