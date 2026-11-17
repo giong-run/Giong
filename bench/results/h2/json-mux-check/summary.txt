@@ -1,0 +1,34 @@
+json-mux on HTTP/2 after #125 and #127: is the server slower than 0.8.0?
+
+Builds of bench/giong-http, same compiler (rustc stable, 2026-11-17):
+  v0.8.0   b6d9b4b  the release
+  003d9e5  #125     refuse connections when memory is low, give idle HTTP/2
+                    memory back (dropped the handler queue after every burst)
+  main     8606db1  after #127 (keeps the queue while bursts follow)
+Machine: 4-vCPU virtual machine (Xeon 2.1 GHz, Linux 6.18.44).
+
+1. Wall clock (wall-clock.csv). Plain HTTP/2 with prior knowledge, one
+   worker on CPU 3, h2load -t3 -c3 -m100 on CPUs 0-2 (the json-mux shape of
+   bench/h2.sh): 2 s warm-up, then 5 s; 9 rounds, builds interleaved.
+   The VM moves by up to 15% between runs, so only the medians mean much.
+
+             median req/s   vs 0.8.0
+   v0.8.0       527,082
+   003d9e5      489,368      -7.2%
+   main         525,845      -0.2%
+
+2. Callgrind with its cache simulation (callgrind.csv), bench/instructions.sh
+   with ENDPOINTS=json-h2 STREAMS=100 CONNS=3, 100,000 requests after a
+   2,000-request warm-up; per request:
+
+             instructions  vs 0.8.0   L1 data misses  vs 0.8.0   last-level misses
+   v0.8.0      11,200                    25.1                      0.025
+   003d9e5     11,672        +4.2%       29.9          +19%        0.022
+   main        11,141        -0.5%       25.0          -0.5%       0.021
+
+The json-mux loss seen on bare metal after #125 (-8% plain, -4.5% TLS, in
+bare-metal-epyc-4345p/linux-7.0/fix-125/h2) was the handler queue being
+reallocated on every burst; #127 removed it. On main the server runs the
+same instructions as 0.8.0 with the same data-cache misses, and the wall
+clock agrees. A gap of 2.6-3.7% on main is not reproduced here; the next
+bare-metal h2.sh run should confirm on the real machine.

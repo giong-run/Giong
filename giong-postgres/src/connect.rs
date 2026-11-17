@@ -25,6 +25,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
 const USER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Free room asked of the read buffer before each receive: replies that
+/// arrive together are taken in one receive up to this much.
+const READ_ROOM: usize = 64 * 1024;
+
 /// The socket under a connection.
 pub(crate) enum Stream {
     Tcp(TcpStream),
@@ -58,6 +62,32 @@ impl Stream {
         }
     }
 
+    /// Receives more bytes into `buf`; `Ok(0)` at the end of the stream.
+    ///
+    /// On plain TCP and Unix sockets the kernel writes straight into `buf`'s
+    /// storage (a one-off receive), which saves copying every byte out of a
+    /// pooled buffer. Not cancel safe there: dropping the future loses the
+    /// bytes in flight and leaves `buf` empty, so it is only for a loop that
+    /// owns the connection, and drops `buf` along with the future.
+    pub(crate) async fn read_into(&self, buf: &mut ReadBuf) -> io::Result<usize> {
+        let tail = match self {
+            Stream::Tcp(_) | Stream::Unix(_) => buf.lend(READ_ROOM),
+            Stream::Tls(_) => {
+                let chunk = self.recv().await?;
+                buf.extend(&chunk);
+                return Ok(chunk.len());
+            }
+        };
+        let (result, tail) = match self {
+            Stream::Tcp(s) => s.read(tail).await,
+            Stream::Unix(s) => s.read(tail).await,
+            Stream::Tls(_) => unreachable!("only sockets read in place"),
+        };
+        let n = giong::IoBuf::len(&tail);
+        buf.filled(tail);
+        result.map(|_| n)
+    }
+
     pub(crate) async fn write_all(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         match self {
             Stream::Tcp(s) => s.write_all(buf).await,
@@ -74,6 +104,44 @@ impl Stream {
             Stream::Unix(s) => s.shutdown(how),
             Stream::Tls(s) => s.tcp().shutdown(how),
         };
+    }
+}
+
+/// The free end of a [`ReadBuf`]'s storage, lent to a one-off receive: the
+/// kernel writes after the bytes already there.
+pub(crate) struct Tail {
+    data: Vec<u8>,
+    /// Where the free end starts: the length when lent.
+    base: usize,
+}
+
+// SAFETY: the bytes are a `Vec`'s, on the heap, so they do not move when the
+// value moves, and only the owner of the value can change them. `as_ptr` and
+// `len` cover the bytes written after `base`.
+unsafe impl giong::IoBuf for Tail {
+    fn as_ptr(&self) -> *const u8 {
+        self.data[self.base..].as_ptr()
+    }
+    fn len(&self) -> usize {
+        self.data.len() - self.base
+    }
+}
+
+// SAFETY: `as_mut_ptr` points at `base` in an allocation of
+// `data.capacity()` bytes, so `capacity() = data.capacity() - base` bytes are
+// writable from it; `set_init` marks only bytes the kernel wrote.
+unsafe impl giong::IoBufMut for Tail {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        // The inherent method, valid for the whole allocation.
+        self.data.as_mut_ptr().wrapping_add(self.base)
+    }
+    fn capacity(&self) -> usize {
+        self.data.capacity() - self.base
+    }
+    unsafe fn set_init(&mut self, n: usize) {
+        // SAFETY: the caller promises the `n` bytes after `base` were
+        // written, and they fit in the allocation (`n <= capacity()`).
+        unsafe { self.data.set_len(self.base + n) }
     }
 }
 
@@ -100,6 +168,39 @@ impl ReadBuf {
             self.skip -= n;
             chunk = &chunk[n..];
         }
+        self.make_room();
+        self.data.extend_from_slice(chunk);
+    }
+
+    /// Lends the free end of the storage, with room for at least `want`
+    /// bytes, to a receive that writes straight into it (no copy through a
+    /// pooled buffer). Give it back with [`filled`](Self::filled).
+    pub(crate) fn lend(&mut self, want: usize) -> Tail {
+        self.make_room();
+        if self.data.capacity() - self.data.len() < want {
+            self.data.reserve(want);
+        }
+        let data = std::mem::take(&mut self.data);
+        Tail {
+            base: data.len(),
+            data,
+        }
+    }
+
+    /// Takes back the storage lent by [`lend`](Self::lend), with the bytes
+    /// the receive wrote after what was there.
+    pub(crate) fn filled(&mut self, tail: Tail) {
+        let Tail { mut data, base } = tail;
+        if self.skip > 0 {
+            let n = self.skip.min(data.len() - base);
+            self.skip -= n;
+            data.drain(base..base + n);
+        }
+        self.data = data;
+    }
+
+    /// Drops the bytes already taken apart, when that is cheap.
+    fn make_room(&mut self) {
         if self.start == self.data.len() {
             self.data.clear();
             self.start = 0;
@@ -107,7 +208,6 @@ impl ReadBuf {
             self.data.drain(..self.start);
             self.start = 0;
         }
-        self.data.extend_from_slice(chunk);
     }
 
     /// The next message's tag and total length, once its header is here.
@@ -264,17 +364,16 @@ async fn next_message(stream: &Stream, buf: &mut ReadBuf) -> Result<(u8, Range<u
                 return Ok((tag, body));
             }
         }
-        let chunk = stream
-            .recv()
+        let n = stream
+            .read_into(buf)
             .await
             .map_err(|e| Error::io(ErrorKind::Connect, "reading from the server failed", e))?;
-        if chunk.is_empty() {
+        if n == 0 {
             return Err(Error::new(
                 ErrorKind::Connect,
                 "the server closed the connection while it was being set up",
             ));
         }
-        buf.extend(&chunk);
     }
 }
 
@@ -597,4 +696,81 @@ pub(crate) async fn cancel(config: &Config, key: (i32, i32)) -> Result<(), Error
             ),
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds `chunk` the way a receive into lent storage does: the kernel
+    /// writes up to the room it is given, so a chunk may take several.
+    fn feed_lent(buf: &mut ReadBuf, mut chunk: &[u8], room: usize) {
+        use giong::IoBufMut;
+        while !chunk.is_empty() {
+            let mut tail = buf.lend(room);
+            assert!(tail.capacity() >= room);
+            let n = chunk.len().min(tail.capacity());
+            // SAFETY: `n` fits in the room lent, and the bytes are written
+            // before they are marked.
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), tail.as_mut_ptr(), n);
+                tail.set_init(n);
+            }
+            assert_eq!(giong::IoBuf::len(&tail), n);
+            buf.filled(tail);
+            chunk = &chunk[n..];
+        }
+    }
+
+    /// A message of `len` bytes in all, tagged `tag`, filled with `fill`.
+    fn message(tag: u8, len: usize, fill: u8) -> Vec<u8> {
+        let mut out = vec![tag];
+        out.extend_from_slice(&(len as u32 - 1).to_be_bytes());
+        out.resize(len, fill);
+        out
+    }
+
+    #[test]
+    fn a_receive_into_lent_storage_reads_what_copying_reads() {
+        let mut input = message(b'D', 20, 1);
+        input.extend(message(b'D', 3 << 20, 2));
+        input.extend(message(b'C', 13, 3));
+        for room in [1, 5, 4096, 64 * 1024] {
+            for lent in [false, true] {
+                let mut buf = ReadBuf::new();
+                let mut seen = Vec::new();
+                for chunk in input.chunks(room.max(1000)) {
+                    if lent {
+                        feed_lent(&mut buf, chunk, room);
+                    } else {
+                        buf.extend(chunk);
+                    }
+                    while let Some((tag, len)) = buf.peek().unwrap() {
+                        if len > 1 << 20 {
+                            // Thrown away as it lands, like an oversized row.
+                            buf.skip(len);
+                            seen.push((tag, len, None));
+                            continue;
+                        }
+                        let Some(body) = buf.body(len) else { break };
+                        seen.push((tag, len, Some(buf.bytes(body).to_vec())));
+                        buf.consume(len);
+                    }
+                    assert!(
+                        buf.data.len() < 1 << 20,
+                        "room {room}: the big message was kept"
+                    );
+                }
+                assert_eq!(
+                    seen,
+                    [
+                        (b'D', 20, Some(vec![1; 15])),
+                        (b'D', 3 << 20, None),
+                        (b'C', 13, Some(vec![3; 8])),
+                    ],
+                    "room {room}, lent {lent}"
+                );
+            }
+        }
+    }
 }

@@ -55,6 +55,44 @@ pub(crate) struct ReadBuf {
     scan: Scan,
 }
 
+/// The free end of a [`ReadBuf`]'s storage, lent to a one-off receive: the
+/// kernel writes after the bytes already there.
+pub(crate) struct Tail {
+    data: Vec<u8>,
+    /// Where the free end starts: the length when lent.
+    base: usize,
+}
+
+// SAFETY: the bytes are a `Vec`'s, on the heap, so they do not move when the
+// value moves, and only the owner of the value can change them. `as_ptr` and
+// `len` cover the bytes written after `base`.
+unsafe impl giong::IoBuf for Tail {
+    fn as_ptr(&self) -> *const u8 {
+        self.data[self.base..].as_ptr()
+    }
+    fn len(&self) -> usize {
+        self.data.len() - self.base
+    }
+}
+
+// SAFETY: `as_mut_ptr` points at `base` in an allocation of
+// `data.capacity()` bytes, so `capacity() = data.capacity() - base` bytes are
+// writable from it; `set_init` marks only bytes the kernel wrote.
+unsafe impl giong::IoBufMut for Tail {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        // The inherent method, valid for the whole allocation.
+        self.data.as_mut_ptr().wrapping_add(self.base)
+    }
+    fn capacity(&self) -> usize {
+        self.data.capacity() - self.base
+    }
+    unsafe fn set_init(&mut self, n: usize) {
+        // SAFETY: the caller promises the `n` bytes after `base` were
+        // written, and they fit in the allocation (`n <= capacity()`).
+        unsafe { self.data.set_len(self.base + n) }
+    }
+}
+
 #[derive(Default)]
 struct Scan {
     /// How far the reply in progress has been scanned, from `start`.
@@ -141,13 +179,36 @@ impl ReadBuf {
         }
     }
 
-    /// Adds bytes that arrived.
-    pub(crate) fn extend(&mut self, mut chunk: &[u8]) {
-        if self.scan.skip > 0 {
-            let n = self.scan.skip.min(chunk.len());
-            self.scan.skip -= n;
-            chunk = &chunk[n..];
+    /// Lends the free end of the storage, with room for at least `want`
+    /// bytes, to a receive that writes straight into it (no copy through a
+    /// pooled buffer). Give it back with [`filled`](Self::filled).
+    pub(crate) fn lend(&mut self, want: usize) -> Tail {
+        self.make_room(want);
+        if self.data.capacity() - self.data.len() < want {
+            self.data.reserve(want);
         }
+        let data = std::mem::take(&mut self.data);
+        Tail {
+            base: data.len(),
+            data,
+        }
+    }
+
+    /// Takes back the storage lent by [`lend`](Self::lend), with the bytes
+    /// the receive wrote after what was there.
+    pub(crate) fn filled(&mut self, tail: Tail) {
+        let Tail { mut data, base } = tail;
+        if self.scan.skip > 0 {
+            let n = self.scan.skip.min(data.len() - base);
+            self.scan.skip -= n;
+            data.drain(base..base + n);
+        }
+        self.data = data;
+    }
+
+    /// Frees room at the end for `want` more bytes, dropping what was read
+    /// or moving what is left to the front when either is cheap.
+    fn make_room(&mut self, want: usize) {
         if self.start == self.data.len() {
             self.data.clear();
             self.start = 0;
@@ -155,7 +216,7 @@ impl ReadBuf {
                 // A large reply has gone: give its memory back.
                 self.data = Vec::with_capacity(INITIAL_CAPACITY);
             }
-        } else if self.start > 0 && self.data.capacity() - self.data.len() < chunk.len() {
+        } else if self.start > 0 && self.data.capacity() - self.data.len() < want {
             // No room at the end. Moving the part of a reply that is left
             // to the front costs a copy of it; growing instead costs a copy
             // of everything, once. Move when what is left is small, so that
@@ -166,6 +227,16 @@ impl ReadBuf {
                 self.start = 0;
             }
         }
+    }
+
+    /// Adds bytes that arrived.
+    pub(crate) fn extend(&mut self, mut chunk: &[u8]) {
+        if self.scan.skip > 0 {
+            let n = self.scan.skip.min(chunk.len());
+            self.scan.skip -= n;
+            chunk = &chunk[n..];
+        }
+        self.make_room(chunk.len());
         self.data.extend_from_slice(chunk);
     }
 
@@ -588,17 +659,62 @@ pub(crate) fn encode(v: &Value, out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
-    /// The replies in `input`, fed `piece` bytes at a time; one over the
-    /// limit is `Err(push)`.
+    /// Feeds `chunk` the way a receive into lent storage does: the kernel
+    /// writes up to the room it is given, so a chunk may take several.
+    fn feed_lent(buf: &mut ReadBuf, mut chunk: &[u8], room: usize) {
+        use giong::IoBufMut;
+        while !chunk.is_empty() {
+            let mut tail = buf.lend(room);
+            assert!(tail.capacity() >= room);
+            let n = chunk.len().min(tail.capacity());
+            // SAFETY: `n` fits in the room lent, and the bytes are written
+            // before they are marked.
+            unsafe {
+                std::ptr::copy_nonoverlapping(chunk.as_ptr(), tail.as_mut_ptr(), n);
+                tail.set_init(n);
+            }
+            assert_eq!(giong::IoBuf::len(&tail), n);
+            buf.filled(tail);
+            chunk = &chunk[n..];
+        }
+    }
+
+    /// The replies in `input`, fed `piece` bytes at a time, both copied in
+    /// and received into lent storage (which must read the same); one over
+    /// the limit is `Err(push)`.
     fn read_all(
         input: &[u8],
         limit: usize,
         piece: usize,
     ) -> Result<Vec<Result<Value, bool>>, Error> {
+        let copied = read_all_with(input, limit, piece, false);
+        let lent = read_all_with(input, limit, piece, true);
+        if let (Ok(a), Ok(b)) = (&copied, &lent) {
+            // Compared as text: a NaN is not equal to itself.
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "lent storage read differently, in pieces of {piece}"
+            );
+        }
+        assert_eq!(copied.is_ok(), lent.is_ok());
+        copied
+    }
+
+    fn read_all_with(
+        input: &[u8],
+        limit: usize,
+        piece: usize,
+        lent: bool,
+    ) -> Result<Vec<Result<Value, bool>>, Error> {
         let mut buf = ReadBuf::new();
         let mut out = Vec::new();
         for chunk in input.chunks(piece.max(1)) {
-            buf.extend(chunk);
+            if lent {
+                feed_lent(&mut buf, chunk, piece.max(1));
+            } else {
+                buf.extend(chunk);
+            }
             loop {
                 match buf.next(limit)? {
                     Next::Pending => break,
@@ -828,6 +944,22 @@ mod tests {
         assert!(buf.data.len() - buf.start < 1000);
         buf.extend(&vec![b'q'; 500_000]);
         buf.extend(b"\r\n:1\r\n");
+        assert_eq!(buf.next(1000).unwrap(), Next::TooLarge { push: false });
+        assert_eq!(buf.next(1000).unwrap(), Next::Ready(4));
+        assert_eq!(buf.take(4).unwrap(), Value::Int(1));
+        assert!(buf.is_empty());
+
+        // The same through lent storage: what is thrown away is dropped as
+        // it lands, and the buffer stays small.
+        let mut buf = ReadBuf::new();
+        feed_lent(&mut buf, b"$1000000\r\n", 64 * 1024);
+        assert_eq!(buf.next(1000).unwrap(), Next::Pending);
+        for _ in 0..10 {
+            feed_lent(&mut buf, &vec![b'q'; 100_000], 64 * 1024);
+            assert_eq!(buf.next(1000).unwrap(), Next::Pending);
+            assert!(buf.data.capacity() <= 256 * 1024, "{}", buf.data.capacity());
+        }
+        feed_lent(&mut buf, b"\r\n:1\r\n", 64 * 1024);
         assert_eq!(buf.next(1000).unwrap(), Next::TooLarge { push: false });
         assert_eq!(buf.next(1000).unwrap(), Next::Ready(4));
         assert_eq!(buf.take(4).unwrap(), Value::Int(1));
