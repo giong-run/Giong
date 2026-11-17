@@ -211,17 +211,17 @@ A pool, on one client core:
 
 | Client | Connections | `point` statements/s | p99 | `list` statements/s | p99 |
 |---|---|---|---|---|---|
-| **giong-mysql** | 3 | **138.7k** (124–144k) | **0.91 ms** | **35.1k** (27–36k) | **3.2 ms** |
-| giong-mysql | 4 | 138.1k (131–144k) | 4.5 ms | 34.3k (32–37k) | 6.9 ms |
-| SQLx | 4 | 19.2k (18–20k) | 4.3 ms | 7.6k (7.0–8.1k) | 11.6 ms |
+| **giong-mysql** | 3 | **150.7k** (142–158k) | **0.81 ms** | **38.9k** (36–40k) | **3.4 ms** |
+| giong-mysql | 4 | 152.1k (134–157k) | 4.4 ms | 38.3k (37–41k) | 6.5 ms |
+| SQLx | 4 | 17.7k (17–18k) | 4.8 ms | 7.6k (7.0–8.4k) | 13.2 ms |
 | SQLx | 64, its best | 29.3k (26–30k) | 3.9 ms | 10.4k (9.0–11.7k) | 9.1 ms |
-| mysql_async | 4, its best | 19.0k (18–20k) | 5.5 ms | 8.9k (8.4–9.4k) | 10.6 ms |
-| mysql_async, default pool settings | 4 | 12.6k (11–13k) | 8.0 ms | 6.4k (5.8–7.0k) | 13.8 ms |
+| mysql_async | 4, its best | 17.1k (16–18k) | 6.4 ms | 9.5k (8.7–10.4k) | 11.2 ms |
+| mysql_async, default pool settings | 4 | 11.5k (9.9–12.7k) | 8.7 ms | 6.4k (5.9–7.2k) | 14.2 ms |
 
-- **Against the best of the others (SQLx with 64 connections): 4.7× the point lookups and 3.4× the 100-row reads, at a quarter to a third of the p99.** SQLx's client core is the limit (99–100% busy). giong-mysql sends the statements of all 64 tasks in a few writes and reads their answers in a few reads; here the server is its limit (its three cores 94% busy), not the client core (74–89%).
+- **Against the best of the others (SQLx with 64 connections): 5.1× the point lookups and 3.7× the 100-row reads, at a fifth to a third of the p99.** SQLx's client core is the limit (99–100% busy). giong-mysql sends the statements of all 64 tasks in a few writes and reads their answers in a few reads; here the server is its limit (its three cores 94% busy), not the client core (74–89%).
 - **mysql_async** is not limited by its core (66–90% busy) and does best with 4 connections: with 16 it does 16.8k point lookups, with 64 13.7k at a p99 of 28 ms. By default its pool resets every connection it takes back (`COM_RESET_CONNECTION`, which also drops the connection's prepared statements); that costs it a third of its throughput (the last row). The other mysql_async rows turn it off.
-- **Size the pool to the database's cores.** With more connections than the server has cores (4 on 3 here), one server thread at a time waits for a core, and the statements pipelined on its connection wait with it: the same throughput, but a p99 of 4.5 ms instead of 0.91. 8 connections give 132.3k at a p99 of 8.3 ms; 2 connections leave a server core idle, 83.9k. With several workers, the connections of all their pools add up. Statements that wait on disk or on locks need more connections than this.
-- **One connection shared by every task:** 28.9k point lookups and 10.4k 100-row reads, about what SQLx does with 64 connections, using 25–30% of the client core. The single server thread is the limit. Neither of the others can share a connection between tasks.
+- **Size the pool to the database's cores.** With more connections than the server has cores (4 on 3 here), one server thread at a time waits for a core, and the statements pipelined on its connection wait with it: the same throughput, but a p99 of 4.4 ms instead of 0.81. 8 connections give 161.6k at a p99 of 8.2 ms; 2 connections leave a server core idle, 87.9k. With several workers, the connections of all their pools add up. Statements that wait on disk or on locks need more connections than this.
+- **One connection shared by every task:** 26.6k point lookups and 10.8k 100-row reads, about what SQLx does with 64 connections, using 29–35% of the client core. The single server thread is the limit. Neither of the others can share a connection between tasks.
 
 Not measured: a server on another machine (network latency, where pipelining should matter more), writes, more than one client core, MySQL versions other than 8.0.46. Results are in `bench/results/mysql/`; pool sizes other than 4 in `pool-size/`.
 
