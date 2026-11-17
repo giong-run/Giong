@@ -89,6 +89,40 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   task has to wait for it again, because in the set every datagram received and every one
   sent and freed wakes epoll's callback on the socket's wait queue.
 
+- **runtime**, **sync**, **time**, **fs**, **net**: the core of the runtime is faster than
+  Tokio's in every workload of the new `bench/core.sh`, which runs the same code on giong,
+  Tokio (current-thread, `LocalSet` and multi-thread), monoio, glommio, compio and smol.
+  Medians of 5 rounds on the 4 vCPU cloud VM, ns per operation, io_uring
+  (`bench/results/core/vm/`): spawning and joining a task 92 (184 before; Tokio 174 to 226),
+  a thread outside the runtime feeding a task over `mpsc` 64 (194; Tokio 155 to 167), one
+  task feeding another 31 (40; Tokio 58 to 62), a chain of 1,000 tasks passing a token 220
+  (270; Tokio 289), a task sleeping once among 100,000 688 (748; Tokio 886 to 935), a
+  loopback TCP round trip with both ends on one thread 4,650 (4,930; Tokio 5,230). On
+  epoll, two tasks bouncing a value over channels take 222 instead of 531 (Tokio 481); the
+  TCP round trip there is level with Tokio's (5,304 against 5,231, the same system calls).
+  monoio and glommio stay ahead on spawning and on their channels, which only work within
+  one thread; giong's channels also carry values between threads. Files (`bench/fs.sh`,
+  page cache, one core, `bench/results/fs/`): 4 KiB at a random offset 1,328,000 reads a
+  second with one task (981,000 before; blocking `std` 1,313,000, monoio 968,000, compio
+  892,000, Tokio 163,000), whole 4 KiB files 437,000 a second (185,000; monoio 375,000,
+  Tokio 135,000) and 517,000 with 64 tasks (317,000; monoio 338,000). The changes:
+  - a task and its join state are one allocation, the waker a poll lends the task holds no
+    reference count of its own, and a finished task's waker state serves the next spawn when
+    no waker of it is left;
+  - the unbounded `mpsc` receiver takes everything queued under one lock when its own values
+    run out, instead of locking once per value;
+  - sleeps polled in the same turn of the event loop share one clock reading; a deadline
+    within a millisecond of it reads the clock again, so a zero timeout still ends at once;
+  - `File::read_at` (and so `fs::read`) first tries `preadv2` with `RWF_NOWAIT`, which copies
+    from the page cache without waiting for the disk, and goes to the driver only when that
+    returns nothing; `fs::read` takes its size hint from `fstat`;
+  - on io_uring, a TCP or Unix stream send by the only runnable task goes out with
+    `send(MSG_DONTWAIT)` instead of waiting a turn of the loop for its completion (with other
+    tasks runnable, sends still reach the kernel together through the ring, and no send can
+    overtake one still in the ring);
+  - on epoll, a busy worker looks for I/O every 61 polls, as Tokio does, instead of making
+    an `epoll_wait` call at every turn of the loop.
+
 ### Deprecated
 
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and

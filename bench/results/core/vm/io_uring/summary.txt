@@ -1,0 +1,116 @@
+5 rounds; ns per operation, median [min-max]
+workload   runtime          wall      min      max      cpu
+spawn      giong            91.5     89.3    137.2     90.1
+spawn      tokio-ct        225.9    219.6    328.3    225.2
+spawn      tokio-local     174.1    166.5    212.4    173.4
+spawn      tokio-mt        526.0    510.3    579.4    927.0
+spawn      monoio           59.1     56.8     61.2     59.1
+spawn      glommio          91.5     89.3    127.4     91.0
+spawn      compio           89.9     89.2     92.3     89.5
+spawn      smol            272.5    265.0    288.7    273.2
+
+yield      giong            23.7     22.0     27.4     23.7
+yield      tokio-ct         62.3     59.3     67.3     62.1
+yield      tokio-local      73.5     71.8     77.6     73.0
+yield      tokio-mt         70.5     63.7     78.0    140.5
+yield      monoio           49.5     47.3     59.8     49.3
+yield      glommio          45.0     43.2     56.4     44.9
+yield      compio           30.5     28.6     31.1     30.3
+yield      smol            137.6    136.7    143.6    137.8
+
+pingpong   giong           224.4    221.0    248.6    224.3
+pingpong   tokio-ct        480.5    451.0    516.5    479.8
+pingpong   tokio-local     528.1    499.5    586.8    516.2
+pingpong   tokio-mt      10945.1   7867.2  11285.7  11160.9
+pingpong   monoio          203.8    183.1    237.6    202.1
+pingpong   glommio         175.0    170.6    187.9    175.3
+pingpong   compio          655.3    641.0    764.3    651.7
+pingpong   smol           1946.3   1866.7   2046.3   1926.9
+
+mpsc       giong            30.9     21.3     31.9     30.6
+mpsc       tokio-ct         61.8     52.5     71.4     61.4
+mpsc       tokio-local      57.9     56.7     75.7     57.6
+mpsc       tokio-mt        140.9    137.3    147.2    270.2
+mpsc       monoio           13.8     13.7     22.1     13.8
+mpsc       glommio          23.4     23.3     26.9     23.4
+mpsc       compio          117.6    109.8    131.2    116.5
+mpsc       smol            109.4    106.4    123.8    108.5
+
+bounded    giong            48.0     44.0     52.2     46.5
+bounded    tokio-ct         94.8     87.9    102.4     93.2
+bounded    tokio-local      95.0     90.5    101.7     94.2
+bounded    tokio-mt        216.2    192.9    260.5    408.2
+bounded    monoio           25.1     24.1     34.3     24.8
+bounded    glommio          45.1     44.1     49.2     45.0
+bounded    compio          103.7     98.1    107.5    100.9
+bounded    smol            116.3    111.6    121.7    116.7
+
+oneshot    giong           293.4    272.9    338.7    291.1
+oneshot    tokio-ct        527.2    512.1    610.0    524.3
+oneshot    tokio-local     532.6    505.6    623.0    532.4
+oneshot    tokio-mt      18203.4  17285.5  18356.3  18980.2
+oneshot    monoio          218.3    201.5    231.8    218.2
+oneshot    glommio         208.1    198.0    229.2    205.9
+oneshot    compio          415.0    407.8    476.4    410.9
+oneshot    smol           1792.8   1723.6   1814.6   1779.4
+
+chain      giong           219.5    211.8    292.0    218.5
+chain      tokio-ct        333.7    325.8    382.5    323.0
+chain      tokio-local     289.3    274.6    379.3    286.8
+chain      tokio-mt        734.4    689.3    789.7   1078.5
+chain      monoio           91.8     86.3    116.3     90.9
+chain      glommio         343.0    318.9    383.3    340.1
+chain      compio          585.0    575.7    648.0    581.5
+chain      smol            484.0    460.8    509.6    452.2
+
+timers     giong           688.2    667.5    898.7    687.6
+timers     tokio-ct        934.8    795.9   1116.9    934.3
+timers     tokio-local     885.6    760.1    970.3    875.6
+timers     tokio-mt        966.9    881.0   1196.3   1570.0
+timers     monoio         1496.6   1356.7   1610.3   1490.3
+timers     glommio        1327.7   1071.8   1659.7   1326.7
+timers     compio          950.6    822.2   1388.3    950.0
+timers     smol           1231.4    971.5   1339.7   1230.8
+
+timeout    giong            35.6     29.0     41.8     34.2
+timeout    tokio-ct         49.0     42.6     53.6     48.6
+timeout    tokio-local      45.5     44.7     58.6     44.7
+timeout    tokio-mt         45.6     42.0     49.8     45.6
+timeout    monoio           56.0     51.5     67.0     55.3
+timeout    glommio          53.3     49.8     65.0     52.8
+timeout    compio           79.8     70.9     95.8     79.5
+timeout    smol             30.8     29.8     38.9     30.8
+
+xthread    giong            64.0     60.1     83.0    101.9
+xthread    tokio-ct        166.8    150.0    213.6    299.8
+xthread    tokio-local     154.5    144.6    162.1    269.3
+xthread    tokio-mt        208.2    168.5    218.7    394.5
+xthread    monoio          185.2    170.0    188.4    324.1
+xthread    glommio         170.4    139.9    176.2    326.2
+xthread    compio          222.6    197.1    239.1    379.9
+xthread    smol            210.8    178.7    269.2    373.1
+
+tcp-rr     giong          4652.4   4603.0   4910.7   4646.6
+tcp-rr     tokio-ct       5231.4   4934.9   5668.9   5183.4
+tcp-rr     tokio-local    5280.2   5129.0   5990.6   5266.9
+tcp-rr     tokio-mt      31218.5  29594.3  32761.0  28717.9
+tcp-rr     monoio         5181.0   4981.9   5449.5   5161.4
+tcp-rr     glommio       13516.6  12899.6  14044.7  13464.1
+tcp-rr     compio         5257.2   5137.4   6833.1   5237.8
+tcp-rr     smol           8850.8   7907.9   8913.9   8761.4
+
+connect    giong         17210.8  13754.0  21758.0  16613.6
+connect    tokio-ct      18741.4  17036.2  20776.3  18454.7
+connect    tokio-local   16887.7  16611.1  22037.7  16723.7
+connect    tokio-mt      38918.4  38226.7  42672.4  45354.4
+connect    monoio        16864.3  16071.6  18997.9  16223.7
+connect    glommio       24281.5  22841.4  27106.0  23523.9
+connect    compio        15309.3  14737.2  18505.8  15044.9
+connect    smol          19274.7  18592.7  20467.0  18747.5
+
+lookup     giong           171.2    160.1    275.4    170.7
+lookup     tokio-ct      29126.4  28354.7  30066.9  25944.3
+lookup     tokio-local   29515.3  28364.0  29873.8  26175.8
+lookup     tokio-mt      28563.8  28173.6  30183.7  25187.7
+lookup     smol          28642.5  24332.9  30428.6  25606.6
+

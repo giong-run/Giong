@@ -1,18 +1,26 @@
 workload      tasks  runtime     ops/s median       min       max
-small-files       1  std               555927    542190    627139
-small-files       1  giong             226792    200605    242807
-small-files       1  tokio             147164    139810    154424
-small-files       1  tokio-all          28714     27926     29718
+small-files       1  std               566556    477312    601904
+small-files       1  giong             436577    395480    444517
+small-files       1  monoio            374967    353829    388189
+small-files       1  compio            141044    109041    148131
+small-files       1  tokio             135119    106943    144655
+small-files       1  tokio-all          33145     30679     36300
 
-small-files      64  giong             292064    268966    316581
-small-files      64  tokio             115582    111798    139893
-small-files      64  tokio-all          81155     76936     84666
+small-files      64  giong             516679    480883    559799
+small-files      64  monoio            337597    287918    365419
+small-files      64  compio            130141    108398    137144
+small-files      64  tokio             125196    115014    135643
+small-files      64  tokio-all          97578     58445    107362
 
-random-read       1  std              1395072   1341621   1463828
-random-read       1  giong            1013596    868332   1152886
-random-read       1  tokio             183558    171371    187689
-random-read       1  tokio-all          33054     32020     34465
+random-read       1  std              1312851   1153011   1449477
+random-read       1  giong            1327552   1281662   1346444
+random-read       1  monoio            968008    899962   1057717
+random-read       1  compio            891943    882270    949466
+random-read       1  tokio             163474    158711    172844
+random-read       1  tokio-all          37820     34542     39066
 
-random-read      64  giong            1259617   1216538   1294114
-random-read      64  tokio             155717    101204    174726
-random-read      64  tokio-all          74455     72170     80232
+random-read      64  giong            1304816   1071731   1355567
+random-read      64  monoio           1231712   1027179   1297602
+random-read      64  compio           1097174    968901   1191816
+random-read      64  tokio             157356    141147    162183
+random-read      64  tokio-all          95942     79588    106339
