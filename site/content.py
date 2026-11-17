@@ -54,7 +54,7 @@ CRATES = {
                "A cancelled write poisons the sending side instead of corrupting the record stream",
                "ALPN, client certificates and a handshake timeout",
                "Kernel TLS after the handshake (`Ktls::Auto`), and files sent with `sendfile`"],
-        fact="TLS costs 4% on `/json`"),
+        fact="TLS costs 2% on `/json`"),
     "giong-postgres": dict(
         layer="clients", tests=107,
         short="PostgreSQL client and pool; statements of every task pipeline together.",
@@ -64,7 +64,7 @@ CRATES = {
                "Every statement prepared once per connection and cached",
                "TLS verified by default for remote hosts; SCRAM-SHA-256; `require_auth`",
                "A connection taken with `get()` comes back to the pool with its session reset"],
-        fact="2.6× deadpool's statements per core"),
+        fact="3.3× deadpool's statements per core"),
     "giong-mysql": dict(
         layer="clients", tests=120,
         short="MySQL and MariaDB client and pool, built the same way as giong-postgres.",
@@ -74,7 +74,7 @@ CRATES = {
                "Prepared statements on the binary protocol, cached per connection",
                "TLS; `caching_sha2_password` and `mysql_native_password`",
                "A connection taken with `get()` comes back to the pool with its session reset"],
-        fact="4.7× SQLx's statements per core"),
+        fact="5.1× SQLx's statements per core"),
     "giong-redis": dict(
         layer="clients", tests=86,
         short="Redis client on RESP3: pipelining across tasks, Pub/Sub, a pool.",
@@ -83,7 +83,7 @@ CRATES = {
                "Transactions with `watch`; Pub/Sub",
                "A `Pool` per worker; `take()` for a connection of your own",
                "TLS; Redis 6 or newer (RESP3)"],
-        fact="1.4× redis-rs's `GET`s per core"),
+        fact="1.3× redis-rs's `GET`s per core, at half the CPU"),
     "giong-web": dict(
         layer="framework", tests=110,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
@@ -133,11 +133,13 @@ LAYERS = [  # top to bottom, as drawn
 
 # ---------------------------------------------------------------- home
 HERO = dict(
-    h1="One syscall per tick, <em>not per operation.</em>",
-    lede=("giong is an async runtime for Rust services on Linux, built on io_uring with one "
-          "thread per core, and an epoll driver wherever io_uring is blocked. It brings its own HTTP server and client, TLS, PostgreSQL, MySQL "
-          "and Redis clients and a web framework, so a whole service runs on it with no Tokio "
-          "underneath."),
+    h1="The Rust runtime <em>built for the agent era.</em>",
+    lede=("giong is an async runtime for Rust services on Linux. Its API is strict rather than "
+          "short, every error it raises says how to fix it, and it is meant to stay on version 1 "
+          "for many years. Underneath: io_uring with one thread per core, one system call per "
+          "tick, and an epoll driver wherever io_uring is blocked. It brings its own HTTP server "
+          "and client, TLS, PostgreSQL, MySQL and Redis clients and a web framework, so a whole "
+          "service runs on it with no Tokio underneath."),
 )
 
 PILLARS = [
@@ -165,15 +167,22 @@ PILLARS = [
 
 AGENTS = dict(
     h2="Made for the agents that write your code",
-    lede=("More code is written by AI coding agents every month. giong is built so they get it "
-          "right on the first try, and can fix it alone when they do not."),
+    lede=("giong is a late entrant, built for a time when more code is written by AI agents "
+          "every month. Its API does not have to be short to type; it has to be strict, always "
+          "correct, and able to grow for years. So agents get it right on the first try, and can "
+          "fix it alone when they do not."),
     points=[
         ("Errors that say how to fix them",
          "Every error giong raises has a stable code, the cause and the fix, and a page of its "
          "own. `giong::error::code(&err)` matches on the code, never on the message."),
         ("One obvious way",
-         "No macros that hide control flow. Strict types, so a mistake is a compile error. Every "
-         "timeout and size limit is finite and documented."),
+         "One way to do each thing, and no macros that hide control flow. Misuse fails at compile "
+         "time, or at run time with a coded error. Every timeout and size limit is finite and "
+         "documented."),
+        ("Version 1 for years",
+         "After 1.0, giong grows through 1.x releases rather than a 2.0. Every behaviour code "
+         "relies on is documented, and a release only adds: it never changes what existing code "
+         "means. `cargo-semver-checks` runs on every change."),
         ("Verification is the law",
          "Tests, ThreadSanitizer, loom, fuzzing and soak tests run in CI and block merging. "
          "Machines check the work, not only reviewers."),
@@ -364,15 +373,18 @@ CHARTS = [
         sub="requests per second, TLS 1.3, the same rustls on both sides · higher is better",
         max=160,
         rows=["`/json`, kept-alive",
-              ("httptls", 144.8, "144.8k", 142.3, 152.9), ("axumtls", 81.0, "81.0k", 80.2, 82.8),
+              ("httptls", 146.6, "146.6k", 135.6, 155.4), ("axumtls", 81.2, "81.2k", 80.1, 85.1),
               "`/users`, 8 KB, kept-alive",
-              ("httptls", 47.8, "47.8k", 43.4, 48.8), ("axumtls", 19.2, "19.2k", 18.7, 19.8),
+              ("httptls", 48.7, "48.7k", 47.4, 50.0), ("axumtls", 18.5, "18.5k", 17.4, 19.5),
               "a new handshake per request",
-              ("httptls", 7.1, "7.1k", 6.7, 7.5), ("axumtls", 7.3, "7.3k", 6.9, 7.6)],
-        short="Handshakes are level: they are almost all cryptography, from the same library.",
-        note=("TLS costs giong 4% on `/json` and 14% on 8 KB responses. Handshakes are level: a "
-              "handshake is almost all cryptography, and both sides use the same library for it. "
-              "Most of the `/users` factor is there without TLS."),
+              ("httptls", 8.4, "8.4k", 7.9, 9.1), ("axumtls", 7.1, "7.1k", 6.3, 7.6)],
+        short="18% more new connections than Axum, mostly from the cipher suite; set up the same "
+              "way, Axum matches it.",
+        note=("TLS costs giong 2% on `/json` and 12% on 8 KB responses. New connections: 18% more "
+              "per second than Axum + rustls at 15% less CPU each, mostly because giong-tls prefers "
+              "AES-128-GCM. Axum set to the same suite matches giong's rate (8.4k), with a higher "
+              "p99 (6.2 ms against 4.2): a handshake is almost all cryptography, from the same "
+              "library. Most of the `/users` factor is there without TLS."),
         src=["bench/tls.sh"],
     ),
     dict(
@@ -523,7 +535,9 @@ ELSEWHERE = [
     "**Monoio** is the mature choice and runs in production at ByteDance. If you need a runtime "
     "proven in production today, or macOS, use it.",
     "**Glommio** is built for storage engines: Direct I/O and priority scheduling are its strengths.",
-    "**Tokio** is the general-purpose runtime. giong is not trying to replace it for every workload.",
+    "**Tokio** is the default general-purpose runtime, with the largest ecosystem and years in "
+    "production. giong aims to beat it on technical merit and replaces its crates with its own, "
+    "but it has not run in production yet; measure your own workload before you switch.",
 ]
 
 FAQ = [

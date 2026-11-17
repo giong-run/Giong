@@ -1157,10 +1157,13 @@ def llms():
              ) if "giong-postgres" in names else ""
     return f"""# giong
 
-> A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
-> worker owns its ring, tasks and buffers; tasks never move between threads, so futures
-> need not be `Send`. Version {VERSION}; every link below is to the documentation of that
-> release, which is what `cargo add` installs.
+> An async runtime for Rust services on Linux, built for code that AI agents write: a
+> strict API meant to stay on major version 1 for many years, errors with a stable code,
+> the cause and the fix, and its own crates for a whole service (HTTP, TLS, PostgreSQL,
+> MySQL, Redis, DNS) with no Tokio underneath. Thread per core on io_uring: every worker
+> owns its ring, tasks and buffers; tasks never move between threads, so futures need not
+> be `Send`. Version {VERSION}; every link below is to the documentation of that release,
+> which is what `cargo add` installs.
 
 Facts that are easy to get wrong:
 
@@ -1193,9 +1196,10 @@ Facts that are easy to get wrong:
   `giong-http` with feature `client`, not reqwest; TLS: `giong-tls`; PostgreSQL:
   `giong-postgres`, not sqlx or tokio-postgres; MySQL: `giong-mysql`; Redis: `giong-redis`,
   not redis-rs; files: `giong::fs`; names: `giong::net::lookup_host`; timers: `giong::time`.
-  Measured against those Tokio crates on Tokio, one core each, they serve 1.2 to 4.7 times
-  the requests or statements, and file reads at an offset 5.5 to 8 times (the README's
-  Benchmarks section has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
+  Measured against those Tokio crates on Tokio, one core each, they serve 1.1 to 5.1 times
+  the requests, statements or commands, and file reads at an offset 5.5 to 8 times; over one
+  PostgreSQL connection shared by every task giong-postgres is 7-9% behind tokio-postgres,
+  so use a `Pool` (the README's Benchmarks section has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
   they are. Only for a protocol giong has no crate for (WebSocket, for one), a crate generic
   over a Tokio or futures-io stream (tokio-tungstenite, h2, tokio-rustls, hyper's `conn`)
   runs through `giong_compat::Compat::new(stream)`, which adds a copy per byte written and
