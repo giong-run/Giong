@@ -496,6 +496,9 @@ impl<S: 'static> App<S> {
     /// assert_eq!(resp.status(), 200);
     /// assert_eq!(resp.body_bytes(), b"hello ada");
     /// ```
+    ///
+    /// Cancel safe as far as the handlers are, like
+    /// [`Next::run`](crate::Next::run).
     pub async fn handle(&self, http: Request) -> Response {
         let method = Method::parse(http.method());
         let mut caps = Captures::new();

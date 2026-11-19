@@ -473,6 +473,10 @@ impl Pool {
     /// [`Client::query`]. Transaction statements and statements that change
     /// the session are refused ([`ErrorKind::Statement`]): run them on a
     /// connection from [`get`](Self::get).
+    ///
+    /// Not cancel safe: if the future is dropped, the statement may still run
+    /// on the server, and what it changes stays; the pool and its connections
+    /// stay usable.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -481,6 +485,8 @@ impl Pool {
 
     /// Runs a statement that returns exactly one row; see
     /// [`Client::query_one`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -489,6 +495,8 @@ impl Pool {
 
     /// Runs a statement that returns at most one row; see
     /// [`Client::query_opt`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -497,6 +505,8 @@ impl Pool {
 
     /// Runs a statement and returns the number of rows it changed; see
     /// [`Client::execute`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -505,6 +515,8 @@ impl Pool {
 
     /// Runs an `INSERT` and returns the `AUTO_INCREMENT` value it generated,
     /// if any; see [`Client::insert`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<u64>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -520,6 +532,8 @@ impl Pool {
     /// [`ErrorKind::Closed`], as do the statements other tasks sent on that
     /// connection after it: they would otherwise have run inside the
     /// transaction.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
         let client = self.shared().await?;
         client.batch_execute(sql).await
@@ -548,6 +562,9 @@ impl Pool {
     /// The connection goes back when the [`PooledClient`] is dropped, and its
     /// session is reset first if it may have changed (see the type's
     /// documentation).
+    ///
+    /// Cancel safe: if the future is dropped, no connection is taken, and the
+    /// place in line goes to the next task.
     pub async fn get(&self) -> Result<PooledClient, Error> {
         let ticket = Ticket {
             pool: self,
@@ -934,6 +951,8 @@ pub struct PooledClient {
 
 impl PooledClient {
     /// Starts a transaction; see [`Client::transaction`].
+    ///
+    /// Cancel safe, like [`Client::transaction`].
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.deref_mut().transaction().await
     }

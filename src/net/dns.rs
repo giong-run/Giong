@@ -300,6 +300,8 @@ impl Resolver {
     /// exist or has no addresses, [`TimedOut`](io::ErrorKind::TimedOut) if no
     /// server answered, and [`InvalidInput`](io::ErrorKind::InvalidInput) for
     /// a name that is not a valid host name.
+    ///
+    /// Cancel safe: it changes nothing; a dropped lookup closes its sockets.
     pub async fn lookup_ip(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         let host = host
             .strip_prefix('[')

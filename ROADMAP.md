@@ -6,9 +6,18 @@ an item so the work is not duplicated.
 
 ## Goal
 
-A runtime for **network services on Linux** that makes the fewest possible system calls and
-keeps tail latency low, by committing fully to io_uring and to one thread per core, and
-that still runs, on epoll, where io_uring is blocked.
+**The best async runtime for Rust, on technical merit**: a complete, general-purpose runtime
+that fits any workload a service has, faster and leaner than Tokio, judged by measurements
+and not by adoption. Linux first: it makes the fewest possible system calls and keeps tail
+latency low by committing fully to io_uring and to one thread per core, and it still runs,
+on epoll, where io_uring is blocked.
+
+giong is a late entrant, built for a time when AI agents write much of the code. Its API
+does not have to be short to type; it has to be strict, always correct, and able to grow
+for many years. After 1.0, giong stays on major version 1 and grows through 1.x minor
+releases (see [Agent-first](#agent-first) for the rules that make this possible). It
+replaces the Tokio ecosystem with crates of its own (HTTP server and client, TLS, DNS,
+database drivers) rather than adapting to it.
 
 By 1.0, a team can write and deploy a real REST API (Postgres or MySQL, Redis, calls to
 other HTTPS services, HTTPS itself) with giong's crates alone, in an ordinary Docker or
@@ -37,7 +46,12 @@ tighter the checks around it have to be.
 2. **One obvious, correct way.** No macros and no magic. Types strict enough that a mistake
    is a compile error: enums instead of flags and strings, `Duration` instead of a number of
    milliseconds, `#[must_use]` on futures and handles. No implicit defaults: every timeout
-   and size limit is finite, documented, and visible in `Debug` output.
+   and size limit is finite, documented, and visible in `Debug` output. Every addition to
+   the API, through 1.0 and all of 1.x, follows four rules:
+   1. One way to do each thing.
+   2. Misuse fails at compile time, or at run time with a coded error.
+   3. Every behaviour code relies on is documented.
+   4. Releases only add; they never change what existing code means.
 3. **Verification is the law.** Tests, cancellation tests, ThreadSanitizer, `loom`, fuzzing
    and soak tests run in CI and block merging; `cargo-semver-checks` guards the API. Machines
    check the work, so human review is not the bottleneck.

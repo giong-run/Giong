@@ -357,6 +357,8 @@ pre.code .t { color: var(--code-type); }
 .points { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.5rem clamp(1.25rem, 3vw, 2.5rem); }
 .points li { display: grid; gap: 0.45rem; align-content: start; padding-top: 1.1rem; border-top: 1px solid var(--line); }
 .points p { color: var(--fg-2); font-size: 0.9688rem; line-height: 1.6; }
+.mcp-foot { grid-column: 1 / -1; margin: 0; }
+@media (min-width: 1100px) { .points.points-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
 .agents-side { display: grid; gap: 1rem; min-width: 0; }
 .term { border: 1px solid var(--line); border-radius: var(--radius); background: var(--code-bg); overflow: hidden; }
 .term-bar { display: flex; align-items: center; gap: 0.25rem; border-bottom: 1px solid var(--line); background: var(--ink-2); font: 0.75rem/1 var(--mono); color: var(--fg-3); padding-block: 0.65rem; }

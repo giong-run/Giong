@@ -434,6 +434,8 @@ impl Pool {
     }
 
     /// Sends a command on a shared connection; see [`Client::query`].
+    ///
+    /// Not cancel safe, like [`Client::query`].
     pub async fn query<T: FromValue>(&self, cmd: &Cmd) -> Result<T, Error> {
         // Refused before a connection is opened for it.
         cmd.check(false, false)?;
@@ -450,6 +452,8 @@ impl Pool {
     }
 
     /// Sends a pipeline on a shared connection; see [`Client::pipeline`].
+    ///
+    /// Not cancel safe, like [`Client::query`].
     pub async fn pipeline<T: FromValue>(&self, pipe: &Pipeline) -> Result<T, Error> {
         pipe.check(pipe.is_atomic())?;
         self.shared().await?.pipeline(pipe).await
@@ -471,6 +475,8 @@ impl Pool {
     ///
     /// Waits up to the [wait timeout](Self::wait_timeout) when every
     /// connection is taken or busy and the pool is full.
+    ///
+    /// Cancel safe: if the future is dropped, no connection is taken.
     pub async fn take(&self) -> Result<PooledClient, Error> {
         let ticket = Ticket {
             pool: self,

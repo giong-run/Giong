@@ -121,6 +121,7 @@ def workspace_crates():
         name = re.search(r'^name\s*=\s*"([^"]+)"', pkg, re.M)[1]
         crates[name] = d
         deps[name] = set(re.findall(r"^([A-Za-z0-9_-]+)\s*=\s*\{[^}]*\bpath\s*=", text, re.M))
+        deps[name].discard(name)  # a dev-dependency on itself, to turn on a feature for its tests
     order = []
 
     def visit(name, stack=()):

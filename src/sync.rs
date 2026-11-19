@@ -186,6 +186,9 @@ pub mod mpsc {
     impl<T> UnboundedReceiver<T> {
         /// Receives the next value, or `None` once every sender is gone and
         /// the channel is empty.
+        ///
+        /// Cancel safe: if the future is dropped, no value is lost; the next
+        /// call returns it.
         pub async fn recv(&mut self) -> Option<T> {
             poll_fn(|cx| {
                 let mut state = self.shared.lock();

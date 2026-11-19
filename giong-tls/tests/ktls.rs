@@ -96,13 +96,13 @@ impl Pki {
     }
 
     fn acceptor(&self, suite: Option<SupportedCipherSuite>, mode: Ktls) -> TlsAcceptor {
-        TlsAcceptor::new(Arc::new(self.server(suite)))
+        TlsAcceptor::from_rustls(Arc::new(self.server(suite)))
             .ktls(mode)
             .unwrap()
     }
 
     fn connector(&self, suite: Option<SupportedCipherSuite>, mode: Ktls) -> TlsConnector {
-        TlsConnector::new(Arc::new(self.client(suite)))
+        TlsConnector::from_rustls(Arc::new(self.client(suite)))
             .ktls(mode)
             .unwrap()
     }
@@ -298,13 +298,13 @@ fn required_fails_up_front_and_says_why_when_the_kernel_cannot() {
         return;
     }
     let pki = pki();
-    let err = TlsAcceptor::new(Arc::new(pki.server(None)))
+    let err = TlsAcceptor::from_rustls(Arc::new(pki.server(None)))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert_eq!(code(&err), Some(Code::KtlsUnavailable), "{err}");
     let why = ktls_support().unavailable_reason().unwrap();
     assert!(err.to_string().contains(why), "{err}");
-    let err = TlsConnector::new(Arc::new(pki.client(None)))
+    let err = TlsConnector::from_rustls(Arc::new(pki.client(None)))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert_eq!(code(&err), Some(Code::KtlsUnavailable), "{err}");
@@ -315,19 +315,19 @@ fn configurations_with_0rtt_data_cannot_use_kernel_tls() {
     let pki = pki();
     let mut server = pki.server(None);
     server.max_early_data_size = 16384;
-    let acceptor = TlsAcceptor::new(Arc::new(server.clone()))
+    let acceptor = TlsAcceptor::from_rustls(Arc::new(server.clone()))
         .ktls(Ktls::Auto)
         .unwrap();
     let why = acceptor.ktls_unavailable().expect("a reason");
     assert!(why.contains("0-RTT"), "{why}");
-    let err = TlsAcceptor::new(Arc::new(server))
+    let err = TlsAcceptor::from_rustls(Arc::new(server))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert_eq!(code(&err), Some(Code::KtlsUnavailable), "{err}");
 
     let mut client = pki.client(None);
     client.enable_early_data = true;
-    let err = TlsConnector::new(Arc::new(client))
+    let err = TlsConnector::from_rustls(Arc::new(client))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert!(err.to_string().contains("0-RTT"), "{err}");
@@ -336,8 +336,8 @@ fn configurations_with_0rtt_data_cannot_use_kernel_tls() {
 #[test]
 fn off_is_the_default_and_keeps_connections_in_the_process() {
     let pki = pki();
-    let acceptor = TlsAcceptor::new(Arc::new(pki.server(None)));
-    let connector = TlsConnector::new(Arc::new(pki.client(None)));
+    let acceptor = TlsAcceptor::from_rustls(Arc::new(pki.server(None)));
+    let connector = TlsConnector::from_rustls(Arc::new(pki.client(None)));
     assert_eq!(acceptor.ktls_unavailable(), None);
     run(async move {
         let (server, client) = tls_pair(acceptor, connector).await;
@@ -423,7 +423,7 @@ fn what_the_handshake_settled_survives_the_handoff() {
     ] {
         let mut server = pki.server(Some(suite));
         server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let acceptor = TlsAcceptor::new(Arc::new(server))
+        let acceptor = TlsAcceptor::from_rustls(Arc::new(server))
             .ktls(Ktls::Required)
             .unwrap();
         let connector = pki
@@ -474,13 +474,16 @@ fn a_peer_that_cuts_its_records_small_still_hands_over_cleanly() {
             let mut client = pki.client(Some(suite));
             let (acceptor, connector) = if kernel_side == "client" {
                 server.max_fragment_size = Some(32);
-                let acceptor = TlsAcceptor::new(Arc::new(server));
-                let connector = TlsConnector::new(Arc::new(client)).ktls(Ktls::Required);
+                let acceptor = TlsAcceptor::from_rustls(Arc::new(server));
+                let connector = TlsConnector::from_rustls(Arc::new(client)).ktls(Ktls::Required);
                 (acceptor, connector.unwrap())
             } else {
                 client.max_fragment_size = Some(32);
-                let acceptor = TlsAcceptor::new(Arc::new(server)).ktls(Ktls::Required);
-                (acceptor.unwrap(), TlsConnector::new(Arc::new(client)))
+                let acceptor = TlsAcceptor::from_rustls(Arc::new(server)).ktls(Ktls::Required);
+                (
+                    acceptor.unwrap(),
+                    TlsConnector::from_rustls(Arc::new(client)),
+                )
             };
             let label = format!("{:?}, kernel on the {kernel_side}", suite.suite());
             run(async move {

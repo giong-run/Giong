@@ -638,6 +638,11 @@ impl KtlsSupport {
     }
 
     /// `true` if the kernel encrypts and decrypts `suite`.
+    ///
+    /// Needs the `unstable-rustls` feature: `suite` is the rustls type
+    /// (outside the semver promise, see [`rustls`](crate::rustls)). The
+    /// [`Display`](fmt::Display) form lists the same without it.
+    #[cfg(feature = "unstable-rustls")]
     pub fn supports(&self, suite: CipherSuite) -> bool {
         match Cipher::of_suite(suite) {
             Some((version, cipher)) => self.has(version, cipher),
@@ -1314,7 +1319,7 @@ impl<'a> Handshake<'a> {
                     Code::TlsProtocol,
                     "the client sent 0-RTT (early) data, which giong-tls does not accept",
                     "set max_early_data_size to 0 in the rustls ServerConfig given to \
-                     TlsAcceptor::new: 0-RTT data can be replayed.",
+                     TlsAcceptor::from_rustls: 0-RTT data can be replayed.",
                 ))
             }
             other => return Err(unexpected(&format!("rustls state {other:?}"))),
@@ -2526,10 +2531,10 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         (
-            crate::TlsAcceptor::new(Arc::new(server))
+            crate::TlsAcceptor::with_config(Arc::new(server))
                 .ktls(Ktls::Required)
                 .unwrap(),
-            crate::TlsConnector::new(Arc::new(client)),
+            crate::TlsConnector::with_config(Arc::new(client)),
         )
     }
 
