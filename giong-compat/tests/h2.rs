@@ -117,13 +117,14 @@ fn h2_over_giong_tls_with_alpn() {
     giong::block_on(async {
         let pki = pki();
         let (c, s) = pair().await;
-        let acceptor = giong_tls::TlsAcceptor::new(server_config(&pki, &[b"h2", b"http/1.1"]));
+        let acceptor =
+            giong_tls::TlsAcceptor::from_rustls(server_config(&pki, &[b"h2", b"http/1.1"]));
         let server = giong::spawn(async move {
             let tls = acceptor.accept(s).await.unwrap();
             assert_eq!(tls.alpn_protocol().as_deref(), Some(&b"h2"[..]));
             serve(Compat::new(tls)).await
         });
-        let connector = giong_tls::TlsConnector::new(client_config(&pki, &[b"h2"]));
+        let connector = giong_tls::TlsConnector::from_rustls(client_config(&pki, &[b"h2"]));
         let tls = connector.connect("localhost", c).await.unwrap();
         let (client, connection) = h2::client::handshake(Compat::new(tls)).await.unwrap();
         let driver = giong::spawn(async move { connection.await.unwrap() });

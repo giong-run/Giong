@@ -154,7 +154,7 @@ async fn recv_exact(tls: &TlsStream, n: usize) -> Vec<u8> {
 
 fn roundtrip(versions: &[&'static rustls::SupportedProtocolVersion]) {
     let pki = pki();
-    let acceptor = TlsAcceptor::new(server_config(&pki, versions, false));
+    let acceptor = TlsAcceptor::from_rustls(server_config(&pki, versions, false));
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -362,7 +362,7 @@ fn alpn_settles_on_a_protocol_both_sides_speak() {
 fn a_client_certificate_is_presented_when_the_server_asks_for_one() {
     let pki = pki();
     let versions = [&rustls::version::TLS13, &rustls::version::TLS12];
-    let acceptor = TlsAcceptor::new(server_config(&pki, &versions, true));
+    let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &versions, true));
     let anonymous = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     let identified = anonymous
         .clone()
@@ -444,6 +444,39 @@ fn reconnecting_resumes_the_session() {
 }
 
 #[test]
+fn a_server_that_only_reads_still_sends_its_session_tickets() {
+    // giong's server holds its TLS 1.3 session tickets back for its first
+    // response; with no response, they go out once its receive has to wait.
+    let pki = pki();
+    let acceptor =
+        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
+    giong::block_on(async move {
+        let addr = serve(acceptor, |tls: io::Result<TlsStream>| async move {
+            let Ok(tls) = tls else { return };
+            while let Ok(data) = tls.recv().await {
+                if data.is_empty() {
+                    break;
+                }
+            }
+            let _ = tls.shutdown().await;
+        });
+        let first = connect(&connector, addr, "localhost").await.unwrap();
+        first.write_all(b"only read".to_vec()).await.0.unwrap();
+        first.shutdown().await.unwrap();
+        // The tickets, then the server's close_notify.
+        let end = giong::time::timeout(Duration::from_secs(10), first.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(end.is_empty());
+        assert!(first.received_close_notify());
+        let second = connect(&connector, addr, "localhost").await.unwrap();
+        assert!(second.resumed());
+    });
+}
+
+#[test]
 fn a_server_that_never_answers_times_out() {
     // Connections queue in the backlog; nobody ever accepts them.
     let listener = StdListener::bind("127.0.0.1:0").unwrap();
@@ -492,6 +525,7 @@ fn trust_roots_must_be_certificates() {
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
     // The same kind as when the machine has none (`with_system_roots`).
+    #[allow(deprecated)] // `with_roots` goes in 1.0.0; the error stays.
     let err = TlsConnector::with_roots(RootCertStore::empty()).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
     assert_eq!(code(&err), Some(Code::NoTrustedRoots), "{err}");

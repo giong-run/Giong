@@ -81,7 +81,10 @@ async fn drain(tls: TlsStream) -> (Vec<u8>, bool, Option<String>) {
 #[test]
 fn a_tls12_write_past_the_record_limit_fails_instead_of_vanishing() {
     let (server, client) = configs(tls12_with_record_limit(40));
-    let (acceptor, connector) = (TlsAcceptor::new(server), TlsConnector::new(client));
+    let (acceptor, connector) = (
+        TlsAcceptor::from_rustls(server),
+        TlsConnector::from_rustls(client),
+    );
     giong::block_on(async move {
         let (server, client) = pair(acceptor, connector).await;
         assert!(!server.is_ktls());
@@ -130,8 +133,8 @@ fn a_tls12_write_past_the_record_limit_fails_instead_of_vanishing() {
 fn two_writers(ktls: Ktls) {
     let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256;
     let (server, client) = configs(suite);
-    let acceptor = TlsAcceptor::new(server).ktls(ktls).unwrap();
-    let connector = TlsConnector::new(client);
+    let acceptor = TlsAcceptor::from_rustls(server).ktls(ktls).unwrap();
+    let connector = TlsConnector::from_rustls(client);
     giong::block_on(async move {
         let (server, client) = pair(acceptor, connector).await;
         assert_eq!(server.is_ktls(), ktls == Ktls::Required);

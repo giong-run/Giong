@@ -272,6 +272,9 @@ impl Client {
     /// # Panics
     ///
     /// Panics when called outside of a giong runtime.
+    ///
+    /// Cancel safe: if the future is dropped, the connection being opened is
+    /// closed.
     pub async fn connect(config: &Config) -> Result<Client, Error> {
         let startup = connect::connect(config).await?;
         Ok(Self::start(startup, config.clone()))
@@ -334,8 +337,10 @@ impl Client {
     /// The server decides each parameter's type from the SQL; see the
     /// [`types`](crate::types) module for which Rust types fit which.
     ///
-    /// Cancel safe in the sense that matters: dropping the future leaves the
-    /// connection usable. The statement may still run on the server.
+    /// Not cancel safe: if the future is dropped, the statement may still run
+    /// on the server, and what it changes stays; the connection stays usable.
+    /// Inside a [`Transaction`], a later [`commit`](Transaction::commit)
+    /// commits it.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
         let (set, _) = self.run(sql, params).await?;
         Ok(set.into_rows())
@@ -344,6 +349,8 @@ impl Client {
     /// Runs a statement that must return exactly one row, and returns it.
     ///
     /// No row or several rows fail with [`ErrorKind::RowCount`].
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
         let mut rows = self.query(sql, params).await?;
         match rows.len() {
@@ -361,6 +368,8 @@ impl Client {
     /// Runs a statement that returns at most one row.
     ///
     /// Several rows fail with [`ErrorKind::RowCount`].
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
         let mut rows = self.query(sql, params).await?;
         match rows.len() {
@@ -377,6 +386,8 @@ impl Client {
 
     /// Runs a statement and returns the number of rows it inserted, updated
     /// or deleted (or returned, for a `SELECT`).
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let (_, tag) = self.run(sql, params).await?;
         Ok(rows_affected(tag.as_deref()))
@@ -389,6 +400,9 @@ impl Client {
     /// The statements run in one implicit transaction unless the SQL has its
     /// own `BEGIN` and `COMMIT`: if one fails, the earlier ones are rolled
     /// back.
+    ///
+    /// Not cancel safe: if the future is dropped, the statements may still run
+    /// on the server, and what they change stays.
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
         let slot = self
             .conn
@@ -410,6 +424,9 @@ impl Client {
     /// tx.commit().await?;
     /// # Ok(()) }
     /// ```
+    ///
+    /// Cancel safe: if the future is dropped, a transaction it began is rolled
+    /// back.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         // The guard exists before BEGIN is sent: if this future is dropped
         // while waiting, the guard's drop rolls the transaction back.
@@ -1128,8 +1145,8 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
         if let Err(e) = conn.process(&mut buf) {
             break e;
         }
-        match conn.stream.recv().await {
-            Ok(chunk) if chunk.is_empty() => {
+        match conn.stream.read_into(&mut buf).await {
+            Ok(0) => {
                 let closing = conn.state.borrow().closing;
                 break Error::closed(if closing {
                     "the connection was closed"
@@ -1137,7 +1154,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
                     "the server closed the connection"
                 });
             }
-            Ok(chunk) => buf.extend(&chunk),
+            Ok(_) => {}
             Err(e) => break Error::io(ErrorKind::Closed, "reading from the server failed", e),
         }
     };
@@ -1200,6 +1217,9 @@ impl Transaction<'_> {
     /// When a statement in the transaction failed earlier, PostgreSQL rolls
     /// the transaction back instead; this is reported as an error, never as
     /// a successful commit.
+    ///
+    /// Not cancel safe: if the future is dropped, the transaction may have been
+    /// committed or rolled back, and the caller does not learn which.
     pub async fn commit(mut self) -> Result<(), Error> {
         self.done = true;
         let slot = self
@@ -1217,6 +1237,9 @@ impl Transaction<'_> {
     }
 
     /// Rolls the transaction back and waits for the server to confirm.
+    ///
+    /// Cancel safe: if the future is dropped, the transaction is rolled back
+    /// all the same.
     pub async fn rollback(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.batch_execute("ROLLBACK").await
@@ -1271,6 +1294,9 @@ impl CancelToken {
     /// Fails with [`ErrorKind::Closed`], sending nothing, when the token was
     /// taken from a [`PooledClient`](crate::PooledClient) that has gone back
     /// to its pool since.
+    ///
+    /// Not cancel safe: if the future is dropped, the request may still reach
+    /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
         if self
             .lease

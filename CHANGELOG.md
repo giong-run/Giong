@@ -28,6 +28,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Added
 
+- **All crates**: every public async fn says in its documentation whether it is cancel
+  safe and, when it is not, what a dropped future leaves behind (a statement that may
+  still run, a datagram that may be sent, a file that may be created).
+  `tests/cancel_docs.rs` fails a public async fn without it.
+- **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
+  without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
+  instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
+  what `TlsStream::peer_certificates` returns) is re-exported.
+- **giong-tls**: the server side without rustls' types. `Certificates` holds one or
+  several certificate chains: `TlsAcceptor::with_certificates` presents the one valid for
+  the name the client asks for (SNI), and `Certificates::replace_pem` swaps the set while
+  the server runs, for renewed certificates. `TlsAcceptor::require_client_cert` and
+  `request_client_cert` turn on mutual TLS. The `post-quantum` feature uses aws-lc-rs and
+  offers the X25519MLKEM768 key exchange first. New error code `GIONG-E2013`
+  (`Code::TlsConfig`) in giong.
+
 - **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
   (`Code::HttpServerLowMemory`) in giong.
 - **giong-mysql**, **giong-redis** (**behaviour change**): `Pool::idle_timeout`,
@@ -54,6 +70,59 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Changed
 
+- **giong-tls** (breaking): rustls' types are out of the stable API, so that a new rustls
+  version, which giong-tls will take up during 1.x, breaks nothing. The rustls
+  configurations that `TlsAcceptor::new` and `TlsConnector::new` took go to the new
+  `TlsAcceptor::from_rustls` and `TlsConnector::from_rustls`, which need the new
+  `unstable-rustls` feature, as do `KtlsSupport::supports` and the `rustls` re-export (no
+  longer there without it). That feature is outside the semver promise: it follows the
+  rustls version giong-tls uses.
+
+- **giong-tls** (**behaviour change**): `TlsAcceptor::from_pem` picks AES-128-GCM first of
+  the cipher suites both sides allow, whatever order the client lists, as Go's and
+  BoringSSL's servers do; a client that lists ChaCha20-Poly1305 before every AES-GCM suite
+  (one without AES instructions) still gets ChaCha20. OpenSSL's clients (wrk, curl, Python)
+  list AES-256-GCM first, whose TLS 1.3 suite hashes with SHA-384, about a sixth of a
+  resumed handshake's CPU time. With `bench/tls.sh` (4-vCPU VM, 7 rounds, raw data in
+  `bench/results/tls/`), new connections went from 6.8k to 8.4k per second (142 to 116 µs
+  of CPU each) together with the next entry, against 7.1k for axum + rustls; axum set to
+  the same order reaches the same 8.4k, so the suite is most of the gain. 64 KiB responses
+  went from 26.3k to 31.9k per second. An acceptor made with `TlsAcceptor::new` uses its
+  configuration as given.
+- **giong-tls**: fewer TCP segments per connection. A TLS 1.3 server's session tickets
+  wait for its first response, or for a receive that has to wait, instead of going out
+  alone; later key updates answering the peer's wait the same way; `shutdown` sends
+  `close_notify` with `MSG_MORE`, so it shares the FIN's segment; and the pieces of one
+  vectored write share one send. Per `Connection: close` request, both directions: 14.4
+  segments against 16.5 (axum + rustls: 14.0), and p99 latency 4.2 ms against 5.8.
+- **giong-compat**: a write at least as large as the write buffer's limit (64 KiB by
+  default), with nothing buffered or being sent before it, goes straight from the caller's
+  memory to the socket in one `sendmsg(2)` that does not wait, as `BufWriter` and Tokio's
+  streams do, instead of being copied into the buffer first; what the socket cannot take
+  at once is still buffered. `bench/compat.sh` (raw data in `bench/results/compat/`): CPU
+  per KiB sent 378 ns against 400 for 0.8.0's `Compat`, and within 2–9% of Tokio over two
+  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged: 30% more CPU per byte than Tokio
+  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive.
+- **giong-tls** (**behaviour change**): `TlsStream::shutdown` returns `Ok` when the
+  `close_notify` cannot be sent because the peer has closed its socket already (`EPIPE`,
+  `ECONNRESET`): the sending direction is closed either way and nobody is left to tell.
+  An h2 server over `Compat` reported such a client's clean departure as an error.
+- **giong-postgres**, **giong-mysql**, **giong-redis**: on plain TCP and Unix sockets a
+  connection has the kernel write what the server sends straight into its read buffer (a
+  one-off receive of up to 64 KiB) instead of copying it there from the runtime's pooled
+  buffers, so each byte is copied once on the way in instead of twice. Measured with
+  `bench/redis.sh`, `bench/postgres.sh` and `bench/mysql.sh` (medians of 5 rounds,
+  `bench/results/`): giong-redis `GET` of 8 KiB values with four connections went from
+  level with redis-rs (259k against 269k per second) to 345k against 276k, and with one
+  connection from about 240k to 375k (redis-rs 151k); giong-postgres's pool of 4 from 243.9k to
+  303.8k point lookups and 53.9k to 72.9k 100-row reads; giong-mysql's from 138.1k to 152.1k
+  and 34.3k to 38.3k; with pools of 3 (the size the READMEs advise for a 3-core server), 240.7k to
+  311.4k and 138.7k to 150.7k point lookups. Small Redis commands are unchanged. Each connection's read buffer now
+  keeps 64 KiB of room (it was 8 or 16 KiB, with the received bytes in the runtime's shared
+  pool). TLS connections read as before. giong-postgres with one connection shared by every
+  task stays 7–9% behind tokio-postgres (47.7k against 51.4k point lookups): the server is
+  the limit there and spends half its time sending one reply per statement; the
+  giong-postgres README says why it does not merge statements under one `Sync`.
 - **giong-http**: the client's `RequestBuilder::header` takes `impl AsRef<str>` for the value,
   as the server's `Response::header` does, so `.header("X-Id", id.to_string())` needs no `&`.
   A call that passed a `&str` or `&String` compiles as before; one that relied on the
@@ -68,6 +137,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
 ### Deprecated
+
+- **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and `TlsConnector::with_roots`, which
+  take rustls' types; they go in 1.0.0. Use `from_pem`, `with_root_pem` or
+  `with_root_pem_any_name`, or `from_rustls` with the `unstable-rustls` feature.
 
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
   giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning

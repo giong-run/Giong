@@ -283,6 +283,8 @@ impl UdpSocket {
     }
 
     /// Like [`recv_from`](Self::recv_from), without the sender's address.
+    ///
+    /// Cancel safe, like [`recv_from`](Self::recv_from).
     pub async fn recv(&self) -> io::Result<Datagram> {
         Ok(self.recv_from().await?.0)
     }
@@ -321,11 +323,12 @@ impl UdpSocket {
     /// returning the buffer with its length set to the bytes received, and the
     /// sender's address. A datagram longer than the buffer is cut off.
     ///
-    /// For datagrams that do not fit a pool buffer. Unlike
-    /// [`recv_from`](Self::recv_from) this is **not** cancel safe (a datagram
-    /// that arrives while the future is being dropped is lost), and the two
-    /// must not be mixed on one socket: once `recv_from` has been used,
-    /// `read_from` fails with `InvalidInput`.
+    /// For datagrams that do not fit a pool buffer. It must not be mixed
+    /// with [`recv_from`](Self::recv_from) on one socket: once `recv_from`
+    /// has been used, `read_from` fails with `InvalidInput`.
+    ///
+    /// Not cancel safe, unlike `recv_from`: a datagram that arrives while the
+    /// future is being dropped is lost.
     ///
     /// A buffer with no capacity (such as `Vec::new()`) is refused with
     /// `GIONG-E0109`: the kernel would take the datagram and keep none of it.
@@ -385,7 +388,9 @@ impl UdpSocket {
 
     /// Like [`read_from`](Self::read_from), without the sender's address: for
     /// a socket that has been [`connect`](Self::connect)ed. The same limits
-    /// apply (not cancel safe, not after `recv` or `recv_from`).
+    /// apply (not after `recv` or `recv_from`).
+    ///
+    /// Not cancel safe, like `read_from`.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         let (res, buf) = self.read_from(buf).await;
         (res.map(|(len, _from)| len), buf)
@@ -393,6 +398,9 @@ impl UdpSocket {
 
     /// Sends `buf` as one datagram to `addr`, returning the number of bytes
     /// sent. The buffer is handed back so it can be reused.
+    ///
+    /// Not cancel safe: if the future is dropped, the datagram may have been
+    /// sent.
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
         let addr = SockAddr::from(addr);
         let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&addr));
@@ -416,6 +424,9 @@ impl UdpSocket {
 
     /// Sends `buf` as one datagram to the peer set with
     /// [`connect`](Self::connect).
+    ///
+    /// Not cancel safe: if the future is dropped, the datagram may have been
+    /// sent.
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
         let len = buf.len().min(u32::MAX as usize) as u32;
         let io = Io::Send {

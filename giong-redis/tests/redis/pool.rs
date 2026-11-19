@@ -186,7 +186,7 @@ fn connections_the_server_closed_are_replaced() {
 #[test]
 fn a_pool_that_cannot_connect_says_why() {
     run(|_server| async move {
-        let port = crate::server::free_port();
+        let (_held, port) = crate::server::closed_port();
         let pool = Pool::new(giong_redis::Config::new().host("127.0.0.1").port(port), 2);
         let e = pool.ping().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect);

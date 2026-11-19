@@ -383,6 +383,10 @@ codes! {
     /// one key and cannot change keys (TLS 1.2, or TLS 1.3 on a kernel older
     /// than 6.14), so it sent `close_notify`.
     TlsKeysExhausted = 2012, ConnectionAborted, "TLS keys used up";
+    /// A TLS setting cannot be applied to this acceptor or connector, such
+    /// as client certificates on an acceptor made from a rustls
+    /// configuration.
+    TlsConfig = 2013, InvalidInput, "TLS setting not possible here";
 
     // ---------------------------------------------------- giong-postgres
     /// The configuration or connection URL is not valid.

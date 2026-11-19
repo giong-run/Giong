@@ -40,7 +40,10 @@ fn workload(mode: Mode) -> (usize, usize) {
     let (cert, key) = certificate().clone();
     giong::block_on(async move {
         let listener = TcpListener::bind("127.0.0.1:8443").unwrap();
+        // The low-memory refusal reads the host's free memory, which must
+        // not decide a simulated run.
         let server = Server::new()
+            .min_free_memory(0)
             .idle_timeout(Duration::from_secs(30))
             .http2(mode == Mode::H2);
         match mode {
