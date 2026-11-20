@@ -194,27 +194,6 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
-- **giong-tls**: a cancelled `TlsStream::recv` could end the stream's sending for good.
-  A receive with nothing to read first sends what the connection owes the peer (a TLS 1.3
-  server's session tickets after the handshake, the answer to a key update); on io_uring
-  that send stayed with the kernel across the poll, and a receive dropped then (a short
-  `timeout`, a `select`) left the record stream cut, so every later write failed with
-  `GIONG-E2008`. Such records now leave in one `send(2)` that does not wait: what the
-  socket takes is sent, the rest goes out first with the next send or receive, in order,
-  and no receive holds a send that dropping it could cut. With kernel TLS the answer to a
-  key update and alerts go the same way, and a key update the socket has no room for is
-  paid by the next send. `recv` is cancel safe without exception; its documentation said
-  otherwise. Found as a rare failure of `recv_is_cancel_safe` under ThreadSanitizer.
-- **giong-tls**: with kernel TLS, a `KeyUpdate` asking for new keys that reached the socket
-  together with the end of the handshake (a peer that renews its keys at once) was never
-  answered, and the peer could not decrypt anything sent to it afterwards. The handshake
-  read whatever had arrived, rustls took the `KeyUpdate`, changed its sending key and kept
-  the answer for a write that never came once the keys went to the kernel. The handshake
-  now reads record by record from the moment this side has sent its first flight, so every
-  record after the peer's last handshake record stays in the socket for the kernel, which
-  answers the key update like any other. A kernel TLS handshake makes a few more small
-  reads for it (two per record of the peer's later flights); handshakes in the process
-  are unchanged.
 - A `File::close` whose future was dropped after it was first polled could leave the
   descriptor open with nobody owning it: on the epoll driver when no blocking thread had
   started the close yet, and on io_uring when the kernel had handed it to a worker thread
@@ -250,6 +229,27 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   of it times up to 999); a lifetime too long for the clock now means none, as
   `wait_timeout(Duration::MAX)` does in giong-redis. Found while adding the same setting to
   the other two pools.
+- **giong-tls**: a cancelled `TlsStream::recv` could end the stream's sending for good.
+  A receive with nothing to read first sends what the connection owes the peer (a TLS 1.3
+  server's session tickets after the handshake, the answer to a key update); on io_uring
+  that send stayed with the kernel across the poll, and a receive dropped then (a short
+  `timeout`, a `select`) left the record stream cut, so every later write failed with
+  `GIONG-E2008`. Such records now leave in one `send(2)` that does not wait: what the
+  socket takes is sent, the rest goes out first with the next send or receive, in order,
+  and no receive holds a send that dropping it could cut. With kernel TLS the answer to a
+  key update and alerts go the same way, and a key update the socket has no room for is
+  paid by the next send. `recv` is cancel safe without exception; its documentation said
+  otherwise. Found as a rare failure of `recv_is_cancel_safe` under ThreadSanitizer.
+- **giong-tls**: with kernel TLS, a `KeyUpdate` asking for new keys that reached the socket
+  together with the end of the handshake (a peer that renews its keys at once) was never
+  answered, and the peer could not decrypt anything sent to it afterwards. The handshake
+  read whatever had arrived, rustls took the `KeyUpdate`, changed its sending key and kept
+  the answer for a write that never came once the keys went to the kernel. The handshake
+  now reads record by record from the moment this side has sent its first flight, so every
+  record after the peer's last handshake record stays in the socket for the kernel, which
+  answers the key update like any other. A kernel TLS handshake makes a few more small
+  reads for it (two per record of the peer's later flights); handshakes in the process
+  are unchanged.
 - **giong-http**: an idle HTTP/2 connection took 61% more resident memory in 0.8.0 than in
   0.5.0 (6.78 KiB against 4.21 on bare metal, `bench/h2.sh`, 5,000 connections that made
   one request each). Since 0.8.0 a connection kept the memory for its streams for a second
