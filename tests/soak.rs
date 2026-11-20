@@ -338,7 +338,7 @@ async fn cross_worker(workers: usize, deadline: Instant, counters: Arc<Counters>
     let handle = giong::handle();
     while Instant::now() < deadline {
         let target = (giong::worker_id() + 1) % workers;
-        let (tx, mut rx) = giong::sync::mpsc::channel::<usize>();
+        let (tx, mut rx) = giong::sync::mpsc::unbounded::<usize>();
         let task = handle.spawn_on(target, move || async move {
             let _ = tx.send(giong::worker_id());
             giong::worker_id()

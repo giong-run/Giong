@@ -118,13 +118,37 @@ extern "C" fn stop_server() {
     }
 }
 
-/// A port nothing listens on now (from the kernel's ephemeral range).
-pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A port on 127.0.0.1 that refuses connections for as long as the
+/// returned socket lives: it is bound there and not listening, so nothing
+/// else can take the port and answer in the meantime.
+pub fn closed_port() -> (std::os::fd::OwnedFd, u16) {
+    use std::os::fd::FromRawFd;
+    // SAFETY: socket, bind and getsockname on a socket this function owns,
+    // with a sockaddr_in of the size given.
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        use std::os::fd::AsRawFd;
+        let raw = fd.as_raw_fd();
+        assert_eq!(
+            libc::bind(raw, std::ptr::addr_of!(addr).cast(), len),
+            0,
+            "bind: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::getsockname(raw, std::ptr::addr_of_mut!(addr).cast(), &mut len),
+            0,
+            "getsockname: {}",
+            std::io::Error::last_os_error()
+        );
+        (fd, u16::from_be(addr.sin_port))
+    }
 }
 
 /// A port for the server that nothing listens on now, below the kernel's
@@ -132,7 +156,7 @@ pub fn free_port() -> u16 {
 ///
 /// Redis cannot be told to pick a port itself and say which (`--port 0`
 /// turns TCP off), so the test picks one and the server binds it a moment
-/// later. A port from the ephemeral range, as `free_port` gives, can be
+/// later. A port from the ephemeral range (what binding port 0 gives) can be
 /// taken in that moment by any socket of the tests or of another job on
 /// the machine: Valkey 8.0 then failed to bind its TLS port and aborted, in
 /// a merge-queue run. Ports below the range are given out only on request,

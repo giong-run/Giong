@@ -65,6 +65,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
   giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
   server).
+- **giong**: `sync::mpsc::unbounded()`, the new name of `sync::mpsc::channel()`. Tokio's
+  `mpsc::channel(n)` is bounded, so code ported from Tokio, or written from memory of it,
+  took giong's `channel()` for a bounded channel; `bounded(n)` is that one here. Its halves
+  are now `UnboundedSender` and `UnboundedReceiver`, as in Tokio, so that in 1.0.0 the short
+  names `Sender` and `Receiver` can go to the bounded channel, whose memory has a limit.
 - **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
   parameter is still `dbname`, as libpq spells it.
 
@@ -167,6 +172,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
   giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
   that names the new method, and go in 1.0.0-rc.1.
+- **giong**: `sync::mpsc::channel()`, renamed `unbounded()`, and `sync::mpsc::Sender` and
+  `Receiver`, renamed `UnboundedSender` and `UnboundedReceiver`; they go in 1.0.0-rc.1 too, which
+  gives the names `Sender` and `Receiver` to `BoundedSender` and `BoundedReceiver`.
 
 ### Fixed
 
@@ -176,6 +184,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   woke them, and a server of 16 tasks on one socket made one kernel entry per datagram. A
   task that stops waiting (its receive timed out) no longer takes the wake-up of the next
   datagram.
+- `UdpSocket::bind` to a port no other socket of the process held could fail with
+  `AddrInUse` for a port that nothing held, while any thread of the process read
+  `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
+  descriptors). The first bind of a port checked it with a probe socket, bound and closed
+  again; a socket closed while such a reader holds it keeps its port for a few
+  microseconds, and the real bind came right after. The first socket of a port is now
+  bound without `SO_REUSEPORT` itself and sets it once bound, so nothing is closed before
+  the bind. `TcpListener::bind` takes the same path (it was not affected). Seen as the
+  rare `AddrInUse` of the UDP rebind test on CI; reproduced without giong at 8 to 105
+  refused binds in about 119,000 with two threads reading `/proc/self/fd`, none without.
 - **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
   pool opened its first connection (the random part of the lifetime was computed as a tenth
   of it times up to 999); a lifetime too long for the clock now means none, as

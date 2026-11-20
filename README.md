@@ -304,7 +304,7 @@ fn main() -> std::io::Result<()> {
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
-| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
+| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::unbounded()`, `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
 | Errors | Every error giong raises starts with a code (`GIONG-E0102: no address found for …`) and links to its page in [docs/errors](docs/errors/README.md); `error::code(&err)` returns it as a `Code` to match on |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response`; with the `client` feature, `client::Client` (`get`, `post`, ... `send`), `client::Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
@@ -978,6 +978,23 @@ it sends and receives (`bench/results/udp-echo/vm/epoll-deep/`). This VM varies 
 between rounds: giong on either driver is ahead of Tokio in every round with one task and in
 four of five with 16 (in the other, Tokio's 324,148 beat both, also on CPU per echo).
 
+On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark over veth, server on one core;
+`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`), the server core
+is saturated near a million echoes a second and the runtimes are close:
+
+| Echoes per second (median of 5, range) | 16 tasks on one socket | 1 task |
+|---|---:|---:|
+| giong, io_uring | 856,470 (851,552–874,909) | **925,683** (878,573–939,792) |
+| giong, epoll | 878,742 (859,516–888,652) | 874,499 (859,842–906,975) |
+| Tokio | 870,331 (868,070–929,761) | 882,456 (872,631–937,811) |
+| Kernel × 32 | 1,011,149 | 1,018,481 |
+
+Here this change alone loses to Tokio in two places: io_uring with 16 tasks (1.6% behind in
+the median, ahead in one round of five) and epoll with one task (0.9% behind, ahead in one
+round of five). epoll with 16 tasks ties (1.0% ahead in the median, two rounds of five);
+io_uring with one task is ahead (4.9%, four rounds of five). Rounds move between two levels
+(about 870k and 930k) for every runtime, so differences under about 5% are within noise.
+
 ### What has not been measured
 
 - **More than eight cores, and the other tables on a physical network.** The bare-metal
@@ -1002,7 +1019,7 @@ cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,111 tests across the nine crates and the example API (`cargo test --workspace
+1,112 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and

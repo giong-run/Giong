@@ -243,16 +243,7 @@ impl UdpSocket {
         // between them by a hash of the sender's address.
         let share = addr.port() != 0;
         let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
-            let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-            if share {
-                // `SO_REUSEPORT` only. With `SO_REUSEADDR` as well, any
-                // user's socket that sets `SO_REUSEADDR` could bind the
-                // port and receive its datagrams; `SO_REUSEPORT` is for
-                // sockets of the same user.
-                sock.set_reuse_port(true)?;
-            }
-            sock.bind(&addr.into())?;
-            Ok(sock)
+            Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         })?;
         let mut socket = Self::from_socket(sock);
         socket.held = held;
