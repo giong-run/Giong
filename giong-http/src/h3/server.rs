@@ -82,6 +82,8 @@ struct Conn {
     critical: Cell<u8>,
     /// The largest MAX_PUSH_ID the client sent.
     max_push_id: Cell<Option<u64>>,
+    /// The identifier in the client's last GOAWAY.
+    goaway: Cell<Option<u64>>,
     /// Request streams being served, and who waits for there to be none.
     active: Cell<usize>,
     idle: Cell<Option<Waker>>,
@@ -283,6 +285,7 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
         closed: Cell::new(false),
         critical: Cell::new(0),
         max_push_id: Cell::new(None),
+        goaway: Cell::new(None),
         active: Cell::new(0),
         idle: Cell::new(None),
     });
@@ -467,8 +470,13 @@ async fn control_stream(conn: &Conn, r: &mut Reader) -> Result<(), Stop> {
                 Settings::parse(&payload)?;
             }
             // The client is going away: it will open no more requests.
+            // The identifier it names may only go down (section 5.2).
             kind::GOAWAY => {
-                single_id(r, header.len).await?;
+                let id = single_id(r, header.len).await?;
+                if conn.goaway.get().is_some_and(|last| id > last) {
+                    return Err(fatal(Code::IdError, "the identifier in GOAWAY went up"));
+                }
+                conn.goaway.set(Some(id));
             }
             kind::MAX_PUSH_ID => {
                 let id = single_id(r, header.len).await?;
@@ -506,6 +514,12 @@ async fn control_stream(conn: &Conn, r: &mut Reader) -> Result<(), Stop> {
 
 /// The integer that GOAWAY, MAX_PUSH_ID and CANCEL_PUSH hold.
 async fn single_id(r: &mut Reader, len: u64) -> Result<u64, Stop> {
+    // A length no control frame of this server's could have is refused for
+    // what it asks the server to hold; one that is merely wrong for an
+    // integer is a frame error.
+    if len > MAX_SETTINGS_FRAME {
+        return Err(fatal(Code::ExcessiveLoad, "a control frame too large"));
+    }
     if len > 8 {
         return Err(fatal(
             Code::FrameError,

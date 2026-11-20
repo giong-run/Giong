@@ -255,9 +255,12 @@ impl Settings {
     /// settings are ignored.
     pub(crate) fn parse(mut payload: &[u8]) -> Result<Self, Error> {
         let mut settings = Self::default();
-        // Identifiers below 64 seen so far, to refuse a repeat; the three
-        // HTTP/3 has are all below 64.
+        // Identifiers seen so far, to refuse a repeat: a bit for each one
+        // below 64, where the three HTTP/3 has are, and a list of the
+        // others, which `MAX_SETTINGS` keeps short.
         let mut seen = 0u64;
+        let mut seen_large = [0u64; MAX_SETTINGS];
+        let mut large = 0;
         let mut count = 0;
         while !payload.is_empty() {
             let cut = Error::new(Code::FrameError, "SETTINGS ends inside a setting");
@@ -273,6 +276,12 @@ impl Settings {
                     return Err(Error::new(Code::SettingsError, "a setting sent twice"));
                 }
                 seen |= 1 << id;
+            } else {
+                if seen_large[..large].contains(&id) {
+                    return Err(Error::new(Code::SettingsError, "a setting sent twice"));
+                }
+                seen_large[large] = id;
+                large += 1;
             }
             match id {
                 // SETTINGS_ENABLE_PUSH and the others of HTTP/2 that have

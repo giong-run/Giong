@@ -166,7 +166,7 @@ fn settings_are_parsed_strictly() {
         })
     );
     // Sent twice.
-    for id in [1, 6, 7, 0x33] {
+    for id in [1, 6, 7, 0x33, 0x40, 0x41, 1 << 40] {
         let twice = Settings::parse(&settings(&[(id, 1), (8, 0), (id, 1)]));
         assert_eq!(twice.unwrap_err().code, Code::SettingsError, "{id}");
     }

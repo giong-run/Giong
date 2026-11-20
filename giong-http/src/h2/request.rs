@@ -291,6 +291,15 @@ impl Builder {
             if !(value.starts_with(b"/") || (options && value == b"*")) {
                 return Built::Malformed("a :path that is neither absolute nor *");
             }
+            // RFC 9114, section 4.3.1: a request for an http or https
+            // resource names its authority, one way or the other. HTTP/2
+            // does not ask for it (RFC 9113, section 8.3.1).
+            if self.h3 && self.authority.is_none() && self.host.is_none() {
+                let scheme = self.scheme.clone().map_or(&b""[..], |s| &pseudo[s]);
+                if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https") {
+                    return Built::Malformed("neither :authority nor a host header field");
+                }
+            }
             path
         };
         // RFC 9113, section 8.3.1. HTTP/1.1 holds an absolute target's
@@ -454,6 +463,33 @@ mod tests {
             names,
             ["host", "accept", "x-id", "content-length", "cookie"]
         );
+    }
+
+    #[cfg(feature = "unstable-http3")]
+    #[test]
+    fn http3_asks_for_an_authority_and_http2_does_not() {
+        let bare = [(":method", "GET"), (":scheme", "https"), (":path", "/")];
+        let h3 = |fields: &[(&str, &str)]| {
+            let mut b = Builder::new(16 * 1024).http3();
+            for (n, v) in fields {
+                b.field(n.as_bytes(), v.as_bytes());
+            }
+            b.finish(None)
+        };
+        assert!(matches!(build(&bare), Built::Request(_)));
+        assert!(matches!(h3(&bare), Built::Malformed(_)));
+        for named in [(":authority", "example.com"), ("host", "example.com")] {
+            let mut fields = bare.to_vec();
+            if named.0 == "host" {
+                fields.push(named);
+            } else {
+                fields.insert(2, named);
+            }
+            assert!(matches!(h3(&fields), Built::Request(_)), "{named:?}");
+        }
+        // Another scheme may have no authority.
+        let other = [(":method", "GET"), (":scheme", "urn"), (":path", "/")];
+        assert!(matches!(h3(&other), Built::Request(_)));
     }
 
     #[test]

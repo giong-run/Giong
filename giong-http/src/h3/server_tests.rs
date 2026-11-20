@@ -467,6 +467,8 @@ fn a_bad_request_loses_its_stream_and_the_connection_goes_on() {
                 ]));
                 fields
             },
+            // Neither :authority nor host (section 4.3.1).
+            headers(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]),
             // A pseudo-header field after a regular one.
             headers(&[
                 (":method", "GET"),
@@ -608,6 +610,48 @@ fn breaking_the_protocol_closes_the_connection_with_its_code() {
         let seen = closed_with(&client).await;
         assert!(seen.contains("0x105") || seen.contains("261"), "{seen}");
 
+        // A setting sent twice, one nobody defined: H3_SETTINGS_ERROR
+        // (0x109).
+        let (conn, endpoint) = connect_bare(Server::new()).await;
+        let mut control = conn.open_uni().await.unwrap();
+        let mut out = vec![0x00];
+        Header::write(&mut out, kind::SETTINGS, 6);
+        out.extend_from_slice(&[0x40, 0x40, 0x00, 0x40, 0x40, 0x00]);
+        control.write_all(&out).await.unwrap();
+        let client = Client {
+            conn,
+            control,
+            _endpoint: endpoint,
+        };
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x109") || seen.contains("265"), "{seen}");
+
+        // GOAWAY going up: H3_ID_ERROR (0x108).
+        let mut client = connect().await;
+        let mut out = Vec::new();
+        super::frame::write_goaway(&mut out, 0);
+        super::frame::write_goaway(&mut out, 4);
+        client.control.write_all(&out).await.unwrap();
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x108") || seen.contains("264"), "{seen}");
+
+        // A GOAWAY that says it is a gibibyte long, and none of it sent:
+        // H3_EXCESSIVE_LOAD (0x107), without waiting for the payload.
+        let mut client = connect().await;
+        let out = [0x07, 0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00];
+        client.control.write_all(&out).await.unwrap();
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x107") || seen.contains("263"), "{seen}");
+
+        // One that is only too long for its integer: H3_FRAME_ERROR.
+        let mut client = connect().await;
+        let mut out = Vec::new();
+        Header::write(&mut out, kind::GOAWAY, 9);
+        out.extend_from_slice(&[0; 9]);
+        client.control.write_all(&out).await.unwrap();
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x106") || seen.contains("262"), "{seen}");
+
         // A push stream from a client: H3_STREAM_CREATION_ERROR.
         let client = connect().await;
         let mut push = client.conn.open_uni().await.unwrap();
@@ -630,6 +674,10 @@ fn what_a_client_may_do_on_its_other_streams_is_accepted() {
             (kind::MAX_PUSH_ID, 3),
             (kind::MAX_PUSH_ID, 7),
             (kind::CANCEL_PUSH, 5),
+            // GOAWAY more than once, as long as it does not go up.
+            (kind::GOAWAY, 4),
+            (kind::GOAWAY, 4),
+            (kind::GOAWAY, 0),
         ] {
             let mut payload = Vec::new();
             write_varint(&mut payload, id);
