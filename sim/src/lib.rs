@@ -275,16 +275,6 @@ impl Sim {
     /// as the blocking pool's time out). A panic in `f` is passed on after
     /// the seed is printed.
     pub fn run<R: Send>(self, f: impl FnOnce() -> R + Send) -> (R, Report) {
-        // A fresh thread for every run, so that no thread-local state (the
-        // standard library's hash keys, for one) carries over between runs.
-        std::thread::scope(|s| {
-            s.spawn(move || self.run_here(f))
-                .join()
-                .unwrap_or_else(|p| panic::resume_unwind(p))
-        })
-    }
-
-    fn run_here<R>(self, f: impl FnOnce() -> R) -> (R, Report) {
         let _serial = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gen = GEN.fetch_add(1, Ordering::Relaxed);
         let limit_ns = self.limit.as_nanos().min(u64::MAX as u128) as u64;
@@ -293,11 +283,27 @@ impl Sim {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(40);
+        // The world is built here, on the caller's thread: it holds hash
+        // maps, and the first one a thread makes draws the thread's hash
+        // keys from the kernel. Built on the run's thread, before the
+        // simulation answers `getrandom`, it left every hash map of the run
+        // with keys the seed did not choose, and a run whose outcome
+        // depends on the order of a map could not be replayed.
         let mut w = world::World::new(gen, self.seed, self.faults, keep, self.full_trace, limit_ns);
         w.net.partitions = self.partitions;
         // The epoll driver, without the one-line notice of an automatic
         // fallback.
         std::env::set_var("GIONG_DRIVER", "epoll");
+        // A fresh thread for every run, so that no thread-local state (the
+        // standard library's hash keys, for one) carries over between runs.
+        std::thread::scope(|s| {
+            s.spawn(move || Self::run_here(gen, w, f))
+                .join()
+                .unwrap_or_else(|p| panic::resume_unwind(p))
+        })
+    }
+
+    fn run_here<R>(gen: u64, w: world::World, f: impl FnOnce() -> R) -> (R, Report) {
         world::install(w);
         world::set_me(gen, Some(0));
         let out = panic::catch_unwind(AssertUnwindSafe(f));
