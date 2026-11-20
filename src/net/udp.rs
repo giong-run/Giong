@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::Deref;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr;
 use std::task::{Context, Poll};
@@ -23,6 +24,9 @@ use crate::error::{raise, Code};
 use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime;
+#[cfg(windows)]
+use crate::sys::fd::{AsRawFd, FromRawFd, IntoRawFd};
+use crate::sys::{IoVec, MsgHdr, SockAddrStorage};
 
 /// What the kernel puts in front of every datagram of a multishot receive
 /// (`struct io_uring_recvmsg_out`: name length, control length, payload
@@ -30,31 +34,26 @@ use crate::runtime;
 const OUT_HEADER: usize = 16;
 /// ... followed by the sender's address in a field of this fixed size, large
 /// enough for IPv4 and IPv6.
-const NAME_LEN: usize = mem::size_of::<libc::sockaddr_in6>();
+const NAME_LEN: usize = mem::size_of::<crate::sys::SockAddrIn6>();
 /// Bytes of every pool buffer that are not available for payload.
 const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 
 /// The `msghdr` of every multishot receive. The kernel only reads the two
 /// length fields from it: room for the sender's address, no control data.
-struct RecvHeader(libc::msghdr);
+struct RecvHeader(MsgHdr);
 
 // SAFETY: never written to after initialisation, and its pointers are null.
 unsafe impl Sync for RecvHeader {}
 
-static RECV_HEADER: RecvHeader = {
-    // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
-    let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
-    hdr.msg_namelen = NAME_LEN as libc::socklen_t;
-    RecvHeader(hdr)
-};
+static RECV_HEADER: RecvHeader = RecvHeader(crate::sys::recv_header(NAME_LEN));
 
 /// Everything a one-off `sendmsg` / `recvmsg` points at, in a [`KernelBox`]
 /// so that the addresses stay put, and stay valid, while the kernel uses
 /// them.
 struct Message {
-    hdr: libc::msghdr,
-    iov: libc::iovec,
-    addr: libc::sockaddr_storage,
+    hdr: MsgHdr,
+    iov: IoVec,
+    addr: SockAddrStorage,
 }
 
 impl Message {
@@ -68,12 +67,10 @@ impl Message {
         // owns; nothing else uses it yet. The pointers stored in it are taken
         // through `m`, so they stay valid when `msg` moves.
         unsafe {
-            (*m).iov.iov_base = base.cast();
-            (*m).iov.iov_len = len;
-            (*m).hdr.msg_iov = ptr::addr_of_mut!((*m).iov);
-            (*m).hdr.msg_iovlen = 1;
-            (*m).hdr.msg_name = ptr::addr_of_mut!((*m).addr).cast();
-            (*m).hdr.msg_namelen = match addr {
+            (*m).iov = crate::sys::io_vec(base, len);
+            let hdr = ptr::addr_of_mut!((*m).hdr);
+            crate::sys::msg_set_iov(hdr, ptr::addr_of_mut!((*m).iov), 1);
+            let name_len = match addr {
                 Some(addr) => {
                     // A `SockAddr` holds `len()` valid bytes, which fit in
                     // `sockaddr_storage`.
@@ -84,8 +81,9 @@ impl Message {
                     );
                     addr.len()
                 }
-                None => mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                None => mem::size_of::<SockAddrStorage>() as crate::sys::SockLen,
             };
+            crate::sys::msg_set_name(hdr, ptr::addr_of_mut!((*m).addr).cast(), name_len);
         }
         msg
     }
@@ -93,18 +91,18 @@ impl Message {
 
 fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
     // Linux's `sa_family` is a `u16`; the BSDs, macOS among them, start
-    // with a `u8` length and a `u8` family.
-    #[cfg(target_os = "linux")]
+    // with a `u8` length and a `u8` family. Windows has Linux's layout.
+    #[cfg(any(target_os = "linux", windows))]
     let family = i32::from(u16::from_ne_bytes([*name.first()?, *name.get(1)?]));
     #[cfg(target_os = "macos")]
     let family = i32::from(*name.get(1)?);
     let port = u16::from_be_bytes([*name.get(2)?, *name.get(3)?]);
     match family {
-        libc::AF_INET => {
+        crate::sys::AF_INET => {
             let ip: [u8; 4] = name.get(4..8)?.try_into().ok()?;
             Some(SocketAddrV4::new(Ipv4Addr::from(ip), port).into())
         }
-        libc::AF_INET6 => {
+        crate::sys::AF_INET6 => {
             let flowinfo = u32::from_ne_bytes(name.get(4..8)?.try_into().ok()?);
             let ip: [u8; 16] = name.get(8..24)?.try_into().ok()?;
             let scope_id = u32::from_ne_bytes(name.get(24..28)?.try_into().ok()?);
@@ -137,7 +135,7 @@ impl Datagram {
         let (name_len, payload_len, flags) = (field(0), field(2), field(3) as i32);
         let from = parse_addr(&buf[OUT_HEADER..OUT_HEADER + name_len.min(NAME_LEN)])
             .ok_or_else(malformed)?;
-        let truncated = flags & libc::MSG_TRUNC != 0 || payload_len > buf.len() - OVERHEAD;
+        let truncated = flags & crate::sys::MSG_TRUNC != 0 || payload_len > buf.len() - OVERHEAD;
         Ok((Self { buf, truncated }, from))
     }
 
@@ -402,11 +400,11 @@ impl UdpSocket {
         // SAFETY: `sockaddr_storage` is plain data of exactly this size.
         let name = unsafe {
             std::slice::from_raw_parts(
-                (&msg.addr as *const libc::sockaddr_storage).cast::<u8>(),
-                mem::size_of::<libc::sockaddr_storage>(),
+                (&msg.addr as *const SockAddrStorage).cast::<u8>(),
+                mem::size_of::<SockAddrStorage>(),
             )
         };
-        match parse_addr(&name[..(msg.hdr.msg_namelen as usize).min(name.len())]) {
+        match parse_addr(&name[..crate::sys::msg_name_len(&msg.hdr).min(name.len())]) {
             Some(from) => (Ok((res as usize, from)), buf),
             None => (
                 Err(unexpected(
@@ -567,9 +565,17 @@ impl UdpSocket {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for UdpSocket {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(&*self.sock)
     }
 }
 
@@ -596,6 +602,8 @@ mod tests {
     use std::{mem, ptr};
 
     use socket2::SockAddr;
+
+    use crate::sys::SockAddrStorage;
 
     use super::{parse_addr, Message};
 
@@ -633,8 +641,8 @@ mod tests {
         // SAFETY: `sockaddr_storage` is plain data of exactly this size.
         let bytes = unsafe {
             std::slice::from_raw_parts(
-                (&msg.addr as *const libc::sockaddr_storage).cast::<u8>(),
-                mem::size_of::<libc::sockaddr_storage>(),
+                (&msg.addr as *const SockAddrStorage).cast::<u8>(),
+                mem::size_of::<SockAddrStorage>(),
             )
         };
         assert_eq!(

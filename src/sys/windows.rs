@@ -6,9 +6,13 @@
 //! posted to the worker's completion port, which the driver owns
 //! (`driver::iocp`).
 
+use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
-use windows_sys::Win32::Networking::WinSock::{SOCKADDR, SOCKADDR_STORAGE, SOCKET, WSAMSG};
+use windows_sys::Win32::Networking::WinSock::{
+    self, SOCKADDR, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, WSABUF, WSAMSG,
+};
 use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
@@ -163,4 +167,237 @@ pub(crate) fn page_size() -> usize {
         info
     };
     info.dwPageSize as usize
+}
+
+/// `true` if a send with `flags` waits for room in the socket's buffer:
+/// always here, where no flag asks an overlapped send not to.
+#[inline(always)]
+pub(crate) fn send_waits(_flags: i32) -> bool {
+    true
+}
+
+/// One piece of a vectored send or receive.
+pub(crate) type IoVec = WSABUF;
+
+/// An IPv6 socket address, the largest giong reads from a datagram.
+pub(crate) type SockAddrIn6 = SOCKADDR_IN6;
+
+/// The address family of IPv4, as a socket address carries it.
+pub(crate) const AF_INET: i32 = WinSock::AF_INET as i32;
+/// The address family of IPv6.
+pub(crate) const AF_INET6: i32 = WinSock::AF_INET6 as i32;
+/// The flag a received message carries when its end was cut off.
+pub(crate) const MSG_TRUNC: i32 = WinSock::MSG_TRUNC as i32;
+
+/// The piece of `len` bytes at `base`. A Winsock piece holds less than
+/// 4 GiB: a longer one is cut there, and the send or receive reports the
+/// shorter count like any partial transfer.
+#[inline(always)]
+pub(crate) fn io_vec(base: *const u8, len: usize) -> IoVec {
+    WSABUF {
+        len: len.min(u32::MAX as usize) as u32,
+        buf: base.cast_mut(),
+    }
+}
+
+/// Where a piece starts and how long it is.
+#[inline(always)]
+pub(crate) fn io_vec_parts(v: &IoVec) -> (*const u8, usize) {
+    (v.buf.cast_const(), v.len as usize)
+}
+
+/// Points a piece at `base`, keeping its length.
+#[inline(always)]
+pub(crate) fn io_vec_set_base(v: &mut IoVec, base: *const u8) {
+    v.buf = base.cast_mut();
+}
+
+/// The header of a receive that only says how much room the sender's
+/// address gets: `name_len` bytes, and nothing else.
+pub(crate) const fn recv_header(name_len: usize) -> MsgHdr {
+    // SAFETY: all-zero is a valid `WSAMSG` (null pointers, zero lengths).
+    let mut hdr: MsgHdr = unsafe { std::mem::zeroed() };
+    hdr.namelen = name_len as SockLen;
+    hdr
+}
+
+/// Points a message header at `count` pieces.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_iov(msg: *mut MsgHdr, iov: *mut IoVec, count: usize) {
+    (*msg).lpBuffers = iov;
+    (*msg).dwBufferCount = count as u32;
+}
+
+/// Points a message header at `len` bytes of ancillary data.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_control(msg: *mut MsgHdr, control: *mut u8, len: usize) {
+    (*msg).Control = io_vec(control, len);
+}
+
+/// Points a message header at an address of `len` bytes, or at room for one.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_name(msg: *mut MsgHdr, name: *mut u8, len: SockLen) {
+    (*msg).name = name.cast();
+    (*msg).namelen = len;
+}
+
+/// The length of the address in a message header.
+#[inline(always)]
+pub(crate) fn msg_name_len(msg: &MsgHdr) -> usize {
+    msg.namelen as usize
+}
+
+/// `send` on a non-blocking socket: the bytes sent, or -1 with the thread's
+/// last error set (`WSAEWOULDBLOCK` when the socket has no room). Every
+/// socket a worker's port knows is non-blocking.
+///
+/// # Safety
+///
+/// `buf` must be valid for `len` bytes.
+#[inline(always)]
+pub(crate) unsafe fn send_nowait(sock: RawSock, buf: *const u8, len: usize) -> isize {
+    WinSock::send(sock, buf, len.min(i32::MAX as usize) as i32, 0) as isize
+}
+
+/// `sendto` on a non-blocking socket: the bytes sent, or -1 with the
+/// thread's last error set.
+///
+/// # Safety
+///
+/// `buf` must be valid for `len` bytes and `addr` for `addr_len`.
+#[inline(always)]
+pub(crate) unsafe fn send_to_nowait(
+    sock: RawSock,
+    buf: *const u8,
+    len: usize,
+    addr: *const SockAddr,
+    addr_len: SockLen,
+) -> isize {
+    WinSock::sendto(
+        sock,
+        buf,
+        len.min(i32::MAX as usize) as i32,
+        0,
+        addr,
+        addr_len,
+    ) as isize
+}
+
+/// The names `net` uses for a socket's raw handle. On Unix they are the
+/// standard library's descriptor traits; here the same names reach the
+/// socket handle, so that the code between the two reads the same.
+pub(crate) mod fd {
+    use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket};
+
+    /// A socket handle.
+    pub(crate) type RawFd = super::RawSock;
+
+    pub(crate) trait AsRawFd {
+        fn as_raw_fd(&self) -> RawFd;
+    }
+
+    impl<T: AsRawSocket> AsRawFd for T {
+        fn as_raw_fd(&self) -> RawFd {
+            self.as_raw_socket() as RawFd
+        }
+    }
+
+    pub(crate) trait FromRawFd {
+        /// # Safety
+        ///
+        /// `raw` must be an open socket nothing else owns.
+        unsafe fn from_raw_fd(raw: RawFd) -> Self;
+    }
+
+    impl<T: FromRawSocket> FromRawFd for T {
+        unsafe fn from_raw_fd(raw: RawFd) -> Self {
+            Self::from_raw_socket(raw as _)
+        }
+    }
+
+    pub(crate) trait IntoRawFd {
+        fn into_raw_fd(self) -> RawFd;
+    }
+
+    impl<T: IntoRawSocket> IntoRawFd for T {
+        fn into_raw_fd(self) -> RawFd {
+            self.into_raw_socket() as RawFd
+        }
+    }
+}
+
+/// What runs when the console asks the process to stop.
+type OnSignal = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// The runtimes that asked to hear console events, each under its own
+/// number so that it can leave again.
+static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new(Vec::new());
+
+/// Called by Windows, on a thread it starts for the purpose, for Ctrl+C and
+/// Ctrl+Break. `TRUE` says the event is handled, so the process is not
+/// ended; with no runtime listening the default handler ends it as usual.
+unsafe extern "system" fn console_event(kind: u32) -> BOOL {
+    if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT {
+        return 0;
+    }
+    let listeners: Vec<OnSignal> = match ON_SIGNAL.lock() {
+        Ok(list) => list.iter().map(|(_, f)| f.clone()).collect(),
+        Err(_) => return 0,
+    };
+    for on_signal in &listeners {
+        on_signal();
+    }
+    BOOL::from(!listeners.is_empty())
+}
+
+/// While it lives, Ctrl+C and Ctrl+Break in the process's console run the
+/// function it was installed with instead of ending the process: what
+/// `SIGINT` and `SIGTERM` are on Unix.
+pub(crate) struct SignalGuard {
+    id: u64,
+}
+
+impl SignalGuard {
+    /// Starts listening. `on_signal` runs on a thread Windows starts for
+    /// each event, so it may block and take locks.
+    pub(crate) fn install(on_signal: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        let mut installed = Ok(());
+        HANDLER.call_once(|| {
+            // SAFETY: `console_event` has the signature of a handler routine
+            // and stays valid for the life of the process.
+            if unsafe { SetConsoleCtrlHandler(Some(console_event), 1) } == 0 {
+                installed = Err(std::io::Error::last_os_error());
+            }
+        });
+        installed?;
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ON_SIGNAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((id, std::sync::Arc::new(on_signal)));
+        Ok(SignalGuard { id })
+    }
+}
+
+impl Drop for SignalGuard {
+    fn drop(&mut self) {
+        ON_SIGNAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, _)| *id != self.id);
+    }
 }

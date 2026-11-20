@@ -22,12 +22,14 @@ pub(crate) mod dns;
 mod sendq;
 mod share;
 mod udp;
+#[cfg(unix)]
 mod unix;
 
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
+#[cfg(unix)]
 pub use unix::{UnixListener, UnixStream};
 
 use std::cell::{Cell, OnceCell};
@@ -36,6 +38,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::net::{Shutdown, SocketAddr};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -48,6 +51,8 @@ use crate::error::{raise, Code};
 use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime::{self, Worker};
+#[cfg(windows)]
+use crate::sys::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 /// The most buffers one `sendmsg` takes (`IOV_MAX` on Linux); a vectored
 /// write with more sends them in several calls.
@@ -167,8 +172,8 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
         // driver is borrowed, both are deferred, in this order.)
         slot.release(w);
         match w.driver.try_borrow_mut() {
-            Ok(mut driver) => driver.close_fd(fd),
-            Err(_) => w.defer_close(fd),
+            Ok(mut driver) => driver.close_sock(fd),
+            Err(_) => w.defer_close_sock(fd),
         }
     })
     .is_some();
@@ -213,7 +218,9 @@ impl ListenSocket {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res) if res >= 0 => {
                         // SAFETY: a fresh descriptor returned by accept.
-                        return Poll::Ready(Ok(unsafe { Socket::from_raw_fd(res) }));
+                        return Poll::Ready(Ok(unsafe {
+                            Socket::from_raw_fd(res as crate::sys::RawSock)
+                        }));
                     }
                     MultiPoll::Item(res) => return Poll::Ready(Err(os_err(res))),
                     MultiPoll::Data(_) => unreachable!("accept never receives data"),
@@ -343,16 +350,21 @@ impl StreamSocket {
         if !self.unix.get() || !self.check_end.replace(false) {
             return false;
         }
-        let mut fd = libc::pollfd {
-            fd: self.sock.as_raw_fd(),
-            events: crate::sys::POLL_PEER_CLOSED,
-            revents: 0,
-        };
-        // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
-        // the socket's state.
-        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
-        ready > 0
-            && fd.revents & (crate::sys::POLL_PEER_CLOSED | libc::POLLHUP | libc::POLLERR) != 0
+        #[cfg(windows)]
+        return false;
+        #[cfg(unix)]
+        {
+            let mut fd = libc::pollfd {
+                fd: self.sock.as_raw_fd(),
+                events: crate::sys::POLL_PEER_CLOSED,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
+            // the socket's state.
+            let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+            ready > 0
+                && fd.revents & (crate::sys::POLL_PEER_CLOSED | libc::POLLHUP | libc::POLLERR) != 0
+        }
     }
 
     /// Where a send of `len` bytes from buffers that cannot change should go
@@ -386,7 +398,7 @@ impl StreamSocket {
         let addr = KernelBox::new(addr);
         let io = Io::Connect {
             fd: sock.as_raw_fd(),
-            addr: addr.get().as_ptr() as *const libc::sockaddr,
+            addr: addr.get().as_ptr() as *const crate::sys::SockAddr,
             len: addr.get().len(),
         };
         // Owned as a stream from here on, so that a connect that fails, or
@@ -525,12 +537,11 @@ impl StreamSocket {
         bufs: Vec<B>,
         offset: usize,
     ) -> (io::Result<usize>, Vec<B>) {
-        let mut iov: Vec<libc::iovec> = pieces_from(&bufs, offset)
-            .map(|(buf, skip)| libc::iovec {
+        let mut iov: Vec<crate::sys::IoVec> = pieces_from(&bufs, offset)
+            .map(|(buf, skip)| {
                 // SAFETY: `skip < len`, so the pointer stays within the
                 // buffer.
-                iov_base: unsafe { buf.as_ptr().add(skip) }.cast_mut().cast(),
-                iov_len: buf.len() - skip,
+                crate::sys::io_vec(unsafe { buf.as_ptr().add(skip) }, buf.len() - skip)
             })
             .collect();
         if iov.is_empty() {
@@ -539,13 +550,12 @@ impl StreamSocket {
         let hold = self.vectored_hold(&bufs, offset, &mut iov);
         // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
         // lengths).
-        let msg: KernelBox<libc::msghdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+        let msg: KernelBox<crate::sys::MsgHdr> = KernelBox::new(unsafe { std::mem::zeroed() });
         // SAFETY: `msg` owns a live `msghdr` nothing else uses yet. The
         // iovec array is a `Vec`'s heap buffer, which moving the `Vec` does
         // not move or reborrow.
         unsafe {
-            (*msg.as_ptr()).msg_iov = iov.as_mut_ptr();
-            (*msg.as_ptr()).msg_iovlen = iov.len() as _;
+            crate::sys::msg_set_iov(msg.as_ptr(), iov.as_mut_ptr(), iov.len());
         }
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
@@ -583,14 +593,15 @@ impl StreamSocket {
         &self,
         bufs: &[B],
         offset: usize,
-        iov: &mut [libc::iovec],
+        iov: &mut [crate::sys::IoVec],
     ) -> Option<Box<ZeroCopyHold>> {
         let (mut shared, mut changing) = (0, 0);
         for ((buf, _), v) in pieces_from(bufs, offset).zip(iov.iter()) {
+            let (_, len) = crate::sys::io_vec_parts(v);
             if is_shared(buf) {
-                shared += v.iov_len;
+                shared += len;
             } else {
-                changing += v.iov_len;
+                changing += len;
             }
         }
         if changing > ZERO_COPY_SCRATCH_MAX {
@@ -604,9 +615,9 @@ impl StreamSocket {
                 Sharing::Owner(owner) => owners.push(owner),
                 Sharing::Static => {}
                 Sharing::No => {
+                    let (base, len) = crate::sys::io_vec_parts(v);
                     // SAFETY: the iovec covers initialised bytes of `buf`.
-                    let bytes =
-                        unsafe { std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len) };
+                    let bytes = unsafe { std::slice::from_raw_parts(base, len) };
                     scratch.extend_from_slice(bytes);
                 }
             }
@@ -616,8 +627,8 @@ impl StreamSocket {
         let mut at = 0;
         for ((buf, _), v) in pieces_from(bufs, offset).zip(iov.iter_mut()) {
             if !is_shared(buf) {
-                v.iov_base = scratch[at..].as_ptr().cast_mut().cast();
-                at += v.iov_len;
+                crate::sys::io_vec_set_base(v, scratch[at..].as_ptr());
+                at += crate::sys::io_vec_parts(v).1;
             }
         }
         Some(Box::new(ZeroCopyHold {
@@ -633,20 +644,15 @@ impl StreamSocket {
         buf: B,
         control: C,
     ) -> (io::Result<usize>, B, C) {
-        let iov = KernelBox::new(libc::iovec {
-            iov_base: buf.as_ptr().cast_mut().cast(),
-            iov_len: buf.len(),
-        });
+        let iov = KernelBox::new(crate::sys::io_vec(buf.as_ptr(), buf.len()));
         // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
-        let msg: KernelBox<libc::msghdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+        let msg: KernelBox<crate::sys::MsgHdr> = KernelBox::new(unsafe { std::mem::zeroed() });
         // SAFETY: `msg` owns a live `msghdr` nothing else uses yet.
         unsafe {
             let m = msg.as_ptr();
-            (*m).msg_iov = iov.as_ptr();
-            (*m).msg_iovlen = 1;
+            crate::sys::msg_set_iov(m, iov.as_ptr(), 1);
             if !control.is_empty() {
-                (*m).msg_control = control.as_ptr().cast_mut().cast();
-                (*m).msg_controllen = control.len() as _;
+                crate::sys::msg_set_control(m, control.as_ptr().cast_mut(), control.len());
             }
         }
         // Control messages go to kernel TLS, which cannot send without a
@@ -675,6 +681,7 @@ impl StreamSocket {
 
     /// Sends `len` bytes of the file `file` from `offset` with
     /// `sendfile(2)`. See [`TcpStream::send_file`].
+    #[cfg(unix)]
     pub(crate) async fn send_file(&self, file: RawFd, offset: u64, len: u64) -> io::Result<()> {
         if offset
             .checked_add(len)
@@ -1053,9 +1060,17 @@ impl Drop for TcpListener {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for TcpListener {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
     }
 }
 
@@ -1301,6 +1316,7 @@ impl TcpStream {
     /// stream.send_file(&file, 0, len).await
     /// # }
     /// ```
+    #[cfg(unix)]
     pub async fn send_file(&self, file: &crate::fs::File, offset: u64, len: u64) -> io::Result<()> {
         self.inner.send_file(file.as_raw_fd(), offset, len).await
     }
@@ -1326,9 +1342,17 @@ impl TcpStream {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for TcpStream {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
     }
 }
 

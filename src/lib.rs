@@ -91,6 +91,7 @@ mod slab;
 mod sys;
 
 pub mod error;
+#[cfg(unix)]
 pub mod fs;
 pub mod net;
 pub mod observe;
