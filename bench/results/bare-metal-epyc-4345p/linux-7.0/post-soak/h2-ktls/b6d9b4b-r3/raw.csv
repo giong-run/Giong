@@ -1,0 +1,7 @@
+server,endpoint,round,rps,mean_ms,cpu,failed
+giong-http-tls,json,1,1417792.00,301us,99,0
+giong-http-tls,users,1,111332.60,4.28ms,100,0
+giong-http-tls,json-mux,1,1943200.00,141us,100,0
+giong-http-ktls,json,1,1110208.80,417us,100,0
+giong-http-ktls,users,1,105720.00,4.52ms,100,0
+giong-http-ktls,json-mux,1,1809026.20,160us,99,0

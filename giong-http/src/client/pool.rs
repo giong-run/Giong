@@ -10,7 +10,10 @@
 //! request that finds room on it sends its stream there. Once an origin is
 //! known to speak HTTP/2, a request that would open a connection while one
 //! is being opened waits for it instead, so that a burst of requests shares
-//! one connection rather than opening one each.
+//! one connection rather than opening one each. So does a request to an
+//! `https` origin offered HTTP/2 through ALPN whose protocol is not known
+//! yet: should ALPN pick HTTP/1.1, the requests in line are told to look
+//! again, and open their own.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -36,7 +39,12 @@ pub(crate) struct HostPool {
     next_h2: u64,
     /// The origin chose HTTP/2 the last time a connection was opened.
     h2_known: bool,
-    /// A connection is being opened to an origin known to speak HTTP/2.
+    /// HTTP/2 is offered to the origin through ALPN.
+    h2_offered: bool,
+    /// The origin chose HTTP/1.1 the last time a connection was opened,
+    /// although HTTP/2 was offered.
+    h1_seen: bool,
+    /// A connection is being opened to an origin expected to speak HTTP/2.
     h2_opening: bool,
 }
 
@@ -74,6 +82,12 @@ impl HostPool {
         (self.open, self.idle.len() + idle_h2)
     }
 
+    /// Whether a connection opened now should speak HTTP/2: the origin did
+    /// last time, or it is offered HTTP/2 and has not turned it down.
+    fn expects_h2(&self) -> bool {
+        self.h2_known || (self.h2_offered && !self.h1_seen)
+    }
+
     /// The first waiter still waiting.
     fn next_waiter(&mut self) -> Option<Rc<Waiter>> {
         // A waiter whose request was dropped is held by the queue alone.
@@ -96,18 +110,22 @@ fn grant(waiter: &Waiter, grant: Grant) {
 /// A connection for one request: an idle one (unless `fresh`), or room to
 /// open one, waiting in line when there is neither. `h2` says the origin
 /// is known to speak HTTP/2 before any connection is opened (prior
-/// knowledge). Cancel safe: a request dropped while it waits gives its
-/// place, or what it was granted, to the next in line.
+/// knowledge); `h2_offered`, that it is offered HTTP/2 through ALPN, so
+/// that while its first connection is being opened the others wait for it.
+/// Cancel safe: a request dropped while it waits gives its place, or what
+/// it was granted, to the next in line.
 pub(crate) async fn acquire(
     pool: &Shared,
     max: usize,
     idle_timeout: Duration,
     fresh: bool,
     h2: bool,
+    h2_offered: bool,
 ) -> Taken {
     let waiter = {
         let mut p = pool.borrow_mut();
         p.h2_known |= h2;
+        p.h2_offered |= h2_offered;
         if p.waiters.is_empty() {
             if fresh {
                 // Make room by closing an idle connection, if need be.
@@ -123,11 +141,11 @@ pub(crate) async fn acquire(
                     return Taken::Reused(conn);
                 }
             }
-            if p.h2_known && p.h2_opening {
+            if p.h2_opening {
                 // Wait for the HTTP/2 connection being opened.
             } else if p.open < max {
                 p.open += 1;
-                p.h2_opening = p.h2_known;
+                p.h2_opening = p.expects_h2();
                 return Taken::Open;
             }
         }
@@ -185,7 +203,7 @@ pub(crate) fn sweep(pool: &Shared, idle_timeout: Duration) -> bool {
 pub(crate) fn free(pool: &Shared) {
     let mut p = pool.borrow_mut();
     if let Some(w) = p.next_waiter() {
-        p.h2_opening = p.h2_known;
+        p.h2_opening = p.expects_h2();
         drop(p);
         grant(&w, Grant::Open);
         return;
@@ -216,16 +234,18 @@ pub(crate) fn add_h2(pool: &Shared, id: u64, conn: h2::Connection) {
     let mut p = pool.borrow_mut();
     p.h2.push((id, conn));
     p.h2_known = true;
+    p.h1_seen = false;
     p.h2_opening = false;
     retry_all(p);
 }
 
 /// A connection just opened to an `https` origin speaks HTTP/1.1: requests
-/// in line no longer wait for an HTTP/2 one.
+/// in line no longer wait for an HTTP/2 one, and look again.
 pub(crate) fn opened_h1(pool: &Shared) {
     let mut p = pool.borrow_mut();
-    if p.h2_known {
-        p.h2_known = false;
+    p.h1_seen = true;
+    p.h2_known = false;
+    if p.h2_opening {
         p.h2_opening = false;
         retry_all(p);
     }

@@ -1,0 +1,12 @@
+2026-11-16T09:52:05Z built
+2026-11-16T09:52:05Z pausing: 89235 189222 371997 (  89235 /root/giong-soak/target/release/build/giong/0c5a5aff4b2b0e41/out/soak-0c; 189222 /root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo test ; 371997 /root/giong-soak/sim/target/release/build/giong-sim/f53ddace695519ea/out;)
+2026-11-16T09:54:13Z b6d9b4b round 1 done
+2026-11-16T09:56:15Z 003d9e5 round 1 done
+2026-11-16T09:58:17Z 3bec259 round 1 done
+2026-11-16T10:00:19Z b6d9b4b round 2 done
+2026-11-16T10:02:21Z 003d9e5 round 2 done
+2026-11-16T10:04:24Z 3bec259 round 2 done
+2026-11-16T10:06:26Z b6d9b4b round 3 done
+2026-11-16T10:08:28Z 003d9e5 round 3 done
+2026-11-16T10:10:30Z 3bec259 round 3 done
+2026-11-16T10:10:30Z resumed 89235 189222 371997

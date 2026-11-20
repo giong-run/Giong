@@ -1,0 +1,9 @@
+# started on Fri Nov 20 01:13:01 2026
+
+
+ Performance counter stats for 'system wide':
+
+                 0      udp:udp_fail_queue_rcv_skb                                            
+
+      45.000533125 seconds time elapsed
+
