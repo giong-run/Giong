@@ -11,7 +11,7 @@ use std::os::fd::RawFd;
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -1293,11 +1293,11 @@ impl Runtime {
             cond: Condvar::new(),
         });
         let signals = if self.builder.signals {
-            Some(SignalGuard::install()?)
+            Some(sys::SignalGuard::install()?)
         } else {
             None
         };
-        let signal_fd = signals.as_ref().map(|s| s.fd);
+        let signal_fd = signals.as_ref().map(|s| s.fd());
 
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
         let mut threads = Vec::with_capacity(n);
@@ -1391,107 +1391,6 @@ impl Runtime {
 
 // --------------------------------------------------------------------- signals
 
-/// The bell the signal handler rings (its write descriptor). Created once
-/// per process and never closed, so the handler can never race with a close.
-static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
-/// The read descriptor of the same bell (the same eventfd on Linux).
-static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
-/// Set while a runtime has the handlers installed.
-static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
-
-/// Async-signal-safe: only `write(2)`, with `errno` preserved.
-extern "C" fn on_signal(_signal: libc::c_int) {
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let errno = sys::errno_location();
-        // SAFETY: `errno` is the calling thread's, valid for reads and
-        // writes; `ring` only calls `write`, which is async-signal-safe.
-        unsafe {
-            let saved = *errno;
-            sys::ring(fd);
-            *errno = saved;
-        }
-    }
-}
-
-/// Installs SIGINT/SIGTERM handlers that poke an eventfd; restores the
-/// previous handlers when dropped.
-///
-/// Handlers (rather than a blocked-signal `signalfd`) are used because signal
-/// masks are per thread: a `signalfd` only works if *every* thread of the
-/// process blocks the signals, which a library cannot guarantee.
-struct SignalGuard {
-    fd: RawFd,
-    old_int: libc::sigaction,
-    old_term: libc::sigaction,
-}
-
-impl SignalGuard {
-    fn install() -> io::Result<Self> {
-        if SIGNALS_IN_USE.swap(true, Ordering::SeqCst) {
-            return Err(crate::error::raise(
-                Code::SignalsTaken,
-                "another giong runtime in this process already handles SIGINT and SIGTERM",
-                "turn on Builder::shutdown_on_signals for one runtime only, or run one runtime \
-                 at a time.",
-            ));
-        }
-        // SAFETY: plain libc calls with valid arguments; results are checked.
-        unsafe {
-            let mut fd = SIGNAL_READ_FD.load(Ordering::SeqCst);
-            if fd < 0 {
-                let bell = match sys::Bell::new() {
-                    Ok(bell) => bell,
-                    Err(e) => {
-                        SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                        return Err(e);
-                    }
-                };
-                let (read, write) = bell.leak();
-                fd = read;
-                SIGNAL_READ_FD.store(read, Ordering::SeqCst);
-                SIGNAL_FD.store(write, Ordering::SeqCst);
-            }
-            // Forget signals that arrived while nobody was listening.
-            sys::drain(fd);
-
-            let mut action: libc::sigaction = mem::zeroed();
-            action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            let mut old_int: libc::sigaction = mem::zeroed();
-            let mut old_term: libc::sigaction = mem::zeroed();
-            if libc::sigaction(libc::SIGINT, &action, &mut old_int) != 0 {
-                let err = io::Error::last_os_error();
-                SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                return Err(err);
-            }
-            if libc::sigaction(libc::SIGTERM, &action, &mut old_term) != 0 {
-                let err = io::Error::last_os_error();
-                libc::sigaction(libc::SIGINT, &old_int, std::ptr::null_mut());
-                SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                return Err(err);
-            }
-            Ok(Self {
-                fd,
-                old_int,
-                old_term,
-            })
-        }
-    }
-}
-
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        // SAFETY: restores the dispositions saved in `install`.
-        unsafe {
-            libc::sigaction(libc::SIGINT, &self.old_int, std::ptr::null_mut());
-            libc::sigaction(libc::SIGTERM, &self.old_term, std::ptr::null_mut());
-        }
-        SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-    }
-}
-
 /// Waits for the signal handler to poke the eventfd, then requests shutdown.
 /// Runs on every worker; whichever reads the eventfd first requests the
 /// shutdown, and the others see it and end.
@@ -1515,7 +1414,7 @@ async fn watch_signals(fd: RawFd) {
                 handle().shutdown();
                 return;
             }
-            if res != -libc::EINTR && res != -libc::EAGAIN {
+            if res != -sys::errno::EINTR && res != -sys::errno::EAGAIN {
                 return;
             }
         }
