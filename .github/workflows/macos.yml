@@ -52,6 +52,7 @@ jobs:
       - name: Lost wake-up race on the kqueue wake-up
         # 300,000 cross-thread wake-ups through EVFILT_USER, with and without
         # spinning (tests/wake.rs; ignored in the default run for its length).
+        if: ${{ !cancelled() }}
         run: cargo test --release -p giong --all-features --test wake -- --ignored
       - name: Keep the logs
         if: always()

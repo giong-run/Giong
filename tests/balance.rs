@@ -24,6 +24,13 @@ fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
         let ran_on = r.clone();
         async move {
             if index == 0 {
+                // Every worker is up before the burst: one whose thread is
+                // still starting takes no job yet, and on a loaded machine
+                // (seen on a macOS runner with three cores) the workers
+                // that were up did most of the jobs meanwhile.
+                while (0..WORKERS).any(|w| handle.driver_choice(w).is_none()) {
+                    sleep(Duration::from_millis(1)).await;
+                }
                 // Jobs that hold their worker's thread, as CPU-heavy work does.
                 let jobs: Vec<_> = (0..JOBS)
                     .map(|_| {
