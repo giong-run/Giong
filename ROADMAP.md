@@ -396,14 +396,16 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       back when the operation ends, and that is the earliest moment a 1.x budget gives
       their share back. *Proved by* `tests/cancel_docs.rs` (every public async fn says
       whether it is cancel safe) and the two tests below.
-- [ ] **A dropped `File::close` still closes**, on both drivers: a close is never
+- [x] **A dropped `File::close` still closes**, on both drivers: a close is never
       cancelled, only its result can be lost. *Test*: on epoll, the blocking threads are
       kept busy so the close waits in their queue; on io_uring, the close is sent to the
       kernel's worker thread (a test-only switch setting `IOSQE_ASYNC`, since a close on a
       local filesystem completes at once and cannot show the bug). In both, the future is
-      polled until the close is submitted, then dropped; once the driver has finished,
-      `fcntl(fd, F_GETFD)` fails with `EBADF`. The code on `main` can leave it open on both
-      drivers.
+      polled until the close is submitted, then dropped; once the driver has finished, no
+      descriptor of the process refers to the file any more (`/proc/self/fd`, which a
+      reused descriptor number cannot fool). `a_dropped_close_still_closes_on_the_epoll_driver`
+      in `tests/cancel.rs` and `a_dropped_close_still_closes` in `src/driver/uring.rs`;
+      both failed before the fix (#159).
 - [ ] **A PostgreSQL transaction refuses to commit after a statement in it was given up**,
       as giong-mysql's already does: `commit` returns a coded error and the transaction
       has to be rolled back. *Test*, on the PostgreSQL server CI starts: begin, insert a
@@ -417,13 +419,15 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       default. *Proved by* the slow-uploads and idle-connections CI jobs (`E1120`,
       `E1121`) and the pools' wait-timeout tests. The names of 1.x's budget types, its
       ledger and how it shares quotas wait for the prototype of 1.5.
-- [ ] **The release candidate is the code that was soaked**: the rc.1 release pull request
-      names the soaked commit, the release commit and the change between them, and says
-      which tests ran again on the release commit and on what basis it is or is not soaked
-      again ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). rc.1 stands on
-      0.9's soak (tree `f1b23074`): the changes since (#134's bind, the channel, UDP and
-      close fixes) are small and get their tests rerun on the release commit, and the next
-      full 72-hour soak runs on a later candidate or 1.x release.
+- [ ] **The release candidate says what it was verified on**: the rc.1 release pull
+      request names the soaked commit, the release commit and the change between them,
+      which tests ran again on the release commit, and the soak that change got
+      ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). A soak is sized by what
+      changed: none outside the soak paths, 2 to 4 hours for the drivers, the scheduler or
+      a cancellation path, 72 hours for a new major version, driver or scheduler. rc.1
+      stands on 0.9's 72 hours (tree `f1b23074`), and the changes since (#134's bind, the
+      channel, UDP, close and TLS receive fixes) get 4 hours per driver once they have all
+      merged.
 - [ ] **The removals**: the checklist in
       [STABILITY.md](docs/STABILITY.md#changes-made-before-10), in one release pull request.
 

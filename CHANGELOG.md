@@ -38,7 +38,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   outcome it does not know) and which limits wait and which refuse by default, which 1.x
   will not change. `docs/RELEASING.md` gives the checklist a 1.0 release candidate carries:
   the soaked commit, the release commit, what changed between them, the tests run again
-  and the basis for soaking again or not.
+  and the soak that change got, sized by what changed (none, 2 to 4 hours, or 72).
 - **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
@@ -215,6 +215,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   answers the key update like any other. A kernel TLS handshake makes a few more small
   reads for it (two per record of the peer's later flights); handshakes in the process
   are unchanged.
+- A `File::close` whose future was dropped after it was first polled could leave the
+  descriptor open with nobody owning it: on the epoll driver when no blocking thread had
+  started the close yet, and on io_uring when the kernel had handed it to a worker thread
+  (network filesystems, FUSE). The close is no longer cancelled; it runs to the end and
+  only its result is lost.
 - **net**: tasks that share a `UdpSocket` and wait in `recv_from` at the same time are each
   woken for a datagram of their own. On io_uring they shared one wake-up slot: only the
   last task to wait was woken, the others saw their datagrams only when something else

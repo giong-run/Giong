@@ -380,7 +380,7 @@ fn locked_memory_error(e: io::Error, what: &str, limit: u64) -> io::Error {
              against it, summed over all processes of the same user: a giong worker locks \
              about 150 KiB with the default settings, more with a larger \
              Builder::ring_entries or Builder::recv_buffers. Without \
-             .driver(DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
+             .driver(crate::DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
              on its epoll driver instead; docs/DEPLOYMENT.md shows how to raise the limit.",
         )
         .with_source(e),
@@ -644,6 +644,14 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
             .flags(flags)
             .mode(mode)
             .build(),
+        #[cfg(test)]
+        Io::Close { fd } if tests::CLOSE_ASYNC.load(std::sync::atomic::Ordering::Relaxed) => {
+            // Handed to a kernel worker thread, as some filesystems do,
+            // where a cancellation can still catch it.
+            opcode::Close::new(types::Fd(fd))
+                .build()
+                .flags(squeue::Flags::ASYNC)
+        }
         Io::Close { fd } => opcode::Close::new(types::Fd(fd)).build(),
         Io::Statx {
             dir,
@@ -1061,8 +1069,12 @@ impl Uring {
         key: usize,
         data: Option<Box<dyn Any>>,
         closes_result: bool,
+        finish: bool,
     ) {
         match cancel_single(&mut self.ops, key, data, closes_result, &mut self.graveyard) {
+            // Left to run to the end (a close): its completion finds the
+            // operation ignored and frees it.
+            AfterCancel::Cancel if finish => {}
             AfterCancel::Cancel => self.push(
                 opcode::AsyncCancel::new(key as u64)
                     .build()
@@ -1843,6 +1855,76 @@ impl Drop for Uring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closes go to the kernel with `IOSQE_ASYNC`, so that a cancellation
+    /// can catch one before it runs.
+    pub(super) static CLOSE_ASYNC: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// How many descriptors of this process refer to `path`.
+    fn open_fds(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target == path)
+            .count()
+    }
+
+    /// A close whose future is dropped once it was submitted still closes
+    /// the descriptor. It was cancelled like any other operation, and a
+    /// close a kernel worker had not started yet then never ran.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot run io_uring")]
+    fn a_dropped_close_still_closes() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::Context;
+
+        let path = std::env::temp_dir().join(format!("giong-drop-close-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let path = path.canonicalize().unwrap();
+        CLOSE_ASYNC.store(true, Ordering::Relaxed);
+        let run = crate::runtime::Builder::new()
+            .driver(crate::DriverKind::IoUring)
+            .block_on(async {
+                if crate::runtime::driver_kind() != crate::DriverKind::IoUring {
+                    eprintln!("skipped: io_uring is not available");
+                    return;
+                }
+                for _ in 0..100 {
+                    let file = crate::fs::File::open(&path).await.unwrap();
+                    let mut close = Box::pin(file.close());
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    // Submitted, then dropped, as when a timeout fires.
+                    // (Under ThreadSanitizer the close is a close(2), done here.)
+                    let _ = close.as_mut().poll(&mut cx);
+                    drop(close);
+                }
+                // Let the driver run the closes.
+                for _ in 0..200 {
+                    if open_fds(&path) == 0 && crate::observe::worker_stats().tracked_ops == 0 {
+                        break;
+                    }
+                    crate::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    open_fds(&path),
+                    0,
+                    "a dropped close left its descriptor open"
+                );
+                assert_eq!(crate::observe::worker_stats().tracked_ops, 0);
+            });
+        CLOSE_ASYNC.store(false, Ordering::Relaxed);
+        std::fs::remove_file(&path).unwrap();
+        match run {
+            // Blocked (Docker's seccomp profile), missing or too old (5.15):
+            // the cases in which the automatic choice falls back to epoll.
+            Err(e) if crate::driver::io_uring_unusable(&e) => {
+                eprintln!("skipped: {e}");
+            }
+            other => other.unwrap(),
+        }
+    }
 
     /// A blocked or missing io_uring is explained; other errors pass through.
     #[test]
