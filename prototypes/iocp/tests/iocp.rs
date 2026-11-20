@@ -616,12 +616,28 @@ fn the_bell_wakes_a_parked_worker_from_another_thread() {
     let mut driver = Driver::new().expect("driver");
     let bell = driver.bell();
 
+    // A wait with nothing to report ends at its timeout. Windows may end
+    // it before the timeout by the clock `Instant` reads (waits follow the
+    // system tick), so a worker waits again for what is left: the contract
+    // is that it sleeps the time out in a few waits, never spins.
     let start = Instant::now();
-    let parked = driver.park(Park::Wait(Some(Duration::from_millis(60))));
-    assert!(!parked.rung && parked.completions == 0);
+    let limit = Duration::from_millis(60);
+    let mut waits = 0;
+    let mut first = None;
+    loop {
+        let left = limit.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        let parked = driver.park(Park::Wait(Some(left)));
+        assert!(!parked.rung && parked.completions == 0);
+        waits += 1;
+        first.get_or_insert(start.elapsed());
+    }
+    println!("a 60 ms wait: first return after {first:?}, {waits} wait(s)");
     assert!(
-        start.elapsed() >= Duration::from_millis(60),
-        "park returned early"
+        waits <= 8,
+        "{waits} waits for 60 ms: the wait returns too early to sleep on"
     );
 
     let ringer = std::thread::spawn(move || {

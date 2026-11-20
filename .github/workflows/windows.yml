@@ -46,11 +46,12 @@ jobs:
       - run: cargo test --release --locked
       # The races these tests are about (a cancel crossing a completion)
       # depend on timing: one pass proves little, so run them many times.
+      # How early a wait with a timeout returns on this machine.
+      - run: cargo test --release --locked -- the_bell --nocapture
       - name: Repeat the tests 200 times
         run: |
-          bin=$(ls -t target/release/deps/iocp-*.exe | head -1)
           for i in $(seq 1 200); do
-            "$bin" > run.log 2>&1 || { echo "run $i failed"; cat run.log; exit 1; }
+            cargo test --release --locked -q > run.log 2>&1 || { echo "run $i failed"; cat run.log; exit 1; }
           done
           echo "200 runs passed" >> "$GITHUB_STEP_SUMMARY"
 
