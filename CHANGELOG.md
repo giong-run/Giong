@@ -148,6 +148,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong-http**: requests sent at once to an `https` origin the client had no connection to
+  yet each opened a connection and did a TLS handshake of their own, up to
+  `max_connections_per_host`, because the pool learned that the origin speaks HTTP/2 only
+  once the first handshake was over. They now wait for that first connection while ALPN may
+  still pick HTTP/2, and share it when it does; when it picks HTTP/1.1 they open their own
+  as before, and when the first one fails or is dropped the next in line opens one. 64
+  requests to a new loopback origin on one worker: 16 TLS connections and 4.70 ms before, 1
+  and 0.78 ms after (median of 21 rounds). Reported from a service that warms its client up
+  while requests arrive (#154).
 - **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
   pool opened its first connection (the random part of the lifetime was computed as a tenth
   of it times up to 999); a lifetime too long for the clock now means none, as
