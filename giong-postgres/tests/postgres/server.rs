@@ -23,7 +23,6 @@ pub struct Server {
     pub port: u16,
     pub socket_dir: PathBuf,
     pub ca_pem: Vec<u8>,
-    dir: PathBuf,
 }
 
 /// Passwords of the roles the server is set up with.
@@ -118,10 +117,6 @@ impl Server {
             cmd.uid(uid).gid(gid);
         }
         cmd
-    }
-
-    pub fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.join("server.log")).unwrap_or_default()
     }
 }
 
@@ -282,15 +277,13 @@ fn start(bin: &Path) -> Server {
     std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    // The server listens on both addresses.
-    let port = server_port(&["127.0.0.1", "127.0.0.2"]);
     let mut conf = std::fs::OpenOptions::new()
         .append(true)
         .open(data.join("postgresql.conf"))
         .unwrap();
     writeln!(
         conf,
-        "\nlisten_addresses = '127.0.0.1,127.0.0.2'\nport = {port}\nunix_socket_directories = '{}'\n\
+        "\nlisten_addresses = '127.0.0.1,127.0.0.2'\nunix_socket_directories = '{}'\n\
          ssl = on\nssl_cert_file = 'server.crt'\nssl_key_file = 'server.key'\n\
          fsync = off\nsynchronous_commit = off\nfull_page_writes = off\n\
          max_connections = 200\npassword_encryption = 'scram-sha-256'\n\
@@ -311,14 +304,67 @@ fn start(bin: &Path) -> Server {
     .unwrap();
     chown_tree(&dir, owner);
 
+    // The server listens on both addresses, on a port free on both a moment
+    // before it binds. A server another test starts can take it in that
+    // moment; PostgreSQL then goes on without that address (or exits, if it
+    // lost both), so a port it could not bind is tried again with another.
+    let mut attempt = 1;
+    let port = loop {
+        let port = server_port(&["127.0.0.1", "127.0.0.2"]);
+        // The last `port` line wins.
+        writeln!(conf, "port = {port}").unwrap();
+        match launch(bin, &data, &dir, &socket_dir, port, owner) {
+            Ok(()) => break port,
+            Err(log) if log.contains("could not bind") && attempt < START_ATTEMPTS => {
+                eprintln!("postgres: port {port} was taken before it could listen; trying another");
+                attempt += 1;
+            }
+            Err(log) => panic!("PostgreSQL did not start:\n{log}"),
+        }
+    };
+    let server = Server {
+        port,
+        socket_dir,
+        ca_pem: ca.pem().into_bytes(),
+    };
+
+    server.psql(&format!(
+        "CREATE ROLE {} LOGIN PASSWORD '{}'; \
+         CREATE ROLE {} LOGIN PASSWORD '{}'; \
+         CREATE ROLE {} LOGIN PASSWORD '{}';",
+        SCRAM_USER.0, SCRAM_USER.1, CLEAR_USER.0, CLEAR_USER.1, TLS_USER.0, TLS_USER.1
+    ));
+    server.psql(&format!(
+        "SET password_encryption = 'md5'; CREATE ROLE {} LOGIN PASSWORD '{}';",
+        MD5_USER.0, MD5_USER.1
+    ));
+    server
+}
+
+/// How many ports `start` tries before it gives up.
+const START_ATTEMPTS: usize = 5;
+
+/// Starts PostgreSQL on `port` and waits until it answers on its Unix
+/// socket, having bound both addresses; or, if it exits or could not bind
+/// one, stops it and gives its log.
+fn launch(
+    bin: &Path,
+    data: &Path,
+    dir: &Path,
+    socket_dir: &Path,
+    port: u16,
+    owner: Option<(u32, u32)>,
+) -> Result<(), String> {
     // The server is started from a thread that never ends, with SIGKILL as
     // its parent-death signal: if this process dies without running its exit
     // handlers, the server goes too.
     let (tx, rx) = std::sync::mpsc::channel();
-    let (bin, data2, log) = (bin.to_owned(), data.clone(), dir.join("server.log"));
+    let (exited_tx, exited) = std::sync::mpsc::channel();
+    let log_path = dir.join("server.log");
+    let (bin2, data2, log) = (bin.to_owned(), data.to_owned(), log_path.clone());
     std::thread::spawn(move || {
         let log = std::fs::File::create(&log).unwrap();
-        let mut cmd = Command::new(bin.join("postgres"));
+        let mut cmd = Command::new(bin2.join("postgres"));
         cmd.arg("-D")
             .arg(&data2)
             .stdin(Stdio::null())
@@ -339,47 +385,52 @@ fn start(bin: &Path) -> Server {
         // Blocks until the server is gone, keeping this thread (its parent)
         // alive until then.
         let _ = child.wait();
+        let _ = exited_tx.send(());
     });
     let pid = rx.recv().unwrap();
     PID.store(pid as i32, Ordering::SeqCst);
 
-    let server = Server {
-        port,
-        socket_dir,
-        ca_pem: ca.pem().into_bytes(),
-        dir,
-    };
-    let socket = server.socket_dir.join(format!(".s.PGSQL.{port}"));
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    let socket = socket_dir.join(format!(".s.PGSQL.{port}"));
     let started = Instant::now();
-    while !socket.exists() || !server.ready() {
+    loop {
+        if exited.try_recv().is_ok() {
+            return Err(log());
+        }
+        // PostgreSQL binds its TCP addresses before it makes the socket.
+        if socket.exists() && ready(bin, socket_dir, port, owner) {
+            break;
+        }
         assert!(
             started.elapsed() < Duration::from_secs(30),
             "PostgreSQL did not start within 30 s:\n{}",
-            server.log()
+            log()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-
-    server.psql(&format!(
-        "CREATE ROLE {} LOGIN PASSWORD '{}'; \
-         CREATE ROLE {} LOGIN PASSWORD '{}'; \
-         CREATE ROLE {} LOGIN PASSWORD '{}';",
-        SCRAM_USER.0, SCRAM_USER.1, CLEAR_USER.0, CLEAR_USER.1, TLS_USER.0, TLS_USER.1
-    ));
-    server.psql(&format!(
-        "SET password_encryption = 'md5'; CREATE ROLE {} LOGIN PASSWORD '{}';",
-        MD5_USER.0, MD5_USER.1
-    ));
-    server
+    let text = log();
+    if text.contains("could not bind") {
+        // SAFETY: signalling the server this function started.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = exited.recv();
+        PID.store(0, Ordering::SeqCst);
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{port}.lock")));
+        let _ = std::fs::remove_file(data.join("postmaster.pid"));
+        return Err(text);
+    }
+    Ok(())
 }
 
-impl Server {
-    fn ready(&self) -> bool {
-        self.command("pg_isready")
-            .arg("-h")
-            .arg(&self.socket_dir)
-            .args(["-p", &self.port.to_string(), "-q"])
-            .status()
-            .is_ok_and(|s| s.success())
+/// Whether the server answers `pg_isready` on its Unix socket.
+fn ready(bin: &Path, socket_dir: &Path, port: u16, owner: Option<(u32, u32)>) -> bool {
+    let mut cmd = Command::new(bin.join("pg_isready"));
+    if let Some((uid, gid)) = owner {
+        cmd.uid(uid).gid(gid);
     }
+    cmd.arg("-h")
+        .arg(socket_dir)
+        .args(["-p", &port.to_string(), "-q"])
+        .status()
+        .is_ok_and(|s| s.success())
 }

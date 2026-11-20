@@ -293,7 +293,7 @@ fn wait<F: std::future::Future>(fut: F) -> F::Output {
 #[test]
 fn channel_delivers_across_workers_and_from_plain_threads() {
     const PER_SENDER: usize = 10_000;
-    let (tx, rx) = mpsc::channel::<usize>();
+    let (tx, rx) = mpsc::unbounded::<usize>();
     let rx = Arc::new(Mutex::new(Some(rx)));
     // One sender for each of workers 1 and 2, handed out by index.
     let senders = Arc::new(Mutex::new(vec![None, Some(tx.clone()), Some(tx.clone())]));
@@ -539,7 +539,7 @@ fn sigterm_still_works_after_worker_0_returned() {
 )]
 fn a_sleeping_worker_is_woken_promptly_by_another_thread() {
     // Latency of the eventfd wake-up path.
-    let (tx, mut rx) = mpsc::channel::<Instant>();
+    let (tx, mut rx) = mpsc::unbounded::<Instant>();
     let sender = std::thread::spawn(move || {
         for _ in 0..200 {
             std::thread::sleep(Duration::from_millis(1));

@@ -65,6 +65,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
   giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
   server).
+- **giong**: `sync::mpsc::unbounded()`, the new name of `sync::mpsc::channel()`. Tokio's
+  `mpsc::channel(n)` is bounded, so code ported from Tokio, or written from memory of it,
+  took giong's `channel()` for a bounded channel; `bounded(n)` is that one here. Its halves
+  are now `UnboundedSender` and `UnboundedReceiver`, as in Tokio, so that in 1.0.0 the short
+  names `Sender` and `Receiver` can go to the bounded channel, whose memory has a limit.
 - **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
   parameter is still `dbname`, as libpq spells it.
 
@@ -137,7 +142,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
-- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll. A UDP echo
+- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll, on a cloud VM. A UDP echo
   server on one core (64-byte datagrams, veth, `bench/udp-echo.sh`, 5 rounds,
   `bench/results/udp-echo/`) answers 328,000 datagrams a second with 16 tasks on one socket
   on io_uring (259,000 before, Tokio 278,000) and 300,000 with one task (286,000 before,
@@ -147,17 +152,26 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
   now costs one system call on either driver where Tokio makes two. Immediate sends count
   against the task's budget, so a task that only sends still gives way to the others.
+  On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark;
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`) the server
+  core is saturated near a million echoes a second and the runtimes are close: this change
+  is behind Tokio with io_uring and 16 tasks (856,000 against 870,000) and with epoll and one
+  task (874,000 against 882,000), level with epoll and 16 tasks (879,000), and ahead with
+  io_uring and one task (926,000 against 882,000).
 - **net**: the epoll driver's UDP path is close to the kernel's ceiling. The same echo
   server answers 336,000 datagrams a second with 16 tasks on epoll (284,000 before, Tokio
   271,000, the kernel-only `recvmmsg`/`sendmmsg` server 390,000) at 4.08 µs of server CPU per
   echo (5.07 before, Tokio 5.33, kernel 3.55), and 351,000 with one task (284,000 before,
-  Tokio 307,000) (`bench/results/udp-echo/vm/epoll-deep/`). Two changes: datagrams that tasks send while
+  Tokio 307,000) (`bench/results/udp-echo/vm/epoll-deep/`), on a cloud VM. Two changes: datagrams that tasks send while
   other tasks of the worker are runnable go to the kernel at the end of that turn of the
   event loop, in one `sendmmsg(2)` per socket, each sender still getting its own result and
   datagrams of one socket keeping their order (both drivers; a lone sender sends at once);
   and on epoll a datagram socket that has received 64 datagrams leaves the epoll set until a
   task has to wait for it again, because in the set every datagram received and every one
   sent and freed wakes epoll's callback on the socket's wait queue.
+  On bare metal (`post-soak/udp-udp-epoll-*`, as above) the margins are small: with 16 tasks
+  921,000 on epoll and 902,000 on io_uring against Tokio's 870,000, ahead in every round;
+  with one task 893,000 and 876,000 against 863,000, a tie within the noise between rounds.
 
 - **runtime**, **sync**, **time**, **fs**, **net**: the core of the runtime is faster than
   Tokio's in every workload of the new `bench/core.sh`, which runs the same code on giong,
@@ -214,6 +228,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
   giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
   that names the new method, and go in 1.0.0-rc.1.
+- **giong**: `sync::mpsc::channel()`, renamed `unbounded()`, and `sync::mpsc::Sender` and
+  `Receiver`, renamed `UnboundedSender` and `UnboundedReceiver`; they go in 1.0.0-rc.1 too, which
+  gives the names `Sender` and `Receiver` to `BoundedSender` and `BoundedReceiver`.
 
 ### Fixed
 
@@ -223,6 +240,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   woke them, and a server of 16 tasks on one socket made one kernel entry per datagram. A
   task that stops waiting (its receive timed out) no longer takes the wake-up of the next
   datagram.
+- `UdpSocket::bind` to a port no other socket of the process held could fail with
+  `AddrInUse` for a port that nothing held, while any thread of the process read
+  `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
+  descriptors). The first bind of a port checked it with a probe socket, bound and closed
+  again; a socket closed while such a reader holds it keeps its port for a few
+  microseconds, and the real bind came right after. The first socket of a port is now
+  bound without `SO_REUSEPORT` itself and sets it once bound, so nothing is closed before
+  the bind. `TcpListener::bind` takes the same path (it was not affected). Seen as the
+  rare `AddrInUse` of the UDP rebind test on CI; reproduced without giong at 8 to 105
+  refused binds in about 119,000 with two threads reading `/proc/self/fd`, none without.
 - **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
   pool opened its first connection (the random part of the lifetime was computed as a tenth
   of it times up to 999); a lifetime too long for the clock now means none, as

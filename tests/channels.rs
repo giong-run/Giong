@@ -323,7 +323,7 @@ fn bounded_refuses_a_capacity_of_zero() {
 fn mpsc_try_recv_tells_empty_from_closed() {
     // try_recv returned an Option, which could not tell "nothing yet" from
     // "nothing ever again" without awaiting recv.
-    let (tx, mut rx) = mpsc::channel();
+    let (tx, mut rx) = mpsc::unbounded();
     assert_eq!(rx.try_recv(), Err(MpscTryRecvError::Empty));
     tx.send(1).unwrap();
     let tx2 = tx.clone();
@@ -350,7 +350,7 @@ fn mpsc_try_recv_tells_empty_from_closed() {
 #[test]
 fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_receiver() {
     giong::block_on(async {
-        let (tx, mut rx) = mpsc::channel::<u32>();
+        let (tx, mut rx) = mpsc::unbounded::<u32>();
         let senders: Vec<_> = (0..3).map(|_| tx.clone()).collect();
         drop(tx);
         for (i, tx) in senders.iter().enumerate() {
@@ -364,7 +364,7 @@ fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_rec
 
         // A receiver waiting in recv is woken when the last sender goes,
         // also from another thread.
-        let (tx, mut rx) = mpsc::channel::<u32>();
+        let (tx, mut rx) = mpsc::unbounded::<u32>();
         let dropper = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             drop(tx);
@@ -378,7 +378,7 @@ fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_rec
         // Values still queued are dropped with the receiver, and sends fail
         // from then on, handing the value back.
         let alive = Rc::new(());
-        let (tx, rx) = mpsc::channel::<Rc<()>>();
+        let (tx, rx) = mpsc::unbounded::<Rc<()>>();
         tx.send(alive.clone()).unwrap();
         assert_eq!(Rc::strong_count(&alive), 2);
         drop(rx);
@@ -394,8 +394,7 @@ fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_rec
 #[test]
 fn batched_receives_keep_each_senders_order() {
     giong::block_on(async {
-        #[allow(deprecated)]
-        let (tx, mut rx) = mpsc::channel::<(u32, u32)>();
+        let (tx, mut rx) = mpsc::unbounded::<(u32, u32)>();
         let threads: Vec<_> = (0..4)
             .map(|t| {
                 let tx = tx.clone();
@@ -437,5 +436,19 @@ fn batched_receives_keep_each_senders_order() {
         for t in threads {
             t.join().unwrap();
         }
+    });
+}
+
+#[test]
+fn the_old_names_of_unbounded_and_its_halves_still_work() {
+    giong::block_on(async {
+        // On the statement, not the function: sim/build.rs moves a test's
+        // attributes to its wrapper.
+        #[allow(deprecated)]
+        let (tx, mut rx): (mpsc::Sender<u32>, mpsc::Receiver<u32>) = mpsc::channel();
+        tx.send(7).unwrap();
+        drop(tx);
+        assert_eq!(rx.recv().await, Some(7));
+        assert_eq!(rx.recv().await, None);
     });
 }
