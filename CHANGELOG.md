@@ -148,6 +148,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- `UdpSocket::bind` to a port no other socket of the process held could fail with
+  `AddrInUse` for a port that nothing held, while any thread of the process read
+  `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
+  descriptors). The first bind of a port checked it with a probe socket, bound and closed
+  again; a socket closed while such a reader holds it keeps its port for a few
+  microseconds, and the real bind came right after. The first socket of a port is now
+  bound without `SO_REUSEPORT` itself and sets it once bound, so nothing is closed before
+  the bind. `TcpListener::bind` takes the same path (it was not affected). Seen as the
+  rare `AddrInUse` of the UDP rebind test on CI; reproduced without giong at 8 to 105
+  refused binds in about 119,000 with two threads reading `/proc/self/fd`, none without.
 - **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
   pool opened its first connection (the random part of the lifetime was computed as a tenth
   of it times up to 999); a lifetime too long for the clock now means none, as
