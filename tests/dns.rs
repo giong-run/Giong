@@ -320,7 +320,13 @@ fn a_server_nobody_listens_on_is_a_coded_error() {
         let os = source
             .downcast_ref::<std::io::Error>()
             .expect("an io::Error");
-        assert_eq!(os.kind(), ErrorKind::ConnectionRefused);
+        // Windows reports a refused datagram as a reset.
+        let refused = if cfg!(windows) {
+            ErrorKind::ConnectionReset
+        } else {
+            ErrorKind::ConnectionRefused
+        };
+        assert_eq!(os.kind(), refused);
     });
 }
 
