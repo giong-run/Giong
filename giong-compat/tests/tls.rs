@@ -35,7 +35,7 @@ mod tokio_traits {
         giong::block_on(async {
             let pki = pki();
             let (c, s) = pair().await;
-            let acceptor = TlsAcceptor::new(server_config(&pki, &[]));
+            let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &[]));
             let server =
                 giong::spawn(
                     async move { native_tls_echo(acceptor.accept(s).await.unwrap()).await },
@@ -82,7 +82,7 @@ mod tokio_traits {
                 }
                 tls.shutdown().await.unwrap();
             });
-            let connector = TlsConnector::new(client_config(&pki, &[b"echo/1"]));
+            let connector = TlsConnector::from_rustls(client_config(&pki, &[b"echo/1"]));
             let tls = connector.connect("localhost", c).await.unwrap();
             assert_eq!(tls.alpn_protocol().as_deref(), Some(&b"echo/1"[..]));
             let msg = pattern(300_000);
@@ -112,12 +112,12 @@ mod tokio_traits {
         giong::block_on(async {
             let pki = pki();
             let (c, s) = pair().await;
-            let acceptor = TlsAcceptor::new(server_config(&pki, &[]));
+            let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &[]));
             let server =
                 giong::spawn(
                     async move { native_tls_echo(acceptor.accept(s).await.unwrap()).await },
                 );
-            let connector = TlsConnector::new(client_config(&pki, &[]));
+            let connector = TlsConnector::from_rustls(client_config(&pki, &[]));
             let mut tls = Compat::new(connector.connect("localhost", c).await.unwrap());
             assert!(format!("{tls:?}").contains("TlsStream"));
             let msg = pattern(1 << 20);
@@ -157,7 +157,7 @@ mod tokio_traits {
         giong::block_on(async {
             let pki = pki();
             let (c, s) = pair().await;
-            let acceptor = TlsAcceptor::new(server_config(&pki, &[]))
+            let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &[]))
                 .ktls(Ktls::Required)
                 .unwrap();
             let server = giong::spawn(async move {
@@ -165,7 +165,7 @@ mod tokio_traits {
                 assert!(tls.is_ktls());
                 native_tls_echo(tls).await
             });
-            let connector = TlsConnector::new(client_config(&pki, &[]))
+            let connector = TlsConnector::from_rustls(client_config(&pki, &[]))
                 .ktls(Ktls::Required)
                 .unwrap();
             let tls = connector.connect("localhost", c).await.unwrap();
@@ -199,7 +199,7 @@ mod futures_traits {
         giong::block_on(async {
             let pki = pki();
             let (c, s) = pair().await;
-            let acceptor = TlsAcceptor::new(server_config(&pki, &[]));
+            let acceptor = TlsAcceptor::from_rustls(server_config(&pki, &[]));
             let server =
                 giong::spawn(
                     async move { native_tls_echo(acceptor.accept(s).await.unwrap()).await },

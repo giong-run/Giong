@@ -8,8 +8,11 @@ disagree, CONTRIBUTING.md wins: report the difference.
 ## What this is
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
-driver where io_uring is blocked or the kernel is too old. One Cargo
-workspace, nine crates, two prototype crates for 1.1 (not published) and two examples:
+driver where io_uring is blocked or the kernel is too old. It aims to be the best Rust
+async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
+is built for code that agents write: strict types, coded errors with the cause and the
+fix, and an API that stays on major version 1 for many years. One Cargo
+workspace, nine crates, crates in progress for 1.1 (not published) and two examples:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -56,6 +59,18 @@ crate that needs the Tokio runtime on a worker. The table with each giong crate,
 replaces and how it measured against it is under
 [Choosing crates](README.md#choosing-crates) in the README.
 
+## Looking inside a running service
+
+To find out why a giong service is slow, stuck or leaking, ask it rather than guess:
+`giong-mcp` serves the runtime's own state over MCP. The service keeps
+`let _mcp = giong_mcp::start_from_env(&handle);` alive; run it with
+`GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` (16 characters or more), and connect with
+`claude mcp add --transport http giong http://127.0.0.1:7777/mcp --header "Authorization: Bearer $GIONG_MCP_TOKEN"`.
+Tools: `overview` (memory, threads, open descriptors, workers, warnings such as a blocked
+worker), `workers`, `tasks` (live tasks by the line that spawned them), `sources` (database
+pools) and `profile` (where the workers spent a time window). It listens on loopback or a
+Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
+
 ## The machine you need
 
 - **Linux 6.0 or newer with io_uring allowed**, to test both drivers. giong does not
@@ -95,6 +110,7 @@ scripts/check.sh epoll       # the tests on the epoll driver only
 scripts/check.sh seccomp     # io_uring blocked as in Docker (scripts/no-io-uring.py): giong picks epoll
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
+scripts/check.sh kani        # Kani proofs of the unsafe core (docs/kani.md; needs kani-verifier 0.68.0)
 scripts/check.sh soak        # minutes of connection churn, then checks for leaks
 scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
@@ -120,10 +136,13 @@ The release test binaries are built once per run (the `build` job, with
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
 CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the last
-release, so no breaking change lands between releases), `instr` (`scripts/instr.py`:
+release, so no breaking change lands between releases; what the 1.x promise covers, and the
+rules for growing the API without breaking it, are in `docs/STABILITY.md`), `instr` (`scripts/instr.py`:
 instructions per operation on the hot paths, counted by callgrind, and heap per idle
-connection, within 1% and 2% of `bench/instr/baseline.csv`; a change meant to move them
-commits the new baseline the job prints, see `bench/instr/README.md`), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+connection, both within 1% of `bench/instr/baseline.csv`; a change meant to move them
+commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
+in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
+operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
 against other server versions (`servers`) on every pull request, and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
@@ -175,6 +194,10 @@ is loaded.
    `fuzz/`, commands in CONTRIBUTING.md).
 8. **Performance claims need numbers**: before and after, the median of several runs with
    the spread, the machine and kernel. Never write a number you did not measure.
+9. **The API rules.** Every public addition follows four rules: one way to do each thing;
+   misuse fails at compile time, or at run time with a coded error; every behaviour code
+   relies on is documented; a release only adds, and never changes what existing code
+   means. Prefer a new item to a new meaning for an old one.
 
 ## Changes, commits and pull requests
 

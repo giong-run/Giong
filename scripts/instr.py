@@ -27,6 +27,7 @@ import io
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -39,11 +40,12 @@ DRIVERS = ["io_uring", "epoll"]
 ITERATIONS = 2000
 WARMUP = 500
 IDLE_CONNECTIONS = 2000
+VALGRIND = shutil.which("valgrind") or "valgrind"
 # Tolerances (percent) for metrics that have none in the baseline yet.
 DEFAULT_TOLERANCE = {
     "instructions": 1.0,
     "allocations": 1.0,
-    "heap_bytes": 2.0,
+    "heap_bytes": 1.0,
     "rss_bytes": 10.0,
 }
 
@@ -93,11 +95,17 @@ def parse_fields(line):
 def measure_case(binary, driver, case, tmp):
     for f in os.listdir(tmp):
         os.remove(os.path.join(tmp, f))
-    env = {**os.environ, "GIONG_DRIVER": driver}
+    # The same stack on every machine and in every job: where the stack
+    # starts depends on the size of the environment and of the program's
+    # path, and a few copies cost some instructions more or less by the
+    # alignment of what is on it (web: 0.2% between two environments). So
+    # the environment is giong's own variables only and the path is relative.
+    env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("GIONG_")}
+    env["GIONG_DRIVER"] = driver
     out = subprocess.run(
-        ["valgrind", "--tool=callgrind", f"--callgrind-out-file={tmp}/cg.%p",
-         binary, "run", case, str(ITERATIONS), str(WARMUP)],
-        env=env, capture_output=True, text=True,
+        [VALGRIND, "--tool=callgrind", f"--callgrind-out-file={tmp}/cg.%p",
+         "./" + os.path.basename(binary), "run", case, str(ITERATIONS), str(WARMUP)],
+        env=env, cwd=os.path.dirname(os.path.abspath(binary)), capture_output=True, text=True,
     )
     if out.returncode != 0:
         sys.exit(f"{case} on {driver} failed:\n{out.stderr[-3000:]}")
@@ -215,7 +223,7 @@ def check(args):
     write_baseline(os.path.join(args.out, "baseline.csv"), env, medians, base, args)
     lines = ["| driver | case | metric | baseline | now | change | limit | |",
              "|---|---|---|---:|---:|---:|---:|---|"]
-    failures, mismatched = [], []
+    failures, mismatched, close = [], [], []
     for k in COMPARABLE:
         if base_env.get(k) != env.get(k):
             mismatched.append(f"{k}: baseline `{base_env.get(k)}`, now `{env.get(k)}`")
@@ -228,6 +236,8 @@ def check(args):
         ok = abs(change) <= tol
         if not ok:
             failures.append(f"{key[1]} ({key[0]}) {key[2]}: {value:g} -> {now:.1f} ({change:+.2f}%, limit {tol:g}%)")
+        elif abs(change) > tol / 2:
+            close.append(f"{key[1]} ({key[0]}) {key[2]}: {value:g} -> {now:.1f} ({change:+.2f}%, limit {tol:g}%)")
         lines.append(f"| {key[0]} | {key[1]} | {key[2]} | {value:g} | {now:.1f} | {change:+.2f}% | "
                      f"±{tol:g}% | {'ok' if ok else '**FAIL**'} |")
     for key in base:
@@ -237,6 +247,12 @@ def check(args):
     if mismatched:
         report += ["The baseline was measured with another setup, so the counts cannot be compared:", ""]
         report += [f"- {m}" for m in mismatched] + [""]
+    if close:
+        # A step that passes is still a step: a reviewer should see +1.8% of
+        # memory per connection without reading the whole table.
+        report += ["Within the limits, but past half of one. If this pull request is not meant "
+                   "to move these, say in its description where the difference comes from:", ""]
+        report += [f"- {c}" for c in close] + [""]
     report += lines + [""]
     if failures or mismatched:
         report += [

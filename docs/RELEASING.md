@@ -35,7 +35,11 @@ request; everything else is automated and safe to re-run.
 2. **Polish it.** Push to the release branch or edit on GitHub until the `CHANGELOG.md`
    section reads well for users: one line on what the release is about, then the
    entries under *Added*, *Changed*, *Deprecated*, *Removed*, *Fixed*, *Security*. Mark
-   breaking changes **Breaking:** and say how to migrate. Thank outside contributors in
+   breaking changes **Breaking:** and say how to migrate. The release pull request of
+   1.0.0-rc.1 also removed every `#[deprecated]` item, listing each under *Removed*
+   with the name that replaces it, and gave `giong::sync::mpsc::Sender` and `Receiver`
+   to the bounded channel; no alias was kept (STABILITY.md, *Changes made before 1.0*).
+   From 1.0.0 on a deprecated item stays for the rest of 1.x. Thank outside contributors in
    the entry for their change: `([#4](…/issues/4), thanks to [@name](https://github.com/name))`.
    CI runs on the branch as on any pull request.
 
@@ -58,6 +62,52 @@ request; everything else is automated and safe to re-run.
 4. **Check it.** The run's summary shows the notes. Look at the
    [Release](https://github.com/giong-run/Giong/releases/latest), the crate pages on
    crates.io (the README, including the dark-mode logo) and https://giong.run.
+
+## Release candidates of 1.0
+
+Every `1.0.0-rc.N` says which soaked code it stands on and what changed since. The release
+pull request carries this checklist, filled in, in its description:
+
+1. **The soaked commit**: its hash and tree, the machines, both drivers' start and end
+   times, and the results directory under `bench/results/` (for 0.9: tree `f1b23074`,
+   commits `674c42c` and `003d9e5`, PR #155).
+2. **The release commit**: the hash the release pull request is based on.
+3. **What changed between them**: `git diff --stat <soaked>..<release> -- src giong-*/src`
+   pasted in, and each pull request in that range listed with one of:
+   - *soak path*: it changes `src/driver/`, `src/op.rs`, `src/buf.rs`, `src/kbox.rs`,
+     `src/slab.rs`, `src/runtime.rs`, `src/executor.rs`, `src/time.rs`, `src/net.rs`,
+     `src/net/`, `src/sync/`, `src/fs.rs`, or the connection, HTTP/2 or TLS state of
+     `giong-http`'s server and of `giong-tls`, in lines that run (doc comments do not
+     count);
+   - *outside*: everything else (the database crates, `giong-http`'s client, `giong-web`,
+     `giong-mcp`, docs, benches, tests).
+4. **The tests run again on the release commit**, each named with its run: the full CI
+   set (kernels 5.15 to 6.18, both drivers, TSan, loom, Kani, the simulation soak), the
+   cancellation tests of STABILITY.md's *Cancellation* section on both drivers, and for
+   each *soak path* pull request the tests it added or that cover the code it changed.
+5. **The soak, sized by what changed** (see [How long to soak](#how-long-to-soak)): the
+   tier the range falls in, the commit that was soaked, for how long on each driver, and
+   the results directory. For 1.0.0-rc.1: the 72-hour soak of 0.9 stands for the code it
+   covered, and the soak-path changes since tree `f1b23074` (#134's bind, the channel, UDP,
+   close and TLS receive fixes) get a 4-hour soak per driver on `main` once they have all merged.
+6. **The removals**: every item of STABILITY.md's *Changes made before 1.0* checked off.
+
+### How long to soak
+
+A soak costs machine time and holds merges back, so its length follows what changed since
+the last soaked commit, not the calendar. The longest tier any pull request in the range
+falls in decides:
+
+| What changed | Soak on bare metal, per driver |
+|---|---|
+| Nothing on a soak path: docs, benches, tests, the database crates, `giong-web`, `giong-mcp`, the HTTP client | none |
+| A soak path (item 3 above): the drivers, the scheduler, a cancellation path, sockets, channels, timers, files, or the connection, HTTP/2 or TLS state of the servers | 2 to 4 hours |
+| A new major version, a new driver (kqueue, IOCP) or a replaced scheduler | 72 hours |
+
+A short soak runs the same `tests/soak.rs` and the same checks as the long one (no leak of
+memory or descriptors, no crash, no stall); two hours for a change the tests of item 4
+cover line by line, four when it reaches further. The 72-hour soak also runs once on a 1.x
+release when none has run for six months, so slow leaks cannot build up unseen.
 
 ## When something fails
 

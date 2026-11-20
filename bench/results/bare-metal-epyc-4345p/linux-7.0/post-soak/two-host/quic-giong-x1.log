@@ -1,0 +1,6 @@
+round 1 rr giong x1: req_s=294252 gbit_s=0.235 p50_us=99 p99_us=336 srv_cpu_pct=38.9 srv_us_per_req=1.32 srv_ns_per_kib=13536.3 cli_cpu_pct=248.8 errors=0
+median of rounds (min-max in brackets)
+
+rr
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+giong x1          2.943e+05 [2.94e+05-2.94e+05]       0.235 [0.235-0.235]             336 [336-336]          38.9 [38.9-38.9]          1.32 [1.32-1.32]1.354e+04 [1.35e+04-1.35e+04]

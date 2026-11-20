@@ -19,6 +19,11 @@
 #                               with the rust-src component)
 #   scripts/check.sh loom       model-check the wake-up handshakes (src/notify.rs)
 #                               with loom, then run the same race on this CPU
+#   scripts/check.sh kani       prove the unsafe core with the Kani model checker
+#                               (`cargo install --locked kani-verifier --version
+#                               0.68.0 && cargo kani setup`): the slab, the
+#                               receive buffer pool, KernelBox and the lifetime
+#                               of an io_uring operation (docs/kani.md)
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
 #                               driver state (tests/soak.rs)
@@ -26,7 +31,17 @@
 #                               epoll driver, under Miri, which checks the unsafe
 #                               code against Rust's memory and aliasing rules
 #                               (needs nightly with the miri component)
-#   scripts/check.sh all        everything above except seccomp, soak and miri
+#   scripts/check.sh sim        the deterministic simulation (sim/README.md): its
+#                               scenarios, months of simulated uptime, and this
+#                               crate's tests on it without faults and then with
+#                               loopback faults for SIM_SEEDS seeds (default 3)
+#   scripts/check.sh sim-long   years of simulated uptime under hostile faults:
+#                               the hostile soak (sim/tests/soak.rs) for
+#                               SIM_LONG_SEEDS seeds (default 1200) from seed
+#                               SIM_LONG_FROM (default 0), SIM_LONG_DAYS
+#                               (default 3650) split over every seed, one
+#                               process per CPU; a failure prints its seed
+#   scripts/check.sh all        everything above except seccomp, soak, miri, kani, sim and sim-long
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -131,6 +146,73 @@ run_miri() {
     cargo +nightly miri test --quiet --test cancel -- --exact a_dropped_open_closes_the_descriptor_it_produced
 }
 
+run_sim() {
+    (
+        cd sim
+        echo "== sim: fmt and clippy"
+        cargo fmt --check
+        cargo clippy --quiet --release --all-targets -- -D warnings
+        echo "== sim: scenarios, long runs, this crate's tests without faults"
+        local log
+        log="$(mktemp)"
+        if ! cargo test --release -- --nocapture >"$log" 2>&1; then
+            tail -n 200 "$log"
+            exit 1
+        fi
+        # How much simulated time this run covered.
+        grep -E '^soak:' "$log"
+        rm -f "$log"
+        for seed in $(seq 1 "${SIM_SEEDS:-3}"); do
+            echo "== sim: this crate's tests with loopback faults, seed $seed"
+            GIONG_SIM_FAULTS=loopback GIONG_SIM_SEED="$seed" cargo test --release --quiet --test suite
+        done
+    )
+}
+
+run_sim_long() {
+    (
+        cd sim
+        local seeds="${SIM_LONG_SEEDS:-1200}" from="${SIM_LONG_FROM:-0}"
+        local days="${SIM_LONG_DAYS:-3650}" jobs bin dir
+        jobs="$(nproc)"
+        bin="$(cargo test --release --test soak --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and .target.name == "soak") | .executable')"
+        dir="$(mktemp -d)"
+        echo "== sim-long: seeds $from to $((from + seeds - 1)), $((days / 7)) simulated days each, $jobs processes"
+        local per=$(((seeds + jobs - 1) / jobs)) i pids=() failed=0
+        for ((i = 0; i < jobs; i++)); do
+            local start=$((from + i * per)) n=$per
+            if ((start + n > from + seeds)); then n=$((from + seeds - start)); fi
+            ((n > 0)) || continue
+            GIONG_SIM_SOAK_DAYS="$days" GIONG_SIM_SEEDS="$n" GIONG_SIM_SEED_FROM="$start" \
+                "$bin" --exact days_of_uptime_under_hostile_faults --nocapture >"$dir/$i.log" 2>&1 &
+            pids+=("$!:$i")
+        done
+        for p in "${pids[@]}"; do
+            if ! wait "${p%%:*}"; then
+                failed=1
+                echo "== sim-long: process ${p##*:} failed:"
+                tail -n 200 "$dir/${p##*:}.log"
+            fi
+        done
+        grep -h -E '^soak:' "$dir"/*.log || true
+        rm -rf "$dir"
+        exit "$failed"
+    )
+}
+
+run_kani() {
+    # Every `#[kani::proof]` in the core crate; each one's module docs say
+    # what it proves and within which bounds. Kani compiles with its own
+    # nightly and sets `cfg(kani)`, which the proofs live under.
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/kani"
+    # The operation lifecycle proof alone: next to another proof it can
+    # exhaust a 16 GB machine. The others in parallel with KANI_JOBS.
+    cargo kani --lib -p giong --output-format terse --harness driver::uring::proofs
+    cargo kani --lib -p giong --output-format terse ${KANI_JOBS:+-j "$KANI_JOBS"} \
+        --harness slab::proofs --harness kbox::proofs --harness buf::proofs
+}
+
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback "${2:-all}" ;;
@@ -140,7 +222,10 @@ case "${1:-all}" in
     loom) run_loom ;;
     soak) run_soak ;;
     miri) run_miri ;;
+    kani) run_kani ;;
+    sim) run_sim ;;
+    sim-long) run_sim_long ;;
     all) run_test; run_fallback all; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|kani|sim|sim-long|all]" >&2; exit 2 ;;
 esac
 echo "ok"

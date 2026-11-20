@@ -1,0 +1,241 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 31K of event 'cpu/cycles/P'
+# Event count (approx.): 41800952235
+#
+# Overhead  Command         Shared Object      Symbol                                                                                                                                                            
+# ........  ..............  .................  ..................................................................................................................................................................
+#
+     4.21%  bench-udp-echo  bench-udp-echo     [.] tokio::runtime::task::raw::poll::<bench_udp_echo::tokio_server::{closure#0}::{closure#0}, alloc::sync::Arc<tokio::runtime::scheduler::current_thread::Handle>>
+            |          
+             --3.02%--<std::sys::sync::mutex::futex::Mutex>::lock (inlined)
+                       <std::sync::poison::mutex::Mutex<tokio::runtime::io::scheduled_io::Waiters>>::lock (inlined)
+                       <tokio::loom::std::mutex::Mutex<tokio::runtime::io::scheduled_io::Waiters>>::lock (inlined)
+                       <tokio::runtime::io::scheduled_io::Readiness as core::ops::drop::Drop>::drop
+
+     2.29%  bench-udp-echo  [kernel.kallsyms]  [k] udp_sendmsg
+            |          
+             --1.10%--fib_table_lookup
+                       |          
+                        --1.09%--ip_route_output_key_hash_rcu
+                                  ip_route_output_flow
+                                  udp_sendmsg
+                                  inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+
+     2.24%  bench-udp-echo  [kernel.kallsyms]  [k] nft_immediate_eval
+     2.21%  bench-udp-echo  [kernel.kallsyms]  [k] _find_next_bit
+            |          
+             --1.30%--arch_exit_to_user_mode_prepare.isra.0
+                       |          
+                        --1.28%--do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+
+     2.20%  bench-udp-echo  [kernel.kallsyms]  [k] _copy_from_iter
+            |          
+             --2.14%--__ip_select_ident
+                       |          
+                        --2.14%--__ip_make_skb
+                                  ip_make_skb
+                                  udp_sendmsg
+                                  inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+
+     2.20%  bench-udp-echo  [kernel.kallsyms]  [k] nft_counter_eval
+     2.13%  bench-udp-echo  [kernel.kallsyms]  [k] nft_do_chain_ipv4
+            |          
+             --1.81%--nft_immediate_eval
+                       |          
+                        --1.72%--nft_do_chain
+                                  nft_do_chain_ipv4
+                                  nf_hook_slow
+                                  __ip_local_out
+                                  ip_send_skb
+                                  udp_send_skb
+                                  udp_sendmsg
+                                  inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+
+     2.00%  bench-udp-echo  [kernel.kallsyms]  [k] ep_poll_callback
+            |          
+             --1.86%--__raw_spin_lock_irqsave
+                       _raw_spin_lock_irqsave
+                       ep_poll_callback
+                       __wake_up_common
+                       __wake_up_sync_key
+                       sock_wfree
+                       ip_rcv_core
+                       ip_rcv
+                       __netif_receive_skb_one_core
+                       __netif_receive_skb
+                       process_backlog
+                       __napi_poll
+                       net_rx_action
+                       handle_softirqs
+                       __do_softirq
+                       do_softirq.part.0
+                       __local_bh_enable_ip
+                       __dev_queue_xmit
+                       neigh_hh_output
+                       ip_finish_output2
+                       __ip_finish_output
+                       ip_finish_output
+                       ip_output
+                       ip_send_skb
+                       udp_send_skb
+                       udp_sendmsg
+                       inet_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+
+     1.96%  bench-udp-echo  [kernel.kallsyms]  [k] nft_do_chain
+     1.89%  bench-udp-echo  [kernel.kallsyms]  [k] entry_SYSCALL_64
+     1.59%  bench-udp-echo  [kernel.kallsyms]  [k] native_queued_spin_lock_slowpath
+     1.46%  bench-udp-echo  [kernel.kallsyms]  [k] process_backlog
+            |          
+             --1.27%--_raw_spin_lock_irq
+                       process_backlog
+                       __napi_poll
+                       net_rx_action
+                       handle_softirqs
+                       __do_softirq
+                       do_softirq.part.0
+                       __local_bh_enable_ip
+                       __dev_queue_xmit
+                       neigh_hh_output
+                       ip_finish_output2
+                       __ip_finish_output
+                       ip_finish_output
+                       ip_output
+                       ip_send_skb
+                       udp_send_skb
+                       udp_sendmsg
+                       inet_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+
+     1.45%  bench-udp-echo  [kernel.kallsyms]  [k] net_rx_action
+     1.39%  bench-udp-echo  [kernel.kallsyms]  [k] do_syscall_64
+     1.31%  bench-udp-echo  [kernel.kallsyms]  [k] __sys_sendto
+            |          
+             --1.06%--udp_sendmsg
+                       |          
+                        --1.06%--inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+
+     1.30%  bench-udp-echo  [kernel.kallsyms]  [k] fib_table_lookup
+            |          
+             --1.16%--__mkroute_output
+                       |          
+                        --1.16%--ip_route_output_key_hash_rcu
+                                  ip_route_output_flow
+                                  udp_sendmsg
+                                  inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+
+     1.30%  bench-udp-echo  [kernel.kallsyms]  [k] __rcu_read_lock
+     1.29%  bench-udp-echo  [kernel.kallsyms]  [k] __sys_recvfrom
+            |          
+             --1.16%--_raw_spin_lock_bh
+                       udp_recvmsg
+                       inet_recvmsg
+                       sock_recvmsg
+                       __sys_recvfrom
+                       __x64_sys_recvfrom
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_recvfrom
+
+     1.23%  bench-udp-echo  [kernel.kallsyms]  [k] __rcu_read_unlock
+     1.23%  bench-udp-echo  [kernel.kallsyms]  [k] read_tsc
+            |          
+             --1.21%--_raw_spin_lock
+                       enqueue_to_backlog
+                       netif_rx_internal
+                       __netif_rx
+                       veth_xmit
+                       xmit_one.constprop.0
+                       dev_hard_start_xmit
+                       __dev_queue_xmit
+                       neigh_hh_output
+                       ip_finish_output2
+                       __ip_finish_output
+                       ip_finish_output
+                       ip_output
+                       ip_send_skb
+                       udp_send_skb
+                       udp_sendmsg
+                       inet_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+
+     1.14%  bench-udp-echo  [kernel.kallsyms]  [k] __ip_append_data
+     1.13%  bench-udp-echo  [kernel.kallsyms]  [k] __siphash_unaligned
+            |
+            ---__nf_conntrack_find_get
+               resolve_normal_ct
+               nf_conntrack_in
+               ipv4_conntrack_local
+               nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               inet_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __libc_sendto
+
+     1.09%  bench-udp-echo  libc.so.6          [.] __libc_sendto
+     1.08%  bench-udp-echo  [kernel.kallsyms]  [k] __alloc_skb
+     1.01%  bench-udp-echo  [kernel.kallsyms]  [k] __udp_enqueue_schedule_skb
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

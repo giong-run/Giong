@@ -88,7 +88,7 @@ fn the_worker_still_sleeps_after_the_spin_budget() {
 
 #[test]
 fn cross_thread_wakeups_reach_a_spinning_worker_and_a_sleeping_one() {
-    let (tx, mut rx) = mpsc::channel::<(u32, Instant)>();
+    let (tx, mut rx) = mpsc::unbounded::<(u32, Instant)>();
     let sender = std::thread::spawn(move || {
         for i in 0..40u32 {
             // Gaps shorter and longer than the 2 ms spin budget, so the message

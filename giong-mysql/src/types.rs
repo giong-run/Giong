@@ -342,7 +342,7 @@ pub trait FromSql<'a>: Sized {
         let _ = column;
         Err(Error::conversion(format!(
             "the value is NULL; read it as Option<{}>",
-            std::any::type_name::<Self>()
+            crate::text::rust_name::<Self>()
         )))
     }
 }
@@ -365,9 +365,9 @@ fn read_as(column: &Column) -> &'static str {
 
 fn wrong_column<T>(column: &Column) -> Error {
     Error::conversion(format!(
-        "a {} cannot be read as {}{}",
-        column.type_name(),
-        std::any::type_name::<T>(),
+        "{} cannot be read as {}{}",
+        crate::text::a(&column.type_name()),
+        crate::text::rust_name::<T>(),
         read_as(column)
     ))
 }
@@ -375,9 +375,9 @@ fn wrong_column<T>(column: &Column) -> Error {
 fn fixed<const N: usize>(raw: &[u8], column: &Column) -> Result<[u8; N], Error> {
     raw.try_into().map_err(|_| {
         Error::conversion(format!(
-            "the server sent {} bytes for a {}, which has {N}",
+            "the server sent {} bytes for {}, which has {N}",
             raw.len(),
-            column.type_name()
+            crate::text::a(&column.type_name())
         ))
     })
 }

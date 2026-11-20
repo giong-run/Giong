@@ -1,0 +1,226 @@
+round 1 rr quinn x1: req_s=671629 gbit_s=0.537 p50_us=186 p99_us=316 srv_cpu_pct=98.0 srv_us_per_req=1.46 srv_ns_per_kib=14940.2 cli_cpu_pct=538.6 errors=0
+round 1 rr quinn x4: req_s=691809 gbit_s=0.553 p50_us=180 p99_us=312 srv_cpu_pct=98.4 srv_us_per_req=1.42 srv_ns_per_kib=14563.9 cli_cpu_pct=544.5 errors=0
+round 1 rr quinn x8: req_s=695556 gbit_s=0.556 p50_us=178 p99_us=317 srv_cpu_pct=99.8 srv_us_per_req=1.43 srv_ns_per_kib=14691.3 cli_cpu_pct=562.7 errors=0
+round 1 rr quinn x16: req_s=674377 gbit_s=0.540 p50_us=184 p99_us=325 srv_cpu_pct=98.5 srv_us_per_req=1.46 srv_ns_per_kib=14956.6 cli_cpu_pct=545.8 errors=0
+round 1 rr proto-tokio x1: req_s=1024084 gbit_s=0.819 p50_us=120 p99_us=258 srv_cpu_pct=93.7 srv_us_per_req=0.91 srv_ns_per_kib=9368.9 cli_cpu_pct=755.0 errors=0
+round 1 rr giong x1: req_s=446034 gbit_s=0.357 p50_us=114 p99_us=272 srv_cpu_pct=56.0 srv_us_per_req=1.26 srv_ns_per_kib=12855.7 cli_cpu_pct=370.1 errors=0
+round 1 rr giong x4: req_s=112732 gbit_s=0.090 p50_us=90 p99_us=53546 srv_cpu_pct=18.1 srv_us_per_req=1.61 srv_ns_per_kib=16439.8 cli_cpu_pct=98.7 errors=0
+round 1 rr giong x8: req_s=271120 gbit_s=0.217 p50_us=112 p99_us=320 srv_cpu_pct=36.1 srv_us_per_req=1.33 srv_ns_per_kib=13634.7 cli_cpu_pct=232.2 errors=0
+round 1 rr giong x16: req_s=341889 gbit_s=0.274 p50_us=107 p99_us=271 srv_cpu_pct=45.3 srv_us_per_req=1.32 srv_ns_per_kib=13566.9 cli_cpu_pct=291.1 errors=0
+round 1 rr giong-seg44 x1: req_s=357697 gbit_s=0.286 p50_us=106 p99_us=274 srv_cpu_pct=44.0 srv_us_per_req=1.23 srv_ns_per_kib=12595.6 cli_cpu_pct=301.0 errors=0
+round 1 rr giong-seg44 x4: req_s=280915 gbit_s=0.225 p50_us=106 p99_us=379 srv_cpu_pct=38.8 srv_us_per_req=1.38 srv_ns_per_kib=14142.3 cli_cpu_pct=241.8 errors=0
+round 1 rr giong-seg44 x8: req_s=230500 gbit_s=0.184 p50_us=108 p99_us=1854 srv_cpu_pct=32.1 srv_us_per_req=1.39 srv_ns_per_kib=14259.6 cli_cpu_pct=197.2 errors=0
+round 1 rr giong-seg44 x16: req_s=219743 gbit_s=0.176 p50_us=107 p99_us=26316 srv_cpu_pct=30.9 srv_us_per_req=1.41 srv_ns_per_kib=14398.0 cli_cpu_pct=187.7 errors=0
+round 1 rr giong-plain x1: req_s=869837 gbit_s=0.696 p50_us=131 p99_us=285 srv_cpu_pct=96.2 srv_us_per_req=1.11 srv_ns_per_kib=11324.2 cli_cpu_pct=667.5 errors=0
+round 1 rr giong-epoll x1: req_s=200872 gbit_s=0.161 p50_us=110 p99_us=26438 srv_cpu_pct=26.2 srv_us_per_req=1.30 srv_ns_per_kib=13355.9 cli_cpu_pct=172.4 errors=0
+round 1 rr giong-epoll x4: req_s=143907 gbit_s=0.115 p50_us=108 p99_us=52997 srv_cpu_pct=22.1 srv_us_per_req=1.54 srv_ns_per_kib=15725.3 cli_cpu_pct=124.1 errors=0
+round 1 rr giong-epoll x8: req_s=135911 gbit_s=0.109 p50_us=105 p99_us=53042 srv_cpu_pct=21.4 srv_us_per_req=1.57 srv_ns_per_kib=16123.4 cli_cpu_pct=118.3 errors=0
+round 1 rr giong-epoll x16: req_s=403341 gbit_s=0.323 p50_us=104 p99_us=263 srv_cpu_pct=60.4 srv_us_per_req=1.50 srv_ns_per_kib=15334.3 cli_cpu_pct=346.7 errors=0
+round 1 bulk quinn x1: req_s=101 gbit_s=13.502 p50_us=38623 p99_us=57026 srv_cpu_pct=80.0 srv_us_per_req=7952.29 srv_ns_per_kib=485.4 cli_cpu_pct=103.1 errors=0
+round 1 bulk quinn x4: req_s=112 gbit_s=15.072 p50_us=34165 p99_us=47877 srv_cpu_pct=88.8 srv_us_per_req=7907.39 srv_ns_per_kib=482.6 cli_cpu_pct=118.5 errors=0
+round 1 bulk quinn x8: req_s=96 gbit_s=12.951 p50_us=39618 p99_us=63535 srv_cpu_pct=76.0 srv_us_per_req=7875.65 srv_ns_per_kib=480.7 cli_cpu_pct=101.0 errors=0
+round 1 bulk quinn x16: req_s=111 gbit_s=14.897 p50_us=34337 p99_us=50373 srv_cpu_pct=86.4 srv_us_per_req=7783.78 srv_ns_per_kib=475.1 cli_cpu_pct=112.4 errors=0
+round 1 bulk proto-tokio x1: req_s=113 gbit_s=15.205 p50_us=34648 p99_us=47945 srv_cpu_pct=90.2 srv_us_per_req=7961.17 srv_ns_per_kib=485.9 cli_cpu_pct=119.7 errors=0
+round 1 bulk giong x1: req_s=66 gbit_s=8.925 p50_us=57745 p99_us=121645 srv_cpu_pct=69.3 srv_us_per_req=10421.05 srv_ns_per_kib=636.1 cli_cpu_pct=90.3 errors=0
+round 1 bulk giong x4: req_s=121 gbit_s=16.239 p50_us=32104 p99_us=56462 srv_cpu_pct=114.7 srv_us_per_req=9479.34 srv_ns_per_kib=578.6 cli_cpu_pct=159.6 errors=0
+round 1 bulk giong x8: req_s=137 gbit_s=18.414 p50_us=29018 p99_us=38496 srv_cpu_pct=131.0 srv_us_per_req=9548.10 srv_ns_per_kib=582.8 cli_cpu_pct=178.0 errors=0
+round 1 bulk giong x16: req_s=128 gbit_s=17.151 p50_us=31759 p99_us=42859 srv_cpu_pct=136.4 srv_us_per_req=10672.93 srv_ns_per_kib=651.4 cli_cpu_pct=173.5 errors=0
+round 1 bulk giong-seg44 x1: req_s=85 gbit_s=11.395 p50_us=46257 p99_us=69427 srv_cpu_pct=70.4 srv_us_per_req=8292.11 srv_ns_per_kib=506.1 cli_cpu_pct=112.7 errors=0
+round 1 bulk giong-seg44 x4: req_s=135 gbit_s=18.132 p50_us=29672 p99_us=40685 srv_cpu_pct=106.3 srv_us_per_req=7868.25 srv_ns_per_kib=480.2 cli_cpu_pct=171.1 errors=0
+round 1 bulk giong-seg44 x8: req_s=124 gbit_s=16.602 p50_us=32707 p99_us=43458 srv_cpu_pct=99.4 srv_us_per_req=8035.57 srv_ns_per_kib=490.5 cli_cpu_pct=155.1 errors=0
+round 1 bulk giong-seg44 x16: req_s=129 gbit_s=17.353 p50_us=31170 p99_us=45097 srv_cpu_pct=106.0 srv_us_per_req=8197.99 srv_ns_per_kib=500.4 cli_cpu_pct=168.4 errors=0
+round 1 bulk giong-plain x1: req_s=35 gbit_s=4.738 p50_us=111871 p99_us=139215 srv_cpu_pct=99.7 srv_us_per_req=28243.63 srv_ns_per_kib=1723.9 cli_cpu_pct=76.0 errors=0
+round 1 bulk giong-epoll x1: req_s=72 gbit_s=9.650 p50_us=54088 p99_us=84083 srv_cpu_pct=75.3 srv_us_per_req=10472.88 srv_ns_per_kib=639.2 cli_cpu_pct=101.1 errors=0
+round 1 bulk giong-epoll x4: req_s=111 gbit_s=14.924 p50_us=35667 p99_us=52104 srv_cpu_pct=111.2 srv_us_per_req=10000.00 srv_ns_per_kib=610.4 cli_cpu_pct=144.5 errors=0
+round 1 bulk giong-epoll x8: req_s=131 gbit_s=17.528 p50_us=30832 p99_us=37112 srv_cpu_pct=131.2 srv_us_per_req=10045.94 srv_ns_per_kib=613.2 cli_cpu_pct=170.0 errors=0
+round 1 bulk giong-epoll x16: req_s=141 gbit_s=18.910 p50_us=28018 p99_us=37601 srv_cpu_pct=144.8 srv_us_per_req=10276.79 srv_ns_per_kib=627.2 cli_cpu_pct=186.1 errors=0
+round 1 many quinn x1: req_s=339217 gbit_s=2.779 p50_us=1780 p99_us=29739 srv_cpu_pct=100.5 srv_us_per_req=2.96 srv_ns_per_kib=2962.6 cli_cpu_pct=285.9 errors=0
+round 1 many quinn x4: req_s=334979 gbit_s=2.744 p50_us=1754 p99_us=29757 srv_cpu_pct=100.6 srv_us_per_req=3.00 srv_ns_per_kib=3003.0 cli_cpu_pct=288.1 errors=0
+round 1 many quinn x8: req_s=330481 gbit_s=2.707 p50_us=1791 p99_us=29731 srv_cpu_pct=100.4 srv_us_per_req=3.04 srv_ns_per_kib=3037.8 cli_cpu_pct=286.3 errors=0
+round 1 many quinn x16: req_s=336515 gbit_s=2.757 p50_us=1750 p99_us=29685 srv_cpu_pct=100.4 srv_us_per_req=2.98 srv_ns_per_kib=2983.5 cli_cpu_pct=287.6 errors=0
+round 1 many proto-tokio x1: req_s=505330 gbit_s=4.140 p50_us=475 p99_us=28077 srv_cpu_pct=100.6 srv_us_per_req=1.99 srv_ns_per_kib=1990.7 cli_cpu_pct=414.3 errors=0
+round 1 many giong x1: req_s=452111 gbit_s=3.704 p50_us=600 p99_us=55226 srv_cpu_pct=100.5 srv_us_per_req=2.22 srv_ns_per_kib=2222.9 cli_cpu_pct=353.6 errors=0
+round 1 many giong x4: req_s=1461537 gbit_s=11.973 p50_us=355 p99_us=754 srv_cpu_pct=366.4 srv_us_per_req=2.51 srv_ns_per_kib=2506.8 cli_cpu_pct=1127.6 errors=0
+round 1 many giong x8: req_s=1674776 gbit_s=13.720 p50_us=240 p99_us=712 srv_cpu_pct=430.2 srv_us_per_req=2.57 srv_ns_per_kib=2568.5 cli_cpu_pct=1290.9 errors=0
+round 1 many giong x16: req_s=1783385 gbit_s=14.609 p50_us=249 p99_us=645 srv_cpu_pct=575.8 srv_us_per_req=3.23 srv_ns_per_kib=3228.7 cli_cpu_pct=1355.7 errors=0
+round 1 many giong-seg44 x1: req_s=456118 gbit_s=3.737 p50_us=601 p99_us=55267 srv_cpu_pct=100.5 srv_us_per_req=2.20 srv_ns_per_kib=2203.3 cli_cpu_pct=358.5 errors=0
+round 1 many giong-seg44 x4: req_s=1454865 gbit_s=11.918 p50_us=320 p99_us=662 srv_cpu_pct=364.2 srv_us_per_req=2.50 srv_ns_per_kib=2503.2 cli_cpu_pct=1117.5 errors=0
+round 1 many giong-seg44 x8: req_s=1932006 gbit_s=15.827 p50_us=279 p99_us=564 srv_cpu_pct=519.1 srv_us_per_req=2.69 srv_ns_per_kib=2686.8 cli_cpu_pct=1398.6 errors=0
+round 1 many giong-seg44 x16: req_s=2057998 gbit_s=16.859 p50_us=343 p99_us=741 srv_cpu_pct=663.7 srv_us_per_req=3.22 srv_ns_per_kib=3224.8 cli_cpu_pct=1453.8 errors=0
+round 1 many giong-plain x1: failed=1
+round 1 many giong-epoll x1: req_s=439623 gbit_s=3.601 p50_us=617 p99_us=29569 srv_cpu_pct=100.6 srv_us_per_req=2.29 srv_ns_per_kib=2288.3 cli_cpu_pct=338.7 errors=0
+round 1 many giong-epoll x4: req_s=1444482 gbit_s=11.833 p50_us=395 p99_us=1245 srv_cpu_pct=344.6 srv_us_per_req=2.39 srv_ns_per_kib=2385.5 cli_cpu_pct=1051.3 errors=0
+round 1 many giong-epoll x8: req_s=1931231 gbit_s=15.821 p50_us=322 p99_us=626 srv_cpu_pct=483.6 srv_us_per_req=2.50 srv_ns_per_kib=2503.9 cli_cpu_pct=1374.3 errors=0
+round 1 many giong-epoll x16: req_s=1984328 gbit_s=16.256 p50_us=300 p99_us=657 srv_cpu_pct=607.1 srv_us_per_req=3.06 srv_ns_per_kib=3059.4 cli_cpu_pct=1412.9 errors=0
+round 2 rr quinn x1: req_s=670128 gbit_s=0.536 p50_us=185 p99_us=354 srv_cpu_pct=98.8 srv_us_per_req=1.47 srv_ns_per_kib=15096.9 cli_cpu_pct=535.5 errors=0
+round 2 rr quinn x4: req_s=705265 gbit_s=0.564 p50_us=175 p99_us=317 srv_cpu_pct=99.6 srv_us_per_req=1.41 srv_ns_per_kib=14459.9 cli_cpu_pct=578.0 errors=0
+round 2 rr quinn x8: req_s=707150 gbit_s=0.566 p50_us=175 p99_us=313 srv_cpu_pct=99.5 srv_us_per_req=1.41 srv_ns_per_kib=14407.3 cli_cpu_pct=576.8 errors=0
+round 2 rr quinn x16: req_s=712222 gbit_s=0.570 p50_us=175 p99_us=302 srv_cpu_pct=99.3 srv_us_per_req=1.39 srv_ns_per_kib=14276.0 cli_cpu_pct=580.5 errors=0
+round 2 rr proto-tokio x1: req_s=1037259 gbit_s=0.830 p50_us=119 p99_us=258 srv_cpu_pct=94.9 srv_us_per_req=0.91 srv_ns_per_kib=9368.2 cli_cpu_pct=769.0 errors=0
+round 2 rr giong x1: req_s=181354 gbit_s=0.145 p50_us=92 p99_us=26982 srv_cpu_pct=25.8 srv_us_per_req=1.42 srv_ns_per_kib=14566.6 cli_cpu_pct=153.2 errors=0
+round 2 rr giong x4: req_s=102758 gbit_s=0.082 p50_us=96 p99_us=53365 srv_cpu_pct=15.9 srv_us_per_req=1.55 srv_ns_per_kib=15844.2 cli_cpu_pct=90.7 errors=0
+round 2 rr giong x8: req_s=318797 gbit_s=0.255 p50_us=93 p99_us=274 srv_cpu_pct=45.8 srv_us_per_req=1.44 srv_ns_per_kib=14710.2 cli_cpu_pct=272.6 errors=0
+round 2 rr giong x16: req_s=115262 gbit_s=0.092 p50_us=97 p99_us=53511 srv_cpu_pct=18.3 srv_us_per_req=1.59 srv_ns_per_kib=16256.7 cli_cpu_pct=100.5 errors=0
+round 2 rr giong-seg44 x1: req_s=378980 gbit_s=0.303 p50_us=109 p99_us=271 srv_cpu_pct=49.2 srv_us_per_req=1.30 srv_ns_per_kib=13293.3 cli_cpu_pct=323.2 errors=0
+round 2 rr giong-seg44 x4: req_s=494787 gbit_s=0.396 p50_us=108 p99_us=265 srv_cpu_pct=64.5 srv_us_per_req=1.30 srv_ns_per_kib=13347.8 cli_cpu_pct=416.5 errors=0
+round 2 rr giong-seg44 x8: req_s=109218 gbit_s=0.087 p50_us=86 p99_us=53516 srv_cpu_pct=17.4 srv_us_per_req=1.59 srv_ns_per_kib=16313.1 cli_cpu_pct=95.3 errors=0
+round 2 rr giong-seg44 x16: req_s=117893 gbit_s=0.094 p50_us=92 p99_us=53368 srv_cpu_pct=19.5 srv_us_per_req=1.65 srv_ns_per_kib=16936.8 cli_cpu_pct=103.2 errors=0
+round 2 rr giong-plain x1: req_s=885084 gbit_s=0.708 p50_us=130 p99_us=283 srv_cpu_pct=97.2 srv_us_per_req=1.10 srv_ns_per_kib=11245.1 cli_cpu_pct=684.4 errors=0
+round 2 rr giong-epoll x1: req_s=469016 gbit_s=0.375 p50_us=110 p99_us=266 srv_cpu_pct=54.9 srv_us_per_req=1.17 srv_ns_per_kib=11985.2 cli_cpu_pct=385.1 errors=0
+round 2 rr giong-epoll x4: req_s=217087 gbit_s=0.174 p50_us=111 p99_us=26234 srv_cpu_pct=30.0 srv_us_per_req=1.38 srv_ns_per_kib=14150.7 cli_cpu_pct=187.6 errors=0
+round 2 rr giong-epoll x8: req_s=288366 gbit_s=0.231 p50_us=105 p99_us=292 srv_cpu_pct=40.9 srv_us_per_req=1.42 srv_ns_per_kib=14523.4 cli_cpu_pct=248.7 errors=0
+round 2 rr giong-epoll x16: req_s=207057 gbit_s=0.166 p50_us=100 p99_us=26579 srv_cpu_pct=32.2 srv_us_per_req=1.56 srv_ns_per_kib=15923.6 cli_cpu_pct=179.0 errors=0
+round 2 bulk quinn x1: req_s=99 gbit_s=13.340 p50_us=37299 p99_us=64276 srv_cpu_pct=77.4 srv_us_per_req=7786.72 srv_ns_per_kib=475.3 cli_cpu_pct=104.2 errors=0
+round 2 bulk quinn x4: req_s=104 gbit_s=13.904 p50_us=37322 p99_us=52486 srv_cpu_pct=81.7 srv_us_per_req=7886.10 srv_ns_per_kib=481.3 cli_cpu_pct=112.6 errors=0
+round 2 bulk quinn x8: req_s=115 gbit_s=15.447 p50_us=33660 p99_us=44877 srv_cpu_pct=89.2 srv_us_per_req=7749.78 srv_ns_per_kib=473.0 cli_cpu_pct=124.6 errors=0
+round 2 bulk quinn x16: req_s=78 gbit_s=10.482 p50_us=51992 p99_us=52277 srv_cpu_pct=61.6 srv_us_per_req=7887.32 srv_ns_per_kib=481.4 cli_cpu_pct=78.7 errors=0
+round 2 bulk proto-tokio x1: req_s=104 gbit_s=13.945 p50_us=37223 p99_us=63839 srv_cpu_pct=82.5 srv_us_per_req=7940.33 srv_ns_per_kib=484.6 cli_cpu_pct=108.9 errors=0
+round 2 bulk giong x1: req_s=72 gbit_s=9.717 p50_us=53884 p99_us=89478 srv_cpu_pct=73.9 srv_us_per_req=10207.18 srv_ns_per_kib=623.0 cli_cpu_pct=100.9 errors=0
+round 2 bulk giong x4: req_s=123 gbit_s=16.576 p50_us=31970 p99_us=53797 srv_cpu_pct=121.7 srv_us_per_req=9854.25 srv_ns_per_kib=601.5 cli_cpu_pct=169.9 errors=0
+round 2 bulk giong x8: req_s=122 gbit_s=16.334 p50_us=32521 p99_us=54851 srv_cpu_pct=118.6 srv_us_per_req=9745.28 srv_ns_per_kib=594.8 cli_cpu_pct=166.1 errors=0
+round 2 bulk giong x16: req_s=136 gbit_s=18.212 p50_us=30948 p99_us=37627 srv_cpu_pct=133.3 srv_us_per_req=9823.14 srv_ns_per_kib=599.6 cli_cpu_pct=183.3 errors=0
+round 2 bulk giong-seg44 x1: req_s=73 gbit_s=9.864 p50_us=54011 p99_us=81450 srv_cpu_pct=63.5 srv_us_per_req=8639.46 srv_ns_per_kib=527.3 cli_cpu_pct=100.2 errors=0
+round 2 bulk giong-seg44 x4: req_s=133 gbit_s=17.849 p50_us=30113 p99_us=39941 srv_cpu_pct=110.5 srv_us_per_req=8308.27 srv_ns_per_kib=507.1 cli_cpu_pct=181.2 errors=0
+round 2 bulk giong-seg44 x8: req_s=128 gbit_s=17.126 p50_us=31808 p99_us=46408 srv_cpu_pct=103.8 srv_us_per_req=8134.80 srv_ns_per_kib=496.5 cli_cpu_pct=169.6 errors=0
+round 2 bulk giong-seg44 x16: req_s=134 gbit_s=18.024 p50_us=30911 p99_us=39218 srv_cpu_pct=107.7 srv_us_per_req=8019.36 srv_ns_per_kib=489.5 cli_cpu_pct=167.8 errors=0
+round 2 bulk giong-plain x1: req_s=33 gbit_s=4.442 p50_us=121949 p99_us=150634 srv_cpu_pct=97.4 srv_us_per_req=29425.98 srv_ns_per_kib=1796.0 cli_cpu_pct=74.2 errors=0
+round 2 bulk giong-epoll x1: req_s=63 gbit_s=8.509 p50_us=62336 p99_us=90276 srv_cpu_pct=67.4 srv_us_per_req=10630.91 srv_ns_per_kib=648.9 cli_cpu_pct=88.3 errors=0
+round 2 bulk giong-epoll x4: req_s=119 gbit_s=15.999 p50_us=32721 p99_us=54049 srv_cpu_pct=121.3 srv_us_per_req=10176.17 srv_ns_per_kib=621.1 cli_cpu_pct=153.2 errors=0
+round 2 bulk giong-epoll x8: req_s=133 gbit_s=17.823 p50_us=31024 p99_us=40204 srv_cpu_pct=135.6 srv_us_per_req=10210.84 srv_ns_per_kib=623.2 cli_cpu_pct=180.6 errors=0
+round 2 bulk giong-epoll x16: req_s=139 gbit_s=18.722 p50_us=28797 p99_us=37625 srv_cpu_pct=160.9 srv_us_per_req=11534.05 srv_ns_per_kib=704.0 cli_cpu_pct=179.0 errors=0
+round 2 many quinn x1: req_s=328282 gbit_s=2.689 p50_us=1798 p99_us=29719 srv_cpu_pct=100.5 srv_us_per_req=3.06 srv_ns_per_kib=3061.4 cli_cpu_pct=281.2 errors=0
+round 2 many quinn x4: req_s=335277 gbit_s=2.747 p50_us=1733 p99_us=29768 srv_cpu_pct=100.4 srv_us_per_req=2.99 srv_ns_per_kib=2994.5 cli_cpu_pct=290.4 errors=0
+round 2 many quinn x8: req_s=328585 gbit_s=2.692 p50_us=1741 p99_us=29707 srv_cpu_pct=100.6 srv_us_per_req=3.06 srv_ns_per_kib=3061.6 cli_cpu_pct=284.3 errors=0
+round 2 many quinn x16: req_s=329256 gbit_s=2.697 p50_us=1769 p99_us=29830 srv_cpu_pct=100.5 srv_us_per_req=3.05 srv_ns_per_kib=3052.1 cli_cpu_pct=282.3 errors=0
+round 2 many proto-tokio x1: req_s=509735 gbit_s=4.176 p50_us=498 p99_us=28082 srv_cpu_pct=100.5 srv_us_per_req=1.97 srv_ns_per_kib=1971.5 cli_cpu_pct=412.3 errors=0
+round 2 many giong x1: req_s=458418 gbit_s=3.755 p50_us=597 p99_us=55053 srv_cpu_pct=100.6 srv_us_per_req=2.19 srv_ns_per_kib=2194.4 cli_cpu_pct=360.5 errors=0
+round 2 many giong x4: req_s=1457136 gbit_s=11.937 p50_us=333 p99_us=855 srv_cpu_pct=355.8 srv_us_per_req=2.44 srv_ns_per_kib=2441.7 cli_cpu_pct=1119.6 errors=0
+round 2 many giong x8: req_s=1921015 gbit_s=15.737 p50_us=340 p99_us=621 srv_cpu_pct=502.9 srv_us_per_req=2.62 srv_ns_per_kib=2617.7 cli_cpu_pct=1390.7 errors=0
+round 2 many giong x16: req_s=1908693 gbit_s=15.636 p50_us=290 p99_us=704 srv_cpu_pct=568.6 srv_us_per_req=2.98 srv_ns_per_kib=2978.8 cli_cpu_pct=1410.1 errors=0
+round 2 many giong-seg44 x1: req_s=448522 gbit_s=3.674 p50_us=610 p99_us=55286 srv_cpu_pct=100.6 srv_us_per_req=2.24 srv_ns_per_kib=2242.8 cli_cpu_pct=353.0 errors=0
+round 2 many giong-seg44 x4: req_s=1249156 gbit_s=10.233 p50_us=345 p99_us=1401 srv_cpu_pct=314.4 srv_us_per_req=2.52 srv_ns_per_kib=2516.7 cli_cpu_pct=971.5 errors=0
+round 2 many giong-seg44 x8: req_s=1693132 gbit_s=13.870 p50_us=348 p99_us=764 srv_cpu_pct=444.5 srv_us_per_req=2.63 srv_ns_per_kib=2625.1 cli_cpu_pct=1286.4 errors=0
+round 2 many giong-seg44 x16: req_s=1893371 gbit_s=15.510 p50_us=289 p99_us=870 srv_cpu_pct=614.1 srv_us_per_req=3.24 srv_ns_per_kib=3243.7 cli_cpu_pct=1387.2 errors=0
+round 2 many giong-plain x1: failed=1
+round 2 many giong-epoll x1: req_s=435462 gbit_s=3.567 p50_us=611 p99_us=55388 srv_cpu_pct=100.5 srv_us_per_req=2.31 srv_ns_per_kib=2307.8 cli_cpu_pct=334.7 errors=0
+round 2 many giong-epoll x4: req_s=1292326 gbit_s=10.587 p50_us=351 p99_us=27009 srv_cpu_pct=304.7 srv_us_per_req=2.36 srv_ns_per_kib=2357.5 cli_cpu_pct=958.5 errors=0
+round 2 many giong-epoll x8: req_s=1932026 gbit_s=15.827 p50_us=321 p99_us=706 srv_cpu_pct=488.1 srv_us_per_req=2.53 srv_ns_per_kib=2526.2 cli_cpu_pct=1375.2 errors=0
+round 2 many giong-epoll x16: req_s=1862572 gbit_s=15.258 p50_us=309 p99_us=760 srv_cpu_pct=541.6 srv_us_per_req=2.91 srv_ns_per_kib=2907.8 cli_cpu_pct=1365.3 errors=0
+round 3 rr quinn x1: req_s=697434 gbit_s=0.558 p50_us=178 p99_us=312 srv_cpu_pct=99.1 srv_us_per_req=1.42 srv_ns_per_kib=14550.2 cli_cpu_pct=563.2 errors=0
+round 3 rr quinn x4: req_s=695009 gbit_s=0.556 p50_us=178 p99_us=330 srv_cpu_pct=99.5 srv_us_per_req=1.43 srv_ns_per_kib=14659.2 cli_cpu_pct=565.2 errors=0
+round 3 rr quinn x8: req_s=691375 gbit_s=0.553 p50_us=180 p99_us=318 srv_cpu_pct=99.5 srv_us_per_req=1.44 srv_ns_per_kib=14736.3 cli_cpu_pct=562.4 errors=0
+round 3 rr quinn x16: req_s=682941 gbit_s=0.546 p50_us=182 p99_us=337 srv_cpu_pct=98.6 srv_us_per_req=1.44 srv_ns_per_kib=14783.3 cli_cpu_pct=541.4 errors=0
+round 3 rr proto-tokio x1: req_s=1033106 gbit_s=0.826 p50_us=119 p99_us=261 srv_cpu_pct=94.9 srv_us_per_req=0.92 srv_ns_per_kib=9405.8 cli_cpu_pct=772.4 errors=0
+round 3 rr giong x1: req_s=594767 gbit_s=0.476 p50_us=115 p99_us=267 srv_cpu_pct=68.4 srv_us_per_req=1.15 srv_ns_per_kib=11775.5 cli_cpu_pct=494.2 errors=0
+round 3 rr giong x4: req_s=172844 gbit_s=0.138 p50_us=109 p99_us=28408 srv_cpu_pct=25.0 srv_us_per_req=1.45 srv_ns_per_kib=14809.9 cli_cpu_pct=150.1 errors=0
+round 3 rr giong x8: req_s=246923 gbit_s=0.198 p50_us=106 p99_us=1291 srv_cpu_pct=35.1 srv_us_per_req=1.42 srv_ns_per_kib=14555.8 cli_cpu_pct=212.0 errors=0
+round 3 rr giong x16: req_s=108779 gbit_s=0.087 p50_us=93 p99_us=53577 srv_cpu_pct=17.3 srv_us_per_req=1.59 srv_ns_per_kib=16283.3 cli_cpu_pct=95.2 errors=0
+round 3 rr giong-seg44 x1: req_s=801341 gbit_s=0.641 p50_us=129 p99_us=275 srv_cpu_pct=90.9 srv_us_per_req=1.13 srv_ns_per_kib=11615.1 cli_cpu_pct=615.9 errors=0
+round 3 rr giong-seg44 x4: req_s=353989 gbit_s=0.283 p50_us=101 p99_us=272 srv_cpu_pct=49.3 srv_us_per_req=1.39 srv_ns_per_kib=14260.3 cli_cpu_pct=301.2 errors=0
+round 3 rr giong-seg44 x8: req_s=145548 gbit_s=0.116 p50_us=105 p99_us=52854 srv_cpu_pct=21.1 srv_us_per_req=1.45 srv_ns_per_kib=14844.3 cli_cpu_pct=125.8 errors=0
+round 3 rr giong-seg44 x16: req_s=116224 gbit_s=0.093 p50_us=90 p99_us=53523 srv_cpu_pct=18.7 srv_us_per_req=1.61 srv_ns_per_kib=16474.2 cli_cpu_pct=101.0 errors=0
+round 3 rr giong-plain x1: req_s=824945 gbit_s=0.660 p50_us=141 p99_us=291 srv_cpu_pct=96.3 srv_us_per_req=1.17 srv_ns_per_kib=11953.2 cli_cpu_pct=628.8 errors=0
+round 3 rr giong-epoll x1: req_s=646831 gbit_s=0.517 p50_us=123 p99_us=274 srv_cpu_pct=72.6 srv_us_per_req=1.12 srv_ns_per_kib=11492.4 cli_cpu_pct=501.3 errors=0
+round 3 rr giong-epoll x4: req_s=249571 gbit_s=0.200 p50_us=101 p99_us=673 srv_cpu_pct=36.5 srv_us_per_req=1.46 srv_ns_per_kib=14975.3 cli_cpu_pct=210.5 errors=0
+round 3 rr giong-epoll x8: req_s=325612 gbit_s=0.260 p50_us=110 p99_us=277 srv_cpu_pct=47.4 srv_us_per_req=1.46 srv_ns_per_kib=14905.7 cli_cpu_pct=276.9 errors=0
+round 3 rr giong-epoll x16: req_s=279513 gbit_s=0.224 p50_us=99 p99_us=336 srv_cpu_pct=40.8 srv_us_per_req=1.46 srv_ns_per_kib=14945.9 cli_cpu_pct=236.3 errors=0
+round 3 bulk quinn x1: req_s=114 gbit_s=15.327 p50_us=33587 p99_us=47834 srv_cpu_pct=87.7 srv_us_per_req=7679.51 srv_ns_per_kib=468.7 cli_cpu_pct=121.0 errors=0
+round 3 bulk quinn x4: req_s=110 gbit_s=14.710 p50_us=34563 p99_us=53896 srv_cpu_pct=85.2 srv_us_per_req=7773.72 srv_ns_per_kib=474.5 cli_cpu_pct=115.1 errors=0
+round 3 bulk quinn x8: req_s=117 gbit_s=15.676 p50_us=32380 p99_us=45515 srv_cpu_pct=91.6 srv_us_per_req=7842.47 srv_ns_per_kib=478.7 cli_cpu_pct=123.2 errors=0
+round 3 bulk quinn x16: req_s=108 gbit_s=14.562 p50_us=35173 p99_us=52776 srv_cpu_pct=84.6 srv_us_per_req=7797.24 srv_ns_per_kib=475.9 cli_cpu_pct=114.5 errors=0
+round 3 bulk proto-tokio x1: req_s=93 gbit_s=12.495 p50_us=41896 p99_us=65311 srv_cpu_pct=76.3 srv_us_per_req=8195.49 srv_ns_per_kib=500.2 cli_cpu_pct=99.2 errors=0
+round 3 bulk giong x1: req_s=66 gbit_s=8.845 p50_us=59184 p99_us=92824 srv_cpu_pct=68.0 srv_us_per_req=10318.66 srv_ns_per_kib=629.8 cli_cpu_pct=94.7 errors=0
+round 3 bulk giong x4: req_s=118 gbit_s=15.891 p50_us=33200 p99_us=57792 srv_cpu_pct=112.0 srv_us_per_req=9459.46 srv_ns_per_kib=577.4 cli_cpu_pct=153.5 errors=0
+round 3 bulk giong x8: req_s=115 gbit_s=15.381 p50_us=33382 p99_us=54478 srv_cpu_pct=109.5 srv_us_per_req=9554.97 srv_ns_per_kib=583.2 cli_cpu_pct=146.2 errors=0
+round 3 bulk giong x16: req_s=119 gbit_s=15.917 p50_us=32755 p99_us=54488 srv_cpu_pct=115.1 srv_us_per_req=9704.89 srv_ns_per_kib=592.3 cli_cpu_pct=154.9 errors=0
+round 3 bulk giong-seg44 x1: req_s=74 gbit_s=9.945 p50_us=53077 p99_us=79144 srv_cpu_pct=63.0 srv_us_per_req=8502.02 srv_ns_per_kib=518.9 cli_cpu_pct=100.7 errors=0
+round 3 bulk giong-seg44 x4: req_s=98 gbit_s=13.113 p50_us=40489 p99_us=64485 srv_cpu_pct=81.5 srv_us_per_req=8341.86 srv_ns_per_kib=509.1 cli_cpu_pct=122.0 errors=0
+round 3 bulk giong-seg44 x8: req_s=120 gbit_s=16.105 p50_us=32016 p99_us=58310 srv_cpu_pct=96.2 srv_us_per_req=8016.67 srv_ns_per_kib=489.3 cli_cpu_pct=153.5 errors=0
+round 3 bulk giong-seg44 x16: req_s=136 gbit_s=18.226 p50_us=29873 p99_us=38569 srv_cpu_pct=122.3 srv_us_per_req=9005.89 srv_ns_per_kib=549.7 cli_cpu_pct=180.3 errors=0
+round 3 bulk giong-plain x1: req_s=35 gbit_s=4.711 p50_us=112686 p99_us=137945 srv_cpu_pct=99.4 srv_us_per_req=28319.09 srv_ns_per_kib=1728.5 cli_cpu_pct=78.6 errors=0
+round 3 bulk giong-epoll x1: req_s=67 gbit_s=9.005 p50_us=59237 p99_us=82213 srv_cpu_pct=70.3 srv_us_per_req=10476.90 srv_ns_per_kib=639.5 cli_cpu_pct=93.3 errors=0
+round 3 bulk giong-epoll x4: req_s=103 gbit_s=13.783 p50_us=39218 p99_us=59963 srv_cpu_pct=101.6 srv_us_per_req=9892.89 srv_ns_per_kib=603.8 cli_cpu_pct=133.0 errors=0
+round 3 bulk giong-epoll x8: req_s=100 gbit_s=13.461 p50_us=40722 p99_us=67752 srv_cpu_pct=99.8 srv_us_per_req=9950.15 srv_ns_per_kib=607.3 cli_cpu_pct=130.1 errors=0
+round 3 bulk giong-epoll x16: req_s=118 gbit_s=15.904 p50_us=33643 p99_us=46081 srv_cpu_pct=125.3 srv_us_per_req=10573.84 srv_ns_per_kib=645.4 cli_cpu_pct=150.1 errors=0
+round 3 many quinn x1: req_s=334314 gbit_s=2.739 p50_us=1804 p99_us=29854 srv_cpu_pct=100.5 srv_us_per_req=3.01 srv_ns_per_kib=3006.1 cli_cpu_pct=284.4 errors=0
+round 3 many quinn x4: req_s=340179 gbit_s=2.787 p50_us=1751 p99_us=29735 srv_cpu_pct=100.4 srv_us_per_req=2.95 srv_ns_per_kib=2951.3 cli_cpu_pct=288.6 errors=0
+round 3 many quinn x8: req_s=330685 gbit_s=2.709 p50_us=1803 p99_us=29842 srv_cpu_pct=100.6 srv_us_per_req=3.04 srv_ns_per_kib=3041.9 cli_cpu_pct=283.6 errors=0
+round 3 many quinn x16: req_s=337444 gbit_s=2.764 p50_us=1737 p99_us=29650 srv_cpu_pct=100.5 srv_us_per_req=2.98 srv_ns_per_kib=2978.1 cli_cpu_pct=285.8 errors=0
+round 3 many proto-tokio x1: req_s=502653 gbit_s=4.118 p50_us=493 p99_us=28118 srv_cpu_pct=100.4 srv_us_per_req=2.00 srv_ns_per_kib=1997.2 cli_cpu_pct=405.9 errors=0
+round 3 many giong x1: req_s=450600 gbit_s=3.691 p50_us=607 p99_us=55153 srv_cpu_pct=100.7 srv_us_per_req=2.23 srv_ns_per_kib=2234.7 cli_cpu_pct=353.8 errors=0
+round 3 many giong x4: req_s=1486887 gbit_s=12.181 p50_us=350 p99_us=674 srv_cpu_pct=375.6 srv_us_per_req=2.53 srv_ns_per_kib=2525.9 cli_cpu_pct=1120.1 errors=0
+round 3 many giong x8: req_s=1950255 gbit_s=15.976 p50_us=297 p99_us=561 srv_cpu_pct=527.1 srv_us_per_req=2.70 srv_ns_per_kib=2702.6 cli_cpu_pct=1408.9 errors=0
+round 3 many giong x16: req_s=2036882 gbit_s=16.686 p50_us=338 p99_us=691 srv_cpu_pct=706.3 srv_us_per_req=3.47 srv_ns_per_kib=3467.6 cli_cpu_pct=1459.0 errors=0
+round 3 many giong-seg44 x1: req_s=444646 gbit_s=3.643 p50_us=620 p99_us=55244 srv_cpu_pct=100.7 srv_us_per_req=2.26 srv_ns_per_kib=2264.7 cli_cpu_pct=345.9 errors=0
+round 3 many giong-seg44 x4: req_s=1496378 gbit_s=12.258 p50_us=338 p99_us=662 srv_cpu_pct=369.7 srv_us_per_req=2.47 srv_ns_per_kib=2470.5 cli_cpu_pct=1151.3 errors=0
+round 3 many giong-seg44 x8: req_s=1934427 gbit_s=15.847 p50_us=322 p99_us=680 srv_cpu_pct=516.3 srv_us_per_req=2.67 srv_ns_per_kib=2668.8 cli_cpu_pct=1401.1 errors=0
+round 3 many giong-seg44 x16: req_s=1809931 gbit_s=14.827 p50_us=233 p99_us=969 srv_cpu_pct=543.3 srv_us_per_req=3.00 srv_ns_per_kib=3001.8 cli_cpu_pct=1367.7 errors=0
+round 3 many giong-plain x1: failed=1
+round 3 many giong-epoll x1: req_s=438826 gbit_s=3.595 p50_us=609 p99_us=54702 srv_cpu_pct=100.6 srv_us_per_req=2.29 srv_ns_per_kib=2292.4 cli_cpu_pct=341.2 errors=0
+round 3 many giong-epoll x4: req_s=1451583 gbit_s=11.891 p50_us=384 p99_us=1442 srv_cpu_pct=344.6 srv_us_per_req=2.37 srv_ns_per_kib=2373.7 cli_cpu_pct=1060.0 errors=0
+round 3 many giong-epoll x8: req_s=1845420 gbit_s=15.118 p50_us=325 p99_us=631 srv_cpu_pct=457.1 srv_us_per_req=2.48 srv_ns_per_kib=2476.8 cli_cpu_pct=1353.6 errors=0
+round 3 many giong-epoll x16: req_s=2006480 gbit_s=16.437 p50_us=325 p99_us=650 srv_cpu_pct=586.0 srv_us_per_req=2.92 srv_ns_per_kib=2920.7 cli_cpu_pct=1422.2 errors=0
+median of rounds (min-max in brackets)
+
+rr
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+quinn x1          6.716e+05 [6.7e+05-6.97e+05]       0.537 [0.536-0.558]             316 [312-354]            98.8 [98-99.1]          1.46 [1.42-1.47]1.494e+04 [1.46e+04-1.51e+04]
+quinn x4          6.95e+05 [6.92e+05-7.05e+05]       0.556 [0.553-0.564]             317 [312-330]          99.5 [98.4-99.6]          1.42 [1.41-1.43]1.456e+04 [1.45e+04-1.47e+04]
+quinn x8          6.956e+05 [6.91e+05-7.07e+05]       0.556 [0.553-0.566]             317 [313-318]          99.5 [99.5-99.8]          1.43 [1.41-1.44]1.469e+04 [1.44e+04-1.47e+04]
+quinn x16         6.829e+05 [6.74e+05-7.12e+05]         0.546 [0.54-0.57]             325 [302-337]          98.6 [98.5-99.3]          1.44 [1.39-1.46]1.478e+04 [1.43e+04-1.5e+04]
+proto-tokio x1    1.033e+06 [1.02e+06-1.04e+06]        0.826 [0.819-0.83]             258 [258-261]          94.9 [93.7-94.9]          0.91 [0.91-0.92]  9369 [9.37e+03-9.41e+03]
+giong x1          4.46e+05 [1.81e+05-5.95e+05]       0.357 [0.145-0.476]         272 [267-2.7e+04]            56 [25.8-68.4]          1.26 [1.15-1.42]1.286e+04 [1.18e+04-1.46e+04]
+giong x4          1.127e+05 [1.03e+05-1.73e+05]        0.09 [0.082-0.138]5.336e+04 [2.84e+04-5.35e+04]            18.1 [15.9-25]          1.55 [1.45-1.61]1.584e+04 [1.48e+04-1.64e+04]
+giong x8          2.711e+05 [2.47e+05-3.19e+05]       0.217 [0.198-0.255]        320 [274-1.29e+03]          36.1 [35.1-45.8]          1.42 [1.33-1.44]1.456e+04 [1.36e+04-1.47e+04]
+giong x16         1.153e+05 [1.09e+05-3.42e+05]       0.092 [0.087-0.274]  5.351e+04 [271-5.36e+04]          18.3 [17.3-45.3]          1.59 [1.32-1.59]1.626e+04 [1.36e+04-1.63e+04]
+giong-seg44 x1    3.79e+05 [3.58e+05-8.01e+05]       0.303 [0.286-0.641]             274 [271-275]            49.2 [44-90.9]           1.23 [1.13-1.3]1.26e+04 [1.16e+04-1.33e+04]
+giong-seg44 x4    3.54e+05 [2.81e+05-4.95e+05]       0.283 [0.225-0.396]             272 [265-379]          49.3 [38.8-64.5]           1.38 [1.3-1.39]1.414e+04 [1.33e+04-1.43e+04]
+giong-seg44 x8    1.455e+05 [1.09e+05-2.3e+05]       0.116 [0.087-0.184]5.285e+04 [1.85e+03-5.35e+04]          21.1 [17.4-32.1]          1.45 [1.39-1.59]1.484e+04 [1.43e+04-1.63e+04]
+giong-seg44 x16   1.179e+05 [1.16e+05-2.2e+05]       0.094 [0.093-0.176]5.337e+04 [2.63e+04-5.35e+04]          19.5 [18.7-30.9]          1.61 [1.41-1.65]1.647e+04 [1.44e+04-1.69e+04]
+giong-plain x1    8.698e+05 [8.25e+05-8.85e+05]        0.696 [0.66-0.708]             285 [283-291]          96.3 [96.2-97.2]           1.11 [1.1-1.17]1.132e+04 [1.12e+04-1.2e+04]
+giong-epoll x1    4.69e+05 [2.01e+05-6.47e+05]       0.375 [0.161-0.517]        274 [266-2.64e+04]          54.9 [26.2-72.6]           1.17 [1.12-1.3]1.199e+04 [1.15e+04-1.34e+04]
+giong-epoll x4    2.171e+05 [1.44e+05-2.5e+05]         0.174 [0.115-0.2]   2.623e+04 [673-5.3e+04]            30 [22.1-36.5]          1.46 [1.38-1.54]1.498e+04 [1.42e+04-1.57e+04]
+giong-epoll x8    2.884e+05 [1.36e+05-3.26e+05]        0.231 [0.109-0.26]         292 [277-5.3e+04]          40.9 [21.4-47.4]          1.46 [1.42-1.57]1.491e+04 [1.45e+04-1.61e+04]
+giong-epoll x16   2.795e+05 [2.07e+05-4.03e+05]       0.224 [0.166-0.323]        336 [263-2.66e+04]          40.8 [32.2-60.4]           1.5 [1.46-1.56]1.533e+04 [1.49e+04-1.59e+04]
+
+bulk
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+quinn x1                        101 [99-114]          13.5 [13.3-15.3]5.703e+04 [4.78e+04-6.43e+04]            80 [77.4-87.7]  7787 [7.68e+03-7.95e+03]           475.3 [469-485]
+quinn x4                       110 [104-112]         14.71 [13.9-15.1]5.249e+04 [4.79e+04-5.39e+04]          85.2 [81.7-88.8]  7886 [7.77e+03-7.91e+03]           481.3 [474-483]
+quinn x8                        115 [96-117]           15.45 [13-15.7]4.552e+04 [4.49e+04-6.35e+04]            89.2 [76-91.6]  7842 [7.75e+03-7.88e+03]           478.7 [473-481]
+quinn x16                       108 [78-111]         14.56 [10.5-14.9]5.228e+04 [5.04e+04-5.28e+04]          84.6 [61.6-86.4]  7797 [7.78e+03-7.89e+03]           475.9 [475-481]
+proto-tokio x1                  104 [93-113]         13.95 [12.5-15.2]6.384e+04 [4.79e+04-6.53e+04]          82.5 [76.3-90.2]   7961 [7.94e+03-8.2e+03]           485.9 [485-500]
+giong x1                          66 [66-72]         8.925 [8.85-9.72]9.282e+04 [8.95e+04-1.22e+05]            69.3 [68-73.9]1.032e+04 [1.02e+04-1.04e+04]           629.8 [623-636]
+giong x4                       121 [118-123]         16.24 [15.9-16.6]5.646e+04 [5.38e+04-5.78e+04]           114.7 [112-122]  9479 [9.46e+03-9.85e+03]           578.6 [577-602]
+giong x8                       122 [115-137]         16.33 [15.4-18.4]5.448e+04 [3.85e+04-5.49e+04]           118.6 [110-131]  9555 [9.55e+03-9.75e+03]           583.2 [583-595]
+giong x16                      128 [119-136]         17.15 [15.9-18.2]4.286e+04 [3.76e+04-5.45e+04]           133.3 [115-136]   9823 [9.7e+03-1.07e+04]           599.6 [592-651]
+giong-seg44 x1                    74 [73-85]         9.945 [9.86-11.4]7.914e+04 [6.94e+04-8.14e+04]            63.5 [63-70.4]  8502 [8.29e+03-8.64e+03]           518.9 [506-527]
+giong-seg44 x4                  133 [98-135]         17.85 [13.1-18.1]4.068e+04 [3.99e+04-6.45e+04]          106.3 [81.5-110]  8308 [7.87e+03-8.34e+03]           507.1 [480-509]
+giong-seg44 x8                 124 [120-128]          16.6 [16.1-17.1]4.641e+04 [4.35e+04-5.83e+04]           99.4 [96.2-104]  8036 [8.02e+03-8.13e+03]           490.5 [489-496]
+giong-seg44 x16                134 [129-136]         18.02 [17.4-18.2]3.922e+04 [3.86e+04-4.51e+04]           107.7 [106-122]  8198 [8.02e+03-9.01e+03]           500.4 [490-550]
+giong-plain x1                    35 [33-35]         4.711 [4.44-4.74]1.392e+05 [1.38e+05-1.51e+05]          99.4 [97.4-99.7]2.832e+04 [2.82e+04-2.94e+04]   1728 [1.72e+03-1.8e+03]
+giong-epoll x1                    67 [63-72]         9.005 [8.51-9.65]8.408e+04 [8.22e+04-9.03e+04]          70.3 [67.4-75.3]1.048e+04 [1.05e+04-1.06e+04]           639.5 [639-649]
+giong-epoll x4                 111 [103-119]           14.92 [13.8-16]5.405e+04 [5.21e+04-6e+04]           111.2 [102-121] 1e+04 [9.89e+03-1.02e+04]           610.4 [604-621]
+giong-epoll x8                 131 [100-133]         17.53 [13.5-17.8]4.02e+04 [3.71e+04-6.78e+04]          131.2 [99.8-136]1.005e+04 [9.95e+03-1.02e+04]           613.2 [607-623]
+giong-epoll x16                139 [118-141]         18.72 [15.9-18.9]3.762e+04 [3.76e+04-4.61e+04]           144.8 [125-161]1.057e+04 [1.03e+04-1.15e+04]           645.4 [627-704]
+
+many
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+quinn x1          3.343e+05 [3.28e+05-3.39e+05]         2.739 [2.69-2.78]2.974e+04 [2.97e+04-2.99e+04]           100.5 [100-100]          3.01 [2.96-3.06]  3006 [2.96e+03-3.06e+03]
+quinn x4          3.353e+05 [3.35e+05-3.4e+05]         2.747 [2.74-2.79]2.976e+04 [2.97e+04-2.98e+04]           100.4 [100-101]             2.99 [2.95-3]     2994 [2.95e+03-3e+03]
+quinn x8          3.305e+05 [3.29e+05-3.31e+05]         2.707 [2.69-2.71]2.973e+04 [2.97e+04-2.98e+04]           100.6 [100-101]          3.04 [3.04-3.06]  3042 [3.04e+03-3.06e+03]
+quinn x16         3.365e+05 [3.29e+05-3.37e+05]          2.757 [2.7-2.76]2.968e+04 [2.96e+04-2.98e+04]           100.5 [100-100]          2.98 [2.98-3.05]  2984 [2.98e+03-3.05e+03]
+proto-tokio x1    5.053e+05 [5.03e+05-5.1e+05]          4.14 [4.12-4.18]2.808e+04 [2.81e+04-2.81e+04]           100.5 [100-101]             1.99 [1.97-2]     1991 [1.97e+03-2e+03]
+giong x1          4.521e+05 [4.51e+05-4.58e+05]         3.704 [3.69-3.75]5.515e+04 [5.51e+04-5.52e+04]           100.6 [100-101]          2.22 [2.19-2.23]  2223 [2.19e+03-2.23e+03]
+giong x4          1.462e+06 [1.46e+06-1.49e+06]         11.97 [11.9-12.2]             754 [674-855]           366.4 [356-376]          2.51 [2.44-2.53]  2507 [2.44e+03-2.53e+03]
+giong x8          1.921e+06 [1.67e+06-1.95e+06]           15.74 [13.7-16]             621 [561-712]           502.9 [430-527]           2.62 [2.57-2.7]   2618 [2.57e+03-2.7e+03]
+giong x16         1.909e+06 [1.78e+06-2.04e+06]         15.64 [14.6-16.7]             691 [645-704]           575.8 [569-706]          3.23 [2.98-3.47]  3229 [2.98e+03-3.47e+03]
+giong-seg44 x1    4.485e+05 [4.45e+05-4.56e+05]         3.674 [3.64-3.74]5.527e+04 [5.52e+04-5.53e+04]           100.6 [100-101]           2.24 [2.2-2.26]   2243 [2.2e+03-2.26e+03]
+giong-seg44 x4    1.455e+06 [1.25e+06-1.5e+06]         11.92 [10.2-12.3]         662 [662-1.4e+03]           364.2 [314-370]           2.5 [2.47-2.52]  2503 [2.47e+03-2.52e+03]
+giong-seg44 x8    1.932e+06 [1.69e+06-1.93e+06]         15.83 [13.9-15.8]             680 [564-764]           516.3 [444-519]          2.67 [2.63-2.69]  2669 [2.63e+03-2.69e+03]
+giong-seg44 x16   1.893e+06 [1.81e+06-2.06e+06]         15.51 [14.8-16.9]             870 [741-969]           614.1 [543-664]             3.22 [3-3.24]     3225 [3e+03-3.24e+03]
+giong-plain x1                       1 [1-1]                         -                         -                         -                         -                         -
+giong-epoll x1    4.388e+05 [4.35e+05-4.4e+05]          3.595 [3.57-3.6]5.47e+04 [2.96e+04-5.54e+04]           100.6 [100-101]          2.29 [2.29-2.31]  2292 [2.29e+03-2.31e+03]
+giong-epoll x4    1.444e+06 [1.29e+06-1.45e+06]         11.83 [10.6-11.9]   1442 [1.24e+03-2.7e+04]           344.6 [305-345]          2.37 [2.36-2.39]  2374 [2.36e+03-2.39e+03]
+giong-epoll x8    1.931e+06 [1.85e+06-1.93e+06]         15.82 [15.1-15.8]             631 [626-706]           483.6 [457-488]           2.5 [2.48-2.53]  2504 [2.48e+03-2.53e+03]
+giong-epoll x16   1.984e+06 [1.86e+06-2.01e+06]         16.26 [15.3-16.4]             657 [650-760]             586 [542-607]          2.92 [2.91-3.06]  2921 [2.91e+03-3.06e+03]

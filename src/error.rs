@@ -261,6 +261,18 @@ codes! {
     /// control character, or a status outside `200..=599`. Raised by
     /// `Response::try_header` and `Response::try_new`.
     HttpInvalidResponse = 1119, InvalidInput, "invalid HTTP response";
+    /// The server refused a request without calling its handler: the
+    /// requests its worker was receiving in full already held
+    /// `Server::max_buffered_request_bytes`. Answered with `503 Service
+    /// Unavailable` and `Retry-After: 1` over HTTP/1.1 (this code in the
+    /// body), `REFUSED_STREAM` over HTTP/2.
+    HttpServerBusy = 1120, Other, "request refused: the server's memory budget for requests is full";
+    /// The server refused a new connection: less memory was left to the
+    /// process than `Server::min_free_memory`. Answered with `503 Service
+    /// Unavailable` and `Retry-After: 1` (this code in the body) on a
+    /// connection without TLS; a TLS connection is closed before its
+    /// handshake.
+    HttpServerLowMemory = 1121, OutOfMemory, "connection refused: the server is low on memory";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
@@ -371,6 +383,10 @@ codes! {
     /// one key and cannot change keys (TLS 1.2, or TLS 1.3 on a kernel older
     /// than 6.14), so it sent `close_notify`.
     TlsKeysExhausted = 2012, ConnectionAborted, "TLS keys used up";
+    /// A TLS setting cannot be applied to this acceptor or connector, such
+    /// as client certificates on an acceptor made from a rustls
+    /// configuration.
+    TlsConfig = 2013, InvalidInput, "TLS setting not possible here";
 
     // ---------------------------------------------------- giong-postgres
     /// The configuration or connection URL is not valid.
@@ -568,12 +584,20 @@ impl fmt::Display for Error {
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Error")
-            .field("code", &self.code)
-            .field("message", &self.message())
-            .field("fix", &self.fix)
-            .field("source", &self.source)
-            .finish()
+        // What `main` prints when it returns this error. A wrapped error's
+        // message already says how to fix it and is its own source, so
+        // neither is shown twice.
+        let mut d = f.debug_struct("Error");
+        d.field("code", &self.code)
+            .field("message", &self.message());
+        if !self.fix.is_empty() {
+            d.field("fix", &self.fix);
+        }
+        match (&self.source, self.wrapped) {
+            (Some(source), false) => d.field("source", source),
+            _ => &mut d,
+        };
+        d.finish()
     }
 }
 
@@ -683,6 +707,11 @@ mod tests {
         assert_eq!(e.to_string(), "GIONG-E3003: refused");
         assert!(e.get_ref().unwrap().downcast_ref::<Companion>().is_some());
         assert!(e.source().is_none());
+        // What `main` prints: the message once, no empty fix.
+        assert_eq!(
+            format!("{e:?}"),
+            "Error { code: PostgresAuth, message: \"GIONG-E3003: refused\" }"
+        );
         let io = io::Error::new(io::ErrorKind::PermissionDenied, e);
         assert_eq!(code(&io), Some(Code::PostgresAuth));
     }

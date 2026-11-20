@@ -242,9 +242,32 @@ fn blocked_json(b: Option<Blocked>, now: Instant) -> Value {
     }
 }
 
+/// `true` for the task giong-http spawns for each connection, which runs
+/// the connection's request handlers.
+fn http_connection(l: Location) -> bool {
+    in_giong_http_server(l.file())
+}
+
+fn in_giong_http_server(file: &str) -> bool {
+    let file = file.replace('\\', "/");
+    file.ends_with("/src/server.rs")
+        && file
+            .rsplit('/')
+            .nth(2)
+            .is_some_and(|dir| dir == "giong-http" || dir.starts_with("giong-http-"))
+}
+
 fn blocked_warning(w: usize, b: Blocked, now: Instant) -> String {
     let secs = now.duration_since(b.since).as_secs_f64();
     match b.task {
+        Some(task) if http_connection(task) => format!(
+            "worker {w} has been inside one poll of a giong-http connection's task (spawned at \
+             {}) for {secs:.1} s: a request handler on that connection blocks the thread (a \
+             blocking call, a long computation or a loop without .await), and every other \
+             task on worker {w} waits. giong cannot name the handler: look for blocking calls \
+             in the handlers, and in the code they call",
+            location(task)
+        ),
         Some(task) => format!(
             "worker {w} has been inside one poll of the task spawned at {} for {secs:.1} s: \
              that task blocks the thread (a blocking call, a long computation or a loop \
@@ -712,7 +735,9 @@ async fn profile(state: &State, args: &Map<String, Value>) -> Result<Value, Stri
         "total": total,
         "workers": workers,
         "note": "share: the part of the window a worker spent polling tasks spawned at that \
-                 location. busy: the part it was awake; the rest of the awake time went to \
+                 location. A location in giong-http's src/server.rs is the task of a \
+                 connection: the time of the request handlers it runs, and of giong-http \
+                 around them. busy: the part it was awake; the rest of the awake time went to \
                  the kernel (I/O) and to the runtime itself.",
     }))
 }
@@ -720,6 +745,26 @@ async fn profile(state: &State, args: &Map<String, Value>) -> Result<Value, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn giong_http_connection_tasks_are_recognised() {
+        for file in [
+            "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/giong-http-0.8.0/src/server.rs",
+            "giong-http/src/server.rs",
+            "/work/giong/giong-http/src/server.rs",
+            "C:\\Users\\k\\.cargo\\registry\\src\\x\\giong-http-0.8.0\\src\\server.rs",
+        ] {
+            assert!(in_giong_http_server(file), "{file}");
+        }
+        for file in [
+            "src/server.rs",
+            "my-app/src/server.rs",
+            "giong-http/src/client/pool.rs",
+            "giong-web/src/server.rs",
+        ] {
+            assert!(!in_giong_http_server(file), "{file}");
+        }
+    }
 
     #[test]
     fn a_profile_dropped_mid_window_turns_profiling_off() {

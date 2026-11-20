@@ -90,3 +90,53 @@ mod tests {
         drop(moved);
     }
 }
+
+/// Kani proofs (`scripts/check.sh kani`): what an operation does with a
+/// `KernelBox` (take the pointer, move the box into the operation and on
+/// to the driver, have the "kernel" write through the pointer, read the
+/// value back, drop it) touches only live memory, and the drop frees the
+/// allocation exactly once. Kani's memory model reports a write to freed
+/// memory, a double free and a dangling read as failures. Kani does not
+/// model the aliasing rules (Stacked or Tree Borrows); the Miri job in CI
+/// covers those for the same type.
+#[cfg(kani)]
+mod proofs {
+    use super::KernelBox;
+
+    #[kani::proof]
+    fn pointer_survives_moves_and_drop_frees_once() {
+        let first: u64 = kani::any();
+        let written: u64 = kani::any();
+        let kb = KernelBox::new(first);
+        let ptr = kb.as_ptr();
+        assert_eq!(*kb.get(), first);
+        // Into an operation, then into the driver as `Box<dyn Any>`, as a
+        // dropped future's resources go.
+        let op = (kb, 0u8);
+        let parked: Box<dyn std::any::Any> = Box::new(op);
+        // SAFETY: `ptr` points at the allocation `parked` owns.
+        unsafe { ptr.write(written) };
+        let (kb, _) = *parked.downcast::<(KernelBox<u64>, u8)>().unwrap();
+        assert_eq!(kb.as_ptr(), ptr);
+        assert_eq!(*kb.get(), written);
+        drop(kb);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn path_pointer_stays_valid() {
+        let byte: u8 = kani::any();
+        kani::assume(byte != 0);
+        let path = KernelBox::path(std::ffi::CString::new([byte, byte, byte]).unwrap());
+        let p = path.c_ptr();
+        let moved = Box::new(path);
+        // Read it as the kernel does, byte by byte up to the NUL (Kani has
+        // no `strlen`, which `CStr::from_ptr` calls).
+        for i in 0..4 {
+            // SAFETY: the C string `moved` owns is alive, 3 bytes and a NUL.
+            let c = unsafe { p.add(i).read() } as u8;
+            assert_eq!(c, if i < 3 { byte } else { 0 });
+        }
+        drop(moved);
+    }
+}

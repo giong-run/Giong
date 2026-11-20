@@ -28,6 +28,10 @@ const USER_TIMEOUT: Duration = Duration::from_secs(60);
 /// The largest reply accepted during the handshake.
 const SETUP_LIMIT: usize = 1 << 20;
 
+/// Free room asked of the read buffer before each receive: replies that
+/// arrive together are taken in one receive up to this much.
+const READ_ROOM: usize = 64 * 1024;
+
 /// The socket under a connection.
 pub(crate) enum Stream {
     Tcp(TcpStream),
@@ -65,6 +69,32 @@ impl Stream {
             #[cfg(any(test, fuzzing))]
             Stream::Detached => std::future::pending().await,
         }
+    }
+
+    /// Receives more bytes into `buf`; `Ok(0)` at the end of the stream.
+    ///
+    /// On plain TCP and Unix sockets the kernel writes straight into `buf`'s
+    /// storage (a one-off receive), which saves copying every byte out of a
+    /// pooled buffer. Not cancel safe there: dropping the future loses the
+    /// bytes in flight and leaves `buf` empty, so it is only for a loop that
+    /// owns the connection, and drops `buf` along with the future.
+    pub(crate) async fn read_into(&self, buf: &mut ReadBuf) -> io::Result<usize> {
+        let tail = match self {
+            Stream::Tcp(_) | Stream::Unix(_) => buf.lend(READ_ROOM),
+            _ => {
+                let chunk = self.recv().await?;
+                buf.extend(&chunk);
+                return Ok(chunk.len());
+            }
+        };
+        let (result, tail) = match self {
+            Stream::Tcp(s) => s.read(tail).await,
+            Stream::Unix(s) => s.read(tail).await,
+            _ => unreachable!("only sockets read in place"),
+        };
+        let n = giong::IoBuf::len(&tail);
+        buf.filled(tail);
+        result.map(|_| n)
     }
 
     pub(crate) async fn write_all(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
@@ -282,11 +312,11 @@ async fn read(config: &Config, stream: &Stream, buf: &mut ReadBuf) -> Result<Val
             }
             Next::Pending => {}
         }
-        let chunk = stream
-            .recv()
+        let n = stream
+            .read_into(buf)
             .await
             .map_err(|e| connect_error(config, "reading from the server failed", e))?;
-        if chunk.is_empty() {
+        if n == 0 {
             return Err(Error::new(
                 ErrorKind::Connect,
                 format!(
@@ -297,7 +327,6 @@ async fn read(config: &Config, stream: &Stream, buf: &mut ReadBuf) -> Result<Val
                 ),
             ));
         }
-        buf.extend(&chunk);
     }
 }
 

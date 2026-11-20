@@ -380,8 +380,9 @@ struct Config {
 
 /// Everything a worker thread owns. Reached through a thread-local.
 /// A single-shot operation whose future was dropped: its key, its
-/// resources, and whether its result is a descriptor to close.
-type DeferredCancel = (usize, Option<Box<dyn Any>>, bool);
+/// resources, whether its result is a descriptor to close, and whether it
+/// must run to the end (see [`Driver::cancel_op`]).
+type DeferredCancel = (usize, Option<Box<dyn Any>>, bool, bool);
 
 /// See [`Worker::deferred`].
 #[derive(Default)]
@@ -413,7 +414,17 @@ pub(crate) struct Worker {
     deferred: RefCell<Deferred>,
     pub(crate) tasks: RefCell<Slab<TaskSlot>>,
     pub(crate) queue: RefCell<VecDeque<usize>>,
+    /// Waker states of finished tasks, reused by the next spawns.
+    pub(crate) spare_wakers: RefCell<Vec<Arc<crate::executor::TaskWaker>>>,
+    /// Datagrams sent in this turn of the loop, for one `sendmmsg` at its end.
+    pub(crate) sends: RefCell<crate::net::SendQueue>,
+    /// `sends` may hold datagrams: read on every turn instead of borrowing it.
+    pub(crate) sends_waiting: Cell<bool>,
     pub(crate) timers: RefCell<Timers>,
+    /// The time read in this turn of the loop, if any (see [`Worker::clock`]).
+    now: Cell<Option<Instant>>,
+    /// Tasks polled since the event loop last looked for I/O.
+    polled_since_io: Cell<usize>,
     pub(crate) pool: Rc<BufPool>,
     pub(crate) next_task_uid: Cell<u64>,
     /// How long to busy-poll for new work before blocking in the kernel.
@@ -474,6 +485,9 @@ fn not_in_runtime() -> ! {
     )
 }
 
+/// Polls after which a busy worker on epoll looks for I/O again.
+const IO_POLL_INTERVAL: usize = 61;
+
 impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
@@ -497,7 +511,12 @@ impl Worker {
             deferred: RefCell::new(Deferred::default()),
             tasks: RefCell::new(Slab::new()),
             queue: RefCell::new(VecDeque::with_capacity(256)),
+            spare_wakers: RefCell::new(Vec::new()),
+            sends: RefCell::new(crate::net::SendQueue::new()),
+            sends_waiting: Cell::new(false),
             timers: RefCell::new(Timers::new()),
+            now: Cell::new(None),
+            polled_since_io: Cell::new(0),
             pool,
             next_task_uid: Cell::new(1),
             spin: cfg.spin,
@@ -595,6 +614,30 @@ impl Worker {
         );
     }
 
+    /// Hands the datagrams queued in this turn to the kernel (see
+    /// [`crate::net::SendQueue`]) once no other task is runnable, or once
+    /// they have waited a whole turn.
+    #[inline(never)]
+    fn flush_sends(&self, tick: u32) {
+        let wakers = {
+            let mut q = self.sends.borrow_mut();
+            if !q.due(tick, self.queue.borrow().is_empty()) {
+                return;
+            }
+            self.sends_waiting.set(false);
+            // Behind what the ring holds, as with a send made at once.
+            let mut driver = self.driver.borrow_mut();
+            if driver.has_queued_submissions() {
+                driver.submit_queued();
+            }
+            drop(driver);
+            q.flush()
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
     fn wake_shutdown_waiters(&self) {
         let waiters = self.shutdown_waiters.borrow_mut().take_all();
         for waker in waiters {
@@ -621,14 +664,36 @@ impl Worker {
                 self.take_balanced_job();
             }
             self.publish_load();
+            let batch = if self.driver_kind == DriverKind::Epoll {
+                self.queue.borrow().len()
+            } else {
+                0
+            };
             self.run_tasks(&mut || done = poll_main());
+            if self.sends_waiting.get() {
+                self.flush_sends(tick);
+            }
             self.publish_load();
             if done || idle() {
                 break;
             }
 
             if !self.queue.borrow().is_empty() {
-                // More tasks are runnable: just exchange work with the kernel.
+                // More tasks are runnable. On epoll, looking for I/O costs an
+                // `epoll_wait` system call however little is ready, so with
+                // small batches (tasks handing work to each other) it waits
+                // until IO_POLL_INTERVAL polls have run since the last look,
+                // as Tokio does. io_uring reads its completions from memory.
+                if self.driver_kind == DriverKind::Epoll {
+                    let polled = self.polled_since_io.get() + batch;
+                    if polled < IO_POLL_INTERVAL {
+                        self.polled_since_io.set(polled);
+                        self.fire_timers();
+                        continue;
+                    }
+                    self.polled_since_io.set(0);
+                }
+                // Just exchange work with the kernel.
                 let graveyard = self.driver.borrow_mut().park(Park::Poll);
                 drop(graveyard);
                 self.fire_timers();
@@ -673,6 +738,7 @@ impl Worker {
                 self.shared.counters.sleeping();
             }
             let graveyard = self.driver.borrow_mut().park(mode);
+            self.polled_since_io.set(0);
             self.shared.bell.unpark();
             if sleeps {
                 self.shared.counters.woke();
@@ -702,11 +768,17 @@ impl Worker {
     /// Cancels the single-shot operation `key`, whose future was dropped
     /// while the driver was borrowed, at the next turn of the event loop;
     /// see [`Driver::cancel_op`].
-    pub(crate) fn defer_cancel(&self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
+    pub(crate) fn defer_cancel(
+        &self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        result_is_fd: bool,
+        finish: bool,
+    ) {
         self.deferred
             .borrow_mut()
             .cancels
-            .push((key, data, result_is_fd));
+            .push((key, data, result_is_fd, finish));
     }
 
     /// Where the main future was started.
@@ -741,8 +813,8 @@ impl Worker {
         for key in deferred.multis {
             driver.drop_multi(key);
         }
-        for (key, data, result_is_fd) in deferred.cancels {
-            driver.cancel_op(key, data, result_is_fd);
+        for (key, data, result_is_fd, finish) in deferred.cancels {
+            driver.cancel_op(key, data, result_is_fd, finish);
         }
         for fd in deferred.closes {
             driver.close_fd(fd);
@@ -819,11 +891,33 @@ impl Worker {
         }
     }
 
+    /// The current time, read at most once per turn of the event loop: the
+    /// first timer polled in a turn reads the clock and the others reuse it.
+    pub(crate) fn clock(&self) -> Instant {
+        match self.now.get() {
+            Some(now) => now,
+            None => {
+                let now = Instant::now();
+                self.now.set(Some(now));
+                now
+            }
+        }
+    }
+
+    /// Reads the clock again and keeps the new time for the rest of the turn.
+    pub(crate) fn refresh_clock(&self) -> Instant {
+        let now = Instant::now();
+        self.now.set(Some(now));
+        now
+    }
+
     fn fire_timers(&self) {
+        // Time has passed in the kernel: the next read is a fresh one.
+        self.now.set(None);
         if self.timers.borrow().len() == 0 {
             return;
         }
-        let expired = self.timers.borrow_mut().expired(Instant::now());
+        let expired = self.timers.borrow_mut().expired(self.clock());
         for waker in expired {
             waker.wake();
         }
@@ -908,7 +1002,7 @@ impl Builder {
             pin_cores: None,
             ring_entries: 1024,
             buf_count: 512,
-            buf_size: 8 * 1024,
+            buf_size: 16 * 1024,
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
@@ -976,7 +1070,11 @@ impl Builder {
     }
 
     /// Per-worker receive buffer pool: `count` buffers (rounded up to a power
-    /// of two, at most 32768) of `size` bytes each. Default: 512 × 8 KiB.
+    /// of two, at most 32768) of `size` bytes each. Default: 512 × 16 KiB.
+    ///
+    /// Each receive brings at most one buffer's worth, so the size sets how
+    /// many receives a bulk transfer takes: at 16 KiB, giong's own `recv`
+    /// spends about 12% less CPU per byte than at 8 KiB (`bench/compat.sh`).
     ///
     /// The pool only needs to cover the connections that receive data within
     /// one turn of the event loop; when it runs short, giong moves data that

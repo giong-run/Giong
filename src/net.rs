@@ -19,12 +19,14 @@
 mod addr;
 mod balance;
 pub(crate) mod dns;
+mod sendq;
 mod share;
 mod udp;
 mod unix;
 
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
+pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
 pub use unix::{UnixListener, UnixStream};
 
@@ -36,7 +38,7 @@ use std::mem::ManuallyDrop;
 use std::net::{Shutdown, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -105,6 +107,54 @@ impl MultiSlot {
                 }
             }
         }
+    }
+}
+
+/// A task's place among those waiting on one [`MultiSlot`], for a future
+/// that polls it. Several tasks may wait on the same datagram socket; each
+/// completion wakes one of them. A future
+/// dropped while it waits gives its place up, and if it was woken for a
+/// completion it did not take, the next waiting task is woken for it, so
+/// that no completion is left with nobody woken for it.
+pub(crate) struct Waiting<'a> {
+    slot: &'a MultiSlot,
+    waker: Option<Waker>,
+}
+
+impl<'a> Waiting<'a> {
+    pub(crate) fn new(slot: &'a MultiSlot) -> Self {
+        Self { slot, waker: None }
+    }
+
+    /// Records the outcome of one poll of the slot.
+    pub(crate) fn polled<T>(&mut self, poll: &Poll<T>, cx: &Context<'_>) {
+        match poll {
+            Poll::Pending => match &self.waker {
+                Some(w) if w.will_wake(cx.waker()) => {}
+                _ => self.waker = Some(cx.waker().clone()),
+            },
+            // Served: the driver took the waker off the list.
+            Poll::Ready(_) => self.waker = None,
+        }
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let Some(waker) = self.waker.take() else {
+            return;
+        };
+        runtime::try_with_worker(|w| {
+            if let Some((key, uid)) = self.slot.key.get() {
+                if uid == w.shared.uid {
+                    // Borrowed only while the driver itself drops futures,
+                    // which it does not do for these.
+                    if let Ok(mut driver) = w.driver.try_borrow_mut() {
+                        driver.leave_multi(key, &waker);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -203,7 +253,48 @@ pub(crate) struct StreamSocket {
     /// Set by the driver when the kernel copied a zero-copy send after all;
     /// made at the first zero-copy send.
     zero_copy_copied: OnceCell<Rc<Cell<bool>>>,
+    /// Sends of this socket waiting in the driver (see [`SendInFlight`]).
+    sends_in_flight: Cell<u32>,
+    /// A send was dropped before its result: it may still go out later, so
+    /// a send made directly could overtake it. Never cleared.
+    send_abandoned: Cell<bool>,
+    /// A Unix socket (see [`end_was_missed`](Self::end_was_missed)).
+    unix: Cell<bool>,
+    /// Data was taken from the multishot receive since the socket was last
+    /// checked for an end of stream the kernel did not report.
+    check_end: Cell<bool>,
     _not_send: PhantomData<*const ()>,
+}
+
+/// Counts a send that waits in the driver, so that [`StreamSocket::send_now`]
+/// never sends ahead of it. Dropped before the send's result (a cancelled
+/// write), it marks the socket for good: the kernel may still send those
+/// bytes, and only sends through the driver stay behind them.
+struct SendInFlight<'a> {
+    sock: &'a StreamSocket,
+    done: bool,
+}
+
+impl<'a> SendInFlight<'a> {
+    fn new(sock: &'a StreamSocket) -> Self {
+        sock.sends_in_flight.set(sock.sends_in_flight.get() + 1);
+        Self { sock, done: false }
+    }
+
+    fn finish(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for SendInFlight<'_> {
+    fn drop(&mut self) {
+        self.sock
+            .sends_in_flight
+            .set(self.sock.sends_in_flight.get() - 1);
+        if !self.done {
+            self.sock.send_abandoned.set(true);
+        }
+    }
 }
 
 impl StreamSocket {
@@ -214,14 +305,53 @@ impl StreamSocket {
             nonblocking: Cell::new(false),
             zero_copy: Cell::new(true),
             zero_copy_copied: OnceCell::new(),
+            sends_in_flight: Cell::new(0),
+            send_abandoned: Cell::new(false),
+            unix: Cell::new(false),
+            check_end: Cell::new(false),
             _not_send: PhantomData,
         }
     }
 
-    /// A socket the kernel cannot send from without a copy (a Unix socket).
-    pub(crate) fn without_zero_copy(self) -> Self {
+    /// A Unix socket: the kernel cannot send from it without a copy, and its
+    /// multishot receive can miss the end of the stream (see
+    /// [`end_was_missed`](Self::end_was_missed)).
+    pub(crate) fn unix(self) -> Self {
         self.zero_copy.set(false);
+        self.unix.set(true);
         self
+    }
+
+    /// Whether the peer of a Unix socket has stopped sending and the kernel's
+    /// multishot receive may have left that unreported. Asked once each time
+    /// the reader has taken everything that was received.
+    ///
+    /// On newer kernels (seen on 6.18.44 and 6.18.63, not on 6.12.117) a
+    /// multishot receive that has emptied a Unix socket goes back to waiting
+    /// without trying once more. When the data arrived together with the
+    /// peer's `shutdown(Write)` and was taken in a pass of its own (more than
+    /// 32 buffers were waiting, or the receive was being set up), nothing
+    /// wakes the receive again: the end of the stream is never reported, and
+    /// a reader that waits for it hangs until the peer closes. A bare ring
+    /// without giong shows the same; TCP sockets do not.
+    ///
+    /// A shutdown that the kernel missed came before the last data was
+    /// taken, so it shows here; one that comes later wakes the receive as
+    /// usual. Starting the receive again makes the kernel read once more,
+    /// which finds the end.
+    fn end_was_missed(&self) -> bool {
+        if !self.unix.get() || !self.check_end.replace(false) {
+            return false;
+        }
+        let mut fd = libc::pollfd {
+            fd: self.sock.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
+        // the socket's state.
+        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+        ready > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
     }
 
     /// Where a send of `len` bytes from buffers that cannot change should go
@@ -294,7 +424,10 @@ impl StreamSocket {
                             _ => Err(unexpected("io_uring returned data without a buffer")),
                         });
                     }
-                    MultiPoll::Data(buf) => return Poll::Ready(Ok(buf)),
+                    MultiPoll::Data(buf) => {
+                        self.check_end.set(true);
+                        return Poll::Ready(Ok(buf));
+                    }
                     MultiPoll::NeedArm => {
                         if !wait_for_pool(&mut driver, cx, false) {
                             return Poll::Pending;
@@ -302,7 +435,12 @@ impl StreamSocket {
                         let fd = self.sock.as_raw_fd();
                         driver.arm_multi(key, MultiIo::Recv { fd });
                     }
-                    MultiPoll::Pending => return Poll::Pending,
+                    MultiPoll::Pending => {
+                        if driver.kind() == crate::DriverKind::IoUring && self.end_was_missed() {
+                            driver.restart_multi(key);
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
         })
@@ -414,6 +552,7 @@ impl StreamSocket {
             flags: libc::MSG_NOSIGNAL as u32,
             zero_copy: hold.is_some(),
         };
+        let in_flight = SendInFlight::new(self);
         // The header, the iovec array (on the heap) and the buffers all stay
         // where they are while the kernel reads them, even if this future is
         // dropped: `Op` keeps them until the operation completes, and the
@@ -427,6 +566,7 @@ impl StreamSocket {
         // moves with the tuple. The hold owns what a zero-copy send reads
         // after its result.
         let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
+        in_flight.finish();
         if res < 0 {
             (Err(os_err(res)), bufs)
         } else {
@@ -516,6 +656,7 @@ impl StreamSocket {
             flags: libc::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
+        let in_flight = SendInFlight::new(self);
         // The header, the iovec and both buffers stay where they are until the
         // kernel is done with them, even if this future is dropped: `Op`
         // keeps them until the operation completes.
@@ -523,6 +664,7 @@ impl StreamSocket {
         // buffers are `IoBuf`s, whose bytes stay put when they move.
         let (res, _, (buf, control, _iov, _msg)) =
             unsafe { Op::new(io, (buf, control, iov, msg)) }.await;
+        in_flight.finish();
         if res < 0 {
             (Err(os_err(res)), buf, control)
         } else {
@@ -619,6 +761,17 @@ impl StreamSocket {
         let hold = self.send_hold(&buf, len as usize);
         // SAFETY: `offset <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(offset) };
+        if hold.is_none() {
+            // SAFETY: `ptr` points at `len` initialised bytes of `buf`.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            if let Some(res) = self.send_now(bytes) {
+                return if res < 0 {
+                    (Err(os_err(res)), buf)
+                } else {
+                    (Ok(res as usize), buf)
+                };
+            }
+        }
         let io = Io::Send {
             fd: self.sock.as_raw_fd(),
             buf: ptr,
@@ -626,6 +779,7 @@ impl StreamSocket {
             flags: libc::MSG_NOSIGNAL,
             zero_copy: hold.is_some(),
         };
+        let in_flight = SendInFlight::new(self);
         // The hold moves into the send, and a zero-copy send the socket
         // refuses is sent again with a copy by `Op` itself, so that this
         // future, which every write awaits, is the size of a plain send's.
@@ -634,11 +788,40 @@ impl StreamSocket {
         // when it moves. The hold owns what a zero-copy send reads after its
         // result.
         let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
+        in_flight.finish();
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }
+    }
+
+    /// Sends at once, without a turn of the event loop, when this task is the
+    /// only one that can run: the socket's buffer usually has room, and the
+    /// task would otherwise wait for the send's result alone (a request and
+    /// its response then cost one turn each way instead of two). While other
+    /// tasks are runnable, sends go through the driver instead, where those
+    /// of the whole turn reach the kernel together. `None` when the driver
+    /// must take it: other tasks to run, a send of this socket still in the
+    /// driver, operations queued for the kernel that it would overtake, a
+    /// full socket, or the budget spent (see `Driver::try_send`).
+    fn send_now(&self, bytes: &[u8]) -> Option<i32> {
+        if bytes.is_empty() || self.sends_in_flight.get() != 0 || self.send_abandoned.get() {
+            return None;
+        }
+        runtime::with_worker(|w| {
+            if !w.queue.borrow().is_empty() {
+                return None;
+            }
+            let mut driver = w.driver.try_borrow_mut().ok()?;
+            // The epoll driver already sends within the operation's first poll.
+            // `try_send` declines while operations wait for the kernel: a send
+            // made directly would overtake them, cancellations included.
+            if driver.kind() != crate::DriverKind::IoUring {
+                return None;
+            }
+            driver.try_send(self.sock.as_raw_fd(), bytes)
+        })
     }
 
     /// What a zero-copy send of `len` bytes of `buf` leaves with the driver,
@@ -759,15 +942,10 @@ impl TcpListener {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
+        // Linux 6.0.16 to 6.0.19 report success for a bind to an address in
+        // use and leave the socket unbound: `share::bind` checks the port.
         let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
-            let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-            sock.set_reuse_address(true)?;
-            sock.set_reuse_port(true)?;
-            sock.bind(&addr.into())?;
-            // Linux 6.0.16 to 6.0.19 report success for a bind to an
-            // address in use and leave the socket unbound.
-            share::check_bound(&sock, addr)?;
-            Ok(sock)
+            Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
         })?;
         let listener = Self {
             inner: ListenSocket::new(sock),
@@ -946,6 +1124,10 @@ impl TcpStream {
     /// # Ok::<_, std::io::Error>(())
     /// # }).unwrap();
     /// ```
+    ///
+    /// Cancel safe: if the future is dropped, every socket it opened is closed,
+    /// so no connection is left behind (the server may have seen one open and
+    /// close).
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let addrs = lookup_host(addr).await?;
         addr::connect_first(addrs, Self::connect_addr).await

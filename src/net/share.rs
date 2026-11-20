@@ -5,25 +5,33 @@
 //! `SO_REUSEPORT` on each of them. The kernel then lets any process of the
 //! same user bind that port too and gives it a share of the traffic, so a
 //! service started twice by mistake would come up twice and split its
-//! clients. To refuse that, the first bind of a port in this process is
-//! preceded by a probe: a socket without `SO_REUSEPORT` bound to the same
-//! address and closed again, which fails with `EADDRINUSE` when anything
-//! else holds the port. Later binds of the port (the other workers) skip the
-//! probe, which their own process would fail.
+//! clients. To refuse that, the first socket of a port in this process is
+//! bound without `SO_REUSEPORT`, which fails with `EADDRINUSE` when anything
+//! else holds the port, and only takes `SO_REUSEPORT` once it is bound.
+//! Later binds of the port (the other workers) set it before binding, and
+//! join the first.
+//!
+//! The check is the bind of the socket that stays, not of a separate probe
+//! socket closed again before it: a socket that was just closed can keep its
+//! port for a moment. While any thread reads /proc/self/fd (`lsof`, `ss -p`,
+//! a monitoring agent, a count of open descriptors), each open file is held
+//! for an instant, and a socket closed in that instant leaves its port only
+//! when the reading thread returns to user space. A bind right after the
+//! probe's close was then refused for a port nothing held.
 //!
 //! A socket that was dropped is closed through the ring, a moment later, and
-//! would fail the probe of a bind that follows at once. So a dropped socket
-//! is first marked ([`Held::release`]) in a way that takes it out of the
-//! probe's sight: a TCP listener stops listening, and a UDP socket gets
-//! `SO_REUSEADDR`, which the probe of a UDP port then sets too and live
-//! sockets never do.
+//! would fail the first bind of a port that follows at once. So a dropped
+//! socket is first marked ([`Held::release`]) in a way that takes it out of
+//! that bind's sight: a TCP listener stops listening, and a UDP socket gets
+//! `SO_REUSEADDR`, which the first bind of a UDP port then sets too, for the
+//! bind only. Live sockets never keep it.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{Shutdown, SocketAddr};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::Socket;
 
 /// The transport a port belongs to: TCP and UDP ports are separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -59,15 +67,16 @@ pub(crate) struct Held {
 
 impl Held {
     /// Gives the port up for `sock`, which is about to be closed: marks the
-    /// socket so that the probe of a later bind does not see it (the close
-    /// itself goes through the ring and takes a moment), then counts it out.
+    /// socket so that the first bind of the port that follows does not see
+    /// it (the close itself goes through the ring and takes a moment), then
+    /// counts it out.
     pub(crate) fn release(self, sock: &Socket) {
         let mut ports = ports();
         // Errors are ignored: a socket that cannot be marked only makes a
         // bind that follows at once fail with `AddrInUse`.
         match self.proto {
             // A socket that no longer listens does not conflict with one
-            // that sets `SO_REUSEADDR`, as the probe and every listener do.
+            // that sets `SO_REUSEADDR`, as every listener does.
             Proto::Tcp => drop(sock.shutdown(Shutdown::Both)),
             Proto::Udp => {
                 drop(sock.set_reuse_address(true));
@@ -87,36 +96,50 @@ impl Held {
     }
 }
 
-/// Binds a socket to `addr` with `bind`, which is refused with `AddrInUse`
-/// when a socket of another process, or one this process did not bind
-/// through here, holds the port. Port 0 is not probed: the kernel picks the
-/// port.
+/// Creates a socket with `new` and binds it to `addr`, refused with
+/// `AddrInUse` when a socket of another process, or one this process did
+/// not bind through here, holds the port. Port 0 is not checked: the kernel
+/// picks the port.
 ///
-/// `bind` creates the socket, sets its options and binds it; `share` says
-/// whether the socket takes part in sharing at all (a UDP socket on port 0
-/// does not: it is bound without `SO_REUSEPORT`).
+/// `new` creates the socket and sets its other options; this sets
+/// `SO_REUSEADDR` and `SO_REUSEPORT` and binds. `share` says whether the
+/// socket takes part in sharing at all (a UDP socket on port 0 does not: it
+/// is bound without `SO_REUSEPORT`).
 pub(crate) fn bind(
     proto: Proto,
     addr: SocketAddr,
     share: bool,
-    bind: impl FnOnce() -> io::Result<Socket>,
+    new: impl FnOnce() -> io::Result<Socket>,
 ) -> io::Result<(Socket, Option<Held>)> {
+    let sock = new()?;
+    // What every listener sets: connections left over from an earlier
+    // listener (in `TIME_WAIT`, or still being served) do not keep the port;
+    // a socket that listens does, whatever its options. A UDP socket keeps
+    // it off: with `SO_REUSEADDR`, any user's socket that sets it too could
+    // bind the port and receive its datagrams. `SO_REUSEPORT` is for sockets
+    // of the same user.
+    if proto == Proto::Tcp {
+        sock.set_reuse_address(true)?;
+    }
     if !share {
-        return Ok((bind()?, None));
+        sock.bind(&addr.into())?;
+        check_bound(&sock, addr)?;
+        return Ok((sock, None));
     }
-    // Held across the probe and the bind, so that two workers binding the
-    // same port for the first time do not both probe, or probe each other.
+    // Held across the bind, so that two workers binding the same port for
+    // the first time do not both bind it alone, or refuse each other.
     let mut ports = ports();
-    if addr.port() != 0 {
-        let known = ports
-            .get(&(proto, addr.port()))
-            .copied()
-            .unwrap_or_default();
-        if known.live == 0 {
-            probe(proto, addr, known.released)?;
-        }
+    let known = ports
+        .get(&(proto, addr.port()))
+        .copied()
+        .unwrap_or_default();
+    if addr.port() != 0 && known.live == 0 {
+        bind_first(proto, &sock, addr, known.released)?;
+    } else {
+        sock.set_reuse_port(true)?;
+        sock.bind(&addr.into())?;
+        check_bound(&sock, addr)?;
     }
-    let sock = bind()?;
     let port = match addr.port() {
         0 => sock
             .local_addr()?
@@ -128,40 +151,34 @@ pub(crate) fn bind(
     Ok((sock, Some(Held { proto, port })))
 }
 
-/// Fails with `EADDRINUSE` when a socket that is not one of this process's
-/// released ones holds `addr`. `released` says whether there may be such
+/// Binds the first socket of a port in this process: without
+/// `SO_REUSEPORT`, so that the bind fails with `EADDRINUSE` when a socket
+/// that is not one of this process's released ones holds `addr`, then sets
+/// it for the workers that join. `released` says whether there may be such
 /// sockets.
-fn probe(proto: Proto, addr: SocketAddr, released: bool) -> io::Result<()> {
-    let domain = Domain::for_address(addr);
-    let sock = match proto {
-        Proto::Tcp => {
-            let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-            // What every listener sets: connections left over from an
-            // earlier listener (in `TIME_WAIT`, or still being served) do
-            // not keep the port; a socket that listens does, whatever its
-            // options.
-            sock.set_reuse_address(true)?;
-            sock
-        }
-        Proto::Udp => {
-            let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-            // Two UDP sockets that both set `SO_REUSEADDR` never conflict,
-            // so this lets the probe pass the sockets `Held::release`
-            // marked. It would also pass another process's socket that
-            // sets it, so it is set only while this process may have
-            // released sockets on the port.
-            if released {
-                sock.set_reuse_address(true)?;
-            }
-            sock
-        }
-    };
+fn bind_first(proto: Proto, sock: &Socket, addr: SocketAddr, released: bool) -> io::Result<()> {
+    // Two UDP sockets that both set `SO_REUSEADDR` never conflict, so this
+    // lets the bind pass the sockets `Held::release` marked. It would also
+    // pass another process's socket that sets it, so it is set only while
+    // this process may have released sockets on the port, and only for the
+    // bind.
+    let marked = proto == Proto::Udp && released;
+    if marked {
+        sock.set_reuse_address(true)?;
+    }
     sock.bind(&addr.into())?;
-    check_bound(&sock, addr)
+    check_bound(sock, addr)?;
+    // The kernel looks at both options as they are when a later socket
+    // binds, so the next worker joins this one.
+    sock.set_reuse_port(true)?;
+    if marked {
+        sock.set_reuse_address(false)?;
+    }
+    Ok(())
 }
 
-/// Checks that `bind` left the TCP socket on the port that was asked for,
-/// and reports `EADDRINUSE` when it did not.
+/// Checks that `bind` left the socket on the port that was asked for, and
+/// reports `EADDRINUSE` when it did not.
 ///
 /// Linux 6.0.16 to 6.0.19, the last four releases of the 6.0 series, return
 /// 1 instead of -1 from bind(2) on a TCP socket whose address is in use
@@ -185,6 +202,7 @@ pub(crate) fn check_bound(sock: &Socket, asked: SocketAddr) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use socket2::{Domain, Protocol, Type};
 
     /// A port that was free a moment ago.
     fn free_port() -> SocketAddr {
@@ -194,10 +212,7 @@ mod tests {
 
     fn udp(addr: SocketAddr) -> io::Result<(Socket, Option<Held>)> {
         bind(Proto::Udp, addr, true, || {
-            let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-            sock.set_reuse_port(true)?;
-            sock.bind(&addr.into())?;
-            Ok(sock)
+            Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         })
     }
 
@@ -206,6 +221,47 @@ mod tests {
             .get(&(Proto::Udp, addr.port()))
             .copied()
             .unwrap_or_default()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
+    fn the_first_socket_of_a_port_refuses_another_holder_and_joins_the_workers() {
+        let addr = free_port();
+        // Another process's socket, as far as this module knows.
+        let other = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        other.set_reuse_port(true).unwrap();
+        other.bind(&addr.into()).unwrap();
+        let err = udp(addr).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(known(addr).live, 0);
+        drop(other);
+
+        let (first, hold) = udp(addr).unwrap();
+        assert!(!first.reuse_address().unwrap());
+        assert!(first.reuse_port().unwrap());
+        let (second, second_hold) = udp(addr).unwrap();
+
+        // The two split the datagrams of many senders between them, by a
+        // hash of the sender's address.
+        for _ in 0..64 {
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender.send_to(b"x", addr).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let count = |sock: &Socket| {
+            sock.set_nonblocking(true).unwrap();
+            let mut buf = [std::mem::MaybeUninit::new(0u8); 8];
+            std::iter::from_fn(|| sock.recv(&mut buf).ok()).count()
+        };
+        let (a, b) = (count(&first), count(&second));
+        assert_eq!(a + b, 64);
+        assert!(
+            a > 0 && b > 0,
+            "one socket got all 64 datagrams: {a} and {b}"
+        );
+
+        second_hold.unwrap().release(&second);
+        hold.unwrap().release(&first);
     }
 
     #[test]
@@ -229,8 +285,15 @@ mod tests {
         );
 
         // Both sockets are still open, and marked: a new bind passes them.
+        // It sets `SO_REUSEADDR` for the bind only, and joins the port's
+        // `SO_REUSEPORT` group once bound.
         let (third, third_hold) = udp(addr).unwrap();
         assert_eq!(known(addr).live, 1);
+        assert!(!third.reuse_address().unwrap());
+        assert!(third.reuse_port().unwrap());
+        let (fourth, fourth_hold) = udp(addr).unwrap();
+        assert_eq!(known(addr).live, 2);
+        fourth_hold.unwrap().release(&fourth);
         third_hold.unwrap().release(&third);
     }
 }

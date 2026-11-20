@@ -13,7 +13,7 @@ use giong::net::{TcpListener, TcpStream};
 use giong::time::sleep;
 use giong_http::client::{Client, ErrorKind};
 use giong_http::{Request, Response, Server, Version};
-use giong_tls::{ktls_stats, Ktls, TlsAcceptor, TlsConnector};
+use giong_tls::{ktls_stats, Certificates, Ktls, TlsAcceptor, TlsConnector};
 
 // ------------------------------------------------------------------ harness
 
@@ -47,7 +47,10 @@ where
 {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
-    let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let acceptor = acceptor.ktls(ktls).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -305,6 +308,131 @@ fn https_chooses_http2_through_alpn_and_requests_share_one_connection() {
         let response = client.get(&base).send().await.unwrap();
         assert_eq!(response.version(), Version::Http11);
         assert_eq!(response.text().unwrap(), "HTTP/1.1");
+    });
+}
+
+/// A TLS acceptor for `localhost` and a connector that trusts it.
+fn tls_pair() -> (TlsAcceptor, TlsConnector) {
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
+    (
+        TlsAcceptor::with_certificates(
+            &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+        )
+        .unwrap(),
+        TlsConnector::with_root_pem(cert.as_bytes()).unwrap(),
+    )
+}
+
+/// Records the peer address of every request and answers with its version.
+fn version_and_peer(
+    peers: &Rc<RefCell<HashSet<SocketAddr>>>,
+) -> impl Fn(Request) -> std::future::Ready<Response> + 'static {
+    let peers = peers.clone();
+    move |req: Request| {
+        peers.borrow_mut().insert(req.peer_addr().unwrap());
+        std::future::ready(Response::text(req.version().as_str()))
+    }
+}
+
+#[test]
+fn a_burst_to_a_new_https_origin_shares_the_first_connection() {
+    giong::block_on(async {
+        let peers = Rc::new(RefCell::new(HashSet::<SocketAddr>::new()));
+        let (base, tls) = serve_tls(version_and_peer(&peers));
+        let client = Client::builder().tls(tls).build();
+        // All of them ask before the first TLS handshake has finished, so
+        // nobody knows yet whether the server speaks HTTP/2.
+        let tasks: Vec<_> = (0..50)
+            .map(|_| {
+                let (client, url) = (client.clone(), base.clone());
+                giong::spawn(async move { client.get(&url).send().await.unwrap().into_body() })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), b"HTTP/2");
+        }
+        assert_eq!(peers.borrow().len(), 1, "one TCP and TLS connection");
+        assert_eq!(client.connections(&base), (1, 1));
+    });
+}
+
+#[test]
+fn a_burst_waiting_for_the_first_connection_opens_its_own_when_alpn_picks_http1() {
+    giong::block_on(async {
+        let peers = Rc::new(RefCell::new(HashSet::<SocketAddr>::new()));
+        let (acceptor, tls) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let handler = version_and_peer(&peers);
+        giong::spawn(async move {
+            Server::new()
+                .http2(false)
+                .serve_tls(listener, acceptor, handler)
+                .await
+        });
+        let client = Client::builder()
+            .tls(tls)
+            .max_connections_per_host(4)
+            .build();
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let (client, url) = (client.clone(), base.clone());
+                giong::spawn(async move {
+                    let response = client.get(&url).send().await.unwrap();
+                    (response.version(), response.into_body())
+                })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), (Version::Http11, b"HTTP/1.1".to_vec()));
+        }
+        // Told that the origin speaks HTTP/1.1, the requests in line opened
+        // connections of their own instead of queueing behind the first.
+        let opened = peers.borrow().len();
+        assert!((2..=4).contains(&opened), "{opened} connections");
+        assert!(client.connections(&base).0 <= 4);
+    });
+}
+
+#[test]
+fn a_request_waiting_for_a_first_connection_that_is_dropped_opens_one() {
+    giong::block_on(async {
+        let peers = Rc::new(RefCell::new(HashSet::<SocketAddr>::new()));
+        let (acceptor, tls) = tls_pair();
+        // Nothing accepts at first: the TLS handshakes wait in the backlog.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let client = Client::builder().tls(tls).build();
+        let first = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move {
+                client
+                    .get(&url)
+                    .timeout(Duration::from_millis(100))
+                    .send()
+                    .await
+                    .map(|_| ())
+            }
+        });
+        // Waits for the first one's connection rather than opening its own.
+        let second = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move { client.get(&url).send().await.unwrap() }
+        });
+        let error = first.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+        let handler = version_and_peer(&peers);
+        giong::spawn(async move { Server::new().serve_tls(listener, acceptor, handler).await });
+        let response = second.await.unwrap();
+        assert_eq!(response.version(), Version::Http2);
+        assert_eq!(client.connections(&base), (1, 1));
     });
 }
 

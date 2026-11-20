@@ -90,6 +90,8 @@ when it is no longer raised.
 | [GIONG-E1117](E1117.md) | `Http2Flood` | too many HTTP/2 control frames |
 | [GIONG-E1118](E1118.md) | `Http2HeadersTooLarge` | HTTP/2 header block too large |
 | [GIONG-E1119](E1119.md) | `HttpInvalidResponse` | invalid HTTP response |
+| [GIONG-E1120](E1120.md) | `HttpServerBusy` | request refused: the server's memory budget for requests is full |
+| [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
 
 ## giong-web
 
@@ -143,6 +145,7 @@ when it is no longer raised.
 | [GIONG-E2010](E2010.md) | `KtlsSetup` | the kernel refused the TLS keys |
 | [GIONG-E2011](E2011.md) | `KtlsKeyUpdate` | the kernel cannot change TLS keys |
 | [GIONG-E2012](E2012.md) | `TlsKeysExhausted` | TLS keys used up |
+| [GIONG-E2013](E2013.md) | `TlsConfig` | TLS setting not possible here |
 
 ## giong-postgres
 

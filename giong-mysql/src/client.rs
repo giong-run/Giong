@@ -347,13 +347,18 @@ impl Drop for Wait {
         if self.done || matches!(self.slot.kind, Kind::Prepare { .. }) {
             return;
         }
-        {
+        // Its answer arrived before the drop: its outcome is known.
+        let known = {
             let mut inner = self.slot.inner.borrow_mut();
             inner.abandoned = true;
             inner.rows = RowsBuilder::default();
-        }
+            inner.outcome.is_some()
+        };
         // The application gave up on a statement of its transaction, which
         // may run all the same: the transaction must not commit it unseen.
+        if known {
+            return;
+        }
         if let Some(conn) = self.slot.in_tx.as_ref().and_then(Weak::upgrade) {
             if matches!(conn.tx.get(), Tx::Open | Tx::Uncertain) {
                 conn.tx.set(Tx::Abandoned);
@@ -373,6 +378,9 @@ impl Client {
     /// # Panics
     ///
     /// Panics when called outside of a giong runtime.
+    ///
+    /// Cancel safe: if the future is dropped, the connection being opened is
+    /// closed.
     pub async fn connect(config: &Config) -> Result<Client, Error> {
         let startup = connect::connect(config).await?;
         Ok(Self::start(startup, config.clone()))
@@ -469,8 +477,10 @@ impl Client {
     /// which. A stored procedure that returns several result sets gives the
     /// rows of the first.
     ///
-    /// Cancel safe in the sense that matters: dropping the future leaves the
-    /// connection usable. The statement may still run on the server.
+    /// Not cancel safe: if the future is dropped, the statement may still run
+    /// on the server, and what it changes stays; the connection stays usable.
+    /// Inside a [`Transaction`], a later [`commit`](Transaction::commit) then
+    /// fails instead of committing it.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
         let (set, _, _) = self.run(sql, params, true).await?;
         Ok(set.into_rows())
@@ -479,6 +489,8 @@ impl Client {
     /// Runs a statement that must return exactly one row, and returns it.
     ///
     /// No row or several rows fail with [`ErrorKind::RowCount`].
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
         let mut rows = self.query(sql, params).await?;
         match rows.len() {
@@ -496,6 +508,8 @@ impl Client {
     /// Runs a statement that returns at most one row.
     ///
     /// Several rows fail with [`ErrorKind::RowCount`].
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
         let mut rows = self.query(sql, params).await?;
         match rows.len() {
@@ -513,6 +527,8 @@ impl Client {
     /// Runs a statement and returns the number of rows it inserted, updated
     /// (matched, including rows already holding the new values) or deleted,
     /// or returned, for a `SELECT`.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let (_, ok, rows) = self.run(sql, params, false).await?;
         Ok(if rows > 0 { rows } else { ok.affected_rows })
@@ -526,6 +542,8 @@ impl Client {
     /// `None` is not an error: the statement ran, and its rows are written
     /// (under autocommit, committed). An error always means the statement
     /// failed, so code that retries on errors never writes twice.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<u64>, Error> {
         let (_, ok, _) = self.run(sql, params, false).await?;
         Ok((ok.last_insert_id != 0).then_some(ok.last_insert_id))
@@ -539,6 +557,9 @@ impl Client {
     /// the rest, and those before it stay done. MySQL commits DDL (`CREATE`,
     /// `ALTER`, `DROP`) as it runs, so wrapping them in a transaction does not
     /// make them all-or-nothing.
+    ///
+    /// Not cancel safe: if the future is dropped, the statements may still run
+    /// on the server, and what they change stays.
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
         self.conn.check_tx().await?;
         let may_change = sql.split(';').any(session::may_change);
@@ -585,6 +606,9 @@ impl Client {
     /// stays ended: after a deadlock rolled it back, or a statement such as
     /// `CREATE TABLE` committed it, the statements that follow fail instead
     /// of running outside any transaction, and `commit` fails.
+    ///
+    /// Cancel safe: if the future is dropped, a transaction it began is rolled
+    /// back.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.conn.check_tx().await?;
         // The guard exists before BEGIN is sent: if this future is dropped
@@ -618,6 +642,9 @@ impl Client {
     ///
     /// Fails with [`ErrorKind::Closed`] if the server refused the reset: the
     /// connection is then closed rather than left in a state nobody chose.
+    ///
+    /// Cancel safe: if the future is dropped, the reset may or may not have
+    /// happened, and calling again does it.
     pub async fn reset_session(&self) -> Result<(), Error> {
         let slots = self.conn.queue_reset_slots()?;
         for slot in slots {
@@ -954,7 +981,7 @@ impl Conn {
     /// are closed and the prepare tried once more.
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
         let e = match self.statement_once(sql).await {
-            Err(e) if e.code() == Some(code::PREPARED_LIMIT) => e,
+            Err(e) if e.server_code() == Some(code::PREPARED_LIMIT) => e,
             other => return other,
         };
         if let Some(counters) = &*self.counters.borrow() {
@@ -1480,7 +1507,7 @@ impl Conn {
     /// knows it (1243), or it no longer fits the schema (1615). The next run
     /// prepares it afresh.
     fn forget_if_stale(&self, stmt: &Statement, e: &Error) {
-        let code = e.code();
+        let code = e.server_code();
         if !matches!(code, Some(code::UNKNOWN_STMT | code::NEED_REPREPARE)) {
             return;
         }
@@ -1557,8 +1584,8 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
         if let Err(e) = conn.process(&mut buf) {
             break e;
         }
-        match conn.stream.recv().await {
-            Ok(chunk) if chunk.is_empty() => {
+        match conn.stream.read_into(&mut buf).await {
+            Ok(0) => {
                 let closing = conn.state.borrow().closing;
                 break Error::closed(if closing {
                     "the connection was closed"
@@ -1566,7 +1593,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
                     "the server closed the connection"
                 });
             }
-            Ok(chunk) => buf.extend(&chunk),
+            Ok(_) => {}
             Err(e) => break Error::io(ErrorKind::Closed, "reading from the server failed", e),
         }
     };
@@ -1636,6 +1663,9 @@ impl Transaction<'_> {
     ///
     /// After a statement in it failed, this first asks the server whether
     /// the error ended the transaction (one round trip).
+    ///
+    /// Not cancel safe: if the future is dropped, the transaction may have been
+    /// committed or rolled back, and the caller does not learn which.
     pub async fn commit(mut self) -> Result<(), Error> {
         let conn = self.client.conn.clone();
         // If this future is dropped while asking, the guard rolls back.
@@ -1653,6 +1683,9 @@ impl Transaction<'_> {
     }
 
     /// Rolls the transaction back and waits for the server to confirm.
+    ///
+    /// Cancel safe: if the future is dropped, the transaction is rolled back
+    /// all the same.
     pub async fn rollback(mut self) -> Result<(), Error> {
         self.done = true;
         self.client.conn.tx.set(Tx::None);
@@ -1716,6 +1749,9 @@ impl CancelToken {
     /// Sends the request. Success means the server received it, not that
     /// something was stopped: the statement may have finished first. Once
     /// the connection is closed, it does nothing: its id may be reused.
+    ///
+    /// Not cancel safe: if the future is dropped, the request may still reach
+    /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());

@@ -4,8 +4,8 @@ An [MCP](https://modelcontextprotocol.io) server that lets an AI agent look insi
 
 ```toml
 [dependencies]
-giong = "0.7"
-giong-mcp = "0.7"
+giong = "1.0.0-rc.1"
+giong-mcp = "1.0.0-rc.1"
 ```
 
 ```rust,no_run
@@ -71,6 +71,8 @@ The answer that matters most is the one other tools cannot give: **which task bl
 ]
 ```
 
+In a giong-http or giong-web service, request handlers run inside the task giong-http spawns for each connection, so a blocking handler is reported as a giong-http connection's task (a location in giong-http's `src/server.rs`), and the warning says so: giong cannot yet name the handler or route. `profile` counts the time of every handler the same way, under that location.
+
 The server runs on a thread and a single-worker giong runtime of its own, so it answers even when every worker of the service is stuck. A worker that cannot answer within `snapshot_timeout` (500 ms by default) is reported as such, with what its counters say.
 
 ## How it works
@@ -101,7 +103,7 @@ Tool results carry the JSON both as `structuredContent` and as compact text, and
 
 ## Testing
 
-`cargo test -p giong-mcp`: 33 tests. Fourteen run a two-worker service with a server on a loopback port and a plain HTTP client: the handshake and tool list, every tool's answer checked against known tasks and sources and against its `outputSchema`, a service with nothing to do reported as idle, a worker blocked in `std::thread::sleep` reported with its line while the other worker still answers, a panicking source told apart from a stopped worker, a profile finding a busy task, JSON-RPC errors and malformed messages, the limits (the review's 254 KiB batch, batches past 16 or from newer clients, 24 clients at once with the process's memory checked), the token rules, busy addresses, and the refusals (token, `Host`, `Origin`, method, content type, protocol version, non-loopback addresses, a Unix socket's mode, a stale socket replaced and a live one or a successor's left alone). `tests/env.rs` checks that `start_from_env` keeps the service running whatever goes wrong. Fifteen unit tests cover address parsing, tokens, a listener the kernel put somewhere else than asked, the `Host` check and the `Bearer` scheme, version negotiation, the watcher (including a second-long window under quick calls), `/proc`, a `profile` call dropped half-way (profiling goes back off) and the fuzz target's starting inputs; three doc tests check the example and that dropping the server at once is a warning. `tests/observe.rs` in the runtime (10 tests) checks the counters, spawn locations, profiles and sources underneath, on both drivers.
+`cargo test -p giong-mcp`: 34 tests. Fourteen run a two-worker service with a server on a loopback port and a plain HTTP client: the handshake and tool list, every tool's answer checked against known tasks and sources and against its `outputSchema`, a service with nothing to do reported as idle, a worker blocked in `std::thread::sleep` reported with its line while the other worker still answers, a panicking source told apart from a stopped worker, a profile finding a busy task, JSON-RPC errors and malformed messages, the limits (the review's 254 KiB batch, batches past 16 or from newer clients, 24 clients at once with the process's memory checked), the token rules, busy addresses, and the refusals (token, `Host`, `Origin`, method, content type, protocol version, non-loopback addresses, a Unix socket's mode, a stale socket replaced and a live one or a successor's left alone). `tests/env.rs` checks that `start_from_env` keeps the service running whatever goes wrong. Sixteen unit tests cover address parsing, tokens, a listener the kernel put somewhere else than asked, the `Host` check and the `Bearer` scheme, version negotiation, the watcher (including a second-long window under quick calls), `/proc`, a `profile` call dropped half-way (profiling goes back off), giong-http's connection tasks told apart from others and the fuzz target's starting inputs; three doc tests check the example and that dropping the server at once is a warning. `tests/observe.rs` in the runtime (10 tests) checks the counters, spawn locations, profiles and sources underneath, on both drivers.
 
 `fuzz/` has a cargo-fuzz target, `request`, that sends any bytes as one request through every check and the JSON-RPC dispatch, and checks that the answer is one the server means to send and that no request without the token gets through (`cd giong-mcp && cargo +nightly fuzz run request`).
 

@@ -2,9 +2,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use std::pin::pin;
+use std::rc::{Rc, Weak};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -103,7 +104,9 @@ const STALLED: Duration = Duration::from_millis(5);
 ///
 /// Connections the server closed, or that broke, are left behind as soon as
 /// that is noticed, which is when it happens: each connection is read
-/// continuously.
+/// continuously. A connection unused for the [idle
+/// timeout](Self::idle_timeout) is closed, and so is one older than the
+/// [maximum lifetime](Self::max_lifetime), once no statement uses it.
 #[derive(Clone)]
 pub struct Pool {
     inner: Rc<Inner>,
@@ -113,10 +116,26 @@ struct Inner {
     config: Config,
     max_size: usize,
     wait_timeout: Duration,
+    idle_timeout: Duration,
+    max_lifetime: Duration,
     state: Rc<RefCell<State>>,
     /// The pool as `giong::observe` sees it; registered by a weak reference,
     /// so it leaves snapshots when the pool is dropped.
     _observed: Rc<Observed>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The task that closes idle connections ends with the pool.
+        let reaper = {
+            let mut st = self.state.borrow_mut();
+            st.stopped = true;
+            st.reaper_waker.take()
+        };
+        if let Some(w) = reaper {
+            w.wake();
+        }
+    }
 }
 
 /// Reports the pool's state in `giong::observe` snapshots (and so to
@@ -152,6 +171,7 @@ impl giong::observe::Source for Observed {
             ("draining", n(s.draining)),
             ("resets", s.resets),
             ("statement_limit_errors", s.statement_limit_errors),
+            ("recycled", s.recycled),
         ]
     }
 }
@@ -165,7 +185,7 @@ fn stats_of(st: &State) -> PoolStats {
             .shared
             .iter()
             .chain(&st.draining)
-            .map(|c| c.in_flight())
+            .map(|m| m.client.in_flight())
             .sum(),
         waiting: st.waiting,
         opened: st.opened,
@@ -174,6 +194,7 @@ fn stats_of(st: &State) -> PoolStats {
         draining: st.draining.len(),
         resets: st.counters.resets.get(),
         statement_limit_errors: st.counters.statement_limit_errors.get(),
+        recycled: st.recycled,
     }
 }
 
@@ -181,11 +202,11 @@ fn stats_of(st: &State) -> PoolStats {
 struct State {
     /// Open connections that are not taken, and that shared statements
     /// use.
-    shared: Vec<Rc<Client>>,
+    shared: Vec<Member>,
     /// Open connections set aside for tasks waiting in [`Pool::get`]: no
     /// new shared statement is sent on them, and the oldest waiting task
     /// takes one as soon as the statements on it are answered.
-    draining: Vec<Rc<Client>>,
+    draining: Vec<Member>,
     taken: usize,
     connecting: usize,
     waiting: usize,
@@ -196,7 +217,29 @@ struct State {
     opened: u64,
     connect_errors: u64,
     timeouts: u64,
+    recycled: u64,
     counters: Rc<Counters>,
+    /// The task that closes idle and old connections is running.
+    reaper: bool,
+    reaper_waker: Option<Waker>,
+    /// The pool was dropped.
+    stopped: bool,
+}
+
+/// An open connection that is not taken.
+struct Member {
+    client: Rc<Client>,
+    /// When it was last lent or came back.
+    used: Instant,
+    /// When it is to be closed, however busy it is.
+    expires: Instant,
+}
+
+impl Member {
+    /// No statement uses it, and nobody else holds it.
+    fn is_free(&self) -> bool {
+        idle(self)
+    }
 }
 
 impl State {
@@ -220,7 +263,7 @@ impl State {
                 .shared
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, c)| (c.in_flight(), Rc::strong_count(c)))
+                .min_by_key(|(_, m)| (m.client.in_flight(), Rc::strong_count(&m.client)))
             else {
                 break;
             };
@@ -232,11 +275,31 @@ impl State {
             self.shared.push(c);
         }
     }
+
+    /// Leaves out the connections that broke, and closes the free ones that
+    /// are idle or too old. Returns whether any went.
+    fn sweep(&mut self, now: Instant, idle_timeout: Duration) -> bool {
+        let before = self.shared.len() + self.draining.len();
+        let mut recycled = 0;
+        let mut keep = |m: &Member| {
+            if m.client.is_closed() {
+                return false;
+            }
+            let stale = m.is_free()
+                && (now >= m.expires || now.saturating_duration_since(m.used) >= idle_timeout);
+            recycled += u64::from(stale);
+            !stale
+        };
+        self.shared.retain(&mut keep);
+        self.draining.retain(&mut keep);
+        self.recycled += recycled;
+        self.shared.len() + self.draining.len() != before
+    }
 }
 
 /// Free for a task of its own: nobody borrows it and nothing is in flight.
-fn idle(c: &Rc<Client>) -> bool {
-    Rc::strong_count(c) == 1 && c.in_flight() == 0
+fn idle(m: &Member) -> bool {
+    Rc::strong_count(&m.client) == 1 && m.client.in_flight() == 0
 }
 
 /// What a pool is doing, from [`Pool::stats`].
@@ -268,6 +331,10 @@ pub struct PoolStats {
     /// was reached (error 1461), each retried once after closing unused
     /// statements.
     pub statement_limit_errors: u64,
+    /// Connections the pool closed because they sat unused for the [idle
+    /// timeout](Pool::idle_timeout) or were older than the [maximum
+    /// lifetime](Pool::max_lifetime).
+    pub recycled: u64,
 }
 
 enum Decision<T> {
@@ -342,12 +409,15 @@ impl Pool {
             max_size,
             state: Rc::clone(&state),
         });
-        giong::observe::register_rc(&observed);
+        let source: Weak<dyn giong::observe::Source> = Rc::downgrade(&observed) as _;
+        giong::observe::register(source);
         Self {
             inner: Rc::new(Inner {
                 config,
                 max_size,
                 wait_timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(10 * 60),
+                max_lifetime: Duration::from_secs(30 * 60),
                 state,
                 _observed: observed,
             }),
@@ -363,16 +433,51 @@ impl Pool {
     /// Panics if other clones of this pool exist; set it right after
     /// [`new`](Self::new).
     pub fn wait_timeout(mut self, timeout: Duration) -> Self {
-        Rc::get_mut(&mut self.inner)
-            .expect("set the wait timeout before cloning the pool")
-            .wait_timeout = timeout;
+        self.settings("wait timeout").wait_timeout = timeout;
         self
+    }
+
+    /// How long a connection may sit unused before the pool closes it: 10
+    /// minutes by default. The pool opens connections again when it needs
+    /// them, so a burst does not hold the server's connections forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics if other clones of this pool exist; set it right after
+    /// [`new`](Self::new).
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.settings("idle timeout").idle_timeout = timeout;
+        self
+    }
+
+    /// How long a connection may live: 30 minutes by default, less up to a
+    /// tenth at random so that the connections of a pool do not all close at
+    /// once. An older connection is closed as soon as no statement uses it,
+    /// and replaced when needed, so that connections follow DNS changes and
+    /// failovers, and the server's per-connection memory is given back.
+    ///
+    /// # Panics
+    ///
+    /// Panics if other clones of this pool exist; set it right after
+    /// [`new`](Self::new).
+    pub fn max_lifetime(mut self, lifetime: Duration) -> Self {
+        self.settings("maximum lifetime").max_lifetime = lifetime;
+        self
+    }
+
+    fn settings(&mut self, what: &str) -> &mut Inner {
+        Rc::get_mut(&mut self.inner)
+            .unwrap_or_else(|| panic!("set the {what} before cloning the pool"))
     }
 
     /// Runs a statement on a shared connection and returns its rows; see
     /// [`Client::query`]. Transaction statements and statements that change
     /// the session are refused ([`ErrorKind::Statement`]): run them on a
     /// connection from [`get`](Self::get).
+    ///
+    /// Not cancel safe: if the future is dropped, the statement may still run
+    /// on the server, and what it changes stays; the pool and its connections
+    /// stay usable.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -381,6 +486,8 @@ impl Pool {
 
     /// Runs a statement that returns exactly one row; see
     /// [`Client::query_one`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -389,6 +496,8 @@ impl Pool {
 
     /// Runs a statement that returns at most one row; see
     /// [`Client::query_opt`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -397,6 +506,8 @@ impl Pool {
 
     /// Runs a statement and returns the number of rows it changed; see
     /// [`Client::execute`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -405,6 +516,8 @@ impl Pool {
 
     /// Runs an `INSERT` and returns the `AUTO_INCREMENT` value it generated,
     /// if any; see [`Client::insert`]. Transaction statements are refused.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn insert(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<u64>, Error> {
         refuse_on_shared(sql)?;
         let client = self.shared().await?;
@@ -420,6 +533,8 @@ impl Pool {
     /// [`ErrorKind::Closed`], as do the statements other tasks sent on that
     /// connection after it: they would otherwise have run inside the
     /// transaction.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
         let client = self.shared().await?;
         client.batch_execute(sql).await
@@ -448,13 +563,16 @@ impl Pool {
     /// The connection goes back when the [`PooledClient`] is dropped, and its
     /// session is reset first if it may have changed (see the type's
     /// documentation).
+    ///
+    /// Cancel safe: if the future is dropped, no connection is taken, and the
+    /// place in line goes to the next task.
     pub async fn get(&self) -> Result<PooledClient, Error> {
         let ticket = Ticket {
             pool: self,
             number: Cell::new(None),
         };
         let client = self
-            .acquire(|st, max| {
+            .acquire(|st, max, _| {
                 let my_turn = match ticket.number.get() {
                     None => st.tickets.is_empty(),
                     Some(n) => st.tickets.front() == Some(&n),
@@ -470,13 +588,13 @@ impl Pool {
                             .position(idle)
                             .map(|i| st.shared.swap_remove(i)),
                     };
-                    if let Some(c) = found {
+                    if let Some(m) = found {
                         st.taken += 1;
                         ticket.leave(st);
-                        return match Rc::try_unwrap(c) {
+                        return match Rc::try_unwrap(m.client) {
                             Ok(client) => {
                                 client.set_shared(false);
-                                Decision::Ready(client)
+                                Decision::Ready((client, m.expires))
                             }
                             Err(_) => unreachable!("checked: nobody else holds it"),
                         };
@@ -500,16 +618,17 @@ impl Pool {
         // Whoever is next in line may be able to go now.
         drop(ticket);
         let client = client?;
-        let client = match client {
+        let (client, expires) = match client {
             Ok(c) => c,
             Err(new) => {
                 new.count_into(self.inner.state.borrow().counters.clone());
                 self.inner.state.borrow_mut().taken += 1;
-                new
+                (new, self.expiry())
             }
         };
         Ok(PooledClient {
             client: Some(client),
+            expires,
             pool: self.clone(),
         })
     }
@@ -517,6 +636,36 @@ impl Pool {
     /// The pool's current state and counters.
     pub fn stats(&self) -> PoolStats {
         stats_of(&self.inner.state.borrow())
+    }
+
+    /// When a connection opened now is to be closed: the maximum lifetime,
+    /// less up to a tenth of it.
+    fn expiry(&self) -> Instant {
+        use std::hash::{BuildHasher, Hasher};
+        let life = self.inner.max_lifetime;
+        // Not for secrets: only spreads the closing times. The standard
+        // library seeds each RandomState differently.
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let jitter = life / 10_000 * u32::try_from(seed % 1000).unwrap_or(0);
+        // A lifetime too long for the clock (`Duration::MAX`) means none.
+        Instant::now()
+            .checked_add(life - jitter)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(100 * 365 * 24 * 3600))
+    }
+
+    /// Starts the task that closes idle and old connections, once.
+    fn start_reaper(&self, st: &mut State) {
+        if st.reaper {
+            return;
+        }
+        st.reaper = true;
+        let state = Rc::downgrade(&self.inner.state);
+        let idle_timeout = self.inner.idle_timeout;
+        let period = (self.inner.idle_timeout.min(self.inner.max_lifetime) / 4)
+            .clamp(Duration::from_millis(50), Duration::from_secs(30));
+        giong::spawn(reap(state, idle_timeout, period));
     }
 
     /// The least busy shared connection, or a new one if every open one is
@@ -528,29 +677,43 @@ impl Pool {
     /// it on that connection.
     async fn shared(&self) -> Result<Lent<'_>, Error> {
         let client = self
-            .acquire(|st, max| {
-                let now = Instant::now();
+            .acquire(|st, max, now| {
                 let room = st.open() < max;
                 // Busy means used by other tasks right now.
+                // A connection past its lifetime takes no new statement, so
+                // that it frees up and closes.
+                let usable = |m: &Member| now < m.expires;
                 let best = st
                     .shared
                     .iter()
-                    .filter(|c| c.waiting_for(now) <= STALLED)
-                    .min_by_key(|c| Rc::strong_count(c))
-                    .cloned();
-                match best {
-                    Some(c) if Rc::strong_count(&c) == 2 || !room => Decision::Ready(c),
+                    .enumerate()
+                    .filter(|(_, m)| usable(m) && m.client.waiting_for(now) <= STALLED)
+                    .min_by_key(|(_, m)| Rc::strong_count(&m.client))
+                    .map(|(i, m)| (i, Rc::strong_count(&m.client) == 1));
+                let pick = match best {
+                    Some((i, free)) if free || !room => Some(i),
                     _ if room => {
                         st.connecting += 1;
-                        Decision::Connect
+                        return Decision::Connect;
                     }
                     // Every connection is stalled and the pool is full: the
                     // one whose oldest statement has waited least, which is
                     // the one most likely to be moving.
-                    _ => match st.shared.iter().min_by_key(|c| c.waiting_for(now)) {
-                        Some(c) => Decision::Ready(c.clone()),
-                        None => Decision::Wait,
-                    },
+                    _ => st
+                        .shared
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| usable(m))
+                        .min_by_key(|(_, m)| m.client.waiting_for(now))
+                        .map(|(i, _)| i),
+                };
+                match pick {
+                    Some(i) => {
+                        let m = &mut st.shared[i];
+                        m.used = now;
+                        Decision::Ready(m.client.clone())
+                    }
+                    None => Decision::Wait,
                 }
             })
             .await?;
@@ -561,7 +724,11 @@ impl Pool {
                 let mut st = self.inner.state.borrow_mut();
                 new.count_into(st.counters.clone());
                 let c = Rc::new(new);
-                st.shared.push(c.clone());
+                st.shared.push(Member {
+                    client: c.clone(),
+                    used: Instant::now(),
+                    expires: self.expiry(),
+                });
                 c
             }
         };
@@ -583,15 +750,16 @@ impl Pool {
     /// opened for the caller (`Err(client)`), or the wait times out.
     async fn acquire<T>(
         &self,
-        mut decide: impl FnMut(&mut State, usize) -> Decision<T>,
+        mut decide: impl FnMut(&mut State, usize, Instant) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
         let deadline = Instant::now() + self.inner.wait_timeout;
         loop {
             let decision = {
                 let mut st = self.inner.state.borrow_mut();
-                st.shared.retain(|c| !c.is_closed());
-                st.draining.retain(|c| !c.is_closed());
-                decide(&mut st, self.inner.max_size)
+                // One clock read for both.
+                let now = Instant::now();
+                st.sweep(now, self.inner.idle_timeout);
+                decide(&mut st, self.inner.max_size, now)
             };
             match decision {
                 Decision::Ready(c) => return Ok(Ok(c)),
@@ -602,6 +770,7 @@ impl Pool {
                     return match result {
                         Ok(client) => {
                             st.opened += 1;
+                            self.start_reaper(&mut st);
                             Ok(Err(client))
                         }
                         Err(e) => {
@@ -625,9 +794,9 @@ impl Pool {
                         // tasks stopped waiting (a timeout dropped them) is
                         // free once they are answered, which nothing else
                         // would announce.
-                        for c in st.shared.iter().chain(&st.draining) {
-                            if Rc::strong_count(c) == 1 && c.in_flight() > 0 {
-                                c.wake_when_idle(cx.waker());
+                        for m in st.shared.iter().chain(&st.draining) {
+                            if Rc::strong_count(&m.client) == 1 && m.client.in_flight() > 0 {
+                                m.client.wake_when_idle(cx.waker());
                             }
                         }
                         Poll::Pending
@@ -651,6 +820,42 @@ impl Pool {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Closes idle and old connections now and then, until the pool is dropped.
+async fn reap(state: Weak<RefCell<State>>, idle_timeout: Duration, period: Duration) {
+    loop {
+        let mut sleep = pin!(giong::time::sleep(period));
+        let stopped = poll_fn(|cx| {
+            let Some(state) = state.upgrade() else {
+                return Poll::Ready(true);
+            };
+            let mut st = state.borrow_mut();
+            if st.stopped {
+                return Poll::Ready(true);
+            }
+            st.reaper_waker = Some(cx.waker().clone());
+            drop(st);
+            sleep.as_mut().poll(cx).map(|()| false)
+        })
+        .await;
+        if stopped {
+            return;
+        }
+        let Some(state) = state.upgrade() else { return };
+        let waiters = {
+            let mut st = state.borrow_mut();
+            if st.sweep(Instant::now(), idle_timeout) {
+                // Room for a new connection.
+                std::mem::take(&mut st.waiters)
+            } else {
+                Vec::new()
+            }
+        };
+        for w in waiters {
+            w.wake();
         }
     }
 }
@@ -740,11 +945,15 @@ impl std::fmt::Debug for Pool {
 /// the [`Client`], and goes back to the pool when dropped.
 pub struct PooledClient {
     client: Option<Client>,
+    /// When the connection is to be closed rather than go back.
+    expires: Instant,
     pool: Pool,
 }
 
 impl PooledClient {
     /// Starts a transaction; see [`Client::transaction`].
+    ///
+    /// Cancel safe, like [`Client::transaction`].
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         self.deref_mut().transaction().await
     }
@@ -776,9 +985,17 @@ impl Drop for PooledClient {
             if !client.is_closed() && client.needs_reset() {
                 client.queue_reset();
             }
-            if !client.is_closed() {
+            let now = Instant::now();
+            if !client.is_closed() && now >= self.expires {
+                // Past its lifetime: closed (dropped) instead of going back.
+                st.recycled += 1;
+            } else if !client.is_closed() {
                 client.set_shared(true);
-                st.shared.push(Rc::new(client));
+                st.shared.push(Member {
+                    client: Rc::new(client),
+                    used: now,
+                    expires: self.expires,
+                });
                 st.rebalance(self.pool.inner.max_size);
             }
         }

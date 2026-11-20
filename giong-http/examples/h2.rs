@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use giong::net::TcpListener;
 use giong_http::{Body, Request, Response, Server};
-use giong_tls::TlsAcceptor;
+use giong_tls::{Certificates, TlsAcceptor};
 
 const PAGE: &str = "<!doctype html>
 <html lang=\"en\">
@@ -79,12 +79,18 @@ fn acceptor() -> TlsAcceptor {
     if let (Ok(cert), Ok(key)) = (std::env::var("GIONG_CERT"), std::env::var("GIONG_KEY")) {
         let cert = std::fs::read(cert).expect("GIONG_CERT");
         let key = std::fs::read(key).expect("GIONG_KEY");
-        return TlsAcceptor::from_pem(&cert, &key).expect("certificate and key");
+        return TlsAcceptor::with_certificates(
+            &Certificates::from_pem(&cert, &key).expect("certificate and key"),
+        )
+        .expect("certificate and key");
     }
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    TlsAcceptor::from_pem(
-        key.cert.pem().as_bytes(),
-        key.key_pair.serialize_pem().as_bytes(),
+    TlsAcceptor::with_certificates(
+        &Certificates::from_pem(
+            key.cert.pem().as_bytes(),
+            key.key_pair.serialize_pem().as_bytes(),
+        )
+        .unwrap(),
     )
     .unwrap()
 }

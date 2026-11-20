@@ -15,7 +15,7 @@ use std::mem::ManuallyDrop;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Instant;
@@ -36,14 +36,38 @@ pub(crate) struct TaskSlot {
 }
 
 struct Task {
-    waker: Waker,
+    /// Lent to each poll as a waker without a reference count of its own
+    /// (see [`Worker::run_batch`]): a spawn and a finished task touch no
+    /// atomic counter unless the future keeps a waker.
     state: Arc<TaskWaker>,
-    fut: Pin<Box<dyn Future<Output = ()>>>,
+    fut: TaskRef,
+}
+
+/// What the executor needs from a spawned task, whatever its future.
+trait Runnable {
+    /// Polls the future, catching its panics, until its result is delivered.
+    fn run(&self, cx: &mut Context<'_>) -> Poll<()>;
+    /// Drops the future if it has not finished, and tells the handle so.
+    fn cancel(&self);
+}
+
+/// The executor's reference to a task. The task's memory is shared with its
+/// [`JoinHandle`] (one allocation per spawn), but its future belongs to the
+/// executor: dropping this drops the future, even while the handle lives on.
+struct TaskRef(Rc<dyn Runnable>);
+
+impl Drop for TaskRef {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 pub(crate) struct TaskWaker {
     shared: Arc<WorkerShared>,
-    id: usize,
+    /// The task's slot. Atomic only so that a retired state can be given a
+    /// new slot without a compare-and-swap: it changes only while no other
+    /// reference to the state exists (see [`Worker::retire`]).
+    id: AtomicUsize,
     /// Set while the task sits in a run queue, so each wake enqueues it once.
     queued: RunFlag,
 }
@@ -52,12 +76,15 @@ pub(crate) struct TaskWaker {
 /// `Worker::run` rather than in the task table.
 pub(crate) const MAIN_TASK: usize = usize::MAX;
 
+/// Retired waker states a worker keeps for reuse (about 64 bytes each).
+const SPARE_WAKERS: usize = 1024;
+
 impl TaskWaker {
     /// The waker state of the main future (enqueued by the caller).
     pub(crate) fn main(shared: Arc<WorkerShared>) -> Arc<Self> {
         Arc::new(Self {
             shared,
-            id: MAIN_TASK,
+            id: AtomicUsize::new(MAIN_TASK),
             queued: RunFlag::new(true),
         })
     }
@@ -65,6 +92,13 @@ impl TaskWaker {
     /// Called right before the task is polled (see [`RunFlag::begin_poll`]).
     pub(crate) fn clear_queued(&self) {
         self.queued.begin_poll();
+    }
+}
+
+impl TaskWaker {
+    fn id(&self) -> usize {
+        // Set before the state was shared with anyone (see `id`).
+        self.id.load(Ordering::Relaxed)
     }
 }
 
@@ -79,9 +113,9 @@ impl Wake for TaskWaker {
         }
         if runtime::current_uid() == self.shared.uid {
             // Same thread: straight onto the local run queue.
-            runtime::try_with_worker(|w| w.queue.borrow_mut().push_back(self.id));
+            runtime::try_with_worker(|w| w.queue.borrow_mut().push_back(self.id()));
         } else {
-            self.shared.inject(Inject::Wake(self.id));
+            self.shared.inject(Inject::Wake(self.id()));
         }
     }
 }
@@ -166,30 +200,25 @@ impl<T> JoinState<T> {
     }
 }
 
-/// Completes the join state as cancelled if the task is dropped unfinished.
-struct CancelOnDrop<T>(Rc<JoinState<T>>);
-
-impl<T> Drop for CancelOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.complete(Err(JoinError::Cancelled));
-    }
-}
-
 /// A handle to a spawned task. Awaiting it yields the task's output.
 ///
 /// Dropping the handle detaches the task: it keeps running in the background.
 pub struct JoinHandle<T> {
-    state: Rc<JoinState<T>>,
+    task: Rc<dyn Joinable<T>>,
     slot: usize,
     uid: u64,
     worker_uid: usize,
 }
 
 impl<T> JoinHandle<T> {
+    fn state(&self) -> &JoinState<T> {
+        self.task.join_state()
+    }
+
     /// Cancels the task: its future is dropped at the next opportunity and the
     /// handle resolves to [`JoinError::Cancelled`]. No-op if already finished.
     pub fn abort(&self) {
-        if self.state.is_finished() {
+        if self.state().is_finished() {
             return;
         }
         let task = runtime::try_with_worker(|w| {
@@ -220,7 +249,7 @@ impl<T> JoinHandle<T> {
 
     /// `true` once the task has completed, panicked or been cancelled.
     pub fn is_finished(&self) -> bool {
-        self.state.is_finished()
+        self.state().is_finished()
     }
 }
 
@@ -228,14 +257,14 @@ impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(result) = self.state.take() {
+        if let Some(result) = self.state().take() {
             return Poll::Ready(result);
         }
         assert!(
-            !self.state.is_finished(),
+            !self.state().is_finished(),
             "JoinHandle polled after completion"
         );
-        let mut waker = self.state.waker.borrow_mut();
+        let mut waker = self.state().waker.borrow_mut();
         match &*waker {
             Some(w) if w.will_wake(cx.waker()) => {}
             _ => *waker = Some(cx.waker().clone()),
@@ -404,43 +433,64 @@ impl<T> fmt::Debug for RemoteJoinHandle<T> {
     }
 }
 
-/// The future a spawned task runs: the user's future, whose result goes to
-/// the [`JoinHandle`].
+/// A spawned task: the user's future and the slot its result goes to, in
+/// one allocation shared by the executor ([`TaskRef`]) and the
+/// [`JoinHandle`].
 ///
-/// Written out by hand rather than as an `async` block: the block would keep
-/// the future it captured and the copy it pins for the `.await` side by side,
-/// and every task would take twice the memory its future needs. A server
-/// holds one task per connection, so that was most of what an idle
-/// connection cost.
+/// The future is held directly, not wrapped in an `async` block: the block
+/// would keep the future it captured and the copy it pins for the `.await`
+/// side by side, and every task would take twice the memory its future
+/// needs. A server holds one task per connection, so that was most of what
+/// an idle connection cost.
 struct LocalTask<F: Future> {
-    /// Pinned with the task: never moved out.
-    fut: F,
-    /// `None` once the result has been delivered.
-    guard: Option<CancelOnDrop<F::Output>>,
+    join: JoinState<F::Output>,
+    /// Pinned in the `Rc`: never moved out, dropped in place (set to `None`)
+    /// as soon as it finishes or the executor lets go of the task.
+    fut: RefCell<Option<F>>,
 }
 
-impl<F: Future> Future for LocalTask<F> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        // SAFETY: `fut` is structurally pinned (it is only ever reached
-        // through `Pin::new_unchecked` below and dropped in place); `guard`
-        // is not pinned and may move.
-        let this = unsafe { self.get_unchecked_mut() };
-        if this.guard.is_none() {
+impl<F: Future> Runnable for LocalTask<F> {
+    fn run(&self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut slot = self.fut.borrow_mut();
+        let Some(fut) = slot.as_mut() else {
             return Poll::Ready(());
-        }
-        // SAFETY: `fut` is structurally pinned (see above).
-        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        };
+        // SAFETY: the future lives inside an `Rc` allocation that never
+        // moves, and it is only ever dropped in place (`*slot = None`), never
+        // moved out: it is pinned for its whole life.
+        let fut = unsafe { Pin::new_unchecked(fut) };
         let result = match panic::catch_unwind(AssertUnwindSafe(|| fut.poll(cx))) {
             Ok(Poll::Pending) => return Poll::Pending,
             Ok(Poll::Ready(value)) => Ok(value),
             Err(payload) => Err(JoinError::Panic(payload)),
         };
-        if let Some(guard) = this.guard.take() {
-            guard.0.complete(result);
-        }
+        // The future's own drop runs before the handle learns the result,
+        // as it did when the task was freed right after completing.
+        *slot = None;
+        drop(slot);
+        self.join.complete(result);
         Poll::Ready(())
+    }
+
+    fn cancel(&self) {
+        // Dropped in place, never moved out (see `run`): an `async` block
+        // that holds a borrow of its own locals across an `.await` would
+        // otherwise run its destructors against the copy it was moved from.
+        // The handle reaches only `join`, so no destructor of the future can
+        // come back to this cell while it is borrowed here.
+        *self.fut.borrow_mut() = None;
+        self.join.complete(Err(JoinError::Cancelled));
+    }
+}
+
+/// The [`JoinHandle`]'s view of a task: its result slot, whatever the future.
+trait Joinable<T> {
+    fn join_state(&self) -> &JoinState<T>;
+}
+
+impl<F: Future> Joinable<F::Output> for LocalTask<F> {
+    fn join_state(&self) -> &JoinState<F::Output> {
+        &self.join
     }
 }
 
@@ -525,14 +575,13 @@ impl Worker {
     where
         F: Future + 'static,
     {
-        let state = Rc::new(JoinState {
-            result: RefCell::new(None),
-            waker: RefCell::new(None),
-            finished: Cell::new(false),
-        });
-        let wrapped = Box::pin(LocalTask {
-            fut,
-            guard: Some(CancelOnDrop(state.clone())),
+        let task = Rc::new(LocalTask {
+            join: JoinState {
+                result: RefCell::new(None),
+                waker: RefCell::new(None),
+                finished: Cell::new(false),
+            },
+            fut: RefCell::new(Some(fut)),
         });
 
         let uid = self.next_task_uid.get();
@@ -545,16 +594,11 @@ impl Worker {
             uid,
             abort: false,
         });
-        let waker_state = Arc::new(TaskWaker {
-            shared: self.shared.clone(),
-            id: slot,
-            // Enqueued right below.
-            queued: RunFlag::new(true),
-        });
+        let waker_state = self.task_waker(slot);
+        let handle_task: Rc<dyn Joinable<F::Output>> = task.clone();
         let task = Task {
-            waker: Waker::from(waker_state.clone()),
             state: waker_state,
-            fut: wrapped,
+            fut: TaskRef(task),
         };
         tasks.get_mut(slot).expect("slot just inserted").task = Some(task);
         drop(tasks);
@@ -562,10 +606,48 @@ impl Worker {
         self.shared.counters.spawned();
 
         JoinHandle {
-            state,
+            task: handle_task,
             slot,
             uid,
             worker_uid: self.shared.uid,
+        }
+    }
+
+    /// The waker state for a new task in `slot`: a retired one when there
+    /// is one, so that a spawn costs one allocation instead of two.
+    fn task_waker(&self, slot: usize) -> Arc<TaskWaker> {
+        if let Some(state) = self.spare_wakers.borrow_mut().pop() {
+            // Nobody else holds it (see `retire`), so plain stores will do.
+            state.id.store(slot, Ordering::Relaxed);
+            // Enqueued by the caller.
+            state.queued.reset(true);
+            return state;
+        }
+        Arc::new(TaskWaker {
+            shared: self.shared.clone(),
+            id: AtomicUsize::new(slot),
+            // Enqueued by the caller.
+            queued: RunFlag::new(true),
+        })
+    }
+
+    /// Drops a task that is done, and keeps its waker state for the next
+    /// spawn if no waker of it is left anywhere: a waker still held by a
+    /// timer, a channel or another thread keeps its state to itself, so it
+    /// can never wake the task that reuses it.
+    fn retire(&self, task: Task) {
+        let Task { state, fut } = task;
+        drop_quietly(fut);
+        // TaskWaker states are never downgraded to `Weak`, so one strong
+        // reference means ours is the only one. The fence pairs with the
+        // release decrement of the last other owner's drop: whatever it did
+        // with the state happens before the reuse.
+        if Arc::strong_count(&state) == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            let mut spare = self.spare_wakers.borrow_mut();
+            if spare.len() < SPARE_WAKERS {
+                spare.push(state);
+            }
         }
     }
 
@@ -608,16 +690,23 @@ impl Worker {
                 (slot.task.take(), slot.location)
             };
             // A stale wake-up for a slot that is empty (or being polled).
-            let Some(mut task) = task else { continue };
+            let Some(task) = task else { continue };
 
             task.state.clear_queued();
             counters.polling(location);
             let start = PROFILE.then(Instant::now);
             let finished = {
-                let mut cx = Context::from_waker(&task.waker);
+                // SAFETY: a waker that borrows the task's reference: made from
+                // the `Arc`'s own pointer without a count of its own, and never
+                // dropped (`ManuallyDrop`), so the count stays balanced. Its
+                // clones count as usual. `task.state` outlives the poll.
+                let waker = ManuallyDrop::new(Waker::from(unsafe {
+                    Arc::from_raw(Arc::as_ptr(&task.state))
+                }));
+                let mut cx = Context::from_waker(&waker);
                 // The task wrapper already catches panics from the user's future;
                 // this guards the wrapper's own cleanup (destructors).
-                match panic::catch_unwind(AssertUnwindSafe(|| task.fut.as_mut().poll(&mut cx))) {
+                match panic::catch_unwind(AssertUnwindSafe(|| task.fut.0.run(&mut cx))) {
                     Ok(Poll::Pending) => false,
                     Ok(Poll::Ready(())) | Err(_) => true,
                 }
@@ -631,7 +720,7 @@ impl Worker {
             if finished || abort {
                 tasks.remove(id);
                 drop(tasks);
-                drop_quietly(task);
+                self.retire(task);
             } else if let Some(slot) = tasks.get_mut(id) {
                 slot.task = Some(task);
             }
@@ -679,6 +768,8 @@ where
 }
 
 /// Yields to the executor, letting other tasks and pending I/O make progress.
+///
+/// Cancel safe: it changes nothing.
 pub async fn yield_now() {
     let mut yielded = false;
     poll_fn(|cx| {
@@ -701,13 +792,16 @@ mod tests {
 
     type Big = Ready<[u8; 4096]>;
 
-    /// A task is as large as its future plus the handle to its result: the
+    /// A task is as large as its future plus its result slot: the
     /// wrappers do not keep a second copy of the future (an `async` block
     /// around it did, and every connection of a server paid twice).
     #[test]
     fn task_wrappers_add_no_copy_of_the_future() {
         let future = mem::size_of::<Big>();
-        assert!(mem::size_of::<LocalTask<Big>>() <= future + 16);
+        // The task also holds the result slot (the output is 4 KiB too), but
+        // only one copy of the future.
+        let result = mem::size_of::<JoinState<[u8; 4096]>>();
+        assert!(mem::size_of::<LocalTask<Big>>() <= future + result + 16);
         assert!(mem::size_of::<RemoteTask<Big>>() <= future + 32);
     }
 }

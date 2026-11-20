@@ -1,0 +1,21 @@
+tcp-segmentation-offload: on
+	tx-tcp-segmentation: on
+	tx-tcp-ecn-segmentation: on
+	tx-tcp-mangleid-segmentation: off
+	tx-tcp6-segmentation: on
+	tx-tcp-accecn-segmentation: off [fixed]
+generic-segmentation-offload: on
+tx-fcoe-segmentation: off [fixed]
+tx-gre-segmentation: on
+tx-gre-csum-segmentation: on
+tx-ipxip4-segmentation: on
+tx-ipxip6-segmentation: on
+tx-udp_tnl-segmentation: on
+tx-udp_tnl-csum-segmentation: on
+tx-tunnel-remcsum-segmentation: off [fixed]
+tx-sctp-segmentation: off [fixed]
+tx-esp-segmentation: off [fixed]
+tx-udp-segmentation: on
+rx-gro-hw: off [fixed]
+rx-gro-list: off
+rx-udp-gro-forwarding: off

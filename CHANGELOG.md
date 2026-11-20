@@ -8,8 +8,466 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-11-20
+
+### Security
+
+- **giong-http**: the server refuses new connections while the process is close to running
+  out of memory, instead of taking on connections until the kernel's out-of-memory killer
+  ends it with every connection it holds. Before each accept it checks what is left (the
+  smaller of what the process's cgroup allows, page cache aside, and the machine's
+  `MemAvailable`), and below a reserve it answers new connections without TLS with `503`,
+  `Retry-After: 1` and `GIONG-E1121`, and closes new TLS connections before their
+  handshake; the connections it holds keep being served. The reserve is
+  `Server::min_free_memory` (new), by default a tenth of the memory limit, between 16 and
+  256 MiB; `0` turns the check off. Found on bare metal in a container of 1 CPU and 512
+  MiB, where 0.8.0 was killed at 36,400 idle HTTPS connections (with `max_connections`
+  raised); the default limit of 10,000 connections per worker was enough to get it killed
+  in smaller containers too: 7,900 idle HTTPS connections in 96 MiB, or 9,100 plain ones in
+  32 MiB (cgroup v1, which leaves kernel socket memory out). With the check, the same runs
+  refuse at 6,500 and 6,600 connections and stay up. CI runs it in a container of 48 MiB
+  with one and four workers on both drivers (`scripts/idle-connections.sh`).
+
+### Added
+
+- **All crates**: every public async fn says in its documentation whether it is cancel
+  safe and, when it is not, what a dropped future leaves behind (a statement that may
+  still run, a datagram that may be sent, a file that may be created).
+  `tests/cancel_docs.rs` fails a public async fn without it.
+- **Docs**: `docs/STABILITY.md` says what a cancelled operation does on both drivers (it
+  may still happen; buffers and descriptors stay with the driver until the kernel is done
+  with them; a close is never cancelled; a transaction never commits a statement whose
+  outcome it does not know) and which limits wait and which refuse by default, which 1.x
+  will not change. `docs/RELEASING.md` gives the checklist a 1.0 release candidate carries:
+  the soaked commit, the release commit, what changed between them, the tests run again
+  and the soak that change got, sized by what changed (none, 2 to 4 hours, or 72).
+- **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
+  without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
+  instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
+  what `TlsStream::peer_certificates` returns) is re-exported.
+- **giong-tls**: the server side without rustls' types. `Certificates` holds one or
+  several certificate chains: `TlsAcceptor::with_certificates` presents the one valid for
+  the name the client asks for (SNI), and `Certificates::replace_pem` swaps the set while
+  the server runs, for renewed certificates. `TlsAcceptor::require_client_cert` and
+  `request_client_cert` turn on mutual TLS. The `post-quantum` feature uses aws-lc-rs and
+  offers the X25519MLKEM768 key exchange first. New error code `GIONG-E2013`
+  (`Code::TlsConfig`) in giong.
+
+- **giong-http**: `Server::min_free_memory`, and the error code `GIONG-E1121`
+  (`Code::HttpServerLowMemory`) in giong.
+- **giong-mysql**, **giong-redis** (**behaviour change**): `Pool::idle_timeout`,
+  `Pool::max_lifetime` and `PoolStats::recycled`, with giong-postgres's defaults and
+  meaning, so the three pools are configured the same way before the 1.0 API freeze. A
+  pooled connection unused for 10 minutes is now closed, and one older than 30 minutes (less
+  up to a tenth at random) takes no new statement or command and is closed once the ones on
+  it are answered, or when it comes back from `get()` or `take()`; the pool opens another
+  when needed. Before, a connection stayed open until the server or the network closed it,
+  so a pool kept talking to the old primary after a DNS failover. giong-redis reads no
+  clock on the path of a shared command for this: a command marks its connection used, and
+  the pool's sweep, which runs every quarter of the shorter of the two settings (at most
+  every 30 seconds), turns the mark into a time. `observe` snapshots and giong-mcp report
+  `recycled` for the two pools.
+- **giong-postgres**, **giong-mysql**: `Error::server_code()`, the name giong-redis already
+  used for the code the server sent (`code()` named a different thing in each crate), and
+  `Error::is_transient()`, as giong-redis and giong-http's client have: true for a failed
+  connect, a closed connection, a pool timeout, and the server errors a retry can cure
+  (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
+  giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
+  server).
+- **giong**: `sync::mpsc::unbounded()`, the new name of `sync::mpsc::channel()`. Tokio's
+  `mpsc::channel(n)` is bounded, so code ported from Tokio, or written from memory of it,
+  took giong's `channel()` for a bounded channel; `bounded(n)` is that one here. Its halves
+  are now `UnboundedSender` and `UnboundedReceiver`, as in Tokio, and the short names
+  `Sender` and `Receiver` go to the bounded channel, whose memory has a limit (see
+  *Removed*).
+- **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
+  parameter is still `dbname`, as libpq spells it.
+
 ### Changed
 
+- **Breaking:** **giong-mcp**: `FromEnv` is `#[non_exhaustive]`, like every other enum that
+  is not complete by nature, so a `match` on it needs a `_` arm. `FromEnv::server()` and
+  `FromEnv::error()` are unchanged.
+- **giong-tls** (breaking): rustls' types are out of the stable API, so that a new rustls
+  version, which giong-tls will take up during 1.x, breaks nothing. The rustls
+  configurations that `TlsAcceptor::new` and `TlsConnector::new` took go to the new
+  `TlsAcceptor::from_rustls` and `TlsConnector::from_rustls`, which need the new
+  `unstable-rustls` feature, as do `KtlsSupport::supports` and the `rustls` re-export (no
+  longer there without it). That feature is outside the semver promise: it follows the
+  rustls version giong-tls uses.
+
+- **giong-tls** (**behaviour change**): `TlsAcceptor::from_pem` picks AES-128-GCM first of
+  the cipher suites both sides allow, whatever order the client lists, as Go's and
+  BoringSSL's servers do; a client that lists ChaCha20-Poly1305 before every AES-GCM suite
+  (one without AES instructions) still gets ChaCha20. OpenSSL's clients (wrk, curl, Python)
+  list AES-256-GCM first, whose TLS 1.3 suite hashes with SHA-384, about a sixth of a
+  resumed handshake's CPU time. With `bench/tls.sh` (4-vCPU VM, 7 rounds, raw data in
+  `bench/results/tls/`), new connections went from 6.8k to 8.4k per second (142 to 116 µs
+  of CPU each) together with the next entry, against 7.1k for axum + rustls; axum set to
+  the same order reaches the same 8.4k, so the suite is most of the gain. 64 KiB responses
+  went from 26.3k to 31.9k per second. An acceptor made with `TlsAcceptor::new` uses its
+  configuration as given.
+- **giong-tls**: fewer TCP segments per connection. A TLS 1.3 server's session tickets
+  wait for its first response, or for a receive that has to wait, instead of going out
+  alone; later key updates answering the peer's wait the same way; `shutdown` sends
+  `close_notify` with `MSG_MORE`, so it shares the FIN's segment; and the pieces of one
+  vectored write share one send. Per `Connection: close` request, both directions: 14.4
+  segments against 16.5 (axum + rustls: 14.0), and p99 latency 4.2 ms against 5.8.
+- **giong-compat**: a write at least as large as the write buffer's limit (64 KiB by
+  default), with nothing buffered or being sent before it, goes straight from the caller's
+  memory to the socket in one `sendmsg(2)` that does not wait, as `BufWriter` and Tokio's
+  streams do, instead of being copied into the buffer first; what the socket cannot take
+  at once is still buffered. `bench/compat.sh` (raw data in `bench/results/compat/`): CPU
+  per KiB sent 378 ns against 400 for 0.8.0's `Compat`, and within 2–9% of Tokio over two
+  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged by it: 30% more CPU per byte than Tokio
+  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive; 19% and 14% with
+  the 16 KiB receive buffers below, where `Compat` sends at 6% less CPU per KiB than Tokio.
+- **giong-tls** (**behaviour change**): `TlsStream::shutdown` returns `Ok` when the
+  `close_notify` cannot be sent because the peer has closed its socket already (`EPIPE`,
+  `ECONNRESET`): the sending direction is closed either way and nobody is left to tell.
+  An h2 server over `Compat` reported such a client's clean departure as an error.
+- **giong-postgres**, **giong-mysql**, **giong-redis**: on plain TCP and Unix sockets a
+  connection has the kernel write what the server sends straight into its read buffer (a
+  one-off receive of up to 64 KiB) instead of copying it there from the runtime's pooled
+  buffers, so each byte is copied once on the way in instead of twice. Measured with
+  `bench/redis.sh`, `bench/postgres.sh` and `bench/mysql.sh` (medians of 5 rounds,
+  `bench/results/`): giong-redis `GET` of 8 KiB values with four connections went from
+  level with redis-rs (259k against 269k per second) to 345k against 276k, and with one
+  connection from about 240k to 375k (redis-rs 151k); giong-postgres's pool of 4 from 243.9k to
+  303.8k point lookups and 53.9k to 72.9k 100-row reads; giong-mysql's from 138.1k to 152.1k
+  and 34.3k to 38.3k; with pools of 3 (the size the READMEs advise for a 3-core server), 240.7k to
+  311.4k and 138.7k to 150.7k point lookups. Small Redis commands are unchanged. Each connection's read buffer now
+  keeps 64 KiB of room (it was 8 or 16 KiB, with the received bytes in the runtime's shared
+  pool). TLS connections read as before. giong-postgres with one connection shared by every
+  task stays 7–9% behind tokio-postgres (47.7k against 51.4k point lookups): the server is
+  the limit there and spends half its time sending one reply per statement; the
+  giong-postgres README says why it does not merge statements under one `Sync`.
+- **giong-http**: the client's `RequestBuilder::header` takes `impl AsRef<str>` for the value,
+  as the server's `Response::header` does, so `.header("X-Id", id.to_string())` needs no `&`.
+  A call that passed a `&str` or `&String` compiles as before; one that relied on the
+  parameter being `&str` to infer a type (`value.as_ref()`, `.into()`) now needs `&str` written
+  out. `cargo-semver-checks` reports no break.
+- **Docs**: giong-web's `Router::layer` and README say that the first middleware added is
+  the outermost, the reverse of axum's `Router::layer`, so code ported from axum lists its
+  layers the other way round.
+- **Docs**: CONTRIBUTING.md lists every fuzz target (`response_body`, the PostgreSQL and
+  MySQL `session` targets and the resolver's two were missing); giong-http's
+  `Response::json` says it sends bytes that are already JSON; the API freeze record
+  (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
+
+- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll, on a cloud VM. A UDP echo
+  server on one core (64-byte datagrams, veth, `bench/udp-echo.sh`, 5 rounds,
+  `bench/results/udp-echo/`) answers 328,000 datagrams a second with 16 tasks on one socket
+  on io_uring (259,000 before, Tokio 278,000) and 300,000 with one task (286,000 before,
+  Tokio 259,000); on epoll 284,000 in both cases (239,000 and 258,000 before). `UdpSocket::send_to` and `send` send within the call when the
+  socket has room, instead of through an operation that waited a turn of the event loop
+  (io_uring) or allocated a message header (both), and use `sendto(2)` rather than
+  `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
+  now costs one system call on either driver where Tokio makes two. Immediate sends count
+  against the task's budget, so a task that only sends still gives way to the others.
+  On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark;
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`) the server
+  core is saturated near a million echoes a second and the runtimes are close: this change
+  is behind Tokio with io_uring and 16 tasks (856,000 against 870,000) and with epoll and one
+  task (874,000 against 882,000), level with epoll and 16 tasks (879,000), and ahead with
+  io_uring and one task (926,000 against 882,000).
+- **net**: the epoll driver's UDP path is close to the kernel's ceiling. The same echo
+  server answers 336,000 datagrams a second with 16 tasks on epoll (284,000 before, Tokio
+  271,000, the kernel-only `recvmmsg`/`sendmmsg` server 390,000) at 4.08 µs of server CPU per
+  echo (5.07 before, Tokio 5.33, kernel 3.55), and 351,000 with one task (284,000 before,
+  Tokio 307,000) (`bench/results/udp-echo/vm/epoll-deep/`), on a cloud VM. Two changes: datagrams that tasks send while
+  other tasks of the worker are runnable go to the kernel at the end of that turn of the
+  event loop, in one `sendmmsg(2)` per socket, each sender still getting its own result and
+  datagrams of one socket keeping their order (both drivers; a lone sender sends at once);
+  and on epoll a datagram socket that has received 64 datagrams leaves the epoll set until a
+  task has to wait for it again, because in the set every datagram received and every one
+  sent and freed wakes epoll's callback on the socket's wait queue.
+  On bare metal (`post-soak/udp-udp-epoll-*`, as above) the margins are small: with 16 tasks
+  921,000 on epoll and 902,000 on io_uring against Tokio's 870,000, ahead in every round;
+  with one task 893,000 and 876,000 against 863,000, a tie within the noise between rounds.
+
+- **runtime**, **sync**, **time**, **fs**, **net**: the core of the runtime is faster than
+  Tokio's in every workload of the new `bench/core.sh`, which runs the same code on giong,
+  Tokio (current-thread, `LocalSet` and multi-thread), monoio, glommio, compio and smol.
+  Medians of 5 rounds on the 4 vCPU cloud VM, ns per operation, io_uring
+  (`bench/results/core/vm/`): spawning and joining a task 92 (184 before; Tokio 174 to 226),
+  a thread outside the runtime feeding a task over `mpsc` 64 (194; Tokio 155 to 167), one
+  task feeding another 31 (40; Tokio 58 to 62), a chain of 1,000 tasks passing a token 220
+  (270; Tokio 289), a task sleeping once among 100,000 688 (748; Tokio 886 to 935), a
+  loopback TCP round trip with both ends on one thread 4,650 (4,930; Tokio 5,230). On
+  epoll, two tasks bouncing a value over channels take 222 instead of 531 (Tokio 481); the
+  TCP round trip there is level with Tokio's (5,304 against 5,231, the same system calls).
+  monoio and glommio stay ahead on spawning and on their channels, which only work within
+  one thread; giong's channels also carry values between threads. Files (`bench/fs.sh`,
+  page cache, one core, `bench/results/fs/`): 4 KiB at a random offset 1,328,000 reads a
+  second with one task (981,000 before; blocking `std` 1,313,000, monoio 968,000, compio
+  892,000, Tokio 163,000), whole 4 KiB files 437,000 a second (185,000; monoio 375,000,
+  Tokio 135,000) and 517,000 with 64 tasks (317,000; monoio 338,000). The changes:
+  - a task and its join state are one allocation, the waker a poll lends the task holds no
+    reference count of its own, and a finished task's waker state serves the next spawn when
+    no waker of it is left;
+  - the unbounded `mpsc` receiver takes everything queued under one lock when its own values
+    run out, instead of locking once per value;
+  - sleeps polled in the same turn of the event loop share one clock reading; a deadline
+    within a millisecond of it reads the clock again, so a zero timeout still ends at once;
+  - `File::read_at` (and so `fs::read`) first tries `preadv2` with `RWF_NOWAIT`, which copies
+    from the page cache without waiting for the disk, and goes to the driver only when that
+    returns nothing; `fs::read` takes its size hint from `fstat`;
+  - on io_uring, a TCP or Unix stream send by the only runnable task goes out with
+    `send(MSG_DONTWAIT)` instead of waiting a turn of the loop for its completion (with other
+    tasks runnable, sends still reach the kernel together through the ring, and no send can
+    overtake one still in the ring);
+  - on epoll, a busy worker looks for I/O every 61 polls, as Tokio does, instead of making
+    an `epoll_wait` call at every turn of the loop.
+
+- **runtime**: the default receive buffers are 16 KiB instead of 8 KiB
+  (`Builder::recv_buffers(512, 16 * 1024)`). Each receive brings at most one buffer, so a
+  bulk receive takes half the receives: giong's own `recv` of a 2 GiB stream spends 124 ns
+  of CPU per KiB instead of 142 (Tokio 120; medians of 7 interleaved rounds, `bench/compat`).
+  The memory a worker reserves for its pool doubles, to 8 MiB of address space, of which it
+  touches only the buffers it lends (16 at first): measured with `bench/memory.sh` (10,000
+  connections, 4 workers), memory per open, idle and pending connection and the peak under
+  load did not change. On kernels without packed buffers (before 6.12), where every stream
+  receive takes a whole buffer, a buffer the application holds now pins 16 KiB instead of
+  8. A datagram received with `recv_from` can now carry up to 16 KiB − 44 bytes before it
+  is cut off.
+
+### Removed
+
+The names the API review replaced go outright, without deprecated aliases: nothing runs
+giong in production yet, and after 1.0.0 a name can only be deprecated, never removed.
+
+- **Breaking:** **giong**: `sync::mpsc::channel()`; use `sync::mpsc::unbounded()`.
+  `sync::mpsc::Sender` and `Receiver` no longer name the unbounded channel's halves, which
+  are `UnboundedSender` and `UnboundedReceiver`: they are now the halves of the bounded
+  channel, as in Tokio, and `BoundedSender` and `BoundedReceiver` are removed. To migrate
+  from 0.8, rename in this order: `channel()` to `unbounded()`, `Sender` and `Receiver` to
+  `UnboundedSender` and `UnboundedReceiver`, then `BoundedSender` and `BoundedReceiver` to
+  `Sender` and `Receiver`. Code that skips a step does not compile: the two kinds of
+  halves have different methods (`send` waits on the bounded one).
+- **Breaking:** **giong-postgres**, **giong-mysql**: `Error::code()`; use
+  `Error::server_code()`, which returns the same value.
+- **Breaking:** **giong-postgres**: `Config::dbname`; use `Config::database`. The URL
+  parameter is still `dbname`.
+- **Breaking:** **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and
+  `TlsConnector::with_roots`, which took rustls' types. Use
+  `TlsAcceptor::with_certificates`, and `TlsConnector::with_system_roots`, `with_root_pem`
+  or `with_root_pem_any_name`; for a rustls configuration of your own, `from_rustls` with
+  the `unstable-rustls` feature, which is outside the semver promise.
+
+Three shortcuts that did what another function already does go as well, so that each task
+has one spelling:
+
+- **Breaking:** **giong-tls**: `TlsAcceptor::from_pem(cert, key)`; write
+  `TlsAcceptor::with_certificates(&Certificates::from_pem(cert, key)?)`. The acceptor is
+  the same (same cipher suite order, no ALPN), and the `Certificates` set is what a
+  service needs anyway to replace a renewed certificate while it runs.
+- **Breaking:** **giong-redis**: `Cmd::new(name)`; use `cmd(name)`.
+- **Breaking:** **giong**: `observe::register_rc(&rc)`; use `observe::register` with
+  `Rc::downgrade(&rc)` as a `Weak<dyn Source>`.
+
+### Fixed
+
+- **giong-postgres**: a `Transaction` in which a statement was given up before its answer
+  came (its future dropped, by a timeout say) could still commit, although the statement
+  may have run on the server unseen. As in giong-mysql, the transaction now refuses every
+  later statement and `commit` with an `ErrorKind::Db` error that says so, sends nothing
+  more, and is rolled back when dropped. In both crates a statement whose answer had
+  arrived before its future was dropped no longer counts, since its outcome is known
+  (giong-mysql refused the commit for it too).
+- A `File::close` whose future was dropped after it was first polled could leave the
+  descriptor open with nobody owning it: on the epoll driver when no blocking thread had
+  started the close yet, and on io_uring when the kernel had handed it to a worker thread
+  (network filesystems, FUSE). The close is no longer cancelled; it runs to the end and
+  only its result is lost.
+- **net**: tasks that share a `UdpSocket` and wait in `recv_from` at the same time are each
+  woken for a datagram of their own. On io_uring they shared one wake-up slot: only the
+  last task to wait was woken, the others saw their datagrams only when something else
+  woke them, and a server of 16 tasks on one socket made one kernel entry per datagram. A
+  task that stops waiting (its receive timed out) no longer takes the wake-up of the next
+  datagram.
+- **giong-http**: requests sent at once to an `https` origin the client had no connection to
+  yet each opened a connection and did a TLS handshake of their own, up to
+  `max_connections_per_host`, because the pool learned that the origin speaks HTTP/2 only
+  once the first handshake was over. They now wait for that first connection while ALPN may
+  still pick HTTP/2, and share it when it does; when it picks HTTP/1.1 they open their own
+  as before, and when the first one fails or is dropped the next in line opens one. 64
+  requests to a new loopback origin on one worker: 16 TLS connections and 4.70 ms before, 1
+  and 0.78 ms after (median of 21 rounds). Reported from a service that warms its client up
+  while requests arrive (#154).
+- `UdpSocket::bind` to a port no other socket of the process held could fail with
+  `AddrInUse` for a port that nothing held, while any thread of the process read
+  `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
+  descriptors). The first bind of a port checked it with a probe socket, bound and closed
+  again; a socket closed while such a reader holds it keeps its port for a few
+  microseconds, and the real bind came right after. The first socket of a port is now
+  bound without `SO_REUSEPORT` itself and sets it once bound, so nothing is closed before
+  the bind. `TcpListener::bind` takes the same path (it was not affected). Seen as the
+  rare `AddrInUse` of the UDP rebind test on CI; reproduced without giong at 8 to 105
+  refused binds in about 119,000 with two threads reading `/proc/self/fd`, none without.
+- **giong-postgres**: `Pool::max_lifetime(Duration::MAX)` panicked with an overflow when the
+  pool opened its first connection (the random part of the lifetime was computed as a tenth
+  of it times up to 999); a lifetime too long for the clock now means none, as
+  `wait_timeout(Duration::MAX)` does in giong-redis. Found while adding the same setting to
+  the other two pools.
+- **giong-tls**: a cancelled `TlsStream::recv` could end the stream's sending for good.
+  A receive with nothing to read first sends what the connection owes the peer (a TLS 1.3
+  server's session tickets after the handshake, the answer to a key update); on io_uring
+  that send stayed with the kernel across the poll, and a receive dropped then (a short
+  `timeout`, a `select`) left the record stream cut, so every later write failed with
+  `GIONG-E2008`. Such records now leave in one `send(2)` that does not wait: what the
+  socket takes is sent, the rest goes out first with the next send or receive, in order,
+  and no receive holds a send that dropping it could cut. With kernel TLS the answer to a
+  key update and alerts go the same way, and a key update the socket has no room for is
+  paid by the next send. `recv` is cancel safe without exception; its documentation said
+  otherwise. Found as a rare failure of `recv_is_cancel_safe` under ThreadSanitizer.
+- **giong-tls**: with kernel TLS, a `KeyUpdate` asking for new keys that reached the socket
+  together with the end of the handshake (a peer that renews its keys at once) was never
+  answered, and the peer could not decrypt anything sent to it afterwards. The handshake
+  read whatever had arrived, rustls took the `KeyUpdate`, changed its sending key and kept
+  the answer for a write that never came once the keys went to the kernel. The handshake
+  now reads record by record from the moment this side has sent its first flight, so every
+  record after the peer's last handshake record stays in the socket for the kernel, which
+  answers the key update like any other. A kernel TLS handshake makes a few more small
+  reads for it (two per record of the peer's later flights); handshakes in the process
+  are unchanged.
+- **giong-tls**: the fix for a cancelled `recv` above made every idle TLS connection hold
+  the buffer its session tickets had passed through: about 200 bytes more heap per idle
+  HTTPS connection (10,981 bytes on io_uring against the 10,784 recorded before it). The
+  buffer is now given back as soon as it is empty: 10,798 bytes on io_uring and 10,849 on
+  epoll (`instr`, 2,000 idle connections), within 30 bytes of the figures recorded before
+  the fix (10,784 and 10,821). What stays of that fix's cost is one field in the stream
+  and two checks per write: 0.4% more instructions per HTTPS request (44,780 against
+  44,604 on io_uring, 43,255 against 43,090 on epoll).
+- **giong-http**: an idle HTTP/2 connection took 61% more resident memory in 0.8.0 than in
+  0.5.0 (6.78 KiB against 4.21 on bare metal, `bench/h2.sh`, 5,000 connections that made
+  one request each). Since 0.8.0 a connection kept the memory for its streams for a second
+  after each request, so that requests following one another allocate none of it: when
+  thousands of connections open together, all of them held it at once, and the allocator
+  kept the pages after it was freed. A connection now keeps it only once a request has
+  followed another within that second. Since 0.6.0 the queue of handlers to start also
+  reserved room for four requests (672 bytes) on its first use; it now starts with room for
+  one, as the slots for streams now do too (they took room for four, 1,408 bytes). Measured on a
+  4-vCPU VM (Linux 6.18, `bench/hold`, 5,000 connections, one worker), resident memory per
+  connection, 0.5.0 / 0.8.0 / now (raw data in `bench/results/low-memory/`): idle 4.56 / 7.09 / 4.54 KiB, one request in progress
+  6.68 / 7.42 / 5.88 KiB, ten requests in progress 19.09 / 21.65 / 19.09 KiB. The `instr`
+  job did not catch it: its `idle-h2` case opened connections without making a request.
+  It now makes one on each, as `bench/h2.sh` does.
+- **giong-http**: the first version of the fix above, merged in #125, gave the queue of
+  handlers to start back each time it emptied after growing past four. A client with many
+  streams in flight grows and empties it all the time, so every burst allocated it again: on
+  bare metal HTTP/2 served 4.6% fewer requests per second (1.519M against 1.593M, `bench/h2.sh`
+  json). The queue is now given back after the first burst only, which keeps ten long
+  requests opened at once from holding it, and kept from the second on until the connection
+  is idle. Instructions per request against 0.8.0 (callgrind, `h2load` with 10 connections,
+  4-vCPU VM; raw data in `bench/results/low-memory/`): one stream at a time +1.2% before,
+  +0.4% now; ten streams +2.1% / +0.3%; a hundred +4.5% / +1.1%. Memory stays as above. The
+  `instr` job sent one request at a time and missed it; its new `h2-streams` case sends ten
+  at once on one connection, with a limit of 0.5%.
+- **giong**: `UnixStream::recv` could miss the end of the stream on Linux 6.18 with
+  io_uring, and wait until the peer closed the socket. When the last data arrived
+  together with the peer's `shutdown(Write)`, the kernel's multishot receive took the
+  data and went back to waiting without reporting the end (a bare ring without giong
+  does the same on 6.18.44 and 6.18.63, with more than 32 buffers of data waiting; 6.12.117
+  and TCP sockets do not). A reader that has taken everything received from a Unix socket
+  now asks the socket whether the peer has stopped sending, with one `poll` call, and
+  starts the receive again if it has. An echo over a Unix socket whose client writes,
+  shuts down and reads to the end stalled about once in 8,000 runs with four of them in
+  parallel; with the check, 480,000 runs had none. The epoll driver was not affected.
+  Sockets from `UnixListener::accept` also no longer try a zero-copy send first, like the
+  other Unix sockets.
+
+## [0.8.0] - 2026-11-16
+
+Verified in CI: the checks on the way to 1.0 that need no machines of their own now run on
+every change, and none of them found a bug in released code. `cargo-semver-checks` holds
+the public API to 0.7.0's. Callgrind counts the instructions and allocations of 16 hot
+paths on both drivers, and the memory per idle HTTP/1.1, HTTP/2 and HTTPS connection, and
+fails a change that moves any past its limit. Kani proves the small `unsafe` core for every
+input within stated bounds. A deterministic simulation runs the epoll driver under lost,
+reordered and reset connections, failing disks and jumping clocks, about 210 simulated days
+per CI run. Every fuzz target runs for 10 minutes each night, and none has an open crash.
+A slow-upload attack runs against a server in a 128 MiB container on every change, behind
+the one fix that changes behaviour for running services: the memory budget for requests
+being received (under Security). No public API changed; two log outputs did (`Logger`,
+`Trace`). This release has no benchmark run on bare metal (that is 0.9); the numbers below
+are instruction and allocation counts from `bench/instr`.
+
+### Added
+
+- **CI**: `cargo-semver-checks` checks the public API of every change against the last
+  release (0.7.0), so a breaking change fails CI; a release pull request that bumps the
+  version may break, as semver allows.
+- **CI**: an `instr` job counts with callgrind the instructions and heap allocations of 16
+  operations on both drivers (spawn, yield, channels, timeouts, TCP and UDP echo, file
+  reads, the HTTP/1.1 server, HTTP/1.1, HTTP/2 and TLS client to server, a giong-web
+  route, Redis, PostgreSQL and MySQL queries against in-process fake servers) and the heap
+  and resident memory per idle HTTP/1.1, HTTP/2 and HTTPS connection, and fails when one
+  moves past its limit from `bench/instr/baseline.csv` (1% for instructions and
+  allocations, 2% for heap, 10% for resident memory). The counts repeat within 0.07% on a
+  shared runner; raw rounds in `bench/results/instr/`.
+- **Testing**: a deterministic simulation (`sim/`, not published) that runs giong's epoll
+  driver on a simulated kernel: virtual sockets, epoll, eventfds, clocks, threads and
+  disk faults, all chosen by a seed, so a failing run replays exactly with
+  `GIONG_SIM_SEED`. It runs the core crate's own tests, HTTP/1, TLS and HTTP/2, Redis,
+  PostgreSQL and file scenarios under lost, split, delayed and reset connections, refused
+  and dropped connects, reordered datagrams, spurious wake-ups, failing disks and jumping
+  clocks, and long runs of months of simulated uptime that check nothing grows per
+  request. It needs no change to the crate itself and covers the epoll driver only, not
+  io_uring, the kernel or the NIC. `scripts/check.sh sim` runs it; see `sim/README.md`.
+- **CI**: Kani proofs of the `unsafe` core, in a new `kani` job and
+  `scripts/check.sh kani` (docs/kani.md): the slab (any state up to 5 slots), the receive
+  buffer pool against a model of the kernel's buffer rings (any state of 2 buffers, on
+  epoll, the whole ring and the packed ring: no buffer both lent to the kernel and held,
+  lent twice or lost), the lifetime of an io_uring single-shot operation across cancel,
+  completion and a zero-copy notification (every order of events), and `KernelBox`. No bug
+  found; each proof caught a planted one. The driver's single-shot lifecycle functions now
+  take the slab and the graveyard as arguments and are generic over the entry and leftover
+  types, so the proofs run the driver's own code; no behaviour change, and the instruction
+  counts are unchanged.
+
+### Security
+
+- **giong-http** (hardening, **behaviour change**): the requests a worker is receiving in
+  full now share a memory budget, `Server::max_buffered_request_bytes`. Before, each
+  connection was bounded (`max_head_size`, `max_body_size`) and so was the number of
+  connections, but not the sum: with the defaults about 11 GiB per worker, and 130 clients
+  each sending a 1 MB body one byte short got a one-worker server in a 128 MiB container
+  OOM-killed (axum with a `Bytes` route dies at the same point). The budget is 64 MiB per
+  worker by default, or a quarter of the process's cgroup memory limit divided among the
+  workers if that is less (32 MiB for one worker in 128 MiB), and never less than one
+  request at `max_head_size` plus `max_body_size`. Bytes count as they arrive, not as
+  announced, from HTTP/1.1 heads and bodies (the first 4 KiB of each request excepted, so
+  ordinary requests keep being served) and HTTP/2 bodies, until the request is dropped. A
+  request that does not fit is refused without calling its handler: over HTTP/1.1 with `503
+  Service Unavailable`, `Retry-After: 1` and `Connection: close`, before its body is read
+  when its `Content-Length` already does not fit; over HTTP/2 with `REFUSED_STREAM`, which
+  clients retry and which does not count against the client's reset budget. A request larger
+  than the whole budget gets `413`. New code `GIONG-E1120` (`Code::HttpServerBusy`), named
+  in the `503`'s body and in a line on stderr at most once a minute per worker. What changes
+  for a running service: under many large uploads at once, requests past the budget get
+  `503` instead of being buffered; streamed bodies (`Handler::stream_body`) are not counted.
+  With the fix, 450 such uploads (300 over HTTP/1.1, 150 over HTTP/2) leave a one-worker
+  server in a 128 MiB container at a 35 MiB peak. CI runs the attack in a 128 MiB container
+  on every change (`slow-uploads` job, `scripts/slow-uploads.sh`). The `max_connections`
+  documentation no longer says that the connection limit alone keeps memory bounded;
+  `docs/DEPLOYMENT.md` has a section on sizing a container.
+
+### Changed
+
+- **giong-http** (performance): HTTP/2 requests allocate less, and idle HTTPS connections hold
+  less memory. An HTTP/2 request made 20 heap allocations in the server besides its
+  handler's, now 2 (the request's head and its shared handle). An HTTP/2 connection used to
+  give back the memory for its streams (their slots, wakers and queues) each time its last
+  stream closed, and allocate it again for the next request. It now keeps it until the
+  connection has been idle for a second. The header fields of each request are decoded into
+  a buffer the connection reuses, and `content-length` is written without an allocation.
+  Measured with `bench/instr` (a giong-http client and server, `GET /json` over HTTP/2):
+  66 allocations per request for both ends, now 48, and about 10% fewer instructions. Over
+  TLS, the handshake now runs on the heap for its length only, and the connection's task
+  no longer holds the TLS stream twice: an idle HTTPS connection holds 10,784 bytes
+  instead of 12,400 (rustls, in the process, `idle-https` case). Method, raw rounds and
+  where each allocation went: `bench/results/h2-allocs/`.
 - **Docs**: a pass over all documentation against the 0.7.0 API. The Rust samples in the
   READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are now compiled by
   `cargo test -p rest-api --doc`, and run where they need no server; 11 of the 34 did not
@@ -30,6 +488,30 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   crate that needs the Tokio runtime. `AGENTS.md`, `llms.txt` and giong-compat's README
   and crate docs say the same, and no longer call the giong crates faster than the same
   protocol through `Compat`, which was never measured.
+- **giong-web** (**behaviour change**): `Logger` and `Trace` now record a request that is
+  dropped before its response is ready: the client reset its HTTP/2 stream, or a `Timeout`
+  layered outside them gave up. Before, such a request left no log line at all and its span
+  ended without an event. `Logger` writes a line with `"event":"request cancelled"`,
+  `"status":null`, `"bytes":null` and the time until the drop in `duration_us` (nginx logs
+  the same case as `499`); `Trace` ends the span with a `request cancelled` event at
+  `INFO`. Found by the service built from the documentation alone (F16).
+- **giong-mcp**: a worker blocked inside the task giong-http spawns for a connection is now
+  reported as a request handler on that connection, with what to look for, instead of only
+  the spawn location in giong-http's `src/server.rs`; `profile`'s note and the README say
+  that this location holds the time of every request handler. giong cannot yet name the
+  handler or route (F2; a request label in `giong::observe` is a 1.x addition).
+
+### Fixed
+
+- **giong-postgres**, **giong-mysql**: conversion errors name Rust types as they are
+  written in code (`String`, `Option<String>`), not as `alloc::string::String`, and put
+  `an` before a vowel sound (`an integer`, `an i32`; it was `a integer`, `a i32`) (F15).
+- **giong-web**: the `cause` of a logged error no longer repeats a source that the error
+  above it already shows: a PostgreSQL statement timeout printed the server's message twice
+  (F15).
+- **giong**: the `Debug` form of an error wrapped from a companion crate, which is what
+  `main` prints when it returns one, shows the message once and leaves out an empty `fix`
+  (F15).
 
 ## [0.7.0] - 2026-11-15
 
@@ -1957,7 +2439,9 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...HEAD
+[1.0.0-rc.1]: https://github.com/giong-run/Giong/compare/v0.8.0...v1.0.0-rc.1
+[0.8.0]: https://github.com/giong-run/Giong/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/giong-run/Giong/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/giong-run/Giong/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/giong-run/Giong/compare/v0.4.0...v0.5.0

@@ -14,7 +14,7 @@ use giong::error::Code;
 /// user 'app'@'10.0.0.7'. See https://…/E3103.md`.
 /// [`kind`](Self::kind) tells errors apart in code; errors the server
 /// reported carry them in [`db`](Self::db), with MySQL's error number in
-/// [`code`](Self::code).
+/// [`server_code`](Self::server_code).
 ///
 /// Errors are cheap to clone, and convert into [`std::io::Error`], so `?`
 /// works in functions that return `io::Result`; there,
@@ -177,7 +177,7 @@ impl Error {
 
     /// The giong error code, the one shown in front of the message: one
     /// for each [`ErrorKind`]. For the server's own code, see
-    /// [`code`](Self::code).
+    /// [`server_code`](Self::server_code).
     pub fn giong_code(&self) -> Code {
         self.0.kind.giong_code()
     }
@@ -190,9 +190,39 @@ impl Error {
 
     /// MySQL's number for the server's error, such as 1062 for a duplicate
     /// key. The numbers are listed in the MySQL manual's "Server Error
-    /// Message Reference".
-    pub fn code(&self) -> Option<u16> {
+    /// Message Reference". For giong's own code, see
+    /// [`giong_code`](Self::giong_code).
+    pub fn server_code(&self) -> Option<u16> {
         self.0.db.as_ref().map(|db| db.code())
+    }
+
+    /// Whether trying again may succeed: the connection could not be
+    /// opened or broke, no pooled connection became free in time, or the
+    /// server reported a deadlock (1213), a lock wait timeout (1205), too
+    /// many connections (1040, 1203), that it is shutting down (1053) or
+    /// read-only (1792, 1836, and 1290 when it names `--read-only` or
+    /// `--super-read-only`: a primary that became a replica after a
+    /// failover), or killed the connection (1927, MariaDB).
+    ///
+    /// A statement that changes data may have run before a
+    /// [`Closed`](ErrorKind::Closed) error: retrying it may run it twice. A
+    /// transaction that hit a deadlock was rolled back by the server and is
+    /// retried from its start, not from the failed statement.
+    pub fn is_transient(&self) -> bool {
+        match self.0.kind {
+            ErrorKind::Connect | ErrorKind::Closed | ErrorKind::PoolTimeout => true,
+            ErrorKind::Db => match self.0.db.as_ref() {
+                // 1290 also stands for other options (`--secure-file-priv`),
+                // where trying again cannot help.
+                Some(db) if db.code() == 1290 => db.message().contains("read"),
+                Some(db) => matches!(
+                    db.code(),
+                    1213 | 1205 | 1040 | 1203 | 1053 | 1792 | 1836 | 1927
+                ),
+                None => false,
+            },
+            _ => false,
+        }
     }
 }
 
@@ -328,7 +358,7 @@ mod tests {
                 .replace("blob/main", concat!("blob/v", env!("CARGO_PKG_VERSION")))
         );
         assert_eq!(e.giong_code(), Code::MysqlAuth);
-        assert_eq!(e.code(), Some(1045));
+        assert_eq!(e.server_code(), Some(1045));
     }
 
     #[test]
@@ -343,6 +373,46 @@ mod tests {
         let wrapped = wrapped.downcast_ref::<giong::error::Error>().unwrap();
         let back = wrapped.get_ref().unwrap().downcast_ref::<Error>().unwrap();
         assert_eq!(back.kind(), ErrorKind::PoolTimeout);
+    }
+
+    #[test]
+    fn transient_errors_are_the_ones_worth_retrying() {
+        let db =
+            |code: u16, message: &str| Error::from_db(DbError::new(code, "HY000", message), None);
+        for code in [1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927] {
+            assert!(db(code, "it failed").is_transient(), "{code}");
+            assert_eq!(db(code, "x").server_code(), Some(code));
+        }
+        assert!(db(
+            1290,
+            "The MySQL server is running with the --super-read-only option so it cannot \
+             execute this statement"
+        )
+        .is_transient());
+        assert!(!db(
+            1290,
+            "The MySQL server is running with the --secure-file-priv option so it cannot \
+             execute this statement"
+        )
+        .is_transient());
+        for code in [1062, 1064, 1146, 1045, 3024, 1969] {
+            assert!(!db(code, "it failed").is_transient(), "{code}");
+        }
+        for kind in [
+            ErrorKind::Connect,
+            ErrorKind::Closed,
+            ErrorKind::PoolTimeout,
+        ] {
+            assert!(Error::new(kind, "x").is_transient(), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::Config,
+            ErrorKind::Auth,
+            ErrorKind::Type,
+            ErrorKind::Statement,
+        ] {
+            assert!(!Error::new(kind, "x").is_transient(), "{kind:?}");
+        }
     }
 
     #[test]

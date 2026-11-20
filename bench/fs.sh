@@ -34,7 +34,7 @@ echo "runtime,workload,tasks,round,ops_per_sec" > "$CSV"
 for round in $(seq 1 "$ROUNDS"); do
   for workload in small-files random-read; do
     for tasks in 1 64; do
-      for runtime in std giong tokio tokio-all; do
+      for runtime in std giong monoio compio tokio tokio-all; do
         [ "$runtime" = std ] && [ "$tasks" != 1 ] && continue
         case "$runtime" in
           tokio-all) rate=$("$BIN" tokio "$workload" "$tasks" "$OPS" "$DIR") ;;

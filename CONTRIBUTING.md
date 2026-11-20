@@ -92,12 +92,14 @@ cargo +nightly fuzz run inflate        # gzip and deflate bodies
 cargo +nightly fuzz run hpack          # HTTP/2 header compression
 cargo +nightly fuzz run h2             # a whole HTTP/2 connection, the server's side
 cargo +nightly fuzz run h2_client      # the client's side of HTTP/2
-cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
-cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
+cargo +nightly fuzz run response_body  # the client's response body framing
+cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, session, url
+cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, session, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: connection, url
 cd ../giong-web && cargo +nightly fuzz run request         # also: routes
 cd ../giong-tls && cargo +nightly fuzz run ktls_records    # record framing and handshake messages around kernel TLS
 cd ../giong-mcp && cargo +nightly fuzz run request         # the MCP server's checks and dispatch
+cd .. && cargo +nightly fuzz run dns_response              # also: resolv_conf (the core crate's resolver)
 ```
 
 Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's
@@ -155,7 +157,10 @@ epoll driver, a file operation running on a blocking thread does the same.
   `miniz_oxide` for gzip, and `tls` or `client` giong-tls).
 - Public items need documentation. The API was settled for 1.0 in 0.7.0
   ([docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md)): add rather
-  than break. A breaking change needs an issue first and an entry in the changelog that
+  than break. giong means to stay on major version 1 for many years, so every addition
+  follows four rules: one way to do each thing; misuse fails at compile time, or at run
+  time with a coded error; every behaviour code relies on is documented; a release only
+  adds, and never changes what existing code means. A breaking change needs an issue first and an entry in the changelog that
   says how to migrate.
 - The Rust samples in the READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are
   compiled by `cargo test -p rest-api --doc`, and run unless marked `no_run`; a change to

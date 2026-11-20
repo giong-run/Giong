@@ -1,6 +1,6 @@
 [package]
 name = "giong"
-version = "0.7.0"
+version = "1.0.0-rc.1"
 edition = "2021"
 rust-version = "1.80"
 description = "Gióng — a thread-per-core async runtime for Linux, built on io_uring, with an epoll fallback"
@@ -10,14 +10,14 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
 
 [workspace]
 members = [".", "giong-proto", "giong-grpc-build", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "examples/rest-api", "examples/proto-hello"]
-exclude = ["bench"]
+exclude = ["bench", "sim"]
 
 [dependencies]
-io-uring = "0.7"
+io-uring = "0.7.2"
 libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
 
@@ -25,7 +25,8 @@ socket2 = { version = "0.6", features = ["all"] }
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.
 # `fuzzing` is set by cargo fuzz for the targets in fuzz/.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(loom)', 'cfg(fuzzing)'] }
+# `kani` is set by the Kani model checker for the proofs (scripts/check.sh kani).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(loom)', 'cfg(fuzzing)', 'cfg(kani)'] }
 
 [profile.release]
 opt-level = 3

@@ -348,6 +348,7 @@ pub fn start_from_env(runtime: &Handle) -> FromEnv {
 /// ```
 #[must_use = "dropping it stops the MCP server at once: keep it, `let _mcp = start_from_env(..);`"]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum FromEnv {
     /// `GIONG_MCP` is unset or empty: nothing was started.
     Off,

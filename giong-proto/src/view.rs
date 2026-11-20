@@ -342,20 +342,55 @@ macro_rules! varint_kind {
     };
 }
 
-varint_kind!(/// `int32`.
-    Int32, i32, |r| r.varint()? as i32, |v| *v as i64 as u64);
-varint_kind!(/// `int64`.
-    Int64, i64, |r| r.varint()? as i64, |v| *v as u64);
-varint_kind!(/// `uint32`.
-    UInt32, u32, |r| r.varint()? as u32, |v| *v as u64);
-varint_kind!(/// `uint64`.
-    UInt64, u64, |r| r.varint()?, |v| *v);
-varint_kind!(/// `sint32`.
-    SInt32, i32, |r| wire::unzigzag32(r.varint()?), |v| wire::zigzag32(*v));
-varint_kind!(/// `sint64`.
-    SInt64, i64, |r| wire::unzigzag64(r.varint()?), |v| wire::zigzag64(*v));
-varint_kind!(/// `bool`.
-    Bool, bool, |r| r.varint()? != 0, |v| *v as u64);
+varint_kind!(
+    /// `int32`.
+    Int32,
+    i32,
+    |r| r.varint()? as i32,
+    |v| *v as i64 as u64
+);
+varint_kind!(
+    /// `int64`.
+    Int64,
+    i64,
+    |r| r.varint()? as i64,
+    |v| *v as u64
+);
+varint_kind!(
+    /// `uint32`.
+    UInt32,
+    u32,
+    |r| r.varint()? as u32,
+    |v| *v as u64
+);
+varint_kind!(
+    /// `uint64`.
+    UInt64,
+    u64,
+    |r| r.varint()?,
+    |v| *v
+);
+varint_kind!(
+    /// `sint32`.
+    SInt32,
+    i32,
+    |r| wire::unzigzag32(r.varint()?),
+    |v| wire::zigzag32(*v)
+);
+varint_kind!(
+    /// `sint64`.
+    SInt64,
+    i64,
+    |r| wire::unzigzag64(r.varint()?),
+    |v| wire::zigzag64(*v)
+);
+varint_kind!(
+    /// `bool`.
+    Bool,
+    bool,
+    |r| r.varint()? != 0,
+    |v| *v as u64
+);
 
 macro_rules! fixed_kind {
     ($(#[$doc:meta])* $name:ident, $out:ty, $wire:ident, $w:expr, |$r:ident| $read:expr, |$v:ident, $buf:ident| $put:expr) => {
@@ -382,18 +417,60 @@ macro_rules! fixed_kind {
     };
 }
 
-fixed_kind!(/// `fixed32`.
-    Fixed32, u32, I32, 4, |r| r.fixed32()?, |v, buf| wire::put_fixed32(buf, *v));
-fixed_kind!(/// `fixed64`.
-    Fixed64, u64, I64, 8, |r| r.fixed64()?, |v, buf| wire::put_fixed64(buf, *v));
-fixed_kind!(/// `sfixed32`.
-    SFixed32, i32, I32, 4, |r| r.fixed32()? as i32, |v, buf| wire::put_fixed32(buf, *v as u32));
-fixed_kind!(/// `sfixed64`.
-    SFixed64, i64, I64, 8, |r| r.fixed64()? as i64, |v, buf| wire::put_fixed64(buf, *v as u64));
-fixed_kind!(/// `float`.
-    Float, f32, I32, 4, |r| f32::from_bits(r.fixed32()?), |v, buf| wire::put_fixed32(buf, v.to_bits()));
-fixed_kind!(/// `double`.
-    Double, f64, I64, 8, |r| f64::from_bits(r.fixed64()?), |v, buf| wire::put_fixed64(buf, v.to_bits()));
+fixed_kind!(
+    /// `fixed32`.
+    Fixed32,
+    u32,
+    I32,
+    4,
+    |r| r.fixed32()?,
+    |v, buf| wire::put_fixed32(buf, *v)
+);
+fixed_kind!(
+    /// `fixed64`.
+    Fixed64,
+    u64,
+    I64,
+    8,
+    |r| r.fixed64()?,
+    |v, buf| wire::put_fixed64(buf, *v)
+);
+fixed_kind!(
+    /// `sfixed32`.
+    SFixed32,
+    i32,
+    I32,
+    4,
+    |r| r.fixed32()? as i32,
+    |v, buf| wire::put_fixed32(buf, *v as u32)
+);
+fixed_kind!(
+    /// `sfixed64`.
+    SFixed64,
+    i64,
+    I64,
+    8,
+    |r| r.fixed64()? as i64,
+    |v, buf| wire::put_fixed64(buf, *v as u64)
+);
+fixed_kind!(
+    /// `float`.
+    Float,
+    f32,
+    I32,
+    4,
+    |r| f32::from_bits(r.fixed32()?),
+    |v, buf| wire::put_fixed32(buf, v.to_bits())
+);
+fixed_kind!(
+    /// `double`.
+    Double,
+    f64,
+    I64,
+    8,
+    |r| f64::from_bits(r.fixed64()?),
+    |v, buf| wire::put_fixed64(buf, v.to_bits())
+);
 
 /// An open (proto3) enum.
 pub struct OpenEnum<E>(PhantomData<fn() -> E>);

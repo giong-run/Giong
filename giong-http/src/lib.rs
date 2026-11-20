@@ -83,6 +83,7 @@
 #![warn(missing_docs)]
 
 mod body;
+mod budget;
 mod chunked;
 #[cfg(feature = "client")]
 pub mod client;
@@ -93,6 +94,7 @@ mod h2;
 mod heap;
 #[cfg(any(test, fuzzing))]
 mod invariants;
+mod memory;
 mod parse;
 mod request;
 mod response;

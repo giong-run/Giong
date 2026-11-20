@@ -2,9 +2,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
+use std::pin::pin;
+use std::rc::{Rc, Weak};
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
@@ -79,10 +80,26 @@ struct Inner {
     config: Config,
     max_size: usize,
     wait_timeout: Duration,
+    idle_timeout: Duration,
+    max_lifetime: Duration,
     state: Rc<RefCell<State>>,
     /// The pool as `giong::observe` sees it; registered by a weak reference,
     /// so it leaves snapshots when the pool is dropped.
     _observed: Rc<Observed>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The task that closes idle connections ends with the pool.
+        let reaper = {
+            let mut st = self.state.borrow_mut();
+            st.stopped = true;
+            st.reaper_waker.take()
+        };
+        if let Some(w) = reaper {
+            w.wake();
+        }
+    }
 }
 
 /// Reports the pool's state in `giong::observe` snapshots (and so to
@@ -115,6 +132,7 @@ impl giong::observe::Source for Observed {
             ("opened", s.opened),
             ("connect_errors", s.connect_errors),
             ("timeouts", s.timeouts),
+            ("recycled", s.recycled),
         ]
     }
 }
@@ -129,17 +147,18 @@ fn stats_of(st: &State) -> PoolStats {
         opened: st.opened,
         connect_errors: st.connect_errors,
         timeouts: st.timeouts,
+        recycled: st.recycled,
     }
 }
 
 #[derive(Default)]
 struct State {
     /// Open connections that are not taken, lent to shared commands.
-    shared: Vec<Rc<Client>>,
+    shared: Vec<Member>,
     /// Open connections set aside for the tasks waiting in `take`: no new
     /// shared command is sent on them, so they become free as soon as the
     /// commands already sent are answered.
-    draining: Vec<Rc<Client>>,
+    draining: Vec<Member>,
     /// The tasks waiting in `take` with the pool full, by ticket, oldest
     /// first. Only the first may take a connection.
     takers: VecDeque<u64>,
@@ -151,6 +170,36 @@ struct State {
     opened: u64,
     connect_errors: u64,
     timeouts: u64,
+    recycled: u64,
+    /// The task that closes idle and old connections is running.
+    reaper: bool,
+    reaper_waker: Option<Waker>,
+    /// The pool was dropped.
+    stopped: bool,
+}
+
+/// An open connection that is not taken.
+///
+/// Shared commands read no clock: they only mark the connection `lent`, and
+/// the task that closes idle connections turns that mark into `used` and an
+/// expired lifetime into `retiring`, once per period.
+struct Member {
+    client: Rc<Client>,
+    /// Lent to a shared command since the last sweep with a clock.
+    lent: bool,
+    /// When it was last seen lent or in use, or came back.
+    used: Instant,
+    /// When it is to be closed, however busy it is.
+    expires: Instant,
+    /// Past its lifetime: takes no new shared command, and closes once free.
+    retiring: bool,
+}
+
+impl Member {
+    /// No command uses it, and nobody else holds it.
+    fn is_free(&self) -> bool {
+        Rc::strong_count(&self.client) == 1 && self.client.in_flight() == 0
+    }
 }
 
 /// What a pool is doing, from [`Pool::stats`].
@@ -173,12 +222,48 @@ pub struct PoolStats {
     pub connect_errors: u64,
     /// Waits that ended with [`ErrorKind::PoolTimeout`].
     pub timeouts: u64,
+    /// Connections the pool closed because they sat unused for the [idle
+    /// timeout](Pool::idle_timeout) or were older than the [maximum
+    /// lifetime](Pool::max_lifetime).
+    pub recycled: u64,
 }
 
 impl State {
     /// The connections that are not taken.
     fn untaken(&self) -> impl Iterator<Item = &Rc<Client>> {
-        self.shared.iter().chain(&self.draining)
+        self.shared.iter().chain(&self.draining).map(|m| &m.client)
+    }
+
+    /// Leaves out the connections that broke or whose server became a
+    /// replica (they close once the commands on them are answered), and
+    /// closes the free ones that are past their lifetime or, given the time,
+    /// idle for `idle_timeout`. Returns whether any went.
+    fn sweep(&mut self, now: Option<Instant>, idle_timeout: Duration) -> bool {
+        let before = self.shared.len() + self.draining.len();
+        let mut recycled = 0;
+        let mut keep = |m: &mut Member| {
+            if m.client.is_closed() || m.client.is_stale() {
+                return false;
+            }
+            let mut idle = false;
+            if let Some(now) = now {
+                // A command still in flight counts as use: one that takes
+                // longer than the idle timeout leaves no mark after the
+                // sweep that cleared it.
+                if std::mem::take(&mut m.lent) || !m.is_free() {
+                    m.used = now;
+                }
+                m.retiring |= now >= m.expires;
+                idle = now.saturating_duration_since(m.used) >= idle_timeout;
+            }
+            let old = m.is_free() && (m.retiring || idle);
+            recycled += u64::from(old);
+            !old
+        };
+        self.shared.retain_mut(&mut keep);
+        self.draining.retain_mut(&mut keep);
+        self.recycled += recycled;
+        self.shared.len() + self.draining.len() != before
     }
 
     /// Sets aside one connection for each task waiting in `take`, but
@@ -190,7 +275,8 @@ impl State {
         let want = self.takers.len().min(untaken.saturating_sub(keep));
         while self.draining.len() < want {
             // The least busy one is free soonest.
-            let Some(i) = (0..self.shared.len()).min_by_key(|&i| Rc::strong_count(&self.shared[i]))
+            let Some(i) =
+                (0..self.shared.len()).min_by_key(|&i| Rc::strong_count(&self.shared[i].client))
             else {
                 break;
             };
@@ -207,17 +293,17 @@ impl State {
     }
 
     /// Hands a connection no command is using to the task taking it.
-    fn take_idle(&mut self) -> Option<Client> {
-        let idle = |v: &Vec<Rc<Client>>| v.iter().position(|c| Rc::strong_count(c) == 1);
-        let c = if let Some(i) = idle(&self.draining) {
+    fn take_idle(&mut self) -> Option<(Client, Instant)> {
+        let idle = |v: &Vec<Member>| v.iter().position(|m| Rc::strong_count(&m.client) == 1);
+        let m = if let Some(i) = idle(&self.draining) {
             self.draining.swap_remove(i)
         } else {
             let i = idle(&self.shared)?;
             self.shared.swap_remove(i)
         };
         self.taken += 1;
-        match Rc::try_unwrap(c) {
-            Ok(client) => Some(client),
+        match Rc::try_unwrap(m.client) {
+            Ok(client) => Some((client, m.expires)),
             Err(_) => unreachable!("checked: nobody else holds it"),
         }
     }
@@ -286,12 +372,15 @@ impl Pool {
             max_size,
             state: Rc::clone(&state),
         });
-        giong::observe::register_rc(&observed);
+        let source: Weak<dyn giong::observe::Source> = Rc::downgrade(&observed) as _;
+        giong::observe::register(source);
         Self {
             inner: Rc::new(Inner {
                 config,
                 max_size,
                 wait_timeout: Duration::from_secs(5),
+                idle_timeout: Duration::from_secs(10 * 60),
+                max_lifetime: Duration::from_secs(30 * 60),
                 state,
                 _observed: observed,
             }),
@@ -308,13 +397,46 @@ impl Pool {
     /// Panics if other clones of this pool exist; set it right after
     /// [`new`](Self::new).
     pub fn wait_timeout(mut self, timeout: Duration) -> Self {
-        Rc::get_mut(&mut self.inner)
-            .expect("set the wait timeout before cloning the pool")
-            .wait_timeout = timeout;
+        self.settings("wait timeout").wait_timeout = timeout;
         self
     }
 
+    /// How long a connection may sit unused before the pool closes it: 10
+    /// minutes by default. The pool opens connections again when it needs
+    /// them, so a burst does not hold the server's connections forever.
+    ///
+    /// # Panics
+    ///
+    /// Panics if other clones of this pool exist; set it right after
+    /// [`new`](Self::new).
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.settings("idle timeout").idle_timeout = timeout;
+        self
+    }
+
+    /// How long a connection may live: 30 minutes by default, less up to a
+    /// tenth at random so that the connections of a pool do not all close at
+    /// once. An older connection takes no new command, is closed as soon as
+    /// the commands on it are answered, and is replaced when needed, so that
+    /// connections follow DNS changes and failovers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if other clones of this pool exist; set it right after
+    /// [`new`](Self::new).
+    pub fn max_lifetime(mut self, lifetime: Duration) -> Self {
+        self.settings("maximum lifetime").max_lifetime = lifetime;
+        self
+    }
+
+    fn settings(&mut self, what: &str) -> &mut Inner {
+        Rc::get_mut(&mut self.inner)
+            .unwrap_or_else(|| panic!("set the {what} before cloning the pool"))
+    }
+
     /// Sends a command on a shared connection; see [`Client::query`].
+    ///
+    /// Not cancel safe, like [`Client::query`].
     pub async fn query<T: FromValue>(&self, cmd: &Cmd) -> Result<T, Error> {
         // Refused before a connection is opened for it.
         cmd.check(false, false)?;
@@ -331,6 +453,8 @@ impl Pool {
     }
 
     /// Sends a pipeline on a shared connection; see [`Client::pipeline`].
+    ///
+    /// Not cancel safe, like [`Client::query`].
     pub async fn pipeline<T: FromValue>(&self, pipe: &Pipeline) -> Result<T, Error> {
         pipe.check(pipe.is_atomic())?;
         self.shared().await?.pipeline(pipe).await
@@ -352,6 +476,8 @@ impl Pool {
     ///
     /// Waits up to the [wait timeout](Self::wait_timeout) when every
     /// connection is taken or busy and the pool is full.
+    ///
+    /// Cancel safe: if the future is dropped, no connection is taken.
     pub async fn take(&self) -> Result<PooledClient, Error> {
         let ticket = Ticket {
             pool: self,
@@ -380,15 +506,16 @@ impl Pool {
             })
             .await?;
         drop(ticket);
-        let client = match client {
+        let (client, expires) = match client {
             Ok(c) => c,
             Err(new) => {
                 self.inner.state.borrow_mut().taken += 1;
-                new
+                (new, self.expiry())
             }
         };
         Ok(PooledClient {
             client: Some(client),
+            expires,
             pool: self.clone(),
         })
     }
@@ -396,6 +523,36 @@ impl Pool {
     /// The pool's current state and counters.
     pub fn stats(&self) -> PoolStats {
         stats_of(&self.inner.state.borrow())
+    }
+
+    /// When a connection opened now is to be closed: the maximum lifetime,
+    /// less up to a tenth of it.
+    fn expiry(&self) -> Instant {
+        use std::hash::{BuildHasher, Hasher};
+        let life = self.inner.max_lifetime;
+        // Not for secrets: only spreads the closing times. The standard
+        // library seeds each RandomState differently.
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let jitter = life / 10_000 * u32::try_from(seed % 1000).unwrap_or(0);
+        // A lifetime too long for the clock (`Duration::MAX`) means none.
+        Instant::now()
+            .checked_add(life - jitter)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(100 * 365 * 24 * 3600))
+    }
+
+    /// Starts the task that closes idle and old connections, once.
+    fn start_reaper(&self, st: &mut State) {
+        if st.reaper {
+            return;
+        }
+        st.reaper = true;
+        let state = Rc::downgrade(&self.inner.state);
+        let idle_timeout = self.inner.idle_timeout;
+        let period = (self.inner.idle_timeout.min(self.inner.max_lifetime) / 4)
+            .clamp(Duration::from_millis(50), Duration::from_secs(30));
+        giong::spawn(reap(state, idle_timeout, period));
     }
 
     /// The least busy shared connection, or a new one if every open one is
@@ -415,29 +572,45 @@ impl Pool {
                     None => false,
                     Some(t) => t + STALLED < *now.get_or_insert_with(Instant::now),
                 };
+                // A connection past its lifetime takes no new command, so
+                // that it frees up and closes.
+                let usable = |m: &Member| !m.retiring;
                 // Busy means used by other tasks right now.
-                let mut best: Option<&Rc<Client>> = None;
-                for c in &st.shared {
-                    if !stalled(c)
-                        && best.map_or(true, |b| Rc::strong_count(c) < Rc::strong_count(b))
+                let mut best: Option<usize> = None;
+                for (i, m) in st.shared.iter().enumerate() {
+                    if usable(m)
+                        && !stalled(&m.client)
+                        && best.map_or(true, |b| {
+                            Rc::strong_count(&m.client) < Rc::strong_count(&st.shared[b].client)
+                        })
                     {
-                        best = Some(c);
+                        best = Some(i);
                     }
                 }
-                let best = best.cloned();
-                match best {
-                    Some(c) if Rc::strong_count(&c) == 2 || !room => Decision::Ready(c),
+                let pick = match best {
+                    Some(i) if Rc::strong_count(&st.shared[i].client) == 1 || !room => Some(i),
                     _ if room => {
                         st.connecting += 1;
-                        Decision::Connect
+                        return Decision::Connect;
                     }
                     // Every connection is stalled and the pool is full: the
                     // one whose oldest command has waited least, which is
                     // the one most likely to be moving.
-                    _ => match st.shared.iter().max_by_key(|c| c.head_since()) {
-                        Some(c) => Decision::Ready(c.clone()),
-                        None => Decision::Wait,
-                    },
+                    _ => st
+                        .shared
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| usable(m))
+                        .max_by_key(|(_, m)| m.client.head_since())
+                        .map(|(i, _)| i),
+                };
+                match pick {
+                    Some(i) => {
+                        let m = &mut st.shared[i];
+                        m.lent = true;
+                        Decision::Ready(m.client.clone())
+                    }
+                    None => Decision::Wait,
                 }
             })
             .await?;
@@ -445,7 +618,13 @@ impl Pool {
             Ok(c) => c,
             Err(new) => {
                 let c = Rc::new(new);
-                self.inner.state.borrow_mut().shared.push(c.clone());
+                self.inner.state.borrow_mut().shared.push(Member {
+                    client: c.clone(),
+                    lent: false,
+                    used: Instant::now(),
+                    expires: self.expiry(),
+                    retiring: false,
+                });
                 c
             }
         };
@@ -477,9 +656,8 @@ impl Pool {
                 // Connections that broke, or whose server became a replica
                 // (`READONLY`, after a failover), are left behind; they
                 // close once the commands on them are answered.
-                st.shared.retain(|c| !c.is_closed() && !c.is_stale());
-                st.draining.retain(|c| !c.is_closed() && !c.is_stale());
-                let returned = st.balance(self.inner.max_size);
+                let swept = st.sweep(None, self.inner.idle_timeout);
+                let returned = st.balance(self.inner.max_size) || swept;
                 (decide(&mut st, self.inner.max_size), returned)
             };
             if returned {
@@ -494,6 +672,7 @@ impl Pool {
                     return match result {
                         Ok(client) => {
                             st.opened += 1;
+                            self.start_reaper(&mut st);
                             Ok(Err(client))
                         }
                         Err(e) => {
@@ -549,6 +728,42 @@ impl Pool {
     }
 }
 
+/// Closes idle and old connections now and then, until the pool is dropped.
+async fn reap(state: Weak<RefCell<State>>, idle_timeout: Duration, period: Duration) {
+    loop {
+        let mut sleep = pin!(giong::time::sleep(period));
+        let stopped = poll_fn(|cx| {
+            let Some(state) = state.upgrade() else {
+                return Poll::Ready(true);
+            };
+            let mut st = state.borrow_mut();
+            if st.stopped {
+                return Poll::Ready(true);
+            }
+            st.reaper_waker = Some(cx.waker().clone());
+            drop(st);
+            sleep.as_mut().poll(cx).map(|()| false)
+        })
+        .await;
+        if stopped {
+            return;
+        }
+        let Some(state) = state.upgrade() else { return };
+        let waiters = {
+            let mut st = state.borrow_mut();
+            if st.sweep(Some(Instant::now()), idle_timeout) {
+                // Room for a new connection.
+                std::mem::take(&mut st.waiters)
+            } else {
+                Vec::new()
+            }
+        };
+        for w in waiters {
+            w.wake();
+        }
+    }
+}
+
 impl std::fmt::Debug for Pool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pool")
@@ -586,6 +801,8 @@ impl Drop for Lent<'_> {
 /// to the [`Client`], and goes back to the pool when dropped.
 pub struct PooledClient {
     client: Option<Client>,
+    /// When the connection is to be closed rather than go back.
+    expires: Instant,
     pool: Pool,
 }
 
@@ -611,8 +828,21 @@ impl Drop for PooledClient {
             st.taken -= 1;
             // A blocking command still in flight was cancelled: it would
             // hold up the commands of other tasks until it returns.
+            let now = Instant::now();
             if !client.is_closed() && !client.is_blocked() && !client.is_stale() {
-                st.shared.push(Rc::new(client));
+                if now >= self.expires {
+                    // Past its lifetime: closed (dropped) instead of going
+                    // back.
+                    st.recycled += 1;
+                } else {
+                    st.shared.push(Member {
+                        client: Rc::new(client),
+                        lent: false,
+                        used: now,
+                        expires: self.expires,
+                        retiring: false,
+                    });
+                }
             }
         }
         self.pool.notify();

@@ -6,9 +6,18 @@ an item so the work is not duplicated.
 
 ## Goal
 
-A runtime for **network services on Linux** that makes the fewest possible system calls and
-keeps tail latency low, by committing fully to io_uring and to one thread per core, and
-that still runs, on epoll, where io_uring is blocked.
+**The best async runtime for Rust, on technical merit**: a complete, general-purpose runtime
+that fits any workload a service has, faster and leaner than Tokio, judged by measurements
+and not by adoption. Linux first: it makes the fewest possible system calls and keeps tail
+latency low by committing fully to io_uring and to one thread per core, and it still runs,
+on epoll, where io_uring is blocked.
+
+giong is a late entrant, built for a time when AI agents write much of the code. Its API
+does not have to be short to type; it has to be strict, always correct, and able to grow
+for many years. After 1.0, giong stays on major version 1 and grows through 1.x minor
+releases (see [Agent-first](#agent-first) for the rules that make this possible). It
+replaces the Tokio ecosystem with crates of its own (HTTP server and client, TLS, DNS,
+database drivers) rather than adapting to it.
 
 By 1.0, a team can write and deploy a real REST API (Postgres or MySQL, Redis, calls to
 other HTTPS services, HTTPS itself) with giong's crates alone, in an ordinary Docker or
@@ -18,7 +27,10 @@ reqwest, axum), and the README says where giong does not win.
 
 After 1.0, the 1.x releases add gRPC, macOS, HTTP/3 and Windows, then a memory limit kept
 under any load, one at a time and without breaking the 1.0 API (see the milestones after 1.0
-below). Linux stays the platform giong is tuned and measured on.
+below). Alongside them, a third track fills in what a general runtime still lacks: blocking
+and compute work, processes and signals, structured concurrency, and scheduling that keeps
+a small machine efficient (see [Runtime core](#runtime-core-track-r-after-10)). Linux stays
+the platform giong is tuned and measured on.
 
 ## Agent-first
 
@@ -34,7 +46,12 @@ tighter the checks around it have to be.
 2. **One obvious, correct way.** No macros and no magic. Types strict enough that a mistake
    is a compile error: enums instead of flags and strings, `Duration` instead of a number of
    milliseconds, `#[must_use]` on futures and handles. No implicit defaults: every timeout
-   and size limit is finite, documented, and visible in `Debug` output.
+   and size limit is finite, documented, and visible in `Debug` output. Every addition to
+   the API, through 1.0 and all of 1.x, follows four rules:
+   1. One way to do each thing.
+   2. Misuse fails at compile time, or at run time with a coded error.
+   3. Every behaviour code relies on is documented.
+   4. Releases only add; they never change what existing code means.
 3. **Verification is the law.** Tests, cancellation tests, ThreadSanitizer, `loom`, fuzzing
    and soak tests run in CI and block merging; `cargo-semver-checks` guards the API. Machines
    check the work, so human review is not the bottleneck.
@@ -61,8 +78,12 @@ These are deliberate. Proposals that need them will be declined.
 - **Work stealing.** A task that has started stays on its worker, so tasks need not be
   `Send`. Balancing happens where new work starts: `Handle::spawn_balanced` and
   `TcpListener::bind_balanced`.
-- **Every workload.** giong covers network services: HTTP, databases, caches and the clients
-  they need. It does not try to replace Tokio for everything Tokio is used for.
+- **Everything in one crate.** giong is a runtime: it takes only what a runtime alone can do
+  (scheduling, I/O, time, processes, memory, observation). Protocols, frameworks and tools
+  are crates built on top of it, as giong-http, giong-web and the database drivers are.
+  Network services come first and set the priorities, but blocking work, CPU-heavy work and
+  child processes have a place in the runtime too (see
+  [Runtime core](#runtime-core-track-r-after-10)).
 - **`Send` futures as a requirement.** The API stays usable with `Rc` and `RefCell`.
 - **Macros that hide control flow, and unbounded defaults.** See [Agent-first](#agent-first).
 
@@ -305,26 +326,36 @@ breaking changes made now rather than after 1.0.
 **Exit criteria:** no item left for the freeze undecided. Met. The freeze is declared once
 real use in a service has reported back, which may still add items before 1.0.0-rc.1.
 
-## 0.8 — Verified in CI
+## 0.8 — Verified in CI (done)
 
 The verification that needs no machines of its own, run on every change. No new public
 features.
 
 - [x] `cargo-semver-checks` in CI, checking every change against 0.7.0.
-- [ ] Speed and memory thresholds checked in CI: instructions per request, counted so the
+- [x] Speed and memory thresholds checked in CI: instructions per request, counted so the
       result is the same on every run of a shared runner, heap allocations per request, and
       memory per idle connection over HTTP/1.1, HTTP/2 and HTTPS, each with its raw data in
       `bench/`.
-- [ ] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
+- [x] Kani proofs for the small `unsafe` core (the slab, the buffers, the kernel-owned
       boxes, the lifetimes of operations), run in CI.
-- [ ] Fault injection through an internal simulation driver: lost, reordered and delayed
+- [x] Fault injection through an internal simulation (`sim/`): lost, reordered and delayed
       packets, reset connections, failing disks and jumping clocks, chosen by a seed, and a
-      failing run replayed exactly from its seed. Internal only; a public form is a 1.x
-      addition.
-- [ ] Every fuzz target run in the nightly fuzz workflow with no open crash.
-- [ ] The remaining code fixes from the service built from the documentation alone.
+      failing run replayed exactly from its seed; long runs in simulated time, months of
+      uptime on every CI run. It covers Gióng's own code on the epoll driver, not io_uring,
+      the kernel or the NIC. Internal only; a public form is a 1.x addition.
+- [x] Every fuzz target run in the nightly fuzz workflow with no open crash.
+- [x] The remaining code fixes from the service built from the documentation alone: a log
+      line and a span event for a request dropped before its response (F16), plainer type
+      names and articles in messages, and a cause said once (F15), and giong-mcp saying
+      when a blocked task is a giong-http connection's request handler (F2; naming the
+      handler itself needs a request label, a 1.x addition). The other findings were
+      settled in 0.7 or left for 1.x as additions, in the
+      [decisions](docs/reviews/2026-11-api-freeze.md).
+- [x] Memory bounded under attack: the requests a worker receives in full share a budget
+      (`max_buffered_request_bytes`), and CI runs hundreds of slow uploads against a server
+      in a 128 MiB container on every change.
 
-**Exit criteria:** all of the above green on `main`.
+**Exit criteria:** all of the above green on `main`. Met in 0.8.0.
 
 ## 0.9 — Bare metal and real use
 
@@ -356,13 +387,60 @@ them all.
 - [ ] `1.0.0-rc.N`: release candidates that change nothing but fixes, until one passes
       every gate; that one becomes 1.0.0.
 
+Before the freeze, the behaviour callers rely on is settled, and each commitment has a test
+that fails without it. 1.0 stays small: nothing here adds an API.
+
+- [ ] **What a cancelled operation does**, written once for every I/O API in
+      [STABILITY.md](docs/STABILITY.md#cancellation): the operation may still happen, the
+      driver keeps buffers and descriptors until the kernel is done with them, slots come
+      back when the operation ends, and that is the earliest moment a 1.x budget gives
+      their share back. *Proved by* `tests/cancel_docs.rs` (every public async fn says
+      whether it is cancel safe) and the two tests below.
+- [x] **A dropped `File::close` still closes**, on both drivers: a close is never
+      cancelled, only its result can be lost. *Test*: on epoll, the blocking threads are
+      kept busy so the close waits in their queue; on io_uring, the close is sent to the
+      kernel's worker thread (a test-only switch setting `IOSQE_ASYNC`, since a close on a
+      local filesystem completes at once and cannot show the bug). In both, the future is
+      polled until the close is submitted, then dropped; once the driver has finished, no
+      descriptor of the process refers to the file any more (`/proc/self/fd`, which a
+      reused descriptor number cannot fool). `a_dropped_close_still_closes_on_the_epoll_driver`
+      in `tests/cancel.rs` and `a_dropped_close_still_closes` in `src/driver/uring.rs`;
+      both failed before the fix (#159).
+- [x] **A PostgreSQL transaction refuses to commit after a statement in it was given up**,
+      as giong-mysql's already does: `commit` returns a coded error and the transaction
+      has to be rolled back. *Test*, on the PostgreSQL server CI starts: begin, insert a
+      row, send a statement and drop its future before the answer, check that `commit`
+      fails with the code, roll back, and check from a second connection that the row is
+      not there. A statement whose answer had arrived before its future was dropped does
+      not block the commit. The same test runs against giong-mysql.
+      `a_statement_given_up_inside_a_transaction_stops_the_commit` in both crates'
+      tests (#158).
+- [ ] **Defaults callers rely on**, in [STABILITY.md](docs/STABILITY.md#defaults-you-can-rely-on):
+      whether each limit waits or refuses by default, and the rule that 1.x never changes
+      which; a new early refusal (overload, tenant budget) is a setting that is off by
+      default. *Proved by* the slow-uploads and idle-connections CI jobs (`E1120`,
+      `E1121`) and the pools' wait-timeout tests. The names of 1.x's budget types, its
+      ledger and how it shares quotas wait for the prototype of 1.5.
+- [ ] **The release candidate says what it was verified on**: the rc.1 release pull
+      request names the soaked commit, the release commit and the change between them,
+      which tests ran again on the release commit, and the soak that change got
+      ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). A soak is sized by what
+      changed: none outside the soak paths, 2 to 4 hours for the drivers, the scheduler or
+      a cancellation path, 72 hours for a new major version, driver or scheduler. rc.1
+      stands on 0.9's 72 hours (tree `f1b23074`), and the changes since (#134's bind, the
+      channel, UDP, close and TLS receive fixes) get 4 hours per driver once they have all
+      merged.
+- [ ] **The removals**: the checklist in
+      [STABILITY.md](docs/STABILITY.md#changes-made-before-10), in one release pull request.
+
 The API freeze also makes sure that nothing public ties the API to Linux or to HTTP/2 in a
 way that the releases below would have to break. A first pass over `main` found nothing
 that forces a 2.0, and a short list to settle before the freeze
 ([findings](docs/reviews/2026-11-api-portability.md)).
 
 After 1.0, each minor release has one main theme and breaks nothing: code written for 1.0 keeps
-compiling. The work runs on two tracks at once, and each release ships as soon as its own
+compiling. The protocol and platform work runs on two tracks at once (a third, the runtime
+core, is described after 1.5), and each release ships as soon as its own
 gates pass. The protocol track does gRPC, which builds on HTTP/2, then HTTP/3, the largest
 piece of protocol work. The platform track first moves the system calls outside the drivers
 behind one internal layer, built once for both systems, then adds macOS, whose kqueue driver
@@ -409,6 +487,12 @@ protobuf of its own, and a simulation driver that tests every service determinis
       buffer. Held to Google's protobuf conformance suite and fuzzed against prost.
 - [ ] The same service over gRPC-Web, for browsers, and as JSON over HTTP from the
       `google.api.http` annotations of its `.proto`: one definition, three ways to call it.
+- [ ] The HTTP client, from what a service gateway asked for (issue #154): connections
+      opened ahead of the first request to an origin (preconnect), HTTP/2 keep-alive
+      `PING`s that find a dead connection before a request does, and hooks that report
+      the pool's and each request's numbers (waiting, dialing, reused, time to first
+      byte) to the service's own metrics. One dial shared by the requests that start
+      together for an origin is #156, outside this list.
 - [ ] A simulation driver: a service, its clients and the network run in one thread, in
       simulated time, from a seed. Packets are lost, reordered and delayed, connections
       reset, disks fail and clocks jump as the seed decides, and a failing run replays
@@ -540,7 +624,99 @@ hold to it.
       mixed, in containers of 64, 128 and 256 MiB, in CI, under the simulation driver and on
       bare metal.
 
+Before any of this becomes public API, a prototype on a branch answers what the API should
+be, and the two-tenant test below decides it. The prototype needs nothing from the other
+1.x releases and starts once 1.0.0 is out. The names of the budget types, the shape of the
+ledger and how quotas are shared are chosen from its results, not before.
+
+- [ ] **Prototype: two resources counted exactly.** Bytes of buffers, and I/O operations
+      waiting for their completion. The charge follows the resource when it moves from a
+      request to a child task or to the driver (a dropped future hands its buffers to the
+      driver, which keeps them until the completion, as STABILITY.md's *Cancellation*
+      says), and is given back at that completion, not at the drop. It grows out of the
+      per-worker budget `max_buffered_request_bytes` already keeps, rather than a second
+      count beside it. Tests catch a share given back too early, given back twice, and
+      never given back; the driver's last-resort path that leaks memory it cannot account
+      for counts as never given back.
+- [ ] **Prototype: tenants kept apart in the request queue and in the upstream connection
+      pool.** It says how much of B's share A may borrow while B is idle, and how B is
+      served when it comes back while A's borrowed slots are still busy. In-flight I/O
+      cannot be taken back, so B's wait on return is bounded by how long a borrowed slot
+      can stay busy (its deadline, then its completion); the prototype measures that bound
+      and limits borrowing to what keeps it within B's deadline.
+- [ ] **Prototype: what happened to each request.** Four times for every request: queued,
+      given a slot, past its deadline, and its I/O really finished; and while it waits,
+      which tenant holds the slots and how many of those requests are already past their
+      deadline. The first version answers one question: is B slow because its upstream
+      answers slowly, or because it waits for slots that A's expired requests still hold?
+      Full record and replay comes later (track R).
+- [ ] **Acceptance: two tenants on a small machine.** A gateway with 1 vCPU and 128 MiB,
+      the same scenario on io_uring and on epoll. A and B are first measured alone for a
+      baseline. Then B keeps sending at the same fixed rate (load sent on a schedule, with
+      latency measured from when each request was due, so a slow server cannot slow the
+      load down) while A's load rises or A's upstream slows down. The deadline is fixed
+      before measuring. Target: while A is overloaded, B's requests completed within the
+      deadline per second stay at 90% or more of B alone at the same rate. Reported per
+      tenant: p99, p99.9, refused and expired. When callers cancel while I/O still runs,
+      the ledger still shows what is held, and after the last completion bytes and slots
+      are back at their baseline. With B absent, A's throughput with borrowing on and off;
+      after A's upstream recovers, how long B takes to get back to normal. Those two
+      numbers are what isolating tenants costs.
+
 **Exit criteria:** no out-of-memory kill in any case of the attack matrix, well-behaved
 clients mixed into it keep at least 90% of their requests per second, the limit costs at
 most 1% more instructions per request, and the cheapest-machine benchmark of 0.9 is
-published again with the limit on, against Tokio, Go and nginx.
+published again with the limit on, against Tokio, Go and nginx, and the two-tenant test
+passes on both drivers.
+
+## Runtime core (track R, after 1.0)
+
+What a general runtime still lacks, from a [gap analysis of the core](docs/reviews/2026-11-runtime-gaps.md)
+against Tokio, Seastar, glommio, monoio, Go and Erlang. This track runs beside the protocol
+and platform tracks; each item ships in the first 1.x release whose gates it passes, breaks
+nothing, and lands only with its tests under the simulation driver, a coded error and page
+for every new failure, and a benchmark with raw data for any claim about speed or memory.
+Like the rest of 1.x, it stays on branches until 1.0.0.
+
+First wave, needing nothing else:
+
+- [ ] Blocking and compute work: `spawn_blocking` on a bounded pool, and a compute pool
+      sized from the same CPU budget as the workers (the container's quota), with a bounded
+      queue, so a blocking call or a CPU-heavy job never stalls a worker.
+- [ ] Processes and signals: child processes waited for through the ring (`waitid`, or a
+      pidfd), their standard input and output as streams, the process's own stdin and
+      stdout, pipes, any signal as a stream, Unix datagram sockets, passing descriptors
+      between processes, and listeners taken from systemd.
+- [ ] Structured concurrency: scopes whose child tasks never outlive them, task groups,
+      values local to a task, and a deadline per scope that the kernel enforces on every
+      operation inside it (a linked timeout in io_uring, the timer wheel on epoll), with
+      the reason for a cancellation as a coded error.
+- [ ] Work done inside the kernel: `splice` between sockets, wake-ups and descriptors sent
+      between workers' rings (`MSG_RING`), registered buffers, receive bundles.
+
+Second wave, after the first:
+
+- [ ] Scheduling groups: shares of CPU and of disk I/O per class of work (requests,
+      background jobs, tenants), so background work does not raise request latency.
+      Needs the scopes.
+- [ ] Restarts that drop nothing: the new process takes the listeners from the old one,
+      which drains; later, idle connections are handed over too, kernel TLS ones included.
+      Needs descriptor passing.
+- [ ] Record and replay: a bounded recording of everything nondeterministic a worker sees
+      (completions, timers, wake-ups from other threads, received bytes), which the
+      simulation driver replays exactly, so a failure in production becomes a test an
+      agent can run. Needs the simulation driver.
+
+Third wave, measured on bare metal:
+
+- [ ] Workers matched to the network card's receive queues, so a connection runs on the
+      core its packets arrive on.
+- [ ] Elastic cores: a quiet service gathers its connections onto fewer workers and lets
+      the rest sleep, and spreads out again under load, so several services share a small
+      machine.
+
+The cgroup's memory limit and its pressure signal (PSI) belong to the memory limit of 1.5,
+which reads them and tightens before the kernel's out-of-memory killer acts.
+
+**Exit criteria:** per item, as above. The track is done when every item has shipped in a
+1.x release.

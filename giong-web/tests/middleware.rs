@@ -546,3 +546,48 @@ fn compression_gzips_text_for_clients_that_accept_it() {
         assert_eq!(resp.get_header("vary"), None, "{path}");
     }
 }
+
+#[test]
+fn the_logger_writes_a_line_for_a_request_dropped_before_its_response() {
+    async fn slow(_req: Req) -> Result<Response, Error> {
+        giong::time::sleep(Duration::from_secs(30)).await;
+        Ok(Response::text("late"))
+    }
+    let (sink, lines) = memory();
+    // The timeout outside the logger drops it, as a client's reset of an
+    // HTTP/2 stream does.
+    let app = Router::new()
+        .get("/slow", slow)
+        .layer(Timeout::new(Duration::from_millis(50)))
+        .layer(RequestId::new())
+        .layer(Logger::new(sink))
+        .build(());
+    assert_eq!(get(&app, "/slow", "").status(), 503);
+    get(&app, "/nope", "");
+
+    let lines = lines.borrow();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let cancelled = &lines[0];
+    for part in [
+        "\"level\":\"info\"",
+        "\"event\":\"request cancelled\"",
+        "\"path\":\"/slow\"",
+        "\"route\":\"/slow\"",
+        "\"status\":null",
+        "\"bytes\":null",
+        "\"request_id\":\"",
+        "\"worker\":0",
+    ] {
+        assert!(cancelled.contains(part), "{part} missing from {cancelled}");
+    }
+    let us: u64 = cancelled
+        .split("\"duration_us\":")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+    assert!(us >= 40_000, "{cancelled}");
+    // A request answered normally still gets one ordinary line.
+    assert!(lines[1].contains("\"event\":\"request\""), "{}", lines[1]);
+    assert!(lines[1].contains("\"status\":404"), "{}", lines[1]);
+}

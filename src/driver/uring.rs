@@ -20,7 +20,7 @@
 //! sockets, provided buffers) is released by the driver itself.
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
@@ -70,7 +70,25 @@ fn recv_backlog_limit(pool: &BufPool) -> usize {
 /// kernel's listen backlog instead of piling up as open descriptors.
 const ACCEPT_BACKLOG_LIMIT: usize = 1024;
 
-enum Lifecycle {
+/// What a dropped single-shot operation leaves with the driver until the
+/// kernel is done: the operation's resources, or a zero-copy send's
+/// [`ZeroCopyHold`]. The driver keeps a `Box<dyn Any>`; the Kani proofs
+/// use a concrete type, whose drop code the model checker can follow.
+trait Leftover: 'static {
+    fn from_hold(hold: Box<ZeroCopyHold>) -> Self;
+    fn as_hold(&self) -> Option<&ZeroCopyHold>;
+}
+
+impl Leftover for Box<dyn Any> {
+    fn from_hold(hold: Box<ZeroCopyHold>) -> Self {
+        hold
+    }
+    fn as_hold(&self) -> Option<&ZeroCopyHold> {
+        self.downcast_ref::<ZeroCopyHold>()
+    }
+}
+
+enum Lifecycle<D = Box<dyn Any>> {
     /// In flight; the waker of the task awaiting it.
     Waiting(Waker),
     /// A zero-copy send has its result, but the kernel may still read the
@@ -84,7 +102,7 @@ enum Lifecycle {
     /// that is not negative is a descriptor nobody owns (an open), which the
     /// driver closes.
     Ignored {
-        data: Option<Box<dyn Any>>,
+        data: Option<D>,
         closes_result: bool,
     },
 }
@@ -112,13 +130,76 @@ struct Multi {
     ring: RingId,
     /// Completions not yet consumed.
     queue: VecDeque<Queued>,
+    /// The task waiting for a completion; with `shared`, the one that has
+    /// waited longest (the others wait in [`Uring::more_waiters`]).
     waker: Option<Waker>,
+    /// Several tasks may wait at once (a datagram socket). Otherwise the
+    /// latest poll's waker replaces the one before, as one reader is
+    /// expected and a stale waker must not take the reader's wake-up.
+    shared: bool,
     /// An SQE is in flight and may still produce completions.
     armed: bool,
     /// We asked the kernel to stop (backpressure); the terminal CQE is pending.
     pausing: bool,
     /// The owner is gone; release whatever still arrives.
     orphan: bool,
+}
+
+/// The tasks waiting on a shared multishot operation `key` after `m.waker`,
+/// oldest first; each is woken for a completion of its own. Kept apart from
+/// [`Multi`], which every stream has, so that operations stay small.
+type MoreWaiters = HashMap<usize, VecDeque<Waker>>;
+
+/// Takes the task that has waited longest on `m` (operation `key`).
+fn next_waiter(m: &mut Multi, more: &mut MoreWaiters, key: usize) -> Option<Waker> {
+    let next = m.waker.take();
+    if next.is_some() && m.shared {
+        m.waker = pop_more(more, key);
+    }
+    next
+}
+
+fn pop_more(more: &mut MoreWaiters, key: usize) -> Option<Waker> {
+    let queue = more.get_mut(&key)?;
+    let w = queue.pop_front();
+    if queue.is_empty() {
+        more.remove(&key);
+    }
+    w
+}
+
+/// Adds `waker`'s task to those waiting on shared `m`, unless it waits.
+fn wait_shared(m: &mut Multi, more: &mut MoreWaiters, key: usize, waker: &Waker) {
+    match &m.waker {
+        None => m.waker = Some(waker.clone()),
+        Some(w) if w.will_wake(waker) => {}
+        Some(_) => {
+            let queue = more.entry(key).or_default();
+            if !queue.iter().any(|w| w.will_wake(waker)) {
+                queue.push_back(waker.clone());
+            }
+        }
+    }
+}
+
+/// Stops waiting on shared `m` for `waker`'s task; `false` if it was not
+/// waiting.
+fn forget(m: &mut Multi, more: &mut MoreWaiters, key: usize, waker: &Waker) -> bool {
+    if m.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        m.waker = pop_more(more, key);
+        return true;
+    }
+    let Some(queue) = more.get_mut(&key) else {
+        return false;
+    };
+    let Some(i) = queue.iter().position(|w| w.will_wake(waker)) else {
+        return false;
+    };
+    queue.remove(i);
+    if queue.is_empty() {
+        more.remove(&key);
+    }
+    true
 }
 
 enum OpState {
@@ -131,6 +212,7 @@ pub(crate) struct Uring {
     /// Kernel bugs worked around while setting the ring up.
     workarounds: Vec<KernelWorkaround>,
     ops: Slab<OpState>,
+    more_waiters: MoreWaiters,
     /// SQEs pushed whose final CQE has not been seen yet.
     inflight: usize,
     /// Batched closes whose CQE has not been seen yet.
@@ -160,6 +242,9 @@ pub(crate) struct Uring {
     /// The smallest send that goes out without a copy, with
     /// [`IoUringFeature::ZeroCopySend`].
     zero_copy_min: Option<usize>,
+    /// The kernel takes a destination address with `IORING_OP_SEND`
+    /// (Linux 6.1), so datagrams to an address need no message header.
+    send_to: bool,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -295,7 +380,7 @@ fn locked_memory_error(e: io::Error, what: &str, limit: u64) -> io::Error {
              against it, summed over all processes of the same user: a giong worker locks \
              about 150 KiB with the default settings, more with a larger \
              Builder::ring_entries or Builder::recv_buffers. Without \
-             .driver(DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
+             .driver(crate::DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
              on its epoll driver instead; docs/DEPLOYMENT.md shows how to raise the limit.",
         )
         .with_source(e),
@@ -363,6 +448,130 @@ const SEND_ZC_REPORT_USAGE: u16 = 1 << 3;
 /// `IORING_NOTIF_USAGE_ZC_COPIED`, in the result of a notification.
 const NOTIF_COPIED: u32 = 1 << 31;
 
+/// The single-shot operation in a slab entry, if it holds one. The driver's
+/// slab holds [`OpState`]s; the Kani proofs use a slab of bare
+/// [`Lifecycle`]s, whose drop code the model checker can follow (an
+/// `OpState`'s includes a multishot queue's, which it cannot bound).
+trait SingleSlot {
+    type Left: Leftover;
+    fn lifecycle(&mut self) -> Option<&mut Lifecycle<Self::Left>>;
+}
+
+impl SingleSlot for OpState {
+    type Left = Box<dyn Any>;
+    fn lifecycle(&mut self) -> Option<&mut Lifecycle> {
+        match self {
+            OpState::Single(lc) => Some(lc),
+            OpState::Multi(_) => None,
+        }
+    }
+}
+
+#[cfg(kani)]
+impl<D: Leftover> SingleSlot for Lifecycle<D> {
+    type Left = D;
+    fn lifecycle(&mut self) -> Option<&mut Lifecycle<D>> {
+        Some(self)
+    }
+}
+
+/// [`Uring::poll_op`], on the slab alone (so that the Kani proofs can run
+/// it without a ring).
+fn poll_single<S: SingleSlot>(
+    ops: &mut Slab<S>,
+    key: usize,
+    waker: &Waker,
+    hold: &mut Option<Box<ZeroCopyHold>>,
+) -> Poll<(i32, u32)> {
+    match ops.get_mut(key).and_then(S::lifecycle) {
+        Some(Lifecycle::Done(res, flags)) => {
+            let out = (*res, *flags);
+            ops.remove(key);
+            Poll::Ready(out)
+        }
+        // A failed send waits for its notification, which comes at once
+        // (the kernel has nothing to read), so that the caller keeps its
+        // hold and can send the same bytes again (see `Op`).
+        Some(lc @ Lifecycle::Sent(..))
+            if hold.is_some() && matches!(*lc, Lifecycle::Sent(_, res, _) if res >= 0) =>
+        {
+            let Lifecycle::Sent(_, res, flags) = *lc else {
+                unreachable!()
+            };
+            *lc = Lifecycle::Ignored {
+                data: hold.take().map(S::Left::from_hold),
+                closes_result: false,
+            };
+            Poll::Ready((res, flags))
+        }
+        Some(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..)) => {
+            if !w.will_wake(waker) {
+                *w = waker.clone();
+            }
+            Poll::Pending
+        }
+        _ => panic!("giong: operation polled in an invalid state"),
+    }
+}
+
+/// What [`Uring::cancel_op`] still has to submit.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterCancel {
+    /// The operation is in flight: ask the kernel to cancel it.
+    Cancel,
+    /// An open that finished before its future was dropped: close the
+    /// descriptor nobody will take.
+    Close(RawFd),
+    Nothing,
+}
+
+/// [`Uring::cancel_op`], on the slab alone (so that the Kani proofs can run
+/// it without a ring).
+fn cancel_single<S: SingleSlot>(
+    ops: &mut Slab<S>,
+    key: usize,
+    data: Option<S::Left>,
+    closes_result: bool,
+    graveyard: &mut Vec<S::Left>,
+) -> AfterCancel {
+    match ops.get_mut(key).and_then(S::lifecycle) {
+        Some(lc @ Lifecycle::Waiting(_)) => {
+            *lc = Lifecycle::Ignored {
+                data,
+                closes_result,
+            };
+            AfterCancel::Cancel
+        }
+        Some(lc @ Lifecycle::Sent(..)) => {
+            // Sent: nothing to cancel, but the kernel may still read the
+            // buffer until the notification.
+            *lc = Lifecycle::Ignored {
+                data,
+                closes_result: false,
+            };
+            AfterCancel::Nothing
+        }
+        Some(&mut Lifecycle::Done(res, _)) => {
+            ops.remove(key);
+            // Completed: the kernel no longer references the resources.
+            if let Some(data) = data {
+                graveyard.push(data);
+            }
+            // An open that finished before its future was dropped.
+            if closes_result && res >= 0 {
+                AfterCancel::Close(res)
+            } else {
+                AfterCancel::Nothing
+            }
+        }
+        _ => {
+            // Unknown state: never free memory the kernel might still use.
+            mem::forget(data);
+            AfterCancel::Nothing
+        }
+    }
+}
+
 /// The SQE for a single-shot operation. `zero_copy` says whether the ring
 /// uses [`IoUringFeature::ZeroCopySend`].
 fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
@@ -402,6 +611,17 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
         Io::SendMsg { fd, msg, flags, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),
+        Io::SendTo {
+            fd,
+            buf,
+            len,
+            addr,
+            addr_len,
+        } => opcode::Send::new(types::Fd(fd), buf, len)
+            .dest_addr(addr)
+            .dest_addr_len(addr_len)
+            .flags(libc::MSG_NOSIGNAL)
+            .build(),
         Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
         Io::ReadReady { fd, buf, len } => opcode::Read::new(types::Fd(fd), buf, len).build(),
         Io::Read {
@@ -424,6 +644,14 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
             .flags(flags)
             .mode(mode)
             .build(),
+        #[cfg(test)]
+        Io::Close { fd } if tests::CLOSE_ASYNC.load(std::sync::atomic::Ordering::Relaxed) => {
+            // Handed to a kernel worker thread, as some filesystems do,
+            // where a cancellation can still catch it.
+            opcode::Close::new(types::Fd(fd))
+                .build()
+                .flags(squeue::Flags::ASYNC)
+        }
         Io::Close { fd } => opcode::Close::new(types::Fd(fd)).build(),
         Io::Statx {
             dir,
@@ -752,13 +980,18 @@ impl Uring {
             features.push(IoUringFeature::ZeroCopySend);
         }
         let recv_limit = recv_backlog_limit(&pool);
+        // Linux 6.0 refuses a destination address on `IORING_OP_SEND` with
+        // `EINVAL`, which cannot be told from a bad address: go by version.
+        let send_to = kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 1));
         Ok(Self {
             workarounds,
             features,
             registered_ring,
             zero_copy_min,
+            send_to,
             ring,
             ops: Slab::new(),
+            more_waiters: HashMap::new(),
             inflight: 0,
             pending_closes: 0,
             pool,
@@ -826,35 +1059,7 @@ impl Uring {
         waker: &Waker,
         hold: &mut Option<Box<ZeroCopyHold>>,
     ) -> Poll<(i32, u32)> {
-        match self.ops.get_mut(key) {
-            Some(OpState::Single(Lifecycle::Done(res, flags))) => {
-                let out = (*res, *flags);
-                self.ops.remove(key);
-                Poll::Ready(out)
-            }
-            // A failed send waits for its notification, which comes at once
-            // (the kernel has nothing to read), so that the caller keeps its
-            // hold and can send the same bytes again (see `Op`).
-            Some(OpState::Single(lc @ Lifecycle::Sent(..)))
-                if hold.is_some() && matches!(*lc, Lifecycle::Sent(_, res, _) if res >= 0) =>
-            {
-                let Lifecycle::Sent(_, res, flags) = *lc else {
-                    unreachable!()
-                };
-                *lc = Lifecycle::Ignored {
-                    data: hold.take().map(|hold| hold as Box<dyn Any>),
-                    closes_result: false,
-                };
-                Poll::Ready((res, flags))
-            }
-            Some(OpState::Single(Lifecycle::Waiting(w) | Lifecycle::Sent(w, ..))) => {
-                if !w.will_wake(waker) {
-                    *w = waker.clone();
-                }
-                Poll::Pending
-            }
-            _ => panic!("giong: operation polled in an invalid state"),
-        }
+        poll_single(&mut self.ops, key, waker, hold)
     }
 
     /// Called when the future of a single-shot operation is dropped before its
@@ -864,42 +1069,19 @@ impl Uring {
         key: usize,
         data: Option<Box<dyn Any>>,
         closes_result: bool,
+        finish: bool,
     ) {
-        match self.ops.get_mut(key) {
-            Some(OpState::Single(lc @ Lifecycle::Waiting(_))) => {
-                *lc = Lifecycle::Ignored {
-                    data,
-                    closes_result,
-                };
-                self.push(
-                    opcode::AsyncCancel::new(key as u64)
-                        .build()
-                        .user_data(UD_IGNORE),
-                );
-            }
-            Some(OpState::Single(lc @ Lifecycle::Sent(..))) => {
-                // Sent: nothing to cancel, but the kernel may still read the
-                // buffer until the notification.
-                *lc = Lifecycle::Ignored {
-                    data,
-                    closes_result: false,
-                };
-            }
-            Some(&mut OpState::Single(Lifecycle::Done(res, _))) => {
-                self.ops.remove(key);
-                // Completed: the kernel no longer references the resources.
-                if let Some(data) = data {
-                    self.graveyard.push(data);
-                }
-                // An open that finished before its future was dropped.
-                if closes_result && res >= 0 {
-                    self.close_fd(res);
-                }
-            }
-            _ => {
-                // Unknown state: never free memory the kernel might still use.
-                mem::forget(data);
-            }
+        match cancel_single(&mut self.ops, key, data, closes_result, &mut self.graveyard) {
+            // Left to run to the end (a close): its completion finds the
+            // operation ignored and frees it.
+            AfterCancel::Cancel if finish => {}
+            AfterCancel::Cancel => self.push(
+                opcode::AsyncCancel::new(key as u64)
+                    .build()
+                    .user_data(UD_IGNORE),
+            ),
+            AfterCancel::Close(fd) => self.close_fd(fd),
+            AfterCancel::Nothing => {}
         }
     }
 
@@ -911,6 +1093,7 @@ impl Uring {
             ring: RingId::Whole,
             queue: VecDeque::new(),
             waker: None,
+            shared: false,
             armed: false,
             pausing: false,
             orphan: false,
@@ -940,6 +1123,7 @@ impl Uring {
 
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
         let stream_ring = self.stream_ring();
+        let shared = matches!(io, MultiIo::RecvMsg { .. });
         let (sqe, ring) = match io {
             MultiIo::Accept { fd } => (
                 opcode::AcceptMulti::new(types::Fd(fd))
@@ -960,6 +1144,7 @@ impl Uring {
             Some(OpState::Multi(m)) if !m.armed => {
                 m.armed = true;
                 m.ring = ring;
+                m.shared = shared;
             }
             _ => panic!("giong: arming an invalid multishot operation"),
         }
@@ -970,6 +1155,9 @@ impl Uring {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
             panic!("giong: polling an invalid multishot operation");
         };
+        if m.shared {
+            return self.poll_shared(key, waker);
+        }
         match m.queue.pop_front() {
             Some(Queued::Raw(res)) => return MultiPoll::Item(res),
             Some(Queued::Piece { bid, off, len, .. }) => {
@@ -990,6 +1178,74 @@ impl Uring {
         MultiPoll::Pending
     }
 
+    /// Cancels multishot operation `key` if it is in flight. Its last
+    /// completion wakes the reader, whose poll then arms it again; what the
+    /// kernel completed before the cancellation stays queued, in order.
+    pub(crate) fn restart_multi(&mut self, key: usize) {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            return;
+        };
+        if !m.armed || m.pausing {
+            return;
+        }
+        m.pausing = true;
+        self.push(
+            opcode::AsyncCancel::new(key as u64)
+                .build()
+                .user_data(UD_IGNORE),
+        );
+    }
+
+    /// [`poll_multi`](Self::poll_multi) for an operation several tasks wait
+    /// on (a datagram socket). Out of line, so that the path every stream
+    /// takes stays as small as it was.
+    #[inline(never)]
+    fn poll_shared(&mut self, key: usize, waker: &Waker) -> MultiPoll {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            panic!("giong: polling an invalid multishot operation");
+        };
+        let got = match m.queue.pop_front() {
+            Some(Queued::Raw(res)) => Some(MultiPoll::Item(res)),
+            Some(Queued::Piece { bid, off, len, .. }) => {
+                self.pooled_queued -= 1;
+                let pool = self.pool.clone();
+                Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len)))
+            }
+            Some(Queued::Heap(data)) => Some(MultiPoll::Data(RecvBuf::heap(data))),
+            None => None,
+        };
+        if let Some(got) = got {
+            // This task is served; it is no longer waiting. If more is
+            // queued, the next waiting task takes it.
+            forget(m, &mut self.more_waiters, key, waker);
+            if !m.queue.is_empty() {
+                if let Some(next) = next_waiter(m, &mut self.more_waiters, key) {
+                    next.wake();
+                }
+            }
+            return got;
+        }
+        if !m.armed {
+            return MultiPoll::NeedArm;
+        }
+        wait_shared(m, &mut self.more_waiters, key, waker);
+        MultiPoll::Pending
+    }
+
+    /// See [`Driver::leave_multi`](super::Driver::leave_multi).
+    pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            return;
+        };
+        // Still waiting: it was not woken, so it owes nothing. Woken, for a
+        // completion it will not take now: pass it on.
+        if !forget(m, &mut self.more_waiters, key, waker) && !m.queue.is_empty() {
+            if let Some(next) = next_waiter(m, &mut self.more_waiters, key) {
+                next.wake();
+            }
+        }
+    }
+
     /// Called when the owner of a multishot operation (listener, stream) goes away.
     pub(crate) fn drop_multi(&mut self, key: usize) {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
@@ -999,6 +1255,7 @@ impl Uring {
         let armed = m.armed;
         let queued = mem::take(&mut m.queue);
         m.waker = None;
+        self.more_waiters.remove(&key);
         m.orphan = true;
         for item in queued {
             if let Queued::Piece { .. } = item {
@@ -1105,15 +1362,24 @@ impl Uring {
         unsafe { libc::close(fd) };
     }
 
+    /// `true` if SQEs wait in the submission queue for the next
+    /// `io_uring_enter`: a system call made directly now would reach the
+    /// kernel before them (see [`Driver::try_send_to`](super::Driver::try_send_to)).
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        !self.ring.submission().is_empty()
+    }
+
     /// Hands every queued SQE to the kernel now. TSan builds call it before
-    /// each close(2).
+    /// each close(2), and the send queue before its `sendmmsg(2)` (see
+    /// `net::sendq`), for the reason given at
+    /// [`Driver::try_send_to`](super::Driver::try_send_to).
     ///
     /// Queued SQEs name descriptors by number, and the kernel looks the
     /// number up only when it takes the SQE. Once close(2) returns, another
     /// thread can get the same number for a new socket, and a receive still
     /// in the queue would take that socket's data. (A close through the ring
     /// comes after those SQEs in the same queue, so it needs no such step.)
-    #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
         let mut attempts = 0u32;
         while !self.ring.submission().is_empty() {
@@ -1132,6 +1398,11 @@ impl Uring {
                 "giong: unable to make progress submitting to io_uring"
             );
         }
+    }
+
+    /// See [`Driver::sends_to`](super::Driver::sends_to).
+    pub(crate) fn sends_to(&self) -> bool {
+        self.send_to
     }
 
     pub(crate) fn pool(&self) -> &Rc<BufPool> {
@@ -1306,16 +1577,10 @@ impl Uring {
                 let remove = match self.ops.get_mut(key) {
                     None => false,
                     Some(OpState::Single(lc)) => {
-                        if let Lifecycle::Ignored {
-                            closes_result: true,
-                            ..
-                        } = lc
-                        {
-                            if !more && res >= 0 {
-                                orphan_fd = Some(res);
-                            }
-                        }
-                        Self::complete(lc, res, flags, more, &mut self.graveyard)
+                        let remove;
+                        (remove, orphan_fd) =
+                            Self::single_cqe(lc, res, flags, more, &mut self.graveyard);
+                        remove
                     }
                     Some(OpState::Multi(m)) => {
                         if !more {
@@ -1395,7 +1660,8 @@ impl Uring {
                                     self.to_pause.push(key);
                                 }
                             }
-                            if let Some(waker) = m.waker.take() {
+                            // One waiting task per completion.
+                            if let Some(waker) = next_waiter(m, &mut self.more_waiters, key) {
                                 waker.wake();
                             }
                             false
@@ -1412,6 +1678,29 @@ impl Uring {
         }
     }
 
+    /// A completion of single-shot operation `lc`: [`complete`](Self::complete),
+    /// and the descriptor an ignored open produced, which nobody will take
+    /// and the caller closes.
+    fn single_cqe<D: Leftover>(
+        lc: &mut Lifecycle<D>,
+        res: i32,
+        flags: u32,
+        more: bool,
+        graveyard: &mut Vec<D>,
+    ) -> (bool, Option<RawFd>) {
+        let mut orphan_fd = None;
+        if let Lifecycle::Ignored {
+            closes_result: true,
+            ..
+        } = lc
+        {
+            if !more && res >= 0 {
+                orphan_fd = Some(res);
+            }
+        }
+        (Self::complete(lc, res, flags, more, graveyard), orphan_fd)
+    }
+
     /// Records a completion of single-shot operation `lc`. Returns `true` if
     /// its slab entry can go.
     ///
@@ -1420,12 +1709,12 @@ impl Uring {
     /// longer reads the buffer. A future with a [`ZeroCopyHold`] gets the
     /// result at the first (see [`poll_op`](Self::poll_op)), any other at
     /// the second.
-    fn complete(
-        lc: &mut Lifecycle,
+    fn complete<D: Leftover>(
+        lc: &mut Lifecycle<D>,
         res: i32,
         flags: u32,
         more: bool,
-        graveyard: &mut Vec<Box<dyn Any>>,
+        graveyard: &mut Vec<D>,
     ) -> bool {
         if more {
             // The result of a zero-copy send; the notification follows. A
@@ -1460,7 +1749,7 @@ impl Uring {
             Lifecycle::Ignored { data, .. } => {
                 if let Some(data) = data {
                     if flags & F_NOTIF != 0 && res as u32 & NOTIF_COPIED != 0 {
-                        if let Some(hold) = data.downcast_ref::<ZeroCopyHold>() {
+                        if let Some(hold) = data.as_hold() {
                             hold.copied.set(true);
                         }
                     }
@@ -1584,6 +1873,76 @@ impl Drop for Uring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closes go to the kernel with `IOSQE_ASYNC`, so that a cancellation
+    /// can catch one before it runs.
+    pub(super) static CLOSE_ASYNC: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// How many descriptors of this process refer to `path`.
+    fn open_fds(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| target == path)
+            .count()
+    }
+
+    /// A close whose future is dropped once it was submitted still closes
+    /// the descriptor. It was cancelled like any other operation, and a
+    /// close a kernel worker had not started yet then never ran.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot run io_uring")]
+    fn a_dropped_close_still_closes() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering;
+        use std::task::Context;
+
+        let path = std::env::temp_dir().join(format!("giong-drop-close-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let path = path.canonicalize().unwrap();
+        CLOSE_ASYNC.store(true, Ordering::Relaxed);
+        let run = crate::runtime::Builder::new()
+            .driver(crate::DriverKind::IoUring)
+            .block_on(async {
+                if crate::runtime::driver_kind() != crate::DriverKind::IoUring {
+                    eprintln!("skipped: io_uring is not available");
+                    return;
+                }
+                for _ in 0..100 {
+                    let file = crate::fs::File::open(&path).await.unwrap();
+                    let mut close = Box::pin(file.close());
+                    let mut cx = Context::from_waker(std::task::Waker::noop());
+                    // Submitted, then dropped, as when a timeout fires.
+                    // (Under ThreadSanitizer the close is a close(2), done here.)
+                    let _ = close.as_mut().poll(&mut cx);
+                    drop(close);
+                }
+                // Let the driver run the closes.
+                for _ in 0..200 {
+                    if open_fds(&path) == 0 && crate::observe::worker_stats().tracked_ops == 0 {
+                        break;
+                    }
+                    crate::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(
+                    open_fds(&path),
+                    0,
+                    "a dropped close left its descriptor open"
+                );
+                assert_eq!(crate::observe::worker_stats().tracked_ops, 0);
+            });
+        CLOSE_ASYNC.store(false, Ordering::Relaxed);
+        std::fs::remove_file(&path).unwrap();
+        match run {
+            // Blocked (Docker's seccomp profile), missing or too old (5.15):
+            // the cases in which the automatic choice falls back to epoll.
+            Err(e) if crate::driver::io_uring_unusable(&e) => {
+                eprintln!("skipped: {e}");
+            }
+            other => other.unwrap(),
+        }
+    }
 
     /// A blocked or missing io_uring is explained; other errors pass through.
     #[test]
@@ -1737,7 +2096,7 @@ mod tests {
         }
         let woken = Arc::new(Count(AtomicUsize::new(0)));
         let mut lc = Lifecycle::Waiting(Waker::from(woken.clone()));
-        let mut graveyard = Vec::new();
+        let mut graveyard: Vec<Box<dyn Any>> = Vec::new();
 
         assert!(!Uring::complete(
             &mut lc,
@@ -1761,7 +2120,7 @@ mod tests {
         // A send whose future already returned (`Ignored`) wakes nobody,
         // and its hold goes when the notification comes.
         let mut lc = Lifecycle::Ignored {
-            data: Some(Box::new(())),
+            data: Some(Box::new(()) as Box<dyn Any>),
             closes_result: false,
         };
         assert!(!Uring::complete(
@@ -1802,5 +2161,265 @@ mod tests {
         // The preferred tier may legitimately fall back on an old kernel, but
         // it must always yield a ring.
         build_ring_from(64, RingTier::Defer).expect("default tier");
+    }
+}
+
+/// Kani proofs (`scripts/check.sh kani`) for the lifetime of a single-shot
+/// operation in the io_uring driver: the same functions the driver calls
+/// ([`poll_single`], [`cancel_single`], [`Uring::single_cqe`]) on a real
+/// slab, against a model of the kernel that posts the operation's
+/// completions in any order relative to the future's polls and drop.
+///
+/// For any interleaving of three events (the kernel posts the next
+/// completion; the future polls; the future is dropped), followed by the
+/// kernel posting whatever is left and a last poll, it proves the list
+/// below. Three are enough for every order: at most three events change
+/// the state (two completions, and either the poll that collects the
+/// result or the drop), and a poll that finds the operation pending
+/// changes nothing but the waker.
+///
+/// * the slab entry stays until the kernel's last completion for it (a
+///   reused key would deliver a completion to another operation), and is
+///   gone once the future and the kernel are both done;
+/// * resources handed over by a dropped future are released (reach the
+///   graveyard) only after the kernel's last completion, exactly once; a
+///   zero-copy send's hold likewise only after its notification;
+/// * the future gets its result once, the one the kernel posted, and only
+///   a send that leaves a hold gets it before the last completion;
+/// * a descriptor an open produced after its future was dropped is closed
+///   exactly once, and never one the future collected.
+///
+/// The kernel model covers a plain operation (one completion) and a
+/// zero-copy send (a result flagged `MORE` then a notification, or a single
+/// completion), with any result in -2..=2 and either notification usage.
+/// Not covered: multishot operations, the `Op` future's own code around
+/// these calls (the thread-local worker lookup, the retry on `EAGAIN`, the
+/// copy fallback on `EOPNOTSUPP`), the SQEs submitted (`AsyncCancel`,
+/// `Close`), and the epoll driver's lifecycle.
+///
+/// The proofs use a slab of bare [`Lifecycle`]s whose leftovers are a
+/// concrete type ([`Left`]) instead of the driver's `OpState`s holding
+/// `Box<dyn Any>`: the functions are generic over both, and Kani cannot
+/// follow the drop code of a `Box<dyn Any>` (any type the crate ever boxes
+/// that way, recursively through `ZeroCopyHold`), nor of a multishot
+/// queue, within its memory.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// What a dropped operation leaves with the driver in the proofs.
+    enum Left {
+        /// The resources the future handed over.
+        Resources,
+        Hold(Box<ZeroCopyHold>),
+    }
+
+    impl Leftover for Left {
+        fn from_hold(hold: Box<ZeroCopyHold>) -> Self {
+            Left::Hold(hold)
+        }
+        fn as_hold(&self) -> Option<&ZeroCopyHold> {
+            match self {
+                Left::Hold(hold) => Some(hold),
+                Left::Resources => None,
+            }
+        }
+    }
+
+    struct Model {
+        ops: Slab<Lifecycle<Left>>,
+        key: usize,
+        graveyard: Vec<Left>,
+        // The operation.
+        zero_copy: bool,
+        with_hold: bool,
+        opens: bool,
+        hold: Option<Box<ZeroCopyHold>>,
+        // The kernel's side.
+        posted: u8,
+        last_posted: bool,
+        /// The result the kernel posted (in the first completion).
+        result: i32,
+        // The future's side.
+        alive: bool,
+        collected: Option<(i32, u32)>,
+        closed: u8,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            let zero_copy: bool = kani::any();
+            let with_hold = zero_copy && kani::any::<bool>();
+            let mut ops = Slab::new();
+            let key = ops.insert(Lifecycle::Waiting(Waker::noop().clone()));
+            Self {
+                ops,
+                key,
+                graveyard: Vec::with_capacity(2),
+                zero_copy,
+                with_hold,
+                opens: !zero_copy && kani::any::<bool>(),
+                hold: with_hold.then(|| {
+                    Box::new(ZeroCopyHold {
+                        owners: Vec::new(),
+                        scratch: Vec::new(),
+                        copied: Rc::new(std::cell::Cell::new(false)),
+                    })
+                }),
+                posted: 0,
+                last_posted: false,
+                result: 0,
+                alive: true,
+                collected: None,
+                closed: 0,
+            }
+        }
+
+        /// The kernel posts the operation's next completion and the driver
+        /// dispatches it.
+        fn kernel_posts(&mut self) {
+            let res: i32 = kani::any();
+            kani::assume((-2..=2).contains(&res));
+            let (res, flags, more) = if self.zero_copy && self.posted == 1 {
+                // The notification; its result says whether it copied.
+                let copied = if kani::any() { NOTIF_COPIED as i32 } else { 0 };
+                (copied, F_NOTIF, false)
+            } else {
+                self.result = res;
+                // A zero-copy send's result: flagged MORE when its
+                // notification follows (not always: not when it fails).
+                let more = self.zero_copy && kani::any::<bool>();
+                (res, if more { F_MORE } else { 0 }, more)
+            };
+            let Some(lc) = self.ops.get_mut(self.key) else {
+                panic!("a completion for an entry that is gone");
+            };
+            let before = self.graveyard.len();
+            let (remove, fd) = Uring::single_cqe(lc, res, flags, more, &mut self.graveyard);
+            if more {
+                assert!(
+                    self.graveyard.len() == before,
+                    "released before the notification"
+                );
+            }
+            if remove {
+                self.ops.remove(self.key);
+            }
+            if let Some(fd) = fd {
+                assert!(
+                    fd == self.result && self.opens,
+                    "closed a descriptor it does not own"
+                );
+                self.closed += 1;
+            }
+            self.posted += 1;
+            self.last_posted = !more;
+        }
+
+        fn poll(&mut self) {
+            let waker = Waker::noop();
+            if let Poll::Ready(out) = poll_single(&mut self.ops, self.key, waker, &mut self.hold) {
+                self.collected = Some(out);
+            }
+        }
+
+        fn drop_future(&mut self) {
+            self.alive = false;
+            let data = Some(Left::Resources);
+            match cancel_single(
+                &mut self.ops,
+                self.key,
+                data,
+                self.opens,
+                &mut self.graveyard,
+            ) {
+                AfterCancel::Close(fd) => {
+                    assert!(self.last_posted && self.opens && fd == self.result && fd >= 0);
+                    self.closed += 1;
+                }
+                AfterCancel::Cancel => assert!(!self.last_posted),
+                AfterCancel::Nothing => {}
+            }
+        }
+
+        fn step(&mut self) {
+            let pending = self.alive && self.collected.is_none();
+            match kani::any::<u8>() {
+                0 if !self.last_posted => self.kernel_posts(),
+                1 if pending => self.poll(),
+                2 if pending => self.drop_future(),
+                _ => {}
+            }
+            self.check();
+        }
+
+        /// What holds after every step.
+        fn check(&self) {
+            if !self.last_posted {
+                assert!(
+                    self.graveyard.is_empty(),
+                    "released while the kernel may use it"
+                );
+                assert!(
+                    self.ops.get(self.key).is_some(),
+                    "entry gone while in flight"
+                );
+            }
+            if let Some((res, _)) = self.collected {
+                assert!(
+                    self.last_posted || self.with_hold,
+                    "a result before the last completion"
+                );
+                assert!(res == self.result, "not the result the kernel posted");
+            }
+        }
+
+        /// The kernel posts what is left, the future (if any) polls once
+        /// more, and both are done.
+        fn finish(mut self) {
+            // A zero-copy send posts at most two completions.
+            if !self.last_posted {
+                self.kernel_posts();
+                self.check();
+            }
+            if !self.last_posted {
+                self.kernel_posts();
+                self.check();
+            }
+            assert!(self.last_posted);
+            if self.alive && self.collected.is_none() {
+                self.poll();
+                assert!(self.collected.is_some(), "the future never gets its result");
+                self.check();
+            }
+            assert!(self.ops.get(self.key).is_none(), "entry left behind");
+            assert!(self.ops.len() == 0);
+            let handed_over =
+                usize::from(!self.alive) + usize::from(self.with_hold && self.hold.is_none());
+            assert!(
+                self.graveyard.len() == handed_over,
+                "released twice or never"
+            );
+            let unowned_fd = self.opens && !self.alive && self.result >= 0;
+            assert!(
+                self.closed == u8::from(unowned_fd),
+                "a descriptor closed wrongly"
+            );
+            // Dropping the harness's bookkeeping only adds drop code.
+            mem::forget(self);
+        }
+    }
+
+    /// Three free events, then the end (see the module docs). One
+    /// harness for every kind of operation: split by kind, the zero-copy
+    /// send alone took twice as long and as much memory.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn resources_outlive_the_kernel() {
+        let mut m = Model::new();
+        m.step();
+        m.step();
+        m.step();
+        m.finish();
     }
 }

@@ -226,21 +226,21 @@ fn long_datagrams_are_truncated_by_recv_from_and_whole_with_read_from() {
         let (owned, owned_addr) = socket();
         let data = payload(20_000, 3);
 
-        // The pool's buffers are 8 KiB by default, 44 bytes of which hold the
+        // The pool's buffers are 16 KiB by default, 44 bytes of which hold the
         // sender's address.
         a.send_to(data.clone(), pooled_addr).await.0.unwrap();
         let (got, from) = pooled.recv_from().await.unwrap();
         assert!(got.is_truncated());
-        assert_eq!((got.len(), from), (8192 - 44, a_addr));
+        assert_eq!((got.len(), from), (16384 - 44, a_addr));
         assert!(*got == data[..got.len()]);
         drop(got);
         // The longest datagram that fits is not truncated.
-        a.send_to(data[..8192 - 44].to_vec(), pooled_addr)
+        a.send_to(data[..16384 - 44].to_vec(), pooled_addr)
             .await
             .0
             .unwrap();
         let got = pooled.recv().await.unwrap();
-        assert!(!got.is_truncated() && *got == data[..8192 - 44]);
+        assert!(!got.is_truncated() && *got == data[..16384 - 44]);
 
         // A buffer of one's own takes the whole datagram.
         a.send_to(data.clone(), owned_addr).await.0.unwrap();
@@ -341,16 +341,115 @@ fn many_tasks_send_on_one_socket() {
 }
 
 #[test]
+fn many_tasks_receive_on_one_socket() {
+    // Each datagram wakes a waiting task of its own. Before 0.9 the tasks
+    // shared one wake-up slot on io_uring: only the last task to wait was
+    // woken, and the others never saw the datagrams queued for them.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        const TASKS: u32 = 8;
+        let receivers: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let b = b.clone();
+                giong::spawn(async move {
+                    let got = timeout(Duration::from_secs(5), b.recv())
+                        .await
+                        .expect("a waiting task was never woken")
+                        .unwrap();
+                    u32::from_be_bytes(got[..].try_into().unwrap())
+                })
+            })
+            .collect();
+        // Let every task start waiting.
+        sleep(Duration::from_millis(20)).await;
+        for i in 0..TASKS {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        let sent = std::time::Instant::now();
+        let mut seen = vec![false; TASKS as usize];
+        for r in receivers {
+            let i = r.await.unwrap() as usize;
+            assert!(!std::mem::replace(&mut seen[i], true), "datagram {i} twice");
+        }
+        // A task that is not woken still gets its datagram when its timeout
+        // polls it at the deadline: check that nobody waited for that.
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "tasks were woken late: {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn a_receiver_that_gave_up_does_not_take_the_next_datagram() {
+    // A task stops waiting (its receive timed out); the next datagram must
+    // wake the task that is waiting now, not the one that left.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        let b1 = b.clone();
+        giong::spawn(async move {
+            assert!(timeout(Duration::from_millis(10), b1.recv()).await.is_err());
+            // Keep this task alive, so that a wake-up meant for the other
+            // one would land here.
+            sleep(Duration::from_secs(10)).await;
+        });
+        sleep(Duration::from_millis(30)).await;
+        let b2 = b.clone();
+        let waiting = giong::spawn(async move {
+            timeout(Duration::from_secs(5), b2.recv())
+                .await
+                .expect("the waiting task was not woken")
+                .unwrap()
+                .to_vec()
+        });
+        sleep(Duration::from_millis(10)).await;
+        let sent = std::time::Instant::now();
+        a.send_to(&b"next"[..], b_addr).await.0.unwrap();
+        assert_eq!(waiting.await.unwrap(), b"next");
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the task was woken late: {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn a_task_that_only_sends_lets_the_others_run() {
+    // Sends of datagrams complete at once, so a task that does nothing else
+    // never waits; the runtime must still make it give way now and then.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (_b, b_addr) = socket();
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let r = ran.clone();
+        giong::spawn(async move { r.set(true) });
+        let mut first_seen = None;
+        for i in 0..5_000u32 {
+            a.send_to(&b"x"[..], b_addr).await.0.unwrap();
+            if ran.get() {
+                first_seen = Some(i);
+                break;
+            }
+        }
+        let i = first_seen.expect("the other task never ran during 5000 sends");
+        assert!(i < 1_000, "the other task first ran after {i} sends");
+    });
+}
+
+#[test]
 fn every_worker_can_bind_the_same_port() {
-    // A socket that a test running at the same time binds to 127.0.0.1 could
-    // get this port once the probe below has let it go, and the workers could
-    // not bind it. No other test binds to 127.0.0.2.
+    // No other test binds to 127.0.0.2, and the port is one the kernel never
+    // hands out for port 0: a socket of a test running at the same time,
+    // bound to port 0 of any address (0.0.0.0 included), cannot take it
+    // before the workers bind it.
     const ADDR: &str = "127.0.0.2";
-    // Reserve a port, then let three workers share it.
-    let port = {
-        let probe = std::net::UdpSocket::bind((ADDR, 0)).unwrap();
-        probe.local_addr().unwrap().port()
-    };
+    let port = port_outside_ephemeral_range([127, 0, 0, 2]).port();
     let received = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
     let rt = giong::Builder::new().workers(3).build().unwrap();
@@ -489,20 +588,171 @@ fn runtime_teardown_with_datagrams_in_flight() {
     }
 }
 
-/// The inode of a socket, to find out later whether any descriptor of this
-/// process still refers to it. (Descriptor numbers are reused by the tests
-/// running in parallel, inodes are not.)
-fn socket_inode(socket: &UdpSocket) -> String {
-    use std::os::fd::AsRawFd;
-    let link = std::fs::read_link(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
-    link.to_string_lossy().into_owned()
+/// What names one socket for good: its address and its cookie, a number the
+/// kernel never gives another socket. (Descriptor numbers are reused by the
+/// tests running in parallel.)
+#[derive(Clone, Copy, Debug)]
+struct SocketId {
+    addr: std::net::SocketAddrV4,
+    cookie: u64,
+    inode: u64,
 }
 
-fn is_open(inode: &str) -> bool {
-    std::fs::read_dir("/proc/self/fd")
-        .unwrap()
-        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-        .any(|target| target.to_string_lossy() == inode)
+fn socket_id(socket: &UdpSocket) -> SocketId {
+    use std::os::fd::AsRawFd;
+    const SO_COOKIE: libc::c_int = 57;
+    let mut cookie = 0u64;
+    let mut len = std::mem::size_of::<u64>() as libc::socklen_t;
+    // SAFETY: `cookie` and `len` are valid for the kernel to write.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_COOKIE,
+            (&raw mut cookie).cast(),
+            &mut len,
+        )
+    };
+    assert_eq!(rc, 0, "SO_COOKIE: {}", std::io::Error::last_os_error());
+    let std::net::SocketAddr::V4(addr) = socket.local_addr().unwrap() else {
+        panic!("not an IPv4 socket");
+    };
+    // SAFETY: `socket` keeps the descriptor open while it is borrowed here.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(socket.as_raw_fd()) };
+    let file = std::fs::File::from(fd.try_clone_to_owned().unwrap());
+    let inode = std::os::unix::fs::MetadataExt::ino(&file.metadata().unwrap());
+    SocketId {
+        addr,
+        cookie,
+        inode,
+    }
+}
+
+/// Whether the socket `id` still exists.
+///
+/// Not from /proc/self/fd: listing or reading those links holds every open
+/// file for a moment, and a socket another test closes in that moment keeps
+/// its port until this thread is done (the rebind test then saw AddrInUse
+/// for a port nothing held). The kernel is asked by address and cookie
+/// instead (sock_diag), in one request. Kernels that cannot answer for UDP
+/// (its sock_diag handler is a module, `udp_diag`, which the QEMU guests of
+/// CI do not have) fall back to the UDP table; the kernel writes that a page
+/// per read, and sockets that come and go in between (the thousand of
+/// `port_zero_gives_every_socket_a_port_of_its_own`) can make a live socket
+/// fall between two pages, so it counts as open when any of several reads
+/// lists it.
+fn is_open(id: SocketId) -> bool {
+    static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let diag = *DIAG.get_or_init(|| {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let probe = UdpSocket::from_std(probe);
+        found_by_sock_diag(socket_id(&probe))
+    });
+    if diag {
+        return found_by_sock_diag(id);
+    }
+    let inode = id.inode.to_string();
+    (0..20).any(|_| {
+        ["/proc/net/udp", "/proc/net/udp6"].iter().any(|table| {
+            std::fs::read_to_string(table)
+                .unwrap_or_default()
+                .lines()
+                .skip(1)
+                .any(|line| line.split_whitespace().nth(9) == Some(inode.as_str()))
+        })
+    })
+}
+
+/// Whether sock_diag finds the UDP socket bound to `id.addr` with
+/// `id.cookie`. Also false when the kernel has no sock_diag for UDP.
+fn found_by_sock_diag(id: SocketId) -> bool {
+    #[repr(C)]
+    struct Request {
+        len: u32,
+        kind: u16,
+        flags: u16,
+        seq: u32,
+        pid: u32,
+        family: u8,
+        protocol: u8,
+        ext: u8,
+        pad: u8,
+        states: u32,
+        sport: [u8; 2],
+        dport: [u8; 2],
+        src: [u8; 16],
+        dst: [u8; 16],
+        interface: u32,
+        cookie: [u32; 2],
+    }
+    const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    let mut src = [0u8; 16];
+    src[..4].copy_from_slice(&id.addr.ip().octets());
+    // A datagram from 127.0.0.1:1 to the socket's address finds it.
+    let mut from = [0u8; 16];
+    from[..4].copy_from_slice(&[127, 0, 0, 1]);
+    let request = Request {
+        len: std::mem::size_of::<Request>() as u32,
+        kind: SOCK_DIAG_BY_FAMILY,
+        flags: libc::NLM_F_REQUEST as u16,
+        seq: 1,
+        pid: 0,
+        family: libc::AF_INET as u8,
+        protocol: libc::IPPROTO_UDP as u8,
+        ext: 0,
+        pad: 0,
+        states: u32::MAX,
+        sport: 1u16.to_be_bytes(),
+        dport: id.addr.port().to_be_bytes(),
+        src: from,
+        dst: src,
+        interface: 0,
+        cookie: [id.cookie as u32, (id.cookie >> 32) as u32],
+    };
+    // SAFETY: plain system calls on a socket this function owns, with
+    // buffers that outlive them.
+    unsafe {
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            NETLINK_SOCK_DIAG,
+        );
+        assert!(fd >= 0, "netlink: {}", std::io::Error::last_os_error());
+        let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let sent = libc::send(
+            fd.as_raw_fd(),
+            (&raw const request).cast(),
+            std::mem::size_of::<Request>(),
+            0,
+        );
+        assert_eq!(sent, std::mem::size_of::<Request>() as isize);
+        let mut reply = [0u32; 1024];
+        let got = libc::recv(fd.as_raw_fd(), reply.as_mut_ptr().cast(), 4096, 0);
+        assert!(
+            got >= 20,
+            "sock_diag reply: {}",
+            std::io::Error::last_os_error()
+        );
+        // The header's type: the socket's description when it was found, an
+        // error when it was not: `ENOENT` when no socket has the address,
+        // `ESTALE` when another one does (a test running in parallel was
+        // given the port once this socket let it go; port-0 sockets do not
+        // share ports, so this one is closed).
+        let kind = reply[1] as u16;
+        if kind == SOCK_DIAG_BY_FAMILY {
+            return true;
+        }
+        assert_eq!(kind, libc::NLMSG_ERROR as u16);
+        let errno = -(reply[4] as i32);
+        assert!(
+            errno == libc::ENOENT || errno == libc::ESTALE,
+            "sock_diag: {}",
+            std::io::Error::from_raw_os_error(errno)
+        );
+        false
+    }
 }
 
 #[test]
@@ -519,12 +769,12 @@ fn dropping_a_socket_closes_it() {
         assert_eq!(res.unwrap(), (1, idle_addr));
         assert_eq!(&multishot.recv_from().await.unwrap().0[..], b"b");
 
-        let inodes = [&idle, &one_off, &multishot].map(socket_inode);
-        assert!(inodes.iter().all(|inode| is_open(inode)));
+        let ids = [&idle, &one_off, &multishot].map(socket_id);
+        assert!(ids.iter().all(|&id| is_open(id)));
         drop((idle, one_off, multishot));
         sleep(Duration::from_millis(20)).await;
-        for inode in &inodes {
-            assert!(!is_open(inode), "{inode} is still open");
+        for id in ids {
+            assert!(!is_open(id), "{id:?} is still open");
         }
     });
 }
@@ -551,6 +801,68 @@ fn a_cancelled_read_from_leaves_the_socket_usable() {
         assert_eq!(res.unwrap().0, 10);
         assert_eq!(buf, b"still here");
     });
+}
+
+/// A `read_from` given up on leaves a cancellation queued for the kernel. A
+/// datagram sent right after it, and answered at once, must reach the next
+/// `read_from`, not the receive being cancelled: a send made within the call
+/// must not overtake the cancellation (seen with Linux 6.0's io_uring, which
+/// runs completions before the next submission).
+#[test]
+fn a_reply_to_a_send_after_a_cancelled_read_from_is_not_lost() {
+    reply_after_cancelled_read_from(false);
+}
+
+/// The same with another task running, so that the send waits for the end
+/// of the turn and goes out with `sendmmsg(2)`.
+#[test]
+fn a_reply_to_a_batched_send_after_a_cancelled_read_from_is_not_lost() {
+    reply_after_cancelled_read_from(true);
+}
+
+fn reply_after_cancelled_read_from(busy: bool) {
+    let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    // Echoes until it gets an empty datagram.
+    let peer = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, from) = echo.recv_from(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            echo.send_to(&buf[..n], from).unwrap();
+        }
+    });
+    giong::block_on(async {
+        let running = Rc::new(std::cell::Cell::new(true));
+        if busy {
+            let running = running.clone();
+            giong::spawn(async move {
+                while running.get() {
+                    giong::yield_now().await;
+                }
+            });
+        }
+        let (a, _) = socket();
+        for i in 0..200u32 {
+            let read = a.read_from(Vec::with_capacity(64));
+            assert!(timeout(Duration::from_micros(200), read).await.is_err());
+            a.send_to(i.to_be_bytes().to_vec(), echo_addr)
+                .await
+                .0
+                .unwrap();
+            let read = a.read_from(Vec::with_capacity(64));
+            let (res, buf) = timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap_or_else(|_| panic!("the reply to datagram {i} was lost"));
+            assert_eq!(res.unwrap().0, 4);
+            assert_eq!(buf, i.to_be_bytes());
+        }
+        running.set(false);
+        a.send_to(Vec::new(), echo_addr).await.0.unwrap();
+    });
+    peer.join().unwrap();
 }
 
 #[test]
@@ -649,20 +961,167 @@ fn a_port_held_by_another_process_is_refused() {
     });
 }
 
+/// A UDP port on `ip` (a loopback address) that is free now and that the
+/// kernel never hands out for port 0, so the other tests of this binary,
+/// which bind port 0 in parallel, cannot take it while a test has let go of
+/// it. Picked at random
+/// below the ephemeral range rather than always the highest such port, which
+/// is the obvious pick for anything else on the machine doing the same.
+fn port_outside_ephemeral_range(ip: [u8; 4]) -> std::net::SocketAddr {
+    use std::hash::{BuildHasher, Hasher};
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+    assert!(
+        low > 2048,
+        "ephemeral range starts at {low}: no room below it"
+    );
+    let mut seed = std::collections::hash_map::RandomState::new().build_hasher();
+    seed.write_u32(std::process::id());
+    let start = seed.finish();
+    let span = u64::from(low - 1024);
+    (0..span)
+        .map(|i| 1024 + ((start + i) % span) as u16)
+        .map(|port| std::net::SocketAddr::from((ip, port)))
+        .find(|addr| std::net::UdpSocket::bind(addr).is_ok())
+        .expect("no free UDP port below the ephemeral range")
+}
+
+/// The process that owns socket `inode`, when /proc lets this process see
+/// it (processes of other users hide their descriptors). Only for a report
+/// after a failure: reading /proc/*/fd holds sockets that close meanwhile
+/// (see `is_open`).
+fn socket_owner(inode: &str) -> Option<String> {
+    let target = format!("socket:[{inode}]");
+    for proc in std::fs::read_dir("/proc").ok()?.flatten() {
+        let pid = proc.file_name().to_string_lossy().into_owned();
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) else {
+            continue;
+        };
+        let owns = fds
+            .flatten()
+            .filter_map(|fd| std::fs::read_link(fd.path()).ok())
+            .any(|link| link.to_string_lossy() == target);
+        if owns {
+            let cmdline = std::fs::read(proc.path().join("cmdline")).unwrap_or_default();
+            let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            let me = if pid == std::process::id().to_string() {
+                " (this process)"
+            } else {
+                ""
+            };
+            return Some(format!("pid {pid}{me}: {}", cmdline.trim()));
+        }
+    }
+    None
+}
+
+/// Every UDP socket on `port` in the system, by inode: local and remote
+/// address, uid, and the owning process when it can be seen.
+fn udp_holders(port: u16) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for table in ["/proc/net/udp", "/proc/net/udp6"] {
+        let text = std::fs::read_to_string(table).unwrap_or_default();
+        for line in text.lines().skip(1) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let Some(local) = f.get(1) else { continue };
+            let hex_port = local.rsplit(':').next().unwrap_or("");
+            if u16::from_str_radix(hex_port, 16).ok() != Some(port) {
+                continue;
+            }
+            let inode = f.get(9).copied().unwrap_or("?");
+            let holder = format!(
+                "{table}: local {local} remote {} uid {}, {}",
+                f.get(2).copied().unwrap_or("?"),
+                f.get(7).copied().unwrap_or("?"),
+                socket_owner(inode).unwrap_or_else(|| "owner gone or not visible".into())
+            );
+            out.push((inode.to_string(), holder));
+        }
+    }
+    out
+}
+
+/// Which plain binds of `addr` the kernel refuses now: none of the options,
+/// `SO_REUSEADDR` only (giong's probe after a release) and `SO_REUSEPORT`
+/// only (giong's own sockets).
+fn refused_binds(addr: std::net::SocketAddr) -> String {
+    let try_bind = |reuse_addr: bool, reuse_port: bool| {
+        let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        sock.set_reuse_address(reuse_addr).unwrap();
+        sock.set_reuse_port(reuse_port).unwrap();
+        match sock.bind(&addr.into()) {
+            Ok(()) => "free",
+            Err(_) => "refused",
+        }
+    };
+    format!(
+        "no options {}, SO_REUSEADDR {}, SO_REUSEPORT {}",
+        try_bind(false, false),
+        try_bind(true, false),
+        try_bind(false, true)
+    )
+}
+
+/// What a failed bind of `addr` ran into. A socket of another process that
+/// lives only for a moment is gone before a single look, so this looks for
+/// half a second and reports every socket seen on the port, when it was
+/// first seen, and which binds the port refused at each change.
+fn bind_failure_report(addr: std::net::SocketAddr) -> String {
+    let start = std::time::Instant::now();
+    let mut seen: Vec<String> = Vec::new();
+    let mut seen_inodes: Vec<String> = Vec::new();
+    // Which binds the port refuses right after the failure; later it
+    // changes hands.
+    let mut report = format!("\n  binds now: {}", refused_binds(addr));
+    while start.elapsed() < Duration::from_millis(500) {
+        let at = start.elapsed();
+        for (inode, holder) in udp_holders(addr.port()) {
+            if seen_inodes.contains(&inode) {
+                continue;
+            }
+            seen_inodes.push(inode);
+            // The same kind of socket again (another process binding the
+            // port over and over) is counted, not listed again.
+            if !seen.contains(&holder) && seen.len() < 10 {
+                report.push_str(&format!("\n  +{at:?} socket {holder}"));
+                seen.push(holder);
+            }
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    if seen.is_empty() {
+        report.push_str("\n  no socket on the port was seen in 500 ms");
+    } else {
+        report.push_str(&format!(
+            "\n  {} sockets on the port in 500 ms",
+            seen_inodes.len()
+        ));
+    }
+    report
+}
+
 /// Workers of one process share a port; a dropped socket's port can be
 /// bound again at once.
 #[test]
 fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
     giong::block_on(async {
-        let free = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = free.local_addr().unwrap();
-        drop(free);
+        // Not a port from port 0: between the drops and the binds below,
+        // another test's socket could be given the same port (seen in CI).
+        let addr = port_outside_ephemeral_range([127, 0, 0, 1]);
         let first = UdpSocket::bind(addr).unwrap();
         let second = UdpSocket::bind(addr).unwrap();
         drop(first);
         drop(second);
-        for _ in 0..20 {
-            let again = UdpSocket::bind(addr).unwrap();
+        for round in 0..20 {
+            let again = UdpSocket::bind(addr).unwrap_or_else(|e| {
+                panic!(
+                    "round {round}: binding {addr} again failed: {e}; on the port since:{}",
+                    bind_failure_report(addr)
+                )
+            });
             let (sender, _) = socket();
             sender.send_to(vec![7; 10], addr).await.0.unwrap();
             let got = timeout(Duration::from_secs(5), again.recv())
@@ -693,5 +1152,150 @@ fn bind_and_connect_refuse_a_host_name() {
             "{err}"
         );
         s.connect("127.0.0.1:53").unwrap();
+    });
+}
+
+#[test]
+fn datagrams_sent_in_one_turn_each_get_their_own_result() {
+    // Tasks that send in the same turn of the loop go to the kernel in one
+    // batch; each still gets its own answer: the oversized datagram fails
+    // alone, the others arrive.
+    giong::block_on(async {
+        let a = Rc::new(socket().0);
+        let (b, b_addr) = socket();
+        let senders: Vec<_> = (0..8u32)
+            .map(|i| {
+                let a = a.clone();
+                giong::spawn(async move {
+                    let buf = if i == 3 {
+                        vec![0u8; 70_000]
+                    } else {
+                        i.to_be_bytes().to_vec()
+                    };
+                    let len = buf.len();
+                    (i, len, a.send_to(buf, b_addr).await.0)
+                })
+            })
+            .collect();
+        for s in senders {
+            let (i, len, res) = s.await.unwrap();
+            if i == 3 {
+                let e = res.expect_err("a 70 000-byte datagram cannot be sent");
+                assert_eq!(e.raw_os_error(), Some(libc::EMSGSIZE));
+            } else {
+                assert_eq!(res.unwrap(), len);
+            }
+        }
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let got = timeout(Duration::from_secs(5), b.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            seen.push(u32::from_be_bytes(got[..].try_into().unwrap()));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, [0, 1, 2, 4, 5, 6, 7]);
+    });
+}
+
+#[test]
+fn a_send_dropped_before_the_end_of_the_turn_is_not_sent() {
+    // The datagram waits in the worker's queue while another task is
+    // runnable; dropping the send takes it out of the queue.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let busy = giong::spawn(async {
+            for _ in 0..4 {
+                giong::yield_now().await;
+            }
+        });
+        {
+            let mut send = std::pin::pin!(a.send_to(b"dropped".to_vec(), b_addr));
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(polled, "with another task runnable the send waits");
+        }
+        busy.await.unwrap();
+        a.send_to(b"kept".to_vec(), b_addr).await.0.unwrap();
+        let got = timeout(Duration::from_secs(5), b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got[..], b"kept");
+    });
+}
+
+#[test]
+fn one_task_sends_in_order_while_others_run() {
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let stop = Rc::new(std::cell::Cell::new(false));
+        let spin = {
+            let stop = stop.clone();
+            giong::spawn(async move {
+                while !stop.get() {
+                    giong::yield_now().await;
+                }
+            })
+        };
+        for i in 0..200u32 {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        stop.set(true);
+        spin.await.unwrap();
+        for i in 0..200u32 {
+            let got = timeout(Duration::from_secs(5), b.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(u32::from_be_bytes(got[..].try_into().unwrap()), i);
+        }
+    });
+}
+
+#[test]
+fn a_busy_socket_that_goes_quiet_still_wakes_its_receiver() {
+    // On epoll a socket that has received many datagrams leaves the epoll
+    // set; it must come back when a task waits on it again.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        for round in 0..3u32 {
+            for i in 0..300u32 {
+                a.send_to((round * 1000 + i).to_be_bytes().to_vec(), b_addr)
+                    .await
+                    .0
+                    .unwrap();
+                if i % 50 == 49 {
+                    // Leave room in the socket's receive buffer.
+                    for _ in 0..50 {
+                        timeout(Duration::from_secs(5), b.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+            }
+            // Quiet, then one more datagram from another task while the
+            // receiver is already waiting.
+            let late = giong::spawn({
+                async move {
+                    sleep(Duration::from_millis(30)).await;
+                    let (c, _) = socket();
+                    c.send_to(b"late".to_vec(), b_addr).await.0.unwrap();
+                }
+            });
+            let got = timeout(Duration::from_secs(5), b.recv())
+                .await
+                .expect("a quiet socket did not wake its receiver")
+                .unwrap();
+            assert_eq!(&got[..], b"late");
+            late.await.unwrap();
+        }
     });
 }

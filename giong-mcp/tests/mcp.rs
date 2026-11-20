@@ -4,7 +4,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -183,7 +183,8 @@ fn with_service(cfg: Config, f: impl FnOnce(SocketAddr, giong::Handle) + Send + 
     rt.run(|_| async {
         // A pool-like source on every worker.
         let pool = Rc::new(TestPool);
-        observe::register_rc(&pool);
+        let source: Weak<dyn observe::Source> = Rc::downgrade(&pool) as _;
+        observe::register(source);
         giong::shutdown_signal().await;
         drop(pool);
     })
@@ -833,7 +834,8 @@ fn a_panicking_source_is_not_a_stopped_worker() {
         let (registered, done) = mpsc::channel();
         let task = handle.spawn_on(1, move || async move {
             let pool = Rc::new(PanickingPool);
-            observe::register_rc(&pool);
+            let source: Weak<dyn observe::Source> = Rc::downgrade(&pool) as _;
+            observe::register(source);
             let _ = registered.send(());
             giong::time::sleep(Duration::from_secs(60)).await;
             drop(pool);

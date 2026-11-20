@@ -1,0 +1,2 @@
+giong-http: GIONG-E1120 refused 1 request(s) on this worker: the requests it receives already hold 67108864 bytes, its max_buffered_request_bytes; see docs/errors/E1120.md
+giong-http: GIONG-E1120 refused 1366 request(s) on this worker: the requests it receives already hold 67108864 bytes, its max_buffered_request_bytes; see docs/errors/E1120.md
