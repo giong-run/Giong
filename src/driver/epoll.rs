@@ -701,6 +701,7 @@ impl Epoll {
         key: usize,
         data: Option<Box<dyn Any>>,
         closes_result: bool,
+        finish: bool,
     ) {
         match self.ops.get_mut(key) {
             Some(EOp::Blocking {
@@ -709,8 +710,11 @@ impl Epoll {
                 ..
             }) => {
                 // The thread may be using the resources: keep them until it
-                // reports. A job that has not started yet skips its call.
-                cancel.cancel();
+                // reports. A job that has not started yet skips its call,
+                // unless it must run to the end (a close).
+                if !finish {
+                    cancel.cancel();
+                }
                 *state = Lifecycle::Ignored {
                     data,
                     closes_result,

@@ -148,6 +148,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- A `File::close` whose future was dropped after it was first polled could leave the
+  descriptor open with nobody owning it: on the epoll driver when no blocking thread had
+  started the close yet, and on io_uring when the kernel had handed it to a worker thread
+  (network filesystems, FUSE). The close is no longer cancelled; it runs to the end and
+  only its result is lost.
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
