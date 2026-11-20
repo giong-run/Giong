@@ -1077,6 +1077,24 @@ impl Uring {
         MultiPoll::Pending
     }
 
+    /// Cancels multishot operation `key` if it is in flight. Its last
+    /// completion wakes the reader, whose poll then arms it again; what the
+    /// kernel completed before the cancellation stays queued, in order.
+    pub(crate) fn restart_multi(&mut self, key: usize) {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            return;
+        };
+        if !m.armed || m.pausing {
+            return;
+        }
+        m.pausing = true;
+        self.push(
+            opcode::AsyncCancel::new(key as u64)
+                .build()
+                .user_data(UD_IGNORE),
+        );
+    }
+
     /// Called when the owner of a multishot operation (listener, stream) goes away.
     pub(crate) fn drop_multi(&mut self, key: usize) {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {

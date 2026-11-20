@@ -213,6 +213,55 @@ fn works_with_the_standard_library_on_the_other_side() {
     client.join().unwrap();
 }
 
+/// Linux 6.18 (seen on 6.18.44 and 6.18.63, not on 6.12.117) leaves a
+/// multishot receive on a Unix socket waiting when the last data arrived
+/// together with the peer's `shutdown(Write)` and more than 32 buffers of it
+/// were unread: the end of the stream was never reported, and this reader
+/// hung until the peer closed.
+#[test]
+fn the_end_of_the_stream_is_seen_after_data_that_was_waiting() {
+    const BUFFER: usize = 4096;
+    giong::Builder::new()
+        .recv_buffers(512, BUFFER)
+        .block_on(async {
+            // A first transfer, so that the worker keeps enough buffers with
+            // the kernel for the second one to be received in one go.
+            let (mut peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+            let warm_up = payload(4 << 20, 12);
+            let sent = warm_up.clone();
+            let writer = std::thread::spawn(move || {
+                peer.write_all(&sent).unwrap();
+            });
+            let stream = UnixStream::from_std(ours);
+            assert!(recv_exact(&stream, warm_up.len()).await == warm_up);
+            assert!(stream.recv().await.unwrap().is_empty());
+            writer.join().unwrap();
+
+            // More buffers of data than the kernel receives in one pass,
+            // little enough to wait in a socket nobody reads yet.
+            let data = payload(40 * BUFFER, 11);
+            let (mut peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.write_all(&data).unwrap();
+            peer.shutdown(Shutdown::Write).unwrap();
+            let stream = UnixStream::from_std(ours);
+            let mut received = Vec::new();
+            loop {
+                let piece = timeout(Duration::from_secs(10), stream.recv())
+                    .await
+                    .expect("the end of the stream was not reported")
+                    .unwrap();
+                if piece.is_empty() {
+                    break;
+                }
+                received.extend_from_slice(&piece);
+            }
+            assert!(received == data);
+            // Open until here: closing it would have woken the receive.
+            drop(peer);
+        })
+        .unwrap();
+}
+
 #[test]
 fn many_connections_at_once() {
     let path = SocketPath::new("many");
