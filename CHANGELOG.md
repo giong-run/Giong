@@ -113,8 +113,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   streams do, instead of being copied into the buffer first; what the socket cannot take
   at once is still buffered. `bench/compat.sh` (raw data in `bench/results/compat/`): CPU
   per KiB sent 378 ns against 400 for 0.8.0's `Compat`, and within 2–9% of Tokio over two
-  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged: 30% more CPU per byte than Tokio
-  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive.
+  sessions (0.8.0's measured 25% above it the same morning). Receiving is unchanged by it: 30% more CPU per byte than Tokio
+  with `read`, 17% with `AsyncBufRead`, most of it in giong's own receive; 19% and 14% with
+  the 16 KiB receive buffers below, where `Compat` sends at 6% less CPU per KiB than Tokio.
 - **giong-tls** (**behaviour change**): `TlsStream::shutdown` returns `Ok` when the
   `close_notify` cannot be sent because the peer has closed its socket already (`EPIPE`,
   `ECONNRESET`): the sending direction is closed either way and nobody is left to tell.
@@ -178,6 +179,52 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   On bare metal (`post-soak/udp-udp-epoll-*`, as above) the margins are small: with 16 tasks
   921,000 on epoll and 902,000 on io_uring against Tokio's 870,000, ahead in every round;
   with one task 893,000 and 876,000 against 863,000, a tie within the noise between rounds.
+
+- **runtime**, **sync**, **time**, **fs**, **net**: the core of the runtime is faster than
+  Tokio's in every workload of the new `bench/core.sh`, which runs the same code on giong,
+  Tokio (current-thread, `LocalSet` and multi-thread), monoio, glommio, compio and smol.
+  Medians of 5 rounds on the 4 vCPU cloud VM, ns per operation, io_uring
+  (`bench/results/core/vm/`): spawning and joining a task 92 (184 before; Tokio 174 to 226),
+  a thread outside the runtime feeding a task over `mpsc` 64 (194; Tokio 155 to 167), one
+  task feeding another 31 (40; Tokio 58 to 62), a chain of 1,000 tasks passing a token 220
+  (270; Tokio 289), a task sleeping once among 100,000 688 (748; Tokio 886 to 935), a
+  loopback TCP round trip with both ends on one thread 4,650 (4,930; Tokio 5,230). On
+  epoll, two tasks bouncing a value over channels take 222 instead of 531 (Tokio 481); the
+  TCP round trip there is level with Tokio's (5,304 against 5,231, the same system calls).
+  monoio and glommio stay ahead on spawning and on their channels, which only work within
+  one thread; giong's channels also carry values between threads. Files (`bench/fs.sh`,
+  page cache, one core, `bench/results/fs/`): 4 KiB at a random offset 1,328,000 reads a
+  second with one task (981,000 before; blocking `std` 1,313,000, monoio 968,000, compio
+  892,000, Tokio 163,000), whole 4 KiB files 437,000 a second (185,000; monoio 375,000,
+  Tokio 135,000) and 517,000 with 64 tasks (317,000; monoio 338,000). The changes:
+  - a task and its join state are one allocation, the waker a poll lends the task holds no
+    reference count of its own, and a finished task's waker state serves the next spawn when
+    no waker of it is left;
+  - the unbounded `mpsc` receiver takes everything queued under one lock when its own values
+    run out, instead of locking once per value;
+  - sleeps polled in the same turn of the event loop share one clock reading; a deadline
+    within a millisecond of it reads the clock again, so a zero timeout still ends at once;
+  - `File::read_at` (and so `fs::read`) first tries `preadv2` with `RWF_NOWAIT`, which copies
+    from the page cache without waiting for the disk, and goes to the driver only when that
+    returns nothing; `fs::read` takes its size hint from `fstat`;
+  - on io_uring, a TCP or Unix stream send by the only runnable task goes out with
+    `send(MSG_DONTWAIT)` instead of waiting a turn of the loop for its completion (with other
+    tasks runnable, sends still reach the kernel together through the ring, and no send can
+    overtake one still in the ring);
+  - on epoll, a busy worker looks for I/O every 61 polls, as Tokio does, instead of making
+    an `epoll_wait` call at every turn of the loop.
+
+- **runtime**: the default receive buffers are 16 KiB instead of 8 KiB
+  (`Builder::recv_buffers(512, 16 * 1024)`). Each receive brings at most one buffer, so a
+  bulk receive takes half the receives: giong's own `recv` of a 2 GiB stream spends 124 ns
+  of CPU per KiB instead of 142 (Tokio 120; medians of 7 interleaved rounds, `bench/compat`).
+  The memory a worker reserves for its pool doubles, to 8 MiB of address space, of which it
+  touches only the buffers it lends (16 at first): measured with `bench/memory.sh` (10,000
+  connections, 4 workers), memory per open, idle and pending connection and the peak under
+  load did not change. On kernels without packed buffers (before 6.12), where every stream
+  receive takes a whole buffer, a buffer the application holds now pins 16 KiB instead of
+  8. A datagram received with `recv_from` can now carry up to 16 KiB − 44 bytes before it
+  is cut off.
 
 ### Deprecated
 

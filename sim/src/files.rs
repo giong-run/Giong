@@ -191,6 +191,34 @@ pub(crate) unsafe fn pread(fd: c_int, buf: *mut c_void, len: size_t, off: i64) -
     r
 }
 
+/// Gióng tries `preadv2(RWF_NOWAIT)` before a read goes to the driver
+/// (`driver::read_cached`). Inside the simulation it always finds nothing
+/// cached, so every read takes the driver's path, where the disk's latency
+/// and faults apply.
+pub(crate) unsafe fn preadv2(
+    fd: c_int,
+    iov: *const libc::iovec,
+    count: c_int,
+    off: i64,
+    flags: c_int,
+) -> ssize_t {
+    match enter() {
+        Some((g, _)) => {
+            drop(g);
+            fail(libc::EAGAIN) as ssize_t
+        }
+        None => libc_ret(syscall6(
+            libc::SYS_preadv2,
+            fd as i64,
+            iov as i64,
+            count as i64,
+            off,
+            0,
+            flags as i64,
+        )) as ssize_t,
+    }
+}
+
 pub(crate) unsafe fn pwrite(fd: c_int, buf: *const c_void, len: size_t, off: i64) -> ssize_t {
     let real = |len: size_t| {
         libc_ret(syscall6(

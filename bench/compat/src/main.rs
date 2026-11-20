@@ -18,7 +18,7 @@
 //! * `rr`: `ROUNDS` (default 50000) round trips of a 64-byte message, which
 //!   the peer echoes; TCP_NODELAY on both ends for every variant.
 //!
-//! `RECV_BUF_KIB` sets the size of giong's receive buffers (default 8 KiB).
+//! `RECV_BUF_KIB` sets the size of giong's receive buffers (default: giong's, 16 KiB).
 //! `EXTERNAL_PEER=1` runs the other end as a child process instead of a
 //! thread, so that the measured side can run alone under valgrind:
 //!

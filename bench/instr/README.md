@@ -44,29 +44,47 @@ instructions per request.
 
 | case | one operation | io_uring | epoll |
 |---|---|---:|---:|
-| `spawn` | spawn a task that returns at once and await it | 1,411 | 1,541 |
-| `yield` | `yield_now`: one trip through the run queue | 489 | 554 |
+| `spawn` | spawn a task that returns at once and await it | 1,405 | 1,124 |
+| `yield` | `yield_now`: one trip through the run queue | 501 | 361 |
 | `oneshot` | a oneshot channel: create, send, receive | 280 | 280 |
-| `channel` | a round trip between two tasks over two bounded channels | 1,732 | 1,862 |
+| `channel` | a round trip between two tasks over two bounded channels | 1,764 | 1,484 |
 | `timeout` | a timeout around a future that is ready at once | 100 | 100 |
-| `tcp-echo` | 64 bytes to an echo task and back over TCP | 4,882 | 4,320 |
-| `udp-echo` | a 64-byte datagram to an echo task and back | 4,119 | 4,805 |
-| `file-read` | read 4 KiB at an offset of an open file (page cache) | 1,489 | 2,637 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 11,144 | 10,053 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 32,396 | 31,202 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 45,276 | 43,962 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 377,292 | 376,134 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 44,604 | 43,090 |
-| `web` | a giong-web router with a path parameter, raw client | 15,115 | 14,002 |
-| `redis-get` | giong-redis `GET` against a fake server | 9,570 | 9,090 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 11,497 | 11,033 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 15,432 | 14,952 |
+| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,624 | 4,510 |
+| `udp-echo` | a 64-byte datagram to an echo task and back | 4,138 | 4,832 |
+| `file-read` | read 4 KiB at an offset of an open file (page cache) | 196 | 248 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,416 | 10,276 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 30,512 | 31,556 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 43,059 | 43,956 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 369,516 | 370,312 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 42,596 | 43,620 |
+| `web` | a giong-web router with a path parameter, raw client | 13,381 | 14,254 |
+| `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,224 | 10,838 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 14,137 | 14,751 |
 
 `udp-echo` went down with the UDP changes of 0.9 (#139, #142): 5,358 to 4,137 on io_uring and
 5,031 to 4,783 on epoll, counted with glibc's malloc as all counts were until 2026-11-20, with
 one allocation per echo instead of two. On io_uring that includes the check that keeps a direct
 send from overtaking queued submissions (Linux 6.0 lost the reply to a datagram sent past a
 queued cancellation).
+
+The core changes of #145, measured against the counts before it with the same allocator:
+`file-read` 1,489 to 196 on io_uring and 2,637 to 248 on epoll (a read the page
+cache can serve is made within the call, with `preadv2(RWF_NOWAIT)`); `tcp-echo`
+4,882 to 3,624 on io_uring (a send made at once when nothing else is runnable or queued); on
+io_uring `http1` 15.6% fewer, `redis-get`, `web` and `postgres-query` 11% to 13%,
+`mysql-query` 8.2%, `http1-client`, `h2` and `https` 5% to 6%, `h2-streams` 2.1%; on epoll
+`spawn` 1,541 to 1,124, `yield` 554 to 361 and `channel` 1,862 to 1,484, and the database
+cases and `h2-streams` 1.2% to 1.9% fewer. A task is one allocation instead of three; with
+the size classes that is 6 instructions of `spawn` on io_uring (1,411 to 1,405). Up:
+`yield` 489 to 501 and `channel` 1,732 to 1,764 on io_uring, `udp-echo` +0.5% and +0.6%;
+on epoll `tcp-echo` 4,320 to 4,510, `http1` +2.2%, `web` +1.8%, `http1-client` +1.2% and
+`https` +0.8%. On epoll a busy worker now looks for I/O every 61 polls instead of only when
+its queue runs dry, so a round trip takes more loop turns between `epoll_wait` calls; measured
+in time, the epoll round trip got faster (`bench/core.sh` `tcp-rr` 5,741 to 5,304 ns). Each
+idle connection takes one allocation fewer (two with TLS); the task and its future now share
+one. Its heap grew by 40 to 64 bytes for `idle-http1` and `idle-h2` (1.0% to 2.7%), and moved
+by less than 20 bytes for `idle-https`.
 
 ### The allocator is not counted as glibc's
 

@@ -163,7 +163,9 @@ fn failing_disk_gives_errors_never_wrong_data() {
         short_io: 0.2,
         ..Faults::none()
     }
-    .disk(prefix, 0.02, 0.02, 0.02);
+    // Low enough that some of the 100 runs see no error at all: every file
+    // operation of a run (open, write, sync, fstat, read) is a chance.
+    .disk(prefix, 0.01, 0.01, 0.02);
     let (mut ok, mut failed) = (0, 0);
     for r in giong_sim::sweep(0..seeds, faults, |_| {
         let (o, f) = scenario(&dir);

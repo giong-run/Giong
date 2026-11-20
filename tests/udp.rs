@@ -226,21 +226,21 @@ fn long_datagrams_are_truncated_by_recv_from_and_whole_with_read_from() {
         let (owned, owned_addr) = socket();
         let data = payload(20_000, 3);
 
-        // The pool's buffers are 8 KiB by default, 44 bytes of which hold the
+        // The pool's buffers are 16 KiB by default, 44 bytes of which hold the
         // sender's address.
         a.send_to(data.clone(), pooled_addr).await.0.unwrap();
         let (got, from) = pooled.recv_from().await.unwrap();
         assert!(got.is_truncated());
-        assert_eq!((got.len(), from), (8192 - 44, a_addr));
+        assert_eq!((got.len(), from), (16384 - 44, a_addr));
         assert!(*got == data[..got.len()]);
         drop(got);
         // The longest datagram that fits is not truncated.
-        a.send_to(data[..8192 - 44].to_vec(), pooled_addr)
+        a.send_to(data[..16384 - 44].to_vec(), pooled_addr)
             .await
             .0
             .unwrap();
         let got = pooled.recv().await.unwrap();
-        assert!(!got.is_truncated() && *got == data[..8192 - 44]);
+        assert!(!got.is_truncated() && *got == data[..16384 - 44]);
 
         // A buffer of one's own takes the whole datagram.
         a.send_to(data.clone(), owned_addr).await.0.unwrap();

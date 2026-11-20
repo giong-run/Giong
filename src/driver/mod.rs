@@ -36,7 +36,7 @@ use std::time::Duration;
 use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 
-pub(crate) use epoll::refill_budget;
+pub(crate) use epoll::{refill_budget, spend_budget};
 
 /// Which I/O driver a worker uses: io_uring, the default, or epoll where
 /// io_uring is not available (see [`Builder::driver`](crate::Builder::driver)).
@@ -580,6 +580,34 @@ fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
             e => return Some(-e),
         }
     }
+}
+
+/// Reads from a regular file at once when the bytes are in the page cache:
+/// `preadv2` with `RWF_NOWAIT`, which copies what is cached and returns
+/// `EAGAIN` instead of waiting for the disk. A cached read then costs one
+/// system call, as with blocking I/O, instead of a trip through io_uring (or
+/// epoll's blocking threads). `None` when the caller must use the driver:
+/// nothing is cached, the file system cannot do it, the call failed in any
+/// other way (the driver's operation then reports the error as before), or
+/// the task's budget is spent, so a loop over cached reads still yields.
+pub(crate) fn read_cached(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Option<i32> {
+    // Miri cannot run `preadv2`: every read goes through the driver there.
+    if cfg!(miri) || len == 0 || offset > i64::MAX as u64 || !epoll::spend_budget() {
+        return None;
+    }
+    let iov = libc::iovec {
+        iov_base: buf.cast(),
+        iov_len: len as usize,
+    };
+    // SAFETY: the caller hands a buffer valid for `len` bytes; the call does
+    // not block (RWF_NOWAIT).
+    let res = unsafe { libc::preadv2(fd, &iov, 1, offset as libc::off_t, libc::RWF_NOWAIT) };
+    if res >= 0 {
+        return Some(res as i32);
+    }
+    // The driver's operation takes its own unit of the budget.
+    epoll::give_back_budget();
+    None
 }
 
 /// `GIONG_DRIVER` when the builder did not choose: `None` if unset or

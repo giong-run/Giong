@@ -325,7 +325,7 @@ Five things to remember:
    a pipe) are not: one that is dropped mid-flight can still take data that arrives before
    the kernel has processed the cancellation.
 3. A datagram received with `recv_from()` lives in a pool buffer, so its longest payload is
-   the buffer size minus 44 bytes (8 KiB − 44 by default). Longer ones are cut off and
+   the buffer size minus 44 bytes (16 KiB − 44 by default). Longer ones are cut off and
    `is_truncated()` says so; raise `.recv_buffers(count, size)` or use `read_from()` with a
    buffer of your own. Do not mix the two kinds on one socket.
 4. A `File` has no cursor: every read and write names its offset. Opened with
@@ -364,24 +364,26 @@ For each job a service has, try these in order and take the first that fits:
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 3.3 times tokio-postgres + deadpool at its best on one row by key, 2.5 times on 100 rows; 7–9% behind tokio-postgres on one shared connection ([PostgreSQL](#postgresql)) |
 | MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 5.1 times SQLx at its best on one row by key, 3.7 times on 100 rows ([MySQL](#mysql)) |
 | Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.1 to 1.8 times redis-rs on small commands, 1.25 to 2.5 times on 8 KiB values, at half its CPU per command or less ([Redis](#redis)) |
-| Files | `giong::fs` | `tokio::fs` | 5.5 to 8 times Tokio on reads at an offset, 1.5 to 2.5 times on whole small files ([File I/O](#file-io)) |
-| Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | Not measured |
-| Timers, channels | `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::time`, `tokio::sync::mpsc` | Not measured on their own |
+| Files | `giong::fs` | `tokio::fs` | 8 times Tokio on reads at an offset, 3.2 to 4.1 times on whole small files ([File I/O](#file-io)) |
+| Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | `localhost` from `/etc/hosts`: 171 ns against Tokio's 28.6 µs ([Core primitives](#core-primitives)); DNS over the network not measured |
+| Tasks, timers, channels | `giong::spawn`, `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::spawn`, `tokio::time`, `tokio::sync` | 1.3 to 2.6 times Tokio; Monoio and Glommio are ahead on spawning and channels within one thread ([Core primitives](#core-primitives)) |
 | Runtime state for an AI agent | [`giong-mcp`](giong-mcp/README.md) | | |
 
 Where a giong crate is not ahead, the sections linked above say so: over one shared
 connection giong-postgres is 7–9% below tokio-postgres at the median, a blocking `std`
-read of a cached file beats every async one, and TLS handshakes cost the same on both once
-axum's rustls is set to the cipher suite giong-tls prefers.
+read of a whole small cached file beats every async one, Monoio and Glommio spawn tasks and
+pass values within one thread faster, and TLS handshakes cost the same on both once axum's
+rustls is set to the cipher suite giong-tls prefers.
 
 What `Compat` adds is measured on its own, on one TCP stream with no protocol on top
 ([giong-compat](giong-compat/README.md#what-it-costs)): large writes go straight from the
-caller's memory to the socket, within 2–9% of Tokio's CPU per byte sent (until 0.8.0 they
-were copied first: 25% above Tokio in a session the same day); against giong's own `recv`, 6–16% more CPU per byte read
-with `read`, and no measurable difference through `AsyncBufRead`; 1–5% more CPU per small
-request and reply. Receiving costs more CPU per byte than Tokio's own (17% through
-`AsyncBufRead`, 30% with `read`, in the latest session), most of it in giong's own receive
-into 8 KiB pool buffers.
+caller's memory to the socket, from 9% above to 6% below Tokio's CPU per byte sent over the
+last two sessions (until 0.8.0 they were copied first: 25% above Tokio in a session the same
+day); against giong's own `recv`, 6–16% more CPU per byte read with `read`, and no measurable
+difference through `AsyncBufRead`; up to 5% more CPU per small request and reply, and level
+with Tokio there. Receiving costs more CPU per byte than Tokio's own (14% through
+`AsyncBufRead`, 19% with `read`, in the latest session, with 16 KiB receive buffers; 17% and
+30% with 8 KiB), most of it in giong's own receive (12% above Tokio).
 A protocol crate over `Compat` brings its own design on top of that, and none has been
 measured against the giong crate for the same protocol. The reason to prefer the giong
 crate is its design (step 1) and the gaps in the table, measured against these Tokio
@@ -636,7 +638,7 @@ others are from 0.4's run on the same kind of VM.
   1 MiB (it rose by 40 MiB when every worker lent all 512 buffers at once).
 - **Small reads share a buffer.** On Linux 6.12 and newer the kernel fills a receive
   buffer piece by piece (`IOU_PBUF_RING_INC`), so a hundred connections that each send a
-  short request use one or two 8 KiB buffers rather than a hundred. Before, each receive
+  short request use one or two buffers rather than a hundred. Before, each receive
   took a whole buffer, and under load a worker cycled through all it had lent: with 20
   workers and 5,000 busy connections giong-http peaked 50 MiB above idle, now 23 MiB
   (epoll 15 MiB, raw Tokio 64 MiB, Axum 124 MiB, Go 184 MiB; `WORKERS=20
@@ -934,27 +936,60 @@ on giong-web (22.9 against 18.5 ms).
 ### File I/O
 
 `bench/fs.sh`: 200,000 operations per measurement, five rounds, all data in the page cache,
-so this measures what one operation costs, not the disk. giong and `std` use one thread.
-Tokio hands every file operation to its blocking thread pool, so it is measured pinned to
-one core and free to use all four.
+so this measures what one operation costs, not the disk. giong, Monoio, compio and `std` use
+one thread. Tokio hands every file operation to its blocking thread pool, so it is measured
+pinned to one core and free to use all four. Raw data: [bench/results/fs](bench/results/fs/summary.txt).
 
 | Operations per second | Whole 4 KiB file, 1 task | 64 tasks | 4 KiB at a random offset, 1 task | 64 tasks |
 |---|---|---|---|---|
-| `std` (blocking) | 556k | | 1.40M | |
-| **giong** | **227k** (201–243k) | **292k** | **1.01M** (0.87–1.15M) | **1.26M** |
-| Tokio, one core | 147k | 116k | 184k | 156k |
-| Tokio, 4 cores | 29k | 81k | 33k | 74k |
+| `std` (blocking) | 567k | | 1.31M | |
+| **giong** | **437k** (395–445k) | **517k** | **1.33M** (1.28–1.35M) | **1.30M** |
+| Monoio 0.2 | 375k | 338k | 968k | 1.23M |
+| compio 0.19 | 141k | 130k | 892k | 1.10M |
+| Tokio, one core | 135k | 125k | 163k | 157k |
+| Tokio, 4 cores | 33k | 98k | 38k | 96k |
 
-- **Reads at an offset: 5.5 times Tokio with one task and 8 times with 64.** On Tokio every
-  read is a hand-off to another thread and back; on giong it is one entry in a batch.
-- **Whole small files (open, statx, read, close): 1.5 to 2.5 times Tokio.**
-- **A blocking `std` call is faster for cached data** (28% for reads at an offset, 2.4
-  times for whole files). What giong buys is a worker that never waits when the data is
-  not cached, which this benchmark does not measure.
+- **Reads at an offset: 8 times Tokio, level with a blocking `std` call.** giong first copies
+  from the page cache with `preadv2(RWF_NOWAIT)`, one system call that never waits for the
+  disk, and goes through the ring only when the data is not cached. On Tokio every read is a
+  hand-off to another thread and back.
+- **Whole small files (open, fstat, read, close): 3.2 to 4.1 times Tokio, 1.2 to 1.5 times
+  Monoio.**
+- **A blocking `std` call is still faster for whole small files** (567k against 437k): opening
+  and closing go through the ring. What giong buys is a worker that never waits when the data
+  is not cached, which this benchmark does not measure.
 
-The HTTPS and file numbers were measured on 2026-11-11, on the same machine, with the
-code as it was just before the busy-poll mode was merged in; the merge did not touch the
-TLS, HTTP or file code. Everything above them was measured again on the merged code.
+Measured on 2026-11-17 on the same machine; the run before the page-cache path is in
+[bench/results/fs/before-core-pr](bench/results/fs/before-core-pr/summary.txt).
+
+### Core primitives
+
+`bench/core.sh 5`: tasks, channels, timers and loopback TCP against Tokio (current thread,
+`LocalSet`, multi-thread), Monoio, Glommio, compio and smol, each on its own scheduler and
+channels, pinned to two cores. Median nanoseconds per operation over five rounds, lower is
+better; giong on io_uring (epoll in parentheses). Method, every runtime and the raw data:
+[bench/results/core/vm](bench/results/core/vm/README.md).
+
+| ns per operation | giong | Tokio (best) | Monoio | Glommio | compio | smol |
+|---|---|---|---|---|---|---|
+| spawn and join a task | **91.5** (93.3) | 174 | 59.1 | 91.5 | 89.9 | 272 |
+| yield | **23.7** (28.7) | 62.3 | 49.5 | 45.0 | 30.5 | 138 |
+| unbounded channel, one producer | **30.9** (24.3) | 57.9 | 13.8 | 23.4 | 118 | 109 |
+| oneshot answered by a new task | **293** (276) | 527 | 218 | 208 | 415 | 1,793 |
+| 1,000 tasks pass a token | **220** (224) | 289 | 91.8 | 343 | 585 | 484 |
+| 100,000 sleeping tasks, per task | **688** (736) | 886 | 1,497 | 1,328 | 951 | 1,231 |
+| a plain thread feeds a task | **64.0** (68.9) | 155 | 185 | 170 | 223 | 211 |
+| one byte back and forth over TCP | **4,652** (5,304) | 5,231 | 5,181 | 13,517 | 5,257 | 8,851 |
+| resolve `localhost` | **171** (186) | 28,564 | | | | 28,643 |
+
+- **giong is ahead of every Tokio flavour in every row**, except TCP round trips on epoll,
+  where both make the same system calls and are level within noise.
+- **Monoio and Glommio are ahead on spawning, channels and oneshots.** Their tasks and channels
+  only work within one thread, with no atomic operations; giong's carry values between threads
+  and workers as well (the "plain thread" row, where giong is 2.4 to 3.5 times faster than every
+  other runtime).
+- `localhost` is answered from giong's cache of `/etc/hosts`; Tokio and smol call
+  `getaddrinfo` on a blocking thread every time. Monoio, Glommio and compio have no resolver.
 
 ### UDP
 
@@ -1009,9 +1044,9 @@ giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for e
   (August and March 2024); their main branches may differ.
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
-`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
-`bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh` and
-`bench/udp-echo.sh`; two cores with
+`bench/tls.sh`, `bench/fs.sh`, `bench/core.sh`, `bench/postgres.sh`, `bench/mysql.sh`,
+`bench/redis.sh`, `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh`
+and `bench/udp-echo.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per

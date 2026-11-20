@@ -388,6 +388,57 @@ fn unbounded_mpsc_closes_when_the_last_sender_goes_and_drops_values_with_the_rec
     });
 }
 
+/// The receiver takes the queue in batches: values from threads outside
+/// the runtime and from tasks still arrive whole, each sender's in order,
+/// with `try_recv` and `recv` mixed.
+#[test]
+fn batched_receives_keep_each_senders_order() {
+    giong::block_on(async {
+        let (tx, mut rx) = mpsc::unbounded::<(u32, u32)>();
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20_000 {
+                        tx.send((t, i)).unwrap();
+                    }
+                })
+            })
+            .collect();
+        let local = tx.clone();
+        giong::spawn(async move {
+            for i in 0..20_000 {
+                local.send((4, i)).unwrap();
+                if i % 100 == 0 {
+                    giong::yield_now().await;
+                }
+            }
+        });
+        drop(tx);
+        let mut next = [0u32; 5];
+        let mut n = 0;
+        loop {
+            let item = if n % 3 == 0 {
+                match rx.try_recv() {
+                    Ok(v) => Some(v),
+                    Err(mpsc::TryRecvError::Empty) => rx.recv().await,
+                    Err(mpsc::TryRecvError::Closed) => None,
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some((s, i)) = item else { break };
+            assert_eq!(i, next[s as usize], "sender {s} out of order");
+            next[s as usize] += 1;
+            n += 1;
+        }
+        assert_eq!(next, [20_000; 5]);
+        for t in threads {
+            t.join().unwrap();
+        }
+    });
+}
+
 #[test]
 fn the_old_names_of_unbounded_and_its_halves_still_work() {
     giong::block_on(async {

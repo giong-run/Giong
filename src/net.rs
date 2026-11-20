@@ -253,12 +253,48 @@ pub(crate) struct StreamSocket {
     /// Set by the driver when the kernel copied a zero-copy send after all;
     /// made at the first zero-copy send.
     zero_copy_copied: OnceCell<Rc<Cell<bool>>>,
+    /// Sends of this socket waiting in the driver (see [`SendInFlight`]).
+    sends_in_flight: Cell<u32>,
+    /// A send was dropped before its result: it may still go out later, so
+    /// a send made directly could overtake it. Never cleared.
+    send_abandoned: Cell<bool>,
     /// A Unix socket (see [`end_was_missed`](Self::end_was_missed)).
     unix: Cell<bool>,
     /// Data was taken from the multishot receive since the socket was last
     /// checked for an end of stream the kernel did not report.
     check_end: Cell<bool>,
     _not_send: PhantomData<*const ()>,
+}
+
+/// Counts a send that waits in the driver, so that [`StreamSocket::send_now`]
+/// never sends ahead of it. Dropped before the send's result (a cancelled
+/// write), it marks the socket for good: the kernel may still send those
+/// bytes, and only sends through the driver stay behind them.
+struct SendInFlight<'a> {
+    sock: &'a StreamSocket,
+    done: bool,
+}
+
+impl<'a> SendInFlight<'a> {
+    fn new(sock: &'a StreamSocket) -> Self {
+        sock.sends_in_flight.set(sock.sends_in_flight.get() + 1);
+        Self { sock, done: false }
+    }
+
+    fn finish(mut self) {
+        self.done = true;
+    }
+}
+
+impl Drop for SendInFlight<'_> {
+    fn drop(&mut self) {
+        self.sock
+            .sends_in_flight
+            .set(self.sock.sends_in_flight.get() - 1);
+        if !self.done {
+            self.sock.send_abandoned.set(true);
+        }
+    }
 }
 
 impl StreamSocket {
@@ -269,6 +305,8 @@ impl StreamSocket {
             nonblocking: Cell::new(false),
             zero_copy: Cell::new(true),
             zero_copy_copied: OnceCell::new(),
+            sends_in_flight: Cell::new(0),
+            send_abandoned: Cell::new(false),
             unix: Cell::new(false),
             check_end: Cell::new(false),
             _not_send: PhantomData,
@@ -514,6 +552,7 @@ impl StreamSocket {
             flags: libc::MSG_NOSIGNAL as u32,
             zero_copy: hold.is_some(),
         };
+        let in_flight = SendInFlight::new(self);
         // The header, the iovec array (on the heap) and the buffers all stay
         // where they are while the kernel reads them, even if this future is
         // dropped: `Op` keeps them until the operation completes, and the
@@ -527,6 +566,7 @@ impl StreamSocket {
         // moves with the tuple. The hold owns what a zero-copy send reads
         // after its result.
         let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
+        in_flight.finish();
         if res < 0 {
             (Err(os_err(res)), bufs)
         } else {
@@ -616,6 +656,7 @@ impl StreamSocket {
             flags: libc::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
+        let in_flight = SendInFlight::new(self);
         // The header, the iovec and both buffers stay where they are until the
         // kernel is done with them, even if this future is dropped: `Op`
         // keeps them until the operation completes.
@@ -623,6 +664,7 @@ impl StreamSocket {
         // buffers are `IoBuf`s, whose bytes stay put when they move.
         let (res, _, (buf, control, _iov, _msg)) =
             unsafe { Op::new(io, (buf, control, iov, msg)) }.await;
+        in_flight.finish();
         if res < 0 {
             (Err(os_err(res)), buf, control)
         } else {
@@ -719,6 +761,17 @@ impl StreamSocket {
         let hold = self.send_hold(&buf, len as usize);
         // SAFETY: `offset <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(offset) };
+        if hold.is_none() {
+            // SAFETY: `ptr` points at `len` initialised bytes of `buf`.
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+            if let Some(res) = self.send_now(bytes) {
+                return if res < 0 {
+                    (Err(os_err(res)), buf)
+                } else {
+                    (Ok(res as usize), buf)
+                };
+            }
+        }
         let io = Io::Send {
             fd: self.sock.as_raw_fd(),
             buf: ptr,
@@ -726,6 +779,7 @@ impl StreamSocket {
             flags: libc::MSG_NOSIGNAL,
             zero_copy: hold.is_some(),
         };
+        let in_flight = SendInFlight::new(self);
         // The hold moves into the send, and a zero-copy send the socket
         // refuses is sent again with a copy by `Op` itself, so that this
         // future, which every write awaits, is the size of a plain send's.
@@ -734,11 +788,40 @@ impl StreamSocket {
         // when it moves. The hold owns what a zero-copy send reads after its
         // result.
         let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
+        in_flight.finish();
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }
+    }
+
+    /// Sends at once, without a turn of the event loop, when this task is the
+    /// only one that can run: the socket's buffer usually has room, and the
+    /// task would otherwise wait for the send's result alone (a request and
+    /// its response then cost one turn each way instead of two). While other
+    /// tasks are runnable, sends go through the driver instead, where those
+    /// of the whole turn reach the kernel together. `None` when the driver
+    /// must take it: other tasks to run, a send of this socket still in the
+    /// driver, operations queued for the kernel that it would overtake, a
+    /// full socket, or the budget spent (see `Driver::try_send`).
+    fn send_now(&self, bytes: &[u8]) -> Option<i32> {
+        if bytes.is_empty() || self.sends_in_flight.get() != 0 || self.send_abandoned.get() {
+            return None;
+        }
+        runtime::with_worker(|w| {
+            if !w.queue.borrow().is_empty() {
+                return None;
+            }
+            let mut driver = w.driver.try_borrow_mut().ok()?;
+            // The epoll driver already sends within the operation's first poll.
+            // `try_send` declines while operations wait for the kernel: a send
+            // made directly would overtake them, cancellations included.
+            if driver.kind() != crate::DriverKind::IoUring {
+                return None;
+            }
+            driver.try_send(self.sock.as_raw_fd(), bytes)
+        })
     }
 
     /// What a zero-copy send of `len` bytes of `buf` leaves with the driver,
