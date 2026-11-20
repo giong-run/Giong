@@ -556,6 +556,69 @@ fn data_sent_with_the_last_handshake_flight_is_not_lost() {
     }
 }
 
+#[test]
+fn a_key_update_sent_with_the_last_handshake_flight_is_answered() {
+    if !kernel_tls() || !kernel_key_updates() {
+        return;
+    }
+    // The client's Finished, data, a KeyUpdate that asks for the server's
+    // and more data, all in one write: the server's handshake finds them in
+    // the socket together. It must leave everything after the Finished to
+    // the kernel. If rustls took the KeyUpdate, it would change the sending
+    // key and keep the answer for a write it never makes, and the client
+    // could not decrypt what the kernel sends.
+    let pki = pki();
+    let suite = suites::TLS13_AES_128_GCM_SHA256;
+    let acceptor = pki.acceptor(Some(suite), Ktls::Required);
+    let config = Arc::new(pki.client(Some(suite)));
+    let updates = ktls_stats().key_updates;
+    with_server(acceptor, echo, move |addr| {
+        for round in 0..10u8 {
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let mut conn = ClientConnection::new(config.clone(), name).unwrap();
+            while conn.is_handshaking() {
+                while conn.wants_write() {
+                    retry(|| conn.write_tls(&mut sock)).unwrap();
+                }
+                assert!(
+                    retry(|| conn.read_tls(&mut sock)).unwrap() > 0,
+                    "closed in the handshake"
+                );
+                conn.process_new_packets().unwrap();
+            }
+            // The Finished is queued, not sent yet.
+            assert!(conn.wants_write());
+            conn.writer().write_all(&[round; 1000]).unwrap();
+            conn.refresh_traffic_keys().unwrap();
+            conn.writer().write_all(&[round + 100; 1000]).unwrap();
+            let mut flight = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut flight).unwrap();
+            }
+            sock.write_all(&flight).unwrap();
+
+            let mut back = Vec::new();
+            while back.len() < 2000 {
+                assert!(
+                    retry(|| conn.read_tls(&mut sock)).unwrap() > 0,
+                    "closed before the echo"
+                );
+                let state = conn.process_new_packets().unwrap();
+                let at = back.len();
+                back.resize(at + state.plaintext_bytes_to_read(), 0);
+                conn.reader().read_exact(&mut back[at..]).unwrap();
+            }
+            assert_eq!(back[..1000], [round; 1000]);
+            assert_eq!(back[1000..], [round + 100; 1000]);
+        }
+    });
+    // Each round: the client's key, and the server's in answer.
+    assert!(ktls_stats().key_updates >= updates + 20);
+}
+
 /// Drives a blocking rustls connection that queues `data` before the
 /// handshake, then expects it echoed back.
 fn eager_peer(mut conn: rustls::Connection, mut sock: std::net::TcpStream, data: &[u8]) {

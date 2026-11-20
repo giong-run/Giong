@@ -1245,6 +1245,10 @@ struct Handshake<'a> {
     /// Application data that arrived before the keys went to the kernel.
     plain: Vec<u8>,
     peer_closed: bool,
+    /// `true` once this side has sent something: from then on the peer may
+    /// hold traffic keys, and a read takes one record at most (see
+    /// [`read_limit`](Self::read_limit)).
+    sent: bool,
 }
 
 struct Done {
@@ -1271,6 +1275,27 @@ impl<'a> Handshake<'a> {
             out: Vec::new(),
             plain: Vec::new(),
             peer_closed: false,
+            sent: false,
+        }
+    }
+
+    /// How much the next read of the handshake may take.
+    ///
+    /// Until this side has sent anything the peer has no keys but the ones
+    /// of its first flight, and a read takes what is there. After that a
+    /// read ends with the record in progress (its header, then its body), so
+    /// that no record after the peer's last handshake record is ever read
+    /// here: it stays in the socket, for the kernel. rustls must not see
+    /// one. It would take a `KeyUpdate` that asks for ours, move to its next
+    /// sending key and keep the answer for its next write, which never
+    /// comes: the kernel would send under a key the peer does not expect.
+    fn read_limit(&self) -> usize {
+        if !self.sent {
+            return MAX_RECORD;
+        }
+        match self.framing.to_boundary() {
+            0 => 5,
+            n => n,
         }
     }
 
@@ -1286,14 +1311,16 @@ impl<'a> Handshake<'a> {
             match step {
                 Step::Again => {}
                 Step::Send => self.send().await?,
-                Step::Read => self.read(MAX_RECORD).await?,
+                Step::Read => self.read(self.read_limit()).await?,
                 Step::Finished => {
-                    // The handshake is over. Bytes left over are the start
-                    // of a record the handshake did not need, or of a
-                    // handshake message spread over records whose next
-                    // record has not arrived: read exactly up to the end of
-                    // that record (or the next one's header), so that the
-                    // kernel starts at a record boundary.
+                    // The handshake is over. Bytes left over came with a
+                    // read made before this side sent anything (see
+                    // `read_limit`): the start of a record the handshake
+                    // did not need, or of a handshake message spread over
+                    // records whose next record has not arrived. Read
+                    // exactly up to the end of that record (or the next
+                    // one's header), so that the kernel starts at a record
+                    // boundary.
                     let need = match self.framing.to_boundary() {
                         _ if self.incoming.is_empty() => break,
                         0 => 5,
@@ -1374,6 +1401,7 @@ impl<'a> Handshake<'a> {
 
     async fn send(&mut self) -> io::Result<()> {
         let out = mem::take(&mut self.out);
+        self.sent = true;
         let (res, mut out) = self.tcp.write_all(out).await;
         res?;
         out.clear();

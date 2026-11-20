@@ -167,6 +167,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   key update and alerts go the same way, and a key update the socket has no room for is
   paid by the next send. `recv` is cancel safe without exception; its documentation said
   otherwise. Found as a rare failure of `recv_is_cancel_safe` under ThreadSanitizer.
+- **giong-tls**: with kernel TLS, a `KeyUpdate` asking for new keys that reached the socket
+  together with the end of the handshake (a peer that renews its keys at once) was never
+  answered, and the peer could not decrypt anything sent to it afterwards. The handshake
+  read whatever had arrived, rustls took the `KeyUpdate`, changed its sending key and kept
+  the answer for a write that never came once the keys went to the kernel. The handshake
+  now reads record by record from the moment this side has sent its first flight, so every
+  record after the peer's last handshake record stays in the socket for the kernel, which
+  answers the key update like any other. A kernel TLS handshake makes a few more small
+  reads for it (two per record of the peer's later flights); handshakes in the process
+  are unchanged.
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
