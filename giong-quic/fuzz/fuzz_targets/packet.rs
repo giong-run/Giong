@@ -1,8 +1,10 @@
 //! The native engine's packet parsing, which every datagram from the
-//! network reaches before any authentication: never panic, and whatever a
-//! header claims stays inside the datagram.
+//! network reaches before any authentication, and the scan of the
+//! ClientHello: never panic, and whatever a header claims stays inside the
+//! datagram.
 #![no_main]
 
+use giong_quic::native::hello::{self, Params};
 use giong_quic::native::{cid, packet, varint};
 use libfuzzer_sys::fuzz_target;
 
@@ -30,6 +32,17 @@ fuzz_target!(|data: &[u8]| {
         let mut out = [0; 8];
         let m = varint::encode(v, &mut out).unwrap();
         assert_eq!(varint::decode(&out[..m]), Some((v, m)));
+    }
+    // The ClientHello scan sees handshake bytes before TLS does. A message
+    // judged once is judged the same with more bytes after it, and one
+    // not yet whole has less than the most a message may hold.
+    match hello::params(data) {
+        Params::Incomplete => assert!(data.len() < hello::MAX_HELLO + 4),
+        found => {
+            let mut more = data.to_vec();
+            more.extend_from_slice(&[0x39, 0xff, 0xa5]);
+            assert_eq!(hello::params(&more), found);
+        }
     }
     if data.len() >= 9 {
         let largest = u64::from_le_bytes(data[..8].try_into().unwrap()) & varint::MAX;

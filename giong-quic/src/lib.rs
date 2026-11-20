@@ -41,6 +41,7 @@ use bytes::Bytes;
 use quinn_proto::Dir;
 
 mod config;
+mod crypto;
 mod error;
 pub mod native;
 mod proto;

@@ -4,5 +4,6 @@
 //! congestion control and the connection state machine.
 
 pub mod cid;
+pub mod hello;
 pub mod packet;
 pub mod varint;

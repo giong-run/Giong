@@ -122,6 +122,8 @@ impl ServerConfig {
                      TLS 1.3 cipher suite that QUIC allows.",
                 )
             })?;
+        // With the check of the ClientHello that rustls leaves open.
+        let crypto = crate::crypto::ServerCrypto(Arc::new(crypto));
         let mut cfg = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
         cfg.transport_config(Arc::new(self.transport.to_proto()?));
         Ok(cfg)
