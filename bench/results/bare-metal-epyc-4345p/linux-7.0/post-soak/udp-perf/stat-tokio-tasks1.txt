@@ -1,0 +1,13 @@
+# started on Fri Nov 20 01:24:13 2026
+
+
+ Performance counter stats for process id '211059':
+
+                 0      syscalls:sys_enter_io_uring_enter                                      
+         7,101,127      syscalls:sys_enter_sendto                                             
+                 0      syscalls:sys_enter_sendmmsg                                           
+                 0      syscalls:sys_enter_recvmmsg                                           
+                46      context-switches                                                      
+
+       8.000332773 seconds time elapsed
+

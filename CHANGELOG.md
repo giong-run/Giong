@@ -148,6 +148,37 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
+- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll, on a cloud VM. A UDP echo
+  server on one core (64-byte datagrams, veth, `bench/udp-echo.sh`, 5 rounds,
+  `bench/results/udp-echo/`) answers 328,000 datagrams a second with 16 tasks on one socket
+  on io_uring (259,000 before, Tokio 278,000) and 300,000 with one task (286,000 before,
+  Tokio 259,000); on epoll 284,000 in both cases (239,000 and 258,000 before). `UdpSocket::send_to` and `send` send within the call when the
+  socket has room, instead of through an operation that waited a turn of the event loop
+  (io_uring) or allocated a message header (both), and use `sendto(2)` rather than
+  `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
+  now costs one system call on either driver where Tokio makes two. Immediate sends count
+  against the task's budget, so a task that only sends still gives way to the others.
+  On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark;
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`) the server
+  core is saturated near a million echoes a second and the runtimes are close: this change
+  is behind Tokio with io_uring and 16 tasks (856,000 against 870,000) and with epoll and one
+  task (874,000 against 882,000), level with epoll and 16 tasks (879,000), and ahead with
+  io_uring and one task (926,000 against 882,000).
+- **net**: the epoll driver's UDP path is close to the kernel's ceiling. The same echo
+  server answers 336,000 datagrams a second with 16 tasks on epoll (284,000 before, Tokio
+  271,000, the kernel-only `recvmmsg`/`sendmmsg` server 390,000) at 4.08 µs of server CPU per
+  echo (5.07 before, Tokio 5.33, kernel 3.55), and 351,000 with one task (284,000 before,
+  Tokio 307,000) (`bench/results/udp-echo/vm/epoll-deep/`), on a cloud VM. Two changes: datagrams that tasks send while
+  other tasks of the worker are runnable go to the kernel at the end of that turn of the
+  event loop, in one `sendmmsg(2)` per socket, each sender still getting its own result and
+  datagrams of one socket keeping their order (both drivers; a lone sender sends at once);
+  and on epoll a datagram socket that has received 64 datagrams leaves the epoll set until a
+  task has to wait for it again, because in the set every datagram received and every one
+  sent and freed wakes epoll's callback on the socket's wait queue.
+  On bare metal (`post-soak/udp-udp-epoll-*`, as above) the margins are small: with 16 tasks
+  921,000 on epoll and 902,000 on io_uring against Tokio's 870,000, ahead in every round;
+  with one task 893,000 and 876,000 against 863,000, a tie within the noise between rounds.
+
 ### Deprecated
 
 - **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and `TlsConnector::with_roots`, which
@@ -163,6 +194,21 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **net**: tasks that share a `UdpSocket` and wait in `recv_from` at the same time are each
+  woken for a datagram of their own. On io_uring they shared one wake-up slot: only the
+  last task to wait was woken, the others saw their datagrams only when something else
+  woke them, and a server of 16 tasks on one socket made one kernel entry per datagram. A
+  task that stops waiting (its receive timed out) no longer takes the wake-up of the next
+  datagram.
+- **giong-http**: requests sent at once to an `https` origin the client had no connection to
+  yet each opened a connection and did a TLS handshake of their own, up to
+  `max_connections_per_host`, because the pool learned that the origin speaks HTTP/2 only
+  once the first handshake was over. They now wait for that first connection while ALPN may
+  still pick HTTP/2, and share it when it does; when it picks HTTP/1.1 they open their own
+  as before, and when the first one fails or is dropped the next in line opens one. 64
+  requests to a new loopback origin on one worker: 16 TLS connections and 4.70 ms before, 1
+  and 0.78 ms after (median of 21 rounds). Reported from a service that warms its client up
+  while requests arrive (#154).
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open

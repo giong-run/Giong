@@ -1081,6 +1081,65 @@ pub unsafe extern "C" fn recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_int
     }
 }
 
+/// `recvmmsg(2)`: one simulated `recvmsg` per header, the first with the
+/// caller's flags and the rest without waiting, as the kernel does; it stops
+/// at the first that finds nothing. The timeout is not modelled (Gióng
+/// passes none). Descriptors outside the simulation go through `recvmsg`'s
+/// own pass-through, one call per header.
+#[no_mangle]
+pub unsafe extern "C" fn recvmmsg(
+    fd: c_int,
+    msgs: *mut libc::mmsghdr,
+    vlen: c_uint,
+    flags: c_int,
+    _timeout: *mut libc::timespec,
+) -> c_int {
+    let mut got: c_uint = 0;
+    while got < vlen {
+        let m = &mut *msgs.add(got as usize);
+        let more = if got == 0 {
+            flags
+        } else {
+            flags | libc::MSG_DONTWAIT
+        };
+        let r = recvmsg(fd, &mut m.msg_hdr, more & !libc::MSG_WAITFORONE);
+        if r < 0 {
+            if got == 0 {
+                return -1;
+            }
+            break;
+        }
+        m.msg_len = r as c_uint;
+        got += 1;
+    }
+    got as c_int
+}
+
+/// `sendmmsg(2)`: one simulated `sendmsg` per header, stopping at the first
+/// error, which is returned only if nothing was sent, as the kernel does.
+#[no_mangle]
+pub unsafe extern "C" fn sendmmsg(
+    fd: c_int,
+    msgs: *mut libc::mmsghdr,
+    vlen: c_uint,
+    flags: c_int,
+) -> c_int {
+    let mut sent: c_uint = 0;
+    while sent < vlen {
+        let m = &mut *msgs.add(sent as usize);
+        let r = sendmsg(fd, &m.msg_hdr, flags);
+        if r < 0 {
+            if sent == 0 {
+                return -1;
+            }
+            break;
+        }
+        m.msg_len = r as c_uint;
+        sent += 1;
+    }
+    sent as c_int
+}
+
 // ------------------------------------------------------- generic descriptors
 
 #[no_mangle]
