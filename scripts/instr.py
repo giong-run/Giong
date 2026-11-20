@@ -27,6 +27,7 @@ import io
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -39,6 +40,7 @@ DRIVERS = ["io_uring", "epoll"]
 ITERATIONS = 2000
 WARMUP = 500
 IDLE_CONNECTIONS = 2000
+VALGRIND = shutil.which("valgrind") or "valgrind"
 # Tolerances (percent) for metrics that have none in the baseline yet.
 DEFAULT_TOLERANCE = {
     "instructions": 1.0,
@@ -93,11 +95,17 @@ def parse_fields(line):
 def measure_case(binary, driver, case, tmp):
     for f in os.listdir(tmp):
         os.remove(os.path.join(tmp, f))
-    env = {**os.environ, "GIONG_DRIVER": driver}
+    # The same stack on every machine and in every job: where the stack
+    # starts depends on the size of the environment and of the program's
+    # path, and a few copies cost some instructions more or less by the
+    # alignment of what is on it (web: 0.2% between two environments). So
+    # the environment is giong's own variables only and the path is relative.
+    env = {k: v for k, v in sorted(os.environ.items()) if k.startswith("GIONG_")}
+    env["GIONG_DRIVER"] = driver
     out = subprocess.run(
-        ["valgrind", "--tool=callgrind", f"--callgrind-out-file={tmp}/cg.%p",
-         binary, "run", case, str(ITERATIONS), str(WARMUP)],
-        env=env, capture_output=True, text=True,
+        [VALGRIND, "--tool=callgrind", f"--callgrind-out-file={tmp}/cg.%p",
+         "./" + os.path.basename(binary), "run", case, str(ITERATIONS), str(WARMUP)],
+        env=env, cwd=os.path.dirname(os.path.abspath(binary)), capture_output=True, text=True,
     )
     if out.returncode != 0:
         sys.exit(f"{case} on {driver} failed:\n{out.stderr[-3000:]}")
