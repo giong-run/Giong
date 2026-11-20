@@ -993,10 +993,19 @@ async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
     entries
 }
 
-#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn directories_list_like_the_standard_library() {
+    // One test with a body per system, as they differ in what a directory
+    // can hold (links without a privilege, sockets, names that are no text).
+    #[cfg(unix)]
+    directories_on_unix();
+    #[cfg(windows)]
+    directories_on_windows();
+}
+
+#[cfg(unix)]
+fn directories_on_unix() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirEntryExt, MetadataExt};
 
@@ -1156,8 +1165,7 @@ fn read_dir_reports_what_it_cannot_list() {
 }
 
 #[cfg(windows)]
-#[test]
-fn directories_list_like_the_standard_library() {
+fn directories_on_windows() {
     let dir = TempDir::new("read-dir");
     giong::block_on(async {
         // An empty directory stays empty when asked again.

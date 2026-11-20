@@ -540,10 +540,11 @@ impl File {
     /// that ends before `offset + len` is extended to there, and Windows
     /// reserves the space. A file that is long enough is left alone.
     ///
-    /// The file must be open for writing. Do not run this while other
-    /// writes extend the same file: Windows sets a file's length rather
-    /// than growing it, so a write that lands past `offset + len` between
-    /// the check and the change would be cut off.
+    /// The file must be open for writing. Calls of `allocate` may overlap
+    /// each other. Do not run one while writes extend the same file past
+    /// `offset + len`: Windows sets a file's length rather than growing it,
+    /// so a write that lands there between the check and the change would
+    /// be cut off.
     ///
     /// Fails with `GIONG-E0202` if `offset + len` is above `i64::MAX`.
     ///
@@ -570,6 +571,12 @@ impl File {
         };
         let file = self.second_handle()?;
         blocking(move || {
+            // Windows sets a length where Unix grows a file, so two calls
+            // that overlapped could leave the shorter length: one checks,
+            // the other grows the file further, the first then sets its
+            // own. One at a time, in the whole process, none can.
+            static GROWING: Mutex<()> = Mutex::new(());
+            let _one_at_a_time = GROWING.lock().unwrap_or_else(|e| e.into_inner());
             // A write of nothing changes nothing, and fails as any write
             // does on a file that is not open for writing: so does this
             // call, whether or not the file has to grow.
