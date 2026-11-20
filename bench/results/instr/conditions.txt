@@ -87,3 +87,25 @@ Instructions per operation, 2,000 operations after 500 of warm-up, integer part.
    seen and within the limit. 60 iterations: +2.12% / +2.21%, and
    `scripts/instr.py check` failed with exit status 1 naming the two rows;
    mysql-query and redis-get did not move by one instruction.
+
+6. Heap per idle connection across CI runners (2026-11-17 to 2026-11-20, the `instr`
+   artifacts of 17 runs of the same code on GitHub's runners: Xeon 6975P-C on
+   7.0.0-1014-aws, EPYC 7763, EPYC 9V45, EPYC 9V74 and Xeon 8573C on 7.0.0-1017-azure;
+   three rounds each, bytes per connection, lowest and highest of all rounds):
+
+   case         io_uring               epoll
+   idle-http1    1964.2 to  1964.9      2142.4 (one round of all: 2162.9)
+   idle-h2       4427.0                 4508.0
+   idle-https   10764.7 to 10766.8     10816.3 to 10818.4
+
+   So the heap agrees within 0.04% whatever the runner's CPU and cloud, and the one
+   stray round (+0.96%) is absorbed by the median of three. Before #142 the three epoll
+   rows were 16 bytes lower on every runner (2126.1, 4491.6, 10800 to 10802): a real
+   change, seen identically everywhere. The resident set of idle-h2 moves by up to 2.7%
+   between rounds of one run (4698 to 4827 on io_uring).
+
+   The baseline's idle rows had been measured on a development VM, where idle-http1
+   is 1940 on one kernel build and 1965 on another, and the limit was 2%: #162 added
+   216 bytes to an idle HTTPS connection (10,765 to 10,981, +2.0% against CI's own
+   number) and passed at +1.8% against a baseline of 10,783.8. Since then the idle rows
+   come from a CI run and the heap limit is 1%, which that step would have failed.
