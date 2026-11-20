@@ -69,6 +69,8 @@ impl Drop for Statement {
 
 /// The error for a statement sent in a transaction that can no longer be
 /// committed.
+#[cold]
+#[inline(never)]
 fn abandoned() -> Error {
     Error::new(
         ErrorKind::Db,
@@ -726,6 +728,17 @@ impl Conn {
         self.enqueue_with(kind, false, encode)
     }
 
+    /// The link a request sent in the open transaction keeps, or the error
+    /// if the transaction can no longer be committed.
+    #[cold]
+    #[inline(never)]
+    fn in_tx(&self) -> Result<Weak<Conn>, Error> {
+        match self.tx.get() {
+            Tx::Abandoned => Err(abandoned()),
+            _ => Ok(self.weak.clone()),
+        }
+    }
+
     fn enqueue_with(
         &self,
         kind: Kind,
@@ -736,10 +749,10 @@ impl Conn {
         if let Some(e) = &st.broken {
             return Err(e.clone());
         }
-        let in_tx = match self.tx.get() {
-            Tx::None => None,
-            Tx::Open => Some(self.weak.clone()),
-            Tx::Abandoned => return Err(abandoned()),
+        let in_tx = if self.tx.get() == Tx::None {
+            None
+        } else {
+            Some(self.in_tx()?)
         };
         let start = st.out.len();
         if let Err(e) = encode(&mut st.out) {
