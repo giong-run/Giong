@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
+use crate::sys::{MsgHdr, PathChar, RawFile, RawSock, SockAddr, SockLen};
 
 pub(crate) use readiness::{refill_budget, spend_budget};
 
@@ -353,12 +354,12 @@ pub(crate) fn buffer_id(flags: u32) -> Option<u16> {
 pub(crate) enum Io {
     /// `connect(2)` a stream socket.
     Connect {
-        fd: RawFd,
-        addr: *const libc::sockaddr,
-        len: libc::socklen_t,
+        fd: RawSock,
+        addr: *const SockAddr,
+        len: SockLen,
     },
     /// A one-off receive on a socket into the caller's buffer.
-    Recv { fd: RawFd, buf: *mut u8, len: u32 },
+    Recv { fd: RawSock, buf: *mut u8, len: u32 },
     /// `send(2)`. With `zero_copy` the io_uring driver sends without a copy
     /// where it can ([`IoUringFeature::ZeroCopySend`]). The kernel then
     /// reads the buffer until a notification that comes once the peer has
@@ -367,7 +368,7 @@ pub(crate) enum Io {
     /// without completes only at the notification, with [`ZC_COPIED`] in
     /// its flags if the kernel copied the data after all.
     Send {
-        fd: RawFd,
+        fd: RawSock,
         buf: *const u8,
         len: u32,
         flags: i32,
@@ -376,11 +377,11 @@ pub(crate) enum Io {
     /// Waits until a socket can take more data (`POLLOUT`), for a caller
     /// that writes to it itself and got `EAGAIN`. Completes with a
     /// non-negative value when the caller should try again.
-    Writable { fd: RawFd },
+    Writable { fd: RawSock },
     /// `sendmsg(2)`; `zero_copy` as for [`Io::Send`].
     SendMsg {
-        fd: RawFd,
-        msg: *const libc::msghdr,
+        fd: RawSock,
+        msg: *const MsgHdr,
         flags: u32,
         zero_copy: bool,
     },
@@ -390,65 +391,59 @@ pub(crate) enum Io {
     /// a destination address, Linux 6.1). Sent with `MSG_NOSIGNAL`; no
     /// other flags, so that every operation stays as small as before.
     SendTo {
-        fd: RawFd,
+        fd: RawSock,
         buf: *const u8,
         len: u32,
-        addr: *const libc::sockaddr,
-        addr_len: libc::socklen_t,
+        addr: *const SockAddr,
+        addr_len: SockLen,
     },
     /// A one-off `recvmsg(2)`.
-    RecvMsg { fd: RawFd, msg: *mut libc::msghdr },
+    RecvMsg { fd: RawSock, msg: *mut MsgHdr },
     /// A `read(2)` from a descriptor that has readiness, such as an eventfd
     /// or a pipe.
-    ReadReady { fd: RawFd, buf: *mut u8, len: u32 },
+    ReadReady { fd: RawFile, buf: *mut u8, len: u32 },
     /// `pread(2)` from a file (a plain `read` on a pipe or a device).
     Read {
-        fd: RawFd,
+        fd: RawFile,
         buf: *mut u8,
         len: u32,
         offset: u64,
     },
     /// `pwrite(2)` to a file (a plain `write` on a pipe or a device).
     Write {
-        fd: RawFd,
+        fd: RawFile,
         buf: *const u8,
         len: u32,
         offset: u64,
     },
     /// `openat(2)` relative to the working directory.
     OpenAt {
-        path: *const libc::c_char,
+        path: *const PathChar,
         flags: i32,
         mode: u32,
     },
     /// `close(2)`, reporting its result.
-    Close { fd: RawFd },
+    Close { fd: RawFile },
     /// `statx(2)` on Linux, `fstatat(2)` elsewhere (see `sys::stat_at`).
     Statx {
-        dir: RawFd,
-        path: *const libc::c_char,
+        dir: RawFile,
+        path: *const PathChar,
         flags: i32,
         mask: u32,
         out: *mut crate::sys::StatBuf,
     },
     /// `fsync(2)`, or `fdatasync(2)` when `datasync`.
-    Fsync { fd: RawFd, datasync: bool },
+    Fsync { fd: RawFile, datasync: bool },
     /// `fallocate(2)` with mode 0.
-    Fallocate { fd: RawFd, offset: u64, len: u64 },
+    Fallocate { fd: RawFile, offset: u64, len: u64 },
     /// `unlinkat(2)` relative to the working directory.
-    UnlinkAt {
-        path: *const libc::c_char,
-        flags: i32,
-    },
+    UnlinkAt { path: *const PathChar, flags: i32 },
     /// `mkdirat(2)` relative to the working directory.
-    MkDirAt {
-        path: *const libc::c_char,
-        mode: u32,
-    },
+    MkDirAt { path: *const PathChar, mode: u32 },
     /// `renameat(2)`, both paths relative to the working directory.
     RenameAt {
-        from: *const libc::c_char,
-        to: *const libc::c_char,
+        from: *const PathChar,
+        to: *const PathChar,
     },
 }
 
@@ -549,13 +544,13 @@ pub(crate) fn event_loop_failed(call: &str, err: io::Error) -> ! {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MultiIo {
     /// Accepted connections, as close-on-exec descriptors.
-    Accept { fd: RawFd },
+    Accept { fd: RawSock },
     /// Data into the worker's pool buffers.
-    Recv { fd: RawFd },
+    Recv { fd: RawSock },
     /// Datagrams into pool buffers, each laid out as io_uring's
     /// `io_uring_recvmsg_out` header, then the sender's address in a field
     /// of `hdr.msg_namelen` bytes, then the payload.
-    RecvMsg { fd: RawFd, hdr: *const libc::msghdr },
+    RecvMsg { fd: RawSock, hdr: *const MsgHdr },
 }
 
 /// A worker's I/O driver.

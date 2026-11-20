@@ -24,6 +24,42 @@ pub(crate) use macos::*;
 use std::io;
 use std::os::fd::RawFd;
 
+/// A socket, as operations name it (`Io`, `MultiIo`): a descriptor on Unix,
+/// a `SOCKET` on Windows.
+#[cfg(unix)]
+pub(crate) type RawSock = RawFd;
+
+/// A file, pipe or device, as operations name it: a descriptor on Unix, a
+/// `HANDLE` on Windows. On Unix it is the same type as [`RawSock`], and
+/// code may pass one for the other; on Windows the two are closed, read
+/// and written by different calls, so an operation says which it takes.
+#[cfg(unix)]
+pub(crate) type RawFile = RawFd;
+
+/// A socket address as the system reads it (`SOCKADDR` on Windows).
+#[cfg(unix)]
+pub(crate) type SockAddr = libc::sockaddr;
+
+/// The length of a socket address (`i32` on Windows).
+#[cfg(unix)]
+pub(crate) type SockLen = libc::socklen_t;
+
+/// Room for any socket address (`SOCKADDR_STORAGE` on Windows).
+#[cfg(unix)]
+#[allow(dead_code)] // The Unix drivers still name `libc::sockaddr_storage`.
+pub(crate) type SockAddrStorage = libc::sockaddr_storage;
+
+/// The header of a `sendmsg` or `recvmsg`: buffers, address and control
+/// data (`WSAMSG` on Windows, whose fields have other names and order, so
+/// code that fills one in is per system).
+#[cfg(unix)]
+pub(crate) type MsgHdr = libc::msghdr;
+
+/// One unit of a path as the system takes it: a byte of a NUL-terminated
+/// string on Unix, a UTF-16 unit on Windows.
+#[cfg(unix)]
+pub(crate) type PathChar = libc::c_char;
+
 /// `-errno` of the last failed call.
 pub(crate) fn neg_errno() -> i32 {
     -io::Error::last_os_error()
