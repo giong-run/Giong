@@ -1,0 +1,20 @@
+IcmpMsg:
+    InType0: 2
+    InType3: 20
+    InType8: 5705
+    OutType0: 5705
+    OutType8: 2
+Udp:
+    1791328820 packets received
+    0 packets to unknown port received
+    11762940 packet receive errors
+    1849127394 packets sent
+    11762940 receive buffer errors
+    4680270 send buffer errors
+UdpLite:
+IpExt:
+    InOctets: 64969288010545
+    OutOctets: 62862049394724
+    InNoECTPkts: 93178730861
+    InECT0Pkts: 1254533649
+MPTcpExt:
