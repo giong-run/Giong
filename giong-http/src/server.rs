@@ -67,7 +67,7 @@ impl<F: Future + Unpin> Future for Caught<F> {
 }
 
 /// The answer to a request whose handler panicked.
-fn panicked() -> Response {
+pub(crate) fn panicked() -> Response {
     Response::new(500)
 }
 
@@ -862,6 +862,64 @@ impl Server {
             // Nothing can be said before the handshake, which is what
             // costs memory: just close.
             drop,
+        )
+        .await;
+    }
+
+    /// Serves HTTP/3 (RFC 9114) on a QUIC endpoint until a shutdown is
+    /// requested, with the same handler and the same limits as the other
+    /// `serve` methods. Needs the `unstable-http3` feature, and may change
+    /// until HTTP/3 is stabilised.
+    ///
+    /// The endpoint's TLS configuration must name the ALPN protocol `h3`.
+    /// Bind one endpoint on every worker, each with its own call of this
+    /// method, as with a TCP listener.
+    ///
+    /// What differs from HTTP/2, because QUIC decides it: the number of
+    /// requests a client may have open at once is the endpoint's
+    /// `TransportConfig::max_streams` (not `max_concurrent_streams`), and an
+    /// idle connection is closed after the endpoint's
+    /// `TransportConfig::idle_timeout` (not `idle_timeout`). On shutdown the
+    /// client is told with `GOAWAY`, requests in flight are finished, and
+    /// later ones are refused with `H3_REQUEST_REJECTED`, which lets the
+    /// client retry them elsewhere.
+    ///
+    /// ```no_run
+    /// # use giong_http::{Request, Response, Server};
+    /// # fn tls() -> rustls::ServerConfig { unimplemented!() }
+    /// # async fn handler(_: Request) -> Response { Response::new(200) }
+    /// # async fn demo() -> std::io::Result<()> {
+    /// // `tls()` is a rustls configuration with `alpn_protocols` set to
+    /// // `vec![b"h3".to_vec()]`.
+    /// let config = giong_quic::ServerConfig::new(tls())?;
+    /// let endpoint = giong_quic::Endpoint::server("0.0.0.0:443".parse().unwrap(), config)?;
+    /// Server::new().serve_h3(endpoint, handler).await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Cancel safe, like [`serve`](Self::serve): dropping the future stops
+    /// accepting; connections already accepted are served to their end.
+    #[cfg(feature = "unstable-http3")]
+    pub async fn serve_h3<H: Handler>(&self, endpoint: giong_quic::Endpoint, handler: H) {
+        let handler = Rc::new(handler);
+        let cfg = self.cfg;
+        let accept = || async {
+            endpoint.accept().await.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "the QUIC endpoint is closed")
+            })
+        };
+        self.accept_loop(
+            accept,
+            |conn: giong_quic::Connection, slot| {
+                let handler = handler.clone();
+                drop(giong::spawn(async move {
+                    let _slot = slot;
+                    crate::h3::server::serve(conn, cfg, handler).await;
+                }));
+            },
+            // Memory is low: H3_EXCESSIVE_LOAD (RFC 9114, section 8.1).
+            |conn: giong_quic::Connection| conn.close(0x107, b""),
         )
         .await;
     }

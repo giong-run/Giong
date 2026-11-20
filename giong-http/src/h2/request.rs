@@ -57,6 +57,9 @@ pub(crate) struct Builder {
     limit: usize,
     error: Option<&'static str>,
     status: Option<u16>,
+    /// The fields are those of an HTTP/3 request: the same rules, another
+    /// version on the request.
+    h3: bool,
 }
 
 /// The fields HTTP/2 forbids because they are about one connection
@@ -120,7 +123,16 @@ impl Builder {
             limit,
             error: None,
             status: None,
+            h3: false,
         }
+    }
+
+    /// The same builder for the fields of an HTTP/3 request, which follow
+    /// the rules of HTTP/2 (RFC 9114, sections 4.2 and 4.3).
+    #[cfg(feature = "unstable-http3")]
+    pub(crate) fn http3(mut self) -> Self {
+        self.h3 = true;
+        self
     }
 
     fn fail(&mut self, why: &'static str) {
@@ -298,7 +310,11 @@ impl Builder {
         let target_start = buf.len();
         buf.extend_from_slice(&pseudo[target.clone()]);
         let target_end = buf.len();
-        buf.extend_from_slice(b" HTTP/2\r\n");
+        buf.extend_from_slice(if self.h3 {
+            b" HTTP/3\r\n"
+        } else {
+            b" HTTP/2\r\n"
+        });
         let headers_start = buf.len();
         if self.host.is_none() {
             if let Some(authority) = self.authority.clone().filter(|a| !a.is_empty()) {
@@ -328,6 +344,7 @@ impl Builder {
             keep_alive: true,
             expect_continue: self.expect_continue,
             h2: true,
+            h3: self.h3,
         };
         Built::Request(Request {
             buf: Rc::new(buf),

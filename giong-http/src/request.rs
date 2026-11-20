@@ -30,6 +30,8 @@ pub enum Version {
     /// HTTP/2, over TLS (chosen through ALPN) or over plain TCP with prior
     /// knowledge.
     Http2,
+    /// HTTP/3, over QUIC.
+    Http3,
 }
 
 impl Version {
@@ -40,6 +42,7 @@ impl Version {
             Version::Http10 => "HTTP/1.0",
             Version::Http11 => "HTTP/1.1",
             Version::Http2 => "HTTP/2",
+            Version::Http3 => "HTTP/3",
         }
     }
 }
@@ -181,6 +184,7 @@ impl Request {
     /// The HTTP version the request came with.
     pub fn version(&self) -> Version {
         match (self.head.h2, self.head.minor) {
+            (true, _) if self.head.h3 => Version::Http3,
             (true, _) => Version::Http2,
             (false, 0) => Version::Http10,
             (false, _) => Version::Http11,

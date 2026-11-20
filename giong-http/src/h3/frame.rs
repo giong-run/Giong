@@ -11,6 +11,8 @@ use std::fmt;
 /// HTTP/3 error codes (RFC 9114, section 8.1) and QPACK's (RFC 9204,
 /// section 6), as sent in `RESET_STREAM`, `STOP_SENDING` and
 /// `CONNECTION_CLOSE`.
+// The registry in full, whether or not a server has a use for each.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub(crate) enum Code {

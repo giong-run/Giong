@@ -2,13 +2,18 @@
 //! Variable-length integers, frames, settings, stream types and error
 //! codes ([`frame`]), and QPACK field compression ([`qpack`]).
 //!
-//! Behind the `unstable-http3` feature while the QUIC transport is being
-//! built: nothing here is reachable from the public API yet.
+//! The server side of a connection is in [`server`], behind the
+//! `unstable-http3` feature: `Server::serve_h3` is its entry point.
 
-// Until the server and the client that use them are in.
-#![allow(dead_code)]
+// Without the feature (in the unit tests and the fuzz build) only the wire
+// format is compiled, and nothing uses it.
+#![cfg_attr(not(feature = "unstable-http3"), allow(dead_code))]
 
 pub(crate) mod frame;
 pub(crate) mod qpack;
+#[cfg(feature = "unstable-http3")]
+pub(crate) mod server;
+#[cfg(all(test, feature = "unstable-http3"))]
+mod server_tests;
 #[cfg(test)]
 mod tests;
