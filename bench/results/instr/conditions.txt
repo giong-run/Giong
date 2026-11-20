@@ -53,3 +53,37 @@ Instructions per operation, 2,000 operations after 500 of warm-up, integer part.
    buffer pool runs low and the driver moves data to the heap, by timing. Opening
    them one at a time (waiting for each server SETTINGS): 4298.8 in all five runs,
    which is what bench/instr does.
+
+5. Heap state (2026-11-20). glibc's malloc does different work for the same
+   allocations depending on what the heap looks like: whether a freed chunk merges
+   with its neighbour, whether a bin is searched or consolidated. The same binary
+   of main 0387cfd, copied to a one-letter name, counted 12,620 instructions per
+   postgres-query on epoll instead of 12,304 (+2.6%), all of it in `_int_malloc`
+   (+150), `unlink_chunk` (+81), `_int_free_merge_chunk` (+69), `malloc_consolidate`
+   (+56), `_int_free` (-54): the program's path is copied to the heap at start and
+   its length decides where later chunks land. Unrelated changes move the heap the
+   same way, and CI showed the same two states: #158 and #162 failed with epoll
+   12,634 and 12,632 against a baseline of 12,345, #142 moved io_uring from 13,175 to
+   12,855, on Intel and AMD runners alike, to the decimal.
+
+   Since then a `run` is served by an allocator of the benchmark's own
+   (bench/instr/src/alloc.rs: power-of-two size classes, a free list per class),
+   whose cost depends only on the sizes asked for. Five heap states, before and
+   after, every case: heap-state.txt. The spread of postgres-query went from 2.54%
+   to 0.00%, mysql-query on epoll from 2.00% to 0.00%, h2 from 0.46% to 0.02%.
+
+   The pull requests that tripped, rebuilt with the new allocator on the main they
+   were tested with (c963367), postgres-query on io_uring / epoll:
+     main c963367          11463.3 / 10998.7
+     #158 (giong-postgres) 11476.3 / 11011.7   +0.11% / +0.12%
+     #162 (giong-tls)      11456.3 / 10991.7   -0.06% / -0.06%
+     main 0387cfd (#142)   11497.4 / 11032.7   +0.30% / +0.31%
+   With glibc's malloc the same four measured 13174.3 / 12303.7, 13177.3 / 12306.7,
+   13186.3 / 12315.7 and 12855.3 / 12340.7 here; CI, where the binary has another
+   path, measured 13177.8 / 12622.9 for the same commit of #158.
+
+   Negative control (not committed): a loop planted in giong-postgres's
+   `parse_backend`. 2 iterations: +0.10% / +0.11%. 20 iterations: +0.73% / +0.76%,
+   seen and within the limit. 60 iterations: +2.12% / +2.21%, and
+   `scripts/instr.py check` failed with exit status 1 naming the two rows;
+   mysql-query and redis-get did not move by one instruction.
