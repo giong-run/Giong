@@ -2,11 +2,11 @@
 name = "giong-quic"
 version = "0.0.0"
 edition = "2021"
-# quinn-proto 0.11.19 (the fallback backend) needs Rust 1.85; giong's
-# libraries need 1.80. To settle before 1.3: pin an older quinn-proto for the
-# fallback, or give giong-quic its own MSRV. The native engine needs nothing
-# newer than giong.
-rust-version = "1.85"
+# The same minimum as giong. quinn-proto (the fallback engine) needs Rust 1.85
+# from 0.11.15 on, so the requirement starts at 0.11.14 (which needs 1.74) and
+# the lockfile CI uses for the 1.80 check stays there; a newer toolchain
+# resolves to the newest 0.11.
+rust-version = "1.80"
 description = "QUIC for the giong thread-per-core runtime (prototype, not published)"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/giong-run/Giong"
@@ -20,7 +20,7 @@ default = []
 
 [dependencies]
 giong = { path = "..", features = ["unstable-udp-offload"] }
-quinn-proto = { version = "0.11.19", default-features = false, features = ["rustls-ring"] }
+quinn-proto = { version = "0.11.14", default-features = false, features = ["rustls-ring"] }
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std"] }
 bytes = "1"
 
@@ -28,7 +28,3 @@ bytes = "1"
 rcgen = "0.13"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
-
-# Its own workspace on this branch so that the root workspace's MSRV 1.80
-# check is not affected (see rust-version above).
-[workspace]
