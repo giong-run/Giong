@@ -120,4 +120,6 @@ pub mod fuzzing {
         check_chunked, check_h2_output, check_h3_frames, check_head, check_hpack, check_huffman,
         check_qpack, h2_connection, h2_input,
     };
+    #[cfg(feature = "unstable-http3")]
+    pub use crate::invariants::{check_h3_response, h3_connection, h3_input, H3Input, H3Request};
 }

@@ -98,6 +98,10 @@ impl Handler for App {
                 let _ = std::fs::remove_file(&path);
                 Response::new(200).body(Body::file(file).unwrap())
             }
+            "/sleep" => {
+                giong::time::sleep(std::time::Duration::from_millis(200)).await;
+                Response::text("slept")
+            }
             "/panic" => panic!("the handler panics on purpose"),
             _ => Response::new(404),
         }
@@ -502,6 +506,13 @@ fn a_bad_request_loses_its_stream_and_the_connection_goes_on() {
         // A stream that ends before its request does: H3_REQUEST_INCOMPLETE.
         let error = roundtrip(&client, Vec::new()).await.expect_err("a reset");
         assert!(text(&error).contains("code 269"), "{error}");
+        // A request the client gives up: its response does not end as if
+        // it were whole. H3_REQUEST_CANCELLED, 0x10c = 268.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&post("/echo", &[])).await.unwrap();
+        send.reset(0x10c);
+        let error = recv.read_to_end(1 << 20).await.expect_err("a reset");
+        assert!(text(&error).contains("code 268"), "{error}");
         // A handler that panics: 500, and nothing else is lost.
         assert_eq!(
             roundtrip(&client, get("/panic")).await.unwrap().status(),
@@ -638,5 +649,148 @@ fn what_a_client_may_do_on_its_other_streams_is_accepted() {
             giong::time::sleep(std::time::Duration::from_millis(10)).await;
             assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
         }
+    });
+}
+
+/// Reads the server's control stream up to and including a GOAWAY frame
+/// and gives the stream ID it announces.
+async fn goaway(conn: &Connection) -> u64 {
+    let mut control = conn.accept_uni().await.unwrap();
+    let mut bytes = Vec::new();
+    loop {
+        // The stream type, then frames.
+        let mut rest = bytes.get(1..).unwrap_or(&[]);
+        while let Some((kind, a)) = read_varint(rest) {
+            let Some((len, b)) = read_varint(&rest[a..]) else {
+                break;
+            };
+            let Some(payload) = rest.get(a + b..a + b + len as usize) else {
+                break;
+            };
+            if kind == kind::GOAWAY {
+                assert_eq!(bytes[0], 0x00, "the control stream");
+                return read_varint(payload).expect("a stream ID").0;
+            }
+            rest = &rest[a + b + len as usize..];
+        }
+        let piece = control.read().await.unwrap().expect("a GOAWAY");
+        bytes.extend_from_slice(&piece);
+    }
+}
+
+#[test]
+fn shutdown_finishes_accepted_requests_and_rejects_later_ones() {
+    run(|| async {
+        let client = connect().await;
+        assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+        // A request in progress when the shutdown is asked for.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&get("/sleep")).await.unwrap();
+        send.finish().unwrap();
+        giong::time::sleep(std::time::Duration::from_millis(50)).await;
+        giong::handle().shutdown();
+
+        // GOAWAY names the first stream that will not be handled (RFC
+        // 9114, section 5.2): streams 0 and 4 were accepted.
+        assert_eq!(goaway(&client.conn).await, 8);
+        // A request after it is rejected so that it can be retried on
+        // another connection: H3_REQUEST_REJECTED, 0x10b = 267.
+        let error = roundtrip(&client, get("/")).await.expect_err("a reset");
+        assert!(text(&error).contains("code 267"), "{error}");
+        // The one in progress is finished ...
+        let reply = parse(&recv.read_to_end(1 << 20).await.unwrap());
+        assert_eq!((reply.status(), &reply.body[..]), (200, &b"slept"[..]));
+        // ... and then the connection is closed without an error:
+        // H3_NO_ERROR, 0x100 = 256.
+        let end = closed_with(&client).await;
+        assert!(end.contains("closed by peer: 256"), "{end}");
+    });
+}
+
+/// Plays `input` on a new connection to the server at `addr` and checks
+/// every response that arrives whole. Returns how many did.
+async fn play(
+    endpoint: &Endpoint,
+    addr: SocketAddr,
+    cfg: &ClientConfig,
+    input: &crate::invariants::H3Input,
+) -> usize {
+    let conn = endpoint.connect(addr, "localhost", cfg).await.unwrap();
+    // Streams stay open until the responses are read: an error on any of
+    // them only shows in what the server does next.
+    let mut open = Vec::new();
+    for bytes in input.control.iter().chain(&input.uni) {
+        let Ok(mut stream) = conn.open_uni().await else {
+            break;
+        };
+        let _ = stream.write_all(bytes).await;
+        open.push(stream);
+    }
+    let mut responses = Vec::new();
+    for request in &input.requests {
+        let Ok((mut send, recv)) = conn.open_bi().await else {
+            break;
+        };
+        let _ = send.write_all(&request.bytes).await;
+        if request.finish {
+            let _ = send.finish();
+        } else {
+            send.reset(0x10c);
+        }
+        responses.push(recv);
+    }
+    let mut whole = 0;
+    for mut recv in responses {
+        if let Ok(output) = recv.read_to_end(1 << 20).await {
+            crate::invariants::check_h3_response(&output);
+            whole += 1;
+        }
+    }
+    conn.close(0x100, b"");
+    whole
+}
+
+#[test]
+fn connections_answer_with_well_formed_responses_whatever_the_client_sends() {
+    use crate::invariants::h3_connection::{server, Fuzzed};
+    use crate::invariants::h3_input;
+
+    const ROUNDS: usize = 400;
+    let mut state: u64 = std::env::var("GIONG_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0xE703_7ED1_A0B4_28DB);
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    run(|| async move {
+        let (server_tls, client_tls) = tls();
+        let endpoint = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerConfig::new(server_tls).unwrap(),
+        )
+        .unwrap();
+        let addr: SocketAddr = endpoint.local_addr().unwrap();
+        drop(giong::spawn(async move {
+            server().serve_h3(endpoint, Fuzzed).await
+        }));
+        let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let cfg = ClientConfig::new(client_tls).unwrap();
+        let mut whole = 0;
+        for round in 0..ROUNDS {
+            let len = 1 + next() as usize % 120;
+            let data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let input = h3_input(&data);
+            let played = giong::time::timeout(
+                std::time::Duration::from_secs(10),
+                play(&client, addr, &cfg, &input),
+            )
+            .await;
+            whole += played.unwrap_or_else(|_| panic!("round {round} hangs: {data:?}"));
+        }
+        assert!(whole > ROUNDS / 4, "only {whole} responses");
     });
 }

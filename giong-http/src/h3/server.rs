@@ -543,7 +543,10 @@ async fn request<H: Handler>(
             send.reset(code as u32);
             r.recv.stop(code as u32);
         }
-        Err(Stop::Gone) => {}
+        // Nobody may be left to hear it, but if the client still reads,
+        // it must not take what was written for a whole response:
+        // dropping the stream would end it cleanly.
+        Err(Stop::Gone) => send.reset(Code::RequestCancelled as u32),
     }
 }
 
