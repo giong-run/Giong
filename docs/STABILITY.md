@@ -171,8 +171,9 @@ part of the promise, because callers rely on it as much as on a return value.
 - **A transaction never commits work whose outcome it does not know.** A statement of a
   transaction that was sent and then given up (its future dropped before the answer) may
   have run, so the transaction refuses `commit` with a coded error and has to be rolled
-  back (dropping it does that). giong-mysql does this today (`Tx::Abandoned`). *Known gap
-  on `main`, fixed before 1.0.0-rc.1: giong-postgres's `commit` still commits.*
+  back (dropping it does that). A statement whose answer had arrived before
+  its future was dropped does not count: its outcome is known. giong-postgres and
+  giong-mysql both do this.
 
 ## Defaults you can rely on
 

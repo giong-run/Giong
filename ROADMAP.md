@@ -406,13 +406,15 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       reused descriptor number cannot fool). `a_dropped_close_still_closes_on_the_epoll_driver`
       in `tests/cancel.rs` and `a_dropped_close_still_closes` in `src/driver/uring.rs`;
       both failed before the fix (#159).
-- [ ] **A PostgreSQL transaction refuses to commit after a statement in it was given up**,
+- [x] **A PostgreSQL transaction refuses to commit after a statement in it was given up**,
       as giong-mysql's already does: `commit` returns a coded error and the transaction
       has to be rolled back. *Test*, on the PostgreSQL server CI starts: begin, insert a
       row, send a statement and drop its future before the answer, check that `commit`
       fails with the code, roll back, and check from a second connection that the row is
       not there. A statement whose answer had arrived before its future was dropped does
       not block the commit. The same test runs against giong-mysql.
+      `a_statement_given_up_inside_a_transaction_stops_the_commit` in both crates'
+      tests (#158).
 - [ ] **Defaults callers rely on**, in [STABILITY.md](docs/STABILITY.md#defaults-you-can-rely-on):
       whether each limit waits or refuses by default, and the rule that 1.x never changes
       which; a new early refusal (overload, tenant budget) is a setting that is off by

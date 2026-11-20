@@ -946,6 +946,7 @@ fn a_write_waiting_for_a_table_lock_is_bounded_by_the_statement_timeout() {
 fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
     run(|s| async move {
         let mut client = connect(s).await;
+        let other = connect(s).await;
         table(&client, "given_up", "id INT").await;
         let tx = client.transaction().await.unwrap();
         tx.execute("INSERT INTO given_up VALUES (1)", &[])
@@ -960,7 +961,24 @@ fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
         assert!(late.is_err());
         let e = tx.commit().await.unwrap_err();
         assert!(e.to_string().contains("given up"), "{e}");
+        assert_eq!(e.kind(), ErrorKind::Db);
+        // Once the late statement has run and the rollback after it, another
+        // connection sees none of the transaction.
+        client.batch_execute("SELECT 1").await.unwrap();
+        assert_eq!(count(&other, "given_up").await, 0, "rolled back");
         assert_eq!(count(&client, "given_up").await, 0, "rolled back");
+        // Answered before its future was dropped: its outcome is known, so it
+        // does not stop the commit. (The statement is cached, so the first
+        // poll sends it.)
+        let tx = client.transaction().await.unwrap();
+        let insert = "INSERT INTO given_up VALUES (?)";
+        tx.execute(insert, &[&4i32]).await.unwrap();
+        let mut answered = Box::pin(tx.execute(insert, &[&5i32]));
+        assert!(poll_fn(|cx| Poll::Ready(answered.as_mut().poll(cx).is_pending())).await);
+        tx.batch_execute("SELECT 1").await.unwrap();
+        drop(answered);
+        tx.commit().await.unwrap();
+        assert_eq!(count(&other, "given_up").await, 2);
     });
 }
 
