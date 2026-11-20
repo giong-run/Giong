@@ -15,8 +15,9 @@
 #                                      giong-tls' kernel TLS tests run (and
 #                                      must: GIONG_KTLS_REQUIRED is set)
 #   SOAK_SECS=60 scripts/kernels.sh 6.18.63
-#                                      then run the soak test (tests/soak.rs)
-#                                      that long, on that kernel's receive path
+#                                      then run the soak tests (tests/soak.rs
+#                                      and giong-tls/tests/soak.rs) that long
+#                                      each, on that kernel's receive path
 #
 # The guest also checks which driver giong chooses by itself: epoll on kernels
 # older than 6.0, io_uring from 6.0 on (GIONG_TEST_EXPECT_DRIVER overrides
@@ -156,13 +157,14 @@ for t in /tests/*; do
     fi
 done
 if [ -n "${soak:-}" ]; then
-    # The soak test is ignored in the run above; it gets its own here.
+    # The soak tests (the runtime's and giong-tls') are ignored in the run
+    # above; each gets its own here.
     for t in /tests/soak-*; do
-        echo "GIONG-RUN soak for ${soak} s"
+        echo "GIONG-RUN $(basename "$t") for ${soak} s"
         if [ -e "$t" ] && GIONG_SOAK_SECS="$soak" "$t" -q --ignored --exact soak --nocapture; then
-            echo "GIONG-PASS soak"
+            echo "GIONG-PASS $(basename "$t") soak"
         else
-            echo "GIONG-FAIL soak"
+            echo "GIONG-FAIL $(basename "$t") soak"
             failed=$((failed + 1))
         fi
     done
