@@ -720,10 +720,11 @@ fn unsupported(kind: DriverKind) -> io::Error {
 
 /// Wakes a worker that sleeps in its driver, from any thread.
 ///
-/// The driver owns the mechanism and hands this out with
-/// [`Driver::waker`]: an eventfd read by the ring or watched by epoll on
-/// Linux, a pipe watched by kqueue on macOS (a completion packet posted to
-/// the port would be the Windows one). What every driver's handle keeps:
+/// Each driver makes its own wake-up when it is created and hands this out
+/// with [`Driver::waker`], one variant per mechanism: an eventfd read by the
+/// ring or watched by epoll on Linux (a user event of the kqueue, or a
+/// completion packet posted to the port, would be others). What every
+/// variant keeps:
 ///
 /// - it is `Send`, `Sync` and `Clone`, and [`ring`](Self::ring) may be
 ///   called from any thread, any number of times, without blocking;
@@ -731,21 +732,28 @@ fn unsupported(kind: DriverKind) -> io::Error {
 ///   `park` returns at once;
 /// - it may outlive the driver and its worker; ringing then does nothing.
 #[derive(Clone)]
-pub(crate) struct WakeHandle(std::sync::Arc<crate::sys::Bell>);
+pub(crate) enum WakeHandle {
+    /// A bell the driver watches: io_uring reads it, epoll polls it.
+    #[cfg(unix)]
+    Bell(std::sync::Arc<crate::sys::Bell>),
+}
 
 impl WakeHandle {
-    fn new() -> io::Result<Self> {
-        Ok(Self(std::sync::Arc::new(crate::sys::Bell::new_worker()?)))
-    }
-
     /// Wakes the worker, or makes its next `park` return at once.
     pub(crate) fn ring(&self) {
-        self.0.ring();
+        match self {
+            #[cfg(unix)]
+            WakeHandle::Bell(bell) => bell.ring(),
+        }
     }
 
-    /// The descriptor the driver waits on.
-    fn fd(&self) -> RawFd {
-        self.0.read_fd()
+    /// Resets the wake-up once the driver saw it, where it does not reset
+    /// itself.
+    fn seen(&self) {
+        match self {
+            #[cfg(unix)]
+            WakeHandle::Bell(bell) => bell.drain(),
+        }
     }
 }
 
@@ -760,24 +768,21 @@ impl Driver {
         pool: Rc<BufPool>,
     ) -> io::Result<(Self, DriverChoice)> {
         let _ = entries;
-        // One wake-up handle, whichever driver comes up (io_uring may give
-        // way to epoll below).
-        let wake = WakeHandle::new()?;
         #[allow(unused_mut)]
         let mut io_uring_error: Option<io::Error> = None;
         let driver = match choice {
             #[cfg(target_os = "linux")]
-            Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool, wake)?),
+            Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool)?),
             #[cfg(target_os = "linux")]
-            Some(DriverKind::Epoll) => Driver::Epoll(readiness::Readiness::new(pool, wake)?),
+            Some(DriverKind::Epoll) => Driver::Epoll(readiness::Readiness::new(pool)?),
             // Reachable for the drivers this build does not have.
             #[allow(unreachable_patterns)]
             Some(other) => return Err(unsupported(other)),
             #[cfg(target_os = "linux")]
-            None => match uring::Uring::new(entries, pool.clone(), wake.clone()) {
+            None => match uring::Uring::new(entries, pool.clone()) {
                 Ok(ring) => Driver::Uring(ring),
                 Err(e) if io_uring_unusable(&e) => {
-                    let driver = Driver::Epoll(readiness::Readiness::new(pool, wake)?);
+                    let driver = Driver::Epoll(readiness::Readiness::new(pool)?);
                     report_fallback(&e);
                     io_uring_error = Some(e);
                     driver

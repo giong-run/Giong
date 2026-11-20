@@ -30,6 +30,17 @@ impl Poller for Epoll {
         })
     }
 
+    fn waker(&self) -> io::Result<super::WakeHandle> {
+        let bell = std::sync::Arc::new(crate::sys::Bell::new_worker()?);
+        // The bell is drained after every wake-up, so it must not block
+        // when another thread got there first. (Under Miri, which has no
+        // `fcntl` on eventfds, it is created non-blocking instead.)
+        #[cfg(not(miri))]
+        super::readiness::set_nonblocking(bell.read_fd())?;
+        self.watch(bell.read_fd(), super::readiness::WAKE)?;
+        Ok(super::WakeHandle::Bell(bell))
+    }
+
     fn watch(&self, fd: RawFd, token: u64) -> io::Result<()> {
         let mut ev = libc::epoll_event {
             events: libc::EPOLLIN as u32,

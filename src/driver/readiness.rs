@@ -58,6 +58,10 @@ use crate::sys;
 pub(crate) trait Poller: Sized {
     /// Creates the event queue.
     fn new() -> io::Result<Self>;
+    /// Makes the worker's wake-up: ringing it from any thread makes
+    /// [`wait`](Self::wait) report an event with the token [`WAKE`], and
+    /// [`WakeHandle::seen`](super::WakeHandle) resets it. Called once.
+    fn waker(&self) -> io::Result<super::WakeHandle>;
     /// Watches a bell for readability, level-triggered.
     fn watch(&self, fd: RawFd, token: u64) -> io::Result<()>;
     /// Registers a descriptor for reading and writing, edge-triggered;
@@ -353,10 +357,8 @@ unsafe fn run_blocking(io: Io) -> i32 {
 pub(crate) struct Readiness<P: Poller> {
     poller: P,
     pool: Rc<BufPool>,
-    /// The read end of the worker's wake-up bell, rung by threads that wake
-    /// it.
-    wake_fd: RawFd,
-    /// Owns `wake_fd`.
+    /// The worker's wake-up, made by the poller and rung by threads that
+    /// wake this worker.
     wake: super::WakeHandle,
     completions: Arc<Completions>,
     ops: Slab<EOp>,
@@ -383,14 +385,13 @@ pub(crate) struct Readiness<P: Poller> {
 }
 
 impl<P: Poller> Readiness<P> {
-    pub(crate) fn new(pool: Rc<BufPool>, wake: super::WakeHandle) -> io::Result<Self> {
-        let wake_fd = wake.fd();
+    pub(crate) fn new(pool: Rc<BufPool>) -> io::Result<Self> {
         let poller = P::new()?;
+        let wake = poller.waker()?;
         let completions = Completions::new()?;
         let driver = Self {
             poller,
             pool,
-            wake_fd,
             wake,
             completions,
             ops: Slab::new(),
@@ -404,12 +405,6 @@ impl<P: Poller> Readiness<P> {
             quieting: Vec::new(),
             graveyard: Vec::new(),
         };
-        // The worker's bell is drained after every wake-up, so it must not
-        // block when another thread got there first. (Under Miri, which has
-        // no `fcntl` on eventfds, it is created non-blocking instead.)
-        #[cfg(not(miri))]
-        set_nonblocking(wake_fd)?;
-        driver.poller.watch(wake_fd, WAKE)?;
         driver.poller.watch(driver.completions.fd(), DONE)?;
         Ok(driver)
     }
@@ -1303,7 +1298,7 @@ impl<P: Poller> Readiness<P> {
         for i in 0..n {
             let (token, readable, writable) = self.poller.event(i);
             match token {
-                WAKE => sys::drain(self.wake_fd),
+                WAKE => self.wake.seen(),
                 DONE => {} // collected below
                 token => {
                     let fd = token as u32 as usize;
@@ -1465,7 +1460,7 @@ fn pooled_flags(bid: u16) -> u32 {
 
 /// Puts `fd` in non-blocking mode.
 #[cfg(not(miri))]
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub(super) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     let mut on: libc::c_int = 1;
     // SAFETY: FIONBIO reads an int from a valid pointer.
     if unsafe { libc::ioctl(fd, libc::FIONBIO, &mut on) } < 0 {
@@ -1477,7 +1472,7 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 /// Puts `fd` in non-blocking mode. Miri has no `ioctl(FIONBIO)`, but has
 /// `fcntl` for pipes and sockets.
 #[cfg(miri)]
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+pub(super) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     // SAFETY: plain syscalls on a descriptor; the results are checked.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);

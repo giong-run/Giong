@@ -78,9 +78,10 @@ one driver for its whole life, the enum is already there, `DriverKind` is
 the public API. A trait object would add an indirect call to every
 operation.
 
-**The wake-up belongs to the driver.** `Driver::new` makes the worker's
-wake-up and every driver keeps it; `Driver::waker()` hands out a
-`WakeHandle`. The contract, which every driver's handle keeps:
+**The wake-up belongs to the driver.** Each driver makes its worker's
+wake-up when it is created (the readiness driver asks its `Poller` for
+it); `Driver::waker()` hands out a `WakeHandle`, an enum with one variant
+per mechanism. The contract, which every variant keeps:
 
 - it is `Send + Sync + Clone`, and `ring()` may be called from any thread;
 - `ring()` never blocks and reports no error;
@@ -89,10 +90,11 @@ wake-up and every driver keeps it; `Driver::waker()` hands out a
 - a handle may outlive its driver: ringing it then does nothing, and never
   touches a descriptor or handle that was closed or reused.
 
-On Linux the handle is an `Arc` around the same `eventfd` as before
-(io_uring reads it, epoll watches it), so the system calls did not change.
-kqueue can put `EVFILT_USER` behind it and IOCP
-`PostQueuedCompletionStatus`, without touching the runtime. The worker's
+On Linux the only variant is an `Arc` around the same `eventfd` as before
+(io_uring reads it, epoll watches it and drains it), so the system calls of
+a wake-up did not change. kqueue adds a variant that triggers
+`EVFILT_USER` and IOCP one that calls `PostQueuedCompletionStatus`,
+without touching the runtime. The worker's
 shared state holds the handle in a `OnceLock`, set on the worker's thread
 as soon as the driver exists. Another thread rings it only when the
 doorbell says the worker sleeps, and a worker cannot sleep before it has a
@@ -107,11 +109,12 @@ table with generations, the batched datagram receive, and the rule that a
 busy datagram socket leaves the poller's set. Only registration and waiting were epoll's. It is
 now `Readiness<P: Poller>` (`src/driver/readiness.rs`, the old `epoll.rs`;
 most lines changed, so git shows a new file, and `git log --follow -M30%`
-finds the history), with a seven-method trait:
+finds the history), with an eight-method trait:
 
 ```rust
 trait Poller {
     fn new() -> io::Result<Self>;
+    fn waker(&self) -> io::Result<WakeHandle>;           // rings report token WAKE
     fn watch(&self, fd, token) -> io::Result<()>;        // a bell, level-triggered
     fn register(&self, fd, token) -> Result<(), i32>;    // read+write, edge-triggered
     fn rearm(&self, fd, token) -> i32;                   // back into the set; -errno
