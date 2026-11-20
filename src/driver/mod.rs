@@ -23,6 +23,7 @@
 //! the socket code above has a single path.
 
 mod blocking;
+mod budget;
 #[cfg(target_os = "linux")]
 mod epoll;
 mod readiness;
@@ -43,7 +44,7 @@ use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 use crate::sys::{MsgHdr, PathChar, RawFile, RawSock, SockAddr, SockLen};
 
-pub(crate) use readiness::{refill_budget, spend_budget};
+pub(crate) use budget::{refill_budget, spend_budget};
 
 /// Which I/O driver a worker uses: io_uring, the default, or epoll where
 /// io_uring is not available (see [`Builder::driver`](crate::Builder::driver)).
@@ -596,7 +597,7 @@ macro_rules! split {
 /// Runs a non-blocking send for [`Driver::try_send_to`]: its result, or
 /// `None` when the socket is full or the task's budget is spent.
 fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
-    if !readiness::spend_budget() {
+    if !budget::spend_budget() {
         return None;
     }
     loop {
@@ -612,7 +613,7 @@ fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
             libc::EAGAIN => {
                 // Full: the operation the caller submits instead waits for
                 // room, and takes its own unit of the budget.
-                readiness::give_back_budget();
+                budget::give_back_budget();
                 return None;
             }
             e => return Some(-e),
@@ -630,7 +631,7 @@ fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
 /// the task's budget is spent, so a loop over cached reads still yields.
 pub(crate) fn read_cached(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Option<i32> {
     // Miri cannot run `preadv2`: every read goes through the driver there.
-    if cfg!(miri) || len == 0 || offset > i64::MAX as u64 || !readiness::spend_budget() {
+    if cfg!(miri) || len == 0 || offset > i64::MAX as u64 || !budget::spend_budget() {
         return None;
     }
     let iov = libc::iovec {
@@ -644,7 +645,7 @@ pub(crate) fn read_cached(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Opt
         return Some(res as i32);
     }
     // The driver's operation takes its own unit of the budget.
-    readiness::give_back_budget();
+    budget::give_back_budget();
     None
 }
 

@@ -29,12 +29,11 @@
 //!
 //! An operation that finishes at once does not yield, so a task whose every
 //! read and write succeeds immediately could keep the worker to itself. A
-//! budget of [`BUDGET`] immediate operations per task poll prevents that:
+//! budget of [`BUDGET`](super::budget::BUDGET) immediate operations per task poll prevents that:
 //! once it is spent, operations report "pending" and wake their task again,
 //! which puts it at the back of the run queue.
 
 use std::any::Any;
-use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::mem;
@@ -46,6 +45,7 @@ use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use super::blocking::{self, Cancel, Completions};
+use super::budget::spend_budget;
 use super::{Io, MultiIo, MultiKind, MultiPoll, Park, Start, BUFFER_SHIFT, F_BUFFER, F_MORE};
 use crate::buf::{BufPool, RecvBuf};
 use crate::slab::Slab;
@@ -84,36 +84,6 @@ pub(crate) trait Poller: Sized {
     /// "readable" and "writable" (end of stream and errors count as both
     /// where they apply).
     fn event(&self, i: usize) -> (u64, bool, bool);
-}
-
-/// Immediate operations a task may complete in one poll before it yields.
-pub(crate) const BUDGET: u32 = 128;
-
-thread_local! {
-    /// What is left of the current task's [`BUDGET`].
-    static LEFT: Cell<u32> = const { Cell::new(BUDGET) };
-}
-
-/// Gives the task about to be polled a full budget. Called by the executor.
-pub(crate) fn refill_budget() {
-    LEFT.with(|left| left.set(BUDGET));
-}
-
-/// Takes one unit of the current task's budget; `false` if it is spent.
-/// Both drivers count immediate sends of datagrams against it.
-pub(crate) fn spend_budget() -> bool {
-    LEFT.with(|left| match left.get() {
-        0 => false,
-        n => {
-            left.set(n - 1);
-            true
-        }
-    })
-}
-
-/// Returns a unit taken by [`spend_budget`] for work that was not done.
-pub(crate) fn give_back_budget() {
-    LEFT.with(|left| left.set(left.get().saturating_add(1).min(BUDGET)));
 }
 
 /// Token of the worker's wake-up bell (cross-thread wake-ups).
