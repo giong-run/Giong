@@ -35,6 +35,14 @@ rcgen = "0.13"
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "tls12"] }
 # A TCP socket that is bound but does not listen. Already a dependency of giong.
 socket2 = "0.6"
+# An HTTP/3 client that is not giong's own, on Tokio in a thread of its own,
+# against `Server::serve_h3`.
+bytes = "1.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.2"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "1.38", features = ["rt", "net", "time", "macros"] }
 
 [[test]]
 name = "tls"
@@ -47,6 +55,10 @@ required-features = ["client", "tls"]
 [[test]]
 name = "client_h2"
 required-features = ["client", "tls"]
+
+[[test]]
+name = "h3"
+required-features = ["unstable-http3"]
 
 [[example]]
 name = "h2"
