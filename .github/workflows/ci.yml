@@ -694,12 +694,35 @@ jobs:
       # the largest alone).
       - run: KANI_JOBS=2 scripts/check.sh kani
 
+  # giong-quic, a crate with a workspace of its own while it is being built
+  # (quinn-proto, behind its API for now, needs a newer compiler than the
+  # workspace's 1.80): format, lints, and its tests, which run its own
+  # client against its own server and quinn against it.
+  quic:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: giong-quic
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # As in the `test` job: every runtime of the tests gets io_uring.
+      - run: ulimit -l && sudo prlimit --pid $$ --memlock=unlimited:unlimited && ulimit -l && cargo test
+
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
   # Docker, the other server versions, loom, h2spec, the lowest dependency
   # versions, the simulation) hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic]
     if: always()
     runs-on: ubuntu-24.04
     steps:

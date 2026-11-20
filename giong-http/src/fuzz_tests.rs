@@ -273,6 +273,43 @@ fn hpack_decodes_or_fails_cleanly_and_round_trips_whatever_the_blocks() {
 }
 
 #[test]
+fn http3_frames_and_qpack_read_or_fail_cleanly_whatever_the_bytes() {
+    use crate::invariants::{check_h3_frames, check_qpack};
+    // A SETTINGS frame, HEADERS and DATA headers, GOAWAY, a reserved type.
+    let frames: &[&[u8]] = &[
+        b"\x04\x06\x06\x80\x01\x00\x00\x01\x00",
+        b"\x01\x40\x52",
+        b"\x00\x80\x01\x00\x00",
+        b"\x07\x01\x08",
+        b"\x40\x40\x00",
+    ];
+    // RFC 9204, B.1, and a section with each static representation.
+    let sections: &[&[u8]] = &[
+        b"\x00\x00\x51\x0b/index.html",
+        b"\x00\x00\xd1\xd7\xc1\x50\x8c\xf1\xe3\xc2\xe5\xf2\x3a\x6b\xa0\xab\x90\xf4\xff",
+        b"\x00\x00\x23x-a\x03abc\x7f\x45\x01x\x5f\x50\x01a",
+    ];
+    for seed in frames {
+        assert!(check_h3_frames(seed));
+    }
+    for seed in sections {
+        assert!(check_qpack(seed));
+    }
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let (mut accepted, mut decoded) = (0, 0);
+    for round in 0..100_000 {
+        let mut input = frames[round % frames.len()].to_vec();
+        mutate(&mut rng, &mut input);
+        accepted += usize::from(check_h3_frames(&input));
+        let mut input = sections[round % sections.len()].to_vec();
+        mutate(&mut rng, &mut input);
+        decoded += usize::from(check_qpack(&input));
+    }
+    assert!(accepted > 1_000, "only {accepted} frame headers accepted");
+    assert!(decoded > 1_000, "only {decoded} sections decoded");
+}
+
+#[test]
 fn http2_connections_answer_with_well_formed_frames_whatever_the_client_sends() {
     use std::cell::RefCell;
     use std::rc::Rc;

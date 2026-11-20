@@ -91,6 +91,8 @@ mod date;
 #[cfg(test)]
 mod fuzz_tests;
 mod h2;
+#[cfg(any(feature = "unstable-http3", test, fuzzing))]
+mod h3;
 mod heap;
 #[cfg(any(test, fuzzing))]
 mod invariants;
@@ -115,7 +117,7 @@ pub mod fuzzing {
         check_h2_client, check_inflate, check_response_body, check_response_head, check_url,
     };
     pub use crate::invariants::{
-        check_chunked, check_h2_output, check_head, check_hpack, check_huffman, h2_connection,
-        h2_input,
+        check_chunked, check_h2_output, check_h3_frames, check_head, check_hpack, check_huffman,
+        check_qpack, h2_connection, h2_input,
     };
 }

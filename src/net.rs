@@ -21,7 +21,7 @@ mod balance;
 pub(crate) mod dns;
 mod sendq;
 mod share;
-mod udp;
+pub(crate) mod udp;
 mod unix;
 
 pub use addr::{lookup_host, ToSocketAddrs};

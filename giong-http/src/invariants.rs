@@ -640,3 +640,57 @@ pub mod h2_connection {
         input
     }
 }
+
+// ------------------------------------------------------------------ HTTP/3
+
+/// Checks QPACK on `input` (see `h3::qpack::check`).
+pub fn check_qpack(input: &[u8]) -> bool {
+    crate::h3::qpack::check(input)
+}
+
+/// What HTTP/3 framing must guarantee for any bytes: reading never panics
+/// and never claims more than it was given; a frame header that reads
+/// writes back to bytes that read the same; SETTINGS and the one-integer
+/// frames parse or fail cleanly. Returns `true` if `input` starts with a
+/// frame header a server accepts.
+pub fn check_h3_frames(input: &[u8]) -> bool {
+    use crate::h3::frame::{
+        parse_single_id, read_varint, write_varint, Header, Need, On, Settings,
+    };
+    if let Some((value, used)) = read_varint(input) {
+        assert!(used <= input.len() && matches!(used, 1 | 2 | 4 | 8));
+        let mut out = Vec::new();
+        write_varint(&mut out, value);
+        assert!(out.len() <= used);
+        assert_eq!(read_varint(&out), Some((value, out.len())));
+    }
+    let mut accepted = false;
+    for on in [On::Control, On::Request] {
+        if let Ok(Need::Got(header)) = Header::read(input, on) {
+            assert!(header.size <= input.len());
+            let mut out = Vec::new();
+            Header::write(&mut out, header.kind, header.len);
+            assert_eq!(
+                Header::read(&out, on),
+                Ok(Need::Got(Header {
+                    size: out.len(),
+                    ..header
+                }))
+            );
+            accepted = true;
+        }
+    }
+    if let Ok(settings) = Settings::parse(input) {
+        let mut out = Vec::new();
+        Settings::write_frame(&mut out, settings.max_field_section_size);
+        let Ok(Need::Got(header)) = Header::read(&out, On::Control) else {
+            panic!("our SETTINGS frame has a header");
+        };
+        let ours = Settings::parse(&out[header.size..]).expect("our SETTINGS parse");
+        assert_eq!(ours.max_field_section_size, settings.max_field_section_size);
+    }
+    if let Ok(id) = parse_single_id(input) {
+        assert_eq!(read_varint(input), Some((id, input.len())));
+    }
+    accepted
+}

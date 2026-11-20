@@ -87,3 +87,10 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "h3"
+path = "fuzz_targets/h3.rs"
+test = false
+doc = false
+bench = false
