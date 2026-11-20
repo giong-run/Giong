@@ -88,7 +88,13 @@ impl Owned {
     /// Takes over the reference a `Copy` or `Create` function returned.
     /// `None` for null.
     fn new(cf: CFTypeRef) -> Option<Self> {
-        (!cf.is_null()).then_some(Self(cf))
+        // Not `then_some`: it would build the value for null too and drop
+        // it, and releasing null stops the process.
+        if cf.is_null() {
+            None
+        } else {
+            Some(Self(cf))
+        }
     }
 
     fn string(text: &str) -> Option<Self> {
@@ -309,6 +315,11 @@ mod tests {
         let mut store = rustls::RootCertStore::empty();
         let (added, _ignored) = store.add_parsable_certificates(roots);
         assert!(added > 50, "rustls took only {added}");
+    }
+
+    #[test]
+    fn null_is_not_an_object_and_is_never_released() {
+        assert!(Owned::new(ptr::null()).is_none());
     }
 
     #[test]

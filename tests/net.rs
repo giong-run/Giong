@@ -663,7 +663,7 @@ fn accept_many_connections() {
             clients.push(TcpStream::connect(addr).await.unwrap());
         }
         assert_eq!(server.await.unwrap(), N);
-        let mut seen = vec![false; N];
+        let mut seen = [false; N];
         for c in &clients {
             let id = u32::from_le_bytes(recv_exact(c, 4).await.try_into().unwrap()) as usize;
             assert!(!seen[id]);
@@ -784,14 +784,10 @@ fn accept_backlog_is_bounded_and_no_connection_is_lost() {
     // More pending connections than the driver is willing to queue (1024):
     // the multishot accept must pause, leave the rest in the kernel's listen
     // backlog, and resume once the application catches up.
-    // macOS keeps at most 128 connections waiting on a listener
-    // (`kern.ipc.somaxconn`) and drops the rest, so fewer go over the
-    // driver's limit there.
-    const N: usize = if cfg!(target_os = "macos") {
-        1100
-    } else {
-        1300
-    };
+    // The kqueue driver accepts only when asked, so on macOS all of them
+    // wait in the kernel, which keeps at most 128 (`kern.ipc.somaxconn`)
+    // and drops the rest: fewer there, and none may be lost.
+    const N: usize = if cfg!(target_os = "macos") { 100 } else { 1300 };
     // Every client, up to 1024 accepted sockets queued in the driver, and
     // room for the other tests.
     allow_open_files(N as u64 + 1024 + 1024);
@@ -811,7 +807,7 @@ fn accept_backlog_is_bounded_and_no_connection_is_lost() {
         }
         sleep(Duration::from_millis(50)).await;
 
-        let mut seen = vec![false; N];
+        let mut seen = [false; N];
         for _ in 0..N {
             let s = timeout(Duration::from_secs(10), l.accept())
                 .await

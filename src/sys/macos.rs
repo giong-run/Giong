@@ -157,7 +157,20 @@ pub(crate) fn accept(fd: RawFd) -> isize {
 ///
 /// `buf` must be valid for `len` bytes of writes.
 pub(crate) unsafe fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> isize {
-    libc::pread(fd, buf.cast(), len, offset as libc::off_t)
+    no_offsets_on_a_terminal(libc::pread(fd, buf.cast(), len, offset as libc::off_t))
+}
+
+/// macOS refuses `pread` and `pwrite` on a terminal with `ENXIO`, where a
+/// pipe (and everything without offsets on Linux) gets `ESPIPE`: reported
+/// as the latter, which the callers answer with a plain read or write.
+fn no_offsets_on_a_terminal(res: isize) -> isize {
+    // SAFETY: the calling thread's own `errno`.
+    unsafe {
+        if res < 0 && *libc::__error() == libc::ENXIO {
+            *libc::__error() = libc::ESPIPE;
+        }
+    }
+    res
 }
 
 /// `pwrite(2)`.
@@ -172,7 +185,7 @@ pub(crate) unsafe fn pwrite(fd: RawFd, buf: *const u8, len: usize, offset: u64) 
     if libc::fcntl(fd, libc::F_GETFL) & libc::O_APPEND != 0 {
         return libc::write(fd, buf.cast(), len);
     }
-    libc::pwrite(fd, buf.cast(), len, offset as libc::off_t)
+    no_offsets_on_a_terminal(libc::pwrite(fd, buf.cast(), len, offset as libc::off_t))
 }
 
 /// `st_mode` of an open descriptor, from `fstat`.
