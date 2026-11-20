@@ -27,6 +27,15 @@ socket2 = { version = "0.6", features = ["all"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.
