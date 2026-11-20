@@ -347,13 +347,18 @@ impl Drop for Wait {
         if self.done || matches!(self.slot.kind, Kind::Prepare { .. }) {
             return;
         }
-        {
+        // Its answer arrived before the drop: its outcome is known.
+        let known = {
             let mut inner = self.slot.inner.borrow_mut();
             inner.abandoned = true;
             inner.rows = RowsBuilder::default();
-        }
+            inner.outcome.is_some()
+        };
         // The application gave up on a statement of its transaction, which
         // may run all the same: the transaction must not commit it unseen.
+        if known {
+            return;
+        }
         if let Some(conn) = self.slot.in_tx.as_ref().and_then(Weak::upgrade) {
             if matches!(conn.tx.get(), Tx::Open | Tx::Uncertain) {
                 conn.tx.set(Tx::Abandoned);

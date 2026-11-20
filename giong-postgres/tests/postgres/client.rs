@@ -757,11 +757,22 @@ fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
         assert_eq!(count(&other, "given_up").await, 0, "rolled back");
         // The connection is fine for the next transaction.
         let tx = client.transaction().await.unwrap();
-        tx.execute("INSERT INTO given_up VALUES (4)", &[])
+        let insert = "INSERT INTO given_up VALUES ($1)";
+        tx.execute(insert, &[&4i32]).await.unwrap();
+        // Answered before its future was dropped: its outcome is known, so it
+        // does not stop the commit. (The statement is cached, so the first
+        // poll sends it.)
+        let mut answered = Box::pin(tx.execute(insert, &[&5i32]));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(answered.as_mut(), cx).is_pending()
+            ))
             .await
-            .unwrap();
+        );
+        tx.batch_execute("SELECT 1").await.unwrap();
+        drop(answered);
         tx.commit().await.unwrap();
-        assert_eq!(count(&other, "given_up").await, 1);
+        assert_eq!(count(&other, "given_up").await, 2);
     });
 }
 

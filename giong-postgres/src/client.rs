@@ -269,15 +269,16 @@ impl Drop for Wait {
         if matches!(self.slot.kind, Kind::Prepare { .. }) {
             return;
         }
-        let delivered = {
+        // Its answer arrived (handed over or not): its outcome is known.
+        let known = {
             let mut inner = self.slot.inner.borrow_mut();
             inner.abandoned = true;
             inner.rows = RowsBuilder::default();
-            inner.delivered
+            inner.delivered || inner.outcome.is_some()
         };
         // The application gave up on a statement of its transaction, which
         // may run all the same: the transaction must not commit it unseen.
-        if !delivered && self.slot.in_tx.is_some() {
+        if !known && self.slot.in_tx.is_some() {
             abandon_tx(&self.slot);
         }
     }
@@ -1288,8 +1289,8 @@ async fn write_loop(conn: Rc<Conn>) {
 /// sent through it, [`commit`](Self::commit) included, fails with an
 /// [`ErrorKind::Db`] error that says so, and nothing more is sent. Drop the
 /// transaction or [`rollback`](Self::rollback) it, and run it again from the
-/// start. A statement whose result was collected, error or not, does not
-/// count.
+/// start. A statement whose answer had arrived before its future was
+/// dropped does not count: its outcome is known.
 pub struct Transaction<'a> {
     client: &'a mut Client,
     done: bool,

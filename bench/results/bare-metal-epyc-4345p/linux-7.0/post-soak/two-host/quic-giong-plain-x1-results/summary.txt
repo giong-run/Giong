@@ -1,0 +1,5 @@
+median of rounds (min-max in brackets)
+
+rr
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+giong-plain x1    8.397e+05 [8.4e+05-8.4e+05]       0.672 [0.672-0.672]             287 [287-287]          96.5 [96.5-96.5]          1.15 [1.15-1.15]1.177e+04 [1.18e+04-1.18e+04]

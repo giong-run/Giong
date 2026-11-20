@@ -1,0 +1,4 @@
+commit 674c42c709d27f2a8ee707d9d4fe3c844cdb9c17 tree f1b23074c5b3d5914a5c1f2046f6e4ae8d2fd18d
+br-1: 7.0.0-43-generic, driver io_uring, ulimit -n 1048576, ulimit -l 7919472, Combined: 16, irdma loaded: 0, EPP performance
+rustc: rustc 1.100.0 (0ef1bc386 2026-11-09); GIONG_SOAK_SECS=259200
+same tree as main 003d9e5 (PR #125 squash-merged, parent b6d9b4b), so this soak covers main 003d9e5
