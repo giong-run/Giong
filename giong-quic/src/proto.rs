@@ -25,6 +25,7 @@ use quinn_proto::{
 };
 
 use crate::error;
+use crate::route::{self, Forwarded, Member};
 
 /// Datagrams quinn-proto may put in one GSO send. quinn uses 10.
 const GSO_SEGMENTS: usize = 10;
@@ -327,8 +328,21 @@ impl State {
     }
 }
 
-/// The driver task of one endpoint.
-async fn drive(sh: Rc<Shared>) {
+/// What woke the driver.
+enum Woke {
+    Datagram(io::Result<(giong::net::Datagram, SocketAddr)>),
+    Forwarded(Forwarded),
+    Other,
+}
+
+/// The driver task of one endpoint. A server endpoint has a `route`: its
+/// place among the endpoints of the other workers on the same address,
+/// and where the datagrams they pass on arrive.
+async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receiver<Forwarded>)>) {
+    let (mut member, mut inbox) = match route {
+        Some((member, inbox)) => (Some(member), Some(inbox)),
+        None => (None, None),
+    };
     loop {
         let now = Instant::now();
         let (deadline, sends, done) = {
@@ -351,38 +365,77 @@ async fn drive(sh: Rc<Shared>) {
         if done {
             return;
         }
-        // Wait for a datagram, the next deadline, or a handle's call.
-        let recv = pin!(sh.sock.recv_from());
-        let mut recv = recv;
-        let sleep = deadline.map(giong::time::sleep_until);
-        let mut sleep = pin!(sleep);
-        let first = poll_fn(|cx| {
-            if let Poll::Ready(r) = recv.as_mut().poll(cx) {
-                return Poll::Ready(Some(r));
-            }
-            if let Some(s) = sleep.as_mut().as_pin_mut() {
-                if s.poll(cx).is_ready() {
-                    return Poll::Ready(None);
+        // Wait for a datagram, one that another worker passes on, the
+        // next deadline, or a handle's call.
+        let first = {
+            let mut recv = pin!(sh.sock.recv_from());
+            let passed = async {
+                match inbox.as_mut() {
+                    Some(inbox) => inbox.recv().await,
+                    None => std::future::pending().await,
                 }
-            }
-            let mut st = sh.st.borrow_mut();
-            if st.wake {
-                return Poll::Ready(None);
-            }
-            st.driver_waker = Some(cx.waker().clone());
-            Poll::Pending
-        })
-        .await;
-        let Some(first) = first else { continue };
+            };
+            let mut passed = pin!(passed);
+            let sleep = deadline.map(giong::time::sleep_until);
+            let mut sleep = pin!(sleep);
+            poll_fn(|cx| {
+                if let Poll::Ready(r) = recv.as_mut().poll(cx) {
+                    return Poll::Ready(Woke::Datagram(r));
+                }
+                if let Poll::Ready(Some(datagram)) = passed.as_mut().poll(cx) {
+                    return Poll::Ready(Woke::Forwarded(datagram));
+                }
+                if let Some(s) = sleep.as_mut().as_pin_mut() {
+                    if s.poll(cx).is_ready() {
+                        return Poll::Ready(Woke::Other);
+                    }
+                }
+                let mut st = sh.st.borrow_mut();
+                if st.wake {
+                    return Poll::Ready(Woke::Other);
+                }
+                st.driver_waker = Some(cx.waker().clone());
+                Poll::Pending
+            })
+            .await
+        };
         let now = Instant::now();
+        let first = match first {
+            Woke::Datagram(r) => r,
+            Woke::Forwarded(first) => {
+                // What the other workers passed on, a batch at most.
+                let mut next = Some(first);
+                let mut n = 0;
+                while let Some(d) = next {
+                    let data = BytesMut::from(&d.data[..]);
+                    sh.st
+                        .borrow_mut()
+                        .handle(now, d.from, d.ecn, data, d.segment);
+                    n += 1;
+                    next = match inbox.as_mut() {
+                        Some(inbox) if n < RECV_BATCH => inbox.try_recv().ok(),
+                        _ => None,
+                    };
+                }
+                continue;
+            }
+            Woke::Other => continue,
+        };
         let mut next = Some(first);
         let mut n = 0;
         while let Some(r) = next {
             if let Ok((dg, from)) = r {
-                let data = BytesMut::from(dg.as_slice());
                 let (seg, ecn) = (dg.segment_size(), dg.ecn());
-                drop(dg);
-                sh.st.borrow_mut().handle(now, from, ecn, data, seg);
+                match member.as_mut() {
+                    Some(member) => {
+                        deliver(&sh, member, now, from, ecn, dg.as_slice(), seg);
+                    }
+                    None => {
+                        let data = BytesMut::from(dg.as_slice());
+                        drop(dg);
+                        sh.st.borrow_mut().handle(now, from, ecn, data, seg);
+                    }
+                }
             }
             n += 1;
             next = if n < RECV_BATCH {
@@ -395,6 +448,52 @@ async fn drive(sh: Rc<Shared>) {
             } else {
                 None
             };
+        }
+    }
+}
+
+/// A receive of a server endpoint: handled here, or passed on to the
+/// worker that owns its connection (see [`route`]).
+fn deliver(
+    sh: &Shared,
+    member: &mut Member,
+    now: Instant,
+    from: SocketAddr,
+    ecn: u8,
+    data: &[u8],
+    seg: Option<usize>,
+) {
+    let me = member.worker();
+    let whole = seg.unwrap_or(data.len()).max(1);
+    // Datagrams received as one mostly go the same way; when they do not,
+    // each goes its own.
+    let (step, seg) = match route::owner_of_all(data, whole, me) {
+        Ok(None) => {
+            let data = BytesMut::from(data);
+            sh.st.borrow_mut().handle(now, from, ecn, data, seg);
+            return;
+        }
+        Ok(Some(_)) => (data.len().max(1), seg),
+        Err(route::Mixed) => (whole, None),
+    };
+    for part in data.chunks(step) {
+        let mut here = Some(part);
+        if let Some(worker) = crate::native::cid::owner(part, me) {
+            let passed = Forwarded {
+                data: part.to_vec(),
+                from,
+                ecn,
+                segment: seg,
+            };
+            // Given back when no endpoint of that worker is there: the
+            // packet is then answered as any that is not known.
+            if member.forward(worker, passed).is_none() {
+                here = None;
+            }
+        }
+        if let Some(part) = here {
+            let data = BytesMut::from(part);
+            sh.st.borrow_mut().handle(now, from, ecn, data, seg);
         }
     }
 }
@@ -413,7 +512,16 @@ pub(crate) fn bind(
     } else {
         1
     };
-    let ep = quinn_proto::Endpoint::new(Arc::new(EndpointConfig::default()), server, true, None);
+    // Connection IDs name this worker, so that another worker that gets
+    // one of this endpoint's packets knows where it belongs.
+    let worker = giong::worker_id() as u16;
+    let mut config = EndpointConfig::default();
+    config.cid_generator(move || Box::new(route::WorkerCids { worker }));
+    let route = match &server {
+        Some(_) => Some(Member::join(sock.local_addr()?, worker)),
+        None => None,
+    };
+    let ep = quinn_proto::Endpoint::new(Arc::new(config), server, true, None);
     let sh = Rc::new(Shared {
         sock,
         st: RefCell::new(State {
@@ -433,7 +541,7 @@ pub(crate) fn bind(
             spare: Vec::new(),
         }),
     });
-    giong::spawn(drive(sh.clone()));
+    giong::spawn(drive(sh.clone(), route));
     Ok(sh)
 }
 

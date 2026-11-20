@@ -1,7 +1,7 @@
 //! A quick stand-in for the fuzz target in fuzz/ (which needs nightly):
 //! millions of random and mutated packets through the native parser.
 
-use giong_quic::native::packet;
+use giong_quic::native::{cid, packet};
 
 fn xorshift(s: &mut u64) -> u64 {
     *s ^= *s << 13;
@@ -34,6 +34,12 @@ fn random_and_mutated_packets_never_panic() {
         if xorshift(&mut s) % 8 == 0 {
             let cut = (xorshift(&mut s) as usize) % (p.len() + 1);
             p.truncate(cut);
+        }
+        // Passed on only to another worker, the one its ID names.
+        let me = (xorshift(&mut s) % 4) as u16;
+        if let Some(worker) = cid::owner(&p, me) {
+            assert!(worker != me && p[0] & 0x80 == 0);
+            assert_eq!(cid::worker_of(&p[1..1 + cid::LEN]), Some(worker));
         }
         let cid_len = (xorshift(&mut s) % 21) as usize;
         if let Ok(h) = packet::parse(&p, cid_len) {

@@ -66,7 +66,7 @@ win and GSO/GRO either way.
   Every connection ID a giong server issues names its worker
   (`native::cid`, QUIC-LB style: 8 bytes, worker index in bytes 1-2). Step
   one: the receiving worker forwards the datagram to the owner over a
-  cross-worker queue (`Handle::spawn_on`-like, measured). Step two, only
+  cross-worker queue (done, `src/route.rs`). Step two, only
   with a benchmark: a `SO_REUSEPORT` eBPF program reads the same bytes and
   picks the socket directly. The main risk (plan, section 5): eBPF needs
   `CAP_BPF`/`CAP_SYS_ADMIN` to attach and is unavailable in some containers,
@@ -130,6 +130,12 @@ Done on the branch:
   and epoll; tests in `tests/udp_offload.rs`; codes `GIONG-E0110`/`E0111`.
 - giong-quic API on quinn-proto: own client and server, quinn interop test,
   GRO/GSO/ECN used when available.
+- Routing after migration, step one: the connection IDs of every endpoint
+  name its worker (`route::WorkerCids`), and a server endpoint passes a
+  short-header packet of another worker's connection on to that worker's
+  endpoint over a bounded queue (`src/route.rs`; a full queue drops, an
+  unknown worker is answered here). `tests/route.rs`: four workers and a
+  client seen at twelve addresses keep one connection on one worker.
 - Native: varints (RFC 9000 A.1 examples), packet numbers (A.2, A.3),
   headers for v1 and v2, in-place seal/open checked byte for byte against
   the RFC 9369 server Initial, worker-routable connection IDs; fuzz target
@@ -138,7 +144,7 @@ Done on the branch:
 Next, in order: frames (ACK, CRYPTO, STREAM, flow control) with fuzz
 targets; the handshake through `rustls::quic::Connection`; loss recovery
 and NewReno then CUBIC (RFC 9002); the interop endpoint image; then
-forwarding between workers and the eBPF steering measurement.
+the eBPF steering measurement.
 
 Not decided: giong-quic's MSRV. quinn-proto 0.11.19 needs Rust 1.85
 (giong's libraries: 1.80); either pin an older quinn-proto for the fallback

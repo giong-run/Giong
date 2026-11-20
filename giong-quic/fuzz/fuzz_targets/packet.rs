@@ -1,6 +1,6 @@
 //! The native engine's packet parsing, which every datagram from the
-//! network reaches before any authentication, and the scan of the
-//! ClientHello: never panic, and whatever a header claims stays inside the
+//! network reaches before any authentication, the choice of the worker
+//! a datagram belongs to, and the scan of the ClientHello: never panic, and whatever a header claims stays inside the
 //! datagram.
 #![no_main]
 
@@ -26,6 +26,15 @@ fuzz_target!(|data: &[u8]| {
             }
             Err(_) => break,
         }
+    }
+    // Where a datagram that reached the wrong worker is passed on to:
+    // only one with a short header, to the worker its ID names, never
+    // back to the worker that has it.
+    let me = u16::from_be_bytes([cid_len as u8, data.len() as u8]) % 5;
+    if let Some(worker) = cid::owner(data, me) {
+        assert!(worker != me && data[0] & 0x80 == 0);
+        assert_eq!(cid::worker_of(&data[1..1 + cid::LEN]), Some(worker));
+        assert_eq!(cid::owner(data, worker), None);
     }
     if let Some((v, n)) = varint::decode(data) {
         assert!(v <= varint::MAX && n <= 8);

@@ -45,6 +45,7 @@ mod crypto;
 mod error;
 pub mod native;
 mod proto;
+mod route;
 
 pub use config::{ClientConfig, ServerConfig, TransportConfig};
 

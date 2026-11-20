@@ -38,6 +38,18 @@ pub fn worker_of(dcid: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([dcid[1], dcid[2]]))
 }
 
+/// The worker a datagram belongs to, when it is another than `me`: the
+/// one named by the connection ID of a packet with a short header.
+pub fn owner(datagram: &[u8], me: u16) -> Option<u16> {
+    // A long header stays. The fixed bit is not looked at: a peer that
+    // was told it may (RFC 9287) sends short headers without it.
+    if datagram.first()? & 0x80 != 0 {
+        return None;
+    }
+    let worker = worker_of(datagram.get(1..1 + LEN)?)?;
+    (worker != me).then_some(worker)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
