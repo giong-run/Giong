@@ -148,6 +148,9 @@ pub(crate) enum On {
     Control,
     /// A request stream, as the server reads it.
     Request,
+    /// A request stream, as the client reads it: the response.
+    #[cfg_attr(not(feature = "client"), allow(dead_code))]
+    Response,
 }
 
 /// A frame header: the type and the length of the payload that follows.
@@ -169,8 +172,8 @@ pub(crate) enum Need<T> {
 }
 
 impl Header {
-    /// Reads a frame header at the start of `buf`, and checks that a server
-    /// may receive that frame on that kind of stream (section 7.2: the table
+    /// Reads a frame header at the start of `buf`, and checks that the
+    /// reader may receive that frame on that kind of stream (section 7.2: the table
     /// of frames and stream types). Unknown types are fine everywhere: the
     /// caller skips their payload.
     pub(crate) fn read(buf: &[u8], on: On) -> Result<Need<Header>, Error> {
@@ -190,9 +193,17 @@ impl Header {
             }
             (
                 kind::CANCEL_PUSH | kind::SETTINGS | kind::GOAWAY | kind::MAX_PUSH_ID,
-                On::Request,
+                On::Request | On::Response,
             ) => {
                 return unexpected("a control frame on a request stream");
+            }
+            // The client allows no push (it sends no MAX_PUSH_ID), so any
+            // push ID is one too many (section 7.2.5).
+            (kind::PUSH_PROMISE, On::Response) => {
+                return Err(Error::new(
+                    Code::IdError,
+                    "PUSH_PROMISE although no push was allowed",
+                ));
             }
             // A client never sends PUSH_PROMISE (section 7.2.5).
             (kind::PUSH_PROMISE, _) => return unexpected("PUSH_PROMISE from a client"),

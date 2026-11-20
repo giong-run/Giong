@@ -98,6 +98,28 @@ fn frames_are_checked_against_the_stream_they_are_on() {
             Code::FrameUnexpected
         );
     }
+    // A response, as the client reads it: control frames are as wrong
+    // there as on a request, and a PUSH_PROMISE names a push that was
+    // never allowed.
+    for k in [
+        kind::CANCEL_PUSH,
+        kind::SETTINGS,
+        kind::GOAWAY,
+        kind::MAX_PUSH_ID,
+        0x06,
+    ] {
+        assert_eq!(
+            header(k, On::Response).unwrap_err().code,
+            Code::FrameUnexpected
+        );
+    }
+    assert_eq!(
+        header(kind::PUSH_PROMISE, On::Response).unwrap_err().code,
+        Code::IdError
+    );
+    for k in [kind::DATA, kind::HEADERS, 0x21] {
+        assert!(matches!(header(k, On::Response), Ok(Need::Got(_))));
+    }
     for on in [On::Control, On::Request] {
         // A client must not push, and HTTP/2's leftovers are refused.
         for k in [kind::PUSH_PROMISE, 0x02, 0x06, 0x08, 0x09] {
