@@ -118,6 +118,8 @@ dependencies = [
  "giong",
  "libc",
  "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
 ]
 
 [[package]]
