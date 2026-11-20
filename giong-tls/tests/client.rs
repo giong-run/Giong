@@ -524,9 +524,4 @@ fn trust_roots_must_be_certificates() {
     let err = TlsConnector::with_root_pem(b"no pem here").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
-    // The same kind as when the machine has none (`with_system_roots`).
-    #[allow(deprecated)] // `with_roots` goes in 1.0.0; the error stays.
-    let err = TlsConnector::with_roots(RootCertStore::empty()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
-    assert_eq!(code(&err), Some(Code::NoTrustedRoots), "{err}");
 }

@@ -36,10 +36,10 @@ request; everything else is automated and safe to re-run.
    section reads well for users: one line on what the release is about, then the
    entries under *Added*, *Changed*, *Deprecated*, *Removed*, *Fixed*, *Security*. Mark
    breaking changes **Breaking:** and say how to migrate. The release pull request of
-   1.0.0-rc.1 also removes every `#[deprecated]` item and lists each under *Removed*
-   with the name that replaces it. It then gives `giong::sync::mpsc::Sender` and `Receiver`
-   to the bounded channel (`BoundedSender` and `BoundedReceiver` become deprecated
-   aliases of them), as the API freeze record says. Thank outside contributors in
+   1.0.0-rc.1 also removed every `#[deprecated]` item, listing each under *Removed*
+   with the name that replaces it, and gave `giong::sync::mpsc::Sender` and `Receiver`
+   to the bounded channel; no alias was kept (STABILITY.md, *Changes made before 1.0*).
+   From 1.0.0 on a deprecated item stays for the rest of 1.x. Thank outside contributors in
    the entry for their change: `([#4](…/issues/4), thanks to [@name](https://github.com/name))`.
    CI runs on the branch as on any pull request.
 

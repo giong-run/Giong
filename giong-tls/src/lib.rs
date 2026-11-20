@@ -444,16 +444,6 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-    /// An acceptor using an existing rustls configuration.
-    #[deprecated(
-        since = "0.9.0",
-        note = "goes in 1.0.0: use `from_pem`, or `from_rustls` with the `unstable-rustls` \
-                feature, which keeps rustls' types out of the stable API"
-    )]
-    pub fn new(config: Arc<ServerConfig>) -> Self {
-        Self::with_config(config)
-    }
-
     /// An acceptor using an existing rustls configuration, for what
     /// [`with_certificates`](Self::with_certificates) and the methods below
     /// do not cover. The acceptor follows the configuration as given.
@@ -741,17 +731,6 @@ pub struct TlsConnector {
 }
 
 impl TlsConnector {
-    /// A connector using an existing rustls configuration.
-    #[deprecated(
-        since = "0.9.0",
-        note = "goes in 1.0.0: use `with_system_roots`, `with_root_pem` or \
-                `with_root_pem_any_name`, or `from_rustls` with the `unstable-rustls` feature, \
-                which keeps rustls' types out of the stable API"
-    )]
-    pub fn new(config: Arc<ClientConfig>) -> Self {
-        Self::with_config(config)
-    }
-
     /// A connector using an existing rustls configuration, for what the
     /// other constructors do not cover (a certificate verifier of its own,
     /// other protocol versions).
@@ -770,17 +749,6 @@ impl TlsConnector {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             ktls: ktls::Plan::Off,
         }
-    }
-
-    /// A connector that trusts the given certificate authorities. TLS 1.2
-    /// and 1.3 with rustls' default cipher suites.
-    #[deprecated(
-        since = "0.9.0",
-        note = "goes in 1.0.0: use `with_root_pem`, which keeps rustls' types out of the \
-                stable API"
-    )]
-    pub fn with_roots(roots: RootCertStore) -> io::Result<Self> {
-        Self::from_roots(roots)
     }
 
     fn from_roots(roots: RootCertStore) -> io::Result<Self> {
@@ -2083,6 +2051,18 @@ impl std::fmt::Debug for TlsStream {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    #[test]
+    fn a_connector_without_trusted_authorities_is_refused() {
+        // The same kind as when the machine has none (`with_system_roots`).
+        let err = TlsConnector::from_roots(RootCertStore::empty()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            giong::error::code(&err),
+            Some(Code::NoTrustedRoots),
+            "{err}"
+        );
+    }
 
     fn authority(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate().unwrap();

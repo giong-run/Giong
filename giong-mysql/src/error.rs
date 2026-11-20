@@ -196,17 +196,6 @@ impl Error {
         self.0.db.as_ref().map(|db| db.code())
     }
 
-    /// The server's error number: the old name of
-    /// [`server_code`](Self::server_code).
-    #[deprecated(
-        since = "0.9.0",
-        note = "renamed server_code(), as in giong-redis: code() named a different thing in each \
-                giong crate; it goes in 1.0.0"
-    )]
-    pub fn code(&self) -> Option<u16> {
-        self.server_code()
-    }
-
     /// Whether trying again may succeed: the connection could not be
     /// opened or broke, no pooled connection became free in time, or the
     /// server reported a deadlock (1213), a lock wait timeout (1205), too
@@ -424,13 +413,6 @@ mod tests {
         ] {
             assert!(!Error::new(kind, "x").is_transient(), "{kind:?}");
         }
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn the_old_name_of_server_code_still_answers() {
-        let e = Error::from_db(DbError::new(1062, "23000", "duplicate"), None);
-        assert_eq!(e.code(), Some(1062));
     }
 
     #[test]

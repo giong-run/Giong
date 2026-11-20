@@ -209,15 +209,6 @@ impl Config {
         self
     }
 
-    /// The database: the old name of [`database`](Self::database).
-    #[deprecated(
-        since = "0.9.0",
-        note = "renamed database(), as in giong-mysql and giong-redis; it goes in 1.0.0"
-    )]
-    pub fn dbname(self, dbname: &str) -> Self {
-        self.database(dbname)
-    }
-
     /// The name the server shows for this connection in `pg_stat_activity`
     /// and in its logs.
     pub fn application_name(mut self, name: &str) -> Self {
@@ -652,16 +643,6 @@ fn parse_port(port: &str) -> Result<u16, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    #[allow(deprecated)]
-    fn the_old_name_of_database_still_sets_it() {
-        assert_eq!(Config::new().dbname("shop").dbname.as_deref(), Some("shop"));
-        assert_eq!(
-            Config::new().database("shop").dbname.as_deref(),
-            Some("shop")
-        );
-    }
 
     #[test]
     fn a_config_without_its_password_keeps_everything_else() {
