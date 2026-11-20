@@ -17,7 +17,8 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 0.8.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
+> **Status: 1.0.0-rc.1**, the first release candidate of 1.0: the API is frozen (see
+> [STABILITY.md](docs/STABILITY.md)). Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server and client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
@@ -1163,7 +1164,7 @@ Not verified, and you should know it:
 
 ## Compared with Monoio and Glommio
 
-| | giong 0.8 | Monoio 0.2.4 | Glommio 0.9.0 |
+| | giong 1.0 | Monoio 0.2.4 | Glommio 0.9.0 |
 |---|---|---|---|
 | Platforms | Linux: io_uring on ≥ 6.0, an epoll driver elsewhere | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
 | Receiving | multishot, kernel-provided buffers | one submission per read, caller's buffer | direct `recv`, io_uring to wait |

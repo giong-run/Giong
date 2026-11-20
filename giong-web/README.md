@@ -4,8 +4,8 @@ Routing, middleware and JSON for HTTP services on the [giong](../README.md) runt
 
 ```toml
 [dependencies]
-giong = "0.8"
-giong-web = { version = "0.8", features = ["serde"] }
+giong = "1.0.0-rc.1"
+giong-web = { version = "1.0.0-rc.1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
