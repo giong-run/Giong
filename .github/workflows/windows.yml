@@ -1,0 +1,68 @@
+name: Windows
+
+# The Windows driver prototype (prototypes/iocp), on real Windows. Lives on
+# the Windows branch until giong itself builds there.
+on:
+  pull_request:
+    paths:
+      - prototypes/iocp/**
+      - .github/workflows/windows.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  iocp:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: prototypes/iocp
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo test --locked
+      - run: cargo test --release --locked
+      # The races these tests are about (a cancel crossing a completion)
+      # depend on timing: one pass proves little, so run them many times.
+      - name: Repeat the tests 200 times
+        run: |
+          bin=$(ls -t target/release/deps/iocp-*.exe | head -1)
+          for i in $(seq 1 200); do
+            "$bin" > run.log 2>&1 || { echo "run $i failed"; cat run.log; exit 1; }
+          done
+          echo "200 runs passed" >> "$GITHUB_STEP_SUMMARY"
+
+  msrv:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: prototypes/iocp
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.80"
+      - run: cargo check --locked

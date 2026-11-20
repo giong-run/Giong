@@ -1,0 +1,26 @@
+[package]
+name = "giong-iocp-prototype"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+description = "Prototype of giong's Windows driver: completion ports behind the driver contract of src/driver/mod.rs"
+license = "MIT OR Apache-2.0"
+
+# Not a member of the giong workspace: it builds for Windows only and moves
+# into src/driver/iocp.rs once the portability layer is in.
+[workspace]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
