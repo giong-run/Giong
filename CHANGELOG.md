@@ -148,6 +148,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong-postgres**: a `Transaction` in which a statement was given up before its answer
+  came (its future dropped, by a timeout say) could still commit, although the statement
+  may have run on the server unseen. As in giong-mysql, the transaction now refuses every
+  later statement and `commit` with an `ErrorKind::Db` error that says so, sends nothing
+  more, and is rolled back when dropped.
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open

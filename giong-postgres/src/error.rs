@@ -48,7 +48,10 @@ pub enum ErrorKind {
     /// The server reported an error for the statement ([`Error::db`] has
     /// the details), or turned a `COMMIT` into a rollback because a statement
     /// in the transaction failed earlier ([`Error::server_code`] is `25P02` and
-    /// [`Error::db`] is `None`).
+    /// [`Error::db`] is `None`), or refused a statement or `COMMIT` in a
+    /// [`Transaction`](crate::Transaction) in which a statement was given up
+    /// before its answer came ([`Error::server_code`] and [`Error::db`] are
+    /// `None`).
     Db,
     /// A value could not be converted between Rust and PostgreSQL: a
     /// parameter, or a column read with [`Row::get`](crate::Row::get).

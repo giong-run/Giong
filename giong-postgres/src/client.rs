@@ -67,6 +67,18 @@ impl Drop for Statement {
     }
 }
 
+/// The error for a statement sent in a transaction that can no longer be
+/// committed.
+fn abandoned() -> Error {
+    Error::new(
+        ErrorKind::Db,
+        "a statement of this transaction was given up before its answer came (its future was \
+         dropped, by a timeout say), and it may have run, so the transaction cannot be \
+         committed; this statement was not sent. Drop the transaction (which rolls it back) and \
+         run it again from the start",
+    )
+}
+
 /// Why a shared connection was closed under its statements.
 const LEFT_OPEN: &str = "a statement sent through the pool's shared methods (Pool::batch_execute) \
      left a transaction open on a connection other tasks share, so the connection was closed and \
@@ -115,6 +127,20 @@ struct Conn {
     /// A statement ran SQL-level `PREPARE`, whose prepared statement outlives
     /// the task that made it.
     user_prepared: Cell<bool>,
+    /// The state of the [`Transaction`] open on this connection.
+    tx: Cell<Tx>,
+}
+
+/// Where a [`Transaction`] stands, as the client sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tx {
+    /// No `Transaction` is open.
+    None,
+    Open,
+    /// A statement in it was given up before its answer came (its future
+    /// was dropped): it may have run, so committing would commit work the
+    /// application believes undone. Nothing more is sent until it ends.
+    Abandoned,
 }
 
 struct State {
@@ -148,6 +174,9 @@ struct Slot {
     /// The pool's session reset: if it fails, the session is in an unknown
     /// state, so the connection is closed rather than reused.
     close_on_error: bool,
+    /// A statement of an open transaction: giving it up before its answer
+    /// marks the transaction [`Tx::Abandoned`].
+    in_tx: Option<Weak<Conn>>,
     inner: RefCell<SlotInner>,
 }
 
@@ -168,6 +197,8 @@ struct SlotInner {
     wakers: Vec<Waker>,
     /// Nobody is waiting for the result any more: rows are not kept.
     abandoned: bool,
+    /// The outcome was handed to the caller.
+    delivered: bool,
     error: Option<Error>,
     params: Option<Vec<Type>>,
     columns: Option<Vec<Column>>,
@@ -190,11 +221,12 @@ enum Response {
 }
 
 impl Slot {
-    fn new(kind: Kind, shared: bool, close_on_error: bool) -> Rc<Self> {
+    fn new(kind: Kind, shared: bool, close_on_error: bool, in_tx: Option<Weak<Conn>>) -> Rc<Self> {
         Rc::new(Slot {
             kind,
             shared,
             close_on_error,
+            in_tx,
             inner: RefCell::default(),
         })
     }
@@ -217,7 +249,10 @@ impl Future for Wait {
                 return Poll::Ready(Ok(Response::Statement(stmt.clone())))
             }
             Some(Err(e)) if shared => return Poll::Ready(Err(e.clone())),
-            Some(_) => return Poll::Ready(inner.outcome.take().expect("checked")),
+            Some(_) => {
+                inner.delivered = true;
+                return Poll::Ready(inner.outcome.take().expect("checked"));
+            }
             None => {}
         }
         if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
@@ -229,10 +264,23 @@ impl Future for Wait {
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        if !matches!(self.slot.kind, Kind::Prepare { .. }) {
+        if matches!(self.slot.kind, Kind::Prepare { .. }) {
+            return;
+        }
+        let delivered = {
             let mut inner = self.slot.inner.borrow_mut();
             inner.abandoned = true;
             inner.rows = RowsBuilder::default();
+            inner.delivered
+        };
+        // The application gave up on a statement of its transaction, which
+        // may run all the same: the transaction must not commit it unseen.
+        if !delivered {
+            if let Some(conn) = self.slot.in_tx.as_ref().and_then(Weak::upgrade) {
+                if conn.tx.get() == Tx::Open {
+                    conn.tx.set(Tx::Abandoned);
+                }
+            }
         }
     }
 }
@@ -300,6 +348,7 @@ impl Client {
             lease: RefCell::new(None),
             retire: Cell::new(false),
             user_prepared: Cell::new(false),
+            tx: Cell::new(Tx::None),
             state: RefCell::new(State {
                 out: Vec::new(),
                 writer: None,
@@ -434,6 +483,7 @@ impl Client {
             client: self,
             done: false,
         };
+        tx.client.conn.tx.set(Tx::Open);
         tx.client.batch_execute("BEGIN").await?;
         Ok(tx)
     }
@@ -679,12 +729,17 @@ impl Conn {
         if let Some(e) = &st.broken {
             return Err(e.clone());
         }
+        let in_tx = match self.tx.get() {
+            Tx::None => None,
+            Tx::Open => Some(self.weak.clone()),
+            Tx::Abandoned => return Err(abandoned()),
+        };
         let start = st.out.len();
         if let Err(e) = encode(&mut st.out) {
             st.out.truncate(start);
             return Err(e);
         }
-        let slot = Slot::new(kind, self.shared.get(), close_on_error);
+        let slot = Slot::new(kind, self.shared.get(), close_on_error, in_tx);
         self.requests.set(self.requests.get() + 1);
         if st.queue.is_empty() {
             self.head_since.set(Some(giong::time::Instant::now()));
@@ -1206,6 +1261,15 @@ async fn write_loop(conn: Rc<Conn>) {
 /// Commit it with [`commit`](Self::commit). Dropping it otherwise rolls it
 /// back: the `ROLLBACK` is queued at once, ahead of anything the connection
 /// runs afterwards.
+///
+/// A statement given up before its answer came (its future dropped, by a
+/// timeout or a `select` say) may still run on the server, so the
+/// transaction can no longer be committed: from then on every statement
+/// sent through it, [`commit`](Self::commit) included, fails with an
+/// [`ErrorKind::Db`] error that says so, and nothing more is sent. Drop the
+/// transaction or [`rollback`](Self::rollback) it, and run it again from the
+/// start. A statement whose result was collected, error or not, does not
+/// count.
 pub struct Transaction<'a> {
     client: &'a mut Client,
     done: bool,
@@ -1216,12 +1280,18 @@ impl Transaction<'_> {
     ///
     /// When a statement in the transaction failed earlier, PostgreSQL rolls
     /// the transaction back instead; this is reported as an error, never as
-    /// a successful commit.
+    /// a successful commit. When a statement in it was given up before its
+    /// answer came, `COMMIT` is not sent: the transaction is rolled back and
+    /// the error says why (see [`Transaction`]).
     ///
     /// Not cancel safe: if the future is dropped, the transaction may have been
     /// committed or rolled back, and the caller does not learn which.
     pub async fn commit(mut self) -> Result<(), Error> {
-        self.done = true;
+        if self.client.conn.tx.get() == Tx::Abandoned {
+            // Dropping `self` rolls it back.
+            return Err(abandoned());
+        }
+        self.end();
         let slot = self
             .client
             .conn
@@ -1241,8 +1311,14 @@ impl Transaction<'_> {
     /// Cancel safe: if the future is dropped, the transaction is rolled back
     /// all the same.
     pub async fn rollback(mut self) -> Result<(), Error> {
-        self.done = true;
+        self.end();
         self.client.batch_execute("ROLLBACK").await
+    }
+
+    /// The transaction ends here: what is sent next is outside it.
+    fn end(&mut self) {
+        self.done = true;
+        self.client.conn.tx.set(Tx::None);
     }
 }
 
@@ -1257,6 +1333,7 @@ impl Deref for Transaction<'_> {
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if !self.done {
+            self.end();
             self.client.send_and_forget("ROLLBACK");
         }
     }
