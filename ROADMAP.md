@@ -417,13 +417,15 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       default. *Proved by* the slow-uploads and idle-connections CI jobs (`E1120`,
       `E1121`) and the pools' wait-timeout tests. The names of 1.x's budget types, its
       ledger and how it shares quotas wait for the prototype of 1.5.
-- [ ] **The release candidate is the code that was soaked**: the rc.1 release pull request
-      names the soaked commit, the release commit and the change between them, and says
-      which tests ran again on the release commit and on what basis it is or is not soaked
-      again ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). rc.1 stands on
-      0.9's soak (tree `f1b23074`): the changes since (#134's bind, the channel, UDP and
-      close fixes) are small and get their tests rerun on the release commit, and the next
-      full 72-hour soak runs on a later candidate or 1.x release.
+- [ ] **The release candidate says what it was verified on**: the rc.1 release pull
+      request names the soaked commit, the release commit and the change between them,
+      which tests ran again on the release commit, and the soak that change got
+      ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). A soak is sized by what
+      changed: none outside the soak paths, 2 to 4 hours for the drivers, the scheduler or
+      a cancellation path, 72 hours for a new major version, driver or scheduler. rc.1
+      stands on 0.9's 72 hours (tree `f1b23074`), and the changes since (#134's bind, the
+      channel, UDP, close and TLS receive fixes) get 4 hours per driver once they have all
+      merged.
 - [ ] **The removals**: the checklist in
       [STABILITY.md](docs/STABILITY.md#changes-made-before-10), in one release pull request.
 
