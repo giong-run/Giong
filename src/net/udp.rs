@@ -611,6 +611,7 @@ mod tests {
     /// does into the operation and back, and the kernel's writes through it
     /// are seen afterwards. Miri runs this one: it is how `recvmsg` and
     /// `sendmsg` use the memory, and Miri cannot call them.
+    #[cfg(unix)]
     #[test]
     fn a_message_header_survives_moves() {
         // Received: the "kernel" writes the payload and the sender through

@@ -165,6 +165,7 @@ fn a_balanced_task_that_panics_reports_it_and_its_worker_carries_on() {
 /// opens `connections` connections: all at once, or `paced`, each one only
 /// once the workers have settled (see [`settle`]). Returns the count per
 /// worker.
+#[cfg(unix)]
 fn connections_per_worker(
     workers: usize,
     busy: usize,
@@ -258,6 +259,7 @@ fn settle(handle: &giong::Handle, tasks: usize) {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_busy_worker_hands_new_connections_to_an_idle_one() {
     let counts = connections_per_worker(2, 20, 8, true, false);
@@ -268,6 +270,7 @@ fn a_busy_worker_hands_new_connections_to_an_idle_one() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn with_exact_figures_connection_counts_stay_within_the_margin() {
     // Connections one at a time, each once the workers have settled: the
@@ -284,6 +287,7 @@ fn with_exact_figures_connection_counts_stay_within_the_margin() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_burst_of_connections_is_shared_out() {
     // All 24 connections at once, so that hand-overs race each other. How
@@ -303,6 +307,7 @@ fn a_burst_of_connections_is_shared_out() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "prints the kernel's own spread, for comparison"]
 fn print_reuseport_spread() {

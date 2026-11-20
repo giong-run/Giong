@@ -17,11 +17,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::buf::BufPool;
-use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park};
+#[cfg(unix)]
+use crate::driver::Io;
+use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
+#[cfg(unix)]
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::sys;

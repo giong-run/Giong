@@ -1374,6 +1374,7 @@ mod tests {
     /// What Linux 6.0.19 leaves behind when its bind(2) returns 1 for a busy
     /// address: a socket without a port, which listen(2) would put on a free
     /// one. `check_bound` must call that `AddrInUse`.
+    #[cfg(unix)]
     #[test]
     fn a_socket_that_bind_left_unbound_counts_as_address_in_use() {
         let asked: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -1404,6 +1405,7 @@ mod tests {
     /// A socket that refuses zero-copy sends, as a kernel TLS socket does
     /// with `EOPNOTSUPP`, gets the same bytes sent again with a copy and
     /// stops trying. A Unix socket refuses them the same way.
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call sendmsg")]
     fn a_refused_zero_copy_send_is_sent_again_with_a_copy() {

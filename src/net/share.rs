@@ -247,6 +247,7 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn the_first_socket_of_a_port_refuses_another_holder_and_joins_the_workers() {
@@ -288,6 +289,7 @@ mod tests {
         hold.unwrap().release(&first);
     }
 
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn a_released_port_is_counted_out_and_can_be_bound_again() {

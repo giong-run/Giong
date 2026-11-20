@@ -37,6 +37,7 @@ pub fn refusing_addr() -> (Socket, SocketAddr) {
 /// The socket is bound with the same options but does not listen, so it gets
 /// no connections, and no socket of another test can take the port before
 /// the listeners have bound it. Keep it until they have.
+#[cfg(unix)]
 pub fn shared_port() -> (Socket, u16) {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.set_reuse_address(true).unwrap();

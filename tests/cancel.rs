@@ -183,6 +183,7 @@ fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dropped_send_file_leaves_nothing_behind() {
     giong::block_on(async {
@@ -556,6 +557,7 @@ fn open_fds(path: &std::path::Path) -> usize {
         .count()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dropped_open_closes_the_descriptor_it_produced() {
     // The result of an open is a new descriptor. When the future was
@@ -597,6 +599,7 @@ fn a_dropped_open_closes_the_descriptor_it_produced() {
     std::fs::remove_file(&path).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dropped_close_still_closes_on_the_epoll_driver() {
     // The epoll driver closes on a blocking thread. A close still waiting

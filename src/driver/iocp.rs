@@ -54,13 +54,14 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    bind, closesocket, getsockname, ioctlsocket, recv, setsockopt, WSAGetLastError,
-    WSAGetOverlappedResult, WSAIoctl, WSARecv, WSASend, WSASendMsg, WSASendTo, WSASocketW,
-    AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX, LPFN_WSARECVMSG,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE,
-    SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF,
-    WSAEINVAL, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG,
-    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    bind, closesocket, getsockname, ioctlsocket, recv, recvfrom, setsockopt, WSAGetLastError,
+    WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendMsg, WSASendTo,
+    WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX, LPFN_WSARECVMSG,
+    MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+    SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+    SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAEINVAL, WSAEMSGSIZE, WSAEOPNOTSUPP, WSAEWOULDBLOCK,
+    WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG, WSA_FLAG_NO_HANDLE_INHERIT,
+    WSA_FLAG_OVERLAPPED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, SetFileCompletionNotificationModes, WriteFile,
@@ -120,8 +121,18 @@ impl Drop for Port {
 #[derive(Clone, Copy)]
 enum After {
     Nothing,
-    Accepted { listener: SOCKET },
-    Connected { socket: SOCKET },
+    Accepted {
+        listener: SOCKET,
+    },
+    Connected {
+        socket: SOCKET,
+    },
+    /// A receive into `room` bytes. Winsock fails one whose datagram is
+    /// longer with `WSAEMSGSIZE` and the buffer full, where Unix reports
+    /// the bytes that fit: the driver reports those too.
+    Received {
+        room: i32,
+    },
 }
 
 /// The socket an `AcceptEx` fills in and the addresses it writes. Owned by
@@ -163,17 +174,74 @@ struct Record {
     after: After,
     state: State,
     accepting: Option<Box<Accepting>>,
+    datagram: Option<Box<Datagram>>,
+}
+
+/// What a datagram receive that waits in the kernel writes to: the buffer,
+/// laid out as the readers of a multishot `recvmsg` expect it (see
+/// [`MultiIo::RecvMsg`]), and the two values Winsock fills in when the
+/// datagram arrives. Boxed, so that they stay where the kernel was told.
+struct Datagram {
+    buf: Vec<u8>,
+    /// Bytes in front of the payload: the header and the address field.
+    overhead: usize,
+    from_len: i32,
+    flags: u32,
+}
+
+/// Bytes of the header in front of every datagram of a multishot receive:
+/// name length, control length, payload length and flags, as `u32`s.
+const DATAGRAM_HEADER: usize = 16;
+
+/// Writes that header for a datagram received into the buffer at `buf`:
+/// `res` is what the receive returned. A datagram longer than its `room`
+/// is cut there, which Winsock reports as `WSAEMSGSIZE` with the buffer
+/// full. The length of the datagram in the buffer, or the error.
+///
+/// # Safety
+///
+/// `buf` must be valid for [`DATAGRAM_HEADER`] bytes.
+unsafe fn finish_datagram(
+    buf: *mut u8,
+    from_len: i32,
+    res: i32,
+    room: usize,
+) -> Result<usize, i32> {
+    let (payload, flags) = match res {
+        n if n >= 0 => (n as usize, 0),
+        n if n == -WSAEMSGSIZE => (room, MSG_TRUNC),
+        e => return Err(e),
+    };
+    let fields = [from_len.max(0) as u32, 0, payload as u32, flags];
+    for (i, field) in fields.iter().enumerate() {
+        ptr::copy_nonoverlapping(field.to_ne_bytes().as_ptr(), buf.add(i * 4), 4);
+    }
+    Ok(payload)
 }
 
 /// A multishot operation: what it runs on, who waits for it, and the one
 /// kernel operation it may have in flight.
 struct Multi {
     io: Option<MultiIo>,
-    waker: Option<Waker>,
+    /// The tasks that wait for it: several may receive on one socket, and
+    /// each of them is woken when something arrives.
+    wakers: Vec<Waker>,
     /// The zero-byte receive or `AcceptEx` in flight; null if none.
     pending: *mut Record,
-    /// An accept that completed and was not collected yet.
+    /// An accept that completed and was not collected yet, or the error
+    /// that ended a receive.
     accepted: Option<i32>,
+    /// A datagram that arrived while its receive waited in the kernel.
+    data: Option<RecvBuf>,
+}
+
+impl Multi {
+    /// Has `waker` woken when the operation in flight completes.
+    fn wait(&mut self, waker: &Waker) {
+        if !self.wakers.iter().any(|w| w.will_wake(waker)) {
+            self.wakers.push(waker.clone());
+        }
+    }
 }
 
 enum Slot {
@@ -344,6 +412,7 @@ impl Iocp {
             after: After::Nothing,
             state,
             accepting: None,
+            datagram: None,
         }))
     }
 
@@ -381,6 +450,26 @@ impl Iocp {
         let record = Self::record(handle, socket, State::Waiting(waker.clone()), offset);
         let ov = record.cast::<OVERLAPPED>();
         let mut transferred = 0u32;
+        // SAFETY: the record was just made; `Op` guarantees the header and
+        // the buffers of a `RecvMsg`.
+        unsafe {
+            match *io {
+                Io::Recv { len, .. } => {
+                    (*record).after = After::Received {
+                        room: len.min(i32::MAX as u32) as i32,
+                    }
+                }
+                Io::RecvMsg { msg, .. } => {
+                    let bufs =
+                        std::slice::from_raw_parts((*msg).lpBuffers, (*msg).dwBufferCount as usize);
+                    let room: u64 = bufs.iter().map(|b| u64::from(b.len)).sum();
+                    (*record).after = After::Received {
+                        room: room.min(i32::MAX as u64) as i32,
+                    };
+                }
+                _ => {}
+            }
+        }
 
         // Each arm leaves `Ok(())` for "the call succeeded at once" and
         // `Err(code)` otherwise, where ERROR_IO_PENDING means in flight.
@@ -477,7 +566,7 @@ impl Iocp {
                         err => err,
                     },
                     Err(code) if code == ERROR_HANDLE_EOF as i32 => 0,
-                    Err(code) => -code,
+                    Err(code) => Self::cut(record.after, -code),
                 };
                 Start::Done(res, 0)
             }
@@ -552,11 +641,20 @@ impl Iocp {
         self.recv_msg.ok_or(WSAEOPNOTSUPP)
     }
 
+    /// The result `res` of an operation, with a datagram that was cut to
+    /// fit its buffer reported as the bytes that fit.
+    fn cut(after: After, res: i32) -> i32 {
+        match after {
+            After::Received { room } if res == -WSAEMSGSIZE => room,
+            _ => res,
+        }
+    }
+
     /// Runs what a successful accept or connect still needs. 0, or the
     /// negated error.
     fn finish(after: After, accepted: SOCKET) -> i32 {
         let rc = match after {
-            After::Nothing => 0,
+            After::Nothing | After::Received { .. } => 0,
             // SAFETY: both sockets are open (the operation just succeeded
             // on them); the option value is the listener's handle.
             After::Accepted { listener } => unsafe {
@@ -656,9 +754,10 @@ impl Iocp {
     pub(crate) fn new_multi(&mut self, _kind: MultiKind) -> usize {
         self.ops.insert(Slot::Multi(Multi {
             io: None,
-            waker: None,
+            wakers: Vec::new(),
             pending: ptr::null_mut(),
             accepted: None,
+            data: None,
         }))
     }
 
@@ -693,10 +792,11 @@ impl Iocp {
             }
             return MultiPoll::Item(res);
         }
+        if let Some(data) = multi.data.take() {
+            return MultiPoll::Data(data);
+        }
         if !multi.pending.is_null() {
-            if !multi.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
-                multi.waker = Some(waker.clone());
-            }
+            multi.wait(waker);
             return MultiPoll::Pending;
         }
         if !spend_budget() {
@@ -706,10 +806,10 @@ impl Iocp {
         match io {
             MultiIo::Accept { fd } => self.poll_accept(key, fd, waker),
             MultiIo::Recv { fd } => self.poll_recv(key, fd, waker),
-            // Datagram receives come with the UDP port of this driver.
-            MultiIo::RecvMsg { .. } => {
-                self.disarm(key);
-                MultiPoll::Item(-WSAEOPNOTSUPP)
+            MultiIo::RecvMsg { fd, hdr } => {
+                // SAFETY: the header of a multishot receive outlives it.
+                let name_len = unsafe { (*hdr).namelen }.max(0) as usize;
+                self.poll_recv_msg(key, fd, name_len, waker)
             }
         }
     }
@@ -770,7 +870,7 @@ impl Iocp {
                     self.inflight += 1;
                     let multi = self.multi(key);
                     multi.pending = record;
-                    multi.waker = Some(waker.clone());
+                    multi.wait(waker);
                     return MultiPoll::Pending;
                 }
                 done => {
@@ -789,6 +889,140 @@ impl Iocp {
         MultiPoll::Pending
     }
 
+    /// The next datagram of `socket`, in front of it the header and the
+    /// sender's address in a field of `name_len` bytes.
+    ///
+    /// A datagram that is already there is read into a pool buffer at once.
+    /// Otherwise the receive waits in the kernel. A receive of zero bytes
+    /// cannot do the waiting, as it does for a stream: it would take the
+    /// datagram and throw it away. So the waiting receive has a buffer, and
+    /// that buffer is on the heap: a socket that waits must not hold a pool
+    /// buffer, or enough idle sockets would hold them all.
+    fn poll_recv_msg(
+        &mut self,
+        key: usize,
+        socket: SOCKET,
+        name_len: usize,
+        waker: &Waker,
+    ) -> MultiPoll {
+        if let Err(e) = self.register(socket as HANDLE, true) {
+            self.disarm(key);
+            return MultiPoll::Item(e);
+        }
+        let overhead = DATAGRAM_HEADER + name_len;
+        let Some((bid, buf, len)) = self.pool.next_free() else {
+            // No pool buffer: the caller waits for one, then arms again.
+            self.disarm(key);
+            return MultiPoll::NeedArm;
+        };
+        if len <= overhead {
+            // Receive buffers too small to hold even the address.
+            self.disarm(key);
+            return MultiPoll::Item(-WSAEINVAL);
+        }
+        let room = len - overhead;
+        let mut from_len = name_len as i32;
+        // SAFETY: `buf` is a free pool buffer of `len` bytes: the payload
+        // goes behind the header and the address field, the address into
+        // its field. The socket is non-blocking.
+        let n = unsafe {
+            recvfrom(
+                socket,
+                buf.add(overhead),
+                room.min(i32::MAX as usize) as i32,
+                0,
+                buf.add(DATAGRAM_HEADER).cast(),
+                &mut from_len,
+            )
+        };
+        let res = if n >= 0 { n } else { -wsa_error() };
+        if res != -WSAEWOULDBLOCK {
+            // SAFETY: the pool buffer is longer than the header.
+            return match unsafe { finish_datagram(buf, from_len, res, room) } {
+                Ok(payload) => {
+                    self.pool.take_next();
+                    let len = (overhead + payload) as u32;
+                    MultiPoll::Data(RecvBuf::pooled(self.pool.clone(), bid, 0, len))
+                }
+                Err(e) => {
+                    self.disarm(key);
+                    MultiPoll::Item(e)
+                }
+            };
+        }
+        // Nothing there: wait for the next datagram in the kernel.
+        let record = Self::record(socket as HANDLE, true, State::Multi(key), 0);
+        let mut datagram = Box::new(Datagram {
+            buf: vec![0u8; len],
+            overhead,
+            from_len: name_len as i32,
+            flags: 0,
+        });
+        let wsabuf = WSABUF {
+            len: room.min(u32::MAX as usize) as u32,
+            // SAFETY: `overhead < len`, within the buffer.
+            buf: unsafe { datagram.buf.as_mut_ptr().add(overhead) },
+        };
+        // SAFETY: the buffer, the address field and the two values the
+        // kernel writes are in the boxed `Datagram`, which the record owns
+        // until its completion; the record lives until then too.
+        let rc = unsafe {
+            let from = datagram.buf.as_mut_ptr().add(DATAGRAM_HEADER).cast();
+            let from_len = ptr::addr_of_mut!(datagram.from_len);
+            let flags = ptr::addr_of_mut!(datagram.flags);
+            (*record).datagram = Some(datagram);
+            WSARecvFrom(
+                socket,
+                &wsabuf,
+                1,
+                ptr::null_mut(),
+                flags,
+                from,
+                from_len,
+                record.cast(),
+                None,
+            )
+        };
+        let done = match wsa(rc) {
+            Err(code) if code == ERROR_IO_PENDING as i32 => {
+                self.inflight += 1;
+                let multi = self.multi(key);
+                multi.pending = record;
+                multi.wait(waker);
+                return MultiPoll::Pending;
+            }
+            // A datagram arrived in between. Finished within the call, so
+            // the port reports nothing.
+            Ok(()) => {
+                // SAFETY: the operation completed; this reads its count.
+                unsafe { (*record).overlapped.InternalHigh as i32 }
+            }
+            Err(code) => -code,
+        };
+        // SAFETY: nothing is in flight for this record.
+        let mut record = unsafe { Box::from_raw(record) };
+        let mut datagram = record.datagram.take().expect("a datagram receive");
+        match Self::datagram(&mut datagram, done) {
+            Ok(data) => MultiPoll::Data(data),
+            Err(e) => {
+                self.disarm(key);
+                MultiPoll::Item(e)
+            }
+        }
+    }
+
+    /// The datagram a waiting receive completed with (`res`), as its
+    /// reader takes it.
+    fn datagram(datagram: &mut Datagram, res: i32) -> Result<RecvBuf, i32> {
+        let room = datagram.buf.len() - datagram.overhead;
+        // SAFETY: the buffer is longer than the header.
+        let payload =
+            unsafe { finish_datagram(datagram.buf.as_mut_ptr(), datagram.from_len, res, room) }?;
+        let mut buf = mem::take(&mut datagram.buf);
+        buf.truncate(datagram.overhead + payload);
+        Ok(RecvBuf::heap(buf))
+    }
+
     fn poll_accept(&mut self, key: usize, listener: SOCKET, waker: &Waker) -> MultiPoll {
         let started = self
             .register(listener as HANDLE, true)
@@ -796,7 +1030,7 @@ impl Iocp {
         match started {
             Ok(Some(res)) => MultiPoll::Item(res),
             Ok(None) => {
-                self.multi(key).waker = Some(waker.clone());
+                self.multi(key).wait(waker);
                 MultiPoll::Pending
             }
             Err(e) => {
@@ -1021,6 +1255,8 @@ impl Iocp {
                     if after != 0 {
                         rec.state = State::Done(after);
                     }
+                } else {
+                    rec.state = State::Done(Self::cut(rec.after, res));
                 }
                 waker.wake();
             }
@@ -1042,15 +1278,23 @@ impl Iocp {
                         Self::accepted(&mut record).unwrap_or_else(|e| e)
                     }
                 });
+                let datagram = record
+                    .datagram
+                    .take()
+                    .map(|mut d| Self::datagram(&mut d, res));
                 let multi = self.multi(key);
                 multi.pending = ptr::null_mut();
-                match accepted {
-                    Some(res) => multi.accepted = Some(res),
-                    // A zero-byte receive that failed: the read that
-                    // follows meets the same error and reports it.
+                match datagram {
+                    Some(Ok(data)) => multi.data = Some(data),
+                    Some(Err(e)) => multi.accepted = Some(e),
                     None => {}
                 }
-                if let Some(waker) = multi.waker.take() {
+                // A zero-byte receive that failed leaves nothing: the read
+                // that follows meets the same error and reports it.
+                if let Some(res) = accepted {
+                    multi.accepted = Some(res);
+                }
+                for waker in multi.wakers.drain(..) {
                     waker.wake();
                 }
             }

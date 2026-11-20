@@ -18,6 +18,7 @@ fn socket() -> (UdpSocket, SocketAddr) {
 
 /// Lets this process open at least `needed` descriptors, by raising the soft
 /// limit (often 1024) towards the hard one.
+#[cfg(unix)]
 fn allow_open_files(needed: u64) {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -492,6 +493,7 @@ fn every_worker_can_bind_the_same_port() {
     assert_eq!(received.load(Ordering::SeqCst), SENDERS);
 }
 
+#[cfg(unix)]
 #[test]
 fn port_zero_gives_every_socket_a_port_of_its_own() {
     // With SO_REUSEPORT set before binding to port 0, Linux picks ports
@@ -871,6 +873,7 @@ fn reply_after_cancelled_read_from(busy: bool) {
     peer.join().unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_new_socket_with_a_closed_sockets_number_is_left_alone() {
     // A receive that the runtime has queued but not yet handed to the kernel
@@ -944,6 +947,7 @@ fn one_buffer_echoes_many_datagrams_between_tasks() {
 /// giong's sockets off that port: with `SO_REUSEPORT` the kernel would share
 /// its datagrams with them, and with `SO_REUSEADDR` on both sides (which
 /// giong no longer sets) any user could.
+#[cfg(unix)]
 #[test]
 fn a_port_held_by_another_process_is_refused() {
     giong::block_on(async {
@@ -1053,6 +1057,7 @@ fn udp_holders(port: u16) -> Vec<(String, String)> {
 /// Which plain binds of `addr` the kernel refuses now: none of the options,
 /// `SO_REUSEADDR` only (giong's probe after a release) and `SO_REUSEPORT`
 /// only (giong's own sockets).
+#[cfg(unix)]
 fn refused_binds(addr: std::net::SocketAddr) -> String {
     let try_bind = |reuse_addr: bool, reuse_port: bool| {
         let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
@@ -1075,6 +1080,7 @@ fn refused_binds(addr: std::net::SocketAddr) -> String {
 /// lives only for a moment is gone before a single look, so this looks for
 /// half a second and reports every socket seen on the port, when it was
 /// first seen, and which binds the port refused at each change.
+#[cfg(unix)]
 fn bind_failure_report(addr: std::net::SocketAddr) -> String {
     let start = std::time::Instant::now();
     let mut seen: Vec<String> = Vec::new();
@@ -1111,6 +1117,7 @@ fn bind_failure_report(addr: std::net::SocketAddr) -> String {
 
 /// Workers of one process share a port; a dropped socket's port can be
 /// bound again at once.
+#[cfg(unix)]
 #[test]
 fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
     giong::block_on(async {

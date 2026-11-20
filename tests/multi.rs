@@ -343,6 +343,7 @@ fn channel_delivers_across_workers_and_from_plain_threads() {
     assert_eq!(total.load(Ordering::SeqCst), 3 * per_sender);
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no SO_REUSEPORT")]
 fn reuseport_listeners_on_every_worker_serve_connections() {
@@ -417,6 +418,7 @@ fn a_panicking_worker_stops_the_runtime_and_propagates() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_triggers_a_graceful_shutdown() {
@@ -465,6 +467,7 @@ fn sigterm_triggers_a_graceful_shutdown() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_still_works_after_worker_0_returned() {

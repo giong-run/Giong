@@ -15,6 +15,7 @@ mod common;
 /// limit up to the hard one. Shells start with a soft limit of 1024 (Ubuntu's
 /// included), which the tests below need more than; the tests running
 /// alongside open some, too.
+#[cfg(unix)]
 fn allow_open_files(needed: u64) {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -338,6 +339,7 @@ impl Drop for TempFile {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn send_file_sends_the_file_and_leaves_the_stream_usable() {
     giong::block_on(async {
@@ -397,6 +399,7 @@ fn send_file_sends_the_file_and_leaves_the_stream_usable() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn send_file_past_the_end_sends_what_there_is_and_says_so() {
     giong::block_on(async {
@@ -429,6 +432,7 @@ fn send_file_past_the_end_sends_what_there_is_and_says_so() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn send_file_to_a_closed_peer_is_an_error_not_a_signal() {
     giong::block_on(async {
@@ -457,6 +461,7 @@ fn send_file_to_a_closed_peer_is_an_error_not_a_signal() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn a_non_blocking_stream_never_reports_would_block() {
     // io_uring stops waiting on a non-blocking socket in some cases (Linux
@@ -638,6 +643,7 @@ fn dropping_a_stream_closes_the_connection() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn accept_many_connections() {
     const N: usize = 500;
@@ -779,6 +785,7 @@ fn from_std_listener_and_stream() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn accept_backlog_is_bounded_and_no_connection_is_lost() {
     // More pending connections than the driver is willing to queue (1024):
@@ -894,6 +901,7 @@ fn small_writes_from_many_connections_share_buffers_and_arrive_intact() {
 /// the kernel would split the connections between the two processes.
 /// A socket made here with socket2 stands for it, since giong does not know
 /// it.
+#[cfg(unix)]
 #[test]
 fn a_port_shared_by_another_process_is_refused() {
     giong::block_on(async {
@@ -938,6 +946,7 @@ fn a_dropped_listener_s_port_can_be_bound_again_at_once() {
 
 /// `bind` cannot wait for a name to be resolved, so it takes IP addresses
 /// only and says what to write instead.
+#[cfg(unix)]
 #[test]
 fn bind_refuses_a_host_name_and_says_what_to_write() {
     giong::block_on(async {
