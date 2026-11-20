@@ -380,8 +380,9 @@ struct Config {
 
 /// Everything a worker thread owns. Reached through a thread-local.
 /// A single-shot operation whose future was dropped: its key, its
-/// resources, and whether its result is a descriptor to close.
-type DeferredCancel = (usize, Option<Box<dyn Any>>, bool);
+/// resources, whether its result is a descriptor to close, and whether it
+/// must run to the end (see [`Driver::cancel_op`]).
+type DeferredCancel = (usize, Option<Box<dyn Any>>, bool, bool);
 
 /// See [`Worker::deferred`].
 #[derive(Default)]
@@ -767,11 +768,17 @@ impl Worker {
     /// Cancels the single-shot operation `key`, whose future was dropped
     /// while the driver was borrowed, at the next turn of the event loop;
     /// see [`Driver::cancel_op`].
-    pub(crate) fn defer_cancel(&self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
+    pub(crate) fn defer_cancel(
+        &self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        result_is_fd: bool,
+        finish: bool,
+    ) {
         self.deferred
             .borrow_mut()
             .cancels
-            .push((key, data, result_is_fd));
+            .push((key, data, result_is_fd, finish));
     }
 
     /// Where the main future was started.
@@ -806,8 +813,8 @@ impl Worker {
         for key in deferred.multis {
             driver.drop_multi(key);
         }
-        for (key, data, result_is_fd) in deferred.cancels {
-            driver.cancel_op(key, data, result_is_fd);
+        for (key, data, result_is_fd, finish) in deferred.cancels {
+            driver.cancel_op(key, data, result_is_fd, finish);
         }
         for fd in deferred.closes {
             driver.close_fd(fd);

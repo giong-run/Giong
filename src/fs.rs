@@ -543,10 +543,10 @@ impl File {
     /// Closes the file and reports the result. Dropping a `File` closes it
     /// too, but cannot report an error.
     ///
-    /// Not cancel safe: if the future is dropped, the result is lost, and on
-    /// io_uring a close the kernel had handed to a worker thread (some network
-    /// filesystems) can be cancelled and leave the descriptor open. Await it to
-    /// the end.
+    /// Cancel safe for the descriptor, not for the result: the close is never
+    /// cancelled. If the future is dropped, before or after it was first
+    /// polled, the descriptor is still closed exactly once, on both drivers;
+    /// only the error, if any, is lost. Await it to the end to see the error.
     pub async fn close(self) -> io::Result<()> {
         let fd = self.fd;
         mem::forget(self);

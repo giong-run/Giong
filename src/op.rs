@@ -142,16 +142,17 @@ impl<T: 'static> Drop for Op<T> {
         let Some(key) = self.key.take() else { return };
         let mut data = self.data.take().map(|data| (data, self.hold.take()));
         let result_is_fd = self.io.is_some_and(|io| io.result_is_fd());
+        let finish = self.io.is_some_and(|io| io.finishes_when_dropped());
         let handed_over = runtime::try_with_worker(|w| {
             if w.shared.uid != self.worker_uid {
                 return false;
             }
             let data = data.take().map(|d| Box::new(d) as Box<dyn Any>);
             match w.driver.try_borrow_mut() {
-                Ok(mut driver) => driver.cancel_op(key as usize, data, result_is_fd),
+                Ok(mut driver) => driver.cancel_op(key as usize, data, result_is_fd, finish),
                 // Dropped by code the driver runs (a waker's `wake` or
                 // `drop`): cancelled at the next turn, still on this worker.
-                Err(_) => w.defer_cancel(key as usize, data, result_is_fd),
+                Err(_) => w.defer_cancel(key as usize, data, result_is_fd, finish),
             }
             true
         })

@@ -77,19 +77,37 @@ pull request carries this checklist, filled in, in its description:
    - *soak path*: it changes `src/driver/`, `src/op.rs`, `src/buf.rs`, `src/kbox.rs`,
      `src/slab.rs`, `src/runtime.rs`, `src/executor.rs`, `src/time.rs`, `src/net.rs`,
      `src/net/`, `src/sync/`, `src/fs.rs`, or the connection, HTTP/2 or TLS state of
-     `giong-http` and `giong-tls`, in lines that run (doc comments do not count);
-   - *outside*: everything else (the database crates, `giong-web`, `giong-mcp`, docs,
-     benches, tests).
+     `giong-http`'s server and of `giong-tls`, in lines that run (doc comments do not
+     count);
+   - *outside*: everything else (the database crates, `giong-http`'s client, `giong-web`,
+     `giong-mcp`, docs, benches, tests).
 4. **The tests run again on the release commit**, each named with its run: the full CI
    set (kernels 5.15 to 6.18, both drivers, TSan, loom, Kani, the simulation soak), the
    cancellation tests of STABILITY.md's *Cancellation* section on both drivers, and for
    each *soak path* pull request the tests it added or that cover the code it changed.
-5. **The soak decision and its basis**: whether the release commit is soaked again before
-   the tag, and why. For 1.0.0-rc.1 the maintainer decided (2026-11-20) that the 0.9 soak
-   stands: the soak-path changes since tree `f1b23074` are small (#134's bind, the channel,
-   UDP and close fixes), the tests of item 4 cover them, and the next full 72-hour soak on
-   both drivers runs on a later candidate or 1.x release, recorded the same way.
+5. **The soak, sized by what changed** (see [How long to soak](#how-long-to-soak)): the
+   tier the range falls in, the commit that was soaked, for how long on each driver, and
+   the results directory. For 1.0.0-rc.1: the 72-hour soak of 0.9 stands for the code it
+   covered, and the soak-path changes since tree `f1b23074` (#134's bind, the channel, UDP,
+   close and TLS receive fixes) get a 4-hour soak per driver on `main` once they have all merged.
 6. **The removals**: every item of STABILITY.md's *Changes made before 1.0* checked off.
+
+### How long to soak
+
+A soak costs machine time and holds merges back, so its length follows what changed since
+the last soaked commit, not the calendar. The longest tier any pull request in the range
+falls in decides:
+
+| What changed | Soak on bare metal, per driver |
+|---|---|
+| Nothing on a soak path: docs, benches, tests, the database crates, `giong-web`, `giong-mcp`, the HTTP client | none |
+| A soak path (item 3 above): the drivers, the scheduler, a cancellation path, sockets, channels, timers, files, or the connection, HTTP/2 or TLS state of the servers | 2 to 4 hours |
+| A new major version, a new driver (kqueue, IOCP) or a replaced scheduler | 72 hours |
+
+A short soak runs the same `tests/soak.rs` and the same checks as the long one (no leak of
+memory or descriptors, no crash, no stall); two hours for a change the tests of item 4
+cover line by line, four when it reaches further. The 72-hour soak also runs once on a 1.x
+release when none has run for six months, so slow leaks cannot build up unseen.
 
 ## When something fails
 

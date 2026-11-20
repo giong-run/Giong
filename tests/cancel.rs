@@ -570,6 +570,73 @@ fn a_dropped_open_closes_the_descriptor_it_produced() {
     std::fs::remove_file(&path).unwrap();
 }
 
+#[test]
+fn a_dropped_close_still_closes_on_the_epoll_driver() {
+    // The epoll driver closes on a blocking thread. A close still waiting
+    // for a thread when its future was dropped was skipped as cancelled,
+    // and the descriptor stayed open with nobody owning it.
+    let dir = std::env::temp_dir().join(format!("giong-drop-close-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    let path = dir.join("file");
+    std::fs::write(&path, b"x").unwrap();
+    // Opening a FIFO for reading blocks until a writer opens it: each open
+    // holds a blocking thread.
+    let fifo = dir.join("fifo");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    giong::Builder::new()
+        .driver(giong::DriverKind::Epoll)
+        .block_on(async {
+            let file = giong::fs::File::open(&path).await.unwrap();
+            // More opens than the pool has threads (64): every thread
+            // waits for the writer, and jobs queued after them wait too.
+            let mut opens: Vec<_> = (0..64)
+                .map(|_| Box::pin(giong::fs::File::open(&fifo)))
+                .collect();
+            for open in &mut opens {
+                let open = open.as_mut();
+                assert!(poll_once(open).await.is_pending());
+            }
+            // Queued behind the opens, then dropped, as when a timeout fires.
+            let mut close = Box::pin(file.close());
+            assert!(poll_once(close.as_mut()).await.is_pending());
+            drop(close);
+            assert_eq!(open_fds(&path), 1);
+            // Let the opens finish; the close runs after them.
+            let writer = std::thread::spawn({
+                let fifo = fifo.clone();
+                move || std::fs::OpenOptions::new().write(true).open(fifo).unwrap()
+            });
+            for open in opens {
+                open.await.unwrap();
+            }
+            let writer = writer.join().unwrap();
+            for _ in 0..200 {
+                if open_fds(&path) == 0 && giong::observe::worker_stats().tracked_ops == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            drop(writer);
+            assert_eq!(
+                open_fds(&path),
+                0,
+                "a dropped close left its descriptor open"
+            );
+            assert_eq!(giong::observe::worker_stats().tracked_ops, 0);
+        })
+        .unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Polls `fut` once and reports what it returned.
+async fn poll_once<F: Future>(fut: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+    let mut fut = Some(fut);
+    std::future::poll_fn(move |cx| std::task::Poll::Ready(fut.take().unwrap().poll(cx))).await
+}
+
 /// A waker that runs `f` the first time it is woken. The driver wakes tasks
 /// while it is borrowed, so `f` runs inside the driver, as code in a
 /// waker's `wake` or `drop` can.
