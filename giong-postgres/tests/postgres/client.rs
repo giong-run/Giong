@@ -725,6 +725,58 @@ fn transactions_commit_roll_back_and_roll_back_when_dropped() {
 }
 
 #[test]
+fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
+    run(|s| async move {
+        let mut client = connect(s).await;
+        let other = connect(s).await;
+        table(&client, "given_up", "id int").await;
+        let tx = client.transaction().await.unwrap();
+        tx.execute("INSERT INTO given_up VALUES (1)", &[])
+            .await
+            .unwrap();
+        // Sent, then given up while the server still runs it.
+        let late = timeout(
+            Duration::from_millis(20),
+            tx.execute("INSERT INTO given_up SELECT 2 FROM pg_sleep(0.3)", &[]),
+        )
+        .await;
+        assert!(late.is_err());
+        // Nothing more is sent in it.
+        let e = tx
+            .execute("INSERT INTO given_up VALUES (3)", &[])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("given up"), "{e}");
+        let e = tx.commit().await.unwrap_err();
+        assert!(e.to_string().contains("given up"), "{e}");
+        assert_eq!(e.kind(), ErrorKind::Db);
+        assert_eq!(e.giong_code(), ErrorKind::Db.giong_code());
+        // Once the late statement has run and the rollback after it, another
+        // connection sees none of the transaction.
+        client.batch_execute("SELECT 1").await.unwrap();
+        assert_eq!(count(&other, "given_up").await, 0, "rolled back");
+        // The connection is fine for the next transaction.
+        let tx = client.transaction().await.unwrap();
+        let insert = "INSERT INTO given_up VALUES ($1)";
+        tx.execute(insert, &[&4i32]).await.unwrap();
+        // Answered before its future was dropped: its outcome is known, so it
+        // does not stop the commit. (The statement is cached, so the first
+        // poll sends it.)
+        let mut answered = Box::pin(tx.execute(insert, &[&5i32]));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(answered.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        tx.batch_execute("SELECT 1").await.unwrap();
+        drop(answered);
+        tx.commit().await.unwrap();
+        assert_eq!(count(&other, "given_up").await, 2);
+    });
+}
+
+#[test]
 fn dropping_the_client_closes_the_session_and_leaks_nothing() {
     run(|s| async move {
         let admin = connect(s).await;

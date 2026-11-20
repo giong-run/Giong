@@ -194,6 +194,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong-postgres**: a `Transaction` in which a statement was given up before its answer
+  came (its future dropped, by a timeout say) could still commit, although the statement
+  may have run on the server unseen. As in giong-mysql, the transaction now refuses every
+  later statement and `commit` with an `ErrorKind::Db` error that says so, sends nothing
+  more, and is rolled back when dropped. In both crates a statement whose answer had
+  arrived before its future was dropped no longer counts, since its outcome is known
+  (giong-mysql refused the commit for it too).
 - A `File::close` whose future was dropped after it was first polled could leave the
   descriptor open with nobody owning it: on the epoll driver when no blocking thread had
   started the close yet, and on io_uring when the kernel had handed it to a worker thread
