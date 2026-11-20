@@ -298,3 +298,38 @@ fn a_dropped_connect_leaves_no_connection() {
         })
         .unwrap();
 }
+
+/// quinn-proto reuses the name of a connection once it has drained, which
+/// can be while streams of it are still held.
+#[test]
+fn streams_held_past_their_connection_do_not_touch_the_next_one() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            giong::spawn(serve(server));
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+
+            let old = client.connect(addr, "localhost", &cfg).await.unwrap();
+            let held = old.open_bi().await.unwrap();
+            old.close(0, b"");
+            drop(old);
+            // Long enough for the closed connection to drain.
+            giong::time::sleep(Duration::from_millis(500)).await;
+
+            let new = client.connect(addr, "localhost", &cfg).await.unwrap();
+            drop(held);
+            let (mut send, mut recv) = new.open_bi().await.unwrap();
+            send.write_all(b"abc").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(16).await.unwrap(), b"cba");
+        })
+        .unwrap();
+}

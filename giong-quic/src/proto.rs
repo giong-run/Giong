@@ -44,6 +44,11 @@ struct Wakers {
 
 struct Conn {
     c: quinn_proto::Connection,
+    /// The name quinn-proto has for it. It gives the name to a new
+    /// connection as soon as this one has drained, which can be before
+    /// the last handle to this one is dropped: handles are slots of
+    /// `State::conns` instead, which are only reused without handles.
+    ch: ConnectionHandle,
     connected: bool,
     lost: Option<ConnectionError>,
     /// Waiting for the handshake, a stream to accept or one to open.
@@ -66,6 +71,11 @@ struct Send {
 struct State {
     ep: quinn_proto::Endpoint,
     conns: Vec<Option<Conn>>,
+    /// The slot in `conns` of the connection quinn-proto knows by each
+    /// of its handles.
+    slots: Vec<usize>,
+    /// Empty slots of `conns`.
+    free: Vec<usize>,
     dirty: Vec<usize>,
     accepted: VecDeque<usize>,
     accept_waker: Option<Waker>,
@@ -107,12 +117,24 @@ impl State {
         }
     }
 
-    fn insert(&mut self, ch: ConnectionHandle, c: quinn_proto::Connection, incoming: bool) {
-        if self.conns.len() <= ch.0 {
-            self.conns.resize_with(ch.0 + 1, || None);
+    /// Takes a new connection in; gives its slot.
+    fn insert(
+        &mut self,
+        ch: ConnectionHandle,
+        c: quinn_proto::Connection,
+        incoming: bool,
+    ) -> usize {
+        let slot = self.free.pop().unwrap_or_else(|| {
+            self.conns.push(None);
+            self.conns.len() - 1
+        });
+        if self.slots.len() <= ch.0 {
+            self.slots.resize(ch.0 + 1, usize::MAX);
         }
-        self.conns[ch.0] = Some(Conn {
+        self.slots[ch.0] = slot;
+        self.conns[slot] = Some(Conn {
             c,
+            ch,
             connected: false,
             lost: None,
             waiters: Vec::new(),
@@ -121,7 +143,8 @@ impl State {
             dirty: false,
             incoming,
         });
-        self.mark(ch.0);
+        self.mark(slot);
+        slot
     }
 
     fn out(&mut self, to: SocketAddr, data: &[u8], segment: usize, ecn: u8) {
@@ -156,7 +179,9 @@ impl State {
                     }
                     self.scratch.clear();
                     match self.ep.accept(inc, now, &mut self.scratch, None) {
-                        Ok((ch, c)) => self.insert(ch, c, true),
+                        Ok((ch, c)) => {
+                            self.insert(ch, c, true);
+                        }
                         Err(e) => {
                             if let Some(t) = e.response {
                                 let d = std::mem::take(&mut self.scratch);
@@ -167,9 +192,12 @@ impl State {
                     }
                 }
                 Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
-                    if let Some(Some(c)) = self.conns.get_mut(ch.0) {
-                        c.c.handle_event(ev);
-                        self.mark(ch.0);
+                    let slot = self.slots.get(ch.0).copied().unwrap_or(usize::MAX);
+                    if let Some(Some(c)) = self.conns.get_mut(slot) {
+                        if c.ch == ch {
+                            c.c.handle_event(ev);
+                            self.mark(slot);
+                        }
                     }
                 }
                 Some(DatagramEvent::Response(t)) => {
@@ -206,10 +234,10 @@ impl State {
     }
 
     fn process_one(&mut self, i: usize, now: Instant) {
-        let ch = ConnectionHandle(i);
         let Some(conn) = self.conns[i].as_mut() else {
             return;
         };
+        let ch = conn.ch;
         conn.dirty = false;
         loop {
             let mut again = false;
@@ -286,6 +314,7 @@ impl State {
         }
         if conn.c.is_drained() && conn.refs == 0 {
             self.conns[i] = None;
+            self.free.push(i);
         }
     }
 }
@@ -382,6 +411,8 @@ pub(crate) fn bind(
         st: RefCell::new(State {
             ep,
             conns: Vec::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
             dirty: Vec::new(),
             accepted: VecDeque::new(),
             accept_waker: None,
@@ -439,8 +470,7 @@ impl Shared {
                 .ep
                 .connect(Instant::now(), cfg, to, name)
                 .map_err(error::connect)?;
-            st.insert(ch, c, false);
-            ch.0
+            st.insert(ch, c, false)
         };
         // Releases the connection if the handshake fails or the caller
         // gives up on it (drops the future), so that it is closed and
