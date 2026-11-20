@@ -166,6 +166,31 @@ jobs:
           "$h2spec" --strict --port 8080 --timeout 5 \
             generic hpack http2/3.5/1 http2/4 http2/5 http2/6 http2/7 http2/8
 
+  # HTTP/3 and QUIC conformance: h3spec against giong-http's h3 example
+  # (`Server::serve_h3` on giong-quic, behind `unstable-http3`). h3spec sends
+  # what a client must not send, on the QUIC and on the HTTP/3 level, and
+  # checks that the server answers with the right error. Its release binary
+  # is checked against the hash GitHub publishes for it before it runs.
+  h3spec:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Fetch h3spec
+        run: |
+          curl -fsSL --retry 3 -o h3spec https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64
+          echo "c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830  h3spec" | sha256sum -c -
+          chmod +x h3spec
+      - run: cargo build --release -p giong-http --features unstable-http3 --example h3
+      - name: Run h3spec
+        run: |
+          target/release/examples/h3 127.0.0.1:8443 &
+          sleep 2
+          ./h3spec --no-validate --timeout 5000 127.0.0.1 8443
+
   # The database crates against the other server versions they support; the
   # jobs above use the runner's PostgreSQL 16, MySQL 8.0 and Ubuntu's Redis
   # 7.0. Each entry installs one server and runs one crate's tests on it.
@@ -718,10 +743,10 @@ jobs:
 
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
-  # Docker, the other server versions, loom, h2spec, the lowest dependency
+  # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
   # versions, the simulation) hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic]
+    needs: [lint, msrv, build, test, h2spec, h3spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic]
     if: always()
     runs-on: ubuntu-24.04
     steps:

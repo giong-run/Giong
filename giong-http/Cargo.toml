@@ -64,6 +64,10 @@ required-features = ["unstable-http3"]
 name = "h2"
 required-features = ["tls"]
 
+[[example]]
+name = "h3"
+required-features = ["unstable-http3"]
+
 [lints.rust]
 # Set by `cargo fuzz` (see fuzz/).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
