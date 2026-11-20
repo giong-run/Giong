@@ -89,6 +89,25 @@ struct State {
     spare: Vec<Vec<u8>>,
 }
 
+impl Conn {
+    /// The connection is over: whoever waits on it or on one of its
+    /// streams is told so. The first reason stays.
+    fn lose(&mut self, reason: ConnectionError) {
+        if self.lost.is_none() {
+            self.lost = Some(reason);
+        }
+        wake_all(&mut self.waiters);
+        for w in self.streams.values_mut() {
+            if let Some(w) = w.read.take() {
+                w.wake();
+            }
+            if let Some(w) = w.write.take() {
+                w.wake();
+            }
+        }
+    }
+}
+
 fn wake_all(w: &mut Vec<Waker>) {
     for w in w.drain(..) {
         w.wake();
@@ -260,18 +279,7 @@ impl State {
                         }
                         wake_all(&mut conn.waiters);
                     }
-                    Event::ConnectionLost { reason } => {
-                        conn.lost = Some(reason);
-                        wake_all(&mut conn.waiters);
-                        for w in conn.streams.values_mut() {
-                            if let Some(w) = w.read.take() {
-                                w.wake();
-                            }
-                            if let Some(w) = w.write.take() {
-                                w.wake();
-                            }
-                        }
-                    }
+                    Event::ConnectionLost { reason } => conn.lose(reason),
                     Event::Stream(StreamEvent::Opened { .. } | StreamEvent::Available { .. }) => {
                         wake_all(&mut conn.waiters)
                     }
@@ -643,9 +651,11 @@ impl Shared {
 
     pub(crate) fn close_conn(&self, h: usize, code: u32, reason: &[u8]) {
         let mut st = self.st.borrow_mut();
-        st.conn(h)
-            .c
-            .close(Instant::now(), code.into(), Bytes::copy_from_slice(reason));
+        let c = st.conn(h);
+        c.c.close(Instant::now(), code.into(), Bytes::copy_from_slice(reason));
+        // quinn-proto has no event for a close of our own: the tasks that
+        // wait on this connection's streams would wait for ever.
+        c.lose(ConnectionError::LocallyClosed);
         st.mark(h);
     }
 

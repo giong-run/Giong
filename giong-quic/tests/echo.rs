@@ -333,3 +333,49 @@ fn streams_held_past_their_connection_do_not_touch_the_next_one() {
         })
         .unwrap();
 }
+
+/// quinn-proto reports no event for a close of our own, and tasks may
+/// wait on the connection when it is closed.
+#[test]
+fn closing_a_connection_ends_what_waits_on_it() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            giong::spawn(serve(server));
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = std::rc::Rc::new(client.connect(addr, "localhost", &cfg).await.unwrap());
+
+            // A stream the server answers only once it is finished, which
+            // it never is: the read waits.
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"abc").await.unwrap();
+            let reader = giong::spawn(async move { recv.read().await });
+            // The server opens no stream of its own: this waits too.
+            let accepting = conn.clone();
+            let acceptor = giong::spawn(async move { accepting.accept_uni().await.map(|_| ()) });
+            giong::time::sleep(Duration::from_millis(50)).await;
+
+            conn.close(7, b"done");
+            let read = giong::time::timeout(Duration::from_secs(5), reader)
+                .await
+                .expect("the read never ends")
+                .unwrap();
+            assert!(read.unwrap_err().to_string().contains("GIONG-E3603"));
+            let accepted = giong::time::timeout(Duration::from_secs(5), acceptor)
+                .await
+                .expect("the accept never ends")
+                .unwrap();
+            assert!(accepted.unwrap_err().to_string().contains("GIONG-E3603"));
+            assert!(conn.open_bi().await.is_err());
+            drop(send);
+        })
+        .unwrap();
+}
