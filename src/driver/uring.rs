@@ -1762,8 +1762,9 @@ mod tests {
         CLOSE_ASYNC.store(false, Ordering::Relaxed);
         std::fs::remove_file(&path).unwrap();
         match run {
-            // Blocked (Docker's seccomp profile) or missing (old kernels).
-            Err(e) if crate::error::code(&e) == Some(Code::IoUringUnavailable) => {
+            // Blocked (Docker's seccomp profile), missing or too old (5.15):
+            // the cases in which the automatic choice falls back to epoll.
+            Err(e) if crate::driver::io_uring_unusable(&e) => {
                 eprintln!("skipped: {e}");
             }
             other => other.unwrap(),
