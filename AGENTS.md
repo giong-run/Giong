@@ -134,7 +134,7 @@ CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the la
 release, so no breaking change lands between releases; what the 1.x promise covers, and the
 rules for growing the API without breaking it, are in `docs/STABILITY.md`), `instr` (`scripts/instr.py`:
 instructions per operation on the hot paths, counted by callgrind, and heap per idle
-connection, within 1% and 2% of `bench/instr/baseline.csv`; a change meant to move them
+connection, both within 1% of `bench/instr/baseline.csv`; a change meant to move them
 commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
 in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
 operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp

@@ -130,9 +130,12 @@ blocking std sockets, which own no heap) and record how much the live heap and t
 set grew per connection. For `idle-https` that thread does each TLS handshake and one
 keep-alive request with rustls, then drops its TLS state and keeps the socket, so the heap
 that stays is the server's (the server cannot tell; nothing is sent). Its allocation count, like
-the other cases', covers both ends, handshakes included. The heap count is exact and
-repeats within a byte per connection; its limit is 2%. The resident set moves with the
-allocator's choices; its limit is 10%. For `idle-h2` the thread sends the preface, SETTINGS and
+the other cases', covers both ends, handshakes included. The heap count is exact: it
+repeats within a byte per connection, and within 0.04% across GitHub's runners (Intel and AMD,
+two clouds; item 6 of [`conditions.txt`](../results/instr/conditions.txt)). Its limit is 1%,
+and the baseline's idle rows are taken from a CI run, not from a development machine, where
+the kernel build alone moved `idle-http1` by 1.3%. The resident set moves with the
+allocator's choices (2.7% between rounds for `idle-h2`); its limit is 10%. For `idle-h2` the thread sends the preface, SETTINGS and
 one `GET /` on each connection and reads the answer, as `bench/h2.sh` does: until 0.9 it sent no
 request, and missed that 0.8.0 kept each connection's memory for streams for a second after a
 request (6,852 heap and 7,371 resident bytes per connection on 0.8.0 with the request, against
@@ -142,13 +145,13 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
-| `idle-http1` (io_uring / epoll) | 1,940 / 2,102 bytes | 1,995 / 2,169 bytes |
-| `idle-h2` (io_uring / epoll) | 4,427 / 4,492 bytes | 4,801 / 4,796 bytes |
-| `idle-https` (io_uring / epoll) | 10,784 / 10,821 bytes | 11,123 / 11,086 bytes |
+| `idle-http1` (io_uring / epoll) | 1,980 / 2,158 bytes | 2,009 / 2,200 bytes |
+| `idle-h2` (io_uring / epoll) | 4,473 / 4,556 bytes | 4,827 / 4,844 bytes |
+| `idle-https` (io_uring / epoll) | 10,797 / 10,865 bytes | 11,174 / 11,121 bytes |
 
-The numbers above were measured on a 4-vCPU Xeon VM (Linux 6.18), the instruction counts on
-2026-11-20 and the memory on 2026-11-15 and after; what CI
-compares against is `baseline.csv`, whose header names the machine it came from.
+The instruction counts above were measured on a 4-vCPU Xeon VM (Linux 6.18) on 2026-11-20 and
+are the same on CI's runners; the memory is from the CI run that put 3fa75c3 on `main`
+(2026-11-20). What CI compares against is `baseline.csv`.
 
 ## When the check fails
 
@@ -160,7 +163,11 @@ counts and a ready `baseline.csv` as the run's `instr` artifact.
   `bench/instr/baseline.csv` in the same pull request (with `bench/results/instr/raw.csv`
   from `scripts/instr.py update` if measured locally on a comparable machine), and say in the
   description what moved and why. A saving is checked as strictly as a cost, so that the
-  baseline always describes `main`.
+  baseline always describes `main`. Take the memory rows (`idle-*`) from the artifact in any
+  case: a development machine's kernel gives other numbers than the runners agree on.
+- **It passes, with rows listed above the table:** those moved by more than half their limit.
+  If the pull request is not meant to move them, look before merging; a step that passes
+  still stays in every later comparison.
 - **It is not:** find what got slower. Run the case under callgrind and annotate it:
 
   ```sh
