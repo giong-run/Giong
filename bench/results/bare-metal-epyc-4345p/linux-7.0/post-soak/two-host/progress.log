@@ -1,0 +1,12 @@
+2026-11-20T01:13:51Z quic giong-x4 done: 0 fail_queue_rcv_skb; p99 101 us
+2026-11-20T01:14:41Z quic giong-x1 done: 0 fail_queue_rcv_skb; p99 99 us
+2026-11-20T01:15:32Z quic giong-plain-x1 done: 14 fail_queue_rcv_skb; p99 138 us
+2026-11-20T01:15:49Z xdp: reboot timer set; 4fc4964 bench: how much of a small-packet server is the kernel, AF_XDP against sockets
+2026-11-20T01:15:49Z xdp: ntuple rule 15359 steers udp/7777 to queue 0, its irq 98 on cpu 0
+2026-11-20T01:17:01Z xdp round 1 done
+2026-11-20T01:18:12Z xdp round 2 done
+2026-11-20T01:19:23Z xdp round 3 done
+2026-11-20T01:19:23Z xdp: rule removed, no XDP program left
+2026-11-20T01:19:24Z xdp: reboot timer cancelled
+2026-11-20T01:20:59Z gso done
+2026-11-20T01:20:59Z all done

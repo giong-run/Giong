@@ -126,6 +126,77 @@ The nine crates are released together and carry the same version. A crate that d
 another depends on the same minor or newer. New crates (`giong-quic`, `giong-grpc` and the
 others on the roadmap) join at the current version when they are first published.
 
+## Cancellation
+
+A future is cancelled by dropping it: a `timeout`, a `select` that takes another branch, a
+task that is aborted or a runtime that shuts down. What every I/O operation does then is
+part of the promise, because callers rely on it as much as on a return value.
+
+- **The operation may still happen.** Dropping the future stops the caller from learning
+  the result, not the kernel from acting. A write, a send, a rename or an `unlink` handed to
+  the kernel (or, on the epoll driver, to a blocking thread) may complete after the drop,
+  in full or in part. Each public async fn says in its documentation whether it is *cancel
+  safe* (dropping it loses nothing and changes nothing the caller cannot see) and, when it
+  is not, what may have happened; `tests/cancel_docs.rs` fails a public async fn that does
+  not say.
+- **The driver holds what the kernel may still touch.** The buffers an operation was given
+  (`IoBuf`, `IoBufMut`, `Vec`), the path it reads and the structures it points at move to
+  the worker's driver when the future is dropped. They are freed, or a pool buffer goes
+  back to its pool, only once nothing can touch them any more:
+  - on io_uring, when the operation's completion arrives (the driver asks the kernel to
+    cancel it at once, and the completion comes either way); for a zero-copy send, when
+    the kernel's notification says it stopped reading the buffer, which comes after the
+    result;
+  - on epoll, at once for an operation that was waiting for readiness (nothing was handed
+    to the kernel), and when the blocking thread returns for a file operation it had
+    already started; one it had not started is skipped.
+  The caller never gets those buffers back: a dropped `write(buf)` loses `buf`. Until they
+  are freed they count wherever they were counted before the drop (a pool buffer stays out
+  of the pool; a request's bytes stay in `max_buffered_request_bytes`), and that moment is
+  also the earliest at which any 1.x budget gives their share back.
+- **Descriptors are never leaked or closed twice.** An `accept`, `connect` or `open` that
+  completes after its future was dropped has its new descriptor closed by the driver. A
+  descriptor that an owner (`File`, `TcpStream`, `UdpSocket`) closes is closed exactly
+  once, and its number may be reused by the process only after that close. A close itself
+  is never cancelled: once `File::close` is called, the descriptor ends up closed whether
+  or not its future is awaited; only the result can be lost.
+- **Slots are given back when the operation ends, not when the future is dropped.** A
+  database statement that was sent keeps its place in the connection's pipeline until its
+  answer has been read and thrown away (`Client::in_flight` counts it until then). An
+  HTTP/2 client stream whose response future was dropped is reset with `CANCEL`.
+- **Data received is not lost by a cancelled receive** where the documentation says
+  *cancel safe*: `TcpStream::recv`, `UdpSocket::recv_from` and the channel receivers keep
+  what arrived for the next call. `read` into a caller's buffer is not: bytes the kernel
+  had copied in are lost with the buffer.
+- **A transaction never commits work whose outcome it does not know.** A statement of a
+  transaction that was sent and then given up (its future dropped before the answer) may
+  have run, so the transaction refuses `commit` with a coded error and has to be rolled
+  back (dropping it does that). giong-mysql does this today (`Tx::Abandoned`). *Known gap
+  on `main`, fixed before 1.0.0-rc.1: giong-postgres's `commit` still commits.*
+
+## Defaults you can rely on
+
+When a limit is reached, a giong API does one of three things by default, and which one is
+part of the promise: it **waits** (with no end, or until a stated timeout), or it
+**refuses** with a coded error. A 1.x release never turns a default that waits into one
+that refuses, or the reverse; a new way of refusing early (an overload policy, a per-tenant
+budget) comes as a setting that is off until it is turned on. The numbers may be tuned when
+the documentation does not promise them; the kind of answer stays.
+
+| Limit | Default answer |
+|---|---|
+| A bounded channel is full (`send`) | waits until there is room |
+| A database pool has no free connection (`Pool::get`) | waits up to `wait_timeout` (5 s), then `E3009`, `E3109` or `E3209` |
+| The HTTP client has `max_connections_per_host` (16) open to the origin | waits for a connection to be free, within the request's `timeout` (30 s) |
+| The HTTP server holds `max_connections` (10,000 per worker) | stops accepting; new connections wait in the kernel's backlog |
+| A request would take a worker past `max_buffered_request_bytes` | refuses: `503` with `E1120` (HTTP/2: `REFUSED_STREAM`) |
+| Free memory is below `min_free_memory` when a connection arrives | refuses: `503` with `E1121`, or a TLS connection closed before its handshake |
+| An HTTP/2 client opens more than `max_concurrent_streams` (100) | refuses the extra streams, as HTTP/2 requires |
+
+The two memory refusals are on by default because waiting is not possible there: the
+memory is already gone. Everything else waits, so code written for 1.0 sees no new errors
+from a 1.x release unless it turns a new policy on.
+
 ## Changes made before 1.0
 
 Breaking changes are refused between releases (`scripts/semver.sh`), so the few the API

@@ -32,6 +32,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   safe and, when it is not, what a dropped future leaves behind (a statement that may
   still run, a datagram that may be sent, a file that may be created).
   `tests/cancel_docs.rs` fails a public async fn without it.
+- **Docs**: `docs/STABILITY.md` says what a cancelled operation does on both drivers (it
+  may still happen; buffers and descriptors stay with the driver until the kernel is done
+  with them; a close is never cancelled; a transaction never commits a statement whose
+  outcome it does not know) and which limits wait and which refuse by default, which 1.x
+  will not change. `docs/RELEASING.md` gives the checklist a 1.0 release candidate carries:
+  the soaked commit, the release commit, what changed between them, the tests run again
+  and the basis for soaking again or not.
 - **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
@@ -65,6 +72,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (giong-postgres: class `08`, `40001`, `40P01`, `55P03`, `53300`, `57P01`-`57P03`, `25006`;
   giong-mysql: 1213, 1205, 1040, 1203, 1053, 1792, 1836, 1927, and 1290 for a read-only
   server).
+- **giong**: `sync::mpsc::unbounded()`, the new name of `sync::mpsc::channel()`. Tokio's
+  `mpsc::channel(n)` is bounded, so code ported from Tokio, or written from memory of it,
+  took giong's `channel()` for a bounded channel; `bounded(n)` is that one here. Its halves
+  are now `UnboundedSender` and `UnboundedReceiver`, as in Tokio, so that in 1.0.0 the short
+  names `Sender` and `Receiver` can go to the bounded channel, whose memory has a limit.
 - **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
   parameter is still `dbname`, as libpq spells it.
 
@@ -145,6 +157,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
   giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
   that names the new method, and go in 1.0.0-rc.1.
+- **giong**: `sync::mpsc::channel()`, renamed `unbounded()`, and `sync::mpsc::Sender` and
+  `Receiver`, renamed `UnboundedSender` and `UnboundedReceiver`; they go in 1.0.0-rc.1 too, which
+  gives the names `Sender` and `Receiver` to `BoundedSender` and `BoundedReceiver`.
 
 ### Fixed
 
@@ -153,6 +168,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   started the close yet, and on io_uring when the kernel had handed it to a worker thread
   (network filesystems, FUSE). The close is no longer cancelled; it runs to the end and
   only its result is lost.
+- **giong-http**: requests sent at once to an `https` origin the client had no connection to
+  yet each opened a connection and did a TLS handshake of their own, up to
+  `max_connections_per_host`, because the pool learned that the origin speaks HTTP/2 only
+  once the first handshake was over. They now wait for that first connection while ALPN may
+  still pick HTTP/2, and share it when it does; when it picks HTTP/1.1 they open their own
+  as before, and when the first one fails or is dropped the next in line opens one. 64
+  requests to a new loopback origin on one worker: 16 TLS connections and 4.70 ms before, 1
+  and 0.78 ms after (median of 21 rounds). Reported from a service that warms its client up
+  while requests arrive (#154).
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
