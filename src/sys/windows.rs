@@ -6,11 +6,13 @@
 //! posted to the worker's completion port, which the driver owns
 //! (`driver::iocp`).
 
-use std::ffi::c_void;
-
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR, SOCKADDR_STORAGE, SOCKET, WSAMSG};
 use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+use windows_sys::Win32::System::Memory::{
+    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+};
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetThreadAffinityMask,
 };
@@ -108,11 +110,57 @@ pub(crate) fn fsync(file: RawFile, _datasync: bool) -> isize {
     }
 }
 
-#[allow(dead_code)]
-const _: fn() = || {
-    // `Io` is `Copy` and holds these by value.
-    fn copy<T: Copy>() {}
-    copy::<RawSock>();
-    copy::<RawFile>();
-    copy::<*const c_void>();
-};
+/// Error numbers the code outside the driver compares results against:
+/// the Winsock and Win32 codes that mean what the Unix names say.
+pub(crate) mod errno {
+    use windows_sys::Win32::Foundation::ERROR_IO_DEVICE;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAEADDRINUSE, WSAEINTR, WSAEOPNOTSUPP, WSAEWOULDBLOCK,
+    };
+
+    pub(crate) const EADDRINUSE: i32 = WSAEADDRINUSE;
+    pub(crate) const EAGAIN: i32 = WSAEWOULDBLOCK;
+    pub(crate) const EINTR: i32 = WSAEINTR;
+    pub(crate) const EIO: i32 = ERROR_IO_DEVICE as i32;
+    pub(crate) const EOPNOTSUPP: i32 = WSAEOPNOTSUPP;
+}
+
+/// Reserves and commits `len` bytes of zero-filled, page-aligned memory for
+/// a buffer pool. Windows gives a committed page physical memory when it is
+/// first touched, so an idle pool costs commit charge, not memory. Null if
+/// the system refuses; `io::Error::last_os_error` then says why.
+pub(crate) fn map_pool(len: usize) -> *mut u8 {
+    // SAFETY: a fresh allocation at an address the system picks.
+    unsafe {
+        VirtualAlloc(
+            std::ptr::null(),
+            len,
+            MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE,
+        )
+        .cast()
+    }
+}
+
+/// Gives back memory from [`map_pool`].
+///
+/// # Safety
+///
+/// `ptr` is the start of a region `map_pool` returned, and nothing uses it
+/// any more.
+pub(crate) unsafe fn unmap_pool(ptr: *mut u8, _len: usize) {
+    // SAFETY: the caller hands a region allocated by `map_pool`; releasing
+    // takes the base address and a size of 0.
+    unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+}
+
+/// The size of a page of memory.
+pub(crate) fn page_size() -> usize {
+    // SAFETY: fills a local with plain data.
+    let info = unsafe {
+        let mut info: SYSTEM_INFO = std::mem::zeroed();
+        GetSystemInfo(&mut info);
+        info
+    };
+    info.dwPageSize as usize
+}

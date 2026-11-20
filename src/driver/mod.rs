@@ -22,10 +22,12 @@
 //! its pool buffer in the flags (`buffer_id`), exactly as io_uring does, so
 //! the socket code above has a single path.
 
+#[cfg(unix)]
 mod blocking;
 mod budget;
 #[cfg(target_os = "linux")]
 mod epoll;
+#[cfg(unix)]
 mod readiness;
 #[cfg(target_os = "linux")]
 mod uring;

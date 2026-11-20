@@ -33,6 +33,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
