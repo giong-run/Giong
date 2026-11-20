@@ -6,20 +6,24 @@
 //! posted to the worker's completion port, which the driver owns
 //! (`driver::iocp`).
 
+use std::{io, mem};
+
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 use windows_sys::Win32::Networking::WinSock::{
     self, SOCKADDR, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, WSABUF, WSAMSG,
 };
-use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
+use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
 use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, SetThreadAffinityMask,
+    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask,
+    SetThreadAffinityMask,
 };
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
 /// A socket, as operations name it.
 pub(crate) type RawSock = SOCKET;
@@ -111,6 +115,107 @@ pub(crate) fn fsync(file: RawFile, _datasync: bool) -> isize {
         0
     } else {
         neg_errno() as isize
+    }
+}
+
+/// `CreateFileW` flag: the file is opened for overlapped I/O.
+pub(crate) const FILE_FLAG_OVERLAPPED: u32 =
+    windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+/// An event of the calling thread for the reads and writes below to wait
+/// on, made at the thread's first use and kept for its lifetime.
+fn thread_event() -> io::Result<HANDLE> {
+    thread_local! {
+        static EVENT: std::cell::Cell<HANDLE> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+    EVENT.with(|event| {
+        if event.get().is_null() {
+            // SAFETY: creates an unnamed manual-reset event, not signalled.
+            let made = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+            if made.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            event.set(made);
+        }
+        Ok(event.get())
+    })
+}
+
+/// Runs a `ReadFile` or `WriteFile` at `offset` to its end on the calling
+/// (blocking) thread, whether or not the handle is open for overlapped I/O.
+///
+/// # Safety
+///
+/// `start` must be sound to call with the OVERLAPPED it is given.
+unsafe fn transfer_at(
+    file: RawFile,
+    offset: u64,
+    start: impl FnOnce(*mut u32, *mut OVERLAPPED) -> i32,
+) -> io::Result<usize> {
+    use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING};
+    // SAFETY: OVERLAPPED is plain data; all-zero is its initial state.
+    let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    // An overlapped handle signals this event at the end, and the low bit
+    // keeps the completion away from a port the handle may belong to.
+    overlapped.hEvent = (thread_event()? as usize | 1) as HANDLE;
+    let mut done = 0u32;
+    let mut ok = start(&mut done, &mut overlapped);
+    // SAFETY: reads the calling thread's last error code.
+    if ok == 0 && unsafe { GetLastError() } == ERROR_IO_PENDING {
+        // SAFETY: waits for the operation started above on this handle;
+        // `overlapped` lives until it returns.
+        ok = unsafe { GetOverlappedResult(file, &overlapped, &mut done, 1) };
+    }
+    if ok != 0 {
+        return Ok(done as usize);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error().map(|code| code as u32) {
+        // The end of a file, or of a pipe whose writer is gone.
+        Some(ERROR_HANDLE_EOF | ERROR_BROKEN_PIPE) => Ok(0),
+        _ => Err(err),
+    }
+}
+
+/// Reads up to `len` bytes at `offset` into `buf`, waiting on the calling
+/// thread; 0 at the end of the file.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `len` bytes.
+pub(crate) unsafe fn read_at(
+    file: RawFile,
+    buf: *mut u8,
+    len: u32,
+    offset: u64,
+) -> io::Result<usize> {
+    // SAFETY: the caller guarantees `buf`; the rest is local to the call.
+    unsafe {
+        transfer_at(file, offset, |done, overlapped| {
+            ReadFile(file, buf, len, done, overlapped)
+        })
+    }
+}
+
+/// Writes `len` bytes from `buf` at `offset`, waiting on the calling
+/// thread.
+///
+/// # Safety
+///
+/// `buf` must be valid for reads of `len` bytes.
+pub(crate) unsafe fn write_at(
+    file: RawFile,
+    buf: *const u8,
+    len: u32,
+    offset: u64,
+) -> io::Result<usize> {
+    // SAFETY: the caller guarantees `buf`; the rest is local to the call.
+    unsafe {
+        transfer_at(file, offset, |done, overlapped| {
+            WriteFile(file, buf, len, done, overlapped)
+        })
     }
 }
 

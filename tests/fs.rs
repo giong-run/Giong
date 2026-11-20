@@ -1,7 +1,11 @@
 //! Files: open, read and write at an offset, sync, metadata, and the
 //! path operations.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -21,6 +25,27 @@ const READINESS: giong::DriverKind = giong::DriverKind::Kqueue;
 const FILE_OF_UNKNOWN_SIZE: &str = "/proc/self/status";
 #[cfg(target_os = "macos")]
 const FILE_OF_UNKNOWN_SIZE: &str = "/dev/null";
+
+/// 1 if this or any other process has `path` open, 0 if not: Windows lists
+/// no handles by path, but it refuses to open a file for nobody else to
+/// share while a handle to it is open. So the tests that count descriptors
+/// check here that the last one goes.
+#[cfg(windows)]
+fn open_fds(path: &std::path::Path) -> usize {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // opens directories too
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let alone = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path);
+    match alone {
+        Ok(_) => 0,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => 1,
+        Err(e) => panic!("cannot tell whether {path:?} is open: {e}"),
+    }
+}
 
 /// A directory of its own for one test, removed afterwards.
 struct TempDir(PathBuf);
@@ -268,15 +293,18 @@ fn open_options_behave_like_the_standard_library() {
         assert!(file.read_at(Vec::with_capacity(4), 0).await.0.is_err());
 
         // Permission bits of a new file.
-        let private = dir.path("private");
-        let file = File::options()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&private)
-            .await
-            .unwrap();
-        assert_eq!(file.metadata().await.unwrap().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            let private = dir.path("private");
+            let file = File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&private)
+                .await
+                .unwrap();
+            assert_eq!(file.metadata().await.unwrap().mode() & 0o777, 0o600);
+        }
 
         let err = File::open("nul\0byte").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -375,9 +403,26 @@ fn metadata_describes_files_directories_and_links() {
         assert!(meta.is_dir() && !meta.is_file());
 
         let link = dir.path("link");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(fs::metadata(&link).await.unwrap().is_file());
-        assert!(fs::symlink_metadata(&link).await.unwrap().is_symlink());
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&path, &link);
+        // Windows lets only some accounts make links (administrators, or
+        // anyone in developer mode).
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&path, &link);
+        match linked {
+            // (Wine makes the link and then cannot follow it; the standard
+            // library is the witness of whether the system can.)
+            Ok(()) if cfg!(windows) && std::fs::metadata(&link).is_err() => {
+                eprintln!("links not followed here");
+                assert!(fs::metadata(&link).await.is_err());
+            }
+            Ok(()) => {
+                assert!(fs::metadata(&link).await.unwrap().is_file());
+                assert!(fs::symlink_metadata(&link).await.unwrap().is_symlink());
+            }
+            Err(e) if cfg!(windows) => eprintln!("links not checked: {e}"),
+            Err(e) => panic!("{e}"),
+        }
 
         let err = fs::metadata(dir.path("missing")).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -501,6 +546,9 @@ fn closed_and_dropped_files_release_their_descriptors() {
         assert_eq!(open_fds(&path), 1);
         drop(kept);
     });
+    // Nothing is left open once the runtime has ended. (Where descriptors
+    // cannot be counted, as on Windows, this is what catches a leak.)
+    assert_eq!(open_fds(&path), 0);
     // Dropping a file outside the runtime closes it directly.
     let file = giong::block_on(async { File::open(&path).await.unwrap() });
     assert_eq!(open_fds(&path), 1);
@@ -526,6 +574,7 @@ fn files_dropped_at_shutdown_release_their_descriptors() {
     assert_eq!(open_fds(&path), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_read_that_never_completes_can_be_cancelled() {
     // A pipe nobody writes to: the read stays in flight until it is dropped.
@@ -553,6 +602,7 @@ fn a_read_that_never_completes_can_be_cancelled() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot open a pseudo-terminal")]
 fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
@@ -586,6 +636,7 @@ fn fd_path(fd: i32) -> std::path::PathBuf {
     std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len]))
 }
 
+#[cfg(unix)]
 fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, close: bool) {
     let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
     let target = fd_path(fd);
@@ -625,6 +676,7 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
 /// # Safety
 ///
 /// `fds` must have room for two descriptors.
+#[cfg(unix)]
 unsafe fn pipe_cloexec(fds: *mut libc::c_int) -> libc::c_int {
     #[cfg(target_os = "linux")]
     return libc::pipe2(fds, libc::O_CLOEXEC);
@@ -645,6 +697,7 @@ unsafe fn pipe_cloexec(fds: *mut libc::c_int) -> libc::c_int {
 /// # Safety
 ///
 /// `fd` must be a terminal master.
+#[cfg(unix)]
 unsafe fn ptsname(fd: libc::c_int, name: &mut [libc::c_char; 64]) -> libc::c_int {
     #[cfg(target_os = "linux")]
     return libc::ptsname_r(fd, name.as_mut_ptr(), name.len());
@@ -667,6 +720,7 @@ unsafe fn ptsname(fd: libc::c_int, name: &mut [libc::c_char; 64]) -> libc::c_int
 }
 
 /// A pseudo-terminal's two ends, or `None` where there are none.
+#[cfg(unix)]
 fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
     let master = std::fs::OpenOptions::new()
@@ -693,6 +747,7 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
     Some((master, slave))
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no mkfifo")]
 fn a_stuck_file_operation_does_not_hold_up_the_others() {
@@ -779,33 +834,48 @@ fn files_work_on_every_worker() {
 fn runtime_teardown_with_file_operations_in_flight() {
     let dir = TempDir::new("teardown");
     for round in 0..20 {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
-        let (reader, writer) = unsafe {
-            (
-                std::fs::File::from_raw_fd(fds[0]),
-                std::fs::File::from_raw_fd(fds[1]),
-            )
+        #[cfg(unix)]
+        let (reader, writer) = {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
+            unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[0]),
+                    std::fs::File::from_raw_fd(fds[1]),
+                )
+            }
         };
         let path = dir.path(&format!("f{round}"));
         giong::block_on(async move {
-            // A read that never completes, and a large write, an open and a
-            // sync that may or may not have finished when the runtime stops.
-            let pipe = File::from_std(reader);
-            giong::spawn(async move {
-                let _ = pipe.read_at(Vec::with_capacity(4096), 0).await;
-            });
+            // A read that never completes (a pipe nobody writes to; on
+            // Unix, where a pipe's read can be cancelled), and a large
+            // write, an open and a sync that may or may not have finished
+            // when the runtime stops.
+            #[cfg(unix)]
+            {
+                let pipe = File::from_std(reader);
+                giong::spawn(async move {
+                    let _ = pipe.read_at(Vec::with_capacity(4096), 0).await;
+                });
+            }
             let file = Rc::new(File::create(&path).await.unwrap());
             let f = file.clone();
             giong::spawn(async move {
                 let _ = f.write_all_at(vec![7u8; 4 * 1024 * 1024], 0).await;
                 let _ = f.sync_all().await;
             });
+            #[cfg(unix)]
             giong::spawn(async move {
                 let _ = fs::read(FILE_OF_UNKNOWN_SIZE).await;
             });
+            #[cfg(windows)]
+            giong::spawn(async move {
+                let _ = fs::read(std::env::current_exe().unwrap()).await;
+                let _ = fs::metadata(std::env::temp_dir()).await;
+            });
             giong::yield_now().await;
         });
+        #[cfg(unix)]
         drop(writer);
     }
 }
@@ -833,6 +903,7 @@ fn a_std_file_can_be_adopted_and_knows_its_length() {
 const STDIN_CHILD: &str = "GIONG_TEST_STDIN_CHILD";
 
 /// Whether `fd` is in non-blocking mode.
+#[cfg(unix)]
 fn nonblocking(fd: i32) -> bool {
     // SAFETY: F_GETFL on a descriptor this process owns.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -845,6 +916,7 @@ fn nonblocking(fd: i32) -> bool {
 /// must read it on a blocking thread rather than switch the mode (which
 /// would make `cat` on the same pipe fail with `EAGAIN`). A pipe the
 /// process made itself still goes through epoll.
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn standard_input_pipes_stay_blocking() {
@@ -921,6 +993,7 @@ async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
     entries
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn directories_list_like_the_standard_library() {
@@ -1063,7 +1136,11 @@ fn read_dir_reports_what_it_cannot_list() {
 
         fs::write(dir.path("file"), "x").await.unwrap();
         let err = fs::read_dir(dir.path("file")).await.unwrap_err();
+        #[cfg(unix)]
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+        // ERROR_DIRECTORY; Wine says ERROR_INVALID_NAME.
+        #[cfg(windows)]
+        assert!(matches!(err.raw_os_error(), Some(267 | 123)), "{err:?}");
 
         let err = fs::read_dir("bad\0path").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -1075,6 +1152,76 @@ fn read_dir_reports_what_it_cannot_list() {
         assert_eq!(err.kind(), ErrorKind::NotFound);
         // Its type was reported with the name, so it is still known.
         assert!(entry.file_type().await.unwrap().is_file());
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn directories_list_like_the_standard_library() {
+    let dir = TempDir::new("read-dir");
+    giong::block_on(async {
+        // An empty directory stays empty when asked again.
+        let mut empty = fs::read_dir(&dir.0).await.unwrap();
+        assert!(empty.next_entry().await.unwrap().is_none());
+        assert!(empty.next_entry().await.unwrap().is_none());
+
+        fs::write(dir.path("file"), "12345").await.unwrap();
+        fs::create_dir(dir.path("sub")).await.unwrap();
+        // A name that is not valid UTF-16: Windows keeps it as it is.
+        let lone = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x61, 0xD800, 0x62])
+        };
+        // (Wine cannot store such a name on a Unix filesystem.)
+        let odd = std::fs::write(dir.0.join(&lone), "");
+        if let Err(e) = &odd {
+            eprintln!("names outside UTF-16 not checked: {e}");
+        }
+        let linked = std::os::windows::fs::symlink_file(dir.path("file"), dir.path("link"));
+        if let Err(e) = &linked {
+            eprintln!("links not checked: {e}");
+        }
+
+        let ours = list(&dir.0).await;
+        let mut theirs: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        theirs.sort_by_key(|entry| entry.file_name());
+        // At most: Wine reports a link as made that no listing shows.
+        let expected = 2 + usize::from(odd.is_ok()) + usize::from(linked.is_ok());
+        assert!((2..=expected).contains(&ours.len()), "{ours:?}");
+        assert_eq!(ours.len(), theirs.len());
+        assert_eq!(
+            ours.iter().any(|entry| entry.file_name() == lone),
+            odd.is_ok()
+        );
+        for (ours, theirs) in ours.iter().zip(&theirs) {
+            assert_eq!(ours.file_name(), theirs.file_name());
+            assert_eq!(ours.path(), theirs.path());
+            // The entry itself: links are not followed.
+            let kind = ours.file_type().await.unwrap();
+            let std_kind = theirs.file_type().unwrap();
+            assert_eq!(
+                (kind.is_file(), kind.is_dir(), kind.is_symlink()),
+                (std_kind.is_file(), std_kind.is_dir(), std_kind.is_symlink()),
+                "{:?}",
+                ours.path()
+            );
+            let meta = ours.metadata().await.unwrap();
+            let std_meta = std::fs::symlink_metadata(theirs.path()).unwrap();
+            assert_eq!(meta.file_type(), kind);
+            assert_eq!(meta.len(), std_meta.len());
+        }
+        // An entry outlives its listing, and clones share the directory.
+        let file = ours
+            .iter()
+            .find(|entry| entry.file_name() == "file")
+            .unwrap()
+            .clone();
+        drop(ours);
+        assert_eq!(file.path(), dir.path("file"));
+        assert_eq!(file.metadata().await.unwrap().len(), 5);
     });
 }
 
@@ -1108,6 +1255,7 @@ fn dropped_listings_release_their_descriptors() {
 #[test]
 #[cfg_attr(miri, ignore = "Miri's fallocate does not reserve blocks")]
 fn allocate_reserves_space_without_touching_data() {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     let dir = TempDir::new("allocate");
@@ -1129,6 +1277,7 @@ fn allocate_reserves_space_without_touching_data() {
         }
         // The file grows, the space is reserved, and the new bytes are zeros.
         assert_eq!(file.len().unwrap(), 1 << 20);
+        #[cfg(unix)]
         assert!(std::fs::metadata(&path).unwrap().blocks() * 512 >= 1 << 20);
         let data = fs::read(&path).await.unwrap();
         assert_eq!(data.len(), 1 << 20);
@@ -1152,7 +1301,10 @@ fn allocate_reserves_space_without_touching_data() {
         // allocating_nothing_does_nothing.)
         let read_only = File::open(&path).await.unwrap();
         let err = read_only.allocate(0, 1).await.unwrap_err();
+        #[cfg(unix)]
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        #[cfg(windows)]
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     });
 }
 

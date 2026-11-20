@@ -1,4 +1,5 @@
-//! The blocking threads of the epoll driver.
+//! The blocking threads of the epoll driver, and of the Windows driver for
+//! the file operations Windows has no overlapped form of.
 //!
 //! A regular file is always "ready" as far as epoll is concerned, so a read
 //! that has to wait for the disk would hold up the whole worker. The epoll
@@ -13,10 +14,14 @@
 //! the worker's eventfd.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::io;
 
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+#[cfg(unix)]
+use std::sync::Arc;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -117,6 +122,7 @@ fn work(pool: &'static Pool) {
 }
 
 /// Results of one worker's blocking jobs, waiting for the worker.
+#[cfg(unix)]
 pub(super) struct Completions {
     done: Mutex<Vec<(usize, i32)>>,
     /// Set while `done` is not empty, so the worker can check without the
@@ -126,6 +132,7 @@ pub(super) struct Completions {
     bell: crate::sys::Bell,
 }
 
+#[cfg(unix)]
 impl Completions {
     pub(super) fn new() -> io::Result<Arc<Self>> {
         let bell = crate::sys::Bell::new()?;
@@ -163,8 +170,10 @@ impl Completions {
 }
 
 /// Lets a blocking job see that it was cancelled before it started.
+#[cfg(unix)]
 pub(super) struct Cancel(AtomicBool);
 
+#[cfg(unix)]
 impl Cancel {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self(AtomicBool::new(false)))

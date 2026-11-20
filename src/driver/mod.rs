@@ -22,7 +22,7 @@
 //! its pool buffer in the flags (`buffer_id`), exactly as io_uring does, so
 //! the socket code above has a single path.
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod blocking;
 mod budget;
 #[cfg(target_os = "linux")]
@@ -454,6 +454,20 @@ pub(crate) enum Io {
         from: *const PathChar,
         to: *const PathChar,
     },
+    /// Runs `job` on a blocking thread: the file operations Windows has no
+    /// overlapped form of (opens, metadata, renames, directory listings).
+    /// The result is what [`BlockingJob::run`] returns.
+    #[cfg(windows)]
+    Blocking { job: *mut dyn BlockingJob },
+}
+
+/// What an [`Io::Blocking`] runs. It lives in the operation's resources, so
+/// the driver keeps it until the job has reported, and only the blocking
+/// thread touches it in between.
+#[cfg(windows)]
+pub(crate) trait BlockingJob: Send {
+    /// Does the work; 0 or more on success, a negated error code on failure.
+    fn run(&mut self) -> i32;
 }
 
 impl Io {

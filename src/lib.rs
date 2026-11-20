@@ -76,8 +76,9 @@
 )]
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
-// The Windows port is not complete: files and Unix sockets are missing
-// there, so some of the code they share with the rest has no caller yet.
+// The Windows port is not complete: `send_file` and Unix sockets are
+// missing there, so some of the code they share with the rest has no caller
+// yet.
 #![cfg_attr(windows, allow(dead_code))]
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -95,6 +96,9 @@ mod sys;
 
 pub mod error;
 #[cfg(unix)]
+pub mod fs;
+#[cfg(windows)]
+#[path = "fs/windows.rs"]
 pub mod fs;
 pub mod net;
 pub mod observe;

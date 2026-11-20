@@ -107,6 +107,40 @@ impl Port {
         // its next timer or completion.
         unsafe { PostQueuedCompletionStatus(self.0, 0, 0, ptr::null()) };
     }
+
+    /// Reports the result of a blocking job as the completion of the
+    /// record at `record`. Called on the blocking thread, which never
+    /// reads the record: only the worker does, when the packet arrives.
+    fn report(&self, record: usize, res: i32) {
+        loop {
+            // SAFETY: the port is open while `self` lives; the address is
+            // only handed back to the worker.
+            let ok = unsafe {
+                PostQueuedCompletionStatus(self.0, res as u32, 0, record as *const OVERLAPPED)
+            };
+            if ok != 0 {
+                return;
+            }
+            // The kernel could not allocate the packet. The operation's
+            // task waits for it, so try again rather than lose it.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+/// A job on its way to a blocking thread. Until it reports, only that
+/// thread uses what the pointer names (see [`super::BlockingJob`]).
+struct SendJob(*mut dyn super::BlockingJob);
+
+// SAFETY: the job is `Send`, and the worker leaves it alone until the
+// report.
+unsafe impl Send for SendJob {}
+
+impl SendJob {
+    fn run(self) -> i32 {
+        // SAFETY: `Op` keeps the job alive and unmoved until the report.
+        unsafe { (*self.0).run() }
+    }
 }
 
 impl Drop for Port {
@@ -437,8 +471,14 @@ impl Iocp {
                 let ok = unsafe { CloseHandle(fd) };
                 return Start::Done(if ok != 0 { 0 } else { -last_error() }, 0);
             }
-            // Windows has no overlapped form of these; they run on the
-            // blocking pool once the file API is ported.
+            Io::Blocking { job } => {
+                let record = Self::record(ptr::null_mut(), false, State::Waiting(waker.clone()), 0);
+                self.inflight += 1;
+                let (port, job, at) = (self.port.clone(), SendJob(job), record as usize);
+                super::blocking::spawn(Box::new(move || port.report(at, job.run())));
+                return Start::Submitted(self.ops.insert(Slot::Single(record)));
+            }
+            // The file API reaches these through `Io::Blocking`.
             Io::OpenAt { .. }
             | Io::Fsync { .. }
             | Io::Fallocate { .. }

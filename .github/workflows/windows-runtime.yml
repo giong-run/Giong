@@ -26,7 +26,7 @@ env:
   SUITES: >-
     --lib --test executor --test channels --test time --test shutdown
     --test observe --test spin --test net --test udp --test cancel
-    --test multi --test balance --test dns
+    --test multi --test balance --test dns --test fs
 
 jobs:
   runtime:
