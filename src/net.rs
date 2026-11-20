@@ -729,8 +729,8 @@ impl StreamSocket {
                 _ => {
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
-                        Some(libc::EINTR) => {}
-                        Some(libc::EAGAIN) => {
+                        Some(crate::sys::errno::EINTR) => {}
+                        Some(crate::sys::errno::EAGAIN) => {
                             // SAFETY: the operation has no pointers.
                             let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
                             if res < 0 {
@@ -1359,7 +1359,11 @@ mod tests {
         for addr in [asked, any_port] {
             let err = check_bound(&unbound, addr).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{addr}");
-            assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE), "{addr}");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(crate::sys::errno::EADDRINUSE),
+                "{addr}"
+            );
         }
 
         let bound = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();

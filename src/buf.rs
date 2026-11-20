@@ -221,24 +221,10 @@ struct Mapping {
 #[cfg(not(kani))]
 impl Mapping {
     fn new(len: usize) -> io::Result<Self> {
-        // SAFETY: a fresh anonymous mapping; the result is checked.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
+        let Some(ptr) = NonNull::new(crate::sys::map_pool(len)) else {
             return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            ptr: NonNull::new(ptr as *mut u8).expect("mmap returned null"),
-            len,
-        })
+        };
+        Ok(Self { ptr, len })
     }
 }
 
@@ -264,11 +250,7 @@ impl Mapping {
 }
 
 #[cfg(not(kani))]
-fn page_size() -> usize {
-    // SAFETY: plain libc call without pointers.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(size).unwrap_or(4096)
-}
+use crate::sys::page_size;
 
 /// Under Kani: a small stand-in, only the size of the padding `Ring::new`
 /// adds for Linux 6.0 (`sysconf` is a foreign function).
@@ -280,8 +262,8 @@ fn page_size() -> usize {
 #[cfg(not(kani))]
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: exactly the region mapped in `new`.
-        unsafe { libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len) };
+        // SAFETY: exactly the region mapped in `new`, which this value owns.
+        unsafe { crate::sys::unmap_pool(self.ptr.as_ptr(), self.len) };
     }
 }
 

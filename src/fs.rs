@@ -491,7 +491,7 @@ impl File {
             0.. => Ok(()),
             // The kind is set here, as older standard libraries leave
             // EOPNOTSUPP uncategorised; the OS error is kept inside.
-            res if -res == libc::EOPNOTSUPP => {
+            res if -res == crate::sys::errno::EOPNOTSUPP => {
                 Err(io::Error::new(io::ErrorKind::Unsupported, os_err(res)))
             }
             res => Err(os_err(res)),

@@ -199,7 +199,7 @@ pub(crate) fn check_bound(sock: &Socket, asked: SocketAddr) -> io::Result<()> {
         .as_socket()
         .map_or(0, |local| local.port());
     if port == 0 || (asked.port() != 0 && port != asked.port()) {
-        return Err(io::Error::from_raw_os_error(libc::EADDRINUSE));
+        return Err(io::Error::from_raw_os_error(crate::sys::errno::EADDRINUSE));
     }
     Ok(())
 }

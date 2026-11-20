@@ -157,10 +157,10 @@ impl SendQueue {
             }
             match io::Error::last_os_error()
                 .raw_os_error()
-                .unwrap_or(libc::EIO)
+                .unwrap_or(crate::sys::errno::EIO)
             {
-                libc::EINTR => {}
-                libc::EAGAIN => {
+                crate::sys::errno::EINTR => {}
+                crate::sys::errno::EAGAIN => {
                     for &k in &keys[at..] {
                         self.finish(k, State::Full, wakers);
                     }
