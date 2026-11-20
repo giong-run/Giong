@@ -60,6 +60,27 @@ behind in two of five 16-task rounds. The epoll driver passes Tokio clearly with
 change (sends of one turn in one `sendmmsg`, busy sockets out of the epoll set; see
 `vm/epoll-deep/` once it lands).
 
+## Bare metal
+
+The same benchmark on an AMD EPYC 4345P (8 cores, SMT on), Linux 7.0.0-43, server on CPU 1,
+client on CPUs 2-3, with this branch at 997b290, on 2026-11-19
+(`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-tasks16/` and
+`-tasks1/`, `raw.csv` with every round). The server core is saturated: the kernel × 32 server
+spends 0.98 µs of process CPU per echo, and the runtimes 1.08 to 1.17.
+
+| Echoes per second, median (min–max) | 16 tasks | 1 task |
+|---|---:|---:|
+| giong io_uring | 856,470 (851,552–874,909) | **925,683** (878,573–939,792) |
+| giong epoll | 878,742 (859,516–888,652) | 874,499 (859,842–906,975) |
+| Tokio | 870,331 (868,070–929,761) | 882,456 (872,631–937,811) |
+| kernel × 32 | 1,011,149 | 1,018,481 |
+
+Rounds in which giong beat Tokio: io_uring 1 of 5 (16 tasks) and 4 of 5 (1 task), epoll 2 of
+5 and 1 of 5. So on bare metal this change loses to Tokio with io_uring and 16 tasks (1.6% in
+the median) and with epoll and one task (0.9%), ties with epoll and 16 tasks, and wins with
+io_uring and one task (4.9%). Every runtime moves between two levels from round to round
+(about 870k and 930k), so differences under about 5% are within noise.
+
 To reproduce:
 
     sudo TASKS=16 bench/udp-echo.sh 5 8

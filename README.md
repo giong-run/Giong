@@ -975,6 +975,23 @@ An echo costs giong one system call on either driver (Tokio two). Server CPU per
 3.62). io_uring is ahead of Tokio in every round; epoll is level with it (ahead in the
 medians, behind in two of five 16-task rounds), within this VM's spread between rounds.
 
+On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark over veth, server on one core;
+`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`), the server core
+is saturated near a million echoes a second and the runtimes are close:
+
+| Echoes per second (median of 5, range) | 16 tasks on one socket | 1 task |
+|---|---:|---:|
+| giong, io_uring | 856,470 (851,552–874,909) | **925,683** (878,573–939,792) |
+| giong, epoll | 878,742 (859,516–888,652) | 874,499 (859,842–906,975) |
+| Tokio | 870,331 (868,070–929,761) | 882,456 (872,631–937,811) |
+| Kernel × 32 | 1,011,149 | 1,018,481 |
+
+Here this change alone loses to Tokio in two places: io_uring with 16 tasks (1.6% behind in
+the median, ahead in one round of five) and epoll with one task (0.9% behind, ahead in one
+round of five). epoll with 16 tasks ties (1.0% ahead in the median, two rounds of five);
+io_uring with one task is ahead (4.9%, four rounds of five). Rounds move between two levels
+(about 870k and 930k) for every runtime, so differences under about 5% are within noise.
+
 ### What has not been measured
 
 - **More than eight cores, and the other tables on a physical network.** The bare-metal
