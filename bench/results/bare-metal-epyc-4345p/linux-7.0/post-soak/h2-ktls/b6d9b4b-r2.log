@@ -1,0 +1,23 @@
+building...
+round 1/1: giong-http-tls done
+round 1/1: giong-http-ktls done
+memory round 1/1: giong-http done
+memory round 1/1: axum done
+Throughput: h2load, json and users with 48 connections x 10 streams,
+json-mux with 3 connections x 100 streams; one server core.
+
+endpoint  server           req/s median       min       max  mean ms  cpu%  failed
+json      giong-http-tls        1431850   1431850   1431850     0.30   100       0
+json      giong-http-ktls       1131753   1131753   1131753     0.41   100       0
+
+users     giong-http-tls         111412    111412    111412     4.28   100       0
+users     giong-http-ktls        106050    106050    106050     4.51    99       0
+
+json-mux  giong-http-tls        1938760   1938760   1938760     0.14   100       0
+json-mux  giong-http-ktls       1773899   1773899   1773899     0.16   100       0
+
+Memory: 5000 connections over HTTP/2 with prior knowledge, one worker thread.
+
+server            h2-idle  h2-pending  per stream   KiB
+giong-http           6.77        7.10        1.58
+axum                23.79       23.03        1.95

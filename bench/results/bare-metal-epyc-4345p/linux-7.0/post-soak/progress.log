@@ -1,0 +1,25 @@
+2026-11-19T09:11:48Z mux round 1 done
+2026-11-19T09:14:01Z mux round 2 done
+2026-11-19T09:16:13Z mux round 3 done
+2026-11-19T09:18:26Z mux round 4 done
+2026-11-19T09:20:38Z mux round 5 done
+2026-11-19T09:32:05Z tls exit 0
+2026-11-19T09:32:07Z checkout feat/sched-contract failed
+2026-11-19T09:32:07Z lanes exit 1
+2026-11-19T09:32:25Z udp udp-faster tasks 16 exit 1
+2026-11-19T09:32:35Z udp udp-faster tasks 1 exit 1
+2026-11-19T09:32:54Z udp udp-epoll tasks 16 exit 1
+2026-11-19T09:33:04Z udp udp-epoll tasks 1 exit 1
+2026-11-19T09:33:07Z udp-next workers 2 exit 126
+2026-11-19T09:33:07Z udp-next workers 4 exit 126
+2026-11-19T09:33:07Z udp-next workers 6 exit 126
+2026-11-19T09:33:07Z udp-next workers 8 exit 126
+2026-11-19T09:33:07Z all done
+2026-11-19T14:32:51Z lanes exit 0
+2026-11-19T14:36:52Z udp udp-faster tasks 16 exit 1
+2026-11-19T14:40:52Z udp udp-faster tasks 1 exit 1
+2026-11-19T14:44:53Z udp udp-epoll tasks 16 exit 1
+2026-11-19T14:48:53Z udp udp-epoll tasks 1 exit 1
+2026-11-19T14:48:54Z udp-next server cpus 1-2 exit 1
+2026-11-19T14:48:54Z udp-next server cpus 1-4 exit 1
+2026-11-19T14:48:54Z all done

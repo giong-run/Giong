@@ -193,13 +193,72 @@ PR #125 at `674c42c`, the same tree as main `003d9e5`, measured on br-1:
 The lower ceiling is the reserve #125 keeps by default (a tenth of the memory limit). The
 HTTP/2 drop is left for a follow-up.
 
-## 7. 72-hour soak (running)
+## 7. 72-hour soak (`soak-72h/`): passed on both drivers
 
-`soak72.sh`: one uninterrupted 72-hour run of `tests/soak.rs` (release build) on
-`674c42c`, which is the same tree as main `003d9e5`. It started 2026-11-16 08:56Z:
+`soak72.sh`: one uninterrupted 72-hour run of `tests/soak.rs` (release build) per machine,
+on the tree `f1b23074` (commit `674c42c` on br-1, main `003d9e5` on br-2; same tree).
+Kernel 7.0.0-43, 16 NIC queues, 4 workers each.
 
-- br-1: io_uring driver;
-- br-2: epoll driver, with the simulation's long runs (`sim/`, growing seed counts and
-  simulated days) beside it at nice 19.
+| | br-1, io_uring | br-2, epoll |
+|---|---:|---:|
+| ran | 2026-11-16 08:56Z to 11-19 08:57Z | 2026-11-16 19:48Z to 11-19 19:48Z |
+| result | passed (259,200 s) | passed (259,200 s) |
+| unexpected errors | 0 | 0 |
+| connections | 5,927,892,837 | 5,908,243,311 |
+| echoes | 13,337,724,262 | 13,293,491,955 |
+| cancelled receives | 1,481,950,909 | 1,477,038,766 |
+| datagrams | 1,067,932,496 | 1,101,662,056 |
+| descriptors at 10 min / 24 h / 48 h / 72 h / after | 409 / 372 / 379 / 400 (60 h) / 24 | 348 / 377 / 391 / 360 (60 h) / 28 |
+| resident memory at 10 min / 72 h | 9.52 / 14.38 MiB | 7.40 / 11.45 MiB |
 
-The results go here when it ends.
+Resident memory grows linearly by 56 KiB an hour on both drivers. The soak test itself
+causes this: it keeps one 16-byte sample a second (4.05 MiB over 72 hours), which is most
+of the growth. The rest is the warm-up of the first hours. The test's own check (median of
+the last quarter against the second) passed on both machines. `tests/soak.rs` does not
+measure latency; every echo stayed within its 10 s bound.
+
+**The first epoll run was aborted** (`soak-72h/br-2-epoll-aborted/`): it was paused twice
+with SIGSTOP to run short HTTP/2 checks on the same machine. After the second pause, two
+echoes exceeded the test's 10 s timeout ("deadline has elapsed"), which would have failed
+the run. It was restarted from scratch and never paused again. A soak must never be paused.
+
+The simulation's long runs (`sim/`) ran beside the aborted run. They were stopped because
+the simulator then used about 0.6 MB per simulated day (fixed in #137). Their failures were
+flaws in the tests, not in the runtime (#129, #137).
+
+## 8. After the soak (`post-soak/`)
+
+Runs that had to wait for the soak. The scripts are `scripts-0.9/br1-queue.sh`,
+`twohost.sh`, `udpnext.sh`, `h2-127.sh` and `h2-ktls.sh`. All of them on kernel 7.0.
+
+- **HTTP/2 handler queue (#127), `h2-127/`:** the −4.6% on HTTP/2 after #125 is gone.
+  Every case is within −0.8% to +1.2% of 0.8.0.
+- **HTTP/2 over kernel TLS, `h2-ktls/`:** main `6372cd5` is within −1.2% to +0.9% of
+  0.8.0 on `json` and `users`. Kernel TLS costs 21–22% on small HTTP/2 responses.
+- **json-mux, `mux/`:** five builds in one interleaved session with `perf stat`. The 3%
+  gap of `6372cd5` is a code-layout effect of its bench binary: the same instructions per
+  request (11,387 against 11,385) at an IPC of 4.02 instead of 4.16. It goes away with the
+  older bench `main.rs`, and main `faa18a3` is +0.4% (TLS) and +0.6% (kernel TLS) against
+  0.8.0.
+- **TLS against axum and rustls, `tls/`** (main `faa18a3`, after #146): new connections
+  17,340/s against axum's 14,471 (+20%; 0.8.0 had 14,180), keep-alive `json` 384,683
+  against 306,914. Kernel TLS is faster only for files sent with `sendfile` from 1 MiB
+  (+36%). It is slower everywhere else, by 9–30%.
+- **Compute lanes with the scheduling contract (#135), `lanes/`:** p99 echo latency with
+  every CPU busy is 989 µs (1,101 µs before; Tokio's `spawn_blocking` 1,963 µs). Better,
+  but still about 1 ms: this machine does not reach the idle latency the cloud VM showed.
+- **UDP echo over veth, one server core (#139, #142), `udp-*/`:** giong is at 86–91% of the
+  kernel's `recvmmsg`/`sendmmsg` ceiling. With #142 it is 3–6% ahead of Tokio on epoll,
+  and 1–4% on io_uring. #139 alone was 1.6% behind Tokio on io_uring with 16 tasks. The client (two threads) limits the 2-
+  and 4-core runs (`udp-next-cpus*`). `udp-perf/` has syscall counts and call graphs:
+  batching works with 16 tasks (about 12 echoes per `sendmmsg`), not with one task. ufw's
+  nftables rules cost about 7% of the server CPU in every mode on the veth.
+- **QUIC, few connections (#109), `two-host/quic-*`:** the 52 ms p99 with 4 workers comes
+  back with no packet dropped (0 `udp_fail_queue_rcv_skb`, no receive-buffer errors).
+  So the cause is not receive-buffer loss.
+- **AF_XDP on the E810 (#136), `two-host/xdp/`:** one NIC queue steered to one core. AF_XDP
+  in copy mode echoes 1,597,454 a second, against 482,514 for kernel sockets, 446,602 for
+  giong and 428,776 for Tokio. Zero-copy mode bound but echoed nothing.
+- **GSO (#141), `two-host/gso/`:** 1,200-byte datagrams to the other machine,
+  2,433,648 a second at 67 ns of sender CPU each with GSO, against about 925,000 at
+  1,080 ns without (Tokio 936,283). GRO on the receiving side was not verified.

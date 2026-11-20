@@ -1,0 +1,6 @@
+round 1 rr giong-plain x1: req_s=839672 gbit_s=0.672 p50_us=138 p99_us=287 srv_cpu_pct=96.5 srv_us_per_req=1.15 srv_ns_per_kib=11767.8 cli_cpu_pct=635.8 errors=0
+median of rounds (min-max in brackets)
+
+rr
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+giong-plain x1    8.397e+05 [8.4e+05-8.4e+05]       0.672 [0.672-0.672]             287 [287-287]          96.5 [96.5-96.5]          1.15 [1.15-1.15]1.177e+04 [1.18e+04-1.18e+04]
