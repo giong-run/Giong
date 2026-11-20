@@ -4,7 +4,7 @@ use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr;
@@ -35,15 +35,25 @@ const NAME_LEN: usize = mem::size_of::<libc::sockaddr_in6>();
 const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 
 /// Room for control messages in front of the payload when GRO or ECN is on
-/// (`unstable-udp-offload`): one `int` for `UDP_GRO` and one for `IP_TOS` or
-/// `IPV6_TCLASS`, each `CMSG_SPACE(4)` = 24 bytes on 64-bit Linux.
-const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE;
+/// (`unstable-udp-offload`): one `int` for `UDP_GRO`, one for `IP_TOS` or
+/// `IPV6_TCLASS` (each `CMSG_SPACE(4)` = 24 bytes on 64-bit Linux), and the
+/// address the datagram was sent to (`IP_PKTINFO`, or `IPV6_PKTINFO` which
+/// is the larger: `CMSG_SPACE(20)` = 40 bytes).
+const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
 const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
 const CMSG_INT_SPACE: usize = (CMSG_HDR + 4 + 7) & !7;
+const CMSG_PKTINFO6_SPACE: usize = (CMSG_HDR + mem::size_of::<libc::in6_pktinfo>() + 7) & !7;
 /// Largest payload a GRO receive can hand over: 64 KiB of coalesced
 /// datagrams.
 #[cfg(feature = "unstable-udp-offload")]
 const GRO_MAX: usize = 65_535;
+
+/// The receive buffer size [`UdpSocket::set_gro`] needs: pass it to
+/// [`Builder::recv_buffers`](crate::Builder::recv_buffers). 64 KiB of
+/// coalesced datagrams plus what giong keeps in front of them.
+/// `unstable-udp-offload`.
+#[cfg(feature = "unstable-udp-offload")]
+pub const GRO_RECV_BUFFER: usize = GRO_MAX + OVERHEAD + CONTROL_SPACE;
 
 /// The `msghdr` of every multishot receive. The kernel only reads the two
 /// length fields from it: room for the sender's address, no control data.
@@ -116,10 +126,11 @@ impl Message {
     }
 }
 
-/// The GRO segment size and the ECN bits from the control messages of a
-/// receive. Unknown or malformed messages are skipped.
-pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8) {
-    let (mut segment, mut ecn) = (0, 0);
+/// The GRO segment size, the ECN bits and the address the datagram was sent
+/// to, from the control messages of a receive. Unknown or malformed
+/// messages are skipped.
+pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
+    let (mut segment, mut ecn, mut local) = (0, 0, None);
     while control.len() >= CMSG_HDR {
         let len = usize::from_ne_bytes(control[..8].try_into().expect("eight bytes"));
         let level = i32::from_ne_bytes(control[8..12].try_into().expect("four bytes"));
@@ -140,12 +151,34 @@ pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8) {
             // class as an int.
             (libc::IPPROTO_IP, libc::IP_TOS) => ecn = data.first().map_or(0, |b| b & 3),
             (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => ecn = int().map_or(0, |v| (v & 3) as u8),
+            // `struct in_pktinfo`: interface index, the local address to
+            // answer from (`ipi_spec_dst`, read here), then the header's
+            // destination, which for a broadcast is not an address of ours.
+            (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
+                if let Some(b) = data.get(..12).map(|d| &d[4..8]) {
+                    let ip: [u8; 4] = b.try_into().expect("four bytes");
+                    local = Some(IpAddr::V4(Ipv4Addr::from(ip)));
+                }
+            }
+            // `struct in6_pktinfo`: the destination address, then the
+            // interface index.
+            (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
+                if let Some(b) = data.get(..20).map(|d| &d[..16]) {
+                    let ip: [u8; 16] = b.try_into().expect("sixteen bytes");
+                    let ip = Ipv6Addr::from(ip);
+                    // A dual-stack socket reports IPv4 destinations mapped.
+                    local = Some(match ip.to_ipv4_mapped() {
+                        Some(v4) => IpAddr::V4(v4),
+                        None => IpAddr::V6(ip),
+                    });
+                }
+            }
             _ => {}
         }
         let next = (len + 7) & !7;
         control = control.get(next..).unwrap_or(&[]);
     }
-    (segment, ecn)
+    (segment, ecn, local)
 }
 
 fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
@@ -182,6 +215,9 @@ pub struct Datagram {
     /// The ECN bits of the IP header (0 when not asked for).
     #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
     ecn: u8,
+    /// The address the datagram was sent to (when asked for).
+    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    local: Option<IpAddr>,
 }
 
 impl Datagram {
@@ -202,10 +238,10 @@ impl Datagram {
         let from = parse_addr(&buf[OUT_HEADER..OUT_HEADER + name_len.min(NAME_LEN)])
             .ok_or_else(malformed)?;
         let truncated = flags & libc::MSG_TRUNC != 0 || payload_len > buf.len() - payload_at;
-        let (segment, ecn) = if control_space > 0 {
+        let (segment, ecn, local) = if control_space > 0 {
             parse_control(&buf[OVERHEAD..OVERHEAD + control_len.min(control_space)])
         } else {
-            (0, 0)
+            (0, 0, None)
         };
         let payload_at = payload_at as u16;
         Ok((
@@ -215,6 +251,7 @@ impl Datagram {
                 payload_at,
                 segment,
                 ecn,
+                local,
             },
             from,
         ))
@@ -246,6 +283,16 @@ impl Datagram {
     #[cfg(feature = "unstable-udp-offload")]
     pub fn ecn(&self) -> u8 {
         self.ecn
+    }
+
+    /// The local address the datagram was sent to, once
+    /// [`UdpSocket::set_recv_local_addr`] is on; `None` otherwise. On a
+    /// socket bound to `0.0.0.0` or `[::]` this is how a server learns which
+    /// of the machine's addresses a client used, to answer from the same one
+    /// ([`SendOptions::source`]).
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn local_ip(&self) -> Option<IpAddr> {
+        self.local
     }
 
     /// `true` if the datagram was longer than a receive buffer and its end
@@ -690,7 +737,7 @@ impl UdpSocket {
         self.before_recv("set_gro")?;
         if on {
             let size = runtime::with_worker(|w| w.driver.borrow().pool().buf_len());
-            let need = GRO_MAX + OVERHEAD + CONTROL_SPACE;
+            let need = GRO_RECV_BUFFER;
             if size < need {
                 return Err(raise(
                     Code::RecvBufferTooSmall,
@@ -699,8 +746,8 @@ impl UdpSocket {
                          {size}: the kernel would cut coalesced datagrams and drop the rest"
                     ),
                     format!(
-                        "build the runtime with Builder::recv_buffers(count, {need}) (or more), \
-                         or leave GRO off."
+                        "build the runtime with Builder::recv_buffers(count, \
+                         giong::net::GRO_RECV_BUFFER) ({need} bytes, or more), or leave GRO off."
                     ),
                 ));
             }
@@ -732,6 +779,95 @@ impl UdpSocket {
             self.control.set(true);
         }
         Ok(())
+    }
+
+    /// Reports the local address each datagram was sent to
+    /// ([`Datagram::local_ip`]): `IP_PKTINFO`, and `IPV6_RECVPKTINFO` on an
+    /// IPv6 socket. For a socket bound to `0.0.0.0` or `[::]` on a machine
+    /// with several addresses. Call it before the first
+    /// [`recv_from`](Self::recv_from). `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn set_recv_local_addr(&self, on: bool) -> io::Result<()> {
+        self.before_recv("set_recv_local_addr")?;
+        let v = on as libc::c_int;
+        if self.local_addr()?.is_ipv6() {
+            setsockopt_int(&self.sock, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, v)?;
+            // A dual-stack socket gets IPv4 datagrams too; they are
+            // reported through the IPv6 message, mapped.
+        } else {
+            setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_PKTINFO, v)?;
+        }
+        if on {
+            self.control.set(true);
+        }
+        Ok(())
+    }
+
+    /// Sends datagrams with "don't fragment" set and without the kernel's
+    /// own path MTU estimate cutting them (`IP_MTU_DISCOVER` =
+    /// `IP_PMTUDISC_PROBE`; on IPv6 also `IPV6_DONTFRAG`): a datagram larger
+    /// than a link on the path is dropped there instead of being fragmented,
+    /// which is what a protocol that probes the path MTU itself needs (QUIC,
+    /// RFC 9000 section 14). A datagram larger than the local interface's
+    /// MTU fails with `EMSGSIZE`. `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn set_dont_fragment(&self, on: bool) -> io::Result<()> {
+        let v4 = if on {
+            libc::IP_PMTUDISC_PROBE
+        } else {
+            libc::IP_PMTUDISC_WANT
+        };
+        if self.local_addr()?.is_ipv6() {
+            let v6 = if on {
+                libc::IPV6_PMTUDISC_PROBE
+            } else {
+                libc::IPV6_PMTUDISC_WANT
+            };
+            setsockopt_int(&self.sock, libc::IPPROTO_IPV6, libc::IPV6_MTU_DISCOVER, v6)?;
+            setsockopt_int(
+                &self.sock,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_DONTFRAG,
+                on as libc::c_int,
+            )?;
+            // The IPv4 side of a dual-stack socket; refused on IPv6-only.
+            let _ = setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, v4);
+            Ok(())
+        } else {
+            setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_MTU_DISCOVER, v4)
+        }
+    }
+
+    /// Asks for a socket receive buffer of `bytes` (`SO_RCVBUF`). The
+    /// kernel doubles the value for its own bookkeeping and caps it at
+    /// `net.core.rmem_max`; [`recv_buffer_size`](Self::recv_buffer_size)
+    /// says what it gave. A server that receives bursts (QUIC) drops
+    /// datagrams with the default of about 200 KiB.
+    /// `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn set_recv_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        self.sock.set_recv_buffer_size(bytes)
+    }
+
+    /// The socket receive buffer the kernel gave, in bytes.
+    /// `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn recv_buffer_size(&self) -> io::Result<usize> {
+        self.sock.recv_buffer_size()
+    }
+
+    /// Asks for a socket send buffer of `bytes` (`SO_SNDBUF`), capped at
+    /// `net.core.wmem_max`. `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn set_send_buffer_size(&self, bytes: usize) -> io::Result<()> {
+        self.sock.set_send_buffer_size(bytes)
+    }
+
+    /// The socket send buffer the kernel gave, in bytes.
+    /// `unstable-udp-offload`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub fn send_buffer_size(&self) -> io::Result<usize> {
+        self.sock.send_buffer_size()
     }
 
     #[cfg(feature = "unstable-udp-offload")]
@@ -769,11 +905,14 @@ impl UdpSocket {
     /// last may be shorter), in one system call: UDP generic segmentation
     /// offload (`UDP_SEGMENT`). With `segment_size` equal to or above the
     /// length it is one datagram. `ecn` (0 to 3) goes into the IP header's
-    /// ECN bits.
+    /// ECN bits. Short for [`send_to_with`](Self::send_to_with).
     ///
     /// Linux takes at most 64 segments and 64 KiB in one send, and refuses
     /// GSO on a route without checksum offload with `EIO`; see
     /// [`gso_supported`](Self::gso_supported). `unstable-udp-offload`.
+    ///
+    /// Not cancel safe: if the future is dropped, the datagrams may have
+    /// been sent.
     #[cfg(feature = "unstable-udp-offload")]
     pub async fn send_segments_to<B: IoBuf>(
         &self,
@@ -782,12 +921,32 @@ impl UdpSocket {
         segment_size: usize,
         ecn: u8,
     ) -> (io::Result<usize>, B) {
+        let options = SendOptions::new().segment_size(segment_size).ecn(ecn);
+        self.send_to_with(buf, addr, &options).await
+    }
+
+    /// Sends `buf` to `addr` with what `options` asks for: split into
+    /// datagrams of one size by the kernel (GSO), ECN bits, and the local
+    /// address to send from. With default options it is
+    /// [`send_to`](Self::send_to). `unstable-udp-offload`.
+    ///
+    /// Not cancel safe: if the future is dropped, the datagrams may have
+    /// been sent.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub async fn send_to_with<B: IoBuf>(
+        &self,
+        buf: B,
+        addr: SocketAddr,
+        options: &SendOptions,
+    ) -> (io::Result<usize>, B) {
+        let (segment_size, ecn) = (options.segment_size, options.ecn);
         let sa = SockAddr::from(addr);
         let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&sa));
         let m = msg.as_ptr();
         // SAFETY: `m` is the live `Message` that `msg` owns; the control
-        // buffer is `CONTROL_SPACE` bytes, room for the two `int` messages
-        // written here, each `CMSG_INT_SPACE` long.
+        // buffer is `CONTROL_SPACE` bytes: room for the two `int` messages
+        // (`CMSG_INT_SPACE` each) and one address message (at most
+        // `CMSG_PKTINFO6_SPACE`) written here.
         unsafe {
             let control = ptr::addr_of_mut!((*m).control).cast::<u8>();
             let mut at = 0;
@@ -798,7 +957,7 @@ impl UdpSocket {
                 p.add(8).cast::<i32>().write_unaligned(level);
                 p.add(12).cast::<i32>().write_unaligned(kind);
                 ptr::copy_nonoverlapping(data.as_ptr(), p.add(CMSG_HDR), data.len());
-                at += CMSG_INT_SPACE;
+                at += (len + 7) & !7;
             };
             if segment_size > 0 && segment_size < buf.len() {
                 let seg = u16::try_from(segment_size).unwrap_or(u16::MAX);
@@ -811,6 +970,27 @@ impl UdpSocket {
                 } else {
                     put(libc::IPPROTO_IP, libc::IP_TOS, &v.to_ne_bytes());
                 }
+            }
+            match (options.source, addr.is_ipv6()) {
+                (Some(IpAddr::V4(ip)), false) => {
+                    // `struct in_pktinfo`: interface 0 (the route decides),
+                    // `ipi_spec_dst` = the source address, `ipi_addr` unused.
+                    let mut info = [0u8; 12];
+                    info[4..8].copy_from_slice(&ip.octets());
+                    put(libc::IPPROTO_IP, libc::IP_PKTINFO, &info);
+                }
+                (Some(ip), true) => {
+                    // `struct in6_pktinfo`: the source address, interface 0.
+                    let ip = match ip {
+                        IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                        IpAddr::V6(v6) => v6,
+                    };
+                    let mut info = [0u8; 20];
+                    info[..16].copy_from_slice(&ip.octets());
+                    put(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &info);
+                }
+                // An IPv6 source for an IPv4 destination: the kernel picks.
+                _ => {}
             }
             if at > 0 {
                 (*m).hdr.msg_control = control.cast();
@@ -871,6 +1051,58 @@ fn setsockopt_int(sock: &Socket, level: i32, name: i32, v: libc::c_int) -> io::R
     }
 }
 
+/// What [`UdpSocket::send_to_with`] does besides sending: nothing by
+/// default. `unstable-udp-offload`.
+///
+/// ```
+/// # #[cfg(feature = "unstable-udp-offload")] {
+/// use giong::net::SendOptions;
+/// // Ten 1200-byte datagrams from one 12,000-byte buffer, marked ECT(0).
+/// let options = SendOptions::new().segment_size(1200).ecn(2);
+/// # let _ = options;
+/// # }
+/// ```
+#[cfg(feature = "unstable-udp-offload")]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct SendOptions {
+    segment_size: usize,
+    ecn: u8,
+    source: Option<IpAddr>,
+}
+
+#[cfg(feature = "unstable-udp-offload")]
+impl SendOptions {
+    /// No options: one datagram, no ECN bits, the source address the route
+    /// gives.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Splits the buffer into datagrams of `bytes` each (the last may be
+    /// shorter) in the kernel (`UDP_SEGMENT`); 0, or the buffer's length or
+    /// more, is one datagram.
+    pub fn segment_size(mut self, bytes: usize) -> Self {
+        self.segment_size = bytes;
+        self
+    }
+
+    /// The two ECN bits of the IP header (0 to 3; higher bits are ignored).
+    pub fn ecn(mut self, ecn: u8) -> Self {
+        self.ecn = ecn & 3;
+        self
+    }
+
+    /// The local address to send from, for a socket bound to `0.0.0.0` or
+    /// `[::]` on a machine with several addresses: answer from the address
+    /// the request was sent to ([`Datagram::local_ip`]). The send fails with
+    /// `EINVAL` if the machine does not have the address.
+    pub fn source(mut self, ip: IpAddr) -> Self {
+        self.source = Some(ip);
+        self
+    }
+}
+
 impl AsRawFd for UdpSocket {
     fn as_raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
@@ -901,7 +1133,11 @@ mod tests {
 
     use socket2::SockAddr;
 
-    use super::{parse_addr, parse_control, Message, CMSG_HDR, CMSG_INT_SPACE};
+    use super::{
+        parse_addr, parse_control, Message, CMSG_HDR, CMSG_INT_SPACE, CMSG_PKTINFO6_SPACE,
+        CONTROL_SPACE,
+    };
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn cmsg(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
         let mut v = (CMSG_HDR + data.len()).to_ne_bytes().to_vec();
@@ -922,23 +1158,61 @@ mod tests {
         assert_eq!(gro.len(), CMSG_INT_SPACE);
         assert_eq!(
             parse_control(&[gro.clone(), tos.clone()].concat()),
-            (1200, 2)
+            (1200, 2, None)
         );
-        assert_eq!(parse_control(&[tclass, gro.clone()].concat()), (1200, 3));
-        assert_eq!(parse_control(&tos), (0, 2));
-        assert_eq!(parse_control(&[]), (0, 0));
+        assert_eq!(
+            parse_control(&[tclass, gro.clone()].concat()),
+            (1200, 3, None)
+        );
+        assert_eq!(parse_control(&tos), (0, 2, None));
+        assert_eq!(parse_control(&[]), (0, 0, None));
         // A length past the end, or shorter than a header, stops parsing.
         let mut bad = gro.clone();
         bad[..8].copy_from_slice(&999usize.to_ne_bytes());
-        assert_eq!(parse_control(&bad), (0, 0));
+        assert_eq!(parse_control(&bad), (0, 0, None));
         let mut bad = gro.clone();
         bad[..8].copy_from_slice(&3usize.to_ne_bytes());
-        assert_eq!(parse_control(&bad), (0, 0));
+        assert_eq!(parse_control(&bad), (0, 0, None));
         // An unknown message is skipped; a GRO size above u16 is ignored.
         let other = cmsg(libc::SOL_SOCKET, libc::SO_TIMESTAMP, &[0; 16]);
-        assert_eq!(parse_control(&[other, gro].concat()), (1200, 0));
+        assert_eq!(
+            parse_control(&[other, gro.clone()].concat()),
+            (1200, 0, None)
+        );
         let huge = cmsg(libc::SOL_UDP, libc::UDP_GRO, &70_000i32.to_ne_bytes());
-        assert_eq!(parse_control(&huge), (0, 0));
+        assert_eq!(parse_control(&huge), (0, 0, None));
+        // The address a datagram was sent to: IPv4 (`ipi_spec_dst`), IPv6,
+        // and IPv4 through a dual-stack socket. All three kinds fit the
+        // room a receive has for them.
+        let mut v4 = [0u8; 12];
+        v4[4..8].copy_from_slice(&[127, 0, 0, 2]);
+        v4[8..12].copy_from_slice(&[10, 0, 0, 9]);
+        let v4 = cmsg(libc::IPPROTO_IP, libc::IP_PKTINFO, &v4);
+        let local = Some(IpAddr::from([127, 0, 0, 2]));
+        assert_eq!(
+            parse_control(&[gro.clone(), tos, v4].concat()),
+            (1200, 2, local)
+        );
+        let mut v6 = [0u8; 20];
+        v6[..16].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let v6 = cmsg(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &v6);
+        let all = [gro.clone(), v6.clone()].concat();
+        assert!(all.len() + CMSG_INT_SPACE <= CONTROL_SPACE);
+        assert_eq!(v6.len(), CMSG_PKTINFO6_SPACE);
+        assert_eq!(
+            parse_control(&all),
+            (1200, 0, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
+        );
+        let mut mapped = [0u8; 20];
+        mapped[..16].copy_from_slice(&Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped().octets());
+        let mapped = cmsg(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &mapped);
+        assert_eq!(
+            parse_control(&mapped),
+            (0, 0, Some(IpAddr::from([192, 0, 2, 7])))
+        );
+        // Too short to hold an address: skipped.
+        let short = cmsg(libc::IPPROTO_IP, libc::IP_PKTINFO, &[0; 8]);
+        assert_eq!(parse_control(&short), (0, 0, None));
     }
 
     /// The header of a `Message` stays valid while the message moves, as it

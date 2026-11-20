@@ -65,7 +65,7 @@ fn payload(n: usize) -> Vec<u8> {
 #[test]
 fn giong_client_and_server() {
     giong::Builder::new()
-        .recv_buffers(64, 65_627)
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
         .block_on(async {
             let (tls, ca) = server_tls();
             let server = Endpoint::server(
@@ -152,7 +152,7 @@ fn quinn_client_against_giong_server() {
     let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
     let server = std::thread::spawn(move || {
         giong::Builder::new()
-            .recv_buffers(64, 65_627)
+            .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
             .block_on(async move {
                 let ep = Endpoint::server(
                     "127.0.0.1:0".parse().unwrap(),

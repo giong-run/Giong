@@ -40,7 +40,7 @@ fn main() {
     let workers: usize = arg("workers", 1);
     let mut b = giong::Builder::new().workers(workers);
     if offload {
-        b = b.recv_buffers(256, 65_627);
+        b = b.recv_buffers(256, giong::net::GRO_RECV_BUFFER);
     }
     if epoll {
         b = b.driver(giong::DriverKind::Epoll);

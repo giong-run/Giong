@@ -858,6 +858,7 @@ impl Driver {
 
     /// [`try_send_to`](Self::try_send_to) for a prepared message (control
     /// data such as `UDP_SEGMENT`): `sendmsg(2)`.
+    #[cfg(feature = "unstable-udp-offload")]
     pub(crate) fn try_sendmsg(&mut self, fd: RawFd, msg: *const libc::msghdr) -> Option<i32> {
         if self.has_queued_submissions() {
             return None;

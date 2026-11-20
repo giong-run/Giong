@@ -22,8 +22,9 @@ libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
 
 [features]
-# UDP offloads for QUIC (GSO, GRO, ECN) on UdpSocket. Prototype on the
-# feat/quic-prototype branch: not part of the 1.0 API.
+# UDP offloads for QUIC on UdpSocket: GSO, GRO, ECN, the local address of a
+# datagram and the source address of a send, socket buffer sizes, "don't
+# fragment". Not part of the 1.0 API: may change until it is stabilised.
 unstable-udp-offload = []
 
 [lints.rust]

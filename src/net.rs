@@ -28,6 +28,8 @@ pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
+#[cfg(feature = "unstable-udp-offload")]
+pub use udp::{SendOptions, GRO_RECV_BUFFER};
 pub use unix::{UnixListener, UnixStream};
 
 use std::cell::{Cell, OnceCell};
