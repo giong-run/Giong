@@ -1137,7 +1137,8 @@ Also:
   taken up again, writes cancelled inside a record. 30 minutes on four workers of a 4-vCPU
   virtual machine, without kernel TLS: 7.6 million connections on io_uring and 7.4 million
   on epoll, about half of them full handshakes, no unexpected error, resident memory
-  between 62 and 89 MB on io_uring and between 56 and 85 MB on epoll with no growth. CI
+  between 62 and 89 MB on io_uring and between 56 and 85 MB on epoll with no growth
+  (`bench/results/tls-soak/4f9083b/`). CI
   runs both for two hours every night, on the runner's kernel and on Linux 6.18 in QEMU,
   whose packed buffer rings cut stream receives wherever a shared buffer fills up; the 6.12
   and 6.18 kernel jobs soak for a minute on every change, 6.18 with kernel TLS.
