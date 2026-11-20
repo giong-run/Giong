@@ -61,6 +61,37 @@ request; everything else is automated and safe to re-run.
    [Release](https://github.com/giong-run/Giong/releases/latest), the crate pages on
    crates.io (the README, including the dark-mode logo) and https://giong.run.
 
+## Release candidates of 1.0
+
+A `1.0.0-rc.N` is cut only from a commit whose runtime has been through the 72-hour
+bare-metal soak, or from a commit whose difference from one is shown not to need it. The
+release pull request carries this checklist, filled in, in its description:
+
+1. **The soaked commit**: its hash and tree, the machines, both drivers' start and end
+   times, and the results directory under `bench/results/` (for 0.9: tree `f1b23074`,
+   commits `674c42c` and `003d9e5`, PR #155).
+2. **The release commit**: the hash the release pull request is based on.
+3. **What changed between them**: `git diff --stat <soaked>..<release> -- src giong-*/src`
+   pasted in, and each pull request in that range listed with one of:
+   - *soak path*: it changes `src/driver/`, `src/op.rs`, `src/buf.rs`, `src/kbox.rs`,
+     `src/slab.rs`, `src/runtime.rs`, `src/executor.rs`, `src/time.rs`, `src/net.rs`,
+     `src/net/`, `src/sync/`, `src/fs.rs`, or the connection, HTTP/2 or TLS state of
+     `giong-http` and `giong-tls`, in lines that run (doc comments do not count);
+   - *outside*: everything else (the database crates, `giong-web`, `giong-mcp`, docs,
+     benches, tests).
+4. **The decision.** If any pull request in the range is on a soak path, the release commit
+   is soaked again for 72 hours on both drivers before the tag, and items 1 and 2 become the
+   same commit. If none is, the candidate may be tagged after these have passed on the
+   release commit itself, each named with its run: the full CI set (kernels 5.15 to 6.18,
+   both drivers, TSan, loom, Kani, the simulation soak), the cancellation tests of
+   STABILITY.md's *Cancellation* section on both drivers. The runtime is then the code
+   that was soaked.
+5. **The removals**: every item of STABILITY.md's *Changes made before 1.0* checked off.
+
+Plan the merges so that one soak covers the candidate: merge everything meant for rc.1
+first, then soak the result once. A fix to the driver or to a cancellation path after that
+soak starts restarts the 72 hours; a fix outside the soak paths does not.
+
 ## When something fails
 
 Every step is idempotent: versions already on crates.io are skipped and an existing
