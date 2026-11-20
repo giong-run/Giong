@@ -36,8 +36,8 @@
 //! * HTTP/2 (RFC 9113), chosen through ALPN over TLS and with prior
 //!   knowledge over plain TCP, for the same handlers: every stream is a
 //!   [`Request`] like any other ([`Request::version`] tells them apart).
-//!   Flow control, HPACK, request trailers (checked, then dropped: a
-//!   [`Request`] has none), `Expect: 100-continue` and streamed
+//!   Flow control, HPACK, trailers both ways (see below), `Expect:
+//!   100-continue` and streamed
 //!   bodies both ways; limits against rapid reset, frame floods,
 //!   CONTINUATION floods, HPACK bombs and stalled readers, each with its
 //!   `GIONG-E` code. See [`Server::http2`].
@@ -46,7 +46,13 @@
 //! * Bodies that do not fit in memory: a handler can read the request body
 //!   as it arrives ([`Handler::stream_body`], [`BodyStream`]) and write the
 //!   response body as it is produced ([`Body::channel`], [`BodySender`]),
-//!   with backpressure both ways.
+//!   with backpressure both ways. Over HTTP/2 a handler can do both at
+//!   once on one stream (full duplex): it answers with a streamed body and
+//!   goes on reading the request's.
+//! * Trailer fields ([`Trailers`]) after a streamed body, over HTTP/2 and
+//!   chunked HTTP/1.1: a response ends with them through
+//!   [`BodySender::send_trailers`], and a request's are read with
+//!   [`BodyStream::trailers`]. A request received whole keeps none.
 //! * Limits on head and body size, timeouts for idle connections, slow
 //!   requests and slow readers, and a cap on open connections (10,000 per
 //!   [`Server::serve`] call unless [`Server::max_connections`] says
@@ -99,11 +105,13 @@ mod parse;
 mod request;
 mod response;
 mod server;
+mod trailers;
 
 pub use body::{BodySender, BodyStream, StreamBody};
 pub use request::{Request, Version};
 pub use response::{reason_phrase, Body, FileBody, Response};
 pub use server::{Handler, Server, Transport};
+pub use trailers::Trailers;
 
 /// Entry points for the fuzz targets in `giong-http/fuzz`. Only built by
 /// `cargo fuzz` (`--cfg fuzzing`); not part of the API.

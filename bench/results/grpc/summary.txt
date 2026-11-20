@@ -1,0 +1,51 @@
+5 rounds of 5 s; median, min and max of the rounds; 2 connections and 32 tasks per load process
+
+server: one server thread, loaded by 3 processes of `load`
+workload  load   server   ops/s median       min       max  p50 us  p99 us  cpu%   us/op  vs tonic
+unary     tonic  tonic          148951    139174    157797     614    1105    95   6.391          
+unary     tonic  giong          213803    195459    224824     408    1002    90   4.219    +43.5%
+unary     giong  tonic          156884    142228    160621     599    1077    95   6.068          
+unary     giong  giong          202924    195701    232699     448     985    92   4.544    +29.3%
+
+unary10k  tonic  tonic           67694     66180     76583    1354    2290    95  14.063          
+unary10k  tonic  giong           62597     57285     64231    1540    2874    81  13.004     -7.5%
+unary10k  giong  tonic           67517     61455     68447    1370    2447    95  14.159          
+unary10k  giong  giong           91249     85687     99433    1020    1741    95  10.433    +35.1%
+
+duplex    tonic  tonic          492739    470577    525029     190     320    95   1.940          
+duplex    tonic  giong          741107    709950    840728     125     237    95   1.290    +50.4%
+duplex    giong  tonic          474737    460227    510242     191     337    96   2.010          
+duplex    giong  giong          726118    686759    749630     125     240    95   1.300    +53.0%
+
+download  tonic  tonic         2716306   2437977   2783517   35060   52957    96   0.351          
+download  tonic  giong        10497599   9763029  10992455    9046   13954    95   0.091   +286.5%
+download  giong  tonic         2597898   2421941   2764268   36266   56553    95   0.366          
+download  giong  giong        10887413  10339823  11449745    8639   12529    95   0.087   +319.1%
+
+
+client: one client thread, against `peer` with three threads
+workload  peer   client   ops/s median       min       max  p50 us  p99 us  cpu%   us/op  vs tonic
+unary     tonic  tonic           80149     79792     81861     379     783    80   9.859          
+unary     tonic  giong           88485     86114     91614     347     703    76   8.702    +10.4%
+unary     giong  tonic          120009    116603    123839     252     466    98   8.051          
+unary     giong  giong          135058    132619    137230     220     479    94   6.937    +12.5%
+
+unary10k  tonic  tonic           47037     42413     48499     643    1397    94  19.559          
+unary10k  tonic  giong           54514     53147     56913     561    1159    92  16.876    +15.9%
+unary10k  giong  tonic           49786     42366     54301     593    1239    97  19.155          
+unary10k  giong  giong           56654     56379     60318     526     969    98  17.298    +13.8%
+
+duplex    tonic  tonic          232646    229264    245298     129     272    73   3.138          
+duplex    tonic  giong          235285    227173    240878     129     268    78   3.280     +1.1%
+duplex    giong  tonic          431257    409958    462276      69     122    97   2.249          
+duplex    giong  giong          471006    446191    484652      63     117    90   1.912     +9.2%
+
+download  tonic  tonic         4977440   4808158   5091639    6339   12827    92   0.183          
+download  tonic  giong         5399038   4623689   5450640    5789   11621    92   0.174     +8.5%
+download  giong  tonic         6664968   5551933   8306066    4669    7974    79   0.116          
+download  giong  giong         7924423   7269043   8082247    3927    8051    92   0.116    +18.9%
+
+memory: server resident memory per open bidirectional stream (1000 streams)
+server    idle KiB  held KiB  bytes/stream median     min     max
+tonic         3532     14904                11636   11624   11694
+giong         3180      8480                 5431    5382    5718

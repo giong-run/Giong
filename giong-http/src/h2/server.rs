@@ -19,8 +19,11 @@
 //!   handler reads its body as it arrives gets more only as the handler
 //!   takes it, the others up to `max_body_size`; and together the bodies a
 //!   connection holds stay within the budget, beyond which only the oldest
-//!   stream still receiving gets more, so that bodies are served in turn
-//!   instead of piling up `max_concurrent_streams` times over. Until the
+//!   stream still receiving gets more than its share, so that bodies are
+//!   served in turn instead of piling up `max_concurrent_streams` times
+//!   over. A stream whose handler has taken what it sent gets its share
+//!   back whatever the others hold, so every stream that is read goes on
+//!   (many long-lived streams on one connection, as with gRPC). Until the
 //!   client has acknowledged our SETTINGS, its streams have the protocol's
 //!   64 KiB windows, so only as many of them as the budget holds may carry
 //!   a body (the others are refused);
@@ -62,7 +65,7 @@ use giong::time::sleep_until;
 
 use super::frame::{self, Head, Reason, PREFACE};
 use super::hpack::{Decoder, Encoder, Index, TABLE_SIZE};
-use super::request::{Builder, Built, Trailers};
+use super::request::{Builder, Built, TrailerBlock};
 use super::wake::Wakers;
 use crate::body::{Failure, Next, Pipe, StreamBody};
 use crate::budget::{self, Charge};
@@ -70,6 +73,7 @@ use crate::heap::HeapFuture;
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, FileBody, Response};
 use crate::server::{catching, drop_quietly, give_buffer, take_buffer, Config, Handler, Transport};
+use crate::trailers::Trailers;
 
 /// The smallest window a stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`
 /// is half the body budget divided among the streams, within this and the
@@ -86,6 +90,9 @@ const MAX_FRAME: usize = frame::DEFAULT_FRAME_SIZE;
 const DATA_FRAME: usize = 16 * 1024;
 /// DATA frames are added to the output until it holds this much.
 const OUT_HIGH: usize = 64 * 1024;
+/// How many times in a row the connection polls the handlers that were
+/// woken while it polled them, before it lets the rest of the worker run.
+const ROUNDS_PER_TURN: usize = 32;
 /// With this much output waiting, input is not read: a client that sends
 /// PINGs and SETTINGS without reading the answers stops being read.
 const OUT_PAUSE: usize = 256 * 1024;
@@ -249,8 +256,9 @@ enum Send {
         at: usize,
         reading: Option<FileRead>,
     },
-    /// Only END_STREAM: an empty DATA frame.
-    End,
+    /// Only END_STREAM: an empty DATA frame, or a HEADERS frame with the
+    /// trailer fields.
+    End(Option<Trailers>),
     /// END_STREAM sent.
     Done,
 }
@@ -267,6 +275,9 @@ struct Stream {
     /// Bytes received and dealt with, not granted back yet.
     unacked: u32,
     content_length: Option<u64>,
+    /// The trailer fields that ended a body its handler reads as a stream,
+    /// until they are handed over with the end of the body.
+    trailers: Option<Box<Trailers>>,
     received: u64,
     /// Body bytes held for this stream: the buffered body (until the
     /// stream ends) or what its handler has not taken yet.
@@ -296,7 +307,7 @@ impl Stream {
             Send::Stream { piece, at, .. } | Send::File { piece, at, .. } => {
                 *at < piece.len() && self.send_window > 0
             }
-            Send::End => true,
+            Send::End(_) => true,
             Send::Waiting | Send::Done => false,
         }
     }
@@ -1016,12 +1027,17 @@ impl Session {
                 self.reset(slot, reason)
             }
             Purpose::Trailers(slot) => {
-                let mut trailers = Trailers::new();
+                let mut trailers = TrailerBlock::new(self.cfg.max_head_size);
                 self.decoder
                     .decode(fragment, |n, v| trailers.field(n, v))
                     .map_err(compression)?;
                 if trailers.error.is_some() || !end_stream {
                     return self.reset(slot, Reason::Protocol);
+                }
+                if let Some(st) = self.stream(slot) {
+                    if matches!(st.recv, Recv::Pipe { .. }) {
+                        st.trailers = Some(Box::new(trailers.fields));
+                    }
                 }
                 self.remote_end(slot)
             }
@@ -1110,6 +1126,7 @@ impl Session {
             queued: false,
             deadline: None,
             blocked_since: None,
+            trailers: None,
         };
         if self.streams.capacity() == 0
             && self.released
@@ -1683,6 +1700,7 @@ impl Session {
         let mut interim = None;
         let mut ended = false;
         let mut aborted = false;
+        let mut trailers = None;
         let mut released = 0;
         let Some(st) = self.stream(slot) else {
             return;
@@ -1710,7 +1728,7 @@ impl Session {
             st.held -= released;
             *taken = now_taken;
             if st.remote_done && pending.is_empty() {
-                pipe.finish(Ok(()));
+                pipe.finish_with(Ok(()), st.trailers.take().map(|t| *t));
                 st.recv = Recv::Done;
                 st.deadline = None;
             } else if pending.is_empty() && !st.remote_done {
@@ -1730,10 +1748,17 @@ impl Session {
                         *piece = next;
                         *at = 0;
                     }
-                    Poll::Ready(Next::End) => ended = true,
+                    Poll::Ready(Next::End(fields)) => {
+                        trailers = fields;
+                        ended = true;
+                    }
                     Poll::Ready(Next::Aborted) => aborted = true,
                     Poll::Pending => {}
                 }
+            } else if *at == 0 && piece.len() < DATA_FRAME {
+                // A small piece that has not left yet: the next small one
+                // goes into the same DATA frame.
+                body.take_small(piece, DATA_FRAME - piece.len());
             }
         }
         if let Send::File {
@@ -1755,7 +1780,7 @@ impl Session {
             }
         }
         if ended {
-            st.send = Send::End;
+            st.send = Send::End(trailers);
         }
         let unsent_after = st.unsent();
         self.unsent = self.unsent + unsent_after - unsent_before;
@@ -1781,7 +1806,10 @@ impl Session {
     /// gets more only while the bodies held, the windows open for more of
     /// them and the first windows of the streams that may still open stay
     /// within the budget; except the oldest stream still receiving, so
-    /// that one body always makes progress.
+    /// that one body always makes progress, and except a stream's share
+    /// (the window it started with), which the budget keeps for it while
+    /// it receives, so that a stream that is read is never left without
+    /// window by the others.
     fn grant(&mut self) {
         self.grant_due = false;
         if self.failed {
@@ -1802,10 +1830,14 @@ impl Session {
         };
         let unopened =
             u64::from(self.cfg.max_concurrent_streams).saturating_sub(self.ids.len() as u64);
+        // A stream that receives keeps its share: what it started with, or
+        // its window when that is larger.
+        let share = i64::from(self.initial_window);
+        let reserved = |window: i64| window.max(share) as u64;
         let mut committed = self.held + unopened * u64::from(first_window);
         for &(_, slot) in &self.ids {
             if let Some(st) = self.streams[slot].as_ref().filter(|st| receiving(st)) {
-                committed += st.recv_window.max(0) as u64;
+                committed += reserved(st.recv_window);
             }
         }
         let mut oldest = true;
@@ -1832,15 +1864,32 @@ impl Session {
             if st.unacked < STREAM_WINDOW / 4 && st.recv_window >= i64::from(STREAM_WINDOW / 2) {
                 continue;
             }
-            let more = u64::from(st.unacked);
-            if holds && !first && committed + more > self.body_budget {
-                continue;
+            let mut more = st.unacked;
+            if holds && !first {
+                let before = reserved(st.recv_window);
+                let after = reserved(st.recv_window + i64::from(more));
+                if committed + (after - before) > self.body_budget {
+                    // The budget has no room for all of it: the stream gets
+                    // its share back once it has used half of it, and what
+                    // room there is, so that a stream whose handler keeps
+                    // reading goes on beside the ones with large windows.
+                    if st.recv_window > share / 2 {
+                        continue;
+                    }
+                    let room = self.body_budget.saturating_sub(committed);
+                    let to_share = (share - st.recv_window.max(0)) as u64;
+                    more = more.min((to_share + room).min(u64::from(u32::MAX)) as u32);
+                    if more == 0 {
+                        continue;
+                    }
+                }
             }
-            frame::write_window_update(&mut self.out, id, st.unacked);
-            st.recv_window += i64::from(st.unacked);
-            st.unacked = 0;
+            let before = reserved(st.recv_window);
+            frame::write_window_update(&mut self.out, id, more);
+            st.recv_window += i64::from(more);
+            st.unacked -= more;
             if holds {
-                committed += more;
+                committed += reserved(st.recv_window) - before;
             }
         }
     }
@@ -1902,8 +1951,24 @@ impl Session {
                         sent = n;
                     }
                 }
-                Send::End => {
+                Send::End(None) => {
                     frame::write_head(&mut self.out, 0, frame::DATA, frame::END_STREAM, id);
+                    end = true;
+                }
+                Send::End(Some(trailers)) => {
+                    let mut block = take_buffer();
+                    self.encoder.begin(&mut block);
+                    for (name, value) in trailers.iter() {
+                        let index = if value.len() > 256 {
+                            Index::No
+                        } else {
+                            Index::Yes
+                        };
+                        self.encoder
+                            .field(name.as_bytes(), value, index, &mut block);
+                    }
+                    frame::write_headers(&mut self.out, id, &block, true, peer_frame);
+                    give_buffer(block);
                     end = true;
                 }
                 Send::Waiting | Send::Done => {}
@@ -2265,20 +2330,35 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             s.service(slot);
             stop_handlers(&mut s, &mut tasks);
         }
-        // Then the woken ones, unless handlers wait.
-        if !s.handlers_wait() {
-            polls.append(&mut parked);
-        }
-        polls.sort_unstable();
-        polls.dedup();
-        for slot in mem::take(&mut polls) {
-            if s.handlers_wait() {
-                parked.push(slot);
-            } else {
-                poll_handler(&mut s, &mut tasks, slot);
+        // Then the woken ones, unless handlers wait. A handler that sends a
+        // streamed body piece by piece is woken as soon as its piece is
+        // taken: it goes on in the same turn, for a few rounds, so that
+        // its small pieces leave in one DATA frame and one write instead
+        // of one each.
+        let mut rounds = 0;
+        loop {
+            if !s.handlers_wait() {
+                polls.append(&mut parked);
             }
-            s.service(slot);
-            stop_handlers(&mut s, &mut tasks);
+            polls.sort_unstable();
+            polls.dedup();
+            for slot in mem::take(&mut polls) {
+                if s.handlers_wait() {
+                    parked.push(slot);
+                } else {
+                    poll_handler(&mut s, &mut tasks, slot);
+                }
+                s.service(slot);
+                stop_handlers(&mut s, &mut tasks);
+            }
+            rounds += 1;
+            if rounds >= ROUNDS_PER_TURN
+                || s.handlers_wait()
+                || s.failed()
+                || !s.wakers.drain(&mut polls)
+            {
+                break;
+            }
         }
         s.fill();
         stop_handlers(&mut s, &mut tasks);

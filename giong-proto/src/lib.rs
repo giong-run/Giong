@@ -34,5 +34,5 @@ pub mod view;
 pub mod wire;
 
 pub use error::{Error, ErrorKind};
-pub use view::{Encode, Enum, EnumType, Lazy, Map, Repeated, View};
+pub use view::{Encode, Enum, EnumType, Lazy, Map, MessageOf, MessageType, Repeated, View};
 pub mod service;

@@ -9,7 +9,9 @@ fn main() {
         "proto/test_messages_proto2.proto",
     ];
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-    giong_grpc_build::compile_to(&files, &["proto"], &out.join("giong_proto.rs")).unwrap();
+    giong_grpc_build::Config::new()
+        .compile_to(&files, &["proto"], &out.join("giong_proto.rs"))
+        .unwrap();
     let fds = protox::compile(files, ["proto"]).unwrap();
     prost_build::Config::new()
         .btree_map(["."])

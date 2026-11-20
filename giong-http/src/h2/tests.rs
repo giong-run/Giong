@@ -947,6 +947,34 @@ fn a_streamed_body_gets_window_only_as_the_handler_reads() {
 }
 
 #[test]
+fn every_streamed_body_that_is_read_gets_window() {
+    // Long-lived streams whose handlers read as the data arrives, as with
+    // gRPC: the first ones take the budget with their full windows, and the
+    // others still get back the share they started with.
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let ids: Vec<u32> = (0..16)
+        .map(|_| c.open("POST", "/pipe", &[], false))
+        .collect();
+    c.frames_within(Duration::from_millis(100));
+    let body = pattern(100_000);
+    for &id in ids.iter().rev() {
+        c.send_body(id, &body, false);
+    }
+    // Still within the budget, and the oldest stream's top-up.
+    c.frames_within(Duration::from_millis(100));
+    let granted: i64 = ids.iter().map(|id| c.send_windows[id].max(0)).sum();
+    assert!(
+        granted <= (1 << 20) + 256 * 1024,
+        "{granted} bytes of window granted"
+    );
+    for &id in &ids {
+        c.send_body(id, &body, true);
+        assert_eq!(c.reply(id).unwrap().text(), "read 200000");
+    }
+}
+
+#[test]
 fn streams_beyond_the_limit_are_refused() {
     let server = TestServer::start(Server::new().max_concurrent_streams(2));
     let mut c = server.client();

@@ -94,6 +94,31 @@ pub trait View<'a>: Default + Clone + Encode {
     fn encode_canonical(&self, buf: &mut Vec<u8>);
 }
 
+/// A protobuf message type, apart from any one message: what generic code
+/// (a gRPC call, a codec) names to say which message travels.
+///
+/// Generated for each message `Foo` on `Foo<'static>`, the message struct
+/// with no borrowed data, so `Foo<'static>` is the name of the type and
+/// [`MessageType::View`] is what a received one is read through.
+pub trait MessageType: 'static {
+    /// The message's full name: `package.Message`.
+    const NAME: &'static str;
+
+    /// The view a received message of this type is decoded into.
+    type View<'a>: View<'a>;
+}
+
+/// Something that encodes one message of the type [`MessageOf::Type`]:
+/// the generated message struct `Foo<'a>` and its view `FooView<'a>`
+/// (which writes the bytes it was decoded from).
+///
+/// Generic code that sends a message of type `M` takes
+/// `&impl MessageOf<Type = M>`, so the wrong message does not compile.
+pub trait MessageOf: Encode {
+    /// The message type this value is one of.
+    type Type: MessageType;
+}
+
 /// Bytes the runs in `src` take. Generated views' [`Encode::encoded_len`].
 #[inline]
 pub fn spans_len(src: &Spans<'_>) -> usize {

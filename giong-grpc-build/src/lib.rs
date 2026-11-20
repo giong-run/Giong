@@ -1,10 +1,8 @@
 //! # giong-grpc-build
 //!
-//! Generates Rust code for [`giong-proto`] from `.proto` files at build time.
-//! The `.proto` files are parsed in Rust by [protox], so there is no
-//! `protoc` binary to install.
-//!
-//! **Prototype for giong 1.1.** Not published; the generated API will change.
+//! Generates Rust code for [`giong-proto`] messages and [`giong-grpc`]
+//! services from `.proto` files at build time. The `.proto` files are
+//! parsed in Rust by [protox], so there is no `protoc` binary to install.
 //!
 //! In `build.rs`:
 //!
@@ -23,12 +21,22 @@
 //! ```
 //!
 //! Every package becomes a module (`foo.bar` is `foo::bar`), every message
-//! `M` a view type `MView<'a>` that borrows from the input, its nested types
-//! a module `m`, every enum a Rust enum, and every service a module with
-//! the paths and kinds of its methods. The output is one file of plain
-//! Rust: no macros, nothing hidden.
+//! `M` a view type `MView<'a>` that borrows from the input and a struct
+//! `M<'a>` to build and encode, its nested types a module `m`, and every
+//! enum a Rust enum. Every service `S` becomes a module `s` with the paths
+//! and kinds of its methods, a trait `S` with one method for each rpc, a
+//! type `SServer` that routes calls to an implementation of the trait
+//! (what `giong_grpc::Server::add` takes), and a client `SClient`.
+//! [`Config::services`] leaves the trait, the server and the client out,
+//! for a crate that only needs the messages.
 //!
-//! [`giong-proto`]: ../giong_proto/index.html
+//! The file starts with `FILE_DESCRIPTOR_SET`: the `.proto` files in
+//! encoded form, for `giong_grpc::reflection`.
+//!
+//! The output is one file of plain Rust: no macros, nothing hidden.
+//!
+//! [`giong-proto`]: https://docs.rs/giong-proto
+//! [`giong-grpc`]: https://docs.rs/giong-grpc
 //! [protox]: https://docs.rs/protox
 
 #![warn(missing_docs)]
@@ -41,66 +49,156 @@ use prost_types::field_descriptor_proto::{Label, Type};
 use prost_types::{DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorSet};
 
 /// Compiles `files` (searched for in `includes`) and writes
-/// `$OUT_DIR/giong_proto.rs`. Prints the `cargo:rerun-if-changed` lines for
-/// the files it read.
+/// `$OUT_DIR/giong_proto.rs`, with everything [`Config`] generates by
+/// default. Prints the `cargo:rerun-if-changed` lines for the files it
+/// read.
 pub fn compile(
     files: &[impl AsRef<Path>],
     includes: &[impl AsRef<Path>],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let out = PathBuf::from(
-        std::env::var_os("OUT_DIR").ok_or("OUT_DIR is not set: call compile from build.rs")?,
-    );
-    compile_to(files, includes, &out.join("giong_proto.rs"))
+    Config::new().compile(files, includes)
 }
 
-/// Like [`compile`], writing to `out` instead.
-pub fn compile_to(
-    files: &[impl AsRef<Path>],
-    includes: &[impl AsRef<Path>],
-    out: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let fds = protox::compile(files, includes)?;
-    for f in files {
-        println!("cargo:rerun-if-changed={}", f.as_ref().display());
+/// What to generate, for a build that needs something other than
+/// [`compile`]'s defaults.
+///
+/// ```no_run
+/// // Messages only: the crate does not depend on giong-grpc.
+/// giong_grpc_build::Config::new()
+///     .services(false)
+///     .compile(&["proto/events.proto"], &["proto"])
+///     .unwrap();
+/// ```
+#[derive(Debug, Clone)]
+#[must_use = "a configuration does nothing until it compiles"]
+pub struct Config {
+    services: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self::new()
     }
-    std::fs::write(out, generate(&fds))?;
-    Ok(())
 }
 
-/// Generates the Rust code for every file in `fds` (imports included), as
-/// one source text.
-pub fn generate(fds: &FileDescriptorSet) -> String {
-    let index = Index::new(fds);
-    let mut tree = Module::default();
-    for file in &fds.file {
-        let pkg: Vec<String> = file
-            .package()
-            .split('.')
-            .filter(|s| !s.is_empty())
-            .map(module_name)
-            .collect();
-        let ctx = FileCtx {
-            proto2: file.syntax() != "proto3" && file.syntax() != "editions",
-        };
-        let m = tree.at(&pkg);
-        for e in &file.enum_type {
-            gen_enum(&mut m.code, e);
+impl Config {
+    /// The defaults: messages, enums, and for each service its trait, its
+    /// server and its client.
+    pub fn new() -> Self {
+        Self { services: true }
+    }
+
+    /// Whether each service gets a trait to implement, a `...Server` that
+    /// routes calls to it and a `...Client` (`true` by default). That code
+    /// uses the giong-grpc crate; without it, a service is only described
+    /// (its name, and the path and kind of each method).
+    pub fn services(mut self, on: bool) -> Self {
+        self.services = on;
+        self
+    }
+
+    /// Compiles `files` (searched for in `includes`) and writes
+    /// `$OUT_DIR/giong_proto.rs`. Prints the `cargo:rerun-if-changed`
+    /// lines for the files it read.
+    pub fn compile(
+        &self,
+        files: &[impl AsRef<Path>],
+        includes: &[impl AsRef<Path>],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let out = PathBuf::from(
+            std::env::var_os("OUT_DIR").ok_or("OUT_DIR is not set: call compile from build.rs")?,
+        );
+        self.compile_to(files, includes, &out.join("giong_proto.rs"))
+    }
+
+    /// Like [`compile`](Self::compile), writing to `out` instead.
+    pub fn compile_to(
+        &self,
+        files: &[impl AsRef<Path>],
+        includes: &[impl AsRef<Path>],
+        out: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fds = protox::compile(files, includes)?;
+        for f in files {
+            println!("cargo:rerun-if-changed={}", f.as_ref().display());
         }
-        for msg in &file.message_type {
-            let prefix = if file.package().is_empty() {
-                String::new()
-            } else {
-                format!(".{}", file.package())
+        std::fs::write(out, self.generate(&fds))?;
+        Ok(())
+    }
+
+    /// Generates the Rust code for every file in `fds` (imports included),
+    /// as one source text.
+    pub fn generate(&self, fds: &FileDescriptorSet) -> String {
+        let index = Index::new(fds);
+        let mut tree = Module::default();
+        for file in &fds.file {
+            let pkg: Vec<String> = file
+                .package()
+                .split('.')
+                .filter(|s| !s.is_empty())
+                .map(module_name)
+                .collect();
+            let ctx = FileCtx {
+                proto2: file.syntax() != "proto3" && file.syntax() != "editions",
             };
-            gen_message(&index, &ctx, m, &pkg, &prefix, msg);
+            let m = tree.at(&pkg);
+            for e in &file.enum_type {
+                gen_enum(&mut m.code, e);
+            }
+            for msg in &file.message_type {
+                let prefix = if file.package().is_empty() {
+                    String::new()
+                } else {
+                    format!(".{}", file.package())
+                };
+                gen_message(&index, &ctx, m, &pkg, &prefix, msg);
+            }
+            for s in &file.service {
+                gen_service(&index, &mut m.code, &pkg, file.package(), s, self.services);
+            }
         }
-        for s in &file.service {
-            gen_service(&index, &mut m.code, &pkg, file.package(), s);
-        }
+        let mut out = String::from("// Generated by giong-grpc-build. Do not edit.\n\n");
+        gen_descriptor_set(&mut out, fds);
+        tree.write(&mut out);
+        out
     }
-    let mut out = String::from("// Generated by giong-grpc-build. Do not edit.\n\n");
-    tree.write(&mut out);
-    out
+}
+
+/// The files as a constant, for reflection: comments and positions
+/// (`source_code_info`) are left out, which more than halves it.
+fn gen_descriptor_set(out: &mut String, fds: &FileDescriptorSet) {
+    use prost::Message as _;
+
+    let mut fds = fds.clone();
+    for file in &mut fds.file {
+        file.source_code_info = None;
+    }
+    out.push_str(
+        "/// The `.proto` files this code was generated from, their imports\n\
+         /// included, as an encoded `google.protobuf.FileDescriptorSet`: what\n\
+         /// `giong_grpc::reflection::Reflection::new` takes. A program that\n\
+         /// does not use it does not carry it.\n\
+         #[allow(dead_code)]\n\
+         pub const FILE_DESCRIPTOR_SET: &[u8] = b\"\\\n",
+    );
+    for line in fds.encode_to_vec().chunks(24) {
+        out.push_str("    ");
+        for &b in line {
+            // A trailing space would be eaten by the line continuation.
+            match b {
+                b'"' | b'\\' => {
+                    out.push('\\');
+                    out.push(b as char);
+                }
+                0x21..=0x7e => out.push(b as char),
+                _ => {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+            }
+        }
+        out.push_str("\\\n");
+    }
+    out.push_str("    \";\n\n");
 }
 
 #[derive(Default)]
@@ -1068,6 +1166,11 @@ fn gen_message(
 
     parent.code.push_str(&out);
     gen_writer(index, ctx, parent, path, &full, msg, &oneofs);
+    let _ = writeln!(
+        parent.code,
+        "impl giong_proto::MessageType for {name}<'static> {{\n    const NAME: &'static str = \"{}\";\n    type View<'a> = {view}<'a>;\n}}\nimpl<'a> giong_proto::MessageOf for {name}<'a> {{\n    type Type = {name}<'static>;\n}}\nimpl<'a> giong_proto::MessageOf for {view}<'a> {{\n    type Type = {name}<'static>;\n}}",
+        &full[1..]
+    );
 }
 
 fn storage_type(index: &Index, g: &FieldGen, f: &FieldDescriptorProto, path: &[String]) -> String {
@@ -1329,21 +1432,29 @@ fn gen_oneof_encode(
 }
 
 fn gen_service(
-    _index: &Index,
+    index: &Index,
     out: &mut String,
-    _path: &[String],
+    path: &[String],
     package: &str,
     s: &prost_types::ServiceDescriptorProto,
+    with_code: bool,
 ) {
     let full = if package.is_empty() {
         s.name().to_string()
     } else {
         format!("{package}.{}", s.name())
     };
+    let modname = module_name(s.name());
+    let mut sub_path = path.to_vec();
+    sub_path.push(modname.clone());
     let _ = writeln!(
         out,
-        "/// The gRPC service `{full}`: its methods' paths and kinds.\npub mod {} {{",
-        module_name(s.name())
+        "/// The gRPC service `{full}`: its methods' paths and kinds{}.\npub mod {modname} {{",
+        if with_code {
+            ", the trait a server implements, the server that routes calls to it, and the client"
+        } else {
+            ""
+        },
     );
     let _ = writeln!(
         out,
@@ -1368,7 +1479,144 @@ fn gen_service(
             m.output_type().trim_start_matches('.'),
         );
     }
+    let _ = writeln!(
+        out,
+        "    /// Every method of the service, in the order of the `.proto`.\n    pub const METHODS: &[giong_proto::service::Method] = &[{}];",
+        s.method
+            .iter()
+            .map(|m| snake(m.name()).to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if with_code {
+        gen_service_code(index, out, &sub_path, &full, s);
+    }
     out.push_str("}\n");
+}
+
+/// The trait, the server and the client of a service, inside its module.
+fn gen_service_code(
+    index: &Index,
+    out: &mut String,
+    sub_path: &[String],
+    full: &str,
+    s: &prost_types::ServiceDescriptorProto,
+) {
+    let name = type_name(s.name());
+    let ty = |full_name: &str| {
+        let info = index.get(full_name);
+        format!("{}{}<'static>", rel_path(sub_path, info), info.name)
+    };
+    const RESULT: &str = "::core::result::Result";
+    const FUTURE: &str = "::core::future::Future";
+
+    // The trait.
+    let _ = writeln!(
+        out,
+        "\n    /// The service `{full}`, as a server implements it: one method for each\n    /// rpc. Returning `Err(status)` ends the call with that status. Each call\n    /// has its own future, on the worker its connection lives on.\n    pub trait {name}: 'static {{"
+    );
+    for m in &s.method {
+        let id = ident(&snake(m.name()));
+        let (req, resp) = (ty(m.input_type()), ty(m.output_type()));
+        let (params, output, what) = match (m.client_streaming(), m.server_streaming()) {
+            (false, false) => (
+                format!("request: giong_grpc::Request<{req}>"),
+                format!("giong_grpc::Reply<{resp}>"),
+                "one request, one response",
+            ),
+            (true, false) => (
+                format!("requests: giong_grpc::RequestStream<{req}>"),
+                format!("giong_grpc::Reply<{resp}>"),
+                "a stream of requests, one response",
+            ),
+            (false, true) => (
+                format!("request: giong_grpc::Request<{req}>, responses: giong_grpc::Sink<{resp}>"),
+                "()".to_string(),
+                "one request, a stream of responses sent through `responses`",
+            ),
+            (true, true) => (
+                format!(
+                    "requests: giong_grpc::RequestStream<{req}>, responses: giong_grpc::Sink<{resp}>"
+                ),
+                "()".to_string(),
+                "a stream of requests, a stream of responses sent through `responses`",
+            ),
+        };
+        let _ = writeln!(
+            out,
+            "        /// `{}`: {what}.\n        fn {id}(\n            &self,\n            {params},\n        ) -> impl {FUTURE}<Output = {RESULT}<{output}, giong_grpc::Status>>;",
+            m.name()
+        );
+    }
+    out.push_str("    }\n");
+
+    // The server.
+    let _ = writeln!(
+        out,
+        "\n    /// Routes the calls of `{full}` to an implementation of [`{name}`]: what\n    /// `giong_grpc::Server::add` takes.\n    pub struct {name}Server<T> {{\n        inner: ::std::rc::Rc<T>,\n    }}\n\n    impl<T: {name}> {name}Server<T> {{\n        /// A server for `service`.\n        pub fn new(service: T) -> Self {{\n            Self {{\n                inner: ::std::rc::Rc::new(service),\n            }}\n        }}\n    }}\n\n    impl<T: {name}> giong_grpc::Service for {name}Server<T> {{\n        fn name(&self) -> &'static str {{\n            NAME\n        }}\n\n        fn call(\n            &self,\n            method: &str,\n            call: giong_grpc::server::Call,\n        ) -> giong_grpc::server::CallFuture {{\n            let inner = self.inner.clone();\n            match method {{"
+    );
+    for m in &s.method {
+        let id = ident(&snake(m.name()));
+        let (req, resp) = (ty(m.input_type()), ty(m.output_type()));
+        let arm = match (m.client_streaming(), m.server_streaming()) {
+            (false, false) => format!(
+                "call.unary::<{req}, {resp}, _, _>(move |request| async move {{ inner.{id}(request).await }})"
+            ),
+            (true, false) => format!(
+                "call.client_streaming::<{req}, {resp}, _, _>(move |requests| async move {{ inner.{id}(requests).await }})"
+            ),
+            (false, true) => format!(
+                "call.server_streaming::<{req}, {resp}, _, _>(move |request, responses| async move {{ inner.{id}(request, responses).await }})"
+            ),
+            (true, true) => format!(
+                "call.bidi::<{req}, {resp}, _, _>(move |requests, responses| async move {{ inner.{id}(requests, responses).await }})"
+            ),
+        };
+        let _ = writeln!(out, "                \"{}\" => {arm},", m.name());
+    }
+    out.push_str("                _ => call.unimplemented(),\n            }\n        }\n    }\n");
+
+    // The client.
+    let _ = writeln!(
+        out,
+        "\n    /// Calls `{full}` on a channel. Cloning it is cheap: the clones share\n    /// the channel.\n    #[derive(Clone, Debug)]\n    pub struct {name}Client {{\n        channel: giong_grpc::Channel,\n    }}\n\n    impl {name}Client {{\n        /// A client that makes its calls on `channel`.\n        pub fn new(channel: giong_grpc::Channel) -> Self {{\n            Self {{ channel }}\n        }}"
+    );
+    for m in &s.method {
+        let id = ident(&snake(m.name()));
+        let konst = snake(m.name()).to_ascii_uppercase();
+        let (req, resp) = (ty(m.input_type()), ty(m.output_type()));
+        match (m.client_streaming(), m.server_streaming()) {
+            (false, false) => {
+                let _ = writeln!(
+                    out,
+                    "\n        /// Calls `{}`: sends `message` and returns the response.\n        ///\n        /// Cancel safe: dropping the future cancels the call.\n        pub async fn {id}(\n            &self,\n            message: &impl giong_proto::MessageOf<Type = {req}>,\n            options: giong_grpc::CallOptions,\n        ) -> {RESULT}<giong_grpc::Reply<{resp}>, giong_grpc::Status> {{\n            self.channel.unary({konst}.path, message, options).await\n        }}",
+                    m.name()
+                );
+            }
+            (false, true) => {
+                let _ = writeln!(
+                    out,
+                    "\n        /// Calls `{}`: sends `message` and returns the stream of responses\n        /// once the server has started to answer. Dropping the stream cancels\n        /// the call.\n        ///\n        /// Cancel safe: dropping the future cancels the call.\n        pub async fn {id}(\n            &self,\n            message: &impl giong_proto::MessageOf<Type = {req}>,\n            options: giong_grpc::CallOptions,\n        ) -> {RESULT}<giong_grpc::ResponseStream<{resp}>, giong_grpc::Status> {{\n            self.channel.server_streaming({konst}.path, message, options).await\n        }}",
+                    m.name()
+                );
+            }
+            (true, false) => {
+                let _ = writeln!(
+                    out,
+                    "\n        /// Starts `{}`: send the requests on the value returned, then\n        /// `finish` it for the response.\n        pub fn {id}(\n            &self,\n            options: giong_grpc::CallOptions,\n        ) -> giong_grpc::ClientStreaming<{req}, {resp}> {{\n            self.channel.client_streaming({konst}.path, options)\n        }}",
+                    m.name()
+                );
+            }
+            (true, true) => {
+                let _ = writeln!(
+                    out,
+                    "\n        /// Starts `{}`: returns the sink for the requests and the stream of\n        /// responses. Dropping the stream cancels the call.\n        pub fn {id}(\n            &self,\n            options: giong_grpc::CallOptions,\n        ) -> (\n            giong_grpc::RequestSink<{req}>,\n            giong_grpc::ResponseStream<{resp}>,\n        ) {{\n            self.channel.bidi({konst}.path, options)\n        }}",
+                    m.name()
+                );
+            }
+        }
+    }
+    out.push_str("    }\n");
 }
 
 /// The Rust type of one value of `f` in a message struct (the writer):

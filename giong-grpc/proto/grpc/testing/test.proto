@@ -1,0 +1,92 @@
+// The messages and services of gRPC's interoperability tests
+// (github.com/grpc/grpc, src/proto/grpc/testing: empty.proto, messages.proto
+// and test.proto), reduced to what the test cases giong-grpc runs use. Field
+// numbers and names are those of the originals, so the two interoperate.
+//
+// Copyright 2015-2016 gRPC authors. Licensed under the Apache License,
+// Version 2.0.
+
+syntax = "proto3";
+
+package grpc.testing;
+
+message Empty {}
+
+enum PayloadType {
+  COMPRESSABLE = 0;
+}
+
+message BoolValue {
+  bool value = 1;
+}
+
+message Payload {
+  PayloadType type = 1;
+  bytes body = 2;
+}
+
+message EchoStatus {
+  int32 code = 1;
+  string message = 2;
+}
+
+message SimpleRequest {
+  PayloadType response_type = 1;
+  int32 response_size = 2;
+  Payload payload = 3;
+  bool fill_username = 4;
+  bool fill_oauth_scope = 5;
+  BoolValue response_compressed = 6;
+  EchoStatus response_status = 7;
+  BoolValue expect_compressed = 8;
+  bool fill_server_id = 9;
+}
+
+message SimpleResponse {
+  Payload payload = 1;
+  string username = 2;
+  string oauth_scope = 3;
+  string server_id = 4;
+  string hostname = 6;
+}
+
+message StreamingInputCallRequest {
+  Payload payload = 1;
+  BoolValue expect_compressed = 2;
+}
+
+message StreamingInputCallResponse {
+  int32 aggregated_payload_size = 1;
+}
+
+message ResponseParameters {
+  int32 size = 1;
+  int32 interval_us = 2;
+  BoolValue compressed = 3;
+}
+
+message StreamingOutputCallRequest {
+  PayloadType response_type = 1;
+  repeated ResponseParameters response_parameters = 2;
+  Payload payload = 3;
+  EchoStatus response_status = 7;
+}
+
+message StreamingOutputCallResponse {
+  Payload payload = 1;
+}
+
+service TestService {
+  rpc EmptyCall(Empty) returns (Empty);
+  rpc UnaryCall(SimpleRequest) returns (SimpleResponse);
+  rpc CacheableUnaryCall(SimpleRequest) returns (SimpleResponse);
+  rpc StreamingOutputCall(StreamingOutputCallRequest) returns (stream StreamingOutputCallResponse);
+  rpc StreamingInputCall(stream StreamingInputCallRequest) returns (StreamingInputCallResponse);
+  rpc FullDuplexCall(stream StreamingOutputCallRequest) returns (stream StreamingOutputCallResponse);
+  rpc HalfDuplexCall(stream StreamingOutputCallRequest) returns (stream StreamingOutputCallResponse);
+  rpc UnimplementedCall(Empty) returns (Empty);
+}
+
+service UnimplementedService {
+  rpc UnimplementedCall(Empty) returns (Empty);
+}

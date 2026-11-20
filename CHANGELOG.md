@@ -8,6 +8,83 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **giong-http: trailer fields.** `Trailers` holds the fields sent after a body. A streamed
+  response ends with them through `BodySender::send_trailers` (a last HEADERS frame over
+  HTTP/2, after the last chunk over HTTP/1.1), a handler reads a streamed request's with
+  `BodyStream::trailers`, and the client reads a response's with
+  `StreamingResponse::trailers`. Fields that mean nothing after a body (`content-length`,
+  `host`, `set-cookie` and the like) are refused when trailers are built (`GIONG-E1122`,
+  `HttpInvalidTrailer`) and dropped when they are received. Until now trailers were
+  checked and dropped.
+- **giong-http client: request bodies written piece by piece.**
+  `RequestBuilder::streamed_body` returns a `RequestBody` to send the pieces through, with
+  backpressure, `abort` and `send_trailers`. Over HTTP/2 the response is read while the
+  request is still being written, so requests and responses can alternate on one stream;
+  over HTTP/1.1 the body is sent chunked and the response read after it. Redirects are not
+  followed for such a request, and it is sent again after a refusal only if no piece had
+  been taken.
+
+- **giong-http: `BodySender::closed`** waits until the client of a streamed response is
+  gone (it reset the stream or its connection closed), for a handler that produces a
+  response on its own and should stop when nobody reads it.
+- **giong-grpc** (new crate): gRPC servers and clients on giong-http's HTTP/2. The four
+  kinds of call (unary, server streaming, client streaming, bidirectional), deadlines sent
+  and enforced on both sides, cancellation that drops the server's handler, text and
+  binary metadata, statuses with details, gzip per message, message size limits (4 MiB by
+  default), TLS through ALPN. `giong_grpc::Server` is a giong-http handler; a `Channel`
+  shares HTTP/2 connections between calls. The statuses it raises itself carry
+  `GIONG-E4101` to `GIONG-E4110` with the cause and the fix. Tested against grpc-go in
+  both directions with the cases of gRPC's interoperability specification, on io_uring and
+  epoll (`giong-grpc/interop/run.sh`, the `gRPC` workflow). Measured against tonic 0.14
+  with `bench/grpc.sh` (4-core cloud VM, median of 5 rounds): a one-thread server does 29%
+  to 44% more 100-byte unary calls a second, 50% more round trips on bidirectional streams
+  and 3.9 to 4.2 times the messages of a server stream, and holds 5.4 kB instead of 11.6 kB
+  per open stream; with 10,000-byte unary calls it is 35% ahead under giong-grpc's own
+  client and 7.5% behind under tonic's. A one-thread client is 1% to 19% ahead. Tables and
+  what was not measured: `giong-grpc/README.md`; raw data: `bench/results/grpc/`.
+- **giong-grpc: health checking and server reflection.** `giong_grpc::health::Health`
+  serves `grpc.health.v1.Health` (Check, List, Watch) from statuses the program sets from
+  any thread, with `check` and `watch` for clients; `giong_grpc::reflection::Reflection`
+  serves `grpc.reflection.v1` and `v1alpha`, so `grpcurl` lists, describes and calls a
+  server's methods without its `.proto` files.
+- **giong-proto** (new crate): Protocol Buffers decoded as views over the receive buffer,
+  with no copy and no allocation for strings, bytes, repeated fields and maps, and message
+  structs whose fields borrow for encoding. Passes Google's protobuf conformance suite and
+  is fuzzed against prost. Codes `GIONG-E4001` to `GIONG-E4008`.
+- **giong-grpc-build** (new crate): generates the giong-proto messages and, for each
+  service, a trait to implement, a server that routes calls to it and a client, from
+  `.proto` files at build time. The files are parsed in Rust (protox): no `protoc` to
+  install. The generated file also carries the descriptors reflection serves.
+
+### Changed
+
+- **giong-http client: HTTP/2 requests sent with `send_streaming` carry `te: trailers`**,
+  since their trailers can now be read; servers that only send them to a client that asks
+  (gRPC) do so. Requests sent with `send` are as before.
+- **giong-http client** (performance): a request costs 1.0% to 1.4% more instructions than
+  in 1.0.0-rc.1 (`bench/instr`: `http1-client` 30,512 to 30,939, `h2` 43,059 to 43,563,
+  `https` 42,596 to 43,175 on io_uring), the price of request bodies that can be streamed;
+  allocations and the memory of idle connections are unchanged. The baseline is updated.
+- **giong-http** (performance): the HTTP/2 server puts the small pieces a handler sends one
+  after the other through `BodySender::send` into one DATA frame (up to 16 KiB) when they
+  are ready in the same turn of the connection, and lets handlers that were woken while it
+  polled them go on for up to 32 rounds before it writes, instead of a frame and a write
+  for each piece. `send` waits for the connection to take each piece as before.
+
+### Fixed
+
+- **giong-http**: on an HTTP/2 connection with more streamed request bodies open at once
+  than the body budget has full windows for (from the fourth, with the default budget of
+  1 MiB), the streams after the first few were never given flow-control window again once they had
+  used the window they started with, although their handlers had read everything: they
+  stalled until an older stream ended, and for good next to streams that never end
+  (bidirectional gRPC streams, long uploads read as they arrive). A stream whose handler
+  has taken what it sent now gets back the window it started with, which the budget keeps
+  for it while it is open; windows beyond that are still granted only within the budget.
+  Found with 16 bidirectional gRPC streams on one connection, of which three made progress.
+
 ## [1.0.0-rc.1] - 2026-11-20
 
 ### Security

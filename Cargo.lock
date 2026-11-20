@@ -331,9 +331,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "giong-grpc"
+version = "0.7.0"
+dependencies = [
+ "giong",
+ "giong-grpc-build",
+ "giong-http",
+ "giong-proto",
+ "giong-tls",
+ "miniz_oxide",
+]
+
+[[package]]
 name = "giong-grpc-build"
 version = "0.7.0"
 dependencies = [
+ "prost",
  "prost-types",
  "protox",
 ]
@@ -423,6 +436,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "grpc-hello"
+version = "0.0.0"
+dependencies = [
+ "giong",
+ "giong-grpc",
+ "giong-grpc-build",
+ "giong-http",
+ "giong-proto",
 ]
 
 [[package]]

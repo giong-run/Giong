@@ -18,3 +18,5 @@ publish = false
 # version at 1.80 (0.10 needs 1.85).
 protox = "0.8"
 prost-types = "0.13"
+# Encodes the descriptors the generated code carries for reflection.
+prost = "0.13"

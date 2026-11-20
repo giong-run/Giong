@@ -471,18 +471,18 @@ make behaviour hard to predict, but giong-mcp suggests settings from what it mea
 gRPC on `giong-http`'s HTTP/2 server and client, in a new crate, `giong-grpc`, on a
 protobuf of its own, and a simulation driver that tests every service deterministically.
 
-- [ ] Trailers in `giong-http`: a streamed response body that ends with trailers, and
+- [x] Trailers in `giong-http`: a streamed response body that ends with trailers, and
       trailers that can be read at the end of a request body and of a client response. gRPC
       sends its status in them.
-- [ ] A client request body sent as it is produced, and a response that can be read while
+- [x] A client request body sent as it is produced, and a response that can be read while
       the request body is still being sent, for client-streaming and bidirectional calls.
       The server already keeps reading a request body while its answer streams; this
       milestone adds the test that holds it to that.
-- [ ] `giong-grpc`: unary, server-streaming, client-streaming and bidirectional calls;
+- [x] `giong-grpc`: unary, server-streaming, client-streaming and bidirectional calls;
       deadlines (`grpc-timeout`), status codes, metadata, cancellation, message size limits
       and gzip. Code generated from `.proto` files at build time, with no macros in user
       code and no `protoc` to install. Errors carry giong codes.
-- [ ] `giong-proto`: protobuf messages decoded as views over the receive buffer, with no
+- [x] `giong-proto`: protobuf messages decoded as views over the receive buffer, with no
       copy and no allocation for strings and bytes, and encoded straight into the send
       buffer. Held to Google's protobuf conformance suite and fuzzed against prost.
 - [ ] The same service over gRPC-Web, for browsers, and as JSON over HTTP from the
@@ -497,9 +497,9 @@ protobuf of its own, and a simulation driver that tests every service determinis
       simulated time, from a seed. Packets are lost, reordered and delayed, connections
       reset, disks fail and clocks jump as the seed decides, and a failing run replays
       exactly from its seed.
-- [ ] Health checking and server reflection, so standard tools (`grpcurl`, Kubernetes gRPC
+- [x] Health checking and server reflection, so standard tools (`grpcurl`, Kubernetes gRPC
       probes) work against a giong service.
-- [ ] Tested against grpc-go in both directions with gRPC's interoperability test cases,
+- [x] Tested against grpc-go in both directions with gRPC's interoperability test cases,
       the message framing fuzzed, and benchmarked against tonic: calls per second, p99
       latency and memory per open stream, for unary and streaming calls.
 
