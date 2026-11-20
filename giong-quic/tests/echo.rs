@@ -102,6 +102,17 @@ fn giong_client_and_server() {
                     .unwrap()
                     .unwrap();
             }
+            // Five streams and more than 3 MiB each way went through.
+            let stats = conn.stats();
+            assert!(stats.sent_bytes > 3 << 20 && stats.received_bytes > 3 << 20);
+            assert!(stats.sent_datagrams > 2000 && stats.received_datagrams > 2000);
+            assert!(stats.sent_packets >= stats.sent_datagrams, "{stats:?}");
+            assert!(stats.lost_packets < stats.sent_packets / 2, "{stats:?}");
+            assert!(stats.rtt > Duration::ZERO && stats.rtt < Duration::from_secs(1));
+            assert!(
+                stats.congestion_window >= 1200 && stats.mtu >= 1200,
+                "{stats:?}"
+            );
         })
         .unwrap();
 }

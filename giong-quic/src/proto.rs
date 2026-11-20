@@ -626,6 +626,23 @@ impl Shared {
         self.st.borrow_mut().conn(h).c.remote_address()
     }
 
+    pub(crate) fn stats(&self, h: usize) -> crate::ConnectionStats {
+        let stats = self.st.borrow_mut().conn(h).c.stats();
+        crate::ConnectionStats {
+            rtt: stats.path.rtt,
+            congestion_window: stats.path.cwnd,
+            congestion_events: stats.path.congestion_events,
+            sent_packets: stats.path.sent_packets,
+            lost_packets: stats.path.lost_packets,
+            lost_bytes: stats.path.lost_bytes,
+            sent_datagrams: stats.udp_tx.datagrams,
+            sent_bytes: stats.udp_tx.bytes,
+            received_datagrams: stats.udp_rx.datagrams,
+            received_bytes: stats.udp_rx.bytes,
+            mtu: stats.path.current_mtu,
+        }
+    }
+
     pub(crate) async fn stream(
         self: &Rc<Self>,
         h: usize,

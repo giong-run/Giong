@@ -194,6 +194,13 @@ impl Connection {
         self.sh.remote_addr(self.h)
     }
 
+    /// What this connection has sent, received and lost so far, and what
+    /// it now takes the path to be. Cheap: a copy of counters the
+    /// connection keeps anyway.
+    pub fn stats(&self) -> ConnectionStats {
+        self.sh.stats(self.h)
+    }
+
     /// Closes the connection with an application error code and reason.
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.sh.close_conn(self.h, code, reason);
@@ -204,6 +211,39 @@ impl Drop for Connection {
     fn drop(&mut self) {
         self.sh.release(self.h);
     }
+}
+
+/// Counters of one connection, read with [`Connection::stats`].
+///
+/// Counts go up for the whole life of the connection; `rtt`,
+/// `congestion_window` and `mtu` describe the path the connection is on
+/// now and start again when the peer moves to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConnectionStats {
+    /// The round-trip time, smoothed (RFC 9002, section 5.3).
+    pub rtt: std::time::Duration,
+    /// Bytes the congestion controller lets be in flight.
+    pub congestion_window: u64,
+    /// Times the congestion controller cut the window for a loss or an
+    /// ECN mark.
+    pub congestion_events: u64,
+    /// Packets sent on this path.
+    pub sent_packets: u64,
+    /// Packets declared lost on this path, and sent again where needed.
+    pub lost_packets: u64,
+    /// Bytes in those packets.
+    pub lost_bytes: u64,
+    /// UDP datagrams sent.
+    pub sent_datagrams: u64,
+    /// Bytes in the datagrams sent.
+    pub sent_bytes: u64,
+    /// UDP datagrams received.
+    pub received_datagrams: u64,
+    /// Bytes in the datagrams received.
+    pub received_bytes: u64,
+    /// The largest UDP payload the path is known to carry.
+    pub mtu: u16,
 }
 
 /// The application error code the peer gave when it reset a stream or asked

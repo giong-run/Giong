@@ -40,12 +40,14 @@ fn main() {
         let errors = Arc::new(AtomicU64::new(0));
         let lat = Arc::new(Mutex::new(Vec::<u32>::new()));
         let mut tasks = Vec::new();
+        let mut held = Vec::new();
         for c in 0..conns {
             let conn = endpoints[c % threads]
                 .connect(addr, "localhost")
                 .unwrap()
                 .await
                 .expect("handshake");
+            held.push(conn.clone());
             for _ in 0..streams {
                 let conn = conn.clone();
                 let (phase, reqs, bytes, errors, lat) =
@@ -106,8 +108,18 @@ fn main() {
         let pct = |p: f64| l.get(((l.len() as f64 * p) as usize).min(l.len().saturating_sub(1))).copied().unwrap_or(0);
         let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
         let srv_cpu = (cpu1 - cpu0) as f64 / tck;
+        // What the client's side of the connections saw of the path: its
+        // own packets declared lost, the times it cut its window, and the
+        // slowest connection's round-trip time.
+        let (mut lost, mut cut, mut rtt) = (0, 0, Duration::ZERO);
+        for conn in &held {
+            let path = conn.stats().path;
+            lost += path.lost_packets;
+            cut += path.congestion_events;
+            rtt = rtt.max(path.rtt);
+        }
         println!(
-            "req_s={:.0} gbit_s={:.3} p50_us={} p99_us={} srv_cpu_pct={:.1} srv_us_per_req={:.2} srv_ns_per_kib={:.1} cli_cpu_pct={:.1} errors={}",
+            "req_s={:.0} gbit_s={:.3} p50_us={} p99_us={} srv_cpu_pct={:.1} srv_us_per_req={:.2} srv_ns_per_kib={:.1} cli_cpu_pct={:.1} errors={} cli_lost_packets={lost} cli_congestion_events={cut} cli_max_rtt_us={}",
             r as f64 / el,
             b as f64 * 8.0 / el / 1e9,
             pct(0.50),
@@ -117,6 +129,7 @@ fn main() {
             if b > 0 { srv_cpu * 1e9 / (b as f64 / 1024.0) } else { 0.0 },
             (me1 - me0) as f64 / tck / el * 100.0,
             errors.load(Relaxed),
+            rtt.as_micros(),
         );
         for ep in endpoints {
             ep.close(0u32.into(), b"done");
