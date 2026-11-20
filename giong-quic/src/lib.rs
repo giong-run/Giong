@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 
 use bytes::Bytes;
+use quinn_proto::Dir;
 
 mod config;
 mod error;
@@ -72,6 +73,10 @@ impl Endpoint {
 
     /// The next connection whose handshake has completed. `None` once the
     /// endpoint is closed.
+    ///
+    /// Cancel safe: a connection is handed over only when the future
+    /// completes; one that arrives after it was dropped waits for the next
+    /// call.
     pub async fn accept(&self) -> Option<Connection> {
         let h = self.sh.accept().await?;
         Some(Connection {
@@ -82,6 +87,9 @@ impl Endpoint {
 
     /// Connects to `to`, checking its certificate against `server_name`.
     /// Fails with `GIONG-E3602`.
+    ///
+    /// Cancel safe: dropping the future closes the connection it was
+    /// making. The peer may have seen the handshake start.
     pub async fn connect(
         &self,
         to: SocketAddr,
@@ -93,6 +101,11 @@ impl Endpoint {
             sh: self.sh.clone(),
             h,
         })
+    }
+
+    /// Connections this endpoint still holds: open, closing or draining.
+    pub fn connections(&self) -> usize {
+        self.sh.connections()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -115,16 +128,47 @@ pub struct Connection {
 
 impl Connection {
     /// The next bidirectional stream the peer opens.
+    ///
+    /// Cancel safe: a stream is taken only when the future completes.
     pub async fn accept_bi(&self) -> io::Result<(SendStream, RecvStream)> {
-        let id = self.sh.stream(self.h, false).await?;
+        let id = self.sh.stream(self.h, false, Dir::Bi).await?;
         Ok(self.pair(id))
     }
 
     /// Opens a bidirectional stream, waiting while the peer's stream limit
     /// is reached.
+    ///
+    /// Cancel safe: a stream is opened only when the future completes.
     pub async fn open_bi(&self) -> io::Result<(SendStream, RecvStream)> {
-        let id = self.sh.stream(self.h, true).await?;
+        let id = self.sh.stream(self.h, true, Dir::Bi).await?;
         Ok(self.pair(id))
+    }
+
+    /// The next unidirectional stream the peer opens.
+    ///
+    /// Cancel safe: a stream is taken only when the future completes.
+    pub async fn accept_uni(&self) -> io::Result<RecvStream> {
+        let id = self.sh.stream(self.h, false, Dir::Uni).await?;
+        Ok(RecvStream {
+            sh: self.sh.clone(),
+            h: self.h,
+            id,
+            done: false,
+        })
+    }
+
+    /// Opens a unidirectional stream, waiting while the peer's stream limit
+    /// is reached.
+    ///
+    /// Cancel safe: a stream is opened only when the future completes.
+    pub async fn open_uni(&self) -> io::Result<SendStream> {
+        let id = self.sh.stream(self.h, true, Dir::Uni).await?;
+        Ok(SendStream {
+            sh: self.sh.clone(),
+            h: self.h,
+            id,
+            finished: false,
+        })
     }
 
     fn pair(&self, id: quinn_proto::StreamId) -> (SendStream, RecvStream) {
@@ -169,7 +213,22 @@ pub struct SendStream {
 }
 
 impl SendStream {
+    /// The stream's identifier (RFC 9000, section 2.1).
+    pub fn id(&self) -> u64 {
+        quinn_proto::VarInt::from(self.id).into_inner()
+    }
+
+    /// Abandons the stream: what was written and not yet delivered may
+    /// never arrive, and the peer is told `code` (`RESET_STREAM`).
+    pub fn reset(&mut self, code: u32) {
+        self.finished = true;
+        self.sh.reset(self.h, self.id, code);
+    }
+
     /// Sends all of `data`, waiting while flow control holds it back.
+    ///
+    /// Not cancel safe: if the future is dropped, a first part of `data`
+    /// may have been sent and the rest not; how much is not known.
     pub async fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
         self.sh.write(self.h, self.id, data).await
     }
@@ -200,7 +259,23 @@ pub struct RecvStream {
 }
 
 impl RecvStream {
+    /// The stream's identifier (RFC 9000, section 2.1).
+    pub fn id(&self) -> u64 {
+        quinn_proto::VarInt::from(self.id).into_inner()
+    }
+
+    /// Asks the peer to stop sending, with `code` (`STOP_SENDING`). What
+    /// arrives afterwards is dropped.
+    pub fn stop(&mut self, code: u32) {
+        if !self.done {
+            self.done = true;
+            self.sh.stop(self.h, self.id, code);
+        }
+    }
+
     /// The next piece of the stream, in order; `None` at its end.
+    ///
+    /// Cancel safe: bytes leave the stream only when the future completes.
     pub async fn read(&mut self) -> io::Result<Option<Bytes>> {
         let r = self.sh.read(self.h, self.id).await;
         if matches!(r, Ok(None) | Err(_)) {
@@ -210,6 +285,8 @@ impl RecvStream {
     }
 
     /// Everything up to the end of the stream, at most `limit` bytes.
+    ///
+    /// Not cancel safe: if the future is dropped, what it had read is lost.
     pub async fn read_to_end(&mut self, limit: usize) -> io::Result<Vec<u8>> {
         let mut all = Vec::new();
         while let Some(b) = self.read().await? {

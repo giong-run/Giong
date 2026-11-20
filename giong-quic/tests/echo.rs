@@ -189,3 +189,112 @@ fn quinn_client_against_giong_server() {
     });
     drop(server);
 }
+
+/// Unidirectional streams both ways, a stream the sender resets and one the
+/// receiver stops: each side sees the other's code as `GIONG-E3604`.
+#[test]
+fn unidirectional_streams_resets_and_stops() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let served = giong::spawn(async move {
+                let conn = server.accept().await.unwrap();
+                // A one-way stream in, answered on a one-way stream out.
+                let mut recv = conn.accept_uni().await.unwrap();
+                assert_eq!(recv.id() & 3, 2, "client-initiated, unidirectional");
+                let got = recv.read_to_end(1 << 20).await.unwrap();
+                let mut send = conn.open_uni().await.unwrap();
+                assert_eq!(send.id() & 3, 3, "server-initiated, unidirectional");
+                send.write_all(&got).await.unwrap();
+                send.write_all(b"!").await.unwrap();
+                send.finish().unwrap();
+                // The client resets the next one after its first bytes.
+                let mut recv = conn.accept_uni().await.unwrap();
+                let err = recv.read_to_end(1 << 20).await.unwrap_err();
+                assert_eq!(
+                    giong::error::code(&err),
+                    Some(giong::error::Code::QuicStreamReset)
+                );
+                assert!(err.to_string().contains("code 77"), "{err}");
+                // And we stop reading the one after: its writer learns why.
+                let mut recv = conn.accept_uni().await.unwrap();
+                let first = recv.read().await.unwrap().expect("some bytes");
+                assert!(first.starts_with(b"start"));
+                recv.stop(99);
+                // Keep the connection until the client is done.
+                let _ = conn.accept_uni().await;
+            });
+
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(b"one way").await.unwrap();
+            send.finish().unwrap();
+            let mut recv = conn.accept_uni().await.unwrap();
+            assert_eq!(recv.read_to_end(100).await.unwrap(), b"one way!");
+
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(b"never finished").await.unwrap();
+            send.reset(77);
+
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(b"start").await.unwrap();
+            let chunk = vec![0u8; 64 * 1024];
+            let err = giong::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Err(e) = send.write_all(&chunk).await {
+                        break e;
+                    }
+                }
+            })
+            .await
+            .expect("the writer is told to stop");
+            assert_eq!(
+                giong::error::code(&err),
+                Some(giong::error::Code::QuicStreamReset)
+            );
+            assert!(err.to_string().contains("code 99"), "{err}");
+            drop(conn);
+            let _ = giong::time::timeout(Duration::from_secs(5), served).await;
+        })
+        .unwrap();
+}
+
+/// A `connect` whose future is dropped (here by a timeout: nothing listens
+/// on the port) closes its connection instead of leaving it behind.
+#[test]
+fn a_dropped_connect_leaves_no_connection() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            // A bound socket that never answers.
+            let silent = giong::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let to = silent.local_addr().unwrap();
+            let (_, ca) = server_tls();
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let attempt = client.connect(to, "localhost", &cfg);
+            assert!(giong::time::timeout(Duration::from_millis(100), attempt)
+                .await
+                .is_err());
+            // Closed at once; forgotten when its draining period is over
+            // (three probe timeouts, about three seconds before any RTT
+            // sample).
+            let gone = giong::time::timeout(Duration::from_secs(20), async {
+                while client.connections() > 0 {
+                    giong::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            assert!(gone.is_ok(), "{} connections left", client.connections());
+        })
+        .unwrap();
+}

@@ -442,6 +442,18 @@ impl Shared {
             st.insert(ch, c, false);
             ch.0
         };
+        // Releases the connection if the handshake fails or the caller
+        // gives up on it (drops the future), so that it is closed and
+        // forgotten instead of staying in the table without an owner.
+        struct Attempt<'a>(&'a Shared, usize, bool);
+        impl Drop for Attempt<'_> {
+            fn drop(&mut self) {
+                if !self.2 {
+                    self.0.release(self.1);
+                }
+            }
+        }
+        let mut attempt = Attempt(self, h, false);
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             let c = st.conn(h);
@@ -454,16 +466,26 @@ impl Shared {
             c.waiters.push(cx.waker().clone());
             Poll::Pending
         })
-        .await
-        .inspect_err(|_| self.release(h))?;
+        .await?;
+        attempt.2 = true;
         Ok(h)
+    }
+
+    /// Connections this endpoint still holds (open, closing or draining).
+    pub(crate) fn connections(&self) -> usize {
+        self.st.borrow().conns.iter().flatten().count()
     }
 
     pub(crate) fn remote_addr(&self, h: usize) -> SocketAddr {
         self.st.borrow_mut().conn(h).c.remote_address()
     }
 
-    pub(crate) async fn stream(self: &Rc<Self>, h: usize, open: bool) -> io::Result<StreamId> {
+    pub(crate) async fn stream(
+        self: &Rc<Self>,
+        h: usize,
+        open: bool,
+        dir: Dir,
+    ) -> io::Result<StreamId> {
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             let c = st.conn(h);
@@ -471,14 +493,15 @@ impl Shared {
                 return Poll::Ready(Err(error::lost(e)));
             }
             let id = if open {
-                c.c.streams().open(Dir::Bi)
+                c.c.streams().open(dir)
             } else {
-                c.c.streams().accept(Dir::Bi)
+                c.c.streams().accept(dir)
             };
             match id {
                 Some(id) => {
                     c.streams.insert(id, Wakers::default());
-                    c.refs += 2;
+                    // One handle per half.
+                    c.refs += if dir == Dir::Bi { 2 } else { 1 };
                     st.mark(h);
                     Poll::Ready(Ok(id))
                 }
@@ -574,6 +597,12 @@ impl Shared {
         let r = c.c.send_stream(id).finish();
         st.mark(h);
         r.map_err(|_| error::lost(&ConnectionError::LocallyClosed))
+    }
+
+    pub(crate) fn reset(&self, h: usize, id: StreamId, code: u32) {
+        let mut st = self.st.borrow_mut();
+        let _ = st.conn(h).c.send_stream(id).reset(code.into());
+        st.mark(h);
     }
 
     pub(crate) fn stop(&self, h: usize, id: StreamId, code: u32) {

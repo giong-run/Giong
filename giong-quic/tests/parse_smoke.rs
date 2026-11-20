@@ -13,7 +13,9 @@ fn xorshift(s: &mut u64) -> u64 {
 #[test]
 fn random_and_mutated_packets_never_panic() {
     // A valid version 1 Initial header to mutate, and random bytes.
-    let mut seed_packet = vec![0xc3, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0x41, 0x00];
+    let mut seed_packet = vec![
+        0xc3, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0x41, 0x00,
+    ];
     seed_packet.resize(1200, 0xaa);
     let mut s = 0x9e37_79b9_7f4a_7c15u64;
     for i in 0..2_000_000u32 {
