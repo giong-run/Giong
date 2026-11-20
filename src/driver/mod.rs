@@ -459,6 +459,15 @@ pub(crate) enum Io {
     /// The result is what [`BlockingJob::run`] returns.
     #[cfg(windows)]
     Blocking { job: *mut dyn BlockingJob },
+    /// `TransmitFile`: sends `len` bytes of `file` from `offset` on the
+    /// stream socket `fd`, straight from the system's file cache.
+    #[cfg(windows)]
+    SendFile {
+        fd: RawSock,
+        file: RawFile,
+        len: u32,
+        offset: u64,
+    },
 }
 
 /// What an [`Io::Blocking`] runs. It lives in the operation's resources, so

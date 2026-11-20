@@ -342,7 +342,6 @@ impl Drop for TempFile {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn send_file_sends_the_file_and_leaves_the_stream_usable() {
     giong::block_on(async {
@@ -402,7 +401,6 @@ fn send_file_sends_the_file_and_leaves_the_stream_usable() {
     });
 }
 
-#[cfg(unix)]
 #[test]
 fn send_file_past_the_end_sends_what_there_is_and_says_so() {
     giong::block_on(async {
@@ -435,7 +433,6 @@ fn send_file_past_the_end_sends_what_there_is_and_says_so() {
     });
 }
 
-#[cfg(unix)]
 #[test]
 fn send_file_to_a_closed_peer_is_an_error_not_a_signal() {
     giong::block_on(async {

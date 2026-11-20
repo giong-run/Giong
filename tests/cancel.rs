@@ -186,7 +186,6 @@ fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
     });
 }
 
-#[cfg(unix)]
 #[test]
 fn a_dropped_send_file_leaves_nothing_behind() {
     giong::block_on(async {

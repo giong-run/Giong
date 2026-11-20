@@ -54,11 +54,11 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    bind, closesocket, getsockname, ioctlsocket, recv, recvfrom, setsockopt, WSAGetLastError,
-    WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendMsg, WSASendTo,
-    WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX, LPFN_WSARECVMSG,
-    MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
-    SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+    bind, closesocket, getsockname, ioctlsocket, recv, recvfrom, setsockopt, TransmitFile,
+    WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendMsg,
+    WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX,
+    LPFN_WSARECVMSG, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
     SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAEINVAL, WSAEMSGSIZE, WSAEOPNOTSUPP, WSAEWOULDBLOCK,
     WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG, WSA_FLAG_NO_HANDLE_INHERIT,
     WSA_FLAG_OVERLAPPED,
@@ -461,6 +461,7 @@ impl Iocp {
             | Io::SendMsg { fd, .. }
             | Io::SendTo { fd, .. }
             | Io::RecvMsg { fd, .. } => (fd as HANDLE, true, 0),
+            Io::SendFile { fd, offset, .. } => (fd as HANDLE, true, offset),
             Io::ReadReady { fd, .. } => (fd, false, 0),
             Io::Read { fd, offset, .. } | Io::Write { fd, offset, .. } => (fd, false, offset),
             // Windows reports no "writable": a send waits by itself.
@@ -616,6 +617,16 @@ impl Iocp {
                         Ok(())
                     } else {
                         Err(last_error())
+                    }
+                }
+                Io::SendFile { fd, file, len, .. } => {
+                    if TransmitFile(fd, file, len, 0, ov, ptr::null(), 0) != 0 {
+                        // The call has no place for the count: it is in
+                        // the OVERLAPPED.
+                        transferred = (*ov).InternalHigh as u32;
+                        Ok(())
+                    } else {
+                        Err(wsa_error())
                     }
                 }
                 _ => unreachable!("handled above"),

@@ -63,6 +63,7 @@ const IOV_MAX: usize = 1024;
 /// in one call anyway).
 const SENDFILE_MAX: u64 = 0x7fff_f000;
 /// Bytes `send_file` sends before it lets the worker's other tasks run.
+#[cfg(unix)]
 const SENDFILE_YIELD: u64 = 512 * 1024;
 
 pub(crate) fn os_err(res: i32) -> io::Error {
@@ -775,6 +776,75 @@ impl StreamSocket {
         Ok(())
     }
 
+    /// Sends `len` bytes of `file` from `offset` with `TransmitFile`. See
+    /// [`TcpStream::send_file`].
+    #[cfg(windows)]
+    pub(crate) async fn send_file(
+        &self,
+        file: &crate::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        use std::os::windows::io::{AsRawHandle, AsRawSocket};
+
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > i64::MAX as u64)
+        {
+            // No file reaches that far.
+            return Err(raise(
+                Code::FileTooShort,
+                format!(
+                    "send_file was asked for {len} bytes from offset {offset}, past any file's end"
+                ),
+                "pass an offset and a length within the file: offset + len must not exceed \
+                 File::len.",
+            ));
+        }
+        let fd = self.sock.as_raw_socket() as crate::sys::RawSock;
+        let (mut offset, mut left) = (offset, len);
+        while left > 0 {
+            // `TransmitFile` is asked only for bytes the file has, so that
+            // a file that is too short sends what it has and then says so,
+            // as on Unix.
+            let there = file.len()?.saturating_sub(offset);
+            let count = left.min(there).min(SENDFILE_MAX) as u32;
+            let sent = if count == 0 {
+                0
+            } else {
+                let io = Io::SendFile {
+                    fd,
+                    file: file.as_raw_handle(),
+                    len: count,
+                    offset,
+                };
+                // SAFETY: the operation has no pointers; the kernel keeps
+                // the file open for as long as it reads from it.
+                let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
+                if res < 0 {
+                    return Err(os_err(res));
+                }
+                res as u64
+            };
+            if sent == 0 {
+                return Err(raise(
+                    Code::FileTooShort,
+                    format!(
+                        "the file ended at byte {offset}, {left} bytes short of the {len} \
+                         send_file was asked to send"
+                    ),
+                    "take the length from the open file (File::len), and replace a file \
+                     that is being served by renaming a new one over it, not by \
+                     rewriting it; the peer has fewer bytes than announced, so close the \
+                     connection.",
+                ));
+            }
+            offset += sent;
+            left -= sent;
+        }
+        Ok(())
+    }
+
     /// Sets `O_NONBLOCK`, once. io_uring does not need it for its own
     /// operations, and stays correct with it (see [`Op`]).
     fn set_nonblocking(&self) -> io::Result<()> {
@@ -1366,11 +1436,18 @@ impl TcpStream {
     ///   peer has gone. Rust programs ignore `SIGPIPE` unless they change
     ///   that, and then the call fails with `BrokenPipe`.
     ///
+    /// On Windows the file goes out with `TransmitFile`, from the system's
+    /// file cache and through the worker's completion port: the worker does
+    /// not wait for the disk there, and neither note above applies. The
+    /// desktop editions of Windows run two such sends at a time and queue
+    /// the others; the server editions have no such limit.
+    ///
     /// Fails with [`FileTooShort`](crate::error::Code::FileTooShort) if the
     /// file ends before `offset + len`, after sending what it had.
     ///
     /// Not cancel safe: if the future is dropped, part of the file may have
-    /// been sent. After the first call, the socket is non-blocking.
+    /// been sent. After the first call, the socket is non-blocking (on
+    /// Unix).
     ///
     /// ```no_run
     /// # use giong::net::TcpStream;
@@ -1382,9 +1459,11 @@ impl TcpStream {
     /// stream.send_file(&file, 0, len).await
     /// # }
     /// ```
-    #[cfg(unix)]
     pub async fn send_file(&self, file: &crate::fs::File, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.send_file(file.as_raw_fd(), offset, len).await
+        #[cfg(unix)]
+        return self.inner.send_file(file.as_raw_fd(), offset, len).await;
+        #[cfg(windows)]
+        return self.inner.send_file(file, offset, len).await;
     }
 
     /// Shuts down the read half, the write half, or both.
