@@ -622,6 +622,7 @@ impl Client {
             config.idle_timeout,
             fresh,
             prior_knowledge,
+            config.http2 && route.origin.https,
         )
         .await;
         match taken {
