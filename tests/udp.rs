@@ -341,6 +341,108 @@ fn many_tasks_send_on_one_socket() {
 }
 
 #[test]
+fn many_tasks_receive_on_one_socket() {
+    // Each datagram wakes a waiting task of its own. Before 0.9 the tasks
+    // shared one wake-up slot on io_uring: only the last task to wait was
+    // woken, and the others never saw the datagrams queued for them.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        const TASKS: u32 = 8;
+        let receivers: Vec<_> = (0..TASKS)
+            .map(|_| {
+                let b = b.clone();
+                giong::spawn(async move {
+                    let got = timeout(Duration::from_secs(5), b.recv())
+                        .await
+                        .expect("a waiting task was never woken")
+                        .unwrap();
+                    u32::from_be_bytes(got[..].try_into().unwrap())
+                })
+            })
+            .collect();
+        // Let every task start waiting.
+        sleep(Duration::from_millis(20)).await;
+        for i in 0..TASKS {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        let sent = std::time::Instant::now();
+        let mut seen = vec![false; TASKS as usize];
+        for r in receivers {
+            let i = r.await.unwrap() as usize;
+            assert!(!std::mem::replace(&mut seen[i], true), "datagram {i} twice");
+        }
+        // A task that is not woken still gets its datagram when its timeout
+        // polls it at the deadline: check that nobody waited for that.
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "tasks were woken late: {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn a_receiver_that_gave_up_does_not_take_the_next_datagram() {
+    // A task stops waiting (its receive timed out); the next datagram must
+    // wake the task that is waiting now, not the one that left.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        let b1 = b.clone();
+        giong::spawn(async move {
+            assert!(timeout(Duration::from_millis(10), b1.recv()).await.is_err());
+            // Keep this task alive, so that a wake-up meant for the other
+            // one would land here.
+            sleep(Duration::from_secs(10)).await;
+        });
+        sleep(Duration::from_millis(30)).await;
+        let b2 = b.clone();
+        let waiting = giong::spawn(async move {
+            timeout(Duration::from_secs(5), b2.recv())
+                .await
+                .expect("the waiting task was not woken")
+                .unwrap()
+                .to_vec()
+        });
+        sleep(Duration::from_millis(10)).await;
+        let sent = std::time::Instant::now();
+        a.send_to(&b"next"[..], b_addr).await.0.unwrap();
+        assert_eq!(waiting.await.unwrap(), b"next");
+        let waited = sent.elapsed();
+        assert!(
+            waited < Duration::from_secs(2),
+            "the task was woken late: {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn a_task_that_only_sends_lets_the_others_run() {
+    // Sends of datagrams complete at once, so a task that does nothing else
+    // never waits; the runtime must still make it give way now and then.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (_b, b_addr) = socket();
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let r = ran.clone();
+        giong::spawn(async move { r.set(true) });
+        let mut first_seen = None;
+        for i in 0..5_000u32 {
+            a.send_to(&b"x"[..], b_addr).await.0.unwrap();
+            if ran.get() {
+                first_seen = Some(i);
+                break;
+            }
+        }
+        let i = first_seen.expect("the other task never ran during 5000 sends");
+        assert!(i < 1_000, "the other task first ran after {i} sends");
+    });
+}
+
+#[test]
 fn every_worker_can_bind_the_same_port() {
     // No other test binds to 127.0.0.2, and the port is one the kernel never
     // hands out for port 0: a socket of a test running at the same time,
@@ -701,6 +803,68 @@ fn a_cancelled_read_from_leaves_the_socket_usable() {
     });
 }
 
+/// A `read_from` given up on leaves a cancellation queued for the kernel. A
+/// datagram sent right after it, and answered at once, must reach the next
+/// `read_from`, not the receive being cancelled: a send made within the call
+/// must not overtake the cancellation (seen with Linux 6.0's io_uring, which
+/// runs completions before the next submission).
+#[test]
+fn a_reply_to_a_send_after_a_cancelled_read_from_is_not_lost() {
+    reply_after_cancelled_read_from(false);
+}
+
+/// The same with another task running, so that the send waits for the end
+/// of the turn and goes out with `sendmmsg(2)`.
+#[test]
+fn a_reply_to_a_batched_send_after_a_cancelled_read_from_is_not_lost() {
+    reply_after_cancelled_read_from(true);
+}
+
+fn reply_after_cancelled_read_from(busy: bool) {
+    let echo = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    // Echoes until it gets an empty datagram.
+    let peer = std::thread::spawn(move || {
+        let mut buf = [0u8; 64];
+        loop {
+            let (n, from) = echo.recv_from(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            echo.send_to(&buf[..n], from).unwrap();
+        }
+    });
+    giong::block_on(async {
+        let running = Rc::new(std::cell::Cell::new(true));
+        if busy {
+            let running = running.clone();
+            giong::spawn(async move {
+                while running.get() {
+                    giong::yield_now().await;
+                }
+            });
+        }
+        let (a, _) = socket();
+        for i in 0..200u32 {
+            let read = a.read_from(Vec::with_capacity(64));
+            assert!(timeout(Duration::from_micros(200), read).await.is_err());
+            a.send_to(i.to_be_bytes().to_vec(), echo_addr)
+                .await
+                .0
+                .unwrap();
+            let read = a.read_from(Vec::with_capacity(64));
+            let (res, buf) = timeout(Duration::from_secs(5), read)
+                .await
+                .unwrap_or_else(|_| panic!("the reply to datagram {i} was lost"));
+            assert_eq!(res.unwrap().0, 4);
+            assert_eq!(buf, i.to_be_bytes());
+        }
+        running.set(false);
+        a.send_to(Vec::new(), echo_addr).await.0.unwrap();
+    });
+    peer.join().unwrap();
+}
+
 #[test]
 fn a_new_socket_with_a_closed_sockets_number_is_left_alone() {
     // A receive that the runtime has queued but not yet handed to the kernel
@@ -988,5 +1152,150 @@ fn bind_and_connect_refuse_a_host_name() {
             "{err}"
         );
         s.connect("127.0.0.1:53").unwrap();
+    });
+}
+
+#[test]
+fn datagrams_sent_in_one_turn_each_get_their_own_result() {
+    // Tasks that send in the same turn of the loop go to the kernel in one
+    // batch; each still gets its own answer: the oversized datagram fails
+    // alone, the others arrive.
+    giong::block_on(async {
+        let a = Rc::new(socket().0);
+        let (b, b_addr) = socket();
+        let senders: Vec<_> = (0..8u32)
+            .map(|i| {
+                let a = a.clone();
+                giong::spawn(async move {
+                    let buf = if i == 3 {
+                        vec![0u8; 70_000]
+                    } else {
+                        i.to_be_bytes().to_vec()
+                    };
+                    let len = buf.len();
+                    (i, len, a.send_to(buf, b_addr).await.0)
+                })
+            })
+            .collect();
+        for s in senders {
+            let (i, len, res) = s.await.unwrap();
+            if i == 3 {
+                let e = res.expect_err("a 70 000-byte datagram cannot be sent");
+                assert_eq!(e.raw_os_error(), Some(libc::EMSGSIZE));
+            } else {
+                assert_eq!(res.unwrap(), len);
+            }
+        }
+        let mut seen = Vec::new();
+        for _ in 0..7 {
+            let got = timeout(Duration::from_secs(5), b.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            seen.push(u32::from_be_bytes(got[..].try_into().unwrap()));
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, [0, 1, 2, 4, 5, 6, 7]);
+    });
+}
+
+#[test]
+fn a_send_dropped_before_the_end_of_the_turn_is_not_sent() {
+    // The datagram waits in the worker's queue while another task is
+    // runnable; dropping the send takes it out of the queue.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let busy = giong::spawn(async {
+            for _ in 0..4 {
+                giong::yield_now().await;
+            }
+        });
+        {
+            let mut send = std::pin::pin!(a.send_to(b"dropped".to_vec(), b_addr));
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(send.as_mut(), cx).is_pending())
+            })
+            .await;
+            assert!(polled, "with another task runnable the send waits");
+        }
+        busy.await.unwrap();
+        a.send_to(b"kept".to_vec(), b_addr).await.0.unwrap();
+        let got = timeout(Duration::from_secs(5), b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got[..], b"kept");
+    });
+}
+
+#[test]
+fn one_task_sends_in_order_while_others_run() {
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        let stop = Rc::new(std::cell::Cell::new(false));
+        let spin = {
+            let stop = stop.clone();
+            giong::spawn(async move {
+                while !stop.get() {
+                    giong::yield_now().await;
+                }
+            })
+        };
+        for i in 0..200u32 {
+            a.send_to(i.to_be_bytes().to_vec(), b_addr).await.0.unwrap();
+        }
+        stop.set(true);
+        spin.await.unwrap();
+        for i in 0..200u32 {
+            let got = timeout(Duration::from_secs(5), b.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(u32::from_be_bytes(got[..].try_into().unwrap()), i);
+        }
+    });
+}
+
+#[test]
+fn a_busy_socket_that_goes_quiet_still_wakes_its_receiver() {
+    // On epoll a socket that has received many datagrams leaves the epoll
+    // set; it must come back when a task waits on it again.
+    giong::block_on(async {
+        let (a, _) = socket();
+        let (b, b_addr) = socket();
+        for round in 0..3u32 {
+            for i in 0..300u32 {
+                a.send_to((round * 1000 + i).to_be_bytes().to_vec(), b_addr)
+                    .await
+                    .0
+                    .unwrap();
+                if i % 50 == 49 {
+                    // Leave room in the socket's receive buffer.
+                    for _ in 0..50 {
+                        timeout(Duration::from_secs(5), b.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                }
+            }
+            // Quiet, then one more datagram from another task while the
+            // receiver is already waiting.
+            let late = giong::spawn({
+                async move {
+                    sleep(Duration::from_millis(30)).await;
+                    let (c, _) = socket();
+                    c.send_to(b"late".to_vec(), b_addr).await.0.unwrap();
+                }
+            });
+            let got = timeout(Duration::from_secs(5), b.recv())
+                .await
+                .expect("a quiet socket did not wake its receiver")
+                .unwrap();
+            assert_eq!(&got[..], b"late");
+            late.await.unwrap();
+        }
     });
 }

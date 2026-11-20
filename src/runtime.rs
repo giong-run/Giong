@@ -414,6 +414,10 @@ pub(crate) struct Worker {
     deferred: RefCell<Deferred>,
     pub(crate) tasks: RefCell<Slab<TaskSlot>>,
     pub(crate) queue: RefCell<VecDeque<usize>>,
+    /// Datagrams sent in this turn of the loop, for one `sendmmsg` at its end.
+    pub(crate) sends: RefCell<crate::net::SendQueue>,
+    /// `sends` may hold datagrams: read on every turn instead of borrowing it.
+    pub(crate) sends_waiting: Cell<bool>,
     pub(crate) timers: RefCell<Timers>,
     pub(crate) pool: Rc<BufPool>,
     pub(crate) next_task_uid: Cell<u64>,
@@ -498,6 +502,8 @@ impl Worker {
             deferred: RefCell::new(Deferred::default()),
             tasks: RefCell::new(Slab::new()),
             queue: RefCell::new(VecDeque::with_capacity(256)),
+            sends: RefCell::new(crate::net::SendQueue::new()),
+            sends_waiting: Cell::new(false),
             timers: RefCell::new(Timers::new()),
             pool,
             next_task_uid: Cell::new(1),
@@ -596,6 +602,30 @@ impl Worker {
         );
     }
 
+    /// Hands the datagrams queued in this turn to the kernel (see
+    /// [`crate::net::SendQueue`]) once no other task is runnable, or once
+    /// they have waited a whole turn.
+    #[inline(never)]
+    fn flush_sends(&self, tick: u32) {
+        let wakers = {
+            let mut q = self.sends.borrow_mut();
+            if !q.due(tick, self.queue.borrow().is_empty()) {
+                return;
+            }
+            self.sends_waiting.set(false);
+            // Behind what the ring holds, as with a send made at once.
+            let mut driver = self.driver.borrow_mut();
+            if driver.has_queued_submissions() {
+                driver.submit_queued();
+            }
+            drop(driver);
+            q.flush()
+        };
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
     fn wake_shutdown_waiters(&self) {
         let waiters = self.shutdown_waiters.borrow_mut().take_all();
         for waker in waiters {
@@ -623,6 +653,9 @@ impl Worker {
             }
             self.publish_load();
             self.run_tasks(&mut || done = poll_main());
+            if self.sends_waiting.get() {
+                self.flush_sends(tick);
+            }
             self.publish_load();
             if done || idle() {
                 break;
