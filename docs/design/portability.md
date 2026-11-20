@@ -222,7 +222,8 @@ plan or a limit of macOS itself):
 | `accept` close-on-exec | atomic (`accept4`) | set after `accept` | same window std has on macOS |
 | Peer-closed check in the HTTP client pool | `POLLRDHUP` | the receive poll only | small; a FIN already received is seen |
 | `TCP_USER_TIMEOUT` in DB clients | set | keepalive only | macOS has no such option |
-| Trust roots, DNS servers | files under `/etc` | `/etc/resolv.conf` only, no keychain | plan S3 |
+| Trust roots (`TlsConnector::with_system_roots`) | bundle files under `/etc` | the keychain's trust settings (`giong-tls/src/keychain.rs`): Apple's roots and the ones the administrator or user added, without the ones turned off; `/etc/ssl/cert.pem` if the keychain cannot be read | equivalent; settings for one host name or application are passed over |
+| DNS servers | `/etc/resolv.conf` | `/etc/resolv.conf`, which macOS writes from its network configuration (the primary resolver) | resolvers for some domains only (`/etc/resolver`, VPN domains) are not consulted |
 | Shutdown signals | handler + eventfd | handler + pipe | equivalent; `EVFILT_SIGNAL` is not used (below) |
 
 **Why not `EVFILT_SIGNAL`.** kqueue can report a signal, but it only
@@ -341,8 +342,9 @@ What fails, by cause:
   guard, `SO_NOSIGPIPE` on every socket path (done, section 4; the shared
   socket is one function in `src/net/share.rs`, where Windows can put an
   acceptor of its own).
-- S3: trust roots from the keychain, DNS servers from the system
-  configuration.
+- S3: trust roots from the keychain; DNS servers from the file macOS
+  writes from its configuration, checked against `scutil --dns` on the
+  runners (done, section 4).
 - S4: the rest of the suite's Linux assumptions, as the runners show them.
 - Before any of it lands: `v1.0.0` tagged, the full Linux gates, and the
   speed comparison above.

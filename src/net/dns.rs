@@ -67,6 +67,13 @@ impl Default for ResolverConfig {
 impl ResolverConfig {
     /// Reads `/etc/resolv.conf` and `/etc/hosts`. A missing file counts as
     /// empty.
+    ///
+    /// On macOS `/etc/resolv.conf` is written by the system from its network
+    /// configuration, and holds the servers and search domains of the
+    /// primary resolver (the first one `scutil --dns` lists), so this follows
+    /// the network the machine is on. Resolvers that macOS uses for some
+    /// domains only (files in `/etc/resolver`, a VPN's own domains) are not
+    /// in that file and are not consulted.
     pub fn system() -> io::Result<Self> {
         let resolv = read_optional("/etc/resolv.conf")?;
         let hosts = read_optional("/etc/hosts")?;
