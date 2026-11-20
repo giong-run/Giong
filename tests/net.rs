@@ -1004,9 +1004,21 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         });
         let c = TcpStream::connect(addr).await.unwrap();
         // Far more than the socket buffers hold: the send stays in the driver.
-        let big = vec![b'a'; 32 << 20];
-        let dropped = timeout(Duration::from_millis(5), c.write_all(big)).await;
-        assert!(dropped.is_err(), "32 MiB went out in 5 ms");
+        // Windows takes a send into the kernel whole, whatever its size,
+        // while the socket's buffer has room: there the first write fills
+        // the buffer and the one after it waits.
+        let mut dropped = false;
+        for _ in 0..4 {
+            let big = vec![b'a'; 32 << 20];
+            if timeout(Duration::from_millis(5), c.write_all(big))
+                .await
+                .is_err()
+            {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "32 MiB went out in 5 ms, four times over");
         let (res, _) = c.write_all(b"END".to_vec()).await;
         res.unwrap();
         c.shutdown(Shutdown::Write).unwrap();

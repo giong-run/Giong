@@ -65,6 +65,15 @@ pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
         .connect(&SocketAddr::from(([127, 0, 0, 1], 9)).into())
         .unwrap();
     let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    // Windows drops a datagram that a connected socket does not take
+    // without telling the sender, so there the port is given back: a
+    // closed port answers, and the short race with another bind is
+    // accepted.
+    #[cfg(windows)]
+    let socket = {
+        drop(socket);
+        Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap()
+    };
     (socket, addr)
 }
 
