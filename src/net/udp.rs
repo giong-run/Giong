@@ -224,6 +224,10 @@ impl UdpSocket {
     /// share a port between processes on purpose, create the sockets
     /// yourself and pass them to [`from_std`](Self::from_std).
     ///
+    /// On macOS every worker can bind the address too, and the port is
+    /// checked the same way, but the kernel gives all its datagrams to one
+    /// of the sockets: one worker receives them.
+    ///
     /// Port 0 asks the kernel for a port of the socket's own, which no other
     /// socket can share.
     ///
@@ -264,6 +268,11 @@ impl UdpSocket {
     }
 
     fn from_socket(sock: Socket) -> Self {
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),

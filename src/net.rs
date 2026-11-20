@@ -189,6 +189,12 @@ pub(crate) struct ListenSocket {
 
 impl ListenSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option, and the connections it accepts inherit it. socket2
+        // sets it on the sockets it creates; this covers a listener that
+        // came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
@@ -916,6 +922,13 @@ impl TcpListener {
     /// before the old one has stopped), create the sockets yourself with
     /// `SO_REUSEPORT` set and pass them to [`from_std`](Self::from_std).
     ///
+    /// On macOS the workers share one listening socket instead (each
+    /// listener is a duplicate of the first one bound to the address), and
+    /// take connections from its one queue as they come: whichever worker
+    /// accepts first gets the next connection. The socket is bound without
+    /// `SO_REUSEPORT`, so no other process can bind the address while a
+    /// listener lives.
+    ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
     /// `"localhost:8080"` is refused with `GIONG-E0100`, which says what to
@@ -1144,6 +1157,11 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> Self {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             inner: StreamSocket::new(sock),
         }
