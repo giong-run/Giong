@@ -141,7 +141,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `Response::json` says it sends bytes that are already JSON; the API freeze record
   (`docs/reviews/2026-11-api-freeze.md`) gains the items of the reviews it had left out.
 
-- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll. A UDP echo
+- **net**: UDP is faster than Tokio's on io_uring and level with it on epoll, on a cloud VM. A UDP echo
   server on one core (64-byte datagrams, veth, `bench/udp-echo.sh`, 5 rounds,
   `bench/results/udp-echo/`) answers 328,000 datagrams a second with 16 tasks on one socket
   on io_uring (259,000 before, Tokio 278,000) and 300,000 with one task (286,000 before,
@@ -151,6 +151,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `sendmsg(2)`. The epoll driver receives up to 16 datagrams with one `recvmmsg(2)`. An echo
   now costs one system call on either driver where Tokio makes two. Immediate sends count
   against the task's budget, so a task that only sends still gives way to the others.
+  On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark;
+  `bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`) the server
+  core is saturated near a million echoes a second and the runtimes are close: this change
+  is behind Tokio with io_uring and 16 tasks (856,000 against 870,000) and with epoll and one
+  task (874,000 against 882,000), level with epoll and 16 tasks (879,000), and ahead with
+  io_uring and one task (926,000 against 882,000).
 
 ### Deprecated
 
