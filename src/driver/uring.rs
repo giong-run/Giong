@@ -20,7 +20,7 @@
 //! sockets, provided buffers) is released by the driver itself.
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, RawFd};
@@ -130,13 +130,76 @@ struct Multi {
     ring: RingId,
     /// Completions not yet consumed.
     queue: VecDeque<Queued>,
+    /// The task waiting for a completion; with `shared`, the one that has
+    /// waited longest (the others wait in [`Uring::more_waiters`]).
     waker: Option<Waker>,
+    /// Several tasks may wait at once (a datagram socket). Otherwise the
+    /// latest poll's waker replaces the one before, as one reader is
+    /// expected and a stale waker must not take the reader's wake-up.
+    shared: bool,
     /// An SQE is in flight and may still produce completions.
     armed: bool,
     /// We asked the kernel to stop (backpressure); the terminal CQE is pending.
     pausing: bool,
     /// The owner is gone; release whatever still arrives.
     orphan: bool,
+}
+
+/// The tasks waiting on a shared multishot operation `key` after `m.waker`,
+/// oldest first; each is woken for a completion of its own. Kept apart from
+/// [`Multi`], which every stream has, so that operations stay small.
+type MoreWaiters = HashMap<usize, VecDeque<Waker>>;
+
+/// Takes the task that has waited longest on `m` (operation `key`).
+fn next_waiter(m: &mut Multi, more: &mut MoreWaiters, key: usize) -> Option<Waker> {
+    let next = m.waker.take();
+    if next.is_some() && m.shared {
+        m.waker = pop_more(more, key);
+    }
+    next
+}
+
+fn pop_more(more: &mut MoreWaiters, key: usize) -> Option<Waker> {
+    let queue = more.get_mut(&key)?;
+    let w = queue.pop_front();
+    if queue.is_empty() {
+        more.remove(&key);
+    }
+    w
+}
+
+/// Adds `waker`'s task to those waiting on shared `m`, unless it waits.
+fn wait_shared(m: &mut Multi, more: &mut MoreWaiters, key: usize, waker: &Waker) {
+    match &m.waker {
+        None => m.waker = Some(waker.clone()),
+        Some(w) if w.will_wake(waker) => {}
+        Some(_) => {
+            let queue = more.entry(key).or_default();
+            if !queue.iter().any(|w| w.will_wake(waker)) {
+                queue.push_back(waker.clone());
+            }
+        }
+    }
+}
+
+/// Stops waiting on shared `m` for `waker`'s task; `false` if it was not
+/// waiting.
+fn forget(m: &mut Multi, more: &mut MoreWaiters, key: usize, waker: &Waker) -> bool {
+    if m.waker.as_ref().is_some_and(|w| w.will_wake(waker)) {
+        m.waker = pop_more(more, key);
+        return true;
+    }
+    let Some(queue) = more.get_mut(&key) else {
+        return false;
+    };
+    let Some(i) = queue.iter().position(|w| w.will_wake(waker)) else {
+        return false;
+    };
+    queue.remove(i);
+    if queue.is_empty() {
+        more.remove(&key);
+    }
+    true
 }
 
 enum OpState {
@@ -149,6 +212,7 @@ pub(crate) struct Uring {
     /// Kernel bugs worked around while setting the ring up.
     workarounds: Vec<KernelWorkaround>,
     ops: Slab<OpState>,
+    more_waiters: MoreWaiters,
     /// SQEs pushed whose final CQE has not been seen yet.
     inflight: usize,
     /// Batched closes whose CQE has not been seen yet.
@@ -178,6 +242,9 @@ pub(crate) struct Uring {
     /// The smallest send that goes out without a copy, with
     /// [`IoUringFeature::ZeroCopySend`].
     zero_copy_min: Option<usize>,
+    /// The kernel takes a destination address with `IORING_OP_SEND`
+    /// (Linux 6.1), so datagrams to an address need no message header.
+    send_to: bool,
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
@@ -544,6 +611,17 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
         Io::SendMsg { fd, msg, flags, .. } => opcode::SendMsg::new(types::Fd(fd), msg)
             .flags(flags)
             .build(),
+        Io::SendTo {
+            fd,
+            buf,
+            len,
+            addr,
+            addr_len,
+        } => opcode::Send::new(types::Fd(fd), buf, len)
+            .dest_addr(addr)
+            .dest_addr_len(addr_len)
+            .flags(libc::MSG_NOSIGNAL)
+            .build(),
         Io::RecvMsg { fd, msg } => opcode::RecvMsg::new(types::Fd(fd), msg).build(),
         Io::ReadReady { fd, buf, len } => opcode::Read::new(types::Fd(fd), buf, len).build(),
         Io::Read {
@@ -894,13 +972,18 @@ impl Uring {
             features.push(IoUringFeature::ZeroCopySend);
         }
         let recv_limit = recv_backlog_limit(&pool);
+        // Linux 6.0 refuses a destination address on `IORING_OP_SEND` with
+        // `EINVAL`, which cannot be told from a bad address: go by version.
+        let send_to = kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 1));
         Ok(Self {
             workarounds,
             features,
             registered_ring,
             zero_copy_min,
+            send_to,
             ring,
             ops: Slab::new(),
+            more_waiters: HashMap::new(),
             inflight: 0,
             pending_closes: 0,
             pool,
@@ -998,6 +1081,7 @@ impl Uring {
             ring: RingId::Whole,
             queue: VecDeque::new(),
             waker: None,
+            shared: false,
             armed: false,
             pausing: false,
             orphan: false,
@@ -1027,6 +1111,7 @@ impl Uring {
 
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
         let stream_ring = self.stream_ring();
+        let shared = matches!(io, MultiIo::RecvMsg { .. });
         let (sqe, ring) = match io {
             MultiIo::Accept { fd } => (
                 opcode::AcceptMulti::new(types::Fd(fd))
@@ -1047,6 +1132,7 @@ impl Uring {
             Some(OpState::Multi(m)) if !m.armed => {
                 m.armed = true;
                 m.ring = ring;
+                m.shared = shared;
             }
             _ => panic!("giong: arming an invalid multishot operation"),
         }
@@ -1057,6 +1143,9 @@ impl Uring {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
             panic!("giong: polling an invalid multishot operation");
         };
+        if m.shared {
+            return self.poll_shared(key, waker);
+        }
         match m.queue.pop_front() {
             Some(Queued::Raw(res)) => return MultiPoll::Item(res),
             Some(Queued::Piece { bid, off, len, .. }) => {
@@ -1077,6 +1166,56 @@ impl Uring {
         MultiPoll::Pending
     }
 
+    /// [`poll_multi`](Self::poll_multi) for an operation several tasks wait
+    /// on (a datagram socket). Out of line, so that the path every stream
+    /// takes stays as small as it was.
+    #[inline(never)]
+    fn poll_shared(&mut self, key: usize, waker: &Waker) -> MultiPoll {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            panic!("giong: polling an invalid multishot operation");
+        };
+        let got = match m.queue.pop_front() {
+            Some(Queued::Raw(res)) => Some(MultiPoll::Item(res)),
+            Some(Queued::Piece { bid, off, len, .. }) => {
+                self.pooled_queued -= 1;
+                let pool = self.pool.clone();
+                Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len)))
+            }
+            Some(Queued::Heap(data)) => Some(MultiPoll::Data(RecvBuf::heap(data))),
+            None => None,
+        };
+        if let Some(got) = got {
+            // This task is served; it is no longer waiting. If more is
+            // queued, the next waiting task takes it.
+            forget(m, &mut self.more_waiters, key, waker);
+            if !m.queue.is_empty() {
+                if let Some(next) = next_waiter(m, &mut self.more_waiters, key) {
+                    next.wake();
+                }
+            }
+            return got;
+        }
+        if !m.armed {
+            return MultiPoll::NeedArm;
+        }
+        wait_shared(m, &mut self.more_waiters, key, waker);
+        MultiPoll::Pending
+    }
+
+    /// See [`Driver::leave_multi`](super::Driver::leave_multi).
+    pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {
+        let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
+            return;
+        };
+        // Still waiting: it was not woken, so it owes nothing. Woken, for a
+        // completion it will not take now: pass it on.
+        if !forget(m, &mut self.more_waiters, key, waker) && !m.queue.is_empty() {
+            if let Some(next) = next_waiter(m, &mut self.more_waiters, key) {
+                next.wake();
+            }
+        }
+    }
+
     /// Called when the owner of a multishot operation (listener, stream) goes away.
     pub(crate) fn drop_multi(&mut self, key: usize) {
         let Some(OpState::Multi(m)) = self.ops.get_mut(key) else {
@@ -1086,6 +1225,7 @@ impl Uring {
         let armed = m.armed;
         let queued = mem::take(&mut m.queue);
         m.waker = None;
+        self.more_waiters.remove(&key);
         m.orphan = true;
         for item in queued {
             if let Queued::Piece { .. } = item {
@@ -1192,15 +1332,24 @@ impl Uring {
         unsafe { libc::close(fd) };
     }
 
+    /// `true` if SQEs wait in the submission queue for the next
+    /// `io_uring_enter`: a system call made directly now would reach the
+    /// kernel before them (see [`Driver::try_send_to`](super::Driver::try_send_to)).
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        !self.ring.submission().is_empty()
+    }
+
     /// Hands every queued SQE to the kernel now. TSan builds call it before
-    /// each close(2).
+    /// each close(2), and the send queue before its `sendmmsg(2)` (see
+    /// `net::sendq`), for the reason given at
+    /// [`Driver::try_send_to`](super::Driver::try_send_to).
     ///
     /// Queued SQEs name descriptors by number, and the kernel looks the
     /// number up only when it takes the SQE. Once close(2) returns, another
     /// thread can get the same number for a new socket, and a receive still
     /// in the queue would take that socket's data. (A close through the ring
     /// comes after those SQEs in the same queue, so it needs no such step.)
-    #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
         let mut attempts = 0u32;
         while !self.ring.submission().is_empty() {
@@ -1219,6 +1368,11 @@ impl Uring {
                 "giong: unable to make progress submitting to io_uring"
             );
         }
+    }
+
+    /// See [`Driver::sends_to`](super::Driver::sends_to).
+    pub(crate) fn sends_to(&self) -> bool {
+        self.send_to
     }
 
     pub(crate) fn pool(&self) -> &Rc<BufPool> {
@@ -1476,7 +1630,8 @@ impl Uring {
                                     self.to_pause.push(key);
                                 }
                             }
-                            if let Some(waker) = m.waker.take() {
+                            // One waiting task per completion.
+                            if let Some(waker) = next_waiter(m, &mut self.more_waiters, key) {
                                 waker.wake();
                             }
                             false
