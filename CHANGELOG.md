@@ -156,6 +156,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong-tls**: a cancelled `TlsStream::recv` could end the stream's sending for good.
+  A receive with nothing to read first sends what the connection owes the peer (a TLS 1.3
+  server's session tickets after the handshake, the answer to a key update); on io_uring
+  that send stayed with the kernel across the poll, and a receive dropped then (a short
+  `timeout`, a `select`) left the record stream cut, so every later write failed with
+  `GIONG-E2008`. Such records now leave in one `send(2)` that does not wait: what the
+  socket takes is sent, the rest goes out first with the next send or receive, in order,
+  and no receive holds a send that dropping it could cut. With kernel TLS the answer to a
+  key update and alerts go the same way, and a key update the socket has no room for is
+  paid by the next send. `recv` is cancel safe without exception; its documentation said
+  otherwise. Found as a rare failure of `recv_is_cancel_safe` under ThreadSanitizer.
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open

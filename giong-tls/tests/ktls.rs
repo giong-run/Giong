@@ -10,6 +10,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{mpsc, Arc};
+use std::task::Poll;
 use std::time::Duration;
 
 use giong::error::Code;
@@ -1182,6 +1183,59 @@ fn kernel_recv_is_cancel_safe() {
         sleep(Duration::from_millis(50)).await;
         let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
+fn a_kernel_recv_dropped_as_it_answers_a_key_update_can_still_send() {
+    if !kernel_tls() || !kernel_key_updates() {
+        return;
+    }
+    let pki = pki();
+    let suite = suites::TLS13_AES_128_GCM_SHA256;
+    let acceptor = pki.acceptor(Some(suite), Ktls::Required);
+    let client = Arc::new(pki.client(Some(suite)));
+    let (tx, rx) = mpsc::channel();
+    // Every receive is dropped after one poll, the one that reads the
+    // peer's KeyUpdate and answers it included. That answer used to be a
+    // send the poll left with the kernel: dropping it ended the stream's
+    // sending (GIONG-E2008).
+    let serve = move |tls: TlsStream| {
+        let tx = tx.clone();
+        async move {
+            let mut got = Vec::new();
+            while got.len() < 2000 {
+                let mut recv = std::pin::pin!(tls.recv());
+                match std::future::poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx))).await {
+                    Poll::Ready(data) => {
+                        let data = data.unwrap();
+                        assert!(!data.is_empty(), "closed after {} bytes", got.len());
+                        got.extend_from_slice(&data);
+                    }
+                    Poll::Pending => sleep(Duration::from_millis(1)).await,
+                }
+            }
+            let (res, _) = tls.write_all(got).await;
+            let _ = tx.send(res);
+            let _ = tls.shutdown().await;
+        }
+    };
+    let updates = ktls_stats().key_updates;
+    with_server(acceptor, serve, move |addr| {
+        let mut c = blocking_client(addr, &client);
+        c.write_all(&[1; 1000]).unwrap();
+        c.conn.refresh_traffic_keys().unwrap();
+        c.write_all(&[2; 1000]).unwrap();
+        // The answer comes under the server's next key, which the client
+        // moves to only when it has read the server's KeyUpdate.
+        let mut back = [0; 2000];
+        c.read_exact(&mut back).unwrap();
+        assert_eq!(back[..1000], [1; 1000]);
+        assert_eq!(back[1000..], [2; 1000]);
+        let sent = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(sent.is_ok(), "{sent:?}");
+        // The peer's key, and ours in answer.
+        assert!(ktls_stats().key_updates >= updates + 2);
     });
 }
 

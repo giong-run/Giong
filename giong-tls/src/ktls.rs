@@ -527,6 +527,45 @@ fn record_type_cmsg(record_type: u8) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), space) }.to_vec()
 }
 
+/// Sends one whole record of the given type through the kernel without
+/// waiting: `Ok(true)` if the socket took it, `Ok(false)` if it has no room
+/// now (nothing was sent).
+fn send_record_now(fd: RawFd, record_type: u8, data: &[u8]) -> io::Result<bool> {
+    let mut control = record_type_cmsg(record_type);
+    let mut iov = libc::iovec {
+        iov_base: data.as_ptr().cast_mut().cast(),
+        iov_len: data.len(),
+    };
+    // SAFETY: all-zero is a valid `msghdr`.
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+    loop {
+        // SAFETY: `msg` points at `iov`, `data` and `control`, which live
+        // until the call returns, with their true lengths; the kernel only
+        // reads `data`.
+        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        if n >= 0 {
+            return if n as usize == data.len() {
+                Ok(true)
+            } else {
+                Err(unexpected(&format!(
+                    "the kernel sent {n} of the {} bytes of a TLS record",
+                    data.len()
+                )))
+            };
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => return Ok(false),
+            _ => return Err(err),
+        }
+    }
+}
+
 /// Reads the record the kernel holds back after a receive failed with `EIO`
 /// (a record that is not application data, which the kernel only returns to
 /// a `recvmsg` with room for its type).
@@ -1755,15 +1794,18 @@ impl TlsStream {
             };
             match control {
                 Control::Done => {}
-                Control::Warn(description) => self.send_alert(ALERT_WARNING, description).await,
+                // A receive may be dropped at any `.await`, and a send
+                // dropped half way would end the stream's sending for good,
+                // so what a receive sends, it sends without waiting.
+                Control::Warn(description) => self.send_alert_now(ALERT_WARNING, description),
                 Control::KeyUpdateOwed => {
-                    // Answer now, so the peer can move on. If the answer
-                    // cannot be sent (the peer may already have closed), the
-                    // stream can no longer send, and later sends say so; what
-                    // the peer sent before closing is still received.
-                    let sending = self.lock_send().await;
-                    let _ = self.pay_key_update().await;
-                    sending.done();
+                    // Answer now if the socket takes it, so the peer can
+                    // move on; otherwise the next send pays first (see
+                    // `before_kernel_send`). If the answer fails (the peer
+                    // may already have closed), the stream can no longer
+                    // send, and later sends say so; what the peer sent
+                    // before closing is still received.
+                    let _ = self.pay_key_update_now();
                 }
                 Control::Fail(e, alert) => {
                     let what = e
@@ -1772,7 +1814,7 @@ impl TlsStream {
                         .map_or_else(|| e.to_string(), |g| g.message().into_owned());
                     self.kernel_mut().recv_failed = Some(what);
                     if let Some(description) = alert {
-                        self.send_alert(ALERT_FATAL, description).await;
+                        self.send_alert_now(ALERT_FATAL, description);
                     }
                     return Err(e);
                 }
@@ -2094,6 +2136,30 @@ impl TlsStream {
                 return Err(kernel_error(e));
             }
         }
+        self.next_sending_key()
+    }
+
+    /// The `KeyUpdate` the peer asked for, sent without waiting, for a
+    /// receive: if no task is writing and the socket takes the record now.
+    /// Otherwise it stays owed, and the next send pays it before its data.
+    fn pay_key_update_now(&self) -> io::Result<()> {
+        let owed = self.kernel_mut().key_update_owed;
+        if !owed || self.sending.get() || self.cannot_send().is_some() {
+            return Ok(());
+        }
+        match send_record_now(self.tcp.as_raw_fd(), HANDSHAKE, &[KEY_UPDATE, 0, 0, 1, 0]) {
+            Ok(true) => self.next_sending_key(),
+            Ok(false) => Ok(()),
+            Err(e) => {
+                self.broken.set(true);
+                Err(kernel_error(e))
+            }
+        }
+    }
+
+    /// Switches the kernel to the next sending key, after a `KeyUpdate`
+    /// went out. On failure the stream cannot send any more.
+    fn next_sending_key(&self) -> io::Result<()> {
         let fd = self.tcp.as_raw_fd();
         let mut k = self.kernel_mut();
         let version = k.version;
@@ -2124,22 +2190,22 @@ impl TlsStream {
         }
     }
 
-    /// Sends one alert through the kernel. Best effort: the connection is
-    /// usually ending.
-    async fn send_alert(&self, level: u8, description: u8) {
-        let sending = self.lock_send().await;
+    /// Sends one alert through the kernel without waiting, for a receive.
+    /// Best effort: the connection is usually ending, and an alert the
+    /// socket has no room for, or that would land inside another task's
+    /// write, is not sent.
+    fn send_alert_now(&self, level: u8, description: u8) {
         if self.cannot_send().is_some() {
-            sending.done();
             return;
         }
-        let (res, _, _) = self
-            .tcp
-            .send_with_control(vec![level, description], record_type_cmsg(ALERT))
-            .await;
-        if res.is_err() || level == ALERT_FATAL {
+        let sent = if self.sending.get() {
+            Ok(false)
+        } else {
+            send_record_now(self.tcp.as_raw_fd(), ALERT, &[level, description])
+        };
+        if sent.is_err() || level == ALERT_FATAL {
             self.closed.set(Some(Code::TlsBroken));
         }
-        sending.done();
     }
 
     /// `write_all` once the kernel encrypts.
