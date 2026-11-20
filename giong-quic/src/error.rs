@@ -50,3 +50,28 @@ pub(crate) fn reset(code: u64) -> io::Error {
             .to_string(),
     )
 }
+
+/// The application error code of a stream the peer reset or stopped
+/// (`GIONG-E3604`); `None` for any other error.
+pub(crate) fn reset_code(error: &io::Error) -> Option<u64> {
+    let ours = error.get_ref()?.downcast_ref::<Error>()?;
+    if ours.code() != Code::QuicStreamReset {
+        return None;
+    }
+    // The message `reset` wrote ends with the code.
+    ours.message().rsplit(' ').next()?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_code_of_a_reset_reads_back() {
+        for code in [0, 0x10b, 0x10c, (1 << 62) - 1] {
+            assert_eq!(reset_code(&reset(code)), Some(code));
+        }
+        assert_eq!(reset_code(&connect("refused")), None);
+        assert_eq!(reset_code(&io::Error::other("code 7")), None);
+    }
+}

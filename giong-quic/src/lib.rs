@@ -205,6 +205,14 @@ impl Drop for Connection {
     }
 }
 
+/// The application error code the peer gave when it reset a stream or asked
+/// this side to stop sending on it, if `error` is that failure
+/// (`GIONG-E3604`, from [`RecvStream::read`] or [`SendStream::write_all`]);
+/// `None` for any other error.
+pub fn reset_code(error: &io::Error) -> Option<u64> {
+    error::reset_code(error)
+}
+
 /// The sending half of a stream. Dropping it finishes the stream.
 pub struct SendStream {
     sh: Rc<proto::Shared>,
