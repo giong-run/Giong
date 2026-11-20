@@ -1,8 +1,10 @@
 //! A TLS echo server on giong, driven by a blocking rustls client.
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{mpsc, Arc};
+use std::task::Poll;
 use std::time::Duration;
 
 use giong::net::TcpListener;
@@ -418,6 +420,38 @@ fn recv_is_cancel_safe() {
         client.read_exact(&mut got).unwrap();
         assert_eq!(got, expected);
     });
+}
+
+#[test]
+fn a_recv_dropped_at_its_first_poll_can_still_send() {
+    // After a TLS 1.3 handshake the server still owes its session tickets,
+    // and a receive with nothing to read sends them. Each receive here is
+    // dropped right after the poll that does so: on io_uring that poll used
+    // to leave the send with the kernel, dropping it cut the record stream,
+    // and every later write failed with GIONG-E2008.
+    async fn serve(tls: TlsStream) {
+        for _ in 0..3 {
+            let mut recv = std::pin::pin!(tls.recv());
+            let ready =
+                std::future::poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_ready())).await;
+            assert!(!ready, "the client sends nothing");
+        }
+        tls.write_all(&b"still here"[..]).await.0.unwrap();
+        tls.shutdown().await.unwrap();
+    }
+    for versions in [
+        &[&rustls::version::TLS13][..],
+        &[&rustls::version::TLS12][..],
+    ] {
+        let c = certs(versions);
+        let config = c.client.clone();
+        with_server(c.acceptor, serve, move |addr| {
+            let mut client = connect(addr, &config);
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"still here");
+        });
+    }
 }
 
 #[test]

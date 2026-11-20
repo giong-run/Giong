@@ -245,6 +245,22 @@ const WIRE_KEPT: usize = 16 * 1024;
 /// gathered, even if more pieces of the write follow.
 const SEND_AT: usize = 64 * 1024;
 
+#[cfg(test)]
+thread_local! {
+    /// How many bytes one [`TlsStream::flush_now`] may hand to the socket,
+    /// for tests of a socket that takes a record in pieces.
+    static FLUSH_ROOM: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// How many bytes one `flush_now` may hand to the socket: no limit outside
+/// tests.
+fn flush_room() -> usize {
+    #[cfg(test)]
+    return FLUSH_ROOM.with(Cell::get);
+    #[cfg(not(test))]
+    usize::MAX
+}
+
 /// `true` if `records`, whole TLS records as rustls writes them, hold one
 /// of application data (content type 23; under TLS 1.3 every encrypted
 /// record says so).
@@ -1205,6 +1221,10 @@ pub struct TlsStream {
     failed: Cell<Option<io::Error>>,
     /// Tasks waiting for `sending` to clear.
     waiters: RefCell<Vec<Waker>>,
+    /// Whole or cut records a receive began to send and the socket did not
+    /// take at once (see [`flush_now`](Self::flush_now)): the next bytes this
+    /// stream sends, ahead of anything rustls has queued since.
+    unsent: RefCell<Vec<u8>>,
 }
 
 /// Who encrypts and decrypts a [`TlsStream`].
@@ -1270,6 +1290,7 @@ impl TlsStream {
             closed: Cell::new(None),
             failed: Cell::new(None),
             waiters: RefCell::new(Vec::new()),
+            unsent: RefCell::new(Vec::new()),
         }
     }
 
@@ -1390,15 +1411,24 @@ impl TlsStream {
             && conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3))
     }
 
-    /// Takes the scratch buffer for outgoing records.
+    /// Takes the scratch buffer for outgoing records. It starts with what
+    /// a receive left unsent (see [`flush_now`](Self::flush_now)), which has
+    /// to go out before anything else. The caller holds the send lock.
     fn take_wire(&self) -> Vec<u8> {
-        mem::take(&mut *self.wire.borrow_mut())
+        let mut wire = mem::take(&mut *self.wire.borrow_mut());
+        wire.append(&mut self.unsent.borrow_mut());
+        wire
     }
 
     /// Keeps `wire` for the next write, unless a large write grew it: a
     /// connection that once sent a large response should not hold that much
     /// for the rest of its life.
     fn keep_wire(&self, mut wire: Vec<u8>) {
+        if !wire.is_empty() && !self.broken.get() {
+            // The write ended before its first send (a file that could not
+            // be read, say): what `take_wire` handed over is still owed.
+            self.unsent.borrow_mut().append(&mut wire);
+        }
         if wire.capacity() <= WIRE_KEPT {
             wire.clear();
             *self.wire.borrow_mut() = wire;
@@ -1419,7 +1449,7 @@ impl TlsStream {
     /// (see [`send_plain`](Self::send_plain)); this waits for it.
     async fn flush_tls(&self) -> io::Result<()> {
         loop {
-            if !self.conn().wants_write() {
+            if !self.wants_send() {
                 return Ok(());
             }
             if self.broken.get() {
@@ -1440,20 +1470,84 @@ impl TlsStream {
         }
     }
 
-    /// Moves every record rustls has queued into `wire` and sends them. The
-    /// caller holds the send lock.
+    /// Moves every record rustls has queued into `wire`, after what it
+    /// holds already, and sends them. The caller holds the send lock.
     async fn send_queued(&self, wire: &mut Vec<u8>) -> io::Result<()> {
         loop {
             {
                 let mut conn = self.conn();
-                if !conn.wants_write() {
-                    return Ok(());
-                }
                 while conn.wants_write() {
                     conn.write_tls(wire)?;
                 }
             }
+            if wire.is_empty() {
+                return Ok(());
+            }
             self.send_wire(wire).await?;
+        }
+    }
+
+    /// `true` if records wait to be sent: queued by rustls, or left unsent
+    /// by a receive.
+    fn wants_send(&self) -> bool {
+        self.conn().wants_write() || !self.unsent.borrow().is_empty()
+    }
+
+    /// Sends the records rustls has queued without waiting, for a receive on
+    /// an established stream: a receive may be dropped at any `.await`, and a
+    /// send dropped half way would cut a record in two and end the stream's
+    /// sending for good. One `send(2)` that does not block has no half way:
+    /// what the socket takes is sent, and what it does not take stays in
+    /// `unsent`, in order, for the next send or the next receive to go on
+    /// from. The peer waits for none of these records (key updates, session
+    /// tickets, an alert), so they may be late.
+    ///
+    /// Does nothing while a task is writing: it sends queued records with
+    /// its own data, and `unsent` is empty while it holds the lock.
+    fn flush_now(&self) -> io::Result<()> {
+        if self.broken.get() {
+            return Err(broken());
+        }
+        if self.sending.get() {
+            return Ok(());
+        }
+        let mut unsent = self.unsent.borrow_mut();
+        {
+            let mut conn = self.conn();
+            while conn.wants_write() {
+                conn.write_tls(&mut *unsent)?;
+            }
+        }
+        loop {
+            // All of it, or as much as a test lets the socket take.
+            let len = unsent.len().min(flush_room());
+            if len == 0 {
+                return Ok(());
+            }
+            // SAFETY: `unsent` is valid for `len` bytes for the call.
+            let n = unsafe {
+                libc::send(
+                    std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
+                    unsent.as_ptr().cast(),
+                    len,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if n >= 0 {
+                // What the socket did not take waits in `unsent`.
+                unsent.drain(..n as usize);
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            match e.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => {
+                    self.broken.set(true);
+                    unsent.clear();
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -1554,7 +1648,7 @@ impl TlsStream {
     async fn pump(&self) -> io::Result<()> {
         // Records held back for the next send (see `hold_output`) go out
         // now if the receive has to wait: the peer may be waiting for them.
-        let ready = if !self.broken.get() && self.conn().wants_write() {
+        let ready = if !self.broken.get() && self.wants_send() {
             poll_fn(|cx| Poll::Ready(self.tcp.poll_recv(cx))).await
         } else {
             Poll::Pending
@@ -1562,11 +1656,11 @@ impl TlsStream {
         let chunk = match ready {
             Poll::Ready(chunk) => chunk?,
             Poll::Pending => {
-                if !self.broken.get() && self.conn().wants_write() {
+                if !self.broken.get() && self.wants_send() {
                     // A failure marks the stream broken, for the next write
                     // to report; it is no reason to withhold what arrives
                     // (the peer may have sent its last data and gone).
-                    let _ = self.flush_tls().await;
+                    let _ = self.flush_for_recv().await;
                 }
                 // Cancelling here loses nothing: `recv` is cancel safe.
                 self.tcp.recv().await?
@@ -1640,8 +1734,21 @@ impl TlsStream {
         if self.broken.get() || (result.is_ok() && self.hold_output()) {
             return result;
         }
-        let flushed = self.flush_tls().await;
+        let flushed = self.flush_for_recv().await;
         result.and(flushed)
+    }
+
+    /// Sends queued records on behalf of a receive. During the handshake
+    /// the peer waits for them and the future is the handshake's own, so
+    /// they are sent in full. Afterwards the receive may be dropped at any
+    /// moment and must leave the stream able to send: see
+    /// [`flush_now`](Self::flush_now).
+    async fn flush_for_recv(&self) -> io::Result<()> {
+        if self.established.get() {
+            self.flush_now()
+        } else {
+            self.flush_tls().await
+        }
     }
 
     /// Receives decrypted data. An empty buffer means that the peer has closed
@@ -1654,9 +1761,10 @@ impl TlsStream {
     /// attack). Check [`received_close_notify`](Self::received_close_notify)
     /// before trusting such data to be complete.
     ///
-    /// Cancel safe: dropping the future loses no data. (If it is dropped at
-    /// the rare moment a TLS protocol message is being sent, sending fails
-    /// from then on instead of continuing on a broken stream.)
+    /// Cancel safe: dropping the future loses no data and leaves the stream
+    /// able to send. A TLS protocol message the receive owes the peer (a key
+    /// update, session tickets) is sent without waiting, and what the socket
+    /// does not take at once goes out with the next send or receive.
     ///
     /// One task may receive while others send. Only one task may receive at
     /// a time: like [`TcpStream::recv`], the stream wakes only the task that
@@ -1964,6 +2072,7 @@ impl std::fmt::Debug for TlsStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
 
     fn authority(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate().unwrap();
@@ -2256,6 +2365,60 @@ mod tests {
     #[test]
     fn mozillas_roots_are_compiled_in() {
         TlsConnector::with_webpki_roots();
+    }
+
+    #[test]
+    fn records_a_receive_could_not_send_whole_go_out_first_and_in_order() {
+        // The socket takes one byte per attempt, so the session tickets a
+        // TLS 1.3 server owes after its handshake leave in pieces, each sent
+        // by a receive that is then dropped. The write that follows has to
+        // send the rest of them before its own record; a byte lost, repeated
+        // or out of place fails the client's decryption.
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = key.cert.pem();
+        let acceptor =
+            TlsAcceptor::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+                .unwrap();
+        let connector = TlsConnector::with_root_pem(cert.as_bytes()).unwrap();
+        giong::block_on(async move {
+            let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = giong::spawn(async move {
+                let tcp = listener.accept().await.unwrap();
+                let tls = acceptor.accept(tcp).await.unwrap();
+                assert!(tls.conn().wants_write(), "tickets wait for the first send");
+                FLUSH_ROOM.set(1);
+                let mut left = None;
+                for _ in 0..5 {
+                    let mut recv = std::pin::pin!(tls.recv());
+                    let ready = poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_ready())).await;
+                    assert!(!ready);
+                    let unsent = tls.unsent.borrow().len();
+                    assert!(
+                        left.map_or(unsent > 0, |l| unsent + 1 == l),
+                        "{left:?} {unsent}"
+                    );
+                    left = Some(unsent);
+                }
+                FLUSH_ROOM.set(usize::MAX);
+                tls.write_all(&b"after the tickets"[..]).await.0.unwrap();
+                assert!(tls.unsent.borrow().is_empty());
+                tls.shutdown().await.unwrap();
+            });
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let tls = connector.connect("localhost", tcp).await.unwrap();
+            let mut got = Vec::new();
+            loop {
+                let data = tls.recv().await.unwrap();
+                if data.is_empty() {
+                    break;
+                }
+                got.extend_from_slice(&data);
+            }
+            assert_eq!(got, b"after the tickets");
+            assert!(tls.received_close_notify());
+            server.await.unwrap();
+        });
     }
 
     #[test]
