@@ -1053,7 +1053,7 @@ the noise of these runs; `bench/instructions.sh` counts the server's instruction
 request with callgrind instead, which repeats within 0.1%. CI holds the hot paths to
 their counts: `scripts/instr.py check` fails a change that makes any of 16 operations
 (spawning a task, a TCP round trip, an HTTP/1.1, HTTP/2 or TLS request, a database query)
-cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](bench/instr/README.md)).
+cost 1% more instructions, or an idle connection 1% more heap ([bench/instr](bench/instr/README.md)).
 
 ## Testing and safety
 

@@ -8,6 +8,8 @@
 # The median of the rounds; a measurement more than tolerance_pct away from
 # value, either way, fails `scripts/instr.py check`. Raw rounds:
 # bench/results/instr/raw.csv. Refresh: bench/instr/README.md.
+# The idle rows are the medians of the CI run that put 3fa75c3 on main (GitHub
+# runner, Linux 7.0.0-1017-azure, EPYC 9V74), not of the machine named above.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1405.4,1
 io_uring,spawn,allocations,1.000,1
@@ -43,15 +45,15 @@ io_uring,postgres-query,instructions,10224.5,1
 io_uring,postgres-query,allocations,16.000,1
 io_uring,mysql-query,instructions,14136.6,1
 io_uring,mysql-query,allocations,27.000,1
-io_uring,idle-http1,heap_bytes,1989.0,2
-io_uring,idle-http1,rss_bytes,2017.3,10
-io_uring,idle-http1,allocations,3.030,1
-io_uring,idle-h2,heap_bytes,4473.4,2
-io_uring,idle-h2,rss_bytes,4759.6,10
-io_uring,idle-h2,allocations,30.050,1
-io_uring,idle-https,heap_bytes,10981.2,2
-io_uring,idle-https,rss_bytes,11368.4,10
-io_uring,idle-https,allocations,216.160,1
+io_uring,idle-http1,heap_bytes,1979.9,1
+io_uring,idle-http1,rss_bytes,2009.1,10
+io_uring,idle-http1,allocations,3.020,1
+io_uring,idle-h2,heap_bytes,4473.4,1
+io_uring,idle-h2,rss_bytes,4827.1,10
+io_uring,idle-h2,allocations,30.040,1
+io_uring,idle-https,heap_bytes,10797.1,1
+io_uring,idle-https,rss_bytes,11173.9,10
+io_uring,idle-https,allocations,216.130,1
 epoll,spawn,instructions,1124.5,1
 epoll,spawn,allocations,1.000,1
 epoll,yield,instructions,360.7,1
@@ -86,12 +88,12 @@ epoll,postgres-query,instructions,10837.7,1
 epoll,postgres-query,allocations,16.000,1
 epoll,mysql-query,instructions,14750.7,1
 epoll,mysql-query,allocations,27.000,1
-epoll,idle-http1,heap_bytes,2162.2,2
-epoll,idle-http1,rss_bytes,2203.6,10
+epoll,idle-http1,heap_bytes,2158.1,1
+epoll,idle-http1,rss_bytes,2199.6,10
 epoll,idle-http1,allocations,4.030,1
-epoll,idle-h2,heap_bytes,4555.6,2
-epoll,idle-h2,rss_bytes,4775.9,10
+epoll,idle-h2,heap_bytes,4555.6,1
+epoll,idle-h2,rss_bytes,4843.5,10
 epoll,idle-h2,allocations,30.040,1
-epoll,idle-https,heap_bytes,11049.0,2
-epoll,idle-https,rss_bytes,11307.0,10
-epoll,idle-https,allocations,216.120,1
+epoll,idle-https,heap_bytes,10865.0,1
+epoll,idle-https,rss_bytes,11120.6,10
+epoll,idle-https,allocations,216.100,1
