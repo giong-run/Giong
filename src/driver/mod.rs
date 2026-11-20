@@ -453,6 +453,13 @@ impl Io {
         matches!(self, Io::OpenAt { .. })
     }
 
+    /// `true` for operations that run to the end once submitted, even when
+    /// their future is dropped: a close the caller gave up on must still
+    /// close, or the descriptor stays open with nobody owning it.
+    pub(crate) fn finishes_when_dropped(&self) -> bool {
+        matches!(self, Io::Close { .. })
+    }
+
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
@@ -706,11 +713,19 @@ impl Driver {
     /// The future of a single-shot operation was dropped before its result
     /// was collected. `data` are the resources the kernel may still use;
     /// `result_is_fd` says the result will be a descriptor nobody owns (see
-    /// [`Io::result_is_fd`]), which the driver then closes.
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
+    /// [`Io::result_is_fd`]), which the driver then closes. With `finish`
+    /// (see [`Io::finishes_when_dropped`]) the operation is not cancelled:
+    /// it runs to the end and its result is thrown away.
+    pub(crate) fn cancel_op(
+        &mut self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        result_is_fd: bool,
+        finish: bool,
+    ) {
         match self {
-            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd),
-            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd),
+            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd, finish),
+            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd, finish),
         }
     }
 

@@ -38,7 +38,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   outcome it does not know) and which limits wait and which refuse by default, which 1.x
   will not change. `docs/RELEASING.md` gives the checklist a 1.0 release candidate carries:
   the soaked commit, the release commit, what changed between them, the tests run again
-  and the basis for soaking again or not.
+  and the soak that change got, sized by what changed (none, 2 to 4 hours, or 72).
 - **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
@@ -194,18 +194,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
-- **giong**: `UnixStream::recv` could miss the end of the stream on Linux 6.18 with
-  io_uring, and wait until the peer closed the socket. When the last data arrived
-  together with the peer's `shutdown(Write)`, the kernel's multishot receive took the
-  data and went back to waiting without reporting the end (a bare ring without giong
-  does the same on 6.18.44 and 6.18.63, with more than 32 buffers of data waiting; 6.12.117
-  and TCP sockets do not). A reader that has taken everything received from a Unix socket
-  now asks the socket whether the peer has stopped sending, with one `poll` call, and
-  starts the receive again if it has. An echo over a Unix socket whose client writes,
-  shuts down and reads to the end stalled about once in 8,000 runs with four of them in
-  parallel; with the check, 480,000 runs had none. The epoll driver was not affected.
-  Sockets from `UnixListener::accept` also no longer try a zero-copy send first, like the
-  other Unix sockets.
+- A `File::close` whose future was dropped after it was first polled could leave the
+  descriptor open with nobody owning it: on the epoll driver when no blocking thread had
+  started the close yet, and on io_uring when the kernel had handed it to a worker thread
+  (network filesystems, FUSE). The close is no longer cancelled; it runs to the end and
+  only its result is lost.
 - **net**: tasks that share a `UdpSocket` and wait in `recv_from` at the same time are each
   woken for a datagram of their own. On io_uring they shared one wake-up slot: only the
   last task to wait was woken, the others saw their datagrams only when something else
@@ -261,6 +254,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   +0.4% now; ten streams +2.1% / +0.3%; a hundred +4.5% / +1.1%. Memory stays as above. The
   `instr` job sent one request at a time and missed it; its new `h2-streams` case sends ten
   at once on one connection, with a limit of 0.5%.
+- **giong**: `UnixStream::recv` could miss the end of the stream on Linux 6.18 with
+  io_uring, and wait until the peer closed the socket. When the last data arrived
+  together with the peer's `shutdown(Write)`, the kernel's multishot receive took the
+  data and went back to waiting without reporting the end (a bare ring without giong
+  does the same on 6.18.44 and 6.18.63, with more than 32 buffers of data waiting; 6.12.117
+  and TCP sockets do not). A reader that has taken everything received from a Unix socket
+  now asks the socket whether the peer has stopped sending, with one `poll` call, and
+  starts the receive again if it has. An echo over a Unix socket whose client writes,
+  shuts down and reads to the end stalled about once in 8,000 runs with four of them in
+  parallel; with the check, 480,000 runs had none. The epoll driver was not affected.
+  Sockets from `UnixListener::accept` also no longer try a zero-copy send first, like the
+  other Unix sockets.
 
 ## [0.8.0] - 2026-11-16
 
