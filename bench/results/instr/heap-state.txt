@@ -1,0 +1,83 @@
+Instructions per operation of the same binary started from five heap states
+(2026-11-20, main 0387cfd, rustc 1.97.0, valgrind 3.22.0, Linux 6.18, 2,000 operations
+after 500 of warm-up). The binary is copied to names of 1, 9, 24, 57 and 120 characters
+and run under callgrind by that name: the standard library copies the program's path to
+the heap at start, so each length leaves glibc's malloc in a different state. Columns:
+driver, case, the count for each length, spread (largest over smallest).
+
+Before: allocations served by glibc's malloc.
+
+io_uring  spawn              1709.4    1709.4    1709.4    1709.4    1709.4   0.00%
+epoll     spawn              1847.4    1847.4    1847.4    1847.4    1847.4   0.00%
+io_uring  yield               482.3     482.3     482.3     482.3     482.3   0.00%
+epoll     yield               551.2     551.2     551.2     551.2     551.2   0.00%
+io_uring  oneshot             386.2     386.2     386.2     386.2     386.2   0.00%
+epoll     oneshot             386.1     386.1     386.1     386.1     386.1   0.00%
+io_uring  channel            1759.4    1759.4    1759.4    1759.4    1759.4   0.00%
+epoll     channel            1897.4    1897.4    1897.4    1897.4    1897.4   0.00%
+io_uring  timeout              99.2      99.2      99.2      99.2      99.2   0.00%
+epoll     timeout              99.1      99.1      99.1      99.1      99.1   0.00%
+io_uring  tcp-echo           4913.6    4913.6    4913.6    4913.6    4913.6   0.00%
+epoll     tcp-echo           4308.4    4308.4    4308.4    4308.4    4308.4   0.00%
+io_uring  udp-echo           4137.4    4137.4    4137.4    4137.4    4137.4   0.00%
+epoll     udp-echo           4792.7    4792.7    4792.7    4792.7    4792.7   0.00%
+io_uring  file-read          1477.2    1477.2    1477.2    1477.2    1477.2   0.00%
+epoll     file-read          2944.6    2942.4    2936.7    2935.9    2935.8   0.30%
+io_uring  http1             11219.0   11215.9   11221.9   11219.0   11215.9   0.05%
+epoll     http1             10103.5   10097.5   10097.4   10103.5   10097.6   0.06%
+io_uring  http1-client      34038.8   34038.8   34044.6   34044.9   34038.7   0.02%
+epoll     http1-client      32753.0   32759.0   32758.9   32758.7   32752.9   0.02%
+io_uring  h2                49176.4   49352.4   49361.0   49401.9   49400.2   0.46%
+epoll     h2                47987.8   48042.6   48086.6   47994.0   48044.6   0.21%
+io_uring  h2-streams       459038.9  458968.0  458673.8  459569.5  458727.4   0.20%
+epoll     h2-streams       458209.4  458286.6  458200.3  458421.1  458792.6   0.13%
+io_uring  https             46652.2   46664.2   46672.9   46670.2   46670.4   0.04%
+epoll     https             45054.0   45064.1   45065.8   45065.9   45059.7   0.03%
+io_uring  web               15338.8   15366.9   15374.8   15364.0   15369.0   0.23%
+epoll     web               14218.5   14248.5   14248.5   14242.5   14242.6   0.21%
+io_uring  redis-get          9727.9    9733.9    9733.9    9727.9    9733.9   0.06%
+epoll     redis-get          9227.8    9227.8    9221.8    9227.8    9227.8   0.07%
+io_uring  postgres-query    13182.3   13182.3   13182.3   12855.3   13182.3   2.54%
+epoll     postgres-query    12654.9   12654.9   12340.7   12340.7   12654.9   2.55%
+io_uring  mysql-query       18811.6   18811.6   18811.6   18811.6   18770.0   0.22%
+epoll     mysql-query       18049.8   18049.8   18049.8   18049.8   17695.9   2.00%
+
+After: allocations of a run served by the size classes of bench/instr/src/alloc.rs.
+What is left (web 0.2%, http1 and redis-get 6 instructions) follows where the stack
+starts, which the length of the path also moves; scripts/instr.py runs every case by
+the same relative path with the same environment, so it does not vary in a check.
+
+io_uring  spawn              1411.4    1411.4    1411.4    1411.4    1411.4   0.00%
+epoll     spawn              1541.4    1541.4    1541.4    1541.4    1541.4   0.00%
+io_uring  yield               489.2     489.2     489.2     489.2     489.2   0.00%
+epoll     yield               554.2     554.2     554.2     554.2     554.2   0.00%
+io_uring  oneshot             280.1     280.1     280.1     280.1     280.1   0.00%
+epoll     oneshot             280.1     280.1     280.1     280.1     280.1   0.00%
+io_uring  channel            1732.4    1732.4    1732.4    1732.4    1732.4   0.00%
+epoll     channel            1862.4    1862.4    1862.4    1862.4    1862.4   0.00%
+io_uring  timeout             100.1     100.1     100.1     100.1     100.1   0.00%
+epoll     timeout             100.1     100.1     100.1     100.1     100.1   0.00%
+io_uring  tcp-echo           4882.5    4882.5    4882.5    4882.5    4882.5   0.00%
+epoll     tcp-echo           4320.4    4320.4    4320.4    4320.4    4320.4   0.00%
+io_uring  udp-echo           4119.4    4119.4    4119.4    4119.4    4119.4   0.00%
+epoll     udp-echo           4804.7    4804.7    4804.7    4804.7    4804.7   0.00%
+io_uring  file-read          1489.2    1489.2    1489.2    1489.2    1489.2   0.00%
+epoll     file-read          2637.3    2637.3    2637.2    2637.3    2637.3   0.00%
+io_uring  http1             11138.0   11144.0   11141.1   11138.0   11144.0   0.05%
+epoll     http1             10052.5   10052.4   10058.5   10052.6   10052.5   0.06%
+io_uring  http1-client      32395.5   32395.5   32389.7   32395.8   32395.5   0.02%
+epoll     http1-client      31201.8   31195.7   31201.7   31201.6   31201.6   0.02%
+io_uring  h2                45272.3   45282.4   45278.4   45280.0   45281.7   0.02%
+epoll     h2                43958.7   43953.1   43958.9   43952.4   43955.3   0.01%
+io_uring  h2-streams       377228.5  377100.5  377132.5  377057.4  377158.3   0.05%
+epoll     h2-streams       376478.9  376343.7  376455.2  376392.6  376357.4   0.04%
+io_uring  https             44607.5   44606.1   44607.1   44607.6   44600.0   0.02%
+epoll     https             43092.1   43092.1   43092.1   43086.0   43092.0   0.01%
+io_uring  web               15091.1   15112.0   15112.0   15118.0   15115.0   0.18%
+epoll     web               13996.6   14020.5   14020.5   14026.5   14026.5   0.21%
+io_uring  redis-get          9569.9    9563.9    9569.9    9563.9    9563.9   0.06%
+epoll     redis-get          9089.8    9083.8    9089.8    9089.7    9083.7   0.07%
+io_uring  postgres-query    11497.4   11497.4   11497.4   11497.4   11497.4   0.00%
+epoll     postgres-query    11032.7   11032.7   11032.7   11032.7   11032.7   0.00%
+io_uring  mysql-query       15432.2   15432.2   15432.2   15432.2   15432.2   0.00%
+epoll     mysql-query       14953.7   14953.7   14953.7   14953.7   14953.7   0.00%
