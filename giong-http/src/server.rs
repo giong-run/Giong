@@ -884,6 +884,11 @@ impl Server {
     /// later ones are refused with `H3_REQUEST_REJECTED`, which lets the
     /// client retry them elsewhere.
     ///
+    /// Clients find HTTP/3 through the `Alt-Svc` header field of responses
+    /// over TCP (RFC 7838): have the server that answers on TCP add it
+    /// with `Response::header("alt-svc", "h3=\":443\"; ma=86400")`, with
+    /// the UDP port this endpoint is bound to.
+    ///
     /// ```no_run
     /// # use giong_http::{Request, Response, Server};
     /// # fn tls() -> rustls::ServerConfig { unimplemented!() }

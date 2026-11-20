@@ -96,6 +96,7 @@ impl Handler for App {
             "/echo" => Response::new(200).body(req.body().to_vec()),
             "/big" => Response::new(200).body(pattern(3 << 20)),
             "/empty" => Response::new(204),
+            "/clear" => Response::text("cleared").header("alt-svc", "clear"),
             "/slow" => {
                 giong::time::sleep(Duration::from_millis(30)).await;
                 Response::text("slow")
@@ -723,4 +724,150 @@ fn a_client_that_is_dropped_closes_its_connections() {
         // H3_NO_ERROR (0x100 = 256).
         assert!(seen.borrow().contains("256"), "{}", seen.borrow());
     });
+}
+
+/// Finding HTTP/3 through `Alt-Svc`: the origin is an HTTPS server over
+/// TCP that says where its HTTP/3 is.
+#[cfg(feature = "tls")]
+mod alt_svc {
+    use super::*;
+    use giong_tls::{Certificates, TlsAcceptor, TlsConnector};
+
+    /// An HTTPS server over TCP whose responses carry `alt_svc(port)` as
+    /// their `Alt-Svc`, with `Server::serve_h3` behind `port`; and a client
+    /// that follows what the origin advertises.
+    fn origin(alt_svc: impl Fn(u16) -> String + 'static, h3: bool) -> (String, Client) {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let (pem, key_pem) = (cert.cert.pem(), cert.key_pair.serialize_pem());
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key.into())
+            .unwrap();
+        server_tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+        // HTTP/3 on a UDP port, or a UDP port where nothing answers.
+        let udp_port = if h3 {
+            let endpoint = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(server_tls).unwrap(),
+            )
+            .unwrap();
+            let port = endpoint.local_addr().unwrap().port();
+            drop(giong::spawn(async move {
+                Server::new().serve_h3(endpoint, App).await
+            }));
+            port
+        } else {
+            let silent = giong::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = silent.local_addr().unwrap().port();
+            std::mem::forget(silent);
+            port
+        };
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(pem.as_bytes(), key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let value = alt_svc(udp_port);
+        drop(giong::spawn(async move {
+            let handler = move |_: Request| {
+                let value = value.clone();
+                async move { Response::text("over TCP").header("alt-svc", value) }
+            };
+            Server::new().serve_tls(listener, acceptor, handler).await
+        }));
+        let client = Client::builder()
+            .tls(TlsConnector::with_root_pem(pem.as_bytes()).unwrap())
+            .http3(ClientConfig::new(client_tls).unwrap())
+            .connect_timeout(Duration::from_millis(400))
+            .build();
+        (format!("https://{addr}"), client)
+    }
+
+    #[test]
+    fn an_origin_that_advertises_http3_gets_its_next_requests_over_it() {
+        run(|| async {
+            let (url, client) = origin(|port| format!("h3=\":{port}\"; ma=60"), true);
+            // The first request has only TCP to go over.
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            assert_eq!(res.text().unwrap(), "over TCP");
+            for _ in 0..3 {
+                let res = client.get(&format!("{url}/")).send().await.unwrap();
+                assert_eq!(res.version(), Version::Http3);
+                assert_eq!(res.text().unwrap(), "hello over HTTP/3");
+                // The origin is the one the URL names, whatever the port
+                // HTTP/3 is on.
+                assert_eq!(res.header("x-host"), Some(&url["https://".len()..]));
+            }
+            // The origin takes it back: TCP again.
+            let res = client.get(&format!("{url}/clear")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http3);
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+        });
+    }
+
+    #[test]
+    fn an_alternative_that_does_not_answer_costs_one_short_wait() {
+        run(|| async {
+            let (url, client) = origin(|port| format!("h3=\":{port}\""), false);
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            // The request that tries the alternative waits for it, then
+            // goes over TCP.
+            let started = std::time::Instant::now();
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            let waited = started.elapsed();
+            assert!(
+                waited >= Duration::from_millis(300) && waited < Duration::from_secs(3),
+                "{waited:?}"
+            );
+            // Those after it do not try again, though the origin goes on
+            // advertising.
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                let res = client.get(&format!("{url}/")).send().await.unwrap();
+                assert_eq!(res.version(), Version::Http2);
+            }
+            assert!(started.elapsed() < Duration::from_millis(300));
+        });
+    }
+
+    #[test]
+    fn an_alternative_on_another_host_is_not_followed() {
+        run(|| async {
+            let (url, client) = origin(|port| format!("h3=\"127.0.0.1:{port}\""), true);
+            for _ in 0..3 {
+                let res = client.get(&format!("{url}/")).send().await.unwrap();
+                assert_eq!(res.version(), Version::Http2);
+            }
+        });
+    }
+
+    #[test]
+    fn prior_knowledge_does_not_wait_for_an_advertisement() {
+        run(|| async {
+            let (endpoint, url, client) = pair();
+            drop(giong::spawn(async move {
+                Server::new().serve_h3(endpoint, App).await
+            }));
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http3);
+        });
+    }
 }

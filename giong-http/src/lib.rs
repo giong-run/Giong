@@ -112,6 +112,8 @@ pub use server::{Handler, Server, Transport};
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing {
+    #[cfg(all(feature = "client", feature = "unstable-http3"))]
+    pub use crate::client::fuzzing::check_alt_svc;
     #[cfg(feature = "client")]
     pub use crate::client::fuzzing::{
         check_h2_client, check_inflate, check_response_body, check_response_head, check_url,

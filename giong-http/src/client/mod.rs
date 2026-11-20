@@ -43,7 +43,8 @@
 //!   dropped request resets its stream instead of closing the connection.
 //!   [`ClientBuilder::http2_prior_knowledge`] speaks it to `http` servers
 //!   known to accept it; [`Response::version`] says which was spoken.
-//! * HTTP/3 with the `unstable-http3` feature, to `https` servers known to
+//! * HTTP/3 with the `unstable-http3` feature, to `https` servers that
+//!   advertise it with `Alt-Svc` (`ClientBuilder::http3`) or are known to
 //!   speak it (`ClientBuilder::http3_prior_knowledge`): one QUIC
 //!   connection for each origin, a stream for each request, so a slow
 //!   response holds back no other. A request the server rejected
@@ -69,6 +70,8 @@
 //!
 //! Not there yet: streaming request bodies, cookies.
 
+#[cfg(feature = "unstable-http3")]
+mod alt_svc;
 mod conn;
 mod decode;
 mod error;
@@ -113,6 +116,21 @@ pub mod fuzzing {
     use super::head::{parse_head, Framing};
     use super::url::Url;
     use crate::parse::{find_head_end, is_token_str};
+
+    /// An `Alt-Svc` header field: read or ignored, and what is read is a
+    /// usable port for a bounded time.
+    #[cfg(feature = "unstable-http3")]
+    pub fn check_alt_svc(input: &[u8]) -> bool {
+        match super::alt_svc::parse(input) {
+            super::alt_svc::AltSvc::H3 { port, max_age } => {
+                assert!(port != 0);
+                assert!(!max_age.is_zero() && max_age <= std::time::Duration::from_secs(604_800));
+                true
+            }
+            super::alt_svc::AltSvc::Clear => true,
+            super::alt_svc::AltSvc::Nothing => false,
+        }
+    }
 
     /// A response head: parsed whole or refused, and what is accepted is
     /// consistent.
@@ -257,10 +275,33 @@ pub struct ClientBuilder {
     http3: Option<Http3>,
 }
 
-/// The QUIC settings HTTP/3 is spoken with.
+/// The QUIC settings HTTP/3 is spoken with, and to whom.
 #[cfg(feature = "unstable-http3")]
 #[derive(Clone)]
-struct Http3(giong_quic::ClientConfig);
+struct Http3 {
+    quic: giong_quic::ClientConfig,
+    /// To every `https` origin, without waiting for it to say it speaks
+    /// HTTP/3.
+    prior_knowledge: bool,
+}
+
+/// How long connecting to an alternative an origin advertised may take
+/// before the request goes over TCP instead.
+#[cfg(feature = "unstable-http3")]
+const ALTERNATIVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long an alternative that could not be reached is left alone.
+#[cfg(feature = "unstable-http3")]
+const ALTERNATIVE_BROKEN_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// HTTP/3 as an origin advertised it with `Alt-Svc`.
+#[cfg(feature = "unstable-http3")]
+struct Alternative {
+    port: u16,
+    until: Instant,
+    /// It could not be reached: not tried again before this.
+    broken_until: Option<Instant>,
+}
 
 #[cfg(feature = "unstable-http3")]
 impl fmt::Debug for Http3 {
@@ -376,6 +417,28 @@ impl ClientBuilder {
         self
     }
 
+    /// Speaks HTTP/3 to the `https` origins that say they do (off by
+    /// default). A response over TCP whose `Alt-Svc` header field names
+    /// `h3` on the origin's own host (`alt-svc: h3=":443"; ma=86400`) makes
+    /// the requests that follow, for as long as it says and a week at
+    /// most, go over QUIC to that UDP port; an alternative on another host
+    /// is not followed. If the alternative does not answer within 2 s (or
+    /// [`connect_timeout`](Self::connect_timeout), when that is shorter)
+    /// the request goes over TCP as before, and HTTP/3 is left alone for
+    /// that origin for five minutes. Not through a proxy.
+    ///
+    /// `quic` is as for
+    /// [`http3_prior_knowledge`](Self::http3_prior_knowledge), which this
+    /// replaces when both are called: the last one counts.
+    #[cfg(feature = "unstable-http3")]
+    pub fn http3(mut self, quic: giong_quic::ClientConfig) -> Self {
+        self.http3 = Some(Http3 {
+            quic,
+            prior_knowledge: false,
+        });
+        self
+    }
+
     /// Speaks HTTP/3 to `https` URLs from the first packet, without asking
     /// ("prior knowledge", off by default): for servers known to accept it,
     /// such as giong-http's own `Server::serve_h3`. Every request to an
@@ -390,7 +453,10 @@ impl ClientBuilder {
     /// requests; [`connect_timeout`](Self::connect_timeout) is.
     #[cfg(feature = "unstable-http3")]
     pub fn http3_prior_knowledge(mut self, quic: giong_quic::ClientConfig) -> Self {
-        self.http3 = Some(Http3(quic));
+        self.http3 = Some(Http3 {
+            quic,
+            prior_knowledge: true,
+        });
         self
     }
 
@@ -457,6 +523,8 @@ struct Shared {
 #[derive(Default)]
 struct H3Pool {
     origins: RefCell<HashMap<url::Origin, H3Slot>>,
+    /// What origins advertised with `Alt-Svc`.
+    alternatives: RefCell<HashMap<url::Origin, Alternative>>,
     v4: OnceCell<giong_quic::Endpoint>,
     v6: OnceCell<giong_quic::Endpoint>,
 }
@@ -824,10 +892,28 @@ impl Client {
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case("accept-encoding"));
         #[cfg(feature = "unstable-http3")]
-        if let (Some(quic), true, None) = (&config.http3, url.https, &route.proxy) {
-            return self
-                .execute_h3(&quic.0, method, url, headers, body, decompress, what)
-                .await;
+        if let (Some(http3), true, None) = (&config.http3, url.https, &route.proxy) {
+            let origin = url.origin();
+            let to = if http3.prior_knowledge {
+                Some((origin.port, config.connect_timeout))
+            } else {
+                // An alternative is used once it is known to answer:
+                // until then the request has TCP to go over.
+                let within = config.connect_timeout.min(ALTERNATIVE_TIMEOUT);
+                match self.h3_alternative(&origin) {
+                    Some(port) => self
+                        .h3_connection(&http3.quic, &origin, port, within)
+                        .await
+                        .ok()
+                        .map(|_| (port, within)),
+                    None => None,
+                }
+            };
+            if let Some(to) = to {
+                return self
+                    .execute_h3(http3, to, method, url, headers, body, decompress, what)
+                    .await;
+            }
         }
         let mut request = None;
         let mut fresh = false;
@@ -868,6 +954,10 @@ impl Client {
                         .await
                     {
                         Ok(answer) => {
+                            #[cfg(feature = "unstable-http3")]
+                            if route.proxy.is_none() {
+                                self.note_alt_svc(url, &answer.head, answer.body.head_bytes());
+                            }
                             return Ok(Pending::new(
                                 Some(lease),
                                 Body::H1(answer.body),
@@ -875,7 +965,7 @@ impl Client {
                                 url,
                                 what,
                                 decompress,
-                            ))
+                            ));
                         }
                         Err(Failure::NothingReceived(_)) if reused && is_idempotent(method) => {
                             drop(lease);
@@ -910,6 +1000,10 @@ impl Client {
             match stream.response().await {
                 Ok(()) => {
                     let head = h2_head(stream.head());
+                    #[cfg(feature = "unstable-http3")]
+                    if route.proxy.is_none() {
+                        self.note_alt_svc(url, &head, &stream.head().bytes);
+                    }
                     return Ok(Pending::new(
                         None,
                         Body::H2(stream),
@@ -950,7 +1044,8 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     async fn execute_h3(
         &self,
-        quic: &giong_quic::ClientConfig,
+        http3: &Http3,
+        (port, connect_timeout): (u16, Duration),
         method: &str,
         url: &Url,
         headers: &[(String, String)],
@@ -977,7 +1072,9 @@ impl Client {
         let mut refused = 0;
         let mut again = false;
         loop {
-            let (conn, reused) = self.h3_connection(quic, &origin).await?;
+            let (conn, reused) = self
+                .h3_connection(&http3.quic, &origin, port, connect_timeout)
+                .await?;
             let response = async {
                 let mut stream = conn.send(&req).await?;
                 stream.response().await?;
@@ -986,6 +1083,7 @@ impl Client {
             match response.await {
                 Ok(stream) => {
                     let head = h2_head(stream.head());
+                    self.note_alt_svc(url, &head, &stream.head().bytes);
                     return Ok(Pending::new(
                         None,
                         Body::H3(Box::new(stream)),
@@ -1029,6 +1127,8 @@ impl Client {
         &self,
         quic: &giong_quic::ClientConfig,
         origin: &url::Origin,
+        port: u16,
+        connect_timeout: Duration,
     ) -> Result<(h3::Connection, bool), Error> {
         let pool = &self.shared.h3;
         loop {
@@ -1053,7 +1153,18 @@ impl Client {
             };
             let opening = H3Opening { pool, origin, gate };
             // Boxed for the reason `checkout` boxes `Conn::open`.
-            let conn = Box::pin(self.h3_open(quic, origin)).await?;
+            let opened = Box::pin(self.h3_open(quic, origin, port, connect_timeout)).await;
+            let conn = match opened {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // An alternative that does not answer is left alone
+                    // for a while; the requests go over TCP meanwhile.
+                    if let Some(alternative) = pool.alternatives.borrow_mut().get_mut(origin) {
+                        alternative.broken_until = Some(Instant::now() + ALTERNATIVE_BROKEN_FOR);
+                    }
+                    return Err(e);
+                }
+            };
             pool.origins
                 .borrow_mut()
                 .insert(origin.clone(), H3Slot::Open(conn.clone()));
@@ -1069,6 +1180,8 @@ impl Client {
         &self,
         quic: &giong_quic::ClientConfig,
         origin: &url::Origin,
+        port: u16,
+        connect_timeout: Duration,
     ) -> Result<h3::Connection, Error> {
         let config = &self.shared.config;
         let pool = &self.shared.h3;
@@ -1077,20 +1190,19 @@ impl Client {
                 ErrorKind::Connect,
                 format!(
                     "cannot connect to {origin} over HTTP/3 (does the server speak HTTP/3 on \
-                     UDP port {}, and is UDP allowed on the way?)",
-                    origin.port
+                     UDP port {port}, and is UDP allowed on the way?)"
                 ),
                 e,
             )
         };
         let connect = async {
-            let addrs = giong::net::lookup_host((origin.host.as_str(), origin.port))
+            let addrs = giong::net::lookup_host((origin.host.as_str(), port))
                 .await
                 .map_err(failed)?;
             // Nothing answers a QUIC packet sent to an address that does
             // not listen, so each address gets its share of the time and
             // the next one is tried when it has passed.
-            let share = config.connect_timeout / addrs.len().max(1) as u32;
+            let share = connect_timeout / addrs.len().max(1) as u32;
             let mut last = None;
             for addr in addrs {
                 let (slot, any) = if addr.is_ipv4() {
@@ -1130,17 +1242,76 @@ impl Client {
                 io::Error::new(io::ErrorKind::NotFound, "the host name has no address")
             })))
         };
-        match giong::time::timeout(config.connect_timeout, connect).await {
+        match giong::time::timeout(connect_timeout, connect).await {
             Ok(result) => result,
             Err(_) => Err(Error::new(
                 ErrorKind::Timeout,
                 format!(
-                    "connecting to {origin} over HTTP/3 took longer than {:?}; check that the \
-                     server speaks HTTP/3 on UDP port {} and that UDP is allowed on the way, or \
-                     raise ClientBuilder::connect_timeout",
-                    config.connect_timeout, origin.port
+                    "connecting to {origin} over HTTP/3 took longer than {connect_timeout:?}; \
+                     check that the server speaks HTTP/3 on UDP port {port} and that UDP is \
+                     allowed on the way, or raise ClientBuilder::connect_timeout"
                 ),
             )),
+        }
+    }
+
+    /// The UDP port `origin` advertised HTTP/3 on, while that holds and the
+    /// alternative is not known to be out of reach.
+    #[cfg(feature = "unstable-http3")]
+    fn h3_alternative(&self, origin: &url::Origin) -> Option<u16> {
+        let mut alternatives = self.shared.h3.alternatives.borrow_mut();
+        let alternative = alternatives.get(origin)?;
+        let now = Instant::now();
+        if alternative.until <= now {
+            alternatives.remove(origin);
+            return None;
+        }
+        if alternative.broken_until.is_some_and(|until| now < until) {
+            return None;
+        }
+        Some(alternative.port)
+    }
+
+    /// Reads what a response says about its origin's HTTP/3 (`Alt-Svc`),
+    /// for a client that follows it.
+    #[cfg(feature = "unstable-http3")]
+    fn note_alt_svc(&self, url: &Url, head: &Head, bytes: &[u8]) {
+        let shared = &self.shared;
+        if !shared
+            .config
+            .http3
+            .as_ref()
+            .is_some_and(|http3| !http3.prior_knowledge && url.https)
+        {
+            return;
+        }
+        let Some(value) = header_in(head, bytes, "alt-svc") else {
+            return;
+        };
+        let mut alternatives = shared.h3.alternatives.borrow_mut();
+        match alt_svc::parse(value) {
+            alt_svc::AltSvc::Nothing => {}
+            alt_svc::AltSvc::Clear => {
+                alternatives.remove(&url.origin());
+            }
+            alt_svc::AltSvc::H3 { port, max_age } => {
+                let until = Instant::now() + max_age;
+                match alternatives.get_mut(&url.origin()) {
+                    // Said again: it holds for longer, and what is known
+                    // of its reach stays.
+                    Some(known) if known.port == port => known.until = until,
+                    _ => {
+                        alternatives.insert(
+                            url.origin(),
+                            Alternative {
+                                port,
+                                until,
+                                broken_until: None,
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 
