@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-11-20
+
 ### Security
 
 - **giong-http**: the server refuses new connections while the process is close to running
@@ -75,13 +77,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong**: `sync::mpsc::unbounded()`, the new name of `sync::mpsc::channel()`. Tokio's
   `mpsc::channel(n)` is bounded, so code ported from Tokio, or written from memory of it,
   took giong's `channel()` for a bounded channel; `bounded(n)` is that one here. Its halves
-  are now `UnboundedSender` and `UnboundedReceiver`, as in Tokio, so that in 1.0.0 the short
-  names `Sender` and `Receiver` can go to the bounded channel, whose memory has a limit.
+  are now `UnboundedSender` and `UnboundedReceiver`, as in Tokio, and the short names
+  `Sender` and `Receiver` go to the bounded channel, whose memory has a limit (see
+  *Removed*).
 - **giong-postgres**: `Config::database`, the name giong-mysql and giong-redis use. The URL
   parameter is still `dbname`, as libpq spells it.
 
 ### Changed
 
+- **Breaking:** **giong-mcp**: `FromEnv` is `#[non_exhaustive]`, like every other enum that
+  is not complete by nature, so a `match` on it needs a `_` arm. `FromEnv::server()` and
+  `FromEnv::error()` are unchanged.
 - **giong-tls** (breaking): rustls' types are out of the stable API, so that a new rustls
   version, which giong-tls will take up during 1.x, breaks nothing. The rustls
   configurations that `TlsAcceptor::new` and `TlsConnector::new` took go to the new
@@ -226,18 +232,39 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   8. A datagram received with `recv_from` can now carry up to 16 KiB − 44 bytes before it
   is cut off.
 
-### Deprecated
+### Removed
 
-- **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and `TlsConnector::with_roots`, which
-  take rustls' types; they go in 1.0.0. Use `from_pem`, `with_root_pem` or
-  `with_root_pem_any_name`, or `from_rustls` with the `unstable-rustls` feature.
+The names the API review replaced go outright, without deprecated aliases: nothing runs
+giong in production yet, and after 1.0.0 a name can only be deprecated, never removed.
 
-- **giong-postgres**, **giong-mysql**: `Error::code()`, renamed `server_code()`, and
-  giong-postgres's `Config::dbname`, renamed `database`. Both still work, with a warning
-  that names the new method, and go in 1.0.0-rc.1.
-- **giong**: `sync::mpsc::channel()`, renamed `unbounded()`, and `sync::mpsc::Sender` and
-  `Receiver`, renamed `UnboundedSender` and `UnboundedReceiver`; they go in 1.0.0-rc.1 too, which
-  gives the names `Sender` and `Receiver` to `BoundedSender` and `BoundedReceiver`.
+- **Breaking:** **giong**: `sync::mpsc::channel()`; use `sync::mpsc::unbounded()`.
+  `sync::mpsc::Sender` and `Receiver` no longer name the unbounded channel's halves, which
+  are `UnboundedSender` and `UnboundedReceiver`: they are now the halves of the bounded
+  channel, as in Tokio, and `BoundedSender` and `BoundedReceiver` are removed. To migrate
+  from 0.8, rename in this order: `channel()` to `unbounded()`, `Sender` and `Receiver` to
+  `UnboundedSender` and `UnboundedReceiver`, then `BoundedSender` and `BoundedReceiver` to
+  `Sender` and `Receiver`. Code that skips a step does not compile: the two kinds of
+  halves have different methods (`send` waits on the bounded one).
+- **Breaking:** **giong-postgres**, **giong-mysql**: `Error::code()`; use
+  `Error::server_code()`, which returns the same value.
+- **Breaking:** **giong-postgres**: `Config::dbname`; use `Config::database`. The URL
+  parameter is still `dbname`.
+- **Breaking:** **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and
+  `TlsConnector::with_roots`, which took rustls' types. Use
+  `TlsAcceptor::with_certificates`, and `TlsConnector::with_system_roots`, `with_root_pem`
+  or `with_root_pem_any_name`; for a rustls configuration of your own, `from_rustls` with
+  the `unstable-rustls` feature, which is outside the semver promise.
+
+Three shortcuts that did what another function already does go as well, so that each task
+has one spelling:
+
+- **Breaking:** **giong-tls**: `TlsAcceptor::from_pem(cert, key)`; write
+  `TlsAcceptor::with_certificates(&Certificates::from_pem(cert, key)?)`. The acceptor is
+  the same (same cipher suite order, no ALPN), and the `Certificates` set is what a
+  service needs anyway to replace a renewed certificate while it runs.
+- **Breaking:** **giong-redis**: `Cmd::new(name)`; use `cmd(name)`.
+- **Breaking:** **giong**: `observe::register_rc(&rc)`; use `observe::register` with
+  `Rc::downgrade(&rc)` as a `Weak<dyn Source>`.
 
 ### Fixed
 
@@ -2412,7 +2439,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...HEAD
+[1.0.0-rc.1]: https://github.com/giong-run/Giong/compare/v0.8.0...v1.0.0-rc.1
 [0.8.0]: https://github.com/giong-run/Giong/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/giong-run/Giong/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/giong-run/Giong/compare/v0.5.0...v0.6.0

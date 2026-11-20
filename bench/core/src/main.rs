@@ -249,8 +249,6 @@ mod giong_rt {
         async move { h.await.unwrap() }
     }
     use giong::yield_now;
-    // `channel` is `unbounded` from 0.9.0 on; the old name works on both.
-    #[allow(deprecated)]
     fn unbounded() -> (mpsc::UnboundedSender<u64>, mpsc::UnboundedReceiver<u64>) {
         mpsc::unbounded()
     }
@@ -260,13 +258,13 @@ mod giong_rt {
     async fn recv(rx: &mut mpsc::UnboundedReceiver<u64>) -> Option<u64> {
         rx.recv().await
     }
-    fn bounded(n: usize) -> (mpsc::BoundedSender<u64>, mpsc::BoundedReceiver<u64>) {
+    fn bounded(n: usize) -> (mpsc::Sender<u64>, mpsc::Receiver<u64>) {
         mpsc::bounded(n)
     }
-    async fn bsend(tx: &mpsc::BoundedSender<u64>, v: u64) {
+    async fn bsend(tx: &mpsc::Sender<u64>, v: u64) {
         tx.send(v).await.ok().unwrap();
     }
-    async fn brecv(rx: &mut mpsc::BoundedReceiver<u64>) -> Option<u64> {
+    async fn brecv(rx: &mut mpsc::Receiver<u64>) -> Option<u64> {
         rx.recv().await
     }
     fn oneshot() -> (os::Sender<u64>, os::Receiver<u64>) {

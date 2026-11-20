@@ -10,7 +10,7 @@ use giong::net::TcpListener;
 use giong_http::client::Client;
 use giong_http::{Request, Response, Server};
 use giong_sim::Faults;
-use giong_tls::{TlsAcceptor, TlsConnector};
+use giong_tls::{Certificates, TlsAcceptor, TlsConnector};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
@@ -69,7 +69,10 @@ fn workload(mode: Mode, jumps: bool) -> (usize, usize) {
                 giong::spawn(async move { server.serve(listener, echo).await });
             }
             Mode::Tls | Mode::H2 => {
-                let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+                let acceptor = TlsAcceptor::with_certificates(
+                    &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+                )
+                .unwrap();
                 giong::spawn(async move { server.serve_tls(listener, acceptor, echo).await });
             }
         }

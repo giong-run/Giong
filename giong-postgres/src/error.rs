@@ -226,16 +226,6 @@ impl Error {
         }
     }
 
-    /// The SQLSTATE code: the old name of [`server_code`](Self::server_code).
-    #[deprecated(
-        since = "0.9.0",
-        note = "renamed server_code(), as in giong-redis: code() named a different thing in each \
-                giong crate; it goes in 1.0.0"
-    )]
-    pub fn code(&self) -> Option<&str> {
-        self.server_code()
-    }
-
     /// Whether trying again may succeed: the connection could not be
     /// opened or broke, no pooled connection became free in time, or the
     /// server reported a serialization failure (`40001`), a deadlock
@@ -559,13 +549,6 @@ mod tests {
             assert!(!Error::new(kind, "x").is_transient(), "{kind:?}");
         }
         assert!(!Error::with_sqlstate("25P02", "rolled back").is_transient());
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn the_old_name_of_server_code_still_answers() {
-        let e = Error::with_sqlstate("25P02", "rolled back");
-        assert_eq!(e.code(), e.server_code());
     }
 
     #[test]

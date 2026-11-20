@@ -119,9 +119,10 @@ bounded but one; every error code has its page; nothing in the 1.x plans needs a
 (`DriverKind`, `Version` and `Body` are `#[non_exhaustive]`, `Transport`'s methods have
 defaults).
 
-A rename is made by adding the new name and deprecating the old one in the 0.9 line, so
-code written against 0.8 keeps compiling and the warning names the new method; the
-release pull request of 1.0.0-rc.1 removes every deprecated item.
+A rename was made by adding the new name and deprecating the old one on `main`; the
+release pull request of 1.0.0-rc.1 then removed every deprecated item outright, since no
+release had shipped them deprecated and nothing ran giong in production. The table gives
+the decisions as taken at the time; `CHANGELOG.md` (1.0.0-rc.1, *Removed*) lists the result.
 
 | Item | Decision |
 |---|---|
@@ -131,7 +132,7 @@ release pull request of 1.0.0-rc.1 removes every deprecated item.
 | giong-http's client `RequestBuilder::header` took `&str` for the value, the server's `Response::header` takes `impl AsRef<str>` | **Changed** to `impl AsRef<str>`; a call passing `&str` or `&String` compiles as before (`cargo-semver-checks` reports no break), one that relied on `&str` to infer a type (`.as_ref()`, `.into()`) has to name it. |
 | giong-web's middleware order is the reverse of axum's, which code ported from axum gets wrong silently | **Kept** (first added is outermost reads in order), and **documented** on `Router::layer` and in the README. |
 | giong's `sync::mpsc::channel()` is unbounded under the name Tokio gives its bounded channel, `channel(n)`, so code ported from Tokio or written from memory of it reaches for the wrong one | **Changed**: `unbounded()` added and `channel()` deprecated, in a pull request held until the 72-hour soak ends, because it is in the core crate. |
-| The unbounded channel had the short names `mpsc::Sender` and `Receiver`, the bounded one `BoundedSender` and `BoundedReceiver`: the reverse of Tokio, and the short name went to the channel whose memory has no limit | **Changed**, in the same pull request: the unbounded halves are `UnboundedSender` and `UnboundedReceiver`, and `Sender` and `Receiver` are deprecated aliases of them. 1.0.0-rc.1 removes the aliases and names the bounded halves `Sender` and `Receiver`, keeping `BoundedSender` and `BoundedReceiver` as deprecated aliases through 1.x, so code written against 0.9 without warnings still compiles. |
+| The unbounded channel had the short names `mpsc::Sender` and `Receiver`, the bounded one `BoundedSender` and `BoundedReceiver`: the reverse of Tokio, and the short name went to the channel whose memory has no limit | **Changed**, in the same pull request: the unbounded halves are `UnboundedSender` and `UnboundedReceiver`, and `Sender` and `Receiver` are deprecated aliases of them. 1.0.0-rc.1 removed the aliases and named the bounded halves `Sender` and `Receiver`; `BoundedSender` and `BoundedReceiver` were removed too, not kept as aliases. |
 
 ## Still open
 

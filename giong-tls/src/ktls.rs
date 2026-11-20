@@ -1146,7 +1146,7 @@ pub(crate) enum Outcome {
 /// The server or client connection, before the handshake.
 pub(crate) enum Start {
     /// The configuration, and the one for clients that list ChaCha20
-    /// first if it differs (see `TlsAcceptor::from_pem`).
+    /// first if it differs (see `TlsAcceptor::with_certificates`).
     Server(Arc<ServerConfig>, Option<Arc<ServerConfig>>),
     Client(Arc<ClientConfig>, ServerName<'static>),
 }

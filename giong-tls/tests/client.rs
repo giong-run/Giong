@@ -15,7 +15,7 @@ use giong_tls::rustls::pki_types::pem::PemObject;
 use giong_tls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use giong_tls::rustls::server::WebPkiClientVerifier;
 use giong_tls::rustls::{self, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
-use giong_tls::{TlsAcceptor, TlsConnector, TlsStream};
+use giong_tls::{Certificates, TlsAcceptor, TlsConnector, TlsStream};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose,
@@ -229,8 +229,10 @@ fn talks_to_a_blocking_rustls_server() {
 #[test]
 fn a_certificate_for_another_name_is_refused() {
     let pki = pki();
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -245,8 +247,10 @@ fn a_certificate_for_another_name_is_refused() {
 fn a_certificate_from_an_unknown_authority_is_refused() {
     let pki = pki();
     let stranger = pki_named("some other CA");
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(stranger.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -271,7 +275,10 @@ fn a_self_signed_certificate_marked_as_an_authority_is_refused_with_the_reason()
     let leaf = params.self_signed(&key).unwrap().pem();
     let key = key.serialize_pem();
     giong::block_on(async move {
-        let acceptor = TlsAcceptor::from_pem(authority.as_bytes(), key.as_bytes()).unwrap();
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(authority.as_bytes(), key.as_bytes()).unwrap(),
+        )
+        .unwrap();
         let connector = TlsConnector::with_root_pem(authority.as_bytes()).unwrap();
         let addr = serve(acceptor, echo);
         let err = connect(&connector, addr, "localhost").await.unwrap_err();
@@ -283,7 +290,10 @@ fn a_self_signed_certificate_marked_as_an_authority_is_refused_with_the_reason()
             "{err}"
         );
 
-        let acceptor = TlsAcceptor::from_pem(leaf.as_bytes(), key.as_bytes()).unwrap();
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(leaf.as_bytes(), key.as_bytes()).unwrap(),
+        )
+        .unwrap();
         let connector = TlsConnector::with_root_pem(leaf.as_bytes()).unwrap();
         let addr = serve(acceptor, echo);
         let tls = connect(&connector, addr, "localhost").await.unwrap();
@@ -295,8 +305,10 @@ fn a_self_signed_certificate_marked_as_an_authority_is_refused_with_the_reason()
 #[test]
 fn an_ip_address_can_be_the_server_name() {
     let pki = pki();
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -313,8 +325,10 @@ fn an_ip_address_can_be_the_server_name() {
 #[test]
 fn a_server_name_that_is_not_a_name_is_refused_before_the_handshake() {
     let pki = pki();
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -330,9 +344,11 @@ fn a_server_name_that_is_not_a_name_is_refused_before_the_handshake() {
 fn alpn_settles_on_a_protocol_both_sides_speak() {
     let pki = pki();
     // The server offers http/1.1 only.
-    let acceptor = TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes())
-        .unwrap()
-        .alpn(&[b"http/1.1"]);
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap()
+    .alpn(&[b"http/1.1"]);
     let plain = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     let alpn = plain.clone().alpn(&[b"h2", b"http/1.1"]);
     giong::block_on(async move {
@@ -423,8 +439,10 @@ fn a_client_certificate_must_match_its_key() {
 #[test]
 fn reconnecting_resumes_the_session() {
     let pki = pki();
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, echo);
@@ -448,8 +466,10 @@ fn a_server_that_only_reads_still_sends_its_session_tickets() {
     // giong's server holds its TLS 1.3 session tickets back for its first
     // response; with no response, they go out once its receive has to wait.
     let pki = pki();
-    let acceptor =
-        TlsAcceptor::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(pki.server_cert.as_bytes(), pki.server_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(pki.ca.as_bytes()).unwrap();
     giong::block_on(async move {
         let addr = serve(acceptor, |tls: io::Result<TlsStream>| async move {
@@ -524,9 +544,4 @@ fn trust_roots_must_be_certificates() {
     let err = TlsConnector::with_root_pem(b"no pem here").unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
     assert_eq!(code(&err), Some(Code::BadCertificateData), "{err}");
-    // The same kind as when the machine has none (`with_system_roots`).
-    #[allow(deprecated)] // `with_roots` goes in 1.0.0; the error stays.
-    let err = TlsConnector::with_roots(RootCertStore::empty()).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
-    assert_eq!(code(&err), Some(Code::NoTrustedRoots), "{err}");
 }

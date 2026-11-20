@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use giong::net::TcpListener;
 use giong_http::client::Client;
-use giong_tls::{TlsAcceptor, TlsConnector};
+use giong_tls::{Certificates, TlsAcceptor, TlsConnector};
 use giong_web::Server;
 use rest_api::{app, AccessLog, State, SCHEMA};
 
@@ -158,8 +158,10 @@ fn tls() -> (TlsAcceptor, Client) {
         .unwrap()
         .self_signed(&key)
         .unwrap();
-    let acceptor =
-        TlsAcceptor::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).unwrap(),
+    )
+    .unwrap();
     let connector = TlsConnector::with_root_pem(cert.pem().as_bytes()).unwrap();
     (acceptor, Client::builder().tls(connector).build())
 }

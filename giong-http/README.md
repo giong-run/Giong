@@ -112,8 +112,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "0.8", features = ["tls"] }
-giong-tls = "0.8"
+giong-http = { version = "1.0.0-rc.1", features = ["tls"] }
+giong-tls = "1.0.0-rc.1"
 ```
 
 ```rust,no_run
@@ -125,10 +125,10 @@ async fn handler(_req: Request) -> Response {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let acceptor = giong_tls::TlsAcceptor::from_pem(
+    let acceptor = giong_tls::TlsAcceptor::with_certificates(&giong_tls::Certificates::from_pem(
         &std::fs::read("cert.pem")?,
         &std::fs::read("key.pem")?,
-    )?;
+    )?)?;
     giong::Builder::new().build()?.run(move |_worker| {
         let acceptor = acceptor.clone();
         async move {
@@ -219,7 +219,7 @@ An idle connection gives its buffers back, so what it keeps is its task, its HPA
 The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "0.8", features = ["client"] }
+giong-http = { version = "1.0.0-rc.1", features = ["client"] }
 ```
 
 ```rust,no_run
