@@ -59,6 +59,14 @@ struct Counters {
     cancelled_writes: AtomicU64,
     /// Handshakes the server did not finish (clients give some up).
     refused: AtomicU64,
+    /// Connects answered "connection refused" although every listener was
+    /// up. Linux does this on its own, rarely: a client that aborts a
+    /// connection the server already closed frees its port at once, and when
+    /// the next connect from that port reaches the server before the abort
+    /// does, the old connection's remains answer it with a reset. Plain
+    /// `std::net` sockets get the same (see `tests/soak.rs` of the runtime). Counted and held to a small share, since a
+    /// listener that went away would refuse thousands.
+    connects_refused: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
 }
@@ -244,6 +252,10 @@ async fn client(
         let addr = addrs[rng.below(addrs.len() as u64) as usize];
         let tcp = match TcpStream::connect(addr).await {
             Ok(tcp) => tcp,
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                Counters::bump(&counters.connects_refused);
+                continue;
+            }
             Err(err) => {
                 counters.unexpected("connect", err);
                 sleep(Duration::from_millis(10)).await;
@@ -653,7 +665,7 @@ fn soak() {
         "soak: done after {secs}s on {workers} workers: {} connections ({} resumed sessions, \
          {} stream ends encrypted by the kernel), {} echoes, {} clean closes, {} cancelled \
          handshakes, {} cancelled receives ({} taken up again), {} cancelled writes, \
-         {} handshakes the server gave up",
+         {} handshakes the server gave up, {} connects refused by the kernel",
         c.connections.load(Ordering::Relaxed),
         c.resumed.load(Ordering::Relaxed),
         offloaded,
@@ -664,10 +676,22 @@ fn soak() {
         c.resumed_recvs.load(Ordering::Relaxed),
         c.cancelled_writes.load(Ordering::Relaxed),
         c.refused.load(Ordering::Relaxed),
+        c.connects_refused.load(Ordering::Relaxed),
     );
 
     // 1. Every scenario behaved as designed, and each one took place.
     assert_eq!(c.unexpected.load(Ordering::Relaxed), 0, "unexpected errors");
+    // Refused connects are the kernel's (see `Counters::connects_refused`):
+    // one in 317 million was measured, so one in 50 million leaves room and
+    // still fails when a listener stops answering.
+    let (refused, connections) = (
+        c.connects_refused.load(Ordering::Relaxed),
+        c.connections.load(Ordering::Relaxed),
+    );
+    assert!(
+        refused <= 1 + connections / 50_000_000,
+        "{refused} of {connections} connects were refused while every listener was up"
+    );
     assert!(c.connections.load(Ordering::Relaxed) > 0);
     assert!(c.resumed.load(Ordering::Relaxed) > 0);
     assert!(c.clean_closes.load(Ordering::Relaxed) > 0);
