@@ -1,0 +1,15 @@
+2026-11-16T08:56:20Z soak start (259200 s, driver epoll)
+2026-11-16T08:56:20Z sim pass 1 start: GIONG_SIM_SEEDS=1000 GIONG_SIM_SOAK_DAYS=3650
+2026-11-16T09:04:56Z sim pass 1 exit 101: 20 passed, 1 failed; soak: 3650.0 simulated days, 1051200 requests, 34901624 steps, 30.139286402s real
+2026-11-16T09:04:56Z sim pass 2 start: GIONG_SIM_SEEDS=4000 GIONG_SIM_SOAK_DAYS=7300
+2026-11-16T09:24:39Z sim pass 2 exit 101: 20 passed, 1 failed; soak: 7300.0 simulated days, 2102400 requests, 69315125 steps, 56.127970655s real
+2026-11-16T09:24:39Z sim pass 3 start: GIONG_SIM_SEEDS=16000 GIONG_SIM_SOAK_DAYS=14600
+2026-11-16T09:52:05Z paused for the PR #127 h2 check: 89235 189222 371997
+2026-11-16T10:10:30Z resumed after the PR #127 h2 check
+2026-11-16T10:32:36Z sim pass 3 exit 101: 20 passed, 1 failed; soak: 14600.0 simulated days, 4204800 requests, 137631306 steps, 129.747821703s real
+2026-11-16T10:32:36Z sim pass 4 start: GIONG_SIM_SEEDS=64000 GIONG_SIM_SOAK_DAYS=29200
+2026-11-16T12:09:51Z paused for the HTTP/2 kTLS check: 89235 524679 1254938
+2026-11-16T12:17:51Z resumed after the HTTP/2 kTLS check
+2026-11-16T13:42:47Z sim pass 4 exit 101: 19 passed, 2 failed; 
+2026-11-16T13:42:47Z sim pass 5 start: GIONG_SIM_SEEDS=256000 GIONG_SIM_SOAK_DAYS=58400
+2026-11-16T19:47:23Z stopped by hand: aborted run (2 unexpected echo timeouts caused by the SIGSTOP pause 12:09:51-12:17:51Z, soak t=11610->12090 s); restarted as a fresh 72 h run

@@ -32,6 +32,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   safe and, when it is not, what a dropped future leaves behind (a statement that may
   still run, a datagram that may be sent, a file that may be created).
   `tests/cancel_docs.rs` fails a public async fn without it.
+- **Docs**: `docs/STABILITY.md` says what a cancelled operation does on both drivers (it
+  may still happen; buffers and descriptors stay with the driver until the kernel is done
+  with them; a close is never cancelled; a transaction never commits a statement whose
+  outcome it does not know) and which limits wait and which refuse by default, which 1.x
+  will not change. `docs/RELEASING.md` gives the checklist a 1.0 release candidate carries:
+  the soaked commit, the release commit, what changed between them, the tests run again
+  and the basis for soaking again or not.
 - **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,
@@ -240,6 +247,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   woke them, and a server of 16 tasks on one socket made one kernel entry per datagram. A
   task that stops waiting (its receive timed out) no longer takes the wake-up of the next
   datagram.
+- **giong-http**: requests sent at once to an `https` origin the client had no connection to
+  yet each opened a connection and did a TLS handshake of their own, up to
+  `max_connections_per_host`, because the pool learned that the origin speaks HTTP/2 only
+  once the first handshake was over. They now wait for that first connection while ALPN may
+  still pick HTTP/2, and share it when it does; when it picks HTTP/1.1 they open their own
+  as before, and when the first one fails or is dropped the next in line opens one. 64
+  requests to a new loopback origin on one worker: 16 TLS connections and 4.70 ms before, 1
+  and 0.78 ms after (median of 21 rounds). Reported from a service that warms its client up
+  while requests arrive (#154).
 - `UdpSocket::bind` to a port no other socket of the process held could fail with
   `AddrInUse` for a port that nothing held, while any thread of the process read
   `/proc/self/fd` (`lsof`, `ss -p`, monitoring agents, `giong-mcp`'s count of open
