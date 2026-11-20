@@ -396,14 +396,16 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       back when the operation ends, and that is the earliest moment a 1.x budget gives
       their share back. *Proved by* `tests/cancel_docs.rs` (every public async fn says
       whether it is cancel safe) and the two tests below.
-- [ ] **A dropped `File::close` still closes**, on both drivers: a close is never
+- [x] **A dropped `File::close` still closes**, on both drivers: a close is never
       cancelled, only its result can be lost. *Test*: on epoll, the blocking threads are
       kept busy so the close waits in their queue; on io_uring, the close is sent to the
       kernel's worker thread (a test-only switch setting `IOSQE_ASYNC`, since a close on a
       local filesystem completes at once and cannot show the bug). In both, the future is
-      polled until the close is submitted, then dropped; once the driver has finished,
-      `fcntl(fd, F_GETFD)` fails with `EBADF`. The code on `main` can leave it open on both
-      drivers.
+      polled until the close is submitted, then dropped; once the driver has finished, no
+      descriptor of the process refers to the file any more (`/proc/self/fd`, which a
+      reused descriptor number cannot fool). `a_dropped_close_still_closes_on_the_epoll_driver`
+      in `tests/cancel.rs` and `a_dropped_close_still_closes` in `src/driver/uring.rs`;
+      both failed before the fix (#159).
 - [ ] **A PostgreSQL transaction refuses to commit after a statement in it was given up**,
       as giong-mysql's already does: `commit` returns a coded error and the transaction
       has to be rolled back. *Test*, on the PostgreSQL server CI starts: begin, insert a

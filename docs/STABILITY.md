@@ -159,11 +159,7 @@ part of the promise, because callers rely on it as much as on a return value.
   descriptor that an owner (`File`, `TcpStream`, `UdpSocket`) closes is closed exactly
   once, and its number may be reused by the process only after that close. A close itself
   is never cancelled: once `File::close` is called, the descriptor ends up closed whether
-  or not its future is awaited; only the result can be lost. *Known gap on `main`, fixed
-  before 1.0.0-rc.1 (see the roadmap): a dropped `File::close` can be cancelled before it
-  runs, on epoll when the blocking thread has not started it, and on io_uring when the
-  kernel handed it to a worker thread (network filesystems, FUSE); the descriptor then
-  stays open.*
+  or not its future is awaited; only the result can be lost.
 - **Slots are given back when the operation ends, not when the future is dropped.** A
   database statement that was sent keeps its place in the connection's pipeline until its
   answer has been read and thrown away (`Client::in_flight` counts it until then). An
