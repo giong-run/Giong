@@ -275,12 +275,19 @@ impl Drop for Wait {
         };
         // The application gave up on a statement of its transaction, which
         // may run all the same: the transaction must not commit it unseen.
-        if !delivered {
-            if let Some(conn) = self.slot.in_tx.as_ref().and_then(Weak::upgrade) {
-                if conn.tx.get() == Tx::Open {
-                    conn.tx.set(Tx::Abandoned);
-                }
-            }
+        if !delivered && self.slot.in_tx.is_some() {
+            abandon_tx(&self.slot);
+        }
+    }
+}
+
+/// Marks the transaction `slot` was sent in as abandoned (see [`Tx::Abandoned`]).
+#[cold]
+#[inline(never)]
+fn abandon_tx(slot: &Slot) {
+    if let Some(conn) = slot.in_tx.as_ref().and_then(Weak::upgrade) {
+        if conn.tx.get() == Tx::Open {
+            conn.tx.set(Tx::Abandoned);
         }
     }
 }
