@@ -96,14 +96,37 @@ fn dropping_an_in_flight_vectored_write_keeps_its_buffers_alive() {
         assert!(abandoned > 0, "expected at least one write to block");
         // Drain on the other side; every byte that arrives must be a 7.
         let mut total = 0usize;
-        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
-            if data.is_empty() {
-                break;
+        let mut reset = false;
+        loop {
+            match timeout(Duration::from_millis(100), s.recv()).await {
+                Ok(Ok(data)) if data.is_empty() => break,
+                Ok(Ok(data)) => {
+                    assert!(data.iter().all(|&b| b == 7));
+                    total += data.len();
+                }
+                // Windows ends a connection whose send was cancelled part
+                // way, since the peer could not tell where the data stops;
+                // what had arrived is discarded with it.
+                Ok(Err(e)) if cfg!(windows) => {
+                    assert!(
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "{e:?}"
+                    );
+                    reset = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("{e:?}"),
+                Err(_) => break,
             }
-            assert!(data.iter().all(|&b| b == 7));
-            total += data.len();
         }
-        assert!(total > 0);
+        assert!(
+            total > 0 || reset,
+            "nothing arrived and the connection is still open"
+        );
         drop((c, s));
         sleep(Duration::from_millis(20)).await;
         let stats = giong::observe::worker_stats();
@@ -129,14 +152,37 @@ fn dropping_an_in_flight_write_keeps_its_buffer_alive() {
         assert!(abandoned > 0, "expected at least one write to block");
         // Drain on the other side; every byte that arrives must be a 7.
         let mut total = 0usize;
-        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
-            if data.is_empty() {
-                break;
+        let mut reset = false;
+        loop {
+            match timeout(Duration::from_millis(100), s.recv()).await {
+                Ok(Ok(data)) if data.is_empty() => break,
+                Ok(Ok(data)) => {
+                    assert!(data.iter().all(|&b| b == 7));
+                    total += data.len();
+                }
+                // Windows ends a connection whose send was cancelled part
+                // way, since the peer could not tell where the data stops;
+                // what had arrived is discarded with it.
+                Ok(Err(e)) if cfg!(windows) => {
+                    assert!(
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "{e:?}"
+                    );
+                    reset = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("{e:?}"),
+                Err(_) => break,
             }
-            assert!(data.iter().all(|&b| b == 7));
-            total += data.len();
         }
-        assert!(total > 0);
+        assert!(
+            total > 0 || reset,
+            "nothing arrived and the connection is still open"
+        );
         drop((c, s));
         sleep(Duration::from_millis(20)).await;
         let stats = giong::observe::worker_stats();
@@ -171,14 +217,37 @@ fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
         assert!(abandoned > 0, "expected at least one send to block");
         // Drain on the other side; every byte that arrives must be a 7.
         let mut total = 0usize;
-        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
-            if data.is_empty() {
-                break;
+        let mut reset = false;
+        loop {
+            match timeout(Duration::from_millis(100), s.recv()).await {
+                Ok(Ok(data)) if data.is_empty() => break,
+                Ok(Ok(data)) => {
+                    assert!(data.iter().all(|&b| b == 7));
+                    total += data.len();
+                }
+                // Windows ends a connection whose send was cancelled part
+                // way, since the peer could not tell where the data stops;
+                // what had arrived is discarded with it.
+                Ok(Err(e)) if cfg!(windows) => {
+                    assert!(
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "{e:?}"
+                    );
+                    reset = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("{e:?}"),
+                Err(_) => break,
             }
-            assert!(data.iter().all(|&b| b == 7));
-            total += data.len();
         }
-        assert!(total > 0);
+        assert!(
+            total > 0 || reset,
+            "nothing arrived and the connection is still open"
+        );
         drop((c, s));
         sleep(Duration::from_millis(20)).await;
         let stats = giong::observe::worker_stats();
@@ -210,14 +279,37 @@ fn a_dropped_send_file_leaves_nothing_behind() {
         }
         assert!(abandoned > 0, "expected at least one send to wait");
         let mut total = 0usize;
-        while let Ok(Ok(data)) = timeout(Duration::from_millis(100), s.recv()).await {
-            if data.is_empty() {
-                break;
+        let mut reset = false;
+        loop {
+            match timeout(Duration::from_millis(100), s.recv()).await {
+                Ok(Ok(data)) if data.is_empty() => break,
+                Ok(Ok(data)) => {
+                    assert!(data.iter().all(|&b| b == 7));
+                    total += data.len();
+                }
+                // Windows ends a connection whose send was cancelled part
+                // way, since the peer could not tell where the data stops;
+                // what had arrived is discarded with it.
+                Ok(Err(e)) if cfg!(windows) => {
+                    assert!(
+                        matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "{e:?}"
+                    );
+                    reset = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("{e:?}"),
+                Err(_) => break,
             }
-            assert!(data.iter().all(|&b| b == 7));
-            total += data.len();
         }
-        assert!(total > 0);
+        assert!(
+            total > 0 || reset,
+            "nothing arrived and the connection is still open"
+        );
         drop((c, s, file));
         std::fs::remove_file(&path).unwrap();
         sleep(Duration::from_millis(20)).await;
