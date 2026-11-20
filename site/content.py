@@ -49,7 +49,7 @@ CRATES = {
         layer="protocols", tests=76,
         short="TLS 1.2 and 1.3 for servers and clients on rustls. No OpenSSL.",
         lede="TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
-        items=["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
+        items=["`TlsAcceptor::with_certificates(&certs)`; `TlsConnector` with the system's or built-in roots",
                "`recv()` is cancel safe",
                "A cancelled write poisons the sending side instead of corrupting the record stream",
                "ALPN, client certificates and a handshake timeout",

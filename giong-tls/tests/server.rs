@@ -155,11 +155,13 @@ fn a_required_client_certificate_must_come_from_the_authority() {
     let (server, server_key) = ca.issue(&["localhost"]);
     let (client, client_key) = ca.issue(&[]);
     let (other, other_key) = stranger.issue(&[]);
-    let acceptor = TlsAcceptor::from_pem(server.as_bytes(), server_key.as_bytes())
-        .unwrap()
-        .alpn(&[b"h2"])
-        .require_client_cert(ca.pem().as_bytes())
-        .unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(server.as_bytes(), server_key.as_bytes()).unwrap(),
+    )
+    .unwrap()
+    .alpn(&[b"h2"])
+    .require_client_cert(ca.pem().as_bytes())
+    .unwrap();
     let plain = TlsConnector::with_root_pem(ca.pem().as_bytes())
         .unwrap()
         .alpn(&[b"h2"]);
@@ -197,10 +199,12 @@ fn a_requested_client_certificate_may_be_missing() {
     let ca = Authority::new("giong test CA");
     let (server, server_key) = ca.issue(&["localhost"]);
     let (client, client_key) = ca.issue(&[]);
-    let acceptor = TlsAcceptor::from_pem(server.as_bytes(), server_key.as_bytes())
-        .unwrap()
-        .request_client_cert(ca.pem().as_bytes())
-        .unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(server.as_bytes(), server_key.as_bytes()).unwrap(),
+    )
+    .unwrap()
+    .request_client_cert(ca.pem().as_bytes())
+    .unwrap();
     let plain = TlsConnector::with_root_pem(ca.pem().as_bytes()).unwrap();
     let with_cert = plain
         .clone()

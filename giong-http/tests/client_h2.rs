@@ -13,7 +13,7 @@ use giong::net::{TcpListener, TcpStream};
 use giong::time::sleep;
 use giong_http::client::{Client, ErrorKind};
 use giong_http::{Request, Response, Server, Version};
-use giong_tls::{ktls_stats, Ktls, TlsAcceptor, TlsConnector};
+use giong_tls::{ktls_stats, Certificates, Ktls, TlsAcceptor, TlsConnector};
 
 // ------------------------------------------------------------------ harness
 
@@ -47,7 +47,10 @@ where
 {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
-    let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let acceptor = acceptor.ktls(ktls).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -313,7 +316,10 @@ fn tls_pair() -> (TlsAcceptor, TlsConnector) {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
     (
-        TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+        TlsAcceptor::with_certificates(
+            &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+        )
+        .unwrap(),
         TlsConnector::with_root_pem(cert.as_bytes()).unwrap(),
     )
 }

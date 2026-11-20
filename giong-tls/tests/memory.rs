@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Duration;
 
 use giong::net::{TcpListener, TcpStream};
-use giong_tls::{TlsAcceptor, TlsConnector};
+use giong_tls::{Certificates, TlsAcceptor, TlsConnector};
 
 struct Counting;
 
@@ -40,9 +40,12 @@ static ALLOCATOR: Counting = Counting;
 fn a_large_write_leaves_no_large_buffer_behind() {
     const PAIRS: usize = 50;
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let acceptor = TlsAcceptor::from_pem(
-        key.cert.pem().as_bytes(),
-        key.key_pair.serialize_pem().as_bytes(),
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(
+            key.cert.pem().as_bytes(),
+            key.key_pair.serialize_pem().as_bytes(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let connector = TlsConnector::with_root_pem(key.cert.pem().as_bytes()).unwrap();

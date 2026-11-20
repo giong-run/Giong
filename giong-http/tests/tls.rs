@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use giong::net::TcpListener;
 use giong::time::sleep;
 use giong_http::{Request, Response, Server};
-use giong_tls::TlsAcceptor;
+use giong_tls::{Certificates, TlsAcceptor};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -55,9 +55,12 @@ impl TestServer {
         Fut: Future<Output = Response> + 'static,
     {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let acceptor = TlsAcceptor::from_pem(
-            key.cert.pem().as_bytes(),
-            key.key_pair.serialize_pem().as_bytes(),
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(
+                key.cert.pem().as_bytes(),
+                key.key_pair.serialize_pem().as_bytes(),
+            )
+            .unwrap(),
         )
         .unwrap()
         .handshake_timeout(handshake_timeout);

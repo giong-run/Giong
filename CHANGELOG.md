@@ -248,10 +248,21 @@ giong in production yet, and after 1.0.0 a name can only be deprecated, never re
 - **Breaking:** **giong-postgres**: `Config::dbname`; use `Config::database`. The URL
   parameter is still `dbname`.
 - **Breaking:** **giong-tls**: `TlsAcceptor::new`, `TlsConnector::new` and
-  `TlsConnector::with_roots`, which took rustls' types. Use `TlsAcceptor::from_pem` or
-  `with_certificates`, and `TlsConnector::with_system_roots`, `with_root_pem` or
-  `with_root_pem_any_name`; for a rustls configuration of your own, `from_rustls` with the
-  `unstable-rustls` feature, which is outside the semver promise.
+  `TlsConnector::with_roots`, which took rustls' types. Use
+  `TlsAcceptor::with_certificates`, and `TlsConnector::with_system_roots`, `with_root_pem`
+  or `with_root_pem_any_name`; for a rustls configuration of your own, `from_rustls` with
+  the `unstable-rustls` feature, which is outside the semver promise.
+
+Three shortcuts that did what another function already does go as well, so that each task
+has one spelling:
+
+- **Breaking:** **giong-tls**: `TlsAcceptor::from_pem(cert, key)`; write
+  `TlsAcceptor::with_certificates(&Certificates::from_pem(cert, key)?)`. The acceptor is
+  the same (same cipher suite order, no ALPN), and the `Certificates` set is what a
+  service needs anyway to replace a renewed certificate while it runs.
+- **Breaking:** **giong-redis**: `Cmd::new(name)`; use `cmd(name)`.
+- **Breaking:** **giong**: `observe::register_rc(&rc)`; use `observe::register` with
+  `Rc::downgrade(&rc)` as a `Weak<dyn Source>`.
 
 ### Fixed
 

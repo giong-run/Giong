@@ -838,7 +838,7 @@ HTTP rows are from the earlier session of five rounds (`bench/results/tls/2026-1
   1.3 handshakes. Two changes since 0.8.0 (which was 5% behind Axum here): giong-tls sends
   its session tickets with the first response and its `close_notify` with the FIN (14.4
   TCP segments per connection, both directions, against 16.5 before and Axum's 14.0), and
-  `TlsAcceptor::from_pem` picks AES-128-GCM first, as Go's and BoringSSL's servers do,
+  `TlsAcceptor::with_certificates` picks AES-128-GCM first, as Go's and BoringSSL's servers do,
   where wrk (OpenSSL) lists AES-256-GCM first and its suite hashes with SHA-384. **The
   suite is most of the gain: Axum set up the same way matches giong's rate** (8.4k), with
   higher latency (p99 6.2 ms against 4.2). A handshake is almost all cryptography, and

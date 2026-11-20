@@ -1,7 +1,7 @@
 //! `giong::observe`: pulses read from other threads, snapshots, profiles,
 //! sources, and tasks named by where they were spawned.
 
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -329,7 +329,8 @@ fn sources_report_until_they_are_dropped() {
         let pool = Rc::new(Pool {
             open: std::cell::Cell::new(3),
         });
-        assert!(observe::register_rc(&pool));
+        let source: Weak<dyn observe::Source> = Rc::downgrade(&pool) as _;
+        assert!(observe::register(source));
         let snap = observe::snapshot();
         assert_eq!(snap.sources.len(), 1);
         assert_eq!(snap.sources[0].kind, "test pool");
@@ -344,7 +345,8 @@ fn sources_report_until_they_are_dropped() {
     let pool = Rc::new(Pool {
         open: std::cell::Cell::new(0),
     });
-    assert!(!observe::register_rc(&pool));
+    let source: Weak<dyn observe::Source> = Rc::downgrade(&pool) as _;
+    assert!(!observe::register(source));
 }
 
 #[test]

@@ -125,10 +125,10 @@ async fn handler(_req: Request) -> Response {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let acceptor = giong_tls::TlsAcceptor::from_pem(
+    let acceptor = giong_tls::TlsAcceptor::with_certificates(&giong_tls::Certificates::from_pem(
         &std::fs::read("cert.pem")?,
         &std::fs::read("key.pem")?,
-    )?;
+    )?)?;
     giong::Builder::new().build()?.run(move |_worker| {
         let acceptor = acceptor.clone();
         async move {

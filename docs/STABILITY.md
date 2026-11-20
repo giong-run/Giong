@@ -219,4 +219,7 @@ every item of it is done:
 - the texts that describe keeping aliases (the freeze record, RELEASING.md, the
   *Deprecated* section of CHANGELOG.md) say what was done instead;
 - `giong_mcp::FromEnv` becomes `#[non_exhaustive]`, like every other enum that is not
-  complete by nature.
+  complete by nature;
+- three shortcuts that repeated another function go, so that each task has one spelling:
+  `TlsAcceptor::from_pem` (`with_certificates` with `Certificates::from_pem`),
+  `giong_redis::Cmd::new` (`cmd`) and `giong::observe::register_rc` (`register`).

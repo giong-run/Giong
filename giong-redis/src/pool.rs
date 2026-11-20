@@ -372,7 +372,8 @@ impl Pool {
             max_size,
             state: Rc::clone(&state),
         });
-        giong::observe::register_rc(&observed);
+        let source: Weak<dyn giong::observe::Source> = Rc::downgrade(&observed) as _;
+        giong::observe::register(source);
         Self {
             inner: Rc::new(Inner {
                 config,
