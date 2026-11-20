@@ -63,9 +63,8 @@ request; everything else is automated and safe to re-run.
 
 ## Release candidates of 1.0
 
-A `1.0.0-rc.N` is cut only from a commit whose runtime has been through the 72-hour
-bare-metal soak, or from a commit whose difference from one is shown not to need it. The
-release pull request carries this checklist, filled in, in its description:
+Every `1.0.0-rc.N` says which soaked code it stands on and what changed since. The release
+pull request carries this checklist, filled in, in its description:
 
 1. **The soaked commit**: its hash and tree, the machines, both drivers' start and end
    times, and the results directory under `bench/results/` (for 0.9: tree `f1b23074`,
@@ -79,18 +78,16 @@ release pull request carries this checklist, filled in, in its description:
      `giong-http` and `giong-tls`, in lines that run (doc comments do not count);
    - *outside*: everything else (the database crates, `giong-web`, `giong-mcp`, docs,
      benches, tests).
-4. **The decision.** If any pull request in the range is on a soak path, the release commit
-   is soaked again for 72 hours on both drivers before the tag, and items 1 and 2 become the
-   same commit. If none is, the candidate may be tagged after these have passed on the
-   release commit itself, each named with its run: the full CI set (kernels 5.15 to 6.18,
-   both drivers, TSan, loom, Kani, the simulation soak), the cancellation tests of
-   STABILITY.md's *Cancellation* section on both drivers. The runtime is then the code
-   that was soaked.
-5. **The removals**: every item of STABILITY.md's *Changes made before 1.0* checked off.
-
-Plan the merges so that one soak covers the candidate: merge everything meant for rc.1
-first, then soak the result once. A fix to the driver or to a cancellation path after that
-soak starts restarts the 72 hours; a fix outside the soak paths does not.
+4. **The tests run again on the release commit**, each named with its run: the full CI
+   set (kernels 5.15 to 6.18, both drivers, TSan, loom, Kani, the simulation soak), the
+   cancellation tests of STABILITY.md's *Cancellation* section on both drivers, and for
+   each *soak path* pull request the tests it added or that cover the code it changed.
+5. **The soak decision and its basis**: whether the release commit is soaked again before
+   the tag, and why. For 1.0.0-rc.1 the maintainer decided (2026-11-20) that the 0.9 soak
+   stands: the soak-path changes since tree `f1b23074` are small (#134's bind, the channel,
+   UDP and close fixes), the tests of item 4 cover them, and the next full 72-hour soak on
+   both drivers runs on a later candidate or 1.x release, recorded the same way.
+6. **The removals**: every item of STABILITY.md's *Changes made before 1.0* checked off.
 
 ## When something fails
 

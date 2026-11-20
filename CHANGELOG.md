@@ -37,8 +37,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   with them; a close is never cancelled; a transaction never commits a statement whose
   outcome it does not know) and which limits wait and which refuse by default, which 1.x
   will not change. `docs/RELEASING.md` gives the checklist a 1.0 release candidate carries:
-  the soaked commit, the release commit, what changed between them and whether that needs
-  a new soak.
+  the soaked commit, the release commit, what changed between them, the tests run again
+  and the basis for soaking again or not.
 - **giong-tls**: `TlsConnector::with_root_pem_any_name(pem)` trusts the given authorities
   without checking the host name (`ssl-mode=VERIFY_CA` in giong-mysql, which now uses it
   instead of a rustls verifier of its own). `CertificateDer` (from `rustls-pki-types` 1.x,

@@ -419,10 +419,11 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       ledger and how it shares quotas wait for the prototype of 1.5.
 - [ ] **The release candidate is the code that was soaked**: the rc.1 release pull request
       names the soaked commit, the release commit and the change between them, and says
-      which tests ran again on the release commit and why that does or does not need a new
-      soak ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). Since 0.9's soak,
-      `main` has changed `src/net/share.rs` (#134), and the queued changes to channels and
-      UDP touch soak paths too, so rc.1 is soaked again once everything for it has merged.
+      which tests ran again on the release commit and on what basis it is or is not soaked
+      again ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). rc.1 stands on
+      0.9's soak (tree `f1b23074`): the changes since (#134's bind, the channel, UDP and
+      close fixes) are small and get their tests rerun on the release commit, and the next
+      full 72-hour soak runs on a later candidate or 1.x release.
 - [ ] **The removals**: the checklist in
       [STABILITY.md](docs/STABILITY.md#changes-made-before-10), in one release pull request.
 
