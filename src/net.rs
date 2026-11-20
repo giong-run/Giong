@@ -807,15 +807,10 @@ impl TcpListener {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
+        // Linux 6.0.16 to 6.0.19 report success for a bind to an address in
+        // use and leave the socket unbound: `share::bind` checks the port.
         let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
-            let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-            sock.set_reuse_address(true)?;
-            sock.set_reuse_port(true)?;
-            sock.bind(&addr.into())?;
-            // Linux 6.0.16 to 6.0.19 report success for a bind to an
-            // address in use and leave the socket unbound.
-            share::check_bound(&sock, addr)?;
-            Ok(sock)
+            Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
         })?;
         let listener = Self {
             inner: ListenSocket::new(sock),

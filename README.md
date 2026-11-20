@@ -304,7 +304,7 @@ fn main() -> std::io::Result<()> {
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
-| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
+| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::unbounded()`, `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
 | Errors | Every error giong raises starts with a code (`GIONG-E0102: no address found for …`) and links to its page in [docs/errors](docs/errors/README.md); `error::code(&err)` returns it as a `Code` to match on |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response`; with the `client` feature, `client::Client` (`get`, `post`, ... `send`), `client::Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
@@ -999,7 +999,7 @@ cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,111 tests across the nine crates and the example API (`cargo test --workspace
+1,112 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and

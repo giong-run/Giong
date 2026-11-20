@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use giong_redis::{cmd, Client, Config, ErrorKind, Tls, TlsConnector, Value};
 
-use crate::server::{free_port, APP};
+use crate::server::{closed_port, APP};
 use crate::{key, run};
 
 #[test]
@@ -130,7 +130,7 @@ fn unix_sockets_and_tls() {
 #[test]
 fn connecting_fails_fast_with_a_reason() {
     run(|_server| async move {
-        let closed = free_port();
+        let (_held, closed) = closed_port();
         let start = Instant::now();
         let e = Client::connect(&Config::new().host("127.0.0.1").port(closed))
             .await
