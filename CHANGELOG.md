@@ -241,6 +241,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ### Fixed
 
+- **giong**: `UnixStream::recv` could miss the end of the stream on Linux 6.18 with
+  io_uring, and wait until the peer closed the socket. When the last data arrived
+  together with the peer's `shutdown(Write)`, the kernel's multishot receive took the
+  data and went back to waiting without reporting the end (a bare ring without giong
+  does the same on 6.18.44 and 6.18.63, with more than 32 buffers of data waiting; 6.12.117
+  and TCP sockets do not). A reader that has taken everything received from a Unix socket
+  now asks the socket whether the peer has stopped sending, with one `poll` call, and
+  starts the receive again if it has. An echo over a Unix socket whose client writes,
+  shuts down and reads to the end stalled about once in 8,000 runs with four of them in
+  parallel; with the check, 480,000 runs had none. The epoll driver was not affected.
+  Sockets from `UnixListener::accept` also no longer try a zero-copy send first, like the
+  other Unix sockets.
 - **net**: tasks that share a `UdpSocket` and wait in `recv_from` at the same time are each
   woken for a datagram of their own. On io_uring they shared one wake-up slot: only the
   last task to wait was woken, the others saw their datagrams only when something else

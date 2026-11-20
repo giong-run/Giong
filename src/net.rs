@@ -258,6 +258,11 @@ pub(crate) struct StreamSocket {
     /// A send was dropped before its result: it may still go out later, so
     /// a send made directly could overtake it. Never cleared.
     send_abandoned: Cell<bool>,
+    /// A Unix socket (see [`end_was_missed`](Self::end_was_missed)).
+    unix: Cell<bool>,
+    /// Data was taken from the multishot receive since the socket was last
+    /// checked for an end of stream the kernel did not report.
+    check_end: Cell<bool>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -302,14 +307,51 @@ impl StreamSocket {
             zero_copy_copied: OnceCell::new(),
             sends_in_flight: Cell::new(0),
             send_abandoned: Cell::new(false),
+            unix: Cell::new(false),
+            check_end: Cell::new(false),
             _not_send: PhantomData,
         }
     }
 
-    /// A socket the kernel cannot send from without a copy (a Unix socket).
-    pub(crate) fn without_zero_copy(self) -> Self {
+    /// A Unix socket: the kernel cannot send from it without a copy, and its
+    /// multishot receive can miss the end of the stream (see
+    /// [`end_was_missed`](Self::end_was_missed)).
+    pub(crate) fn unix(self) -> Self {
         self.zero_copy.set(false);
+        self.unix.set(true);
         self
+    }
+
+    /// Whether the peer of a Unix socket has stopped sending and the kernel's
+    /// multishot receive may have left that unreported. Asked once each time
+    /// the reader has taken everything that was received.
+    ///
+    /// On newer kernels (seen on 6.18.44 and 6.18.63, not on 6.12.117) a
+    /// multishot receive that has emptied a Unix socket goes back to waiting
+    /// without trying once more. When the data arrived together with the
+    /// peer's `shutdown(Write)` and was taken in a pass of its own (more than
+    /// 32 buffers were waiting, or the receive was being set up), nothing
+    /// wakes the receive again: the end of the stream is never reported, and
+    /// a reader that waits for it hangs until the peer closes. A bare ring
+    /// without giong shows the same; TCP sockets do not.
+    ///
+    /// A shutdown that the kernel missed came before the last data was
+    /// taken, so it shows here; one that comes later wakes the receive as
+    /// usual. Starting the receive again makes the kernel read once more,
+    /// which finds the end.
+    fn end_was_missed(&self) -> bool {
+        if !self.unix.get() || !self.check_end.replace(false) {
+            return false;
+        }
+        let mut fd = libc::pollfd {
+            fd: self.sock.as_raw_fd(),
+            events: libc::POLLRDHUP,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
+        // the socket's state.
+        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+        ready > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
     }
 
     /// Where a send of `len` bytes from buffers that cannot change should go
@@ -382,7 +424,10 @@ impl StreamSocket {
                             _ => Err(unexpected("io_uring returned data without a buffer")),
                         });
                     }
-                    MultiPoll::Data(buf) => return Poll::Ready(Ok(buf)),
+                    MultiPoll::Data(buf) => {
+                        self.check_end.set(true);
+                        return Poll::Ready(Ok(buf));
+                    }
                     MultiPoll::NeedArm => {
                         if !wait_for_pool(&mut driver, cx, false) {
                             return Poll::Pending;
@@ -390,7 +435,12 @@ impl StreamSocket {
                         let fd = self.sock.as_raw_fd();
                         driver.arm_multi(key, MultiIo::Recv { fd });
                     }
-                    MultiPoll::Pending => return Poll::Pending,
+                    MultiPoll::Pending => {
+                        if driver.kind() == crate::DriverKind::IoUring && self.end_was_missed() {
+                            driver.restart_multi(key);
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
         })
