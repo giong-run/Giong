@@ -328,7 +328,7 @@ What fails, by cause:
 | A hang talking to a std Unix socket | unix `works_with_the_standard_library_on_the_other_side` | **bug**, to investigate |
 | `sendfile` to a closed peer gives `ENOTCONN` | net `send_file_to_a_closed_peer_is_an_error_not_a_signal` | error mapping |
 | A pseudo-terminal read returns at once | fs `a_file_is_closed_only_once_a_blocking_thread_is_done_with_it` | **bug** or pty difference, to investigate |
-| `/proc` readers in giong-mcp have no macOS source | giong-mcp: 3 tests | plan S4 (`proc_pidinfo`) |
+| `/proc` readers in giong-mcp had no macOS source | giong-mcp: 3 tests | fixed: `proc_pidinfo`, `/dev/fd`, `getrlimit` (`giong-mcp/src/proc.rs`) |
 | Elapsed-time bounds tuned on Linux | giong-http server/tls shutdown tests (230 ms) | test timing |
 | A SYN to a full backlog waits instead of failing | giong-http `a_server_that_does_not_answer_hits_the_timeout` | test assumption |
 | `kTLS` auto mode hangs on macOS 26 only | giong-tls `auto_stays_in_the_process_when_the_kernel_cannot_take_connections` | **bug**, to investigate |
