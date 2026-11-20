@@ -82,6 +82,7 @@ dependencies = [
  "io-uring",
  "libc",
  "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

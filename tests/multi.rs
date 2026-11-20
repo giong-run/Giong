@@ -1,5 +1,8 @@
 //! The thread-per-core runtime: workers, cross-thread wake-ups, shutdown.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;

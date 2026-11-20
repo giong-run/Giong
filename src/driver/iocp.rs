@@ -504,7 +504,36 @@ impl Iocp {
                     wsa(WSASend(fd, &wsabuf, 1, &mut transferred, 0, ov, None))
                 }
                 Io::SendMsg { fd, msg, .. } => {
-                    wsa(WSASendMsg(fd, msg, 0, &mut transferred, ov, None))
+                    let m = &*msg;
+                    if m.Control.len != 0 {
+                        // Ancillary data: only `WSASendMsg` carries it,
+                        // and only datagram sockets take that call.
+                        wsa(WSASendMsg(fd, msg, 0, &mut transferred, ov, None))
+                    } else if m.name.is_null() {
+                        // What a vectored write on a stream is: Winsock
+                        // refuses `WSASendMsg` on a stream socket.
+                        wsa(WSASend(
+                            fd,
+                            m.lpBuffers,
+                            m.dwBufferCount,
+                            &mut transferred,
+                            0,
+                            ov,
+                            None,
+                        ))
+                    } else {
+                        wsa(WSASendTo(
+                            fd,
+                            m.lpBuffers,
+                            m.dwBufferCount,
+                            &mut transferred,
+                            0,
+                            m.name,
+                            m.namelen,
+                            ov,
+                            None,
+                        ))
+                    }
                 }
                 Io::SendTo {
                     fd,

@@ -1365,6 +1365,7 @@ impl std::fmt::Debug for TcpStream {
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(unused_imports))]
 mod tests {
     use std::borrow::Cow;
 

@@ -1,5 +1,8 @@
 //! TCP: accept, recv (multishot + provided buffers), read, write, close.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};

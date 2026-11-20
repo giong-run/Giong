@@ -1,5 +1,8 @@
 //! UDP: send_to, recv_from (multishot + provided buffers), read_from.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::rc::Rc;

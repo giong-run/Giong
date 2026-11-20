@@ -4,6 +4,9 @@
 //! futures dropped while the kernel still owns their buffers, and the shared
 //! receive pool running dry.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::rc::Rc;

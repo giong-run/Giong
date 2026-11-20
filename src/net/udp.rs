@@ -596,7 +596,7 @@ impl std::fmt::Debug for UdpSocket {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::net::SocketAddr;
     use std::{mem, ptr};
