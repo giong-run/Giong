@@ -211,8 +211,12 @@ plan or a limit of macOS itself):
 | TCP port shared by workers | `SO_REUSEPORT` spreads connections by a hash of their addresses | one listening socket, duplicated for each worker (`src/net/share.rs`): whichever worker accepts first gets the connection | different spread, same API; `SO_REUSEPORT` on macOS would send every connection to one socket |
 | UDP port shared by workers | `SO_REUSEPORT` spreads datagrams by sender | each worker binds with `SO_REUSEPORT`; the kernel gives every datagram to one socket | macOS limit: one worker receives |
 | Port guard against a second process | the first socket of a port binds without `SO_REUSEPORT` (`src/net/share.rs`) | TCP: the shared socket never has `SO_REUSEPORT`, so nothing else can bind while it lives. UDP: a probe socket without the option is bound and closed before the first bind | TCP stronger than Linux; UDP checked at the first bind only (a process of the same user that sets `SO_REUSEPORT` can join later) |
-| Largest UDP datagram | 65507 bytes | 9216 by default (`net.inet.udp.maxdgram`) | macOS limit |
+| Largest UDP datagram | 65507 bytes | 65507 bytes: giong raises the send buffer of the sockets it binds to 65,535 bytes, where the system's default (`net.inet.udp.maxdgram`) refuses datagrams over 9216 | equivalent; a `from_std` socket keeps what it was given |
 | Listen backlog | `net.core.somaxconn` (4096) | `kern.ipc.somaxconn` (128) | macOS limit; bursts of connections are refused sooner |
+| A send to a full socket | `MSG_DONTWAIT` on every send | every stream is non-blocking from the start (`StreamSocket::new`): macOS waits in a send even with `MSG_DONTWAIT`, which only a receive honours there | equivalent |
+| `sendfile` to a closed peer | `EPIPE` | `ENOTCONN` from the kernel, reported as `EPIPE` | equivalent |
+| Reads and writes on a terminal | `pread` fails with `ESPIPE`, then `read` | `pread` fails with `ENXIO`, then `read` | equivalent |
+| Memory left (`Server::min_free_memory` in giong-http) | the cgroup's limit and `MemAvailable` | free and inactive pages from `host_statistics64`; no cgroups | equivalent for the machine; no per-container limit exists on macOS |
 | Append-mode writes | `pwrite` appends on `O_APPEND` | `write(2)` when the descriptor has `O_APPEND` | emulated; same visible result |
 | UDP truncated datagram | true length reported (`MSG_TRUNC` in) | truncation flagged (`recvmsg`'s `msg_flags`), true length unknown | macOS limit |
 | UDP GSO/GRO, `IP_PKTINFO`, ECN | not in the API yet | not in the API yet | later 1.x, Linux first |
@@ -291,48 +295,46 @@ ignores 5, on io_uring and with `GIONG_DRIVER=epoll`. Clippy is clean for
 Linux and, cross-checked, for `aarch64-apple-darwin`; the libraries build
 on Rust 1.80.
 
-The rest of this section is the kqueue prototype (branch
-`feat/kqueue-prototype`, on the tree before 1.0.0-rc.1), kept as the
-starting point of the macOS work.
-
 **libkqueue** (section 5): 11 test files pass whole (blocked, cancel,
 channels, driver, error_docs, executor, fs, observe, spin, time, udp). The
 multi-worker, large-transfer and shutdown tests hang there, as libkqueue's
 thread-based emulation does; the macOS runners are the verdict for those.
 
-**macOS, Apple Silicon runners.** Clippy and the build of every test pass
-on both. The first run (commit 9112aa4, macOS 15) found a sockaddr layout
-bug, a port probe that refused the workers' own binds, append writes and
-`allocate` on read-only files; those are fixed. The second run (commit
-0275ab4) ran every test binary of the workspace under a time limit:
+**macOS, Apple Silicon runners** (`macos-15` and `macos-26`, every test
+binary of the workspace under a time limit, draft PR #173):
 
-| | Passed | Failed | Ignored | Hung (> 60 s) |
-|---|---|---|---|---|
-| macOS 15 | 934 | 18 | 6 | 1 |
-| macOS 26 | 934 | 17 | 6 | 2 |
+| Commit | | Passed | Failed | Ignored | Hung (> 60 s) |
+|---|---|---|---|---|---|
+| 78da16d | macOS 15 | 905 | 19 | 5 | 4 |
+| | macOS 26 | 903 | 20 | 5 | 5 |
+| 45f7587 | macOS 15 | 1033 | 8 | 5 | 0 |
+| | macOS 26 | 1032 | 9 | 5 | 0 |
+| 8d00308 | macOS 15 | 1042 | 0 | 5 | 0 |
+| | macOS 26 | 1042 | 0 | 5 | 0 |
 
-Whole binaries that pass on both: in `giong`, the unit tests, dns, multi,
-balance, driver, cancel, channels, executor, observe, shutdown, time, spin;
-all of giong-web, giong-postgres, giong-mysql and giong-redis; giong-tls
-except one kTLS test on macOS 26; giong-http except three tests.
+What the runs found, by cause:
 
-What fails, by cause:
-
-| Cause | Tests | Kind |
+| Cause | Seen as | Fix |
 |---|---|---|
-| Another process can join a port (`SO_REUSEPORT` without the Linux probe) | net `a_port_shared_by_another_process_is_refused`, udp `a_port_held_by_another_process_is_refused` | **gap** (section 4) |
-| UDP datagrams above 9216 bytes refused (`net.inet.udp.maxdgram`) | udp `larger_pool_buffers_carry_larger_datagrams`, `long_datagrams_are_truncated_by_recv_from_and_whole_with_read_from` | macOS limit; the API should report it with a coded error |
-| Truncation flag set on a whole datagram | udp `datagrams_roundtrip_with_their_sender` | **bug**, in the readiness `recvmsg` emulation |
-| A worker's UDP bind to a shared port fails with `EADDRNOTAVAIL` | udp `every_worker_can_bind_the_same_port` | **bug**, to investigate |
-| Small listen backlog for Unix and TCP sockets | unix `many_connections_at_once`, net `accept_backlog_is_bounded_and_no_connection_is_lost` | macOS limit (`kern.ipc.somaxconn`); tests to adapt |
-| A hang talking to a std Unix socket | unix `works_with_the_standard_library_on_the_other_side` | **bug**, to investigate |
-| `sendfile` to a closed peer gives `ENOTCONN` | net `send_file_to_a_closed_peer_is_an_error_not_a_signal` | error mapping |
-| A pseudo-terminal read returns at once | fs `a_file_is_closed_only_once_a_blocking_thread_is_done_with_it` | **bug** or pty difference, to investigate |
-| `/proc` readers in giong-mcp had no macOS source | giong-mcp: 3 tests | fixed: `proc_pidinfo`, `/dev/fd`, `getrlimit` (`giong-mcp/src/proc.rs`) |
-| Elapsed-time bounds tuned on Linux | giong-http server/tls shutdown tests (230 ms) | test timing |
-| A SYN to a full backlog waits instead of failing | giong-http `a_server_that_does_not_answer_hits_the_timeout` | test assumption |
-| `kTLS` auto mode hangs on macOS 26 only | giong-tls `auto_stays_in_the_process_when_the_kernel_cannot_take_connections` | **bug**, to investigate |
-| `TCP_NODELAY` read back as 4, a non-UTF-8 name APFS refuses | 2 tests | tests fixed after the run |
+| A send to a full socket waits despite `MSG_DONTWAIT` | giong-compat's direct send held the worker on a Unix socket pair: a hang | streams are non-blocking from the start |
+| The keychain reader released a null reference when a trust settings domain was empty | `SIGTRAP` in every test that loaded the system's roots | the null check no longer builds an owner for null |
+| UDP datagrams above 9216 bytes refused | two udp tests | the send buffer is raised at bind |
+| `sendfile` to a closed peer gives `ENOTCONN` | one net test | reported as `EPIPE` |
+| `pread` on a terminal gives `ENXIO` | the pseudo-terminal test in fs | falls back to `read`, as for `ESPIPE` |
+| giong-http had no source for the memory left | three tests of `min_free_memory` | `host_statistics64` |
+| The tests' port holder kept the shared listening socket from binding | balance, multi, one net test | no holder on macOS |
+| Tests that relied on Linux's socket buffer sizes (a megabyte written before its reader starts) | hangs in unix and the kTLS exchange | the tests write and read together |
+| Listen backlog of 128 | unix `many_connections_at_once`, net `accept_backlog_is_bounded_and_no_connection_is_lost` | fewer connections on macOS |
+| A SYN to a bound socket that does not listen is dropped, not refused | giong-http client timeout test | the port is given back first |
+| Tests that named epoll or read `/proc` | cancel, proc_readers, one giong-http unit test | the platform's readiness driver; `cfg(linux)` for `/proc` |
+| Elapsed-time bounds that assumed an exact sleep | giong-http shutdown tests | the time really slept is counted |
+
+**The wake-up.** `src/notify.rs` and its loom models are above
+`WakeHandle` and do not change with the mechanism behind it. What is new
+on macOS is the kernel's part (`EVFILT_USER`), which the lost wake-up race
+of `tests/wake.rs` exercises on the runners (300,000 cross-thread wake-ups
+with and without spinning), and which ThreadSanitizer checks there over
+the tests of the `giong` crate (`.github/workflows/macos.yml`).
 
 ## 8. Next steps
 
@@ -345,6 +347,7 @@ What fails, by cause:
 - S3: trust roots from the keychain; DNS servers from the file macOS
   writes from its configuration, checked against `scutil --dns` on the
   runners (done, section 4).
-- S4: the rest of the suite's Linux assumptions, as the runners show them.
+- S4: the rest of the suite's Linux assumptions, as the runners showed
+  them (done, section 7: every test passes on macOS 15 and 26).
 - Before any of it lands: `v1.0.0` tagged, the full Linux gates, and the
   speed comparison above.

@@ -49,9 +49,36 @@ jobs:
         # time is run again test by test, so a hung test is named. Doc tests
         # are not run here.
         run: .github/macos-tests.sh "${{ matrix.os }}"
+      - name: Lost wake-up race on the kqueue wake-up
+        # 300,000 cross-thread wake-ups through EVFILT_USER, with and without
+        # spinning (tests/wake.rs; ignored in the default run for its length).
+        run: cargo test --release -p giong --all-features --test wake -- --ignored
       - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-logs-${{ matrix.os }}
           path: logs/
+
+  # ThreadSanitizer over the tests of the giong crate on the kqueue driver:
+  # the wake-up, the blocking pool and the shared listening socket are the
+  # parts that differ from Linux.
+  tsan:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GIONG_TEST_EXPECT_DRIVER: kqueue
+      RUSTFLAGS: -Zsanitizer=thread --cfg giong_tsan
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+      # The two signal tests are skipped as on Linux: TSan holds a signal
+      # back until the thread next calls a function it intercepts, and a
+      # worker waiting in kevent calls none.
+      - run: >
+          cargo test -Zbuild-std --target aarch64-apple-darwin -p giong --all-features --tests
+          -- --skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned
