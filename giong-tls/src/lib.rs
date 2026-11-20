@@ -1416,7 +1416,12 @@ impl TlsStream {
     /// to go out before anything else. The caller holds the send lock.
     fn take_wire(&self) -> Vec<u8> {
         let mut wire = mem::take(&mut *self.wire.borrow_mut());
-        wire.append(&mut self.unsent.borrow_mut());
+        let mut unsent = self.unsent.borrow_mut();
+        if unsent.capacity() > 0 {
+            wire.extend_from_slice(&unsent);
+            // Not `clear`: an idle connection keeps no buffer for this.
+            *unsent = Vec::new();
+        }
         wire
     }
 
@@ -1534,8 +1539,13 @@ impl TlsStream {
                 )
             };
             if n >= 0 {
-                // What the socket did not take waits in `unsent`.
-                unsent.drain(..n as usize);
+                if n as usize == unsent.len() {
+                    // All sent: an idle connection keeps no buffer for this.
+                    *unsent = Vec::new();
+                } else {
+                    // What the socket did not take waits in `unsent`.
+                    unsent.drain(..n as usize);
+                }
                 return Ok(());
             }
             let e = io::Error::last_os_error();
@@ -1544,7 +1554,7 @@ impl TlsStream {
                 io::ErrorKind::WouldBlock => return Ok(()),
                 _ => {
                     self.broken.set(true);
-                    unsent.clear();
+                    *unsent = Vec::new();
                     return Err(e);
                 }
             }
@@ -2402,7 +2412,9 @@ mod tests {
                 }
                 FLUSH_ROOM.set(usize::MAX);
                 tls.write_all(&b"after the tickets"[..]).await.0.unwrap();
-                assert!(tls.unsent.borrow().is_empty());
+                // Sent, and the buffer given back: an idle connection keeps
+                // none for this.
+                assert_eq!(tls.unsent.borrow().capacity(), 0);
                 tls.shutdown().await.unwrap();
             });
             let tcp = TcpStream::connect(addr).await.unwrap();
@@ -2416,6 +2428,41 @@ mod tests {
                 got.extend_from_slice(&data);
             }
             assert_eq!(got, b"after the tickets");
+            assert!(tls.received_close_notify());
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_receive_that_sent_what_was_owed_keeps_no_buffer_for_it() {
+        // A TLS 1.3 server's first receive sends its session tickets. The
+        // buffer they pass through is given back once they are sent: 2,000
+        // idle connections held about 200 bytes each when it was kept.
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = key.cert.pem();
+        let acceptor =
+            TlsAcceptor::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+                .unwrap();
+        let connector = TlsConnector::with_root_pem(cert.as_bytes()).unwrap();
+        giong::block_on(async move {
+            let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = giong::spawn(async move {
+                let tcp = listener.accept().await.unwrap();
+                let tls = acceptor.accept(tcp).await.unwrap();
+                assert!(tls.conn().wants_write(), "tickets wait for the first send");
+                // The client sends nothing, so this receive has to wait,
+                // and sends them first.
+                let mut recv = std::pin::pin!(tls.recv());
+                let ready = poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_ready())).await;
+                assert!(!ready);
+                assert!(!tls.conn().wants_write());
+                assert_eq!(tls.unsent.borrow().capacity(), 0);
+                tls.shutdown().await.unwrap();
+            });
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let tls = connector.connect("localhost", tcp).await.unwrap();
+            assert!(tls.recv().await.unwrap().is_empty());
             assert!(tls.received_close_notify());
             server.await.unwrap();
         });
