@@ -1,0 +1,8 @@
+2026-11-16T19:47:52Z soak start (259200 s, driver epoll)
+2026-11-16T19:47:52Z sim pass 1 start: GIONG_SIM_SEEDS=1000 GIONG_SIM_SOAK_DAYS=3650
+2026-11-16T19:56:38Z sim pass 1 exit 101: 20 passed, 1 failed; soak: 3650.0 simulated days, 1051200 requests, 34901624 steps, 30.192305787s real
+2026-11-16T19:56:38Z sim pass 2 start: GIONG_SIM_SEEDS=4000 GIONG_SIM_SOAK_DAYS=7300
+2026-11-16T20:16:48Z sim pass 2 exit 101: 20 passed, 1 failed; soak: 7300.0 simulated days, 2102400 requests, 69315125 steps, 63.24800197s real
+2026-11-16T20:16:48Z sim pass 3 start: GIONG_SIM_SEEDS=16000 GIONG_SIM_SOAK_DAYS=14600
+2026-11-16T20:22:20Z sim long runs stopped (host memory risk, coordinator decision); main loop pid 774752 stopped, the soak subshell 774997 continues
+2026-11-19T19:48:22Z soak exit soak exit 0: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 259229.77s

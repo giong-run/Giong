@@ -17,7 +17,7 @@ members = [".", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "gio
 exclude = ["bench", "sim"]
 
 [dependencies]
-io-uring = "0.7"
+io-uring = "0.7.2"
 libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
 

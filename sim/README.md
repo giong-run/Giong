@@ -16,10 +16,10 @@ cd sim && cargo test --release
 ## How it works
 
 A test binary that links `giong-sim` defines the libc functions the runtime
-calls (`socket`, `connect`, `send`, `recv`, `epoll_wait`, `eventfd`,
-`clock_gettime`, `nanosleep`, `futex` through `syscall`, `getrandom`,
-`pthread_create`, `openat`, `pread64` and more), and the dynamic linker
-prefers the executable's symbols to libc's. Inside `Sim::run`:
+calls (`socket`, `connect`, `send`, `recv`, `recvmmsg`, `sendmmsg`,
+`epoll_wait`, `eventfd`, `clock_gettime`, `nanosleep`, `futex` through
+`syscall`, `getrandom`, `pthread_create`, `openat`, `pread64` and more), and
+the dynamic linker prefers the executable's symbols to libc's. Inside `Sim::run`:
 
 - **Network**: TCP, UDP and Unix sockets between sockets of the process, in
   memory, with Linux's rules where tests depend on them (port sharing with
@@ -56,7 +56,7 @@ compares runs; `Report::first_difference` finds where two runs part.
 
 | Test | What it checks |
 |---|---|
-| `suite` | The core crate's own tests (`tests/*.rs` of the root crate), each in a child process: 180 pass, 17 are skipped with a reason (see `build.rs`). `GIONG_SIM_FAULTS=loopback` runs them under faults. |
+| `suite` | The core crate's own tests (`tests/*.rs` of the root crate), each in a child process: 183 pass, 17 are skipped with a reason (see `build.rs`). `GIONG_SIM_FAULTS=loopback` runs them under faults. |
 | `basics`, `workers` | Virtual time, turn taking, the same seed giving the same trace, a seed replaying the same in a fresh process. |
 | `hostile` | A TCP echo server and its clients under 100 hostile seeds; benign faults never show as errors; a partition makes connects time out. |
 | `http` | giong-http over plain TCP, TLS and HTTP/2: a response never goes to the wrong request, benign faults never show as errors. |

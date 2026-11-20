@@ -63,6 +63,34 @@ request; everything else is automated and safe to re-run.
    [Release](https://github.com/giong-run/Giong/releases/latest), the crate pages on
    crates.io (the README, including the dark-mode logo) and https://giong.run.
 
+## Release candidates of 1.0
+
+Every `1.0.0-rc.N` says which soaked code it stands on and what changed since. The release
+pull request carries this checklist, filled in, in its description:
+
+1. **The soaked commit**: its hash and tree, the machines, both drivers' start and end
+   times, and the results directory under `bench/results/` (for 0.9: tree `f1b23074`,
+   commits `674c42c` and `003d9e5`, PR #155).
+2. **The release commit**: the hash the release pull request is based on.
+3. **What changed between them**: `git diff --stat <soaked>..<release> -- src giong-*/src`
+   pasted in, and each pull request in that range listed with one of:
+   - *soak path*: it changes `src/driver/`, `src/op.rs`, `src/buf.rs`, `src/kbox.rs`,
+     `src/slab.rs`, `src/runtime.rs`, `src/executor.rs`, `src/time.rs`, `src/net.rs`,
+     `src/net/`, `src/sync/`, `src/fs.rs`, or the connection, HTTP/2 or TLS state of
+     `giong-http` and `giong-tls`, in lines that run (doc comments do not count);
+   - *outside*: everything else (the database crates, `giong-web`, `giong-mcp`, docs,
+     benches, tests).
+4. **The tests run again on the release commit**, each named with its run: the full CI
+   set (kernels 5.15 to 6.18, both drivers, TSan, loom, Kani, the simulation soak), the
+   cancellation tests of STABILITY.md's *Cancellation* section on both drivers, and for
+   each *soak path* pull request the tests it added or that cover the code it changed.
+5. **The soak decision and its basis**: whether the release commit is soaked again before
+   the tag, and why. For 1.0.0-rc.1 the maintainer decided (2026-11-20) that the 0.9 soak
+   stands: the soak-path changes since tree `f1b23074` are small (#134's bind, the channel,
+   UDP and close fixes), the tests of item 4 cover them, and the next full 72-hour soak on
+   both drivers runs on a later candidate or 1.x release, recorded the same way.
+6. **The removals**: every item of STABILITY.md's *Changes made before 1.0* checked off.
+
 ## When something fails
 
 Every step is idempotent: versions already on crates.io are skipped and an existing

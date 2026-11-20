@@ -56,22 +56,54 @@ impl Drop for Readers {
     }
 }
 
-/// A port no socket held a moment ago, found before the readers start.
-fn free_addr() -> SocketAddr {
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let addr = sock.local_addr().unwrap();
-    let tcp = std::net::TcpListener::bind(addr);
-    drop((sock, tcp));
-    addr
+/// Binds the first free port of `ports` with `bind`, starting at a random
+/// one, and returns its address with the socket.
+///
+/// The bind under test is itself what finds the port. Binding a socket of
+/// the standard library to port 0 and closing it would not do: that port is
+/// in the range the kernel hands out to every connection of the machine, so
+/// another process can hold it in TCP, and the closed socket itself keeps
+/// the port for a moment when the readers of the other test are running
+/// (both failed the first bind on CI). `ports` lies below that range, and
+/// each test has its own.
+fn bind_free<T>(
+    ports: std::ops::Range<u16>,
+    bind: impl Fn(SocketAddr) -> std::io::Result<T>,
+) -> (SocketAddr, T) {
+    use std::hash::{BuildHasher, Hasher};
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let len = u64::from(ports.end - ports.start);
+    for i in 0..len {
+        let port = ports.start + ((random + i) % len) as u16;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        match bind(addr) {
+            Ok(socket) => return (addr, socket),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(e) => panic!("bind of {addr} failed: {e}"),
+        }
+    }
+    panic!("no free port in {ports:?}");
+}
+
+/// Where the ports the kernel hands out by itself begin.
+fn ephemeral_start() -> u16 {
+    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+    assert!(low > 12_000, "no room below the ephemeral range at {low}");
+    low
 }
 
 const RUN_FOR: Duration = Duration::from_secs(2);
 
 #[test]
 fn a_udp_port_can_be_bound_again_at_once_while_proc_is_read() {
-    let addr = free_addr();
+    let ports = 10_000..10_000 + (ephemeral_start() - 10_000) / 2;
     let readers = Readers::start(2);
     giong::block_on(async move {
+        let (addr, found) = bind_free(ports, UdpSocket::bind);
+        drop(found);
         let started = Instant::now();
         let mut binds = 0u64;
         while started.elapsed() < RUN_FOR {
@@ -91,9 +123,11 @@ fn a_udp_port_can_be_bound_again_at_once_while_proc_is_read() {
 
 #[test]
 fn a_tcp_port_can_be_bound_again_at_once_while_proc_is_read() {
-    let addr = free_addr();
+    let ports = 10_000 + (ephemeral_start() - 10_000) / 2..ephemeral_start();
     let readers = Readers::start(2);
     giong::block_on(async move {
+        let (addr, found) = bind_free(ports, TcpListener::bind);
+        drop(found);
         let started = Instant::now();
         let mut binds = 0u64;
         while started.elapsed() < RUN_FOR {
