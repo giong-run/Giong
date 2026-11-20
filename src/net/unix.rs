@@ -64,7 +64,7 @@ impl UnixListener {
     ///
     /// Cancel safe: dropping the future loses no connection.
     pub async fn accept(&self) -> io::Result<UnixStream> {
-        let inner = self.inner.accept().await?;
+        let inner = self.inner.accept().await?.unix();
         Ok(UnixStream { inner })
     }
 }
@@ -96,9 +96,7 @@ impl UnixStream {
     /// connection is left behind.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let addr = SockAddr::unix(path)?;
-        let inner = StreamSocket::connect(new_socket()?, addr)
-            .await?
-            .without_zero_copy();
+        let inner = StreamSocket::connect(new_socket()?, addr).await?.unix();
         Ok(Self { inner })
     }
 
@@ -106,7 +104,7 @@ impl UnixStream {
     pub fn pair() -> io::Result<(Self, Self)> {
         let (a, b) = Socket::pair(Domain::UNIX, Type::STREAM, None)?;
         let wrap = |sock| Self {
-            inner: StreamSocket::new(sock).without_zero_copy(),
+            inner: StreamSocket::new(sock).unix(),
         };
         Ok((wrap(a), wrap(b)))
     }
@@ -116,7 +114,7 @@ impl UnixStream {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
         Self {
-            inner: StreamSocket::new(sock).without_zero_copy(),
+            inner: StreamSocket::new(sock).unix(),
         }
     }
 

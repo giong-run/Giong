@@ -819,6 +819,15 @@ impl Driver {
         }
     }
 
+    /// Stops a multishot receive that is waiting in the kernel, so that the
+    /// reader's next poll starts it again (io_uring; the epoll driver reads
+    /// when the socket is readable and misses nothing).
+    pub(crate) fn restart_multi(&mut self, key: usize) {
+        if let Driver::Uring(d) = self {
+            d.restart_multi(key);
+        }
+    }
+
     /// A future that waited on multishot operation `key` with `waker` was
     /// dropped (see `net::Waiting`).
     pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {
