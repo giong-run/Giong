@@ -78,6 +78,8 @@ mod error;
 mod h2;
 #[cfg(feature = "unstable-http3")]
 mod h3;
+#[cfg(all(any(test, fuzzing), feature = "unstable-http3"))]
+pub(crate) mod h3_hostile;
 #[cfg(all(test, feature = "unstable-http3"))]
 mod h3_tests;
 mod head;

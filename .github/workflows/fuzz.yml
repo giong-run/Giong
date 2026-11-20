@@ -91,6 +91,7 @@ jobs:
           { "crate": "giong-http", "target": "h2_client" }
           { "crate": "giong-http", "target": "h3" }
           { "crate": "giong-http", "target": "h3_server" }
+          { "crate": "giong-http", "target": "h3_client" }
           { "crate": "giong-postgres", "target": "messages" }
           { "crate": "giong-postgres", "target": "scram" }
           { "crate": "giong-postgres", "target": "url" }

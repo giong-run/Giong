@@ -10,10 +10,9 @@ use std::time::Duration;
 
 use giong_quic::{ClientConfig, Connection, Endpoint, SendStream, ServerConfig};
 
+use super::h3_hostile::{ask, data, headers, pattern, serve, Data, Seeded, Source};
 use super::{Client, ClientBuilder, ErrorKind};
-use crate::h2::hpack::Index;
 use crate::h3::frame::{self, kind, Header, Settings};
-use crate::h3::qpack::Encoder;
 use crate::{Body, Handler, Request, Response, Server, Version};
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -47,10 +46,6 @@ fn run<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F) {
         .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
         .block_on(test())
         .unwrap();
-}
-
-fn pattern(n: usize) -> Vec<u8> {
-    (0..n).map(|i| (i * 31 + i / 253) as u8).collect()
 }
 
 /// A server endpoint on a port of its own, the address to reach it at, and
@@ -225,29 +220,6 @@ async fn request(conn: &Connection) -> SendStream {
     let (send, mut recv) = conn.accept_bi().await.unwrap();
     recv.read_to_end(1 << 20).await.unwrap();
     send
-}
-
-/// A HEADERS frame.
-fn headers(status: Option<u16>, fields: &[(&str, &str)]) -> Vec<u8> {
-    let mut block = Vec::new();
-    Encoder::begin(&mut block);
-    if let Some(status) = status {
-        Encoder::status(status, &mut block);
-    }
-    for (name, value) in fields {
-        Encoder::field(name.as_bytes(), value.as_bytes(), Index::Yes, &mut block);
-    }
-    let mut out = Vec::new();
-    Header::write(&mut out, kind::HEADERS, block.len() as u64);
-    out.extend_from_slice(&block);
-    out
-}
-
-fn data(body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    Header::write(&mut out, kind::DATA, body.len() as u64);
-    out.extend_from_slice(body);
-    out
 }
 
 /// Answers every request on one connection with what `answer` gives for
@@ -870,4 +842,64 @@ mod alt_svc {
             assert_eq!(res.version(), Version::Http3);
         });
     }
+}
+
+/// Requests to servers that do what `source` says, a new server and a
+/// new client for each seed; gives how many were answered and how many
+/// failed.
+async fn against_hostile_servers<S: Source>(source: impl Fn(u64) -> S) -> (usize, usize) {
+    let (mut answered, mut failed) = (0, 0);
+    for seed in 1..=120u64 {
+        let (endpoint, url, client) = pair();
+        let mut src = source(seed);
+        let mut fork = src.fork();
+        let server = giong::spawn(async move {
+            while let Some(conn) = endpoint.accept().await {
+                drop(giong::spawn(serve(conn, fork.fork())));
+            }
+        });
+        for _ in 0..4 {
+            // Some one after another, some at once.
+            let mut tasks = Vec::new();
+            for _ in 0..1 + src.below(6) {
+                let (client, url) = (client.clone(), format!("{url}/"));
+                tasks.push(giong::spawn(async move { ask(&client, &url).await }));
+            }
+            for task in tasks {
+                match task.await {
+                    Ok(true) => answered += 1,
+                    Ok(false) => failed += 1,
+                    Err(_) => panic!("seed {seed}: a request panicked"),
+                }
+            }
+        }
+        drop(client);
+        server.abort();
+    }
+    (answered, failed)
+}
+
+#[test]
+fn a_hostile_server_neither_hangs_nor_fools_the_client() {
+    run(|| async {
+        let (answered, failed) =
+            against_hostile_servers(|seed| Seeded(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15))).await;
+        // Both happen, or the test checks nothing.
+        assert!(answered > 300, "{answered} answered, {failed} failed");
+        assert!(failed > 50, "{answered} answered, {failed} failed");
+    });
+}
+
+/// The same from bytes, as the `h3_client` fuzz target reads them.
+#[test]
+fn a_hostile_server_made_of_fuzz_data_neither_hangs_nor_fools_the_client() {
+    run(|| async {
+        let (answered, failed) = against_hostile_servers(|seed| {
+            let mut rng = Seeded(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            Data::new(&rng.bytes(400))
+        })
+        .await;
+        assert!(answered > 300, "{answered} answered, {failed} failed");
+        assert!(failed > 50, "{answered} answered, {failed} failed");
+    });
 }
