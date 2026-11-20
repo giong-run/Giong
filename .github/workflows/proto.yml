@@ -32,12 +32,16 @@ jobs:
         with:
           toolchain: stable
       # Building the runner takes about 10 minutes; it changes only with the tag.
+      # The runner loads the jsoncpp library that the build fetches and builds
+      # beside it, so the cache holds both.
       - name: Restore the conformance runner
         id: runner
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: giong-proto/conformance/target/protobuf/build/conformance_test_runner
-          key: protobuf-conformance-runner-${{ env.PROTOBUF_TAG }}-ubuntu-24.04
+          path: |
+            giong-proto/conformance/target/protobuf/build/conformance_test_runner
+            giong-proto/conformance/target/protobuf/build/**/libjsoncpp.so*
+          key: protobuf-conformance-runner-${{ env.PROTOBUF_TAG }}-ubuntu-24.04-2
       - name: Install build tools
         if: steps.runner.outputs.cache-hit != 'true'
         run: sudo apt-get update && sudo apt-get install -y ninja-build cmake

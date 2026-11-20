@@ -46,3 +46,27 @@ fn differential_against_prost() {
     }
     eprintln!("{cases} inputs: {stats:#?}");
 }
+
+/// Found by the `differential` fuzz target: field 234 881 008 as fixed32,
+/// its tag padded to 6 bytes. giong-proto refuses a tag of more than 5
+/// bytes, as Google's C++ does; prost reads it.
+#[test]
+fn overlong_tag_is_a_known_difference() {
+    use giong_proto_conformance::diff::Divergence;
+    let input = [0x85, 0xff, 0xff, 0xff, 0x86, 0x00, 0x00, 0x20, 0x00, 0x24];
+    for check in [check_proto3, check_proto2] {
+        match check(&input) {
+            Ok(Outcome::Known(Divergence::OverlongTag)) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    // The same field with a 5-byte tag is read by both.
+    let input = [0x85, 0xff, 0xff, 0xff, 0x06, 0x00, 0x20, 0x00, 0x24];
+    for check in [check_proto3, check_proto2] {
+        assert!(
+            matches!(check(&input), Ok(Outcome::BothAccepted)),
+            "{:?}",
+            check(&input)
+        );
+    }
+}

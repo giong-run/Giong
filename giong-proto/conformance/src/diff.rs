@@ -25,6 +25,10 @@ pub enum Divergence {
     /// kept as an unknown field (so it moves to the end on re-encoding).
     /// prost: stored as the field's value.
     ClosedEnumUnknown,
+    /// A field tag is a varint of more than 5 bytes whose value still fits
+    /// 32 bits (padded with continuation bytes). Google's C++: an error.
+    /// prost: accepted.
+    OverlongTag,
 }
 
 /// The result of one check.
@@ -88,10 +92,19 @@ macro_rules! check_fn {
                     let msg = pe.to_string();
                     Err(format!("prost rejects ({msg}) but giong accepts: {g:?}"))
                 }
+                (Ok(_), Err(ge)) if ge.kind() == giong_proto::ErrorKind::BadTag && has_long_varint(bytes) => {
+                    Ok(Outcome::Known(Divergence::OverlongTag))
+                }
                 (Ok(p), Err(ge)) => Err(format!("giong rejects ({ge}) but prost accepts: {p:?}")),
             }
         }
     };
+}
+
+/// Whether `bytes` holds a varint of more than 5 bytes anywhere: 5 bytes in
+/// a row with the continuation bit. Without one, no tag can be overlong.
+fn has_long_varint(bytes: &[u8]) -> bool {
+    bytes.windows(5).any(|w| w.iter().all(|&b| b >= 0x80))
 }
 
 check_fn!(

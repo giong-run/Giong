@@ -96,6 +96,7 @@ dependencies = [
 name = "giong-grpc-build"
 version = "0.7.0"
 dependencies = [
+ "prost",
  "prost-types",
  "protox",
 ]

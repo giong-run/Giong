@@ -16,7 +16,7 @@ pub enum ErrorKind {
     /// 64 bits.
     BadVarint,
     /// `GIONG-E4003`: a field tag has field number 0, a number above
-    /// 536 870 911, or wire type 6 or 7.
+    /// 536 870 911, wire type 6 or 7, or more than 5 bytes.
     BadTag,
     /// `GIONG-E4004`: an end-group tag without its start, with another
     /// field number, or a group the input ends inside.
