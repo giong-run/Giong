@@ -63,23 +63,34 @@ change (sends of one turn in one `sendmmsg`, busy sockets out of the epoll set; 
 ## Bare metal
 
 The same benchmark on an AMD EPYC 4345P (8 cores, SMT on), Linux 7.0.0-43, server on CPU 1,
-client on CPUs 2-3, with this branch at 997b290, on 2026-11-19
-(`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-tasks16/` and
-`-tasks1/`, `raw.csv` with every round). The server core is saturated: the kernel × 32 server
-spends 0.98 µs of process CPU per echo, and the runtimes 1.08 to 1.17.
+client on CPUs 2-3, with this branch at f3310e5, on 2026-11-19
+(`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-epoll-tasks16/` and
+`-tasks1/`, `raw.csv` with every round; the runtime before the send queue, 997b290, in
+`udp-udp-faster-*`). The server core is saturated: the kernel × 32 server spends 0.99 µs of
+process CPU per echo, and the runtimes 1.08 to 1.17.
 
 | Echoes per second, median (min–max) | 16 tasks | 1 task |
 |---|---:|---:|
-| giong io_uring | 856,470 (851,552–874,909) | **925,683** (878,573–939,792) |
-| giong epoll | 878,742 (859,516–888,652) | 874,499 (859,842–906,975) |
-| Tokio | 870,331 (868,070–929,761) | 882,456 (872,631–937,811) |
-| kernel × 32 | 1,011,149 | 1,018,481 |
+| giong epoll | **920,836** (904,872–926,239) | **892,565** (881,529–906,552) |
+| giong io_uring | **902,459** (895,390–914,320) | 875,632 (863,835–927,756) |
+| Tokio | 870,488 (855,699–877,000) | 863,001 (851,625–897,835) |
+| kernel × 32 | 1,009,532 | 1,028,443 |
 
-Rounds in which giong beat Tokio: io_uring 1 of 5 (16 tasks) and 4 of 5 (1 task), epoll 2 of
-5 and 1 of 5. So on bare metal this change loses to Tokio with io_uring and 16 tasks (1.6% in
-the median) and with epoll and one task (0.9%), ties with epoll and 16 tasks, and wins with
-io_uring and one task (4.9%). Every runtime moves between two levels from round to round
-(about 870k and 930k), so differences under about 5% are within noise.
+Server process CPU per echo (median, µs): 16 tasks epoll 1.085, io_uring 1.107, Tokio 1.148;
+1 task 1.119, 1.141, 1.157.
+
+Rounds in which giong beat Tokio: with 16 tasks 5 of 5 on both drivers (5.8% and 3.7% in the
+median); with one task 4 of 5 on epoll and 3 of 5 on io_uring (3.4% and 1.5%, one of those
+wins by 0.1%). So 16 tasks is a clear win and one task a tie within noise: every runtime moves
+between two levels from round to round (about 870k and 930k). Before the send queue (997b290)
+giong lost to Tokio with io_uring and 16 tasks (856,470 against 870,331) and with epoll and one
+task (874,499 against 882,456).
+
+`perf stat` on the server for 8 s (`post-soak/udp-perf/`): with 16 tasks giong io_uring made
+328,444 `io_uring_enter` and 547,405 `sendmmsg` calls, about 0.12 per echo, where Tokio made
+6,857,450 `sendto`; with one task giong makes one `sendto` per echo
+(6,720,819) and 203,662 `io_uring_enter`. Most of an echo's cost is the kernel's UDP and veth
+path, including 6.6% in nftables (the host's firewall on veth, the same for every server).
 
 To reproduce:
 

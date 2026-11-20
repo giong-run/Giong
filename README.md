@@ -979,21 +979,24 @@ between rounds: giong on either driver is ahead of Tokio in every round with one
 four of five with 16 (in the other, Tokio's 324,148 beat both, also on CPU per echo).
 
 On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark over veth, server on one core;
-`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-faster-*`), the server core
-is saturated near a million echoes a second and the runtimes are close:
+`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-epoll-*`), the server core
+is saturated near a million echoes a second and the margins are much smaller:
 
 | Echoes per second (median of 5, range) | 16 tasks on one socket | 1 task |
 |---|---:|---:|
-| giong, io_uring | 856,470 (851,552–874,909) | **925,683** (878,573–939,792) |
-| giong, epoll | 878,742 (859,516–888,652) | 874,499 (859,842–906,975) |
-| Tokio | 870,331 (868,070–929,761) | 882,456 (872,631–937,811) |
-| Kernel × 32 | 1,011,149 | 1,018,481 |
+| giong, epoll | **920,836** (904,872–926,239) | **892,565** (881,529–906,552) |
+| giong, io_uring | **902,459** (895,390–914,320) | 875,632 (863,835–927,756) |
+| Tokio | 870,488 (855,699–877,000) | 863,001 (851,625–897,835) |
+| Kernel × 32 | 1,009,532 | 1,028,443 |
 
-Here this change alone loses to Tokio in two places: io_uring with 16 tasks (1.6% behind in
-the median, ahead in one round of five) and epoll with one task (0.9% behind, ahead in one
-round of five). epoll with 16 tasks ties (1.0% ahead in the median, two rounds of five);
-io_uring with one task is ahead (4.9%, four rounds of five). Rounds move between two levels
-(about 870k and 930k) for every runtime, so differences under about 5% are within noise.
+With 16 tasks giong wins clearly: 5.8% (epoll) and 3.7% (io_uring) ahead of Tokio in the
+median, ahead in every round, at 1.09 and 1.11 µs of server process CPU per echo against
+Tokio's 1.15 (kernel × 32: 0.99). With one task it only ties: ahead in the median (3.4% and
+1.5%) but behind Tokio in one round of five on epoll and two on io_uring. Every runtime moves
+between two levels from round to round (about 870k and 930k), so differences under about 5%
+are within noise. Most of an echo's cost here is the kernel's UDP and veth path: with 16 tasks
+giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for each one
+(`post-soak/udp-perf/`).
 
 ### What has not been measured
 
