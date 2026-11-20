@@ -304,6 +304,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   answers the key update like any other. A kernel TLS handshake makes a few more small
   reads for it (two per record of the peer's later flights); handshakes in the process
   are unchanged.
+- **giong-tls**: the fix for a cancelled `recv` above made every idle TLS connection hold
+  the buffer its session tickets had passed through: about 200 bytes more heap per idle
+  HTTPS connection (10,981 bytes on io_uring against the 10,784 recorded before it). The
+  buffer is now given back as soon as it is empty: 10,798 bytes on io_uring and 10,849 on
+  epoll (`instr`, 2,000 idle connections), within 30 bytes of the figures recorded before
+  the fix (10,784 and 10,821). What stays of that fix's cost is one field in the stream
+  and two checks per write: 0.4% more instructions per HTTPS request (44,780 against
+  44,604 on io_uring, 43,255 against 43,090 on epoll).
 - **giong-http**: an idle HTTP/2 connection took 61% more resident memory in 0.8.0 than in
   0.5.0 (6.78 KiB against 4.21 on bare metal, `bench/h2.sh`, 5,000 connections that made
   one request each). Since 0.8.0 a connection kept the memory for its streams for a second
