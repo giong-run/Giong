@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "0.8.0"
+version = "1.0.0-rc.1"
 dependencies = [
  "io-uring 0.7.16",
  "libc",

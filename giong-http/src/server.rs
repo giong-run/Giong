@@ -796,10 +796,10 @@ impl Server {
     /// # use giong_http::{Request, Response, Server};
     /// # async fn handler(_: Request) -> Response { Response::new(200) }
     /// # async fn demo() -> std::io::Result<()> {
-    /// let acceptor = giong_tls::TlsAcceptor::from_pem(
+    /// let acceptor = giong_tls::TlsAcceptor::with_certificates(&giong_tls::Certificates::from_pem(
     ///     &std::fs::read("cert.pem")?,
     ///     &std::fs::read("key.pem")?,
-    /// )?;
+    /// )?)?;
     /// let listener = TcpListener::bind("0.0.0.0:8443")?;
     /// Server::new().serve_tls(listener, acceptor, handler).await;
     /// # Ok(())

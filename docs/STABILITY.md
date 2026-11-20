@@ -201,12 +201,12 @@ from a 1.x release unless it turns a new policy on.
 ## Changes made before 1.0
 
 Breaking changes are refused between releases (`scripts/semver.sh`), so the few the API
-review left for 1.0 are made together by one release pull request, the first after the
-0.9 soak (0.9.0 or 1.0.0-rc.1, see [RELEASING.md](RELEASING.md)). Nothing uses giong in
-production yet, so no deprecated alias is kept: old names go outright. This list is that
-pull request's checklist:
+review left for 1.0 were made together by one release pull request, that of 1.0.0-rc.1
+(see [RELEASING.md](RELEASING.md)). Nothing used giong in production yet, so no deprecated
+alias was kept: old names went outright. This list was that pull request's checklist, and
+every item of it is done:
 
-- every item deprecated during 0.9 is removed, each listed under *Removed* with the name
+- every item deprecated after 0.8 is removed, each listed under *Removed* with the name
   that replaces it: `Error::code` in giong-postgres and giong-mysql (`server_code`),
   `Config::dbname` in giong-postgres (`database`), `giong::sync::mpsc::channel`
   (`unbounded`), `TlsAcceptor::new` and `TlsConnector::new` (`from_rustls`, or the stable
@@ -219,4 +219,7 @@ pull request's checklist:
 - the texts that describe keeping aliases (the freeze record, RELEASING.md, the
   *Deprecated* section of CHANGELOG.md) say what was done instead;
 - `giong_mcp::FromEnv` becomes `#[non_exhaustive]`, like every other enum that is not
-  complete by nature.
+  complete by nature;
+- three shortcuts that repeated another function go, so that each task has one spelling:
+  `TlsAcceptor::from_pem` (`with_certificates` with `Certificates::from_pem`),
+  `giong_redis::Cmd::new` (`cmd`) and `giong::observe::register_rc` (`register`).

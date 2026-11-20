@@ -439,9 +439,11 @@ async fn https(m: &Meter) {
     // records' cost does not depend on the key.
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key");
     let cert = key.cert.pem();
-    let acceptor =
-        giong_tls::TlsAcceptor::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+    let certs =
+        giong_tls::Certificates::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
             .expect("the test certificate");
+    let acceptor =
+        giong_tls::TlsAcceptor::with_certificates(&certs).expect("the test certificate");
     let _server =
         giong::spawn(async move { Server::new().serve_tls(listener, acceptor, json).await });
     let connector = giong_tls::TlsConnector::with_root_pem(cert.as_bytes()).expect("the test root");
@@ -501,11 +503,13 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
     if proto == Proto::Https {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key");
         let cert = key.cert.pem();
-        let acceptor = giong_tls::TlsAcceptor::from_pem(
+        let certs = giong_tls::Certificates::from_pem(
             cert.as_bytes(),
             key.key_pair.serialize_pem().as_bytes(),
         )
         .expect("the test certificate");
+        let acceptor =
+            giong_tls::TlsAcceptor::with_certificates(&certs).expect("the test certificate");
         let _server =
             giong::spawn(async move { Server::new().serve_tls(listener, acceptor, json).await });
         // One request first, so whatever the server sets up once is not

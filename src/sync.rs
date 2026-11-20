@@ -16,12 +16,12 @@ pub mod mpsc {
     //! Tokio's `mpsc::channel(n)` is [`bounded`]`(n)` here, and its
     //! `unbounded_channel()` is [`unbounded`]`()`.
     //!
-    //! The halves are [`UnboundedSender`] and [`UnboundedReceiver`], and
-    //! [`BoundedSender`] and [`BoundedReceiver`]. In 1.0.0 the bounded ones
-    //! also take the short names `Sender` and `Receiver`, as in Tokio, so the
-    //! short name is the channel that holds its memory to a bound.
+    //! The halves of the bounded channel are [`Sender`] and [`Receiver`], as in
+    //! Tokio, so the short name is the channel that holds its memory to a
+    //! bound; the unbounded ones are [`UnboundedSender`] and
+    //! [`UnboundedReceiver`].
 
-    pub use super::bounded::{bounded, BoundedReceiver, BoundedSender, TrySendError};
+    pub use super::bounded::{bounded, Receiver, Sender, TrySendError};
 
     use std::collections::VecDeque;
     use std::fmt;
@@ -65,16 +65,6 @@ pub mod mpsc {
         )
     }
 
-    /// Creates an unbounded channel.
-    #[deprecated(
-        since = "0.9.0",
-        note = "renamed unbounded(), so that it is not taken for Tokio's bounded \
-                channel(n), which is bounded(n) here; it goes in 1.0.0"
-    )]
-    pub fn channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
-        unbounded()
-    }
-
     /// The sending half. Cheap to clone; `Send` when `T` is.
     pub struct UnboundedSender<T> {
         shared: Arc<Shared<T>>,
@@ -92,23 +82,7 @@ pub mod mpsc {
         taken: Mutex<VecDeque<T>>,
     }
 
-    /// The old name of [`UnboundedSender`].
-    #[deprecated(
-        since = "0.9.0",
-        note = "renamed UnboundedSender; in 1.0.0 Sender names the bounded channel's \
-                sender, as in Tokio"
-    )]
-    pub type Sender<T> = UnboundedSender<T>;
-
-    /// The old name of [`UnboundedReceiver`].
-    #[deprecated(
-        since = "0.9.0",
-        note = "renamed UnboundedReceiver; in 1.0.0 Receiver names the bounded channel's \
-                receiver, as in Tokio"
-    )]
-    pub type Receiver<T> = UnboundedReceiver<T>;
-
-    /// Returned by [`UnboundedSender::send`] and [`BoundedSender::send`] when the receiver
+    /// Returned by [`UnboundedSender::send`] and [`Sender::send`] when the receiver
     /// is gone; holds the value.
     pub struct SendError<T>(pub T);
 
@@ -126,7 +100,7 @@ pub mod mpsc {
 
     impl<T> std::error::Error for SendError<T> {}
 
-    /// Why [`UnboundedReceiver::try_recv`] or [`BoundedReceiver::try_recv`] returned
+    /// Why [`UnboundedReceiver::try_recv`] or [`Receiver::try_recv`] returned
     /// no value.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum TryRecvError {

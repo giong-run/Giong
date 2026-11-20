@@ -12,7 +12,7 @@ use giong::net::{TcpListener, TcpStream};
 use giong::time::sleep;
 use giong_http::client::{Client, ErrorKind, Proxy};
 use giong_http::{Request, Response, Server};
-use giong_tls::{TlsAcceptor, TlsConnector};
+use giong_tls::{Certificates, TlsAcceptor, TlsConnector};
 
 // ------------------------------------------------------------------ harness
 
@@ -772,7 +772,10 @@ where
     Fut: Future<Output = Response> + 'static,
 {
     let (cert, key) = certificate();
-    let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+    )
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     giong::spawn(async move { Server::new().serve_tls(listener, acceptor, handler).await });
@@ -865,7 +868,10 @@ fn a_tls_handshake_that_never_ends_hits_the_connect_timeout() {
 fn an_https_body_that_ends_with_the_connection_needs_close_notify() {
     giong::block_on(async {
         let (cert, key) = certificate();
-        let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+        )
+        .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         // A response without a length, so its body ends where the connection

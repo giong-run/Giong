@@ -11,7 +11,7 @@ use giong::net::TcpListener;
 use giong::time::timeout;
 use giong_tls::rustls::pki_types::{CertificateDer, ServerName};
 use giong_tls::rustls::{self, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use giong_tls::{TlsAcceptor, TlsStream};
+use giong_tls::{Certificates, TlsAcceptor, TlsStream};
 
 type Client = StreamOwned<ClientConnection, TcpStream>;
 
@@ -25,7 +25,10 @@ fn certs(versions: &[&'static rustls::SupportedProtocolVersion]) -> Certs {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = key.cert.pem();
     let key_pem = key.key_pair.serialize_pem();
-    let acceptor = TlsAcceptor::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
 
     let mut roots = RootCertStore::empty();
     roots

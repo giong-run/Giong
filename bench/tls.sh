@@ -37,7 +37,7 @@
 #     server without a cache of open files does.
 #   * `axum-tls-aes128` is axum-tls with its rustls configuration set to
 #     pick AES-128-GCM first whatever order the client lists, as giong-tls'
-#     `TlsAcceptor::from_pem` does. wrk (OpenSSL) lists AES-256-GCM first,
+#     `TlsAcceptor::with_certificates` does. wrk (OpenSSL) lists AES-256-GCM first,
 #     which the other rustls servers follow; its suite hashes with SHA-384,
 #     which costs a resumed handshake about a sixth of its CPU time. The row
 #     shows how much of giong's handshake rate is that choice.

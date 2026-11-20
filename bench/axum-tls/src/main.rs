@@ -42,7 +42,7 @@ async fn main() {
     let cert = std::env::var("TLS_CERT").expect("TLS_CERT");
     let key = std::env::var("TLS_KEY").expect("TLS_KEY");
     // PREFER_AES128=1 (bench/tls.sh, axum-tls-aes128): pick AES-128-GCM first
-    // whatever order the client lists, as giong-tls' `TlsAcceptor::from_pem`
+    // whatever order the client lists, as giong-tls' `TlsAcceptor::with_certificates`
     // does, to show how much of a handshake that choice is.
     let tls = if std::env::var_os("PREFER_AES128").is_some() {
         use rustls::pki_types::pem::PemObject;

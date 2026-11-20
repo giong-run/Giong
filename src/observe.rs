@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::panic;
 use std::ptr;
-use std::rc::{Rc, Weak};
+use std::rc::Weak;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -455,13 +455,6 @@ pub fn snapshot() -> Snapshot {
 /// ```
 pub fn register(source: Weak<dyn Source>) -> bool {
     runtime::try_with_worker(|w| w.observe.sources.borrow_mut().push(source)).is_some()
-}
-
-/// Registers `source` (see [`register`]) and keeps nothing else: a shortcut
-/// for a source held in an `Rc`.
-pub fn register_rc<S: Source + 'static>(source: &Rc<S>) -> bool {
-    let weak: Weak<dyn Source> = Rc::downgrade(source) as Weak<dyn Source>;
-    register(weak)
 }
 
 /// Returns the poll times gathered on the current worker since profiling

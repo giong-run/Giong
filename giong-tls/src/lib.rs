@@ -8,12 +8,12 @@
 //!
 //! ```no_run
 //! use giong::net::TcpListener;
-//! use giong_tls::TlsAcceptor;
+//! use giong_tls::{Certificates, TlsAcceptor};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! let cert = std::fs::read("cert.pem")?;
 //! let key = std::fs::read("key.pem")?;
-//! let acceptor = TlsAcceptor::from_pem(&cert, &key)?;
+//! let acceptor = TlsAcceptor::with_certificates(&Certificates::from_pem(&cert, &key)?)?;
 //!
 //! giong::block_on(async move {
 //!     let listener = TcpListener::bind("0.0.0.0:8443")?;
@@ -333,7 +333,7 @@ fn base_provider() -> rustls::crypto::CryptoProvider {
 }
 
 /// [`provider`] with AES-128-GCM first, then ChaCha20-Poly1305, then AES-256-GCM,
-/// in each protocol version: the order of [`TlsAcceptor::from_pem`].
+/// in each protocol version: the order of [`TlsAcceptor::with_certificates`].
 ///
 /// AES-128-GCM is as safe in practice and cheaper: its suites hash with
 /// SHA-256, which processors run in hardware, where AES-256-GCM's TLS 1.3
@@ -430,7 +430,7 @@ fn server_configs(
 #[derive(Clone)]
 pub struct TlsAcceptor {
     config: Arc<ServerConfig>,
-    /// From [`from_pem`](Self::from_pem): `config` picks the server's
+    /// From [`with_certificates`](Self::with_certificates): `config` picks the server's
     /// favourite cipher suite (AES-128-GCM), and this copy of it the
     /// client's, for clients that list ChaCha20 first (see
     /// [`prefers_chacha`]).
@@ -444,16 +444,6 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-    /// An acceptor using an existing rustls configuration.
-    #[deprecated(
-        since = "0.9.0",
-        note = "goes in 1.0.0: use `from_pem`, or `from_rustls` with the `unstable-rustls` \
-                feature, which keeps rustls' types out of the stable API"
-    )]
-    pub fn new(config: Arc<ServerConfig>) -> Self {
-        Self::with_config(config)
-    }
-
     /// An acceptor using an existing rustls configuration, for what
     /// [`with_certificates`](Self::with_certificates) and the methods below
     /// do not cover. The acceptor follows the configuration as given.
@@ -476,10 +466,12 @@ impl TlsAcceptor {
         }
     }
 
-    /// An acceptor for one certificate chain and its private key, both in PEM
-    /// format. TLS 1.2 and 1.3 with rustls' default cipher suites, no client
-    /// authentication, and no protocol offered through ALPN: set them with
-    /// [`alpn`](Self::alpn). (giong-http's `Server::serve_tls` sets its own.)
+    /// An acceptor presenting `certificates`: one chain, or several chosen
+    /// by the name the client asks for (SNI), replaceable while the server
+    /// runs (see [`Certificates`]). TLS 1.2 and 1.3 with rustls' default
+    /// cipher suites, no client authentication, and no protocol offered
+    /// through ALPN: set them with [`alpn`](Self::alpn). (giong-http's
+    /// `Server::serve_tls` sets its own.)
     ///
     /// Of the suites both sides allow, the server picks AES-128-GCM first,
     /// as Go's and BoringSSL's servers do: it costs less than AES-256-GCM,
@@ -487,13 +479,6 @@ impl TlsAcceptor {
     /// before AES-128-GCM, as clients without AES instructions do, gets
     /// ChaCha20. An acceptor made with `from_rustls` follows its
     /// configuration as given.
-    pub fn from_pem(cert_chain: &[u8], private_key: &[u8]) -> io::Result<Self> {
-        Self::with_certificates(&Certificates::from_pem(cert_chain, private_key)?)
-    }
-
-    /// An acceptor presenting `certificates`: one chain, or several chosen
-    /// by the name the client asks for (SNI), replaceable while the server
-    /// runs (see [`Certificates`]). Otherwise as [`from_pem`](Self::from_pem).
     ///
     /// ```no_run
     /// use giong_tls::{Certificates, TlsAcceptor};
@@ -520,7 +505,7 @@ impl TlsAcceptor {
     /// another, fails the handshake. The accepted client's certificates are
     /// [`TlsStream::peer_certificates`], the client's own first.
     ///
-    /// For acceptors made with [`from_pem`](Self::from_pem) or
+    /// For acceptors made with
     /// [`with_certificates`](Self::with_certificates); one made with
     /// `from_rustls` sets client authentication in its configuration, and
     /// gets `GIONG-E2013` here.
@@ -545,7 +530,7 @@ impl TlsAcceptor {
                 "client certificates cannot be set on an acceptor made with from_rustls",
                 "set client authentication in the rustls configuration given to from_rustls \
                  (ServerConfig::builder().with_client_cert_verifier), or make the acceptor \
-                 with from_pem or with_certificates.",
+                 with with_certificates.",
             ));
         };
         let mut roots = RootCertStore::empty();
@@ -627,10 +612,11 @@ impl TlsAcceptor {
     /// kernel (not when `Auto` finds the kernel unable).
     ///
     /// ```no_run
-    /// use giong_tls::{Ktls, TlsAcceptor};
+    /// use giong_tls::{Certificates, Ktls, TlsAcceptor};
     ///
     /// # fn main() -> std::io::Result<()> {
-    /// let acceptor = TlsAcceptor::from_pem(&std::fs::read("cert.pem")?, &std::fs::read("key.pem")?)?
+    /// let certs = Certificates::from_pem(&std::fs::read("cert.pem")?, &std::fs::read("key.pem")?)?;
+    /// let acceptor = TlsAcceptor::with_certificates(&certs)?
     ///     .ktls(Ktls::Auto)?;
     /// # Ok(())
     /// # }
@@ -741,17 +727,6 @@ pub struct TlsConnector {
 }
 
 impl TlsConnector {
-    /// A connector using an existing rustls configuration.
-    #[deprecated(
-        since = "0.9.0",
-        note = "goes in 1.0.0: use `with_system_roots`, `with_root_pem` or \
-                `with_root_pem_any_name`, or `from_rustls` with the `unstable-rustls` feature, \
-                which keeps rustls' types out of the stable API"
-    )]
-    pub fn new(config: Arc<ClientConfig>) -> Self {
-        Self::with_config(config)
-    }
-
     /// A connector using an existing rustls configuration, for what the
     /// other constructors do not cover (a certificate verifier of its own,
     /// other protocol versions).
@@ -770,17 +745,6 @@ impl TlsConnector {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             ktls: ktls::Plan::Off,
         }
-    }
-
-    /// A connector that trusts the given certificate authorities. TLS 1.2
-    /// and 1.3 with rustls' default cipher suites.
-    #[deprecated(
-        since = "0.9.0",
-        note = "goes in 1.0.0: use `with_root_pem`, which keeps rustls' types out of the \
-                stable API"
-    )]
-    pub fn with_roots(roots: RootCertStore) -> io::Result<Self> {
-        Self::from_roots(roots)
     }
 
     fn from_roots(roots: RootCertStore) -> io::Result<Self> {
@@ -2084,6 +2048,18 @@ mod tests {
     use super::*;
     use std::future::Future;
 
+    #[test]
+    fn a_connector_without_trusted_authorities_is_refused() {
+        // The same kind as when the machine has none (`with_system_roots`).
+        let err = TlsConnector::from_roots(RootCertStore::empty()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        assert_eq!(
+            giong::error::code(&err),
+            Some(Code::NoTrustedRoots),
+            "{err}"
+        );
+    }
+
     fn authority(name: &str) -> (rcgen::Certificate, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -2350,10 +2326,12 @@ mod tests {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
         for mode in [Ktls::Off, Ktls::Auto] {
-            let acceptor = TlsAcceptor::from_pem(cert.as_bytes(), key.as_bytes())
-                .unwrap()
-                .ktls(mode)
-                .unwrap();
+            let acceptor = TlsAcceptor::with_certificates(
+                &Certificates::from_pem(cert.as_bytes(), key.as_bytes()).unwrap(),
+            )
+            .unwrap()
+            .ktls(mode)
+            .unwrap();
             let tries = acceptor.ktls.tries();
             assert_eq!(acceptor.config.enable_secret_extraction, tries, "{mode:?}");
             let connector = TlsConnector::with_root_pem(cert.as_bytes())
@@ -2386,9 +2364,11 @@ mod tests {
         // or out of place fails the client's decryption.
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = key.cert.pem();
-        let acceptor =
-            TlsAcceptor::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
-                .unwrap();
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
         let connector = TlsConnector::with_root_pem(cert.as_bytes()).unwrap();
         giong::block_on(async move {
             let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2440,9 +2420,11 @@ mod tests {
         // idle connections held about 200 bytes each when it was kept.
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert = key.cert.pem();
-        let acceptor =
-            TlsAcceptor::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
-                .unwrap();
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
         let connector = TlsConnector::with_root_pem(cert.as_bytes()).unwrap();
         giong::block_on(async move {
             let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();

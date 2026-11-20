@@ -5,7 +5,7 @@ use std::io::Write;
 
 use giong::net::TcpListener;
 use giong_http::{Request, Response, Server};
-use giong_tls::{Ktls, TlsAcceptor};
+use giong_tls::{Certificates, Ktls, TlsAcceptor};
 
 fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }
 
@@ -156,7 +156,8 @@ fn main() -> std::io::Result<()> {
     // handshake (kernel TLS); off by default.
     let tls = match (std::env::var("TLS_CERT"), std::env::var("TLS_KEY")) {
         (Ok(cert), Ok(key)) => {
-            let acceptor = TlsAcceptor::from_pem(&std::fs::read(cert)?, &std::fs::read(key)?)?;
+            let certs = Certificates::from_pem(&std::fs::read(cert)?, &std::fs::read(key)?)?;
+            let acceptor = TlsAcceptor::with_certificates(&certs)?;
             let mode = match std::env::var("GIONG_KTLS").as_deref() {
                 Ok("auto") => Ktls::Auto,
                 Ok("required") => Ktls::Required,
