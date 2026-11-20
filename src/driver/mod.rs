@@ -955,6 +955,12 @@ impl Driver {
         each!(self, d => d.poll_multi(key, waker))
     }
 
+    /// Lets a multishot operation run out (see `Iocp::finish_multi`).
+    #[cfg(windows)]
+    pub(crate) fn finish_multi(&mut self, key: usize) {
+        each!(self, d => d.finish_multi(key))
+    }
+
     /// Stops a multishot receive that is waiting in the kernel, so that the
     /// reader's next poll starts it again (io_uring; the epoll driver reads
     /// when the socket is readable and misses nothing).

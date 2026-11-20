@@ -21,6 +21,8 @@ mod balance;
 pub(crate) mod dns;
 mod sendq;
 mod share;
+#[cfg(windows)]
+mod spread;
 mod udp;
 #[cfg(unix)]
 mod unix;
@@ -232,6 +234,27 @@ impl ListenSocket {
                 }
             }
         })
+    }
+}
+
+#[cfg(windows)]
+impl ListenSocket {
+    /// The connection the accept this listener has in the driver still
+    /// takes, if it has one there; no further accept is started.
+    pub(crate) fn poll_last_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<Socket>> {
+        let accepting = runtime::with_worker(|w| {
+            let active = self.accept.is_active(w);
+            if active {
+                let key = self.accept.key(w);
+                w.driver.borrow_mut().finish_multi(key);
+            }
+            active
+        });
+        if accepting {
+            self.poll_accept(cx)
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -903,6 +926,10 @@ pub struct TcpListener {
     /// The listener's hold on its port, for one that [`bind`](Self::bind)
     /// made (see `share`).
     held: Option<share::Held>,
+    /// The listener's share of an address that several workers listen on
+    /// (see `spread`). After `inner`: the socket is closed first.
+    #[cfg(windows)]
+    spread: Option<spread::Member>,
 }
 
 impl TcpListener {
@@ -922,6 +949,10 @@ impl TcpListener {
     /// share a port between processes on purpose (a new version started
     /// before the old one has stopped), create the sockets yourself with
     /// `SO_REUSEPORT` set and pass them to [`from_std`](Self::from_std).
+    ///
+    /// On Windows a port has one listening socket. The workers' listeners
+    /// share it: from the second listener on, one thread accepts the
+    /// connections and hands them to the listeners in turn.
     ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
@@ -949,19 +980,47 @@ impl TcpListener {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
-        // Linux 6.0.16 to 6.0.19 report success for a bind to an address in
-        // use and leave the socket unbound: `share::bind` checks the port.
-        let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
-            Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
-        })?;
-        let listener = Self {
-            inner: ListenSocket::new(sock),
-            balance: None,
-            held,
+        let bind = || -> io::Result<Self> {
+            // Linux 6.0.16 to 6.0.19 report success for a bind to an
+            // address in use and leave the socket unbound: `share::bind`
+            // checks the port.
+            let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
+                Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            })?;
+            let listener = Self {
+                inner: ListenSocket::new(sock),
+                balance: None,
+                held,
+                #[cfg(windows)]
+                spread: None,
+            };
+            // A failure from here on drops `listener`, which gives the
+            // port up.
+            listener.inner.socket().listen(4096)?;
+            Ok(listener)
         };
-        // A failure from here on drops `listener`, which gives the port up.
-        listener.inner.socket().listen(4096)?;
-        Ok(listener)
+        #[cfg(unix)]
+        return bind();
+        // A port has one socket on Windows: a listener for an address that
+        // listeners of this process hold already joins them.
+        #[cfg(windows)]
+        {
+            let mut bound = None;
+            let (sock, _, member) = spread::bind(addr, || {
+                let listener: Self = bind()?;
+                let handle = listener.inner.socket().try_clone()?;
+                bound = Some(listener);
+                Ok((handle, ()))
+            })?;
+            let mut listener = bound.unwrap_or_else(|| Self {
+                inner: ListenSocket::new(sock),
+                balance: None,
+                held: None,
+                spread: None,
+            });
+            listener.spread = member;
+            Ok(listener)
+        }
     }
 
     /// Like [`bind`](Self::bind), and the listener shares new connections
@@ -1019,6 +1078,8 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held: None,
+            #[cfg(windows)]
+            spread: None,
         }
     }
 
@@ -1037,17 +1098,22 @@ impl TcpListener {
     /// so back off (e.g. [`sleep`](crate::time::sleep)) before retrying.
     pub async fn accept(&self) -> io::Result<TcpStream> {
         let inner = match &self.balance {
-            None => self.inner.accept().await?,
-            Some(member) => {
-                poll_fn(|cx| {
-                    member
-                        .poll_accept(cx, &self.inner)
-                        .map_ok(StreamSocket::new)
-                })
-                .await?
-            }
+            None => poll_fn(|cx| self.poll_next(cx)).await?,
+            Some(member) => poll_fn(|cx| member.poll_accept(cx, |cx| self.poll_next(cx))).await?,
         };
-        Ok(TcpStream { inner })
+        Ok(TcpStream {
+            inner: StreamSocket::new(inner),
+        })
+    }
+
+    /// The next connection of this listener's socket, or of its share of
+    /// one where the workers share a socket.
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<io::Result<Socket>> {
+        #[cfg(windows)]
+        if let Some(member) = &self.spread {
+            return member.poll_accept(cx, &self.inner);
+        }
+        self.inner.poll_accept(cx)
     }
 }
 

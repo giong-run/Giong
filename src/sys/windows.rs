@@ -401,3 +401,150 @@ impl Drop for SignalGuard {
             .retain(|(id, _)| *id != self.id);
     }
 }
+
+/// What [`AcceptEvents::wait`] woke up for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AcceptWake {
+    /// Connections may be waiting on the listener.
+    Accept,
+    /// [`AcceptEvents::stop`] was called.
+    Stop,
+    /// Neither, within the time given.
+    Timeout,
+}
+
+/// Lets a thread that is not a worker wait for connections on a listening
+/// socket, and be told to stop.
+///
+/// The wait is a `select` on the listener and on a datagram socket that is
+/// connected to itself: [`stop`](Self::stop) sends that socket a byte,
+/// which nobody reads, so it stays readable. `select` reports what is true
+/// at the moment it is asked, so a connection that arrives at any point is
+/// seen by the next wait (an event object set by `WSAEventSelect` can be
+/// reset past one).
+pub(crate) struct AcceptEvents {
+    listener: RawSock,
+    wake: RawSock,
+    /// Set by `stop`, and looked at every so often in case the byte could
+    /// not be sent.
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl AcceptEvents {
+    /// Prepares to wait on `listener`, which the caller keeps open for as
+    /// long as this lives, and makes it non-blocking.
+    pub(crate) fn new(listener: RawSock) -> std::io::Result<Self> {
+        // SAFETY: plain Winsock calls on a new socket, which is closed on
+        // every failure, and on the caller's listener; the address is a
+        // local of the size given.
+        unsafe {
+            let mut on = 1u32;
+            if WinSock::ioctlsocket(listener, WinSock::FIONBIO, &mut on) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let wake = WinSock::socket(
+                WinSock::AF_INET as i32,
+                WinSock::SOCK_DGRAM,
+                WinSock::IPPROTO_UDP,
+            );
+            if wake == WinSock::INVALID_SOCKET {
+                return Err(std::io::Error::last_os_error());
+            }
+            let events = AcceptEvents {
+                listener,
+                wake,
+                stopped: std::sync::atomic::AtomicBool::new(false),
+            };
+            let mut addr: WinSock::SOCKADDR_IN = std::mem::zeroed();
+            addr.sin_family = WinSock::AF_INET;
+            addr.sin_addr.S_un.S_addr = u32::from_ne_bytes([127, 0, 0, 1]);
+            let mut len = std::mem::size_of::<WinSock::SOCKADDR_IN>() as i32;
+            let name = (&mut addr as *mut WinSock::SOCKADDR_IN).cast::<SOCKADDR>();
+            if WinSock::bind(wake, name, len) != 0
+                || WinSock::getsockname(wake, name, &mut len) != 0
+                || WinSock::connect(wake, name, len) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(events)
+        }
+    }
+
+    /// Waits for a connection or for [`stop`](Self::stop), at most
+    /// `timeout` milliseconds (`None`: without limit).
+    pub(crate) fn wait(&self, timeout: Option<u32>) -> AcceptWake {
+        loop {
+            if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                return AcceptWake::Stop;
+            }
+            match self.wait_once(timeout.unwrap_or(100)) {
+                AcceptWake::Timeout if timeout.is_none() => {}
+                woke => return woke,
+            }
+        }
+    }
+
+    fn wait_once(&self, timeout: u32) -> AcceptWake {
+        // SAFETY: the set and the timeout are locals; both sockets are
+        // open while `self` lives.
+        unsafe {
+            let mut read: WinSock::FD_SET = std::mem::zeroed();
+            read.fd_count = 2;
+            read.fd_array[0] = self.listener;
+            read.fd_array[1] = self.wake;
+            let limit = WinSock::TIMEVAL {
+                tv_sec: (timeout / 1000) as i32,
+                tv_usec: (timeout % 1000 * 1000) as i32,
+            };
+            let ready = WinSock::select(
+                0,
+                &mut read,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &limit,
+            );
+            let set = &read.fd_array[..(read.fd_count as usize).min(2)];
+            if ready > 0 && set.contains(&self.wake) {
+                AcceptWake::Stop
+            } else if ready > 0 {
+                AcceptWake::Accept
+            } else {
+                AcceptWake::Timeout
+            }
+        }
+    }
+
+    /// Makes [`wait`](Self::wait) return [`AcceptWake::Stop`], now and
+    /// from here on.
+    pub(crate) fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        // SAFETY: one byte from a local to the socket's own address.
+        unsafe { WinSock::send(self.wake, [1u8].as_ptr(), 1, 0) };
+    }
+}
+
+impl Drop for AcceptEvents {
+    fn drop(&mut self) {
+        // SAFETY: the socket is owned by `self` and closed once.
+        unsafe { WinSock::closesocket(self.wake) };
+    }
+}
+
+/// Takes one waiting connection from the non-blocking `listener`: the
+/// socket, `None` if none waits, or the error.
+pub(crate) fn accept_nowait(listener: RawSock) -> std::io::Result<Option<RawSock>> {
+    // SAFETY: `accept` without an address; the socket it returns is new
+    // and owned by the caller.
+    unsafe {
+        let sock = WinSock::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+        if sock == WinSock::INVALID_SOCKET {
+            let err = std::io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(WinSock::WSAEWOULDBLOCK) => Ok(None),
+                _ => Err(err),
+            };
+        }
+        Ok(Some(sock))
+    }
+}

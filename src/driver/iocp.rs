@@ -233,6 +233,8 @@ struct Multi {
     accepted: Option<i32>,
     /// A datagram that arrived while its receive waited in the kernel.
     data: Option<RecvBuf>,
+    /// Set by [`Iocp::finish_multi`]: nothing new is started.
+    last: bool,
 }
 
 impl Multi {
@@ -787,6 +789,7 @@ impl Iocp {
             pending: ptr::null_mut(),
             accepted: None,
             data: None,
+            last: false,
         }))
     }
 
@@ -810,17 +813,32 @@ impl Iocp {
         self.multi(key).io = None;
     }
 
+    /// Lets the multishot operation run out: what it has in the kernel
+    /// still completes and is reported, and nothing new is started. For a
+    /// listener whose connections another thread accepts from now on: the
+    /// accept already in flight takes one more connection, which must not
+    /// be lost.
+    pub(crate) fn finish_multi(&mut self, key: usize) {
+        self.multi(key).last = true;
+    }
+
     pub(crate) fn poll_multi(&mut self, key: usize, waker: &Waker) -> MultiPoll {
         let multi = self.multi(key);
-        let Some(io) = multi.io else {
-            return MultiPoll::NeedArm;
-        };
         if let Some(res) = multi.accepted.take() {
             if res < 0 {
                 multi.io = None;
             }
             return MultiPoll::Item(res);
         }
+        if multi.last {
+            if !multi.pending.is_null() {
+                multi.wait(waker);
+            }
+            return MultiPoll::Pending;
+        }
+        let Some(io) = multi.io else {
+            return MultiPoll::NeedArm;
+        };
         if let Some(data) = multi.data.take() {
             return MultiPoll::Data(data);
         }

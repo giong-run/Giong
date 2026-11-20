@@ -346,7 +346,6 @@ fn channel_delivers_across_workers_and_from_plain_threads() {
     assert_eq!(total.load(Ordering::SeqCst), 3 * per_sender);
 }
 
-#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no SO_REUSEPORT")]
 fn reuseport_listeners_on_every_worker_serve_connections() {

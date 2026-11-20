@@ -49,6 +49,20 @@ pub fn shared_port() -> (Socket, u16) {
     (socket, port)
 }
 
+/// A port on 127.0.0.1 for the listeners of a test to share. Windows has
+/// no `SO_REUSEPORT` to hold it with: the port is one that was free a
+/// moment ago, and the short race with another bind is accepted.
+#[cfg(windows)]
+pub fn shared_port() -> (Socket, u16) {
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    socket
+        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    drop(socket);
+    (Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(), port)
+}
+
 /// An address on 127.0.0.1 where a UDP datagram is refused (the kernel
 /// answers with "port unreachable"), for as long as the returned socket
 /// lives.

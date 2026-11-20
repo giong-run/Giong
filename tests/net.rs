@@ -747,10 +747,6 @@ fn interoperates_with_blocking_std_clients() {
 /// A port held by a listener that shares it with nobody. Linux 6.0.16 to
 /// 6.0.19 answer 1, not -1, to the bind(2) of a second TCP socket there,
 /// which reads as success and would leave the listener on some other port.
-#[cfg_attr(
-    windows,
-    ignore = "a port has one socket on Windows; the workers will share it by handing sockets out"
-)]
 #[test]
 fn binding_a_busy_address_fails_and_says_so() {
     giong::block_on(async {
@@ -932,10 +928,6 @@ fn a_port_shared_by_another_process_is_refused() {
 /// Dropping a listener and binding the same address again at once works,
 /// although the socket is closed through the ring a moment later; and every
 /// listener bound meanwhile shares the port.
-#[cfg_attr(
-    windows,
-    ignore = "a port has one socket on Windows; the workers will share it by handing sockets out"
-)]
 #[test]
 fn a_dropped_listener_s_port_can_be_bound_again_at_once() {
     giong::block_on(async {
