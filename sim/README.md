@@ -124,7 +124,13 @@ runs under `loopback`.
   process and a warm one diverge.
 - Each run executes on a fresh thread: the standard library seeds its
   `HashMap` keys per thread, and those draws would otherwise land in one run
-  only.
+  only. Nothing may make a hash map on that thread before the simulation
+  answers `getrandom` (the world itself is built on the caller's thread for
+  that reason), or the run's maps get keys the seed did not choose.
+- What every run of a process shares (a certificate, say) must not be made
+  inside the first run of a sweep: it would depend on that run's seed, and a
+  seed that fails in a sweep would not fail when replayed alone. Make it in
+  a run of its own with a fixed seed, as `tests/http.rs` does.
 - A spurious `EAGAIN` must come with a new readiness edge: with
   edge-triggered epoll, real Linux never leaves queued data without one, and
   a runtime would wait forever.
