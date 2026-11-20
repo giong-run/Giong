@@ -1910,13 +1910,20 @@ impl TlsStream {
                 conn.write_tls(wire)?;
             }
         }
+        // Linux holds the bytes for the FIN (`MSG_MORE`) and takes
+        // `MSG_NOSIGNAL`; elsewhere this is a plain send that does not wait,
+        // on a socket giong made with `SO_NOSIGPIPE`.
+        #[cfg(target_os = "linux")]
+        const FLAGS: libc::c_int = libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        #[cfg(target_os = "macos")]
+        const FLAGS: libc::c_int = libc::MSG_DONTWAIT;
         // SAFETY: `wire` is valid for `wire.len()` bytes for the call.
         let n = unsafe {
             libc::send(
                 std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
                 wire.as_ptr().cast(),
                 wire.len(),
-                libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                FLAGS,
             )
         };
         if n >= 0 {

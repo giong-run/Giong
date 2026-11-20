@@ -249,6 +249,8 @@ pub(crate) struct Uring {
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
     wake_fd: RawFd,
+    /// Owns `wake_fd`.
+    wake: super::WakeHandle,
     wake_buf: Box<u64>,
     wake_armed: bool,
     closing: bool,
@@ -953,7 +955,15 @@ fn buffer_ring_error(release: &str, e: io::Error) -> io::Error {
 }
 
 impl Uring {
-    pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
+    pub(crate) fn waker(&self) -> super::WakeHandle {
+        self.wake.clone()
+    }
+
+    pub(crate) fn new(
+        entries: u32,
+        pool: Rc<BufPool>,
+        wake: super::WakeHandle,
+    ) -> io::Result<Self> {
         let ring = build_ring(entries)?;
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
@@ -1003,7 +1013,8 @@ impl Uring {
             recv_copied: 0,
             turn: 0,
             graveyard: Vec::new(),
-            wake_fd,
+            wake_fd: wake.fd(),
+            wake,
             wake_buf: Box::new(0),
             wake_armed: false,
             closing: false,

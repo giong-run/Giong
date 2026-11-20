@@ -23,6 +23,7 @@ use crate::protocol::{self, frame, parse_backend, Backend};
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const USER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Free room asked of the read buffer before each receive: replies that

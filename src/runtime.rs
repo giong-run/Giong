@@ -7,7 +7,7 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
@@ -25,6 +25,7 @@ use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
 use crate::op::Op;
 use crate::slab::Slab;
+use crate::sys;
 use crate::time::Timers;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -95,24 +96,15 @@ pub(crate) struct WorkerShared {
     /// nanoseconds, so that its readings never go down. Written by the
     /// threads that read, never by the worker, and away from `counters`.
     idle_seen: AtomicU64,
-    eventfd: OwnedFd,
+    /// Rung to wake the worker when it sleeps in the kernel: its driver's
+    /// handle, set once the driver is up (a worker cannot sleep before).
+    wake: OnceLock<crate::driver::WakeHandle>,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
 }
 
 impl WorkerShared {
     fn new() -> io::Result<Arc<Self>> {
-        // Under Miri, created non-blocking: the epoll driver makes it so with
-        // `ioctl(FIONBIO)`, and Miri has neither that nor `fcntl` on eventfds.
-        #[cfg(not(miri))]
-        let flags = libc::EFD_CLOEXEC;
-        #[cfg(miri)]
-        let flags = libc::EFD_CLOEXEC | libc::EFD_NONBLOCK;
-        // SAFETY: plain syscall; the result is checked.
-        let fd = unsafe { libc::eventfd(0, flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         Ok(Arc::new(Self {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             load: Load::new(),
@@ -121,8 +113,7 @@ impl WorkerShared {
             bell: Doorbell::new(),
             closed: AtomicBool::new(false),
             idle_seen: AtomicU64::new(0),
-            // SAFETY: a fresh descriptor we own.
-            eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            wake: OnceLock::new(),
             driver_choice: OnceLock::new(),
         }))
     }
@@ -139,14 +130,8 @@ impl WorkerShared {
         // Handshake with `Doorbell::prepare_park` in `Worker::drive`: at least
         // one side always observes the other (modelled in `notify`).
         if self.bell.ring() {
-            let one: u64 = 1;
-            // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own.
-            unsafe {
-                libc::write(
-                    self.eventfd.as_raw_fd(),
-                    &one as *const u64 as *const libc::c_void,
-                    8,
-                );
+            if let Some(wake) = self.wake.get() {
+                wake.ring();
             }
         }
         true
@@ -492,13 +477,11 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let (driver, choice) = Driver::new(
-            cfg.driver,
-            cfg.chosen_by,
-            cfg.ring_entries,
-            pool.clone(),
-            shared.eventfd.as_raw_fd(),
-        )?;
+        let (driver, choice) =
+            Driver::new(cfg.driver, cfg.chosen_by, cfg.ring_entries, pool.clone())?;
+        // A worker instance is built once, so the slots are always empty
+        // here.
+        let _ = shared.wake.set(driver.waker());
         shared.counters.set_driver(driver.kind());
         // A worker instance is built once, so the slot is always empty here.
         let _ = shared.driver_choice.set(choice);
@@ -1303,7 +1286,7 @@ impl Runtime {
         let pin = self
             .builder
             .pin_cores
-            .unwrap_or_else(|| pin_by_default(cpus.len(), parallelism()));
+            .unwrap_or_else(|| sys::CAN_PIN && pin_by_default(cpus.len(), parallelism()));
         let f = Arc::new(f);
         let gate = Arc::new(Gate {
             state: Mutex::new(None),
@@ -1408,9 +1391,11 @@ impl Runtime {
 
 // --------------------------------------------------------------------- signals
 
-/// The eventfd the signal handler writes to. Created once per process and
-/// never closed, so the handler can never race with a close.
+/// The bell the signal handler rings (its write descriptor). Created once
+/// per process and never closed, so the handler can never race with a close.
 static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
+/// The read descriptor of the same bell (the same eventfd on Linux).
+static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
 /// Set while a runtime has the handlers installed.
 static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
 
@@ -1418,12 +1403,12 @@ static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
 extern "C" fn on_signal(_signal: libc::c_int) {
     let fd = SIGNAL_FD.load(Ordering::Relaxed);
     if fd >= 0 {
-        let one: u64 = 1;
-        // SAFETY: `write` is async-signal-safe; `errno` is restored afterwards.
+        let errno = sys::errno_location();
+        // SAFETY: `errno` is the calling thread's, valid for reads and
+        // writes; `ring` only calls `write`, which is async-signal-safe.
         unsafe {
-            let errno = libc::__errno_location();
             let saved = *errno;
-            libc::write(fd, &one as *const u64 as *const libc::c_void, 8);
+            sys::ring(fd);
             *errno = saved;
         }
     }
@@ -1453,18 +1438,22 @@ impl SignalGuard {
         }
         // SAFETY: plain libc calls with valid arguments; results are checked.
         unsafe {
-            let mut fd = SIGNAL_FD.load(Ordering::SeqCst);
+            let mut fd = SIGNAL_READ_FD.load(Ordering::SeqCst);
             if fd < 0 {
-                fd = libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
-                if fd < 0 {
-                    SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                    return Err(io::Error::last_os_error());
-                }
-                SIGNAL_FD.store(fd, Ordering::SeqCst);
+                let bell = match sys::Bell::new() {
+                    Ok(bell) => bell,
+                    Err(e) => {
+                        SIGNALS_IN_USE.store(false, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                };
+                let (read, write) = bell.leak();
+                fd = read;
+                SIGNAL_READ_FD.store(read, Ordering::SeqCst);
+                SIGNAL_FD.store(write, Ordering::SeqCst);
             }
             // Forget signals that arrived while nobody was listening.
-            let mut stale: u64 = 0;
-            libc::read(fd, &mut stale as *mut u64 as *mut libc::c_void, 8);
+            sys::drain(fd);
 
             let mut action: libc::sigaction = mem::zeroed();
             action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
@@ -2102,28 +2091,11 @@ fn pin_by_default(allowed: usize, parallelism: Option<usize>) -> bool {
 
 /// CPUs the calling thread is allowed to run on.
 fn allowed_cpus() -> Vec<usize> {
-    // SAFETY: `set` is a valid, zeroed cpu_set_t of the size we pass.
-    unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        if libc::sched_getaffinity(0, mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            let n = thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            return (0..n).collect();
-        }
-        (0..libc::CPU_SETSIZE as usize)
-            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-            .collect()
-    }
+    sys::allowed_cpus()
 }
 
 fn pin_to_cpu(cpu: usize) {
-    // SAFETY: as above. Failure is not fatal: the worker just stays unpinned.
-    unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set);
-    }
+    sys::pin_to_cpu(cpu);
 }
 
 #[cfg(test)]

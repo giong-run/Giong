@@ -133,7 +133,12 @@ pub(crate) fn bind(
         .get(&(proto, addr.port()))
         .copied()
         .unwrap_or_default();
-    if addr.port() != 0 && known.live == 0 {
+    // The first bind without `SO_REUSEPORT` relies on Linux's rules: there
+    // the option can be set on a bound socket and later binds join it. On
+    // macOS every socket of a port needs it before it binds, so the port
+    // is not guarded against another process there (see
+    // docs/design/portability.md).
+    if cfg!(target_os = "linux") && addr.port() != 0 && known.live == 0 {
         bind_first(proto, &sock, addr, known.released)?;
     } else {
         sock.set_reuse_port(true)?;

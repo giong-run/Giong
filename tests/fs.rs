@@ -10,6 +10,18 @@ use std::time::{Duration, Instant, SystemTime};
 use giong::fs::{self, File, OpenOptions};
 use giong::time::timeout;
 
+/// The readiness driver of this platform: epoll on Linux, kqueue on macOS.
+#[cfg(target_os = "linux")]
+const READINESS: giong::DriverKind = giong::DriverKind::Epoll;
+#[cfg(target_os = "macos")]
+const READINESS: giong::DriverKind = giong::DriverKind::Kqueue;
+
+/// A file whose size its metadata does not tell.
+#[cfg(target_os = "linux")]
+const FILE_OF_UNKNOWN_SIZE: &str = "/proc/self/status";
+#[cfg(target_os = "macos")]
+const FILE_OF_UNKNOWN_SIZE: &str = "/dev/null";
+
 /// A directory of its own for one test, removed afterwards.
 struct TempDir(PathBuf);
 
@@ -47,11 +59,36 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
 
 /// How many descriptors of this process refer to `path`. (Counting all
 /// descriptors would see those of tests running in parallel.)
+#[cfg(target_os = "linux")]
 fn open_fds(path: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
         .filter(|target| target == path)
+        .count()
+}
+
+/// How many descriptors of this process refer to `path`. macOS has no
+/// `/proc`: the descriptors are listed in `/dev/fd` and `F_GETPATH` names
+/// their file, with symbolic links resolved (`/var` is `/private/var`).
+#[cfg(target_os = "macos")]
+fn open_fds(path: &std::path::Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.into_iter()
+        .filter(|&fd| {
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+                return false;
+            }
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            std::ffi::OsStr::from_bytes(&buf[..len]) == path.as_os_str()
+        })
         .count()
 }
 
@@ -345,10 +382,13 @@ fn metadata_describes_files_directories_and_links() {
         let err = fs::metadata(dir.path("missing")).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
 
-        // Files whose size is not known in advance.
-        let status = fs::read("/proc/self/status").await.unwrap();
-        assert!(status.starts_with(b"Name:"));
-        assert!(status.len() > 100);
+        // Files whose size is not known in advance (Linux's /proc).
+        #[cfg(target_os = "linux")]
+        {
+            let status = fs::read("/proc/self/status").await.unwrap();
+            assert!(status.starts_with(b"Name:"));
+            assert!(status.len() > 100);
+        }
     });
 }
 
@@ -490,7 +530,7 @@ fn files_dropped_at_shutdown_release_their_descriptors() {
 fn a_read_that_never_completes_can_be_cancelled() {
     // A pipe nobody writes to: the read stays in flight until it is dropped.
     let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
     let (reader, writer) = unsafe {
         (
             std::fs::File::from_raw_fd(fds[0]),
@@ -529,9 +569,26 @@ fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
     }
 }
 
+/// The file descriptor `fd` refers to.
+#[cfg(target_os = "linux")]
+fn fd_path(fd: i32) -> std::path::PathBuf {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
+}
+
+/// The file descriptor `fd` refers to (`F_GETPATH`).
+#[cfg(target_os = "macos")]
+fn fd_path(fd: i32) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+    assert!(unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } >= 0);
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len]))
+}
+
 fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, close: bool) {
     let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
-    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+    let target = fd_path(fd);
     let before = open_fds(&target);
     giong::block_on(async move {
         let file = File::from_std(master);
@@ -542,8 +599,8 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
         } else {
             drop(file);
         }
-        let epoll = giong::driver_kind() == giong::DriverKind::Epoll;
-        if epoll {
+        let readiness = giong::driver_kind() != giong::DriverKind::IoUring;
+        if readiness {
             // The thread still waits in read(2): the descriptor stays open.
             giong::time::sleep(Duration::from_millis(20)).await;
             assert_eq!(open_fds(&target), before);
@@ -552,7 +609,7 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
         // io_uring the read was cancelled in the kernel, and the terminal
         // may already be closed, which makes this write fail.)
         let wrote = std::io::Write::write_all(&mut slave, b"x\n");
-        if epoll {
+        if readiness {
             wrote.unwrap();
         }
         let start = Instant::now();
@@ -561,6 +618,52 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
             giong::time::sleep(Duration::from_millis(5)).await;
         }
     });
+}
+
+/// `pipe2(O_CLOEXEC)`, or `pipe` and `fcntl` where there is no `pipe2`.
+///
+/// # Safety
+///
+/// `fds` must have room for two descriptors.
+unsafe fn pipe_cloexec(fds: *mut libc::c_int) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    return libc::pipe2(fds, libc::O_CLOEXEC);
+    #[cfg(target_os = "macos")]
+    {
+        let res = libc::pipe(fds);
+        if res == 0 {
+            for i in 0..2 {
+                libc::fcntl(*fds.add(i), libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        res
+    }
+}
+
+/// The name of the terminal whose master is `fd`, into `name`.
+///
+/// # Safety
+///
+/// `fd` must be a terminal master.
+unsafe fn ptsname(fd: libc::c_int, name: &mut [libc::c_char; 64]) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    return libc::ptsname_r(fd, name.as_mut_ptr(), name.len());
+    #[cfg(target_os = "macos")]
+    {
+        // Not reentrant, which no test needs.
+        let p = libc::ptsname(fd);
+        if p.is_null() {
+            return -1;
+        }
+        let bytes = std::ffi::CStr::from_ptr(p).to_bytes_with_nul();
+        if bytes.len() > name.len() {
+            return -1;
+        }
+        for (d, s) in name.iter_mut().zip(bytes) {
+            *d = *s as libc::c_char;
+        }
+        0
+    }
 }
 
 /// A pseudo-terminal's two ends, or `None` where there are none.
@@ -576,10 +679,7 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
     let mut name = [0 as libc::c_char; 64];
     // SAFETY: `fd` is a terminal master we own; `name` is large enough.
     unsafe {
-        if libc::grantpt(fd) != 0
-            || libc::unlockpt(fd) != 0
-            || libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) != 0
-        {
+        if libc::grantpt(fd) != 0 || libc::unlockpt(fd) != 0 || ptsname(fd, &mut name) != 0 {
             return None;
         }
     }
@@ -617,7 +717,7 @@ fn a_stuck_file_operation_does_not_hold_up_the_others() {
     });
     let opens = paths.clone();
     giong::Builder::new()
-        .driver(giong::DriverKind::Epoll)
+        .driver(READINESS)
         .block_on(async move {
             // One quick operation, so that a blocking thread exists and is idle.
             fs::metadata("/").await.unwrap();
@@ -680,7 +780,7 @@ fn runtime_teardown_with_file_operations_in_flight() {
     let dir = TempDir::new("teardown");
     for round in 0..20 {
         let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
         let (reader, writer) = unsafe {
             (
                 std::fs::File::from_raw_fd(fds[0]),
@@ -702,7 +802,7 @@ fn runtime_teardown_with_file_operations_in_flight() {
                 let _ = f.sync_all().await;
             });
             giong::spawn(async move {
-                let _ = fs::read("/proc/self/status").await;
+                let _ = fs::read(FILE_OF_UNKNOWN_SIZE).await;
             });
             giong::yield_now().await;
         });
@@ -764,7 +864,7 @@ fn standard_input_pipes_stay_blocking() {
 
             let mut fds = [0; 2];
             // SAFETY: a valid array of two descriptors.
-            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
             // SAFETY: both ends are fresh descriptors this process owns.
             let (read, mut write) = unsafe {
                 (
@@ -792,7 +892,7 @@ fn standard_input_pipes_stay_blocking() {
             "--nocapture",
         ])
         .env(STDIN_CHILD, "1")
-        .env("GIONG_DRIVER", "epoll")
+        .env("GIONG_DRIVER", READINESS.name())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -839,9 +939,12 @@ fn directories_list_like_the_standard_library() {
         std::os::unix::fs::symlink(dir.path("file"), dir.path("link")).unwrap();
         std::os::unix::fs::symlink(dir.path("missing"), dir.path("dangling")).unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(dir.path("socket")).unwrap();
-        // A name that is not UTF-8.
-        let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
-        std::fs::write(dir.0.join(latin1), "").unwrap();
+        // A name that is not UTF-8 (APFS refuses one with EILSEQ).
+        #[cfg(target_os = "linux")]
+        {
+            let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
+            std::fs::write(dir.0.join(latin1), "").unwrap();
+        }
 
         let ours = list(&dir.0).await;
         let mut theirs: Vec<_> = std::fs::read_dir(&dir.0)
@@ -853,17 +956,11 @@ fn directories_list_like_the_standard_library() {
             .iter()
             .map(|entry| entry.file_name().as_bytes())
             .collect();
-        assert_eq!(
-            names,
-            [
-                &b"caf\xe9"[..],
-                b"dangling",
-                b"file",
-                b"link",
-                b"socket",
-                b"sub"
-            ]
-        );
+        let mut expected = vec![&b"dangling"[..], b"file", b"link", b"socket", b"sub"];
+        if cfg!(target_os = "linux") {
+            expected.insert(0, b"caf\xe9");
+        }
+        assert_eq!(names, expected);
         assert_eq!(ours.len(), theirs.len());
         for (ours, theirs) in ours.iter().zip(&theirs) {
             assert_eq!(ours.file_name(), theirs.file_name());
@@ -874,7 +971,7 @@ fn directories_list_like_the_standard_library() {
             let std_meta = std::fs::symlink_metadata(theirs.path()).unwrap();
             assert_eq!(
                 kind.mode(),
-                std_meta.mode() & libc::S_IFMT,
+                std_meta.mode() & 0o170000, // S_IFMT, a u16 on macOS
                 "{:?}",
                 ours.path()
             );

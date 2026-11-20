@@ -112,7 +112,7 @@ impl SendQueue {
     /// One `sendmmsg` (more after an error) for `keys`, all on one socket.
     fn send_run(&mut self, keys: &[usize], wakers: &mut Vec<Waker>) {
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(keys.len());
-        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(keys.len());
+        let mut msgs: Vec<crate::sys::MMsgHdr> = Vec::with_capacity(keys.len());
         let fd = self.entries.get(keys[0]).map_or(-1, |e| e.fd);
         for &k in keys {
             let e = self.entries.get(k).expect("queued datagram");
@@ -124,7 +124,7 @@ impl SendQueue {
         for (n, &k) in keys.iter().enumerate() {
             let e = self.entries.get(k).expect("queued datagram");
             // SAFETY: an all-zero `mmsghdr` is a valid empty header.
-            let mut m: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            let mut m: crate::sys::MMsgHdr = unsafe { std::mem::zeroed() };
             if let Some(a) = &e.addr {
                 m.msg_hdr.msg_name = a.as_ptr().cast_mut().cast();
                 m.msg_hdr.msg_namelen = a.len();
@@ -140,11 +140,11 @@ impl SendQueue {
             // buffers and addresses, which stay put until their senders are
             // woken; non-blocking.
             let res = unsafe {
-                libc::sendmmsg(
+                crate::sys::sendmmsg(
                     fd,
                     msgs.as_mut_ptr().add(at),
-                    left,
-                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                    left as usize,
+                    crate::sys::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
                 )
             };
             if res > 0 {

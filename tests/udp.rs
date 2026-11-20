@@ -591,6 +591,7 @@ fn runtime_teardown_with_datagrams_in_flight() {
 /// What names one socket for good: its address and its cookie, a number the
 /// kernel never gives another socket. (Descriptor numbers are reused by the
 /// tests running in parallel.)
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 struct SocketId {
     addr: std::net::SocketAddrV4,
@@ -598,6 +599,7 @@ struct SocketId {
     inode: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn socket_id(socket: &UdpSocket) -> SocketId {
     use std::os::fd::AsRawFd;
     const SO_COOKIE: libc::c_int = 57;
@@ -641,6 +643,7 @@ fn socket_id(socket: &UdpSocket) -> SocketId {
 /// `port_zero_gives_every_socket_a_port_of_its_own`) can make a live socket
 /// fall between two pages, so it counts as open when any of several reads
 /// lists it.
+#[cfg(target_os = "linux")]
 fn is_open(id: SocketId) -> bool {
     static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let diag = *DIAG.get_or_init(|| {
@@ -665,6 +668,7 @@ fn is_open(id: SocketId) -> bool {
 
 /// Whether sock_diag finds the UDP socket bound to `id.addr` with
 /// `id.cookie`. Also false when the kernel has no sock_diag for UDP.
+#[cfg(target_os = "linux")]
 fn found_by_sock_diag(id: SocketId) -> bool {
     #[repr(C)]
     struct Request {
@@ -755,6 +759,8 @@ fn found_by_sock_diag(id: SocketId) -> bool {
     }
 }
 
+// Linux only: the sockets are found through sock_diag or /proc/net/udp.
+#[cfg(target_os = "linux")]
 #[test]
 fn dropping_a_socket_closes_it() {
     giong::block_on(async {

@@ -88,6 +88,7 @@ mod notify;
 mod op;
 mod runtime;
 mod slab;
+mod sys;
 
 pub mod error;
 pub mod fs;
