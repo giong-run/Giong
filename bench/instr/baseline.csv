@@ -21,8 +21,8 @@ io_uring,timeout,instructions,99.2,1
 io_uring,timeout,allocations,0.000,1
 io_uring,tcp-echo,instructions,4884.6,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,5357.5,1
-io_uring,udp-echo,allocations,2.000,1
+io_uring,udp-echo,instructions,4137.4,1
+io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,1478.2,1
 io_uring,file-read,allocations,0.000,1
 io_uring,http1,instructions,11143.7,1
@@ -39,7 +39,7 @@ io_uring,web,instructions,15259.7,1
 io_uring,web,allocations,5.000,1
 io_uring,redis-get,instructions,9703.9,1
 io_uring,redis-get,allocations,2.000,1
-io_uring,postgres-query,instructions,13214.0,1
+io_uring,postgres-query,instructions,12896.3,1
 io_uring,postgres-query,allocations,16.000,1
 io_uring,mysql-query,instructions,18795.9,1
 io_uring,mysql-query,allocations,27.000,1
@@ -64,8 +64,8 @@ epoll,timeout,instructions,99.1,1
 epoll,timeout,allocations,0.000,1
 epoll,tcp-echo,instructions,4279.4,1
 epoll,tcp-echo,allocations,1.000,1
-epoll,udp-echo,instructions,5031.4,1
-epoll,udp-echo,allocations,2.000,1
+epoll,udp-echo,instructions,4782.9,1
+epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,2938.2,3
 epoll,file-read,allocations,2.000,1
 epoll,http1,instructions,10021.5,1
@@ -82,7 +82,7 @@ epoll,web,instructions,14135.6,1
 epoll,web,allocations,5.000,1
 epoll,redis-get,instructions,9178.8,1
 epoll,redis-get,allocations,2.000,1
-epoll,postgres-query,instructions,12344.7,1
+epoll,postgres-query,instructions,12379.7,1
 epoll,postgres-query,allocations,16.000,1
 epoll,mysql-query,instructions,17884.8,1
 epoll,mysql-query,allocations,27.000,1

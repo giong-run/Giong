@@ -956,6 +956,48 @@ The HTTPS and file numbers were measured on 2026-11-11, on the same machine, wit
 code as it was just before the busy-poll mode was merged in; the merge did not touch the
 TLS, HTTP or file code. Everything above them was measured again on the merged code.
 
+### UDP
+
+`bench/udp-echo.sh`: a UDP echo server on one core, 64-byte datagrams, the client in
+another network namespace over veth keeping 256 datagrams in flight, five rounds of 8 s
+(`bench/results/udp-echo/`). "Kernel × 32" is a server with no runtime that calls
+`recvmmsg` and `sendmmsg` 32 datagrams at a time: the ceiling for kernel sockets.
+
+| Echoes per second | 16 tasks on one socket | 1 task |
+|---|---:|---:|
+| giong, epoll | **335,535** | **351,241** |
+| giong, io_uring | **319,380** | **346,643** |
+| Tokio | 270,672 | 307,195 |
+| Kernel × 32 | 389,686 | 366,291 |
+
+Server CPU per echo with 16 tasks: 4.08 µs on epoll and 4.37 µs on io_uring against
+Tokio's 5.33 (kernel × 32: 3.55); with one task 3.89 and 4.10 against 4.68 (3.81). Datagrams
+that tasks send in one turn of the event loop go to the kernel in one `sendmmsg(2)`, and on
+epoll a busy datagram socket leaves the epoll set, so it pays no wake-ups for the datagrams
+it sends and receives (`bench/results/udp-echo/vm/epoll-deep/`). This VM varies by about 15%
+between rounds: giong on either driver is ahead of Tokio in every round with one task and in
+four of five with 16 (in the other, Tokio's 324,148 beat both, also on CPU per echo).
+
+On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark over veth, server on one core;
+`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-epoll-*`), the server core
+is saturated near a million echoes a second and the margins are much smaller:
+
+| Echoes per second (median of 5, range) | 16 tasks on one socket | 1 task |
+|---|---:|---:|
+| giong, epoll | **920,836** (904,872–926,239) | **892,565** (881,529–906,552) |
+| giong, io_uring | **902,459** (895,390–914,320) | 875,632 (863,835–927,756) |
+| Tokio | 870,488 (855,699–877,000) | 863,001 (851,625–897,835) |
+| Kernel × 32 | 1,009,532 | 1,028,443 |
+
+With 16 tasks giong wins clearly: 5.8% (epoll) and 3.7% (io_uring) ahead of Tokio in the
+median, ahead in every round, at 1.09 and 1.11 µs of server process CPU per echo against
+Tokio's 1.15 (kernel × 32: 0.99). With one task it only ties: ahead in the median (3.4% and
+1.5%) but behind Tokio in one round of five on epoll and two on io_uring. Every runtime moves
+between two levels from round to round (about 870k and 930k), so differences under about 5%
+are within noise. Most of an echo's cost here is the kernel's UDP and veth path: with 16 tasks
+giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for each one
+(`post-soak/udp-perf/`).
+
 ### What has not been measured
 
 - **More than eight cores, and the other tables on a physical network.** The bare-metal
@@ -968,7 +1010,8 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
 `bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
-`bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh` and `bench/compat.sh`; two cores with
+`bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh` and
+`bench/udp-echo.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per
@@ -992,7 +1035,7 @@ the example API describe theirs in their READMEs.
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
 | `tests/net.rs` (27) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
-| `tests/udp.rs` (22) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
+| `tests/udp.rs` (25) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, many tasks receiving on one socket each woken for a datagram of its own, a receiver that gave up not taking the next datagram, a task that only sends letting the others run, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
 | `tests/fs.rs` (25) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll), one stuck operation not holding up the others, offsets above `i64::MAX` and open options that cannot work refused with their codes, a pipe on standard input left blocking |
 | `tests/cancel.rs` (17) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; a dropped `send_file` leaves nothing behind; **a dropped open closes the descriptor it produced**; a stream or operation dropped by code the driver runs is still closed and cancelled; connections accepted for a listener that outlives its runtime are closed; teardown with everything in flight |
 | `tests/multi.rs` (16) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM (also after worker 0 returned), work sent to a stopped runtime cancelled, a panicking worker |
