@@ -67,3 +67,21 @@ pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
     let addr = socket.local_addr().unwrap().as_socket().unwrap();
     (socket, addr)
 }
+
+/// Error numbers the tests compare against, as each system spells them.
+pub mod errno {
+    /// A datagram too long to send.
+    #[cfg(unix)]
+    pub const EMSGSIZE: i32 = libc::EMSGSIZE;
+    /// A datagram too long to send (`WSAEMSGSIZE`).
+    #[cfg(windows)]
+    pub const EMSGSIZE: i32 = 10040;
+
+    /// A send without an address on a socket that has no peer.
+    #[cfg(unix)]
+    pub const NO_PEER: i32 = libc::EDESTADDRREQ;
+    /// A send without an address on a socket that has no peer
+    /// (`WSAENOTCONN`).
+    #[cfg(windows)]
+    pub const NO_PEER: i32 = 10057;
+}

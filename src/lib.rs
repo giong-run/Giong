@@ -76,6 +76,9 @@
 )]
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
+// The Windows port is not complete: files and Unix sockets are missing
+// there, so some of the code they share with the rest has no caller yet.
+#![cfg_attr(windows, allow(dead_code))]
 
 #[cfg(not(any(target_os = "linux", windows)))]
 compile_error!("giong supports Linux (io_uring, epoll) and Windows (completion ports)");

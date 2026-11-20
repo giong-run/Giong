@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 use giong::net::UdpSocket;
 use giong::time::{sleep, timeout};
 
@@ -154,7 +156,7 @@ fn connected_sockets_send_and_filter() {
 
         // Without a peer, `send` has nowhere to go.
         let err = stranger.send("lost").await.0.unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EDESTADDRREQ));
+        assert_eq!(err.raw_os_error(), Some(common::errno::NO_PEER));
     });
 }
 
@@ -443,6 +445,10 @@ fn a_task_that_only_sends_lets_the_others_run() {
     });
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "a port has one socket on Windows; the workers will share it by handing sockets out"
+)]
 #[test]
 fn every_worker_can_bind_the_same_port() {
     // No other test binds to 127.0.0.2, and the port is one the kernel never
@@ -1194,7 +1200,7 @@ fn datagrams_sent_in_one_turn_each_get_their_own_result() {
             let (i, len, res) = s.await.unwrap();
             if i == 3 {
                 let e = res.expect_err("a 70 000-byte datagram cannot be sent");
-                assert_eq!(e.raw_os_error(), Some(libc::EMSGSIZE));
+                assert_eq!(e.raw_os_error(), Some(common::errno::EMSGSIZE));
             } else {
                 assert_eq!(res.unwrap(), len);
             }
