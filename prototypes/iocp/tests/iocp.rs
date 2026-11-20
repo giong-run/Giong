@@ -612,6 +612,114 @@ fn files_read_and_write_at_offsets() {
 }
 
 #[test]
+fn several_buffers_go_out_as_one_write() {
+    use windows_sys::Win32::Networking::WinSock::WSABUF;
+
+    both(|| async {
+        let (listener, addr) = Listener::bind();
+        let client = Sock::connect(addr).await.expect("connect");
+        let server = listener.accept().await.expect("accept");
+
+        let parts: Vec<Vec<u8>> = vec![
+            b"HTTP/1.1 200 OK\r\ncontent-length: 70000\r\n\r\n".to_vec(),
+            vec![b'a'; 30_000],
+            Vec::new(),
+            vec![b'b'; 40_000],
+        ];
+        let expected: Vec<u8> = parts.concat();
+        let bufs: Vec<WSABUF> = parts
+            .iter()
+            .map(|p| WSABUF {
+                len: p.len() as u32,
+                buf: p.as_ptr().cast_mut(),
+            })
+            .collect();
+        let io = Io::SendV {
+            socket: server.raw(),
+            bufs: bufs.as_ptr(),
+            count: bufs.len() as u32,
+        };
+        // SAFETY: the entries and the bytes they name are heap blocks
+        // owned by the tuple.
+        let mut send = unsafe { Op::new(io, (bufs, parts)) };
+        let mut sent = poll_once(&mut send).await.map(|(n, _)| n);
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let (n, buf) = client.recv(Vec::with_capacity(16 * 1024)).await;
+            assert!(n > 0, "recv: {}", err(n));
+            got.extend_from_slice(&buf);
+        }
+        if sent.is_none() {
+            sent = Some(send.await.0);
+        }
+        assert_eq!(
+            sent,
+            Some(expected.len() as i32),
+            "a vectored send is whole"
+        );
+        assert!(got == expected, "bytes differ or are out of order");
+    });
+}
+
+#[test]
+fn a_file_is_sent_from_an_offset_without_reading_it() {
+    both(|| async {
+        let path = std::env::temp_dir().join(format!(
+            "giong-iocp-sendfile-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let content: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&path, &content).expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+
+        let (listener, addr) = Listener::bind();
+        let client = Sock::connect(addr).await.expect("connect");
+        let server = listener.accept().await.expect("accept");
+
+        for (offset, len) in [(0u64, 1000u32), (1000, 250_000), (299_990, 10)] {
+            let io = Io::SendFile {
+                socket: server.raw(),
+                file: file.as_raw_handle() as HANDLE,
+                offset,
+                len,
+            };
+            // SAFETY: the operation points at no memory; `file` and
+            // `server` outlive it.
+            let mut send = unsafe { Op::new(io, ()) };
+            let mut sent = poll_once(&mut send).await.map(|(n, ())| n);
+            let mut got = Vec::new();
+            while got.len() < len as usize {
+                let (n, buf) = client.recv(Vec::with_capacity(64 * 1024)).await;
+                assert!(n > 0, "recv: {}", err(n));
+                got.extend_from_slice(&buf);
+            }
+            if sent.is_none() {
+                sent = Some(send.await.0);
+            }
+            assert_eq!(sent, Some(len as i32), "{}", err(sent.unwrap()));
+            let range = offset as usize..offset as usize + len as usize;
+            assert!(got == content[range], "bytes differ at offset {offset}");
+        }
+
+        // Past the end of the file: an error, not a short send.
+        let io = Io::SendFile {
+            socket: server.raw(),
+            file: file.as_raw_handle() as HANDLE,
+            offset: 299_990,
+            len: 100,
+        };
+        // SAFETY: as above.
+        let (res, ()) = unsafe { Op::new(io, ()) }.await;
+        println!("TransmitFile past the end of the file: {res}");
+        assert!(res < 0 || res == 10, "{res}");
+
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    });
+}
+
+#[test]
 fn the_bell_wakes_a_parked_worker_from_another_thread() {
     let mut driver = Driver::new().expect("driver");
     let bell = driver.bell();

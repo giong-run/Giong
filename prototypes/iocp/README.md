@@ -19,6 +19,8 @@ layer:
 | Accept | `AcceptEx` into a socket created ahead, then `SO_UPDATE_ACCEPT_CONTEXT` | `tcp_echo_through_accept_and_connect`, `many_accepts_wait_at_once_and_each_gets_one_connection` |
 | Connect | `ConnectEx` on a bound socket, then `SO_UPDATE_CONNECT_CONTEXT` | `tcp_echo_through_accept_and_connect`, `connecting_to_a_closed_port_is_refused_with_its_error_code` |
 | Stream I/O | `WSARecv`, `WSASend` | `a_megabyte_arrives_whole_in_both_directions` |
+| Several buffers in one write | `WSASend` with an array of buffers | `several_buffers_go_out_as_one_write` |
+| Files to sockets | `TransmitFile` from an offset | `a_file_is_sent_from_an_offset_without_reading_it` |
 | Idle connections hold no buffer | a receive of zero bytes waits for data | `a_zero_byte_receive_waits_for_data_and_holds_no_buffer` |
 | Datagrams | `WSARecvFrom`, `WSASendTo` | `datagrams_roundtrip_with_their_sender` |
 | Files | overlapped `ReadFile`, `WriteFile` at an offset; no blocking pool | `files_read_and_write_at_offsets` |
@@ -50,7 +52,7 @@ Wine reports a reset peer as an orderly close.
 
 - Multishot accept and receive (`MultiIo`), written as loops over these
   single operations with pool buffers.
-- `TransmitFile`, vectored sends, `WSARecvMsg`/`WSASendMsg`.
+- `WSARecvMsg`/`WSASendMsg` (control messages).
 - One listening socket shared by the workers: a handle belongs to one port,
   so one worker's port sees every accept and hands the sockets out.
 - Timer resolution of the wait (about 15.6 ms by default on Windows).

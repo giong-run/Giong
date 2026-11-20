@@ -41,10 +41,10 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    setsockopt, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend,
-    WSASendTo, LPFN_ACCEPTEX, LPFN_CONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKET,
-    SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAID_ACCEPTEX,
-    WSAID_CONNECTEX,
+    setsockopt, TransmitFile, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv,
+    WSARecvFrom, WSASend, WSASendTo, LPFN_ACCEPTEX, LPFN_CONNECTEX,
+    SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKET, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+    SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAID_ACCEPTEX, WSAID_CONNECTEX,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, SetFileCompletionNotificationModes, WriteFile,
@@ -101,6 +101,23 @@ pub enum Io {
         buf: *const u8,
         len: u32,
     },
+    /// Send several buffers as one write (an HTTP head and its body).
+    /// `bufs` points at `count` entries, kept with the buffers they name.
+    SendV {
+        socket: SOCKET,
+        bufs: *const WSABUF,
+        count: u32,
+    },
+    /// Send `len` bytes of `file` from `offset` without copying them
+    /// through the process (`TransmitFile`). `len` is at most 2^31 - 1 and
+    /// not 0, which Windows reads as "to the end of the file". The file
+    /// handle need not be registered with the driver.
+    SendFile {
+        socket: SOCKET,
+        file: HANDLE,
+        offset: u64,
+        len: u32,
+    },
     /// Receive one datagram and the address it came from. `addr_len` holds
     /// the size of `addr` going in and the address's length coming out.
     RecvFrom {
@@ -140,6 +157,8 @@ impl Io {
             Io::Connect { socket, .. }
             | Io::Recv { socket, .. }
             | Io::Send { socket, .. }
+            | Io::SendV { socket, .. }
+            | Io::SendFile { socket, .. }
             | Io::RecvFrom { socket, .. }
             | Io::SendTo { socket, .. } => (socket as HANDLE, true),
             Io::Read { file, .. } | Io::Write { file, .. } => (file, false),
@@ -376,7 +395,9 @@ impl Driver {
         let mut after = After::Nothing;
         // SAFETY: OVERLAPPED is plain data; all-zero is its initial state.
         let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
-        if let Io::Read { offset, .. } | Io::Write { offset, .. } = *io {
+        if let Io::Read { offset, .. } | Io::Write { offset, .. } | Io::SendFile { offset, .. } =
+            *io
+        {
             overlapped.Anonymous.Anonymous.Offset = offset as u32;
             overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
         }
@@ -471,6 +492,34 @@ impl Driver {
                     };
                     let rc = WSASend(s, &wsabuf, 1, &mut transferred, 0, ov, None);
                     if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(wsa_error())
+                    }
+                }
+                Io::SendV {
+                    socket: s,
+                    bufs,
+                    count,
+                } => {
+                    let rc = WSASend(s, bufs, count, &mut transferred, 0, ov, None);
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        Err(wsa_error())
+                    }
+                }
+                Io::SendFile {
+                    socket: s,
+                    file,
+                    len,
+                    ..
+                } => {
+                    if TransmitFile(s, file, len, 0, ov, ptr::null(), 0) != 0 {
+                        // TransmitFile has no out-parameter for the count:
+                        // a call that finishes at once leaves it in the
+                        // OVERLAPPED, as a completion would.
+                        transferred = (*record).overlapped.InternalHigh as u32;
                         Ok(())
                     } else {
                         Err(wsa_error())
