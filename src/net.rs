@@ -305,10 +305,19 @@ impl Drop for SendInFlight<'_> {
 
 impl StreamSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS waits in a send to a full socket even with `MSG_DONTWAIT`
+        // (the flag only keeps a receive from waiting there), so a stream is
+        // non-blocking from the start: a send made outside the driver, as
+        // giong-compat's direct sends are, must never hold the worker. The
+        // driver would set the mode at the first operation anyway.
+        #[cfg(target_os = "macos")]
+        let nonblocking = sock.set_nonblocking(true).is_ok();
+        #[cfg(not(target_os = "macos"))]
+        let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
-            nonblocking: Cell::new(false),
+            nonblocking: Cell::new(nonblocking),
             zero_copy: Cell::new(true),
             zero_copy_copied: OnceCell::new(),
             sends_in_flight: Cell::new(0),

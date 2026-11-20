@@ -784,7 +784,14 @@ fn accept_backlog_is_bounded_and_no_connection_is_lost() {
     // More pending connections than the driver is willing to queue (1024):
     // the multishot accept must pause, leave the rest in the kernel's listen
     // backlog, and resume once the application catches up.
-    const N: usize = 1300;
+    // macOS keeps at most 128 connections waiting on a listener
+    // (`kern.ipc.somaxconn`) and drops the rest, so fewer go over the
+    // driver's limit there.
+    const N: usize = if cfg!(target_os = "macos") {
+        1100
+    } else {
+        1300
+    };
     // Every client, up to 1024 accepted sockets queued in the driver, and
     // room for the other tests.
     allow_open_files(N as u64 + 1024 + 1024);

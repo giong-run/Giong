@@ -5,7 +5,7 @@
 # A binary that passes or fails in time is counted from its "test result"
 # line. A binary that runs out of time is run again one test at a time,
 # each under a shorter limit, so a single hung test is named instead of
-# holding the whole job. Counts go to the job summary and annotations;
+# holding the whole job; so is a binary that a signal killed. Counts go to the job summary and annotations;
 # every log is kept in logs/ for the artifact.
 set -uo pipefail
 
@@ -49,13 +49,14 @@ while IFS=$'\t' read -r pkg name exe manifest; do
   (cd "$dir" && limited "$bin_limit" "$exe" --test-threads=4) > "$log" 2>&1 < /dev/null
   code=$?
   p=0; f=0; i=0; h=0; failed_names=""; hung_names=""
-  if [ "$code" = 124 ]; then
-    # Out of time: one test at a time.
+  if [ "$code" = 124 ] || [ "$code" -ge 128 ]; then
+    # Out of time, or killed by a signal (a crash names no test and loses
+    # the captured output): one test at a time, output not captured.
     (cd "$dir" && "$exe" --list --format terse 2>/dev/null) | sed -n 's/: test$//p' > "logs/$crate-$name.list"
     : > "logs/$crate-$name.each.log"
     while read -r t; do
       one=$(mktemp)
-      (cd "$dir" && limited "$test_limit" "$exe" --exact "$t" --test-threads=1) > "$one" 2>&1 < /dev/null
+      (cd "$dir" && limited "$test_limit" "$exe" --exact "$t" --test-threads=1 --nocapture) > "$one" 2>&1 < /dev/null
       c=$?
       { echo "=== $t (exit $c)"; cat "$one"; } >> "logs/$crate-$name.each.log"
       if [ "$c" = 124 ]; then

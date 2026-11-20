@@ -226,7 +226,10 @@ impl UdpSocket {
     ///
     /// On macOS every worker can bind the address too, and the port is
     /// checked the same way, but the kernel gives all its datagrams to one
-    /// of the sockets: one worker receives them.
+    /// of the sockets: one worker receives them. giong also raises the
+    /// socket's send buffer there to 65,535 bytes when it is smaller (the
+    /// system's default refuses datagrams over 9,216 bytes), so a datagram
+    /// of any length UDP allows can be sent, as on Linux.
     ///
     /// Port 0 asks the kernel for a port of the socket's own, which no other
     /// socket can share.
@@ -254,6 +257,14 @@ impl UdpSocket {
         let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
             Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         })?;
+        // macOS refuses a datagram longer than the socket's send buffer,
+        // 9216 bytes unless changed (`net.inet.udp.maxdgram`): raised to the
+        // longest datagram UDP has, so the limit is the protocol's, as on
+        // Linux. A failure leaves the system's limit.
+        #[cfg(target_os = "macos")]
+        if sock.send_buffer_size().is_ok_and(|size| size < 65_535) {
+            drop(sock.set_send_buffer_size(65_535));
+        }
         let mut socket = Self::from_socket(sock);
         socket.held = held;
         Ok(socket)

@@ -49,6 +49,7 @@ extern "C" {
     fn CFArrayGetTypeID() -> usize;
     fn CFArrayGetCount(array: CFTypeRef) -> CFIndex;
     fn CFArrayGetValueAtIndex(array: CFTypeRef, index: CFIndex) -> CFTypeRef;
+    fn CFDataGetTypeID() -> usize;
     fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
     fn CFDataGetLength(data: CFTypeRef) -> CFIndex;
     fn CFDictionaryGetTypeID() -> usize;
@@ -74,6 +75,7 @@ extern "C" {
         domain: u32,
         settings: *mut CFTypeRef,
     ) -> OSStatus;
+    fn SecCertificateGetTypeID() -> usize;
     fn SecCertificateCopyData(cert: CFTypeRef) -> CFTypeRef;
     fn SecPolicyGetTypeID() -> usize;
     fn SecPolicyCopyProperties(policy: CFTypeRef) -> CFTypeRef;
@@ -164,6 +166,9 @@ fn is_tls_policy(policy: CFTypeRef) -> bool {
         let Some(properties) = Owned::new(SecPolicyCopyProperties(policy)) else {
             return false;
         };
+        if CFGetTypeID(properties.0) != CFDictionaryGetTypeID() {
+            return false;
+        }
         let oid = CFDictionaryGetValue(properties.0, kSecPolicyOid);
         !oid.is_null() && CFEqual(oid, kSecPolicyAppleSSL) != 0
     }
@@ -228,6 +233,10 @@ fn evaluate(settings: &Owned, keys: &Keys) -> Option<Trust> {
 /// The certificates the keychain trusts as roots for TLS servers, in DER.
 /// Empty when the trust settings cannot be read.
 pub(crate) fn trusted_roots() -> Vec<CertificateDer<'static>> {
+    // One reader at a time: the framework's trust settings code keeps state
+    // of its own, and nothing is gained by reading the keychain in parallel.
+    static ONE_READER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_READER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(keys) = Keys::new() else {
         return Vec::new();
     };
@@ -243,15 +252,20 @@ pub(crate) fn trusted_roots() -> Vec<CertificateDer<'static>> {
             continue;
         };
         for cert in elements(&certs) {
-            if cert.is_null() {
-                continue;
-            }
-            // SAFETY: `cert` is a certificate of the array, alive while the
-            // array is; the data is a copy we own, read within its length.
+            // SAFETY: `cert` is an element of the array, alive while the
+            // array is, and passed on as a certificate only once its type
+            // says it is one; the data is a copy we own, read within its
+            // length.
             let der = unsafe {
+                if cert.is_null() || CFGetTypeID(cert) != SecCertificateGetTypeID() {
+                    continue;
+                }
                 let Some(data) = Owned::new(SecCertificateCopyData(cert)) else {
                     continue;
                 };
+                if CFGetTypeID(data.0) != CFDataGetTypeID() {
+                    continue;
+                }
                 let (bytes, len) = (CFDataGetBytePtr(data.0), CFDataGetLength(data.0));
                 if bytes.is_null() || len <= 0 {
                     continue;

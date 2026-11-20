@@ -271,10 +271,18 @@ pub(crate) fn sendfile(sock: RawFd, file: RawFd, offset: &mut u64, count: usize)
         return len as isize;
     }
     if res == 0 {
-        0
-    } else {
-        -1
+        return 0;
     }
+    // A peer that closed makes macOS answer "not connected" where a send
+    // (and Linux's sendfile) says "broken pipe": reported as the latter, so
+    // one error means one thing on every system.
+    // SAFETY: the calling thread's own `errno`.
+    unsafe {
+        if *libc::__error() == libc::ENOTCONN {
+            *libc::__error() = libc::EPIPE;
+        }
+    }
+    -1
 }
 
 /// Reads a batch of directory entries into `buf` (whose capacity is the
