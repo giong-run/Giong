@@ -77,8 +77,10 @@
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("giong only supports Linux: it is built on io_uring and epoll");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "giong supports Linux (io_uring and epoll) and, as a development platform, macOS (kqueue)"
+);
 
 mod buf;
 mod driver;

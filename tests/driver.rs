@@ -63,6 +63,7 @@ fn a_named_driver_is_the_one_every_worker_gets() {
 fn driver_names_are_what_giong_driver_accepts() {
     assert_eq!(DriverKind::IoUring.name(), "io_uring");
     assert_eq!(DriverKind::Epoll.to_string(), "epoll");
+    assert_eq!(DriverKind::Kqueue.to_string(), "kqueue");
 }
 
 const CHILD: &str = "GIONG_TEST_DRIVER_CHILD";

@@ -7,9 +7,10 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use super::Bell;
 
-/// macOS has no `MSG_NOSIGNAL`. Every socket giong makes is created by
-/// socket2, which sets `SO_NOSIGPIPE` on it (accepted sockets inherit it
-/// from their listener), so a send to a closed peer fails with `EPIPE`.
+/// macOS has no `MSG_NOSIGNAL`: the socket carries `SO_NOSIGPIPE` instead,
+/// so a send to a closed peer fails with `EPIPE`. socket2 sets it on every
+/// socket it creates, accepted sockets inherit it from their listener, and
+/// the `from_std` constructors and every listener set it themselves.
 pub(crate) const MSG_NOSIGNAL: i32 = 0;
 
 /// giong's own flag for "stat the descriptor itself" (macOS has no
@@ -66,13 +67,6 @@ impl Bell {
             set_nonblocking(fd)?;
         }
         Ok(Bell { read, write })
-    }
-
-    /// The worker's wake-up bell. A pipe, like every bell on macOS: the
-    /// kqueue driver could use an `EVFILT_USER` event instead, which needs
-    /// no descriptor and no read to reset (see the design document).
-    pub(crate) fn new_worker() -> io::Result<Self> {
-        Self::new()
     }
 }
 

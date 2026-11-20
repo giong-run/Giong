@@ -26,6 +26,8 @@ mod blocking;
 mod budget;
 #[cfg(target_os = "linux")]
 mod epoll;
+#[cfg(any(target_os = "macos", giong_libkqueue))]
+mod kqueue;
 mod readiness;
 #[cfg(target_os = "linux")]
 mod uring;
@@ -60,14 +62,20 @@ pub enum DriverKind {
     /// kernel older than 6.0. File operations run on a pool of blocking
     /// threads. Every API behaves the same; it costs more system calls.
     Epoll,
+    /// Readiness-based I/O through one kqueue per worker: the driver on
+    /// macOS, which is supported for development, not for speed. It is the
+    /// epoll driver's logic over kqueue; file operations run on a pool of
+    /// blocking threads.
+    Kqueue,
 }
 
 impl DriverKind {
-    /// `"io_uring"` or `"epoll"`, as accepted by `GIONG_DRIVER`.
+    /// `"io_uring"`, `"epoll"` or `"kqueue"`, as accepted by `GIONG_DRIVER`.
     pub const fn name(self) -> &'static str {
         match self {
             DriverKind::IoUring => "io_uring",
             DriverKind::Epoll => "epoll",
+            DriverKind::Kqueue => "kqueue",
         }
     }
 }
@@ -563,6 +571,8 @@ pub(crate) enum Driver {
     Uring(uring::Uring),
     #[cfg(target_os = "linux")]
     Epoll(readiness::Readiness<epoll::Epoll>),
+    #[cfg(any(target_os = "macos", giong_libkqueue))]
+    Kqueue(readiness::Readiness<kqueue::Kqueue>),
 }
 
 /// Expands to a `match` on a [`Driver`] that runs the same expression for
@@ -574,6 +584,8 @@ macro_rules! each {
             Driver::Uring($d) => $body,
             #[cfg(target_os = "linux")]
             Driver::Epoll($d) => $body,
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue($d) => $body,
         }
     };
 }
@@ -587,6 +599,11 @@ macro_rules! split {
             Driver::Uring($d) => $uring,
             #[cfg(target_os = "linux")]
             Driver::Epoll($d) => {
+                let _ = &$d;
+                $ready
+            }
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue($d) => {
                 let _ = &$d;
                 $ready
             }
@@ -658,11 +675,13 @@ pub(crate) fn kind_from_env() -> io::Result<Option<DriverKind>> {
             "" | "auto" => Ok(None),
             "io_uring" | "io-uring" | "uring" => Ok(Some(DriverKind::IoUring)),
             "epoll" => Ok(Some(DriverKind::Epoll)),
+            "kqueue" => Ok(Some(DriverKind::Kqueue)),
             other => Err(crate::error::raise(
                 Code::InvalidConfig,
                 format!("GIONG_DRIVER is {other:?}, which is not a driver"),
-                "set GIONG_DRIVER to io_uring or epoll, or unset it to use io_uring where the \
-                 kernel allows it and epoll elsewhere.",
+                "set GIONG_DRIVER to io_uring or epoll (Linux) or kqueue (macOS), or unset it \
+                 to use io_uring where the kernel allows it, epoll elsewhere on Linux, and \
+                 kqueue on macOS.",
             )),
         },
     }
@@ -709,8 +728,8 @@ fn unsupported(kind: DriverKind) -> io::Error {
     crate::error::raise(
         Code::InvalidConfig,
         format!("the {kind} driver does not exist on this operating system"),
-        "name a driver this system has (Builder::driver or GIONG_DRIVER), or name none to \
-         let giong choose.",
+        "name io_uring or epoll on Linux and kqueue on macOS (Builder::driver or \
+         GIONG_DRIVER), or name none to let giong choose.",
     )
 }
 
@@ -730,16 +749,21 @@ fn unsupported(kind: DriverKind) -> io::Error {
 #[derive(Clone)]
 pub(crate) enum WakeHandle {
     /// A bell the driver watches: io_uring reads it, epoll polls it.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Bell(std::sync::Arc<crate::sys::Bell>),
+    /// The user event of a kqueue.
+    #[cfg(any(target_os = "macos", giong_libkqueue))]
+    Kqueue(std::sync::Arc<kqueue::Wake>),
 }
 
 impl WakeHandle {
     /// Wakes the worker, or makes its next `park` return at once.
     pub(crate) fn ring(&self) {
         match self {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             WakeHandle::Bell(bell) => bell.ring(),
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            WakeHandle::Kqueue(wake) => wake.ring(),
         }
     }
 
@@ -747,8 +771,10 @@ impl WakeHandle {
     /// itself.
     fn seen(&self) {
         match self {
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             WakeHandle::Bell(bell) => bell.drain(),
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            WakeHandle::Kqueue(_) => {}
         }
     }
 }
@@ -771,6 +797,8 @@ impl Driver {
             Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool)?),
             #[cfg(target_os = "linux")]
             Some(DriverKind::Epoll) => Driver::Epoll(readiness::Readiness::new(pool)?),
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Some(DriverKind::Kqueue) => Driver::Kqueue(readiness::Readiness::new(pool)?),
             // Reachable for the drivers this build does not have.
             #[allow(unreachable_patterns)]
             Some(other) => return Err(unsupported(other)),
@@ -785,6 +813,8 @@ impl Driver {
                 }
                 Err(e) => return Err(e),
             },
+            #[cfg(target_os = "macos")]
+            None => Driver::Kqueue(readiness::Readiness::new(pool)?),
         };
         let choice = DriverChoice {
             kind: driver.kind(),
@@ -809,6 +839,8 @@ impl Driver {
             Driver::Uring(_) => DriverKind::IoUring,
             #[cfg(target_os = "linux")]
             Driver::Epoll(_) => DriverKind::Epoll,
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue(_) => DriverKind::Kqueue,
         }
     }
 

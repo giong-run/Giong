@@ -143,7 +143,7 @@ Everything outside the drivers that differs per OS, one function each:
 | `sys::` | Linux (unchanged calls) | macOS | Windows (plan) |
 |---|---|---|---|
 | `Bell` (blocking pool, signals) | `eventfd` | non-blocking pipe | completion packet to the port |
-| `Bell::new_worker` (behind `WakeHandle`) | `eventfd`, blocking (io_uring reads it) | pipe; `EVFILT_USER` in the kqueue driver | `PostQueuedCompletionStatus` |
+| A worker's wake-up (behind `WakeHandle`) | `Bell::new_worker`: an `eventfd`, blocking (io_uring reads it) | `kqueue::Wake`: an `EVFILT_USER` event of the worker's own queue, no descriptor | `PostQueuedCompletionStatus` |
 | `ring` / `drain` | 8-byte write / read | 1-byte write / read until empty | - |
 | `errno_location` | `__errno_location` | `__error` | `GetLastError` |
 | `allowed_cpus`, `pin_to_cpu`, `CAN_PIN` | `sched_{get,set}affinity` | all CPUs; no pinning | processor groups |
@@ -208,20 +208,36 @@ plan or a limit of macOS itself):
 | Files | io_uring, or blocking pool on epoll | blocking pool (as epoll) | macOS has no usable async file I/O |
 | `sync_all`/`sync_data` | `fsync`/`fdatasync` | `F_FULLFSYNC` for both | slower but durable; macOS has no `fdatasync` |
 | `allocate` | `fallocate` | `F_PREALLOCATE` + `ftruncate` | emulated; same visible result |
-| Ports shared by workers | `SO_REUSEPORT` spreads connections | `SO_REUSEPORT` binds but sends every connection to one socket | **gap**; plan S2: one listening socket shared by the workers |
-| Port guard against a second process | a probe socket without `SO_REUSEPORT` (`src/net/share.rs`) | no probe: on macOS it would refuse the process's own workers | **gap**; macOS needs `SO_REUSEPORT` on both sockets, so another process of the user can bind the port too |
+| TCP port shared by workers | `SO_REUSEPORT` spreads connections by a hash of their addresses | one listening socket, duplicated for each worker (`src/net/share.rs`): whichever worker accepts first gets the connection | different spread, same API; `SO_REUSEPORT` on macOS would send every connection to one socket |
+| UDP port shared by workers | `SO_REUSEPORT` spreads datagrams by sender | each worker binds with `SO_REUSEPORT`; the kernel gives every datagram to one socket | macOS limit: one worker receives |
+| Port guard against a second process | the first socket of a port binds without `SO_REUSEPORT` (`src/net/share.rs`) | TCP: the shared socket never has `SO_REUSEPORT`, so nothing else can bind while it lives. UDP: a probe socket without the option is bound and closed before the first bind | TCP stronger than Linux; UDP checked at the first bind only (a process of the same user that sets `SO_REUSEPORT` can join later) |
 | Largest UDP datagram | 65507 bytes | 9216 by default (`net.inet.udp.maxdgram`) | macOS limit |
 | Listen backlog | `net.core.somaxconn` (4096) | `kern.ipc.somaxconn` (128) | macOS limit; bursts of connections are refused sooner |
 | Append-mode writes | `pwrite` appends on `O_APPEND` | `write(2)` when the descriptor has `O_APPEND` | emulated; same visible result |
 | UDP truncated datagram | true length reported (`MSG_TRUNC` in) | truncation flagged (`recvmsg`'s `msg_flags`), true length unknown | macOS limit |
 | UDP GSO/GRO, `IP_PKTINFO`, ECN | not in the API yet | not in the API yet | later 1.x, Linux first |
 | TLS offload | kTLS | in-process rustls (`Ktls::Auto` falls back; `Required` fails) | kTLS is Linux-only by design |
+| `SIGPIPE` on a send to a closed peer | `MSG_NOSIGNAL` on every send | `SO_NOSIGPIPE` on every socket: set by socket2 on the ones giong creates, inherited by accepted ones, set by giong on every listener and `from_std` socket | equivalent |
 | CPU pinning | default where allowed | never (`pin_cores(true)` is a no-op) | macOS limit |
 | `accept` close-on-exec | atomic (`accept4`) | set after `accept` | same window std has on macOS |
 | Peer-closed check in the HTTP client pool | `POLLRDHUP` | the receive poll only | small; a FIN already received is seen |
 | `TCP_USER_TIMEOUT` in DB clients | set | keepalive only | macOS has no such option |
 | Trust roots, DNS servers | files under `/etc` | `/etc/resolv.conf` only, no keychain | plan S3 |
-| Shutdown signals | handler + eventfd | handler + pipe (`EVFILT_SIGNAL` possible) | equivalent |
+| Shutdown signals | handler + eventfd | handler + pipe | equivalent; `EVFILT_SIGNAL` is not used (below) |
+
+**Why not `EVFILT_SIGNAL`.** kqueue can report a signal, but it only
+observes it: the signal's default action still happens, so `SIGINT` would
+still end the process unless a handler is installed as well. With the
+handler there anyway, the handler ringing a `Bell` is the whole mechanism,
+and it is the same code on Linux and macOS (`sys/unix.rs`). One mechanism
+on every Unix beats a second one that saves nothing.
+
+**The wake-up on macOS** is an `EVFILT_USER` event (`EV_CLEAR`) registered
+on the worker's kqueue; `WakeHandle::ring` triggers it with `NOTE_TRIGGER`
+from any thread. A trigger while the worker is awake stays pending until
+its next `kevent`, any number of triggers collapse into one event, and
+there is nothing to drain, so it keeps the `WakeHandle` contract of
+section 2.1 with one system call per ring and none per wake.
 
 Tests that cannot run on macOS are marked, not deleted:
 `tests/blocked.rs` (seccomp, capabilities, io_uring) is `cfg(linux)`;
@@ -320,9 +336,11 @@ What fails, by cause:
 ## 8. Next steps
 
 - S1: the kqueue driver on this layer, with `EVFILT_USER` behind
-  `WakeHandle` and `EVFILT_SIGNAL` for shutdown.
-- S2: share one listening socket between workers on macOS; `SO_NOSIGPIPE`
-  checked on every socket path.
+  `WakeHandle` (done; shutdown signals stay on the handler, section 4).
+- S2: one listening socket shared by the workers on macOS, the port
+  guard, `SO_NOSIGPIPE` on every socket path (done, section 4; the shared
+  socket is one function in `src/net/share.rs`, where Windows can put an
+  acceptor of its own).
 - S3: trust roots from the keychain, DNS servers from the system
   configuration.
 - S4: the rest of the suite's Linux assumptions, as the runners show them.
