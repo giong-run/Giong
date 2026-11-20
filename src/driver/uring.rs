@@ -1761,7 +1761,13 @@ mod tests {
             });
         CLOSE_ASYNC.store(false, Ordering::Relaxed);
         std::fs::remove_file(&path).unwrap();
-        run.unwrap();
+        match run {
+            // Blocked (Docker's seccomp profile) or missing (old kernels).
+            Err(e) if crate::error::code(&e) == Some(Code::IoUringUnavailable) => {
+                eprintln!("skipped: {e}");
+            }
+            other => other.unwrap(),
+        }
     }
 
     /// A blocked or missing io_uring is explained; other errors pass through.
