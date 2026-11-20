@@ -39,9 +39,13 @@ const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 /// `IPV6_TCLASS` (each `CMSG_SPACE(4)` = 24 bytes on 64-bit Linux), and the
 /// address the datagram was sent to (`IP_PKTINFO`, or `IPV6_PKTINFO` which
 /// is the larger: `CMSG_SPACE(20)` = 40 bytes).
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_INT_SPACE: usize = (CMSG_HDR + 4 + 7) & !7;
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_PKTINFO6_SPACE: usize = (CMSG_HDR + mem::size_of::<libc::in6_pktinfo>() + 7) & !7;
 /// Largest payload a GRO receive can hand over: 64 KiB of coalesced
 /// datagrams.
@@ -71,6 +75,7 @@ static RECV_HEADER: RecvHeader = {
 
 /// The header of a multishot receive that also takes control messages
 /// (GRO segment size, ECN bits).
+#[cfg(feature = "unstable-udp-offload")]
 static RECV_HEADER_CONTROL: RecvHeader = {
     // SAFETY: as above.
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
@@ -88,7 +93,7 @@ struct Message {
     addr: libc::sockaddr_storage,
     /// Control messages of a send (`UDP_SEGMENT`, `IP_TOS`), aligned for
     /// `cmsghdr`. Unused unless `unstable-udp-offload` sets them.
-    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    #[cfg(feature = "unstable-udp-offload")]
     control: [u64; CONTROL_SPACE / 8],
 }
 
@@ -129,6 +134,7 @@ impl Message {
 /// The GRO segment size, the ECN bits and the address the datagram was sent
 /// to, from the control messages of a receive. Unknown or malformed
 /// messages are skipped.
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
     let (mut segment, mut ecn, mut local) = (0, 0, None);
     while control.len() >= CMSG_HDR {
@@ -206,23 +212,45 @@ fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
 pub struct Datagram {
     buf: RecvBuf,
     truncated: bool,
+    // The fields below exist only with the feature, so that a datagram
+    // costs what it did without it (it is moved through every `Poll`).
     /// Where the payload starts in `buf`.
+    #[cfg(feature = "unstable-udp-offload")]
     payload_at: u16,
     /// GRO: the size of every coalesced datagram but the last (0: one
     /// datagram).
-    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    #[cfg(feature = "unstable-udp-offload")]
     segment: u16,
     /// The ECN bits of the IP header (0 when not asked for).
-    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    #[cfg(feature = "unstable-udp-offload")]
     ecn: u8,
     /// The address the datagram was sent to (when asked for).
-    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    #[cfg(feature = "unstable-udp-offload")]
     local: Option<IpAddr>,
 }
 
 impl Datagram {
+    /// Splits what a multishot `recvmsg` wrote into a buffer.
+    #[cfg(not(feature = "unstable-udp-offload"))]
+    fn parse(buf: RecvBuf) -> io::Result<(Self, SocketAddr)> {
+        let malformed = || unexpected("io_uring returned a malformed datagram");
+        if buf.len() < OVERHEAD {
+            return Err(malformed());
+        }
+        let field = |i: usize| {
+            let bytes: [u8; 4] = buf[i * 4..i * 4 + 4].try_into().expect("four bytes");
+            u32::from_ne_bytes(bytes) as usize
+        };
+        let (name_len, payload_len, flags) = (field(0), field(2), field(3) as i32);
+        let from = parse_addr(&buf[OUT_HEADER..OUT_HEADER + name_len.min(NAME_LEN)])
+            .ok_or_else(malformed)?;
+        let truncated = flags & libc::MSG_TRUNC != 0 || payload_len > buf.len() - OVERHEAD;
+        Ok((Self { buf, truncated }, from))
+    }
+
     /// Splits what a multishot `recvmsg` wrote into a buffer, armed with
     /// `control_space` bytes of room for control messages.
+    #[cfg(feature = "unstable-udp-offload")]
     fn parse(buf: RecvBuf, control_space: usize) -> io::Result<(Self, SocketAddr)> {
         let malformed = || unexpected("io_uring returned a malformed datagram");
         let payload_at = OVERHEAD + control_space;
@@ -259,7 +287,11 @@ impl Datagram {
 
     /// The payload.
     pub fn as_slice(&self) -> &[u8] {
-        &self.buf[usize::from(self.payload_at)..]
+        #[cfg(feature = "unstable-udp-offload")]
+        let at = usize::from(self.payload_at);
+        #[cfg(not(feature = "unstable-udp-offload"))]
+        let at = OVERHEAD;
+        &self.buf[at..]
     }
 
     /// With GRO on ([`UdpSocket::set_gro`]), several datagrams of one sender
@@ -344,6 +376,7 @@ pub struct UdpSocket {
     recv: MultiSlot,
     /// Receives take control messages (GRO, ECN): set before the first
     /// `recv_from`.
+    #[cfg(feature = "unstable-udp-offload")]
     control: std::cell::Cell<bool>,
     /// The socket's hold on its port, for one that [`bind`](Self::bind)
     /// made on a port of the caller's choice (see `share`).
@@ -419,6 +452,7 @@ impl UdpSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
+            #[cfg(feature = "unstable-udp-offload")]
             control: std::cell::Cell::new(false),
             held: None,
             _not_send: PhantomData,
@@ -486,6 +520,9 @@ impl UdpSocket {
                             Err(unexpected("io_uring returned a datagram without a buffer"))
                         });
                     }
+                    #[cfg(not(feature = "unstable-udp-offload"))]
+                    MultiPoll::Data(buf) => return Poll::Ready(Datagram::parse(buf)),
+                    #[cfg(feature = "unstable-udp-offload")]
                     MultiPoll::Data(buf) => {
                         let space = if self.control.get() { CONTROL_SPACE } else { 0 };
                         return Poll::Ready(Datagram::parse(buf, space));
@@ -494,6 +531,9 @@ impl UdpSocket {
                         if !wait_for_pool(&mut driver, cx, true) {
                             return Poll::Pending;
                         }
+                        #[cfg(not(feature = "unstable-udp-offload"))]
+                        let hdr = &RECV_HEADER.0;
+                        #[cfg(feature = "unstable-udp-offload")]
                         let hdr = if self.control.get() {
                             &RECV_HEADER_CONTROL.0
                         } else {
