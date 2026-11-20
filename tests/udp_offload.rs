@@ -14,7 +14,35 @@ use giong::{Builder, DriverKind};
 
 const GRO_BUFFER: usize = giong::net::GRO_RECV_BUFFER;
 
+/// `true` if io_uring works here (it is blocked, for instance, under
+/// `scripts/no-io-uring.py`, in Docker with its default seccomp profile, or
+/// on a kernel without buffer rings). Where CI says it must work
+/// (`GIONG_TEST_EXPECT_DRIVER=io_uring`), not working is a failure.
+fn io_uring_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let res = Builder::new()
+            .driver(DriverKind::IoUring)
+            .block_on(async {});
+        if let Err(e) = &res {
+            assert_ne!(
+                std::env::var("GIONG_TEST_EXPECT_DRIVER").as_deref(),
+                Ok("io_uring"),
+                "io_uring must work here, but: {e}"
+            );
+        }
+        res.is_ok()
+    })
+}
+
+/// Runs a test on the `kind` driver; where io_uring cannot be used, its
+/// turn goes to epoll, so that every test still runs.
 fn run(fut: impl std::future::Future<Output = ()>, kind: DriverKind) {
+    let kind = if kind == DriverKind::IoUring && !io_uring_available() {
+        DriverKind::Epoll
+    } else {
+        kind
+    };
     Builder::new()
         .driver(kind)
         .recv_buffers(64, GRO_BUFFER)
