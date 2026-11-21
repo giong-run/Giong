@@ -56,6 +56,14 @@ use crate::sys;
 /// otherwise a descriptor number in the lower half and a generation in the
 /// upper half.
 pub(crate) trait Poller: Sized {
+    /// A look that cannot wait (`Park::Poll`) is skipped while no
+    /// descriptor is registered: it could only find the two bells, whose
+    /// news keeps (the blocking threads' reports are read from memory, and
+    /// a wake-up stays pending for the next wait). Set where a look costs
+    /// far more than the polls between looks: on macOS each `kevent` is an
+    /// involuntary context switch (about 20 µs on the CI runners), while an
+    /// `epoll_wait` that finds nothing is cheap, so epoll keeps looking.
+    const SKIP_EMPTY_POLL: bool;
     /// Creates the event queue.
     fn new() -> io::Result<Self>;
     /// Makes the worker's wake-up: ringing it from any thread makes
@@ -347,6 +355,8 @@ pub(crate) struct Readiness<P: Poller> {
     quieting: Vec<(RawFd, u32)>,
     /// What is known about each descriptor, indexed by its number.
     fds: Vec<Option<Slot>>,
+    /// How many of `fds` are [`Slot::Pollable`].
+    pollable: usize,
     next_gen: u32,
     /// Events collected by `has_completions` and not dispatched yet.
     ready: usize,
@@ -371,6 +381,7 @@ impl<P: Poller> Readiness<P> {
             completions,
             ops: Slab::new(),
             fds: Vec::new(),
+            pollable: 0,
             next_gen: 1,
             ready: 0,
             done: Vec::new(),
@@ -424,7 +435,10 @@ impl<P: Poller> Readiness<P> {
         if self.fds.len() <= i {
             self.fds.resize_with(i + 1, || None);
         }
-        self.fds[i] = Some(slot);
+        self.pollable += usize::from(matches!(slot, Slot::Pollable(_)));
+        if let Some(Slot::Pollable(_)) = self.fds[i].replace(slot) {
+            self.pollable -= 1;
+        }
     }
 
     /// `true` if reads and writes on file descriptor `fd` can wait for
@@ -460,7 +474,9 @@ impl<P: Poller> Readiness<P> {
     /// Forgets what is known about `fd`, which is being closed.
     fn forget(&mut self, fd: RawFd) {
         if let Some(slot) = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)) {
-            *slot = None;
+            if let Some(Slot::Pollable(_)) = slot.take() {
+                self.pollable -= 1;
+            }
         }
     }
 
@@ -1261,6 +1277,9 @@ impl<P: Poller> Readiness<P> {
         if self.ready > 0 || self.completions.any() {
             return true;
         }
+        if self.nothing_to_poll() {
+            return false;
+        }
         self.ready = self.wait_events(Some(Duration::ZERO));
         self.ready > 0
     }
@@ -1268,6 +1287,8 @@ impl<P: Poller> Readiness<P> {
     pub(crate) fn park(&mut self, mode: Park) -> Vec<Box<dyn Any>> {
         let n = if self.ready > 0 {
             mem::take(&mut self.ready)
+        } else if matches!(mode, Park::Poll) && self.nothing_to_poll() {
+            0
         } else {
             let timeout = match mode {
                 _ if self.completions.any() => Some(Duration::ZERO),
@@ -1284,6 +1305,13 @@ impl<P: Poller> Readiness<P> {
         mem::take(&mut self.graveyard)
     }
 
+    /// `true` if a look that cannot wait is to be skipped (see
+    /// [`Poller::SKIP_EMPTY_POLL`]).
+    #[inline]
+    fn nothing_to_poll(&self) -> bool {
+        P::SKIP_EMPTY_POLL && self.pollable == 0
+    }
+
     /// Waits for events; `None` waits without a time limit.
     fn wait_events(&mut self, timeout: Option<Duration>) -> usize {
         self.poller.wait(timeout)
@@ -1295,7 +1323,10 @@ impl<P: Poller> Readiness<P> {
             let (token, readable, writable) = self.poller.event(i);
             match token {
                 WAKE => self.wake.seen(),
-                DONE => {} // collected below
+                // Collected below; a ring left over from results that
+                // were already taken is reset, or every wait would end
+                // at once.
+                DONE => self.completions.quiet(),
                 token => {
                     let fd = token as u32 as usize;
                     let gen = (token >> 32) as u32;
@@ -1477,4 +1508,38 @@ pub(super) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    type Platform = super::super::epoll::Epoll;
+    #[cfg(all(not(target_os = "linux"), any(target_os = "macos", giong_libkqueue)))]
+    type Platform = super::super::kqueue::Kqueue;
+
+    /// A blocking job that finishes while its worker takes the results
+    /// rings the bell after the results are gone. The next wait sees the
+    /// ring and resets it: the one after waits again.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call epoll_wait or kevent")]
+    fn a_late_ring_of_the_blocking_threads_does_not_end_every_wait() {
+        let mut driver = Readiness::<Platform>::new(BufPool::new(2, 64).unwrap()).unwrap();
+        driver.completions.push(usize::MAX, 0);
+        let mut taken = Vec::new();
+        driver.completions.take(&mut taken);
+        assert_eq!(taken.len(), 1);
+        // The ring of a job whose result was already taken.
+        driver.completions.ring();
+        driver.park(Park::Wait(Some(Duration::from_millis(1))));
+        let wait = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        driver.park(Park::Wait(Some(wait)));
+        assert!(
+            start.elapsed() >= wait - Duration::from_millis(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
 }

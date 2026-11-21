@@ -153,6 +153,24 @@ impl Completions {
         self.any.load(Ordering::Acquire)
     }
 
+    /// Resets the bell if no result is waiting. A job that finishes while
+    /// [`take`](Self::take) runs can ring the bell after `take` reset it
+    /// and took the job's result: the bell then stays readable with nothing
+    /// to take, and a level-triggered watch would report it on every wait.
+    /// A job's ring comes after its `any`, so a reset here never hides a
+    /// result: `any` already says it.
+    pub(super) fn quiet(&self) {
+        if !self.any() {
+            self.bell.drain();
+        }
+    }
+
+    /// Rings the bell as a job does, with no result.
+    #[cfg(test)]
+    pub(super) fn ring(&self) {
+        self.bell.ring();
+    }
+
     /// Takes the waiting results, and resets the bell.
     pub(super) fn take(&self, into: &mut Vec<(usize, i32)>) {
         self.bell.drain();
