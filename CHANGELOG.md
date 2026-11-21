@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-21
+
 ### Fixed
 
 - A worker with `spin_before_park` could stop blocking for good and burn its core: the
@@ -2479,7 +2481,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/giong-run/Giong/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/giong-run/Giong/compare/v0.8.0...v1.0.0-rc.1
 [0.8.0]: https://github.com/giong-run/Giong/compare/v0.7.0...v0.8.0
