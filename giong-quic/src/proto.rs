@@ -664,6 +664,18 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
                 None
             };
         }
+        // What other workers passed on gets a batch every round too: the
+        // wait above looks at it only when the socket has nothing, so
+        // under load the connections that moved here would starve.
+        if let Some(inbox) = inbox.as_mut() {
+            for _ in 0..RECV_BATCH {
+                let Ok(d) = inbox.try_recv() else { break };
+                let data = BytesMut::from(&d.data[..]);
+                sh.st
+                    .borrow_mut()
+                    .handle(now, d.from, d.local, d.ecn, data, d.segment);
+            }
+        }
     }
 }
 
