@@ -33,8 +33,7 @@ for round in $(seq "$ROUNDS"); do
             if [ "$w" = lookup ]; then
                 case "$r" in monoio | glommio | compio) continue ;; esac
             fi
-            # tr: Windows ends the line with 
-.
+            # tr: Windows ends each line with a carriage return too.
             $PIN target/release/bench-core "$r" "$w" | tr -d '\r' >>"$OUT/raw.csv"
         done
     done
