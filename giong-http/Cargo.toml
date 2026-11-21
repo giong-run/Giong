@@ -44,6 +44,10 @@ required-features = ["client", "tls"]
 name = "client_h2"
 required-features = ["client", "tls"]
 
+[[test]]
+name = "tracing"
+required-features = ["client"]
+
 [[example]]
 name = "h2"
 required-features = ["tls"]

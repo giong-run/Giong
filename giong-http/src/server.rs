@@ -15,6 +15,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use giong::observe::RequestTrace;
 use giong::time::{sleep, timeout};
 
 use crate::body::{Failure, Next, Pipe, StreamBody};
@@ -52,18 +53,72 @@ pub(crate) fn drop_quietly<T>(value: T) {
 /// A handler's future whose panic becomes `Err`. A handler that panics
 /// gets its request answered with `500` instead of taking down the
 /// connection with it.
-struct Caught<F>(F);
+///
+/// While requests are traced, it also carries the request's trace, and
+/// polls the handler through it (see `giong::observe::RequestTrace`): one
+/// branch per poll when they are not. It lives on the heap with the
+/// handler's future, so that tracing does not make the connection's own
+/// future larger; once the handler is done, the trace goes back through
+/// `HANDED_BACK` (see `handed_back`).
+struct Caught<F> {
+    fut: F,
+    trace: Option<Box<RequestTrace>>,
+}
 
-impl<F: Future + Unpin> Future for Caught<F> {
+thread_local! {
+    /// The trace of the handler that just finished, between `Caught`
+    /// answering and its connection taking it back in the same poll.
+    static HANDED_BACK: Cell<Option<Box<RequestTrace>>> = const { Cell::new(None) };
+}
+
+/// The trace of the handler `Caught` just finished, if requests are traced.
+/// Called right after the handler's future answers, in the same poll, so
+/// no other connection's handler can have finished meanwhile.
+#[cold]
+fn handed_back() -> Option<Box<RequestTrace>> {
+    HANDED_BACK.with(Cell::take)
+}
+
+impl<F: Future> Future for Caught<F> {
     type Output = Result<F::Output, ()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match catching(|| Pin::new(&mut self.0).poll(cx)) {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `fut` is pinned along with `self` (structural pinning):
+        // it is never moved out, and `Caught` has no `Drop` of its own.
+        // `trace` is not pinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
+        if this.trace.is_some() {
+            return poll_traced(fut, &mut this.trace, cx);
+        }
+        match catching(|| fut.poll(cx)) {
             Ok(Poll::Pending) => Poll::Pending,
             Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
             Err(()) => Poll::Ready(Err(())),
         }
     }
+}
+
+/// `Caught::poll` while requests are traced: polls the handler through its
+/// trace, and hands the trace back once the handler is done.
+#[cold]
+#[inline(never)]
+fn poll_traced<F: Future>(
+    mut fut: Pin<&mut F>,
+    trace: &mut Option<Box<RequestTrace>>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<F::Output, ()>> {
+    let polled = match trace {
+        Some(t) => t.poll(|| catching(|| fut.as_mut().poll(cx))),
+        None => catching(|| fut.as_mut().poll(cx)),
+    };
+    let answer = match polled {
+        Ok(Poll::Pending) => return Poll::Pending,
+        Ok(Poll::Ready(value)) => Ok(value),
+        Err(()) => Err(()),
+    };
+    HANDED_BACK.set(trace.take());
+    Poll::Ready(answer)
 }
 
 /// The answer to a request whose handler panicked.
@@ -1184,10 +1239,107 @@ struct Conn<T> {
     /// What the unparsed data and the body being decoded hold against the
     /// worker's budget for requests (see `budget`).
     charge: Charge,
+    /// Where the requests followed while request tracing is on (see
+    /// `giong::observe::RequestTrace`) are kept, in the worker's `TRACES`:
+    /// its index plus one, 0 for none. Kept there and not in the connection,
+    /// so that tracing does not make idle connections larger (this fits in
+    /// what the connection's layout leaves free).
+    traces: u32,
     /// The connection's place under `max_connections`, given back when the
     /// connection is dropped. Declared last, so that the stream is closed
     /// first.
     _slot: Option<Slot>,
+}
+
+/// See `Conn::traces`.
+#[derive(Default)]
+struct Traces {
+    /// The request being received or answered. Its handler's wrapper
+    /// (`Caught`) holds it while the handler runs.
+    current: Option<Box<RequestTrace>>,
+    /// Requests answered whose answers are in `out`, finished once it is
+    /// written.
+    answered: Vec<RequestTrace>,
+}
+
+thread_local! {
+    /// The worker's `Traces`, by connection (see `Conn::traces`); `None`
+    /// marks a free entry, listed in `free`.
+    static TRACES: RefCell<TraceSlab> = const {
+        RefCell::new(TraceSlab {
+            entries: Vec::new(),
+            free: Vec::new(),
+        })
+    };
+}
+
+struct TraceSlab {
+    entries: Vec<Option<Traces>>,
+    free: Vec<u32>,
+}
+
+/// A new entry in `TRACES`, as `Conn::traces` names it.
+fn new_traces() -> u32 {
+    TRACES
+        .try_with(|slab| {
+            let mut slab = slab.borrow_mut();
+            if let Some(i) = slab.free.pop() {
+                slab.entries[i as usize] = Some(Traces::default());
+                return i + 1;
+            }
+            let Ok(i) = u32::try_from(slab.entries.len()) else {
+                return 0;
+            };
+            if i == u32::MAX {
+                return 0;
+            }
+            slab.entries.push(Some(Traces::default()));
+            i + 1
+        })
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the entry `slot` of `TRACES` (not 0).
+fn with_traces<R>(slot: u32, f: impl FnOnce(&mut Traces) -> R) -> Option<R> {
+    TRACES
+        .try_with(|slab| {
+            let mut slab = slab.borrow_mut();
+            slab.entries
+                .get_mut(slot as usize - 1)
+                .and_then(Option::as_mut)
+                .map(f)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Frees the entry `slot` of `TRACES` (not 0). The requests it still
+/// follows are dropped, after the slab is released: they count as
+/// abandoned.
+fn free_traces(slot: u32) {
+    let traces = TRACES
+        .try_with(|slab| {
+            let mut slab = slab.borrow_mut();
+            let traces = slab
+                .entries
+                .get_mut(slot as usize - 1)
+                .and_then(Option::take);
+            if traces.is_some() {
+                slab.free.push(slot - 1);
+            }
+            traces
+        })
+        .ok()
+        .flatten();
+    drop(traces);
+}
+
+impl<T> Drop for Conn<T> {
+    fn drop(&mut self) {
+        if self.traces != 0 {
+            free_traces(self.traces);
+        }
+    }
 }
 
 impl<T: Transport> Conn<T> {
@@ -1205,8 +1357,85 @@ impl<T: Transport> Conn<T> {
             deadline: None,
             first: true,
             charge: Charge::none(),
+            traces: 0,
             _slot: slot,
         }
+    }
+
+    /// Starts following a request whose first bytes are in, if it is not
+    /// followed yet. Called when `RequestTrace::is_on`.
+    #[cold]
+    #[inline(never)]
+    fn trace_arrival(&mut self) {
+        if self.traces != 0 && with_traces(self.traces, |t| t.current.is_some()) == Some(true) {
+            return;
+        }
+        if let Some(trace) = RequestTrace::start("http/1.1") {
+            if self.traces == 0 {
+                self.traces = new_traces();
+            }
+            if self.traces != 0 {
+                with_traces(self.traces, |t| t.current = Some(Box::new(trace)));
+            }
+        }
+    }
+
+    /// The trace of the request whose handler is about to be called, taken
+    /// out for the handler's wrapper to hold.
+    #[cold]
+    #[inline(never)]
+    fn trace_handler(&mut self) -> Option<Box<RequestTrace>> {
+        if self.traces == 0 {
+            return None;
+        }
+        let mut trace = with_traces(self.traces, |t| t.current.take()).flatten()?;
+        trace.started();
+        Some(trace)
+    }
+
+    /// The handler is done with the trace `trace_handler` took.
+    #[cold]
+    #[inline(never)]
+    fn trace_back(&mut self, trace: Option<Box<RequestTrace>>) {
+        if let (true, Some(trace)) = (self.traces != 0, trace) {
+            with_traces(self.traces, |t| t.current = Some(trace));
+        }
+    }
+
+    /// The handler answered with `status`: the answer goes out with the
+    /// next write. The trace is the one given back with `trace_back`, or
+    /// else the one its wrapper (`Caught`) just handed back.
+    #[cold]
+    #[inline(never)]
+    fn trace_answered(&mut self, status: u16) {
+        let handed = handed_back();
+        if self.traces != 0 {
+            with_traces(self.traces, |t| {
+                if let Some(mut trace) = t.current.take().or(handed) {
+                    trace.responded(status);
+                    t.answered.push(*trace);
+                }
+            });
+        }
+    }
+
+    /// Everything answered has been written.
+    #[inline]
+    fn trace_written(&mut self) {
+        if self.traces != 0 {
+            self.trace_written_slow();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trace_written_slow(&mut self) {
+        // Finishing a trace does not reach `TRACES`.
+        with_traces(self.traces, |t| {
+            for trace in t.answered.drain(..) {
+                trace.finish();
+            }
+        });
     }
 
     /// The connection's task.
@@ -1255,6 +1484,7 @@ impl<T: Transport> Conn<T> {
                 (minor, head_only, wants_keep_alive, req)
             };
 
+            let traced = self.traces != 0;
             let (resp, body_read) = match streamed {
                 None => {
                     // Poll the handler once before deciding what to do with
@@ -1267,9 +1497,21 @@ impl<T: Transport> Conn<T> {
                     // future, it would make every connection as large as the
                     // largest handler future (a database query, a call to
                     // another service) even while idle.
-                    let answer = match catching(|| HeapFuture::new(handler.call(req))) {
-                        Ok(fut) => {
-                            let mut fut = Caught(fut);
+                    let made = {
+                        let mut trace = if traced { self.trace_handler() } else { None };
+                        let made = catching(|| {
+                            HeapFuture::new(Caught {
+                                fut: handler.call(req),
+                                trace: trace.take(),
+                            })
+                        });
+                        if traced && made.is_err() {
+                            self.trace_back(trace);
+                        }
+                        made
+                    };
+                    let answer = match made {
+                        Ok(mut fut) => {
                             let first =
                                 poll_fn(|cx| Poll::Ready(Pin::new(&mut fut).poll(cx))).await;
                             match first {
@@ -1308,6 +1550,9 @@ impl<T: Transport> Conn<T> {
                 }
             };
 
+            if traced {
+                self.trace_answered(resp.status());
+            }
             // Decided after the handler ran: a shutdown may have begun meanwhile.
             self.closing |= giong::is_shutting_down();
             let streams = resp.is_streaming() && resp.sends_body(head_only);
@@ -1392,24 +1637,32 @@ impl<T: Transport> Conn<T> {
         body: Streamed,
     ) -> (Response, bool) {
         let mut pumped = None;
+        // Out of the connection, which the pump borrows, while the handler
+        // runs.
+        let trace = self.trace_handler();
+        let traced = trace.is_some();
         let answer = match catching(|| handler.call(req)) {
             Ok(fut) => {
                 let mut pump = pin!(self.pump(&body));
-                // Bound first: Rust 1.80 does not extend `pin!` inside a call.
-                let fut = pin!(fut);
-                let mut fut = Caught(fut);
+                let mut fut = pin!(Caught { fut, trace });
                 poll_fn(|cx| {
                     if pumped.is_none() {
                         if let Poll::Ready(result) = pump.as_mut().poll(cx) {
                             pumped = Some(result);
                         }
                     }
-                    Pin::new(&mut fut).poll(cx)
+                    fut.as_mut().poll(cx)
                 })
                 .await
             }
-            Err(()) => Err(()),
+            Err(()) => {
+                self.trace_back(trace);
+                Err(())
+            }
         };
+        if traced {
+            self.trace_back(handed_back());
+        }
         // If the handler answered first, nothing reads the rest of the body;
         // a stream it kept says so. (The first end counts.)
         body.pipe.finish(Err(Failure::Abandoned));
@@ -1602,6 +1855,12 @@ impl<T: Transport> Conn<T> {
                 }
                 self.first = false;
             }
+            let data = if !data.is_empty() && RequestTrace::is_on() {
+                self.trace_arrival();
+                &self.buf[self.pos..]
+            } else {
+                data
+            };
             if let Some(end) = find_head_end(data, self.scanned) {
                 if end > self.cfg.max_head_size {
                     return Err(End::Status(431));
@@ -1880,6 +2139,7 @@ impl<T: Transport> Conn<T> {
     /// Writes everything in `out`. One send per batch of responses.
     async fn flush(&mut self) -> Result<(), End> {
         if self.out.is_empty() && matches!(self.body, Body::Empty) {
+            self.trace_written();
             return Ok(());
         }
         let out = mem::take(&mut self.out);
@@ -1900,6 +2160,7 @@ impl<T: Transport> Conn<T> {
             Ok((Ok(()), mut out)) => {
                 out.clear();
                 self.out = out;
+                self.trace_written();
                 Ok(())
             }
             _ => Err(End::Close),

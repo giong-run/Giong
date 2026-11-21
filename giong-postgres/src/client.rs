@@ -463,6 +463,7 @@ impl Client {
     /// Not cancel safe: if the future is dropped, the statements may still run
     /// on the server, and what they change stays.
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Query, "postgres");
         let slot = self
             .conn
             .enqueue(Kind::Simple, |out| protocol::query(out, sql))?;
@@ -624,6 +625,7 @@ impl Client {
         sql: &str,
         params: &[&dyn ToSql],
     ) -> Result<(ResultSet, Option<String>), Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Query, "postgres");
         if params.len() > MAX_PARAMS {
             return Err(Error::conversion(format!(
                 "{} parameters were given; a statement can have at most {MAX_PARAMS}",

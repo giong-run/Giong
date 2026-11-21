@@ -355,3 +355,229 @@ fn pulse_of_a_worker_that_does_not_exist_panics() {
     let rt = giong::Builder::new().workers(1).build().unwrap();
     rt.handle().pulse(1);
 }
+
+/// Polls `fut` to the end through `trace`, as a protocol crate polls a
+/// request's handler.
+async fn serve_traced<F: std::future::Future>(
+    trace: &mut observe::RequestTrace,
+    fut: F,
+) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| trace.poll(|| fut.as_mut().poll(cx))).await
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "timing: compares phases with sleeps")]
+fn requests_are_split_into_phases_and_grouped_by_route() {
+    use observe::{RequestTrace, Route, Wait};
+    static CHECKOUT: Route = Route::from_static("POST /checkout");
+    let report = giong::block_on(async {
+        let h = giong::handle();
+        assert!(!h.is_request_tracing());
+        h.set_request_tracing(true);
+        assert!(h.is_request_tracing());
+        // Workers notice at their next batch of tasks.
+        giong::yield_now().await;
+        for i in 0..20u64 {
+            let mut trace = RequestTrace::start("test").expect("tracing is on");
+            trace.started();
+            serve_traced(&mut trace, async {
+                observe::set_route(&CHECKOUT);
+                let pool = observe::wait(Wait::Pool, "postgres");
+                let ms = if i == 19 { 40 } else { 1 };
+                giong::time::sleep(Duration::from_millis(ms)).await;
+                pool.end();
+                let _query = observe::wait(Wait::Query, "postgres");
+                giong::time::sleep(Duration::from_millis(1)).await;
+            })
+            .await;
+            trace.responded(200);
+            giong::time::sleep(Duration::from_millis(2)).await;
+            trace.finish();
+        }
+        // Dropped before its answer was written: abandoned.
+        let mut gone = RequestTrace::start("test").unwrap();
+        gone.set_route(&CHECKOUT);
+        drop(gone);
+
+        // Another task blocks the worker while a request waits.
+        let blocker_line = line!() + 1;
+        let blocker = giong::spawn(async {
+            giong::time::sleep(Duration::from_millis(5)).await;
+            std::thread::sleep(Duration::from_millis(30));
+        });
+        let mut trace = RequestTrace::start("test").unwrap();
+        trace.started();
+        serve_traced(&mut trace, async {
+            observe::set_route(&Route::new("GET /cart"));
+            giong::time::sleep(Duration::from_millis(60)).await;
+        })
+        .await;
+        trace.responded(200);
+        trace.finish();
+        blocker.await.unwrap();
+
+        h.set_request_tracing(false);
+        giong::yield_now().await;
+        assert!(RequestTrace::start("test").is_none(), "tracing is off");
+        (observe::take_requests(), blocker_line)
+    });
+    let (report, blocker_line) = report;
+    assert_eq!(report.worker, 0);
+    assert_eq!(report.routes.len(), 2, "{:?}", report.routes);
+
+    let checkout = &report.routes[0];
+    assert_eq!(checkout.route, Some(CHECKOUT.clone()));
+    assert_eq!(checkout.requests, 20);
+    assert_eq!(checkout.abandoned, 1);
+    assert!(checkout.max >= Duration::from_millis(43), "{checkout:?}");
+    assert!(
+        checkout.quantile(0.5) < Duration::from_millis(30),
+        "{checkout:?}"
+    );
+    let slowest = &checkout.slowest[0];
+    assert_eq!(slowest.protocol, "test");
+    assert_eq!(slowest.status, 200);
+    assert!(
+        slowest.pool.total >= Duration::from_millis(40),
+        "{slowest:?}"
+    );
+    assert_eq!(slowest.pool.count, 1);
+    assert_eq!(slowest.pool.what, Some("postgres"));
+    assert!(
+        slowest.query.total >= Duration::from_millis(1),
+        "{slowest:?}"
+    );
+    assert!(slowest.write >= Duration::from_millis(2), "{slowest:?}");
+    assert!(slowest.polls >= 3, "{slowest:?}");
+    // The phases add up to the whole, to within the microseconds a wait
+    // shares with the polls it starts and ends in.
+    let sum = slowest.read
+        + slowest.poll
+        + slowest.pool.total
+        + slowest.query.total
+        + slowest.upstream.total
+        + slowest.other
+        + slowest.write;
+    let gap = if sum > slowest.total {
+        sum - slowest.total
+    } else {
+        slowest.total - sum
+    };
+    assert!(gap < Duration::from_millis(1), "{slowest:?}");
+    // The slowest one stands out in the tail.
+    let tail = checkout.breakdown(0.99, 1.0);
+    assert_eq!(tail.requests, 1);
+    assert!(tail.pool >= Duration::from_millis(40));
+    let fast = checkout.breakdown(0.0, 0.5);
+    assert!(fast.requests >= 10);
+    assert!(fast.pool < Duration::from_millis(3) * fast.requests as u32);
+
+    let cart = &report.routes[1];
+    assert_eq!(cart.route, Some(Route::new("GET /cart")));
+    let r = &cart.slowest[0];
+    assert!(r.blocked >= Duration::from_millis(25), "{r:?}");
+    let by = r.blocked_by.as_ref().expect("the blocking task is named");
+    assert!(here(by.location.file()), "{by:?}");
+    assert_eq!(by.location.line(), blocker_line);
+    assert_eq!(by.route, None);
+    let lp = report
+        .long_polls
+        .iter()
+        .find(|p| p.location.line() == blocker_line)
+        .expect("the long poll is listed");
+    assert_eq!(lp.polls, 1);
+    assert!(lp.max >= Duration::from_millis(30));
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "timing: compares phases with sleeps")]
+fn a_request_holding_the_worker_is_named_by_its_route() {
+    use observe::{RequestTrace, Route};
+    let report = giong::block_on(async {
+        giong::handle().set_request_tracing(true);
+        giong::yield_now().await;
+        let slow = giong::spawn(async {
+            giong::time::sleep(Duration::from_millis(5)).await;
+            let mut trace = RequestTrace::start("test").unwrap();
+            trace.started();
+            serve_traced(&mut trace, async {
+                observe::set_route(&Route::from_static("GET /report"));
+                std::thread::sleep(Duration::from_millis(30));
+            })
+            .await;
+            trace.responded(200);
+            trace.finish();
+        });
+        let mut trace = RequestTrace::start("test").unwrap();
+        trace.started();
+        serve_traced(&mut trace, async {
+            observe::set_route(&Route::from_static("GET /fast"));
+            giong::time::sleep(Duration::from_millis(50)).await;
+        })
+        .await;
+        trace.responded(200);
+        trace.finish();
+        slow.await.unwrap();
+        observe::take_requests()
+    });
+    let fast = report
+        .routes
+        .iter()
+        .find(|r| r.route == Some(Route::from_static("GET /fast")))
+        .unwrap();
+    let by = fast.slowest[0].blocked_by.as_ref().expect("named");
+    assert_eq!(by.route, Some(Route::from_static("GET /report")));
+    // The request that held the worker is not blocked by itself.
+    let report_route = report
+        .routes
+        .iter()
+        .find(|r| r.route == Some(Route::from_static("GET /report")))
+        .unwrap();
+    assert_eq!(report_route.slowest[0].blocked, Duration::ZERO);
+    assert!(report_route.slowest[0].longest_poll >= Duration::from_millis(30));
+}
+
+/// What the tests above check without timing, so that Miri runs the code
+/// that finds the request being served from inside its handler.
+#[test]
+fn waits_and_routes_reach_the_request_being_served() {
+    use observe::{RequestTrace, Route, Wait};
+    static ROUTE: Route = Route::from_static("GET /any");
+    let report = giong::block_on(async {
+        let h = giong::handle();
+        h.set_request_tracing(true);
+        giong::yield_now().await;
+        let mut trace = RequestTrace::start("test").expect("tracing is on");
+        trace.started();
+        serve_traced(&mut trace, async {
+            observe::set_route(&ROUTE);
+            let _query = observe::wait(Wait::Query, "redis");
+            giong::yield_now().await;
+        })
+        .await;
+        // Outside the handler: belongs to no request.
+        drop(observe::wait(Wait::Pool, "redis"));
+        trace.responded(204);
+        trace.finish();
+        drop(RequestTrace::start("test").unwrap());
+        h.set_request_tracing(false);
+        giong::yield_now().await;
+        assert!(RequestTrace::start("test").is_none());
+        observe::take_requests()
+    });
+    let any = report
+        .routes
+        .iter()
+        .find(|r| r.route.as_ref() == Some(&ROUTE))
+        .expect("the route is named");
+    assert_eq!(any.requests, 1);
+    let r = &any.slowest[0];
+    assert_eq!(r.status, 204);
+    assert_eq!(r.polls, 2);
+    assert_eq!(r.query.count, 1);
+    assert_eq!(r.query.what, Some("redis"));
+    assert_eq!(r.pool.count, 0);
+    let unnamed = report.routes.iter().find(|r| r.route.is_none()).unwrap();
+    assert_eq!((unnamed.requests, unnamed.abandoned), (0, 1));
+}
