@@ -1131,7 +1131,17 @@ impl Uring {
                     .build(),
                 RingId::Whole,
             ),
-            MultiIo::Recv { fd } => (
+            // One buffer, taken only once the data is there: the rest stays
+            // in the socket for the reader's own buffer. The completion has
+            // no `IORING_CQE_F_MORE`, so the next poll arms again.
+            MultiIo::Recv { fd, once: true } => (
+                opcode::Recv::new(types::Fd(fd), std::ptr::null_mut(), 0)
+                    .buf_group(stream_ring.group())
+                    .build()
+                    .flags(squeue::Flags::BUFFER_SELECT),
+                stream_ring,
+            ),
+            MultiIo::Recv { fd, once: false } => (
                 opcode::RecvMulti::new(types::Fd(fd), stream_ring.group()).build(),
                 stream_ring,
             ),
