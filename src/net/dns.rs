@@ -92,11 +92,21 @@ impl ResolverConfig {
         {
             let (servers, search) = crate::sys::dns_config()?;
             let hosts = read_optional(crate::sys::hosts_path())?;
-            Ok(Self::parse(
-                &adapters_as_resolv_conf(&servers, &search),
-                &hosts,
-            ))
+            Ok(Self::from_adapters(&servers, &search, &hosts))
         }
+    }
+
+    /// What the adapters report, with the hosts file. With no DNS server
+    /// there is none: Windows runs no server at `127.0.0.1:53`, the
+    /// default a `resolv.conf` without one gets, so a lookup there would
+    /// only time out; it fails with `GIONG-E0104` instead.
+    #[cfg(windows)]
+    fn from_adapters(servers: &[IpAddr], search: &[String], hosts: &str) -> Self {
+        let mut cfg = Self::parse(&adapters_as_resolv_conf(servers, search), hosts);
+        if servers.is_empty() {
+            cfg.nameservers.clear();
+        }
+        cfg
     }
 
     /// Builds a configuration from the text of a `resolv.conf` and a `hosts`
@@ -466,12 +476,21 @@ impl Resolver {
         let cfg = &self.inner.cfg;
         let servers = &cfg.nameservers;
         if servers.is_empty() {
-            return Err(raise(
-                Code::NoDnsServer,
+            #[cfg(windows)]
+            let (what, fix) = (
+                "no DNS server is configured: ResolverConfig::nameservers was given none, or no \
+                 network adapter reports one",
+                "give a network adapter a DNS server (`ipconfig /all` lists them), pass at least \
+                 one server to ResolverConfig::nameservers, or use an address or a name from the \
+                 hosts file.",
+            );
+            #[cfg(unix)]
+            let (what, fix) = (
                 "no DNS server is configured: ResolverConfig::nameservers was given none",
                 "pass at least one server to ResolverConfig::nameservers, or use an address or a \
                  name from /etc/hosts.",
-            ));
+            );
+            return Err(raise(Code::NoDnsServer, what, fix));
         }
         let start = if cfg.rotate {
             let n = self.inner.next_server.get();
@@ -972,10 +991,7 @@ fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
     match &stamps.1 {
         Some((servers, search)) => {
             let hosts = read_optional(crate::sys::hosts_path())?;
-            Ok(ResolverConfig::parse(
-                &adapters_as_resolv_conf(servers, search),
-                &hosts,
-            ))
+            Ok(ResolverConfig::from_adapters(servers, search, &hosts))
         }
         // Asked again, for the error.
         None => ResolverConfig::system(),
@@ -1264,6 +1280,23 @@ mod tests {
             assert_eq!(cfg.nameservers, expected);
             assert_eq!(cfg.search, search);
             ResolverConfig::system().unwrap();
+        }
+    }
+
+    #[test]
+    fn windows_with_no_adapter_dns_server_fails_with_a_coded_error() {
+        // One name on every platform, for the simulation's index; the body
+        // is Windows'.
+        #[cfg(windows)]
+        {
+            let cfg = ResolverConfig::from_adapters(&[], &["corp.example".into()], "");
+            assert!(cfg.nameservers.is_empty());
+            let resolver = Resolver::new(cfg);
+            let err = crate::block_on(resolver.lookup_ip("db.corp.example")).unwrap_err();
+            assert_eq!(
+                crate::error::code(&err),
+                Some(crate::error::Code::NoDnsServer)
+            );
         }
     }
 

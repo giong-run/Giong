@@ -521,7 +521,9 @@ impl UdpSocket {
         if let Some(member) = &self.spread {
             // SAFETY: the kernel wrote `res` bytes at the start of `buf`.
             let payload = unsafe { std::slice::from_raw_parts(buf.as_mut_ptr(), res as usize) };
-            if member.pass_on(name, payload, false) {
+            // A datagram cut to fit `buf` is passed on marked as cut.
+            let truncated = msg.hdr.dwFlags & crate::sys::MSG_TRUNC as u32 != 0;
+            if member.pass_on(name, payload, truncated) {
                 return read_inbox(member, buf).await;
             }
         }

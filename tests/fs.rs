@@ -1444,19 +1444,29 @@ fn a_pipe_whose_writer_has_gone_reads_to_its_end() {
 #[test]
 fn a_pipe_message_longer_than_the_buffer_is_read_in_parts() {
     #[cfg(windows)]
-    {
+    for blocking in [false, true] {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_MESSAGE};
-        let (server, name) = named_pipe("message", true);
+        let (server, name) = named_pipe(&format!("message-{blocking}"), true);
         giong::block_on(async move {
             // Changing the read mode needs write access to the pipe's
-            // attributes, which a read-only open does not have.
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&name)
-                .await
-                .unwrap();
+            // attributes, which a read-only open does not have. A handle
+            // from the standard library takes the blocking path.
+            let file = if blocking {
+                let std = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&name)
+                    .unwrap();
+                File::from_std(std)
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&name)
+                    .await
+                    .unwrap()
+            };
             let mode = PIPE_READMODE_MESSAGE;
             // SAFETY: the client end, open; the mode is a local.
             let ok = unsafe {
@@ -1473,7 +1483,7 @@ fn a_pipe_message_longer_than_the_buffer_is_read_in_parts() {
             let mut got = Vec::new();
             while got.len() < 10 {
                 let (res, buf) = file.read_at(Vec::with_capacity(4), 0).await;
-                let n = res.unwrap();
+                let n = res.unwrap_or_else(|e| panic!("blocking path {blocking}: {e}"));
                 assert!(n > 0 && n <= 4, "{n}");
                 got.extend_from_slice(&buf);
             }
