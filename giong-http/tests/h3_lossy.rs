@@ -123,7 +123,13 @@ fn relay(server: SocketAddr, path: Path) -> SocketAddr {
         path,
         0x2545_f491_4f6c_dd1d,
     );
-    forward(back, front, move |_| *client.lock().unwrap(), path, 0x9e37_79b9_7f4a_7c15);
+    forward(
+        back,
+        front,
+        move |_| *client.lock().unwrap(),
+        path,
+        0x9e37_79b9_7f4a_7c15,
+    );
     addr
 }
 
@@ -157,7 +163,11 @@ fn requests_over(path: Path, sizes: &[usize], within: Duration) {
                         let res = if i % 2 == 0 {
                             client.get(&format!("{url}/bytes/{n}")).send().await
                         } else {
-                            client.post(&format!("{url}/echo")).body(pattern(n)).send().await
+                            client
+                                .post(&format!("{url}/echo"))
+                                .body(pattern(n))
+                                .send()
+                                .await
                         };
                         let res = res.unwrap_or_else(|e| panic!("request {i} ({n} bytes): {e}"));
                         assert_eq!(res.status(), 200);
@@ -172,7 +182,18 @@ fn requests_over(path: Path, sizes: &[usize], within: Duration) {
         .unwrap();
 }
 
-const SIZES: &[usize] = &[0, 1, 1200, 5_000, 70_000, 300_000, 1 << 20, 10, 2_000_000, 64];
+const SIZES: &[usize] = &[
+    0,
+    1,
+    1200,
+    5_000,
+    70_000,
+    300_000,
+    1 << 20,
+    10,
+    2_000_000,
+    64,
+];
 
 #[test]
 fn requests_survive_some_loss_reordering_and_duplicates() {
