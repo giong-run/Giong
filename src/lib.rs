@@ -74,6 +74,8 @@
     html_logo_url = "https://raw.githubusercontent.com/giong-run/Giong/main/assets/giong-icon.svg",
     html_favicon_url = "https://raw.githubusercontent.com/giong-run/Giong/main/assets/giong-icon.svg"
 )]
+// Every public item is documented, as in giong's other crates.
+#![warn(missing_docs)]
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
 // Windows uses less of the shared code than Unix does: it has no Unix

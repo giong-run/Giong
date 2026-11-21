@@ -105,7 +105,9 @@ falls in decides:
 | A new major version, a new driver (kqueue, IOCP) or a replaced scheduler | 72 hours |
 
 A short soak runs the same `tests/soak.rs` and the same checks as the long one (no leak of
-memory or descriptors, no crash, no stall); two hours for a change the tests of item 4
+memory or descriptors, no crash, no stall), and `giong-tls/tests/soak.rs` when the range
+touches TLS (`scripts/check.sh soak tls`; with the kernel's `tls` module loaded, half its
+connections use kernel TLS); two hours for a change the tests of item 4
 cover line by line, four when it reaches further. The 72-hour soak also runs once on a 1.x
 release when none has run for six months, so slow leaks cannot build up unseen.
 
