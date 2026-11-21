@@ -1039,3 +1039,40 @@ fn early_connections_that_never_validate_are_bounded() {
         })
         .unwrap();
 }
+
+#[test]
+fn a_closed_endpoint_still_draining_refuses_new_clients_at_once() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            // One connection, held; then the endpoint goes, and the
+            // connection keeps its socket open.
+            giong::spawn(async move {
+                let conn = server.accept().await.unwrap();
+                drop(server);
+                giong::time::sleep(Duration::from_secs(10)).await;
+                drop(conn);
+            });
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let _held = client.connect(addr, "localhost", &cfg).await.unwrap();
+            giong::time::sleep(Duration::from_millis(50)).await;
+            let started = std::time::Instant::now();
+            let refused = giong::time::timeout(
+                Duration::from_secs(5),
+                client.connect(addr, "localhost", &cfg),
+            )
+            .await
+            .expect("the closed endpoint left the client to its timeout");
+            assert!(refused.is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        })
+        .unwrap();
+}

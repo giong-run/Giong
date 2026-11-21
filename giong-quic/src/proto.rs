@@ -342,13 +342,12 @@ impl State {
                 .handle(now, from, local, ecn, one, &mut self.scratch)
             {
                 Some(DatagramEvent::NewConnection(inc)) => {
-                    if self.closed {
-                        self.ep.ignore(inc);
-                        return;
-                    }
                     self.scratch.clear();
                     let pending = self.unaccepted + self.unvalidated;
-                    let answer = if pending >= MAX_UNACCEPTED {
+                    // A closed endpoint, still draining its connections,
+                    // refuses at once rather than leave the client to its
+                    // timeout.
+                    let answer = if self.closed || pending >= MAX_UNACCEPTED {
                         Some(self.ep.refuse(inc, &mut self.scratch))
                     } else if pending >= RETRY_ABOVE && !inc.remote_address_validated() {
                         match self.ep.retry(inc, &mut self.scratch) {
