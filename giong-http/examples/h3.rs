@@ -7,8 +7,8 @@
 //!
 //! Without `GIONG_CERT` and `GIONG_KEY` (PEM files), a self-signed
 //! certificate for `localhost` is made at start. One worker serves the
-//! port: a QUIC endpoint per worker needs connection IDs that name the
-//! worker, which giong-quic does not issue yet.
+//! port, which keeps the example short; a server can run an endpoint on
+//! every worker, on the same port.
 //!
 //! Routes: `/` (a small page), `/bytes?n=<len>`, `/echo` (the request body
 //! back), `/stream?n=<pieces>` (16 KiB pieces, produced as they are sent).

@@ -1,5 +1,6 @@
-//! QUIC for giong (prototype on the `feat/quic-prototype` branch; not part
-//! of 1.0).
+//! QUIC (RFC 9000) for giong: endpoints, connections and streams, the
+//! transport under giong-http's HTTP/3 (`Server::serve_h3` and the HTTP/3
+//! client, feature `unstable-http3`).
 //!
 //! One [`Endpoint`] per worker: each worker binds its own socket to the same
 //! address (giong's `UdpSocket::bind` shares the port), and the kernel
@@ -8,7 +9,7 @@
 //!
 //! The engine underneath is quinn-proto today. A native engine built for
 //! io_uring and thread-per-core (encryption in place in the receive and send
-//! buffers, whole flights in one GSO send) grows in [`native`] and replaces
+//! buffers, whole flights in one GSO send) grows in this crate and replaces
 //! it behind this same API once it passes the QUIC interop runner. Nothing
 //! of quinn-proto appears in this API, so the swap is invisible to users.
 //!
@@ -43,6 +44,9 @@ use quinn_proto::Dir;
 mod config;
 mod crypto;
 mod error;
+/// The native engine, work in progress. Public only for its tests and fuzz
+/// target: not part of the API, and outside the semver promise.
+#[doc(hidden)]
 pub mod native;
 mod proto;
 mod route;
