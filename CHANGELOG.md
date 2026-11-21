@@ -8,6 +8,22 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Changed
+
+- **Balanced listeners place new connections by how busy each worker has been, not only by
+  how many tasks it holds.** `TcpListener::bind_balanced` now first compares the CPU time
+  each worker used in the last few milliseconds, less time spent spinning for work, plus
+  the average cost of a task for each connection it took on since; only workers within 5%
+  of a core of the least busy one are compared by counts of tasks, as before. A worker
+  kept busy by one hot connection used to be preferred for new connections over a worker
+  holding 300 idle ones (it had the fewest tasks); now they go to the worker with room. In `bench/placement.sh` (2 workers, 4 vCPUs, medians of 10 rounds), with
+  paced short connections next to a hot one, their p99 went from 503 to 172 µs and the hot
+  connection got 9% more done; with short connections sent back to back, their median rose
+  from 67 to 98 µs and their throughput fell 15% (they queue on the quiet worker), for a 3%
+  better p99. Nothing is added to the workers' loops: the accepting listener reads each
+  worker thread's CPU time from the kernel, less the time it spent spinning before a sleep
+  (now counted), at most every 5 ms. No connection ever moves once it is served.
+
 ## [1.0.0-rc.1] - 2026-11-20
 
 ### Security

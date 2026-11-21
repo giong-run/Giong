@@ -186,6 +186,13 @@ fn connections_per_worker(
                 if paced {
                     // Each kept connection is one live task.
                     settle(&h, busy + n);
+                    // And let the workers rest long enough that the next
+                    // sample of how busy they have been (CPU time) sees them
+                    // idle: a sample older than 20 ms is replaced, not
+                    // averaged. Accepting the last connections can make one
+                    // worker look busier for a moment, and then counts would
+                    // not decide.
+                    std::thread::sleep(Duration::from_millis(25));
                 }
                 std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()
             })
@@ -260,7 +267,9 @@ fn settle(handle: &giong::Handle, tasks: usize) {
 
 #[test]
 fn a_busy_worker_hands_new_connections_to_an_idle_one() {
-    let counts = connections_per_worker(2, 20, 8, true, false);
+    // Both workers idle, so counts of tasks decide: worker 1 holds 20.
+    // Paced, so that neither looks busier from accepting the others.
+    let counts = connections_per_worker(2, 20, 8, true, true);
     assert_eq!(
         counts,
         vec![8, 0],

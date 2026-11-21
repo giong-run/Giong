@@ -811,6 +811,37 @@ other two vCPUs could no longer keep up once the server had two workers, so that
 shows the one-worker numbers (giong 218.9k, Monoio 214.2k, giong-http 186.1k, Glommio
 175.8k, raw Tokio 151.1k). Recorded output: `bench/results/workers/`.
 
+### Uneven load across workers
+
+Where `TcpListener::bind_balanced` puts new connections when the workers are busy in
+uneven ways (`bench/placement.sh`, 10 rounds of 4 s, medians; 2 workers on 2 vCPUs, the
+client on the other 2). "Before" is the 1.0.0-rc.1 rule, which compared counts of tasks
+only; "now" compares the CPU time each worker used lately first, and counts only among
+workers within 5% of a core of the least busy one.
+
+**Skewed:** one hot connection keeps its worker about 75% busy, 300 idle connections sit on
+the other worker, and 4 clients keep opening short connections (20 requests of 20 µs of
+work each). By counts the hot worker looks least busy, so it got a quarter of the short
+connections.
+
+| Listeners | Requests | p50 | p99 | p99.9 | Hot connection |
+|---|---|---|---|---|---|
+| Plain (`bind`), paced | 16,000/s | 92 µs | 574 µs | 981 µs | 3,394 req/s |
+| Balanced before, paced | 16,000/s | 66 µs | 503 µs | 710 µs | 3,734 req/s |
+| **Balanced now, paced** | 16,000/s | **55 µs** | **172 µs** | **588 µs** | **4,076 req/s** |
+| Plain, back to back | 20,878/s | 96 µs | 598 µs | 824 µs | 3,086 req/s |
+| Balanced before, back to back | **33,575/s** | **67 µs** | 498 µs | **656 µs** | 3,548 req/s |
+| Balanced now, back to back | 28,538/s | 98 µs | **483 µs** | 821 µs | **3,742 req/s** |
+
+"Paced" sends one request per 250 µs per client; "back to back" sends the next as soon as
+the last is answered. Paced, the short connections' p99 drops by two thirds and the hot
+connection gets 9% more done. **Back to back it is a loss:** the short connections pile
+onto the quiet worker and queue behind each other there, so their median rises by half and
+they get 15% fewer requests through, for a 3% better p99 and 5% more for the hot
+connection. With 24 connections arriving in random order (6 hot, 18 light), the work done
+is the same (17.2k req/s), the light requests' p99 is 11% lower (664 against 742 µs) and
+their median 15% higher (316 against 274 µs). Raw data: `bench/results/placement/`.
+
 ### HTTPS
 
 `bench/tls.sh`: `giong-http` + `giong-tls` against Axum + `axum-server`, both on rustls with
@@ -1218,7 +1249,8 @@ younger than both and has not run in production.
   [`giong-redis`](giong-redis/README.md); for HTTP requests, `giong-http`'s client.
 - **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
   `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
-  `TcpListener::bind_balanced` hand new connections to less busy workers. A connection
+  `TcpListener::bind_balanced` hand new connections to workers that have been less busy
+  lately (by time spent working, not by connection counts). A connection
   already being served stays on its worker, however busy that worker gets.
 - **Graceful draining is opt-in.** By default, when a worker's main future returns, the
   remaining connections are dropped. Set `.shutdown_grace(..)` and use `until_shutdown` in
@@ -1256,7 +1288,7 @@ src/
   net.rs        the core shared by stream sockets, TcpListener, TcpStream
   net/addr.rs   ToSocketAddrs, connecting to the first of several addresses (Happy Eyeballs)
   net/dns.rs    lookup_host and Resolver: /etc/hosts, DNS over UDP and TCP, cache
-  net/balance.rs  bind_balanced: handing new connections to idle workers
+  net/balance.rs  bind_balanced: handing new connections to less busy workers
   net/share.rs  which ports this process holds, so bind refuses another process's
   net/unix.rs   UnixListener, UnixStream
   net/udp.rs    UdpSocket, Datagram
