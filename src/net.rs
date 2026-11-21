@@ -16,19 +16,23 @@
 //! behave the same way, with a non-blocking system call made when the socket
 //! is ready (see [`DriverKind`](crate::DriverKind)).
 
+mod activation;
 mod addr;
 mod balance;
 pub(crate) mod dns;
+mod fds;
 mod sendq;
 mod share;
 mod udp;
 mod unix;
 
+pub use activation::{activated_sockets, ActivatedSocket};
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
+pub use fds::{PeerCred, MAX_FDS};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
-pub use unix::{UnixListener, UnixStream};
+pub use unix::{UnixDatagram, UnixListener, UnixStream};
 
 use std::cell::{Cell, OnceCell};
 use std::future::poll_fn;
@@ -896,6 +900,11 @@ pub struct TcpListener {
     /// The listener's hold on its port, for one that [`bind`](Self::bind)
     /// made (see `share`).
     held: Option<share::Held>,
+    /// Set once the descriptor has been lent out ([`AsFd`](std::os::fd::AsFd),
+    /// [`AsRawFd`]): it may have been duplicated or passed to another
+    /// process, so dropping the listener must only close this descriptor,
+    /// never shut the socket down for every copy.
+    lent: Cell<bool>,
 }
 
 impl TcpListener {
@@ -951,6 +960,7 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held,
+            lent: Cell::new(false),
         };
         // A failure from here on drops `listener`, which gives the port up.
         listener.inner.socket().listen(4096)?;
@@ -1012,6 +1022,7 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held: None,
+            lent: Cell::new(false),
         }
     }
 
@@ -1048,14 +1059,31 @@ impl Drop for TcpListener {
     fn drop(&mut self) {
         // Before the socket is closed, which happens when `inner` is dropped.
         if let Some(held) = self.held.take() {
-            held.release(self.inner.socket());
+            if self.lent.get() {
+                held.release_lent();
+            } else {
+                held.release(self.inner.socket());
+            }
         }
     }
 }
 
 impl AsRawFd for TcpListener {
+    /// The descriptor. Once it has been taken, dropping the listener only
+    /// closes it, so that copies made of it (with `dup`, or passed to another
+    /// process with [`UnixStream::send_with_fds`]) keep listening.
     fn as_raw_fd(&self) -> RawFd {
+        self.lent.set(true);
         self.inner.socket().as_raw_fd()
+    }
+}
+
+impl std::os::fd::AsFd for TcpListener {
+    /// The descriptor, with the same effect on drop as
+    /// [`as_raw_fd`](AsRawFd::as_raw_fd).
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.lent.set(true);
+        std::os::fd::AsFd::as_fd(self.inner.socket())
     }
 }
 
@@ -1329,6 +1357,12 @@ impl TcpStream {
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+impl std::os::fd::AsFd for TcpStream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(self.inner.socket())
     }
 }
 

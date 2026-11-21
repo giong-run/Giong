@@ -1215,6 +1215,12 @@ Facts that are easy to get wrong:
   `std::thread::spawn` and a `giong::sync::oneshot` channel, and never block a worker.
   `giong::sync` has `mpsc` and `oneshot`; Tokio's `sync` module (`Semaphore`, `Notify`,
   `watch`, `broadcast`) needs no Tokio runtime and works on giong.
+- Child processes: `giong::process::Command` (std's builder; `.output().await`,
+  `.spawn()?` then `child.wait().await`); a child's pipes and `giong::process::stdin()` /
+  `stdout()` read and write owned buffers. Signals: `giong::signal::listen(SignalKind::HANGUP)?`
+  then `.recv().await`. Descriptors pass between processes with
+  `UnixStream::send_with_fds` / `recv_with_fds`; systemd's sockets come from
+  `giong::net::activated_sockets()`.
 - Choosing crates: use the giong crate for the job first. HTTP server: `giong-http`, not
   hyper or axum; routing, JSON and middleware: `giong-web`, not axum; HTTP client:
   `giong-http` with feature `client`, not reqwest; TLS: `giong-tls`; PostgreSQL:

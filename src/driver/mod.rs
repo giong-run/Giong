@@ -385,8 +385,17 @@ pub(crate) enum Io {
         addr: *const libc::sockaddr,
         addr_len: libc::socklen_t,
     },
-    /// A one-off `recvmsg(2)`.
-    RecvMsg { fd: RawFd, msg: *mut libc::msghdr },
+    /// A one-off `recvmsg(2)` with `flags` (such as `MSG_CMSG_CLOEXEC`).
+    RecvMsg {
+        fd: RawFd,
+        msg: *mut libc::msghdr,
+        flags: i32,
+    },
+    /// Waits until a descriptor has something to read (`POLLIN`), such as a
+    /// pidfd whose process exited, or a non-blocking pipe that returned
+    /// `EAGAIN`. Completes with a non-negative value when the caller should
+    /// look again.
+    Readable { fd: RawFd },
     /// A `read(2)` from a descriptor that has readiness, such as an eventfd
     /// or a pipe.
     ReadReady { fd: RawFd, buf: *mut u8, len: u32 },
@@ -879,6 +888,27 @@ impl Driver {
     pub(crate) fn evacuate(&mut self) {
         if let Driver::Uring(d) = self {
             d.evacuate();
+        }
+    }
+
+    /// Keeps `fd` off epoll: its reads and writes go to a blocking thread,
+    /// so the driver never makes it non-blocking. For descriptors whose
+    /// open file the process shares with others (its own stdin, stdout and
+    /// stderr), where `O_NONBLOCK` would reach them too. io_uring never
+    /// changes a descriptor's flags, so it has nothing to do.
+    pub(crate) fn keep_blocking(&mut self, fd: RawFd) {
+        match self {
+            Driver::Uring(_) => {}
+            Driver::Epoll(d) => d.keep_blocking(fd),
+        }
+    }
+
+    /// Forgets `fd`, which the caller hands on without closing it (to a
+    /// child process, say): the epoll driver takes it out of its epoll set.
+    pub(crate) fn release_fd(&mut self, fd: RawFd) {
+        match self {
+            Driver::Uring(_) => {}
+            Driver::Epoll(d) => d.release_fd(fd),
         }
     }
 

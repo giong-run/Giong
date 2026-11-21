@@ -534,6 +534,9 @@ EXAMPLES = [
      "cargo run --release --example udp_echo", "echo hello | nc -u -w1 127.0.0.1 7001"),
     ("cat", "Prints files to standard output, reading them through io_uring with positional reads.",
      "cargo run --release --example cat -- Cargo.toml", ""),
+    ("stdio", "A line protocol over standard input and output, as a local tool server speaks it: "
+              "runs programs as child processes and answers with their output, and notes `SIGHUP`.",
+     "cargo run --release --example stdio", "run uname -s"),
 ]
 
 # The example that is a crate of its own, in a folder: (folder, what it is, how to run it).

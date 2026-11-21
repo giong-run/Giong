@@ -95,6 +95,8 @@ pub mod error;
 pub mod fs;
 pub mod net;
 pub mod observe;
+pub mod process;
+pub mod signal;
 pub mod sync;
 pub mod time;
 
