@@ -36,6 +36,12 @@ const SEPARATE_BODY_AT: usize = 32 * 1024;
 /// straight into the read buffer (`Transport::recv_into`), not copied out of
 /// the runtime's receive buffers.
 const RECV_INTO_AT: usize = 64 * 1024;
+
+/// The room `recv_body_into` makes in the read buffer at a time: as much as
+/// the buffer already holds, at least `FIRST_STEP` and at most `RESERVE_STEP`.
+const FIRST_STEP: usize = 1024 * 1024;
+const RESERVE_STEP: usize = 8 * 1024 * 1024;
+
 /// After an error response, how long the connection keeps discarding input so
 /// that the client can read the response instead of getting a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
@@ -204,7 +210,9 @@ pub trait Transport: 'static {
     ///
     /// The default appends what [`recv`](Self::recv) returns.
     /// [`TcpStream`] and [`UnixStream`] receive straight into `buf`,
-    /// without copying the body out of the runtime's receive buffers.
+    /// without copying the body out of the runtime's receive buffers. Unlike
+    /// `recv`, it need not be cancel safe: the server closes the connection
+    /// when it gives up on one.
     #[doc(hidden)]
     fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
         async move {
@@ -1782,27 +1790,42 @@ impl<T: Transport> Conn<T> {
             buf.drain(..self.pos);
             self.pos = 0;
         }
-        buf.reserve(want.saturating_sub(buf.len()));
-        let mut buf = mem::take(buf);
         let request_timeout = self.cfg.request_timeout;
         let deadline = *self
             .deadline
             .get_or_insert_with(|| Instant::now() + request_timeout);
-        while buf.len() < want {
+        while self.buf.len() < want {
+            let Some(buf) = Rc::get_mut(&mut self.buf) else {
+                return Ok(());
+            };
+            let mut buf = mem::take(buf);
+            // Room for more of the body: as much as has arrived (which the
+            // budget charges), at least 1 MiB and at most 8 MiB. A client
+            // that announces a large body and sends little is not given room
+            // for what it announced. Each step past the first may copy the
+            // buffer, so they are not smaller: growing from 64 KiB costs a
+            // third of the 1 MiB uploads per second on io_uring.
+            if buf.capacity() == buf.len() {
+                let step = buf.len().clamp(FIRST_STEP, RESERVE_STEP);
+                buf.reserve_exact((want - buf.len()).min(step));
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             let (res, back) = match timeout(left, self.stream.recv_into(buf)).await {
                 Ok(received) => received,
                 Err(_) => return Err(End::Status(408)),
             };
-            buf = back;
+            *Rc::get_mut(&mut self.buf).expect("the read buffer is not shared") = back;
             match res {
                 Ok(n) if n > 0 => {}
                 // Closed by the peer, or an I/O error.
                 _ => return Err(End::Close),
             }
+            // Charged as it arrives, like what `read_more` receives: past the
+            // worker's budget for requests being received, the connection is
+            // refused (`Busy`), so stalled uploads cannot hold more than it.
+            self.account(0)?;
         }
-        *Rc::get_mut(&mut self.buf).expect("the read buffer is not shared") = buf;
-        self.account(0)
+        Ok(())
     }
 
     /// Answers `Expect: 100-continue` once, before waiting for the body.

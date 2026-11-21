@@ -110,6 +110,15 @@ impl MultiSlot {
     }
 }
 
+/// A pooled receive of less than this is a small message.
+const SMALL_RECV: usize = 2048;
+
+/// After this many small messages in a row, a stream in `bulk` mode goes
+/// back to the multishot receive: its traffic is small messages again. (One
+/// small receive alone proves nothing: the rest of a buffer the kernel has
+/// partly filled can be small.)
+const SMALL_RECVS_TO_LEAVE_BULK: u8 = 8;
+
 /// What [`StreamSocket::recv_into`] found when it stopped the pooled receive.
 enum Stopped {
     Data(RecvBuf),
@@ -270,9 +279,11 @@ pub(crate) struct StreamSocket {
     /// Data was taken from the multishot receive since the socket was last
     /// checked for an end of stream the kernel did not report.
     check_end: Cell<bool>,
-    /// `recv_into` has been used: the pooled receive takes one buffer at a
-    /// time instead of all the data there is (io_uring).
-    bulk: Cell<bool>,
+    /// `recv_into` has been used, and small messages have not come in a row
+    /// since: the pooled receive takes one buffer at a time instead of all
+    /// the data there is (io_uring).
+    /// 0, or 1 plus the number of small messages received in a row since.
+    bulk: Cell<u8>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -319,7 +330,7 @@ impl StreamSocket {
             send_abandoned: Cell::new(false),
             unix: Cell::new(false),
             check_end: Cell::new(false),
-            bulk: Cell::new(false),
+            bulk: Cell::new(0),
             _not_send: PhantomData,
         }
     }
@@ -437,6 +448,16 @@ impl StreamSocket {
                     }
                     MultiPoll::Data(buf) => {
                         self.check_end.set(true);
+                        let bulk = self.bulk.get();
+                        if bulk > 0 {
+                            self.bulk.set(match buf.len() < SMALL_RECV {
+                                // Small messages again: back to the multishot
+                                // receive, which costs less for them.
+                                true if bulk > SMALL_RECVS_TO_LEAVE_BULK => 0,
+                                true => bulk + 1,
+                                false => 1,
+                            });
+                        }
                         return Poll::Ready(Ok(buf));
                     }
                     MultiPoll::NeedArm => {
@@ -448,7 +469,7 @@ impl StreamSocket {
                             key,
                             MultiIo::Recv {
                                 fd,
-                                once: self.bulk.get(),
+                                once: self.bulk.get() > 0,
                             },
                         );
                     }
@@ -495,11 +516,16 @@ impl StreamSocket {
     /// same stream, and `recv` may follow it: the kernel's receive into the
     /// pool is stopped first, and the next `recv` starts it again. For a
     /// large body whose size is known, this saves copying it out of pool
-    /// buffers. `Ok(0)` is the end of the stream.
+    /// buffers. `Ok(0)` is the end of the stream. Until the pooled receive
+    /// brings several small messages in a row, the stream's pooled receives
+    /// take one buffer at a time.
+    ///
+    /// Not cancel safe, like `read`: if the future is dropped, bytes the
+    /// receive had already taken from the socket are lost.
     pub(crate) async fn recv_into(&self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         // From now on the pooled receive takes one buffer at a time, so the
         // next large body is still in the socket when its head is parsed.
-        self.bulk.set(true);
+        self.bulk.set(1);
         if runtime::with_worker(|w| self.recv.is_active(w)) {
             match poll_fn(|cx| self.poll_stop_recv(cx)).await {
                 Stopped::Data(chunk) => {
@@ -1286,6 +1312,9 @@ impl TcpStream {
     /// [`recv`](Self::recv) has already taken; `recv` may come before and
     /// after it. For the crates of this workspace (giong-http reads large
     /// request bodies with it), not part of the API.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost.
     #[doc(hidden)]
     pub async fn recv_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.inner.recv_into(buf).await

@@ -1258,3 +1258,37 @@ fn large_bodies_arrive_whole_between_other_requests() {
     let r = c.reply();
     assert_eq!((r.status, r.text()), (200, checksum_of(&b).as_str()));
 }
+
+/// Bodies of 64 KiB and more are received straight into the request buffer,
+/// and charged against the worker's budget as they arrive, like any other:
+/// two uploads admitted together cannot both hold more than the budget.
+#[test]
+fn large_bodies_received_straight_into_the_buffer_are_charged_as_they_arrive() {
+    let server = TestServer::start(
+        Server::new().max_buffered_request_bytes(256 * 1024),
+        budgeted,
+    );
+    let head = "POST /big HTTP/1.1\r\nHost: t\r\nContent-Length: 200000\r\n\r\n";
+    // Both are admitted while nothing is held yet.
+    let mut a = server.client();
+    let mut b = server.client();
+    a.send(head);
+    b.send(head);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The first holds 150,000 bytes: a probe for as much again is refused.
+    a.send(vec![b'a'; 150_000]);
+    let refused = wait_until_refused(&server, 150_000);
+    assert_eq!(refused.status, 503);
+
+    // The second sends as much: it does not fit next to the first, and is
+    // refused once its bytes arrive.
+    let _ = b.stream.write_all(&vec![b'b'; 150_000]);
+    let cut = b.reply();
+    assert_eq!(cut.status, 503);
+    assert!(cut.text().starts_with("GIONG-E1120"), "{}", cut.text());
+
+    // The first completes.
+    a.send(vec![b'a'; 50_000]);
+    assert_eq!(a.reply().text(), "got 200000");
+}
