@@ -512,6 +512,29 @@ impl Drop for SignalGuard {
     }
 }
 
+/// Binds of `sock` are exclusive (`SO_EXCLUSIVEADDRUSE`): no other socket
+/// can bind its port, `SO_REUSEADDR` or not, while it is open. Set before
+/// the bind.
+pub(crate) fn set_exclusive_address(sock: &socket2::Socket) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_EXCLUSIVEADDRUSE};
+    let on: BOOL = 1;
+    // SAFETY: an open socket; the value is a local of the size given.
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as RawSock,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&on as *const BOOL).cast(),
+            mem::size_of::<BOOL>() as i32,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Readies a UDP socket for the runtime, once, when it is made or wrapped:
 ///
 /// - Non-blocking, so the sends that do not wait (`send_to_nowait`) never

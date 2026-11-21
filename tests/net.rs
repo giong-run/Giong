@@ -126,6 +126,36 @@ fn connections_reset_before_they_are_accepted_do_not_end_the_accept_loop() {
 }
 
 #[test]
+fn no_other_socket_can_bind_over_a_live_listener_or_udp_socket() {
+    // Not even one that sets `SO_REUSEADDR`: on Windows that option lets a
+    // socket bind a port another socket holds, unless that one is bound
+    // exclusively.
+    giong::block_on(async {
+        let (_l, addr) = listener();
+        let udp = giong::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        for (kind, addr) in [
+            (socket2::Type::STREAM, addr),
+            (socket2::Type::DGRAM, udp_addr),
+        ] {
+            let other = socket2::Socket::new(socket2::Domain::IPV4, kind, None).unwrap();
+            other.set_reuse_address(true).unwrap();
+            let err = other
+                .bind(&addr.into())
+                .expect_err("bound over a live socket");
+            // Windows says "access denied" to a socket that asked to share.
+            let refused = [std::io::ErrorKind::AddrInUse]
+                .into_iter()
+                .chain(cfg!(windows).then_some(std::io::ErrorKind::PermissionDenied));
+            assert!(
+                refused.into_iter().any(|k| k == err.kind()),
+                "{kind:?}: {err:?}"
+            );
+        }
+    });
+}
+
+#[test]
 fn echo_roundtrip() {
     giong::block_on(async {
         let (l, addr) = listener();

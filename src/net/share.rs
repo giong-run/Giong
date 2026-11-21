@@ -137,6 +137,9 @@ impl Held {
             // A socket that no longer listens does not conflict with one
             // that sets `SO_REUSEADDR`, as every listener does.
             Proto::Tcp => drop(sock.shutdown(Shutdown::Both)),
+            // Windows closes a socket at once, and its sockets are bound
+            // exclusively, which the option cannot be set on.
+            Proto::Udp if cfg!(windows) => {}
             Proto::Udp => {
                 drop(sock.set_reuse_address(true));
                 // Until it is closed, the socket is still a member of the
@@ -188,6 +191,12 @@ pub(crate) fn bind(
     if proto == Proto::Tcp && cfg!(unix) {
         sock.set_reuse_address(true)?;
     }
+    // Nor can another socket that sets `SO_REUSEADDR` bind over this one
+    // there (a more specific address on the same port, which would take
+    // its connections or datagrams): Windows refuses that only for a
+    // socket bound with `SO_EXCLUSIVEADDRUSE`.
+    #[cfg(windows)]
+    crate::sys::set_exclusive_address(&sock)?;
     if !share {
         sock.bind(&addr.into())?;
         check_bound(&sock, addr)?;
@@ -320,7 +329,7 @@ fn bind_first(proto: Proto, sock: &Socket, addr: SocketAddr, released: bool) -> 
     // pass another process's socket that sets it, so it is set only while
     // this process may have released sockets on the port, and only for the
     // bind.
-    let marked = proto == Proto::Udp && released;
+    let marked = proto == Proto::Udp && released && cfg!(unix);
     if marked {
         sock.set_reuse_address(true)?;
     }

@@ -102,10 +102,12 @@ impl Port {
     /// Wakes the worker that waits on the port, or makes its next wait
     /// return at once: a packet with no operation behind it.
     pub(crate) fn post(&self) {
-        // SAFETY: the port is open while `self` lives. It fails only when
-        // the kernel cannot allocate the packet; the worker then wakes at
-        // its next timer or completion.
-        unsafe { PostQueuedCompletionStatus(self.0, 0, 0, ptr::null()) };
+        // SAFETY: the port is open while `self` lives.
+        while unsafe { PostQueuedCompletionStatus(self.0, 0, 0, ptr::null()) } == 0 {
+            // The kernel could not allocate the packet. A worker that waits
+            // without a timer or I/O would never wake: try again.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Reports the result of a blocking job as the completion of the
