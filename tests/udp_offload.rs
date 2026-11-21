@@ -293,6 +293,42 @@ fn local_addresses_are_reported_over_ipv6_too() {
     }
 }
 
+/// ECN bits sent from a dual-stack socket to an IPv4 peer (a v4-mapped
+/// address) arrive. Skipped where the machine has no IPv6.
+#[test]
+fn ecn_reaches_an_ipv4_peer_of_a_dual_stack_socket() {
+    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+        run(
+            async move {
+                let Ok(sender) = UdpSocket::bind("[::]:0") else {
+                    eprintln!("no IPv6 here; skipped");
+                    return;
+                };
+                let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+                receiver.set_recv_ecn(true).unwrap();
+                let port = receiver.local_addr().unwrap().port();
+                let to = std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
+                    port,
+                ));
+                let options = SendOptions::new().ecn(2);
+                let (res, _) = sender.send_to_with(b"ect".to_vec(), to, &options).await;
+                if res.is_err() {
+                    // An IPv6-only socket (`bindv6only`) cannot send IPv4.
+                    eprintln!("cannot send to {to}; skipped");
+                    return;
+                }
+                let (dg, _) = timeout(Duration::from_secs(2), receiver.recv_from())
+                    .await
+                    .expect("the datagram arrives")
+                    .unwrap();
+                assert_eq!(dg.ecn(), 2, "{kind:?}");
+            },
+            kind,
+        );
+    }
+}
+
 /// A source address the machine does not have is refused, not replaced.
 #[test]
 fn a_source_address_the_machine_lacks_is_refused() {

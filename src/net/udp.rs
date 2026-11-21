@@ -1014,7 +1014,10 @@ impl UdpSocket {
             }
             if ecn & 3 != 0 {
                 let v = libc::c_int::from(ecn & 3);
-                if addr.is_ipv6() {
+                // To an IPv4-mapped address a dual-stack socket sends IPv4,
+                // where Linux reads IP_TOS and ignores IPV6_TCLASS.
+                let mapped = matches!(addr, SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some());
+                if addr.is_ipv6() && !mapped {
                     put(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &v.to_ne_bytes());
                 } else {
                     put(libc::IPPROTO_IP, libc::IP_TOS, &v.to_ne_bytes());
