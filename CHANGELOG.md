@@ -39,6 +39,36 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   worker, slow clients) with the evidence it rests on, a confidence and a suggested fix, and
   the slowest requests in full. It only proposes: nothing in the service changes.
 
+## [1.0.0] - 2026-11-21
+
+The first stable release. The code is that of 1.0.0-rc.1, unchanged: the API is frozen
+([STABILITY.md](docs/STABILITY.md)), and from here on a 1.x release adds and never changes
+what an existing name means. Coming from 0.8.0, the entries of 1.0.0-rc.1 below say what
+was removed or renamed and how to migrate.
+
+### Added
+
+- A soak test for `giong-tls` (`giong-tls/tests/soak.rs`, `scripts/check.sh soak tls`): TLS
+  1.3 and 1.2 between giong's own acceptor and connector on every worker, resumed sessions
+  and full handshakes, kernel TLS on half the stream ends where the `tls` module is loaded,
+  clean closes, dropped connections, handshakes given up, receives cancelled and taken up
+  again, writes cancelled inside a record; afterwards no descriptor, memory or driver state
+  may be left over. CI runs it every night beside the runtime's soak, and for a minute on
+  the 6.12 and 6.18 kernel jobs of every change
+  ([#171](https://github.com/giong-run/Giong/pull/171)). Both soak tests count the connects
+  Linux refuses on its own when a port is reused right after an aborted connection, apart
+  from real errors, and fail when more than one in 50 million is refused
+  ([#176](https://github.com/giong-run/Giong/pull/176)).
+
+### Changed
+
+- No change to the code of the published crates since 1.0.0-rc.1 beyond their version
+  number and one lint attribute (`#![warn(missing_docs)]` in `giong`). What was checked on
+  the release candidate before this release: four hours of soak per driver on bare metal
+  (about 320 million connections each, no leak, crash or stall;
+  [#169](https://github.com/giong-run/Giong/pull/169)), the TLS soak above, the test suite
+  under AddressSanitizer, and use in a service whose author reported no error.
+
 ## [1.0.0-rc.1] - 2026-11-20
 
 ### Security
@@ -2470,7 +2500,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/giong-run/Giong/compare/v0.8.0...v1.0.0-rc.1
 [0.8.0]: https://github.com/giong-run/Giong/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/giong-run/Giong/compare/v0.6.0...v0.7.0
