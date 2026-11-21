@@ -653,3 +653,74 @@ fn attack_send_file_dropped_and_file_closed() {
     assert_eq!(bad, 0);
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("giong-attack-sf-{}", std::process::id())));
 }
+
+/// Diagnosis for the Windows send_file failure: which sequence makes a
+/// later `send_file` fail. Prints what each step returns.
+#[test]
+fn diag_send_file_after_a_dropped_one() {
+    let dir = std::env::temp_dir().join(format!("giong-diag-sf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f");
+    std::fs::write(&path, vec![0x77u8; 8 << 20]).unwrap();
+    for case in 0..6 {
+        let (l, addr) = listener();
+        let peer = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0u64;
+            // Slow at first, so that a send is still in flight.
+            let start = Instant::now();
+            loop {
+                match c.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n as u64,
+                }
+                if start.elapsed() < Duration::from_millis(300) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+            total
+        });
+        let path = path.clone();
+        let out = giong::block_on(async move {
+            let s = l.accept().await.unwrap();
+            let f = giong::fs::File::open(&path).await.unwrap();
+            let first = start_and_drop(s.send_file(&f, 0, 8 << 20)).await.is_none();
+            let mut steps = vec![format!("first dropped in flight: {first}")];
+            match case {
+                // A second send_file at once, same file kept open.
+                0 => steps.push(format!("send_file at once: {:?}", s.send_file(&f, 0, 1 << 20).await)),
+                // A plain write at once.
+                1 => steps.push(format!("write_all at once: {:?}", s.write_all(vec![0x77u8; 1 << 20]).await.0)),
+                // The file closed, a new one opened, then send_file.
+                2 => {
+                    drop(f);
+                    let g = giong::fs::File::open(&path).await.unwrap();
+                    steps.push(format!("new file, send_file at once: {:?}", s.send_file(&g, 0, 1 << 20).await));
+                }
+                // Wait for the first to end, then send_file.
+                3 => {
+                    sleep(Duration::from_secs(3)).await;
+                    steps.push(format!("after 3 s, send_file: {:?}", s.send_file(&f, 0, 1 << 20).await));
+                }
+                // The file closed, wait, then send_file on a new one.
+                4 => {
+                    drop(f);
+                    sleep(Duration::from_secs(3)).await;
+                    let g = giong::fs::File::open(&path).await.unwrap();
+                    steps.push(format!("file closed, after 3 s, send_file: {:?}", s.send_file(&g, 0, 1 << 20).await));
+                }
+                // Two dropped ones, then send_file.
+                _ => {
+                    let again = start_and_drop(s.send_file(&f, 0, 8 << 20)).await.is_none();
+                    steps.push(format!("second dropped in flight: {again}"));
+                    steps.push(format!("third at once: {:?}", s.send_file(&f, 0, 1 << 20).await));
+                }
+            }
+            steps
+        });
+        let total = peer.join().unwrap();
+        eprintln!("diag case {case}: {out:?}, peer got {total} bytes");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
