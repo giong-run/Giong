@@ -308,7 +308,10 @@ keep the soft limit, for a program that starts children which still use `select(
 need descriptors below 1,024 (children inherit the limit), build with
 `Builder::raise_open_files_limit(false)`. A hard limit below what the service needs is
 raised from outside: `docker run --ulimit nofile=65536:65536`, `ulimits` in Compose,
-`LimitNOFILE` in systemd.
+`LimitNOFILE` in systemd. When a server does run out, each worker says so on stderr at most
+once a minute, with the limits it found ([GIONG-E1123](errors/E1123.md)), and giong-mcp's
+`overview` shows the limits of the container (CPUs, CPU quota, memory, `pids.max`, open
+files) beside where the worker count came from.
 
 ## Stopping: SIGTERM and process 1
 

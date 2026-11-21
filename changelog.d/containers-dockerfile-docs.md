@@ -5,6 +5,14 @@
   Kubernetes nodes, starts containers at 1,024 soft and 524,288 hard, which stopped a
   server near 1,000 connections. `Builder::raise_open_files_limit(false)` keeps the soft
   limit.
+- **giong-http**: a server that cannot accept a connection because the process is out of file
+  descriptors (`EMFILE`, `ENFILE`) says so on stderr, at most once a minute per worker, with the
+  limits on open files: `GIONG-E1123` (`Code::HttpServerOutOfFiles`). It said nothing before,
+  while new clients waited in the listen queue.
+- **giong-mcp**: `overview` has a `limits` object (CPUs, CPU quota, memory limit, `pids.max`
+  and `pids.current`, soft and hard open files, read from the cgroup and `/proc`), says in
+  `runtime.workers_from` whether the worker count came from the CPUs, the CPU quota or the
+  program, and warns when four fifths of `pids.max` are in use.
 - **rest-api example**: a `Dockerfile` (a 44 MB distroless image) and a `compose.yaml` that
   runs it with PostgreSQL and Redis, a CPU and a memory limit, and the lines that allow
   io_uring.

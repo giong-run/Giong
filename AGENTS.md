@@ -76,10 +76,10 @@ To find out why a giong service is slow, stuck or leaking, ask it rather than gu
 `let _mcp = giong_mcp::start_from_env(&handle);` alive; run it with
 `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` (16 characters or more), and connect with
 `claude mcp add --transport http giong http://127.0.0.1:7777/mcp --header "Authorization: Bearer $GIONG_MCP_TOKEN"`.
-Tools: `overview` (memory, threads, open descriptors, workers, warnings such as a blocked
-worker), `workers`, `tasks` (live tasks by the line that spawned them), `sources` (database
-pools) and `profile` (where the workers spent a time window). It listens on loopback or a
-Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
+Tools: `overview` (memory, threads, open descriptors, container limits and why this many
+workers, warnings such as a blocked worker), `workers`, `tasks` (live tasks by the line that
+spawned them), `sources` (database pools) and `profile` (where the workers spent a time
+window). It listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
 
 ## The machine you need
 

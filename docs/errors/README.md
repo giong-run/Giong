@@ -93,6 +93,7 @@ when it is no longer raised.
 | [GIONG-E1120](E1120.md) | `HttpServerBusy` | request refused: the server's memory budget for requests is full |
 | [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
 | [GIONG-E1122](E1122.md) | `HttpInvalidTrailer` | invalid HTTP trailer field |
+| [GIONG-E1123](E1123.md) | `HttpServerOutOfFiles` | connection not accepted: the server is out of file descriptors |
 
 ## giong-web
 

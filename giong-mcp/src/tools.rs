@@ -14,6 +14,7 @@ use giong::observe::{self, Location, PollProfile, Snapshot, WorkerState};
 use giong::{ChosenBy, DriverChoice, Handle, JoinError};
 use serde_json::{json, Map, Value};
 
+use crate::limits;
 use crate::proc;
 use crate::schema;
 use crate::watch::{Blocked, Watch};
@@ -79,9 +80,11 @@ pub(crate) fn list() -> Value {
         tool(
             "overview",
             "Overview",
-            "Start here. The process (memory, threads, open descriptors, uptime), the runtime \
-             (workers, shutdown), each worker's state, I/O driver, live tasks and load over the \
-             last second, and warnings, such as a worker blocked inside one task.",
+            "Start here. The process (memory, threads, open descriptors, uptime), the limits a \
+             container puts on it (CPUs, CPU quota, memory, pids.max, open files), the runtime \
+             (workers and where their number came from, shutdown), each worker's state, I/O \
+             driver, live tasks and load over the last second, and warnings, such as a worker \
+             blocked inside one task.",
             json!({}),
             schema::overview(),
             true,
@@ -413,11 +416,23 @@ fn overview(state: &State) -> Value {
             ));
         }
     }
+    let limits = limits::limits();
+    if let (Some(max), Some(current)) = (limits.pids_max, limits.pids_current) {
+        if current * 10 >= max * 8 {
+            warnings.push(format!(
+                "{current} of the {max} processes and threads the cgroup allows (pids.max) are \
+                 in use: past it, new threads fail (GIONG-E0020), blocking file work on epoll \
+                 included"
+            ));
+        }
+    }
     json!({
         "giong_mcp": env!("CARGO_PKG_VERSION"),
         "process": process,
+        "limits": limits::json(&limits),
         "runtime": {
             "workers": target.workers(),
+            "workers_from": limits::workers_from(target.workers(), &limits),
             "shutting_down": target.is_shutdown(),
             "profiling": target.is_profiling(),
         },
