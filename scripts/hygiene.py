@@ -88,7 +88,8 @@ def report(stale_days):
 
     delete, unknown, kept = [], [], []
     for name, sha in sorted(branches.items()):
-        if name == "main" or name in in_use:
+        # gh-readonly-queue/... are the merge queue's own branches, created and deleted by GitHub.
+        if name == "main" or name in in_use or name.startswith("gh-readonly-queue/"):
             continue
         if name in keep:
             kept.append(f"- `{name}`: {keep[name]}")
