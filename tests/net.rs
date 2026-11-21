@@ -169,14 +169,31 @@ fn connections_handed_round_a_shared_address_are_not_inherited() {
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = first.local_addr().unwrap();
         let second = TcpListener::bind(addr).unwrap();
+        // Whichever listener the connections go to: each accepts them.
+        let got: Rc<std::cell::RefCell<Vec<TcpStream>>> = Rc::default();
+        let tasks: Vec<_> = [first, second]
+            .into_iter()
+            .map(|listener| {
+                let got = got.clone();
+                giong::spawn(async move {
+                    loop {
+                        let stream = listener.accept().await.unwrap();
+                        got.borrow_mut().push(stream);
+                    }
+                })
+            })
+            .collect();
         let _clients: Vec<_> = (0..2)
             .map(|_| std::net::TcpStream::connect(addr).unwrap())
             .collect();
-        for listener in [&first, &second] {
-            let stream = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("no connection handed over")
-                .unwrap();
+        let start = std::time::Instant::now();
+        while got.borrow().len() < 2 && start.elapsed() < Duration::from_secs(5) {
+            sleep(Duration::from_millis(10)).await;
+        }
+        tasks.iter().for_each(|t| t.abort());
+        let got = got.borrow();
+        assert_eq!(got.len(), 2, "connections handed over");
+        for stream in got.iter() {
             let mut flags = 0u32;
             // SAFETY: reads the flags of an open socket into a local.
             let ok = unsafe { GetHandleInformation(stream.as_raw_socket() as _, &mut flags) };
