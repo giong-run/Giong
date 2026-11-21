@@ -78,8 +78,11 @@ struct State {
     services: BTreeMap<String, bool>,
     /// Counts the changes.
     version: u64,
-    /// The `Watch` calls waiting for the next change.
-    watchers: Vec<Waker>,
+    /// The `Watch` calls waiting for the next change, by number: a call
+    /// that ends takes its entry out.
+    watchers: Vec<(u64, Waker)>,
+    /// The number of the next waiting call.
+    next_watcher: u64,
 }
 
 /// The health of a server's services, by name: set by the program, served
@@ -157,7 +160,7 @@ impl Health {
             std::mem::take(&mut state.watchers)
         };
         // Outside the lock: a waker may run code of its own.
-        for waker in woken {
+        for (_, waker) in woken {
             waker.wake();
         }
     }
@@ -177,13 +180,42 @@ impl Health {
 
     /// Waits until the state is no longer at change count `seen`.
     async fn changed(&self, seen: u64) {
+        /// Takes the waker out when the wait ends without a change, as
+        /// when the client cancels the call.
+        struct Waiting<'a> {
+            health: &'a Health,
+            number: Option<u64>,
+        }
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                if let Some(number) = self.number {
+                    self.health.state().watchers.retain(|(n, _)| *n != number);
+                }
+            }
+        }
+        let mut waiting = Waiting {
+            health: self,
+            number: None,
+        };
         poll_fn(|cx| {
             let mut state = self.state();
             if state.version != seen {
                 return Poll::Ready(());
             }
-            if !state.watchers.iter().any(|w| w.will_wake(cx.waker())) {
-                state.watchers.push(cx.waker().clone());
+            let number = match waiting.number {
+                Some(number) => number,
+                None => {
+                    let number = state.next_watcher;
+                    state.next_watcher += 1;
+                    waiting.number = Some(number);
+                    number
+                }
+            };
+            match state.watchers.iter_mut().find(|(n, _)| *n == number) {
+                Some((_, waker)) => waker.clone_from(cx.waker()),
+                // New, or taken by a change that this poll does not see
+                // yet.
+                None => state.watchers.push((number, cx.waker().clone())),
             }
             Poll::Pending
         })
@@ -429,6 +461,36 @@ mod tests {
             giong::time::sleep(Duration::from_millis(50)).await;
             health.set("a.B", true);
             assert!(health.state().watchers.is_empty());
+        });
+    }
+
+    #[test]
+    fn cancelled_watches_leave_nothing_behind() {
+        giong::block_on(async {
+            let health = Health::new();
+            let channel = serve(&health);
+            // Calls that end while nothing changes, as clients that watch
+            // for a while and go: none of them stays among the watchers.
+            for _ in 0..3 {
+                let mut watches = Vec::new();
+                for _ in 0..20 {
+                    let options = CallOptions::new().timeout(Duration::from_secs(20));
+                    let mut watch = watch(&channel, "", options).await.unwrap();
+                    assert_eq!(watch.next().await.unwrap(), Some(ServingStatus::Serving));
+                    watches.push(watch);
+                }
+                giong::time::sleep(Duration::from_millis(50)).await;
+                assert_eq!(health.state().watchers.len(), 20);
+                drop(watches);
+                giong::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(health.state().watchers.len(), 0);
+            }
+            // The ones still open hear the next change.
+            let options = CallOptions::new().timeout(Duration::from_secs(20));
+            let mut watch = watch(&channel, "", options).await.unwrap();
+            assert_eq!(watch.next().await.unwrap(), Some(ServingStatus::Serving));
+            health.set("", false);
+            assert_eq!(watch.next().await.unwrap(), Some(ServingStatus::NotServing));
         });
     }
 

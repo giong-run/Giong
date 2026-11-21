@@ -182,10 +182,7 @@ impl giong_http::Handler for Server {
     async fn call(&self, req: giong_http::Request) -> giong_http::Response {
         let limits = self.inner.limits;
         let content_type = req.header("content-type").unwrap_or_default();
-        let is_grpc = content_type == b"application/grpc"
-            || content_type.starts_with(b"application/grpc+")
-            || content_type.starts_with(b"application/grpc;");
-        if !is_grpc {
+        if !codec::is_grpc_content_type(content_type) {
             // Not a gRPC client: plain HTTP is the only answer it reads.
             return giong_http::Response::new(415)
                 .header("content-type", "text/plain; charset=utf-8")
@@ -261,26 +258,30 @@ fn status_fields(status: &Status, extra: &Metadata) -> Vec<(String, Vec<u8>)> {
 }
 
 /// The trailers that end a call. Metadata that cannot travel in trailers
-/// fails the call instead, so that it is noticed.
+/// (`authorization`, `cookie`, `transfer-encoding` and the other fields
+/// HTTP keeps out of them) is left out: the call keeps the status its
+/// handler gave, because a client told `INTERNAL` about a call that did
+/// its work might do the work again.
 fn closing(status: &Status, extra: &Metadata) -> Trailers {
-    let mut trailers = Trailers::new();
-    for (name, value) in status_fields(status, extra) {
-        trailers = match trailers.field(&name, value) {
-            Ok(trailers) => trailers,
-            Err(e) => return closing(&bad_trailer(&name, &e), &Metadata::new()),
-        };
+    let mut left_out: Vec<String> = Vec::new();
+    'build: loop {
+        let mut trailers = Trailers::new();
+        for (name, value) in status_fields(status, extra) {
+            if left_out.contains(&name) {
+                continue;
+            }
+            trailers = match trailers.field(&name, value) {
+                Ok(trailers) => trailers,
+                // Rare: built again without it, rather than copying the
+                // trailers for each field.
+                Err(_) => {
+                    left_out.push(name);
+                    continue 'build;
+                }
+            };
+        }
+        return trailers;
     }
-    trailers
-}
-
-fn bad_trailer(name: &str, error: &giong::error::Error) -> Status {
-    Status::raised(
-        Code::Internal,
-        ErrorCode::GrpcInvalidMetadata,
-        format!("the metadata name {name} cannot be sent after the response: {error}"),
-        "send it with Reply::with_metadata or Sink::set_metadata, before the messages, \
-         or choose another name.",
-    )
 }
 
 fn head(gzip: bool) -> giong_http::Response {
@@ -332,6 +333,15 @@ fn trailers_only(status: &Status) -> giong_http::Response {
         };
     }
     response
+}
+
+fn bad_trailer(name: &str, error: &giong::error::Error) -> Status {
+    Status::raised(
+        Code::Internal,
+        ErrorCode::GrpcInvalidMetadata,
+        format!("the metadata name {name} cannot be sent: {error}"),
+        "choose another name.",
+    )
 }
 
 // ----------------------------------------------------------------- calls
@@ -396,7 +406,7 @@ impl Call {
         Ok(Self {
             body,
             metadata,
-            deadline: Instant::now() + timeout.unwrap_or(limits.default_timeout),
+            deadline: codec::deadline_after(timeout.unwrap_or(limits.default_timeout)),
             timeout,
             peer: req.peer_addr(),
             limits,
@@ -823,6 +833,9 @@ where
         })
         .await;
         if result.is_some() && !shared.closed.get() {
+            // The call is over: a sink moved to another task fails from
+            // now on, rather than add messages behind the ones taken here.
+            shared.closed.set(true);
             // What the handler sent last goes out before the status.
             let mut open = true;
             if let Some(sending) = flush.as_mut().as_pin_mut() {
@@ -977,7 +990,9 @@ impl<M: MessageType> Sink<M> {
 
     /// Sets the metadata sent after the last message, with the status
     /// (the response's trailers). The last call before the handler returns
-    /// counts.
+    /// counts. Names HTTP keeps out of trailers (`authorization`,
+    /// `cookie`, `transfer-encoding` and the like) are left out; send them
+    /// with [`set_metadata`](Self::set_metadata).
     pub fn set_trailers(&mut self, trailers: Metadata) {
         *self.shared.trailers.borrow_mut() = trailers;
     }
@@ -1224,5 +1239,32 @@ impl<M> fmt::Debug for RequestStream<M> {
 impl<M> From<Received<M>> for Payload {
     fn from(received: Received<M>) -> Self {
         received.into_payload()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trailers_leave_out_what_http_keeps_out_of_them_and_keep_the_status() {
+        let mut extra = Metadata::new();
+        extra.add("x-before", "1").unwrap();
+        extra.add("authorization", "Bearer x").unwrap();
+        extra.add("cookie", "a=b").unwrap();
+        extra.add("x-after", "2").unwrap();
+        let trailers = closing(&Status::new(Code::Ok, ""), &extra);
+        assert_eq!(trailers.get_str("grpc-status"), Some("0"));
+        assert_eq!(trailers.get_str("x-before"), Some("1"));
+        assert_eq!(trailers.get_str("x-after"), Some("2"));
+        assert_eq!(trailers.get("authorization"), None);
+        assert_eq!(trailers.get("cookie"), None);
+        assert_eq!(trailers.get("grpc-message"), None);
+
+        // A failed call keeps its own status and message too.
+        let trailers = closing(&Status::new(Code::NotFound, "gone"), &extra);
+        assert_eq!(trailers.get_str("grpc-status"), Some("5"));
+        assert_eq!(trailers.get_str("grpc-message"), Some("gone"));
+        assert_eq!(trailers.get_str("x-after"), Some("2"));
     }
 }

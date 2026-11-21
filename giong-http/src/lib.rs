@@ -113,6 +113,13 @@ pub use response::{reason_phrase, Body, FileBody, Response};
 pub use server::{Handler, Server, Transport};
 pub use trailers::Trailers;
 
+/// The longest timeout kept: a century. A longer one (`Duration::MAX`
+/// and the like) means no timeout, and counts as this so that adding it to
+/// the clock cannot overflow.
+pub(crate) fn bounded(timeout: std::time::Duration) -> std::time::Duration {
+    timeout.min(std::time::Duration::from_secs(100 * 365 * 24 * 3600))
+}
+
 /// Entry points for the fuzz targets in `giong-http/fuzz`. Only built by
 /// `cargo fuzz` (`--cfg fuzzing`); not part of the API.
 #[cfg(fuzzing)]

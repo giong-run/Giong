@@ -301,6 +301,93 @@ fn deadlines_end_calls_on_both_sides() {
 }
 
 #[test]
+fn the_longest_timeouts_mean_no_deadline() {
+    giong::block_on(async {
+        // Duration::MAX on the server's default and the call's own timeout:
+        // a deadline beyond any clock, not a panic.
+        let server = test_server().default_timeout(Duration::MAX);
+        let channel = Channel::builder(&serve(server))
+            .timeout(Duration::MAX)
+            .build()
+            .unwrap();
+        let client = TestServiceClient::new(channel);
+        client
+            .empty_call(&Empty::default(), CallOptions::new())
+            .await
+            .unwrap();
+        client
+            .empty_call(&Empty::default(), CallOptions::new().timeout(Duration::MAX))
+            .await
+            .unwrap();
+        let mut calls = client
+            .streaming_output_call(
+                &StreamingOutputCallRequest {
+                    response_parameters: &[sized(1), sized(2)],
+                    ..Default::default()
+                },
+                CallOptions::new().timeout(Duration::MAX),
+            )
+            .await
+            .unwrap();
+        let mut sizes = Vec::new();
+        while let Some(message) = calls.message().await.unwrap() {
+            sizes.push(message.message().unwrap().payload().unwrap().body().len());
+        }
+        assert_eq!(sizes, [1, 2]);
+    });
+}
+
+#[test]
+fn a_send_the_server_does_not_take_ends_at_the_deadline() {
+    giong::block_on(async {
+        // A server that takes the call and never reads it: the requests
+        // fill the flow-control windows, and the next send waits for room
+        // until the call's deadline, no longer.
+        let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        struct NeverReads;
+        impl giong_http::Handler for NeverReads {
+            async fn call(&self, _req: giong_http::Request) -> giong_http::Response {
+                sleep(Duration::from_secs(3600)).await;
+                giong_http::Response::new(200)
+            }
+            fn stream_body(&self, _req: &giong_http::Request) -> Option<u64> {
+                Some(u64::MAX)
+            }
+        }
+        giong::spawn(async move { giong_http::Server::new().serve(listener, NeverReads).await });
+        let client = TestServiceClient::new(channel(&base));
+        let (mut requests, _responses) =
+            client.full_duplex_call(CallOptions::new().timeout(Duration::from_millis(300)));
+        let body = vec![0u8; 64 * 1024];
+        let payload = Payload {
+            body: &body,
+            ..Default::default()
+        };
+        let request = StreamingOutputCallRequest {
+            payload: Some(&payload),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let status = loop {
+            if let Err(status) = requests.send(&request).await {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "sends never wait"
+            );
+        };
+        assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_secs(2),
+            "{waited:?}"
+        );
+    });
+}
+
+#[test]
 fn messages_past_the_limit_are_refused_on_each_side() {
     giong::block_on(async {
         let base = serve(test_server().max_message_size(10_000));

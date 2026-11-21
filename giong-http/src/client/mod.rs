@@ -277,19 +277,19 @@ impl ClientBuilder {
     /// following redirects. [`RequestBuilder::timeout`] changes it for one
     /// request.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = crate::bounded(timeout);
         self
     }
 
     /// How long opening a connection may take, TLS included (default 10 s).
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+        self.connect_timeout = crate::bounded(timeout);
         self
     }
 
     /// How long an unused connection is kept open (default 60 s).
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
+        self.idle_timeout = crate::bounded(timeout);
         self
     }
 
@@ -790,10 +790,15 @@ impl Client {
                             ))
                         }
                         // A streamed body nothing was taken from is whole:
-                        // the request can be sent again as it is.
+                        // the request can be sent again as it is. One that
+                        // was taken from cannot be, whatever its method.
                         Err(Failure::NothingReceived(_))
                             if reused
-                                && (is_idempotent(method) || (streamed && source.is_some())) =>
+                                && if streamed {
+                                    source.is_some()
+                                } else {
+                                    is_idempotent(method)
+                                } =>
                         {
                             drop(lease);
                             fresh = true;
@@ -1543,7 +1548,7 @@ impl RequestBuilder {
     /// The timeout for this request instead of the client's
     /// ([`ClientBuilder::timeout`]).
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
+        self.timeout = Some(crate::bounded(timeout));
         self
     }
 

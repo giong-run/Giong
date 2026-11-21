@@ -17,7 +17,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `StreamingResponse::trailers`. Fields that mean nothing after a body (`content-length`,
   `host`, `set-cookie` and the like) are refused when trailers are built (`GIONG-E1122`,
   `HttpInvalidTrailer`) and dropped when they are received. Until now trailers were
-  checked and dropped.
+  checked and dropped, which a request body received whole still does; a streamed one's
+  trailers count against `max_head_size` over HTTP/2.
 - **giong-http client: request bodies written piece by piece.**
   `RequestBuilder::streamed_body` returns a `RequestBody` to send the pieces through, with
   backpressure, `abort` and `send_trailers`. Over HTTP/2 the response is read while the
@@ -95,7 +96,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (bidirectional gRPC streams, long uploads read as they arrive). A stream whose handler
   has taken what it sent now gets back the window it started with, which the budget keeps
   for it while it is open; windows beyond that are still granted only within the budget.
-  Found with 16 bidirectional gRPC streams on one connection, of which three made progress.
+  A body received whole before its handler runs holds what it received, so it gets no
+  window past the budget. Found with 16 bidirectional gRPC streams on one connection, of
+  which three made progress.
+- **giong-http**: a timeout of `Duration::MAX` (or anything past what the clock can add)
+  given to `Server::idle_timeout`, `request_timeout`, `write_timeout`, `shutdown_linger`,
+  `ClientBuilder::timeout`, `connect_timeout`, `idle_timeout` or `RequestBuilder::timeout`
+  panicked when it was added to the clock, in the connection's task. Such a timeout now
+  counts as a century: no timeout.
 
 ## [1.0.0] - 2026-11-21
 

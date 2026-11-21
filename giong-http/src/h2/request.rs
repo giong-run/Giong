@@ -363,18 +363,20 @@ impl NoneOrEq for Option<u64> {
 }
 
 /// The fields of a trailer block, checked as they are decoded: no
-/// pseudo-header fields, the same rules as other fields, and no more than
-/// `limit` bytes (names, values and 32 bytes for each field, as for a
-/// header list).
+/// pseudo-header fields and the same rules as other fields. Kept only for
+/// a body read as a stream, whose handler can read them, and then no more
+/// than `limit` bytes (names, values and 32 bytes for each field, as for a
+/// header list); a body received whole drops them, as it always has.
 pub(crate) struct TrailerBlock {
     pub(crate) error: Option<&'static str>,
     pub(crate) fields: Trailers,
     size: usize,
-    limit: usize,
+    /// `None`: checked, not kept.
+    limit: Option<usize>,
 }
 
 impl TrailerBlock {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: Option<usize>) -> Self {
         Self {
             error: None,
             fields: Trailers::new(),
@@ -387,12 +389,19 @@ impl TrailerBlock {
         if self.error.is_some() {
             return;
         }
-        self.size += name.len() + value.len() + 32;
         if name.starts_with(b":") {
             self.error = Some("a pseudo-header field in trailers");
-        } else if !valid_name(name) || !valid_value(value) || connection_specific(name) {
+            return;
+        }
+        if !valid_name(name) || !valid_value(value) || connection_specific(name) {
             self.error = Some("an invalid field in trailers");
-        } else if self.size > self.limit {
+            return;
+        }
+        let Some(limit) = self.limit else {
+            return;
+        };
+        self.size += name.len() + value.len() + 32;
+        if self.size > limit {
             self.error = Some("trailers larger than the limit for a header list");
         } else if !self.fields.received(name, value) {
             self.error = Some("an invalid field in trailers");

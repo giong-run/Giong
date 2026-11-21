@@ -507,7 +507,7 @@ impl Server {
     /// How long a keep-alive connection may sit between requests before it is
     /// closed (default: 60 s).
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.idle_timeout = timeout;
+        self.cfg.idle_timeout = crate::bounded(timeout);
         self
     }
 
@@ -515,14 +515,14 @@ impl Server {
     /// the moment the server first has to wait for more of it (default: 30 s).
     /// Slower clients get `408 Request Timeout`.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.request_timeout = timeout;
+        self.cfg.request_timeout = crate::bounded(timeout);
         self
     }
 
     /// How long a client may take to accept a batch of responses before the
     /// connection is dropped (default: 30 s).
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.write_timeout = timeout;
+        self.cfg.write_timeout = crate::bounded(timeout);
         self
     }
 
@@ -591,7 +591,7 @@ impl Server {
     /// 100 ms). Requests in progress are not affected by this: they get the
     /// runtime's [`shutdown_grace`](giong::Builder::shutdown_grace).
     pub fn shutdown_linger(mut self, linger: Duration) -> Self {
-        self.cfg.shutdown_linger = linger;
+        self.cfg.shutdown_linger = crate::bounded(linger);
         self
     }
 

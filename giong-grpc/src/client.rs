@@ -3,8 +3,11 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::future::{poll_fn, Future};
 use std::marker::PhantomData;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use giong::error::{Code as ErrorCode, Error};
@@ -258,7 +261,7 @@ impl Channel {
             );
         }
         let deadline = Deadline {
-            at: Instant::now() + limit,
+            at: codec::deadline_after(limit),
             limit,
         };
         (request, deadline, gzip)
@@ -371,6 +374,7 @@ impl Channel {
             announced: gzip,
             cancelled: Rc::new(Cell::new(false)),
             max_message: self.inner.max_message,
+            deadline,
             marker: PhantomData,
         };
         stream.cancelled = sink.cancelled.clone();
@@ -483,6 +487,8 @@ pub struct RequestSink<M> {
     /// Set by `cancel`, for the response side to say so.
     cancelled: Rc<Cell<bool>>,
     max_message: usize,
+    /// The call's: a send that waits for room waits no longer.
+    deadline: Deadline,
     marker: PhantomData<fn(M)>,
 }
 
@@ -498,13 +504,29 @@ impl<M: MessageType> RequestSink<M> {
     /// ended it (its status is on the response side), the connection
     /// broke, or the response stream was dropped. `RESOURCE_EXHAUSTED`
     /// (`GIONG-E4102`) for a message past the channel's limit; the call
-    /// can go on with smaller ones.
+    /// can go on with smaller ones. `DEADLINE_EXCEEDED` (`GIONG-E4108`)
+    /// when the call's deadline passes while the message waits for room,
+    /// because the server does not read.
     pub async fn send(&mut self, message: &impl MessageOf<Type = M>) -> Result<(), Status> {
         let frame = codec::encode_frame(message, self.gzip, self.max_message)?;
         let Some(body) = &self.body else {
             return Err(ended());
         };
-        body.send(frame).await.map_err(|_| ended())
+        let mut send = pin!(body.send(frame));
+        // Most sends find room at once: no timer for those.
+        let first = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
+        let sent = match first {
+            Poll::Ready(sent) => sent,
+            Poll::Pending => self.deadline.bound(send).await?,
+        };
+        sent.map_err(|_| {
+            // The call's deadline ends the request too.
+            if Instant::now() >= self.deadline.at {
+                self.deadline.passed()
+            } else {
+                ended()
+            }
+        })
     }
 
     /// Whether the messages sent from now on are compressed, on a call
@@ -662,7 +684,7 @@ impl<M: MessageType> ResponseStream<M> {
         self.opened = true;
         let status = response.status();
         let content_type = response.header("content-type").unwrap_or_default();
-        if status != 200 || !content_type.starts_with("application/grpc") {
+        if status != 200 || !codec::is_grpc_content_type(content_type.as_bytes()) {
             let code = if status == 200 {
                 Code::Unknown
             } else {

@@ -2,7 +2,7 @@
 //! `grpc-timeout` and the percent-encoding of `grpc-message`.
 
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use giong::error::Code as ErrorCode;
 use giong_proto::Encode;
@@ -457,6 +457,25 @@ pub(crate) fn parse_timeout(value: &[u8]) -> Option<Duration> {
     })
 }
 
+/// Whether a `content-type` names gRPC: `application/grpc`, with a codec
+/// (`+proto`) or parameters, and not gRPC-Web (`application/grpc-web`),
+/// whose framing differs.
+pub(crate) fn is_grpc_content_type(content_type: &[u8]) -> bool {
+    content_type == b"application/grpc"
+        || content_type.starts_with(b"application/grpc+")
+        || content_type.starts_with(b"application/grpc;")
+}
+
+/// The instant `timeout` from now. A timeout past what the clock can hold
+/// (`Duration::MAX` and the like) means no deadline: a century from now.
+pub(crate) fn deadline_after(timeout: Duration) -> Instant {
+    const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    let now = Instant::now();
+    now.checked_add(timeout.min(CENTURY))
+        .or_else(|| now.checked_add(Duration::from_secs(365 * 24 * 3600)))
+        .unwrap_or(now)
+}
+
 /// Writes a duration as a `grpc-timeout` value, rounded up to the first
 /// unit in which it fits in 8 digits, so the server never gets less time
 /// than the caller allowed.
@@ -533,6 +552,35 @@ pub(crate) fn decode_message(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grpc_content_types_are_told_from_grpc_web() {
+        for yes in [
+            "application/grpc",
+            "application/grpc+proto",
+            "application/grpc;x=y",
+        ] {
+            assert!(is_grpc_content_type(yes.as_bytes()), "{yes}");
+        }
+        for no in [
+            "application/grpc-web",
+            "application/grpc-web+proto",
+            "application/grpc-web-text",
+            "application/grpcx",
+            "text/plain",
+            "",
+        ] {
+            assert!(!is_grpc_content_type(no.as_bytes()), "{no}");
+        }
+    }
+
+    #[test]
+    fn deadlines_past_the_clock_are_a_century_away() {
+        let far = deadline_after(Duration::MAX);
+        assert!(far > Instant::now() + Duration::from_secs(50 * 365 * 24 * 3600));
+        let near = deadline_after(Duration::from_secs(1));
+        assert!(near <= Instant::now() + Duration::from_secs(1));
+    }
 
     struct Raw(Vec<u8>);
 

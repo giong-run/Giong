@@ -180,11 +180,15 @@ impl<'a> Spans<'a> {
         }
     }
 
-    /// Adds a whole segment as its own run.
+    /// Adds a whole segment as its own run. An empty one only marks that
+    /// something was read: once anything was, it adds nothing and takes no
+    /// room, so that a field repeated as empty messages costs no memory.
     #[inline]
     pub fn push(&mut self, seg: &'a [u8]) {
         match self {
             Spans::None => *self = Spans::One(seg),
+            _ if seg.is_empty() => {}
+            Spans::One(s) if s.is_empty() => *s = seg,
             Spans::One(s) => *self = Spans::Many(vec![*s, seg]),
             Spans::Many(v) => v.push(seg),
         }

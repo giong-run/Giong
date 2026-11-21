@@ -134,7 +134,9 @@ impl<M: MessageType> Reply<M> {
     }
 
     /// Sets the metadata sent after the message, with the status (the
-    /// response's trailers).
+    /// response's trailers). Names HTTP keeps out of trailers
+    /// (`authorization`, `cookie`, `transfer-encoding` and the like) are
+    /// left out; send them with [`with_metadata`](Self::with_metadata).
     pub fn with_trailers(mut self, trailers: Metadata) -> Self {
         self.trailers = trailers;
         self

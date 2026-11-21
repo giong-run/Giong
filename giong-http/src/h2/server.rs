@@ -1063,15 +1063,19 @@ impl Session {
                 self.reset(slot, reason)
             }
             Purpose::Trailers(slot) => {
-                let mut trailers = TrailerBlock::new(self.cfg.max_head_size);
+                // Kept only where a handler reads the body as a stream.
+                let keep = self
+                    .stream(slot)
+                    .is_some_and(|st| matches!(st.recv, Recv::Pipe { .. }));
+                let mut trailers = TrailerBlock::new(keep.then_some(self.cfg.max_head_size));
                 self.decoder
                     .decode(fragment, |n, v| trailers.field(n, v))
                     .map_err(compression)?;
                 if trailers.error.is_some() || !end_stream {
                     return self.reset(slot, Reason::Protocol);
                 }
-                if let Some(st) = self.stream(slot) {
-                    if matches!(st.recv, Recv::Pipe { .. }) {
+                if keep {
+                    if let Some(st) = self.stream(slot) {
                         st.trailers = Some(Box::new(trailers.fields));
                     }
                 }
@@ -1905,10 +1909,16 @@ impl Session {
                 let before = reserved(st.recv_window);
                 let after = reserved(st.recv_window + i64::from(more));
                 if committed + (after - before) > self.body_budget {
-                    // The budget has no room for all of it: the stream gets
-                    // its share back once it has used half of it, and what
-                    // room there is, so that a stream whose handler keeps
-                    // reading goes on beside the ones with large windows.
+                    // The budget has no room for all of it. A body buffered
+                    // whole waits: what it holds counts against the budget
+                    // until its handler takes it.
+                    if !matches!(st.recv, Recv::Pipe { .. }) {
+                        continue;
+                    }
+                    // A streamed body gets its share back once it has used
+                    // half of it, and what room there is, so that a stream
+                    // whose handler keeps reading goes on beside the ones
+                    // with large windows.
                     if st.recv_window > share / 2 {
                         continue;
                     }
