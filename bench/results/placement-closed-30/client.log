@@ -1,0 +1,300 @@
+== skew-closed before round 1
+probe_rps=29345 p50_us=77 p99_us=528 p999_us=736 max_us=8294 probe_conns=5869 hot_rps=3346
+  worker 0: 89000 requests, p50_us=72 p99_us=320
+  worker 1: 28380 requests, p50_us=289 p99_us=602
+  first request of a connection: p50_us=204 p99_us=731
+== skew-closed balanced round 1
+probe_rps=30630 p50_us=74 p99_us=502 p999_us=662 max_us=5281 probe_conns=6126 hot_rps=3466
+  worker 0: 96380 requests, p50_us=70 p99_us=312
+  worker 1: 26140 requests, p50_us=284 p99_us=575
+  first request of a connection: p50_us=201 p99_us=637
+== skew-closed before round 2
+probe_rps=32275 p50_us=73 p99_us=492 p999_us=614 max_us=14796 probe_conns=6455 hot_rps=3550
+  worker 0: 103640 requests, p50_us=71 p99_us=310
+  worker 1: 25460 requests, p50_us=276 p99_us=556
+  first request of a connection: p50_us=198 p99_us=614
+== skew-closed balanced round 2
+probe_rps=30465 p50_us=75 p99_us=498 p999_us=706 max_us=5240 probe_conns=6093 hot_rps=3486
+  worker 0: 94980 requests, p50_us=71 p99_us=312
+  worker 1: 26880 requests, p50_us=280 p99_us=569
+  first request of a connection: p50_us=201 p99_us=613
+== skew-closed before round 3
+probe_rps=31650 p50_us=75 p99_us=486 p999_us=830 max_us=5889 probe_conns=6330 hot_rps=3541
+  worker 0: 25200 requests, p50_us=275 p99_us=558
+  worker 1: 101400 requests, p50_us=72 p99_us=314
+  first request of a connection: p50_us=195 p99_us=629
+== skew-closed balanced round 3
+probe_rps=30485 p50_us=74 p99_us=532 p999_us=718 max_us=11607 probe_conns=6097 hot_rps=3380
+  worker 0: 96580 requests, p50_us=70 p99_us=338
+  worker 1: 25360 requests, p50_us=286 p99_us=618
+  first request of a connection: p50_us=211 p99_us=698
+== skew-closed before round 4
+probe_rps=33110 p50_us=71 p99_us=505 p999_us=631 max_us=8703 probe_conns=6622 hot_rps=3548
+  worker 0: 25300 requests, p50_us=275 p99_us=570
+  worker 1: 107140 requests, p50_us=68 p99_us=317
+  first request of a connection: p50_us=193 p99_us=641
+== skew-closed balanced round 4
+probe_rps=31280 p50_us=72 p99_us=507 p999_us=903 max_us=4908 probe_conns=6256 hot_rps=3512
+  worker 0: 99080 requests, p50_us=69 p99_us=320
+  worker 1: 26040 requests, p50_us=280 p99_us=572
+  first request of a connection: p50_us=190 p99_us=644
+== skew-closed before round 5
+probe_rps=31935 p50_us=68 p99_us=506 p999_us=744 max_us=11799 probe_conns=6387 hot_rps=3428
+  worker 0: 29640 requests, p50_us=280 p99_us=582
+  worker 1: 98100 requests, p50_us=66 p99_us=298
+  first request of a connection: p50_us=181 p99_us=722
+== skew-closed balanced round 5
+probe_rps=31105 p50_us=73 p99_us=499 p999_us=626 max_us=5708 probe_conns=6221 hot_rps=3524
+  worker 0: 26560 requests, p50_us=279 p99_us=562
+  worker 1: 97860 requests, p50_us=70 p99_us=322
+  first request of a connection: p50_us=203 p99_us=616
+== skew-closed before round 6
+probe_rps=30845 p50_us=71 p99_us=527 p999_us=752 max_us=13555 probe_conns=6169 hot_rps=3354
+  worker 0: 94600 requests, p50_us=67 p99_us=309
+  worker 1: 28780 requests, p50_us=287 p99_us=623
+  first request of a connection: p50_us=187 p99_us=749
+== skew-closed balanced round 6
+probe_rps=29905 p50_us=76 p99_us=502 p999_us=1045 max_us=9733 probe_conns=5981 hot_rps=3427
+  worker 0: 93420 requests, p50_us=72 p99_us=311
+  worker 1: 26200 requests, p50_us=283 p99_us=587
+  first request of a connection: p50_us=198 p99_us=710
+== skew-closed before round 7
+probe_rps=30900 p50_us=70 p99_us=547 p999_us=829 max_us=14826 probe_conns=6180 hot_rps=3304
+  worker 0: 28080 requests, p50_us=289 p99_us=654
+  worker 1: 95520 requests, p50_us=67 p99_us=316
+  first request of a connection: p50_us=192 p99_us=806
+== skew-closed balanced round 7
+probe_rps=29775 p50_us=76 p99_us=532 p999_us=662 max_us=5465 probe_conns=5955 hot_rps=3358
+  worker 0: 93600 requests, p50_us=73 p99_us=335
+  worker 1: 25500 requests, p50_us=292 p99_us=606
+  first request of a connection: p50_us=208 p99_us=674
+== skew-closed before round 8
+probe_rps=27420 p50_us=72 p99_us=537 p999_us=728 max_us=4320 probe_conns=5484 hot_rps=3238
+  worker 0: 74800 requests, p50_us=67 p99_us=305
+  worker 1: 34880 requests, p50_us=298 p99_us=600
+  first request of a connection: p50_us=219 p99_us=728
+== skew-closed balanced round 8
+probe_rps=30075 p50_us=76 p99_us=507 p999_us=764 max_us=6850 probe_conns=6015 hot_rps=3486
+  worker 0: 94140 requests, p50_us=72 p99_us=321
+  worker 1: 26160 requests, p50_us=281 p99_us=587
+  first request of a connection: p50_us=208 p99_us=662
+== skew-closed before round 9
+probe_rps=31470 p50_us=70 p99_us=513 p999_us=763 max_us=4221 probe_conns=6294 hot_rps=3400
+  worker 0: 29520 requests, p50_us=282 p99_us=592
+  worker 1: 96360 requests, p50_us=66 p99_us=292
+  first request of a connection: p50_us=180 p99_us=723
+== skew-closed balanced round 9
+probe_rps=31535 p50_us=72 p99_us=501 p999_us=734 max_us=4762 probe_conns=6307 hot_rps=3483
+  worker 0: 26340 requests, p50_us=281 p99_us=583
+  worker 1: 99800 requests, p50_us=68 p99_us=305
+  first request of a connection: p50_us=186 p99_us=656
+== skew-closed before round 10
+probe_rps=31890 p50_us=68 p99_us=499 p999_us=711 max_us=10423 probe_conns=6378 hot_rps=3405
+  worker 0: 97300 requests, p50_us=66 p99_us=289
+  worker 1: 30260 requests, p50_us=281 p99_us=564
+  first request of a connection: p50_us=171 p99_us=619
+== skew-closed balanced round 10
+probe_rps=31390 p50_us=71 p99_us=508 p999_us=964 max_us=5283 probe_conns=6278 hot_rps=3454
+  worker 0: 99500 requests, p50_us=67 p99_us=319
+  worker 1: 26060 requests, p50_us=281 p99_us=601
+  first request of a connection: p50_us=190 p99_us=673
+== skew-closed before round 11
+probe_rps=27910 p50_us=71 p99_us=545 p999_us=723 max_us=4850 probe_conns=5582 hot_rps=3277
+  worker 0: 34420 requests, p50_us=299 p99_us=605
+  worker 1: 77220 requests, p50_us=65 p99_us=319
+  first request of a connection: p50_us=247 p99_us=752
+== skew-closed balanced round 11
+probe_rps=30700 p50_us=73 p99_us=505 p999_us=933 max_us=5271 probe_conns=6140 hot_rps=3487
+  worker 0: 96720 requests, p50_us=70 p99_us=315
+  worker 1: 26080 requests, p50_us=280 p99_us=583
+  first request of a connection: p50_us=190 p99_us=660
+== skew-closed before round 12
+probe_rps=31885 p50_us=75 p99_us=497 p999_us=694 max_us=5239 probe_conns=6377 hot_rps=3507
+  worker 0: 102800 requests, p50_us=72 p99_us=311
+  worker 1: 24740 requests, p50_us=277 p99_us=583
+  first request of a connection: p50_us=197 p99_us=655
+== skew-closed balanced round 12
+probe_rps=31725 p50_us=71 p99_us=500 p999_us=759 max_us=5349 probe_conns=6345 hot_rps=3509
+  worker 0: 100780 requests, p50_us=67 p99_us=311
+  worker 1: 26120 requests, p50_us=280 p99_us=578
+  first request of a connection: p50_us=190 p99_us=622
+== skew-closed before round 13
+probe_rps=31275 p50_us=70 p99_us=522 p999_us=748 max_us=16831 probe_conns=6255 hot_rps=3373
+  worker 0: 29440 requests, p50_us=284 p99_us=597
+  worker 1: 95660 requests, p50_us=66 p99_us=309
+  first request of a connection: p50_us=189 p99_us=715
+== skew-closed balanced round 13
+probe_rps=31715 p50_us=72 p99_us=502 p999_us=660 max_us=12420 probe_conns=6343 hot_rps=3512
+  worker 0: 27100 requests, p50_us=278 p99_us=567
+  worker 1: 99760 requests, p50_us=68 p99_us=306
+  first request of a connection: p50_us=185 p99_us=616
+== skew-closed before round 14
+probe_rps=33405 p50_us=70 p99_us=492 p999_us=621 max_us=8488 probe_conns=6681 hot_rps=3598
+  worker 0: 108280 requests, p50_us=67 p99_us=311
+  worker 1: 25340 requests, p50_us=274 p99_us=553
+  first request of a connection: p50_us=188 p99_us=611
+== skew-closed balanced round 14
+probe_rps=31600 p50_us=70 p99_us=495 p999_us=755 max_us=19067 probe_conns=6320 hot_rps=3527
+  worker 0: 26440 requests, p50_us=278 p99_us=561
+  worker 1: 99960 requests, p50_us=66 p99_us=312
+  first request of a connection: p50_us=186 p99_us=611
+== skew-closed before round 15
+probe_rps=30510 p50_us=72 p99_us=517 p999_us=703 max_us=7529 probe_conns=6102 hot_rps=3381
+  worker 0: 92880 requests, p50_us=69 p99_us=307
+  worker 1: 29160 requests, p50_us=285 p99_us=592
+  first request of a connection: p50_us=194 p99_us=684
+== skew-closed balanced round 15
+probe_rps=32035 p50_us=71 p99_us=502 p999_us=656 max_us=4675 probe_conns=6407 hot_rps=3523
+  worker 0: 26540 requests, p50_us=280 p99_us=564
+  worker 1: 101600 requests, p50_us=68 p99_us=308
+  first request of a connection: p50_us=179 p99_us=622
+== skew-closed before round 16
+probe_rps=33620 p50_us=70 p99_us=494 p999_us=612 max_us=3529 probe_conns=6724 hot_rps=3567
+  worker 0: 25760 requests, p50_us=276 p99_us=550
+  worker 1: 108720 requests, p50_us=67 p99_us=300
+  first request of a connection: p50_us=179 p99_us=596
+== skew-closed balanced round 16
+probe_rps=29855 p50_us=75 p99_us=501 p999_us=2289 max_us=11922 probe_conns=5971 hot_rps=3507
+  worker 0: 93500 requests, p50_us=71 p99_us=326
+  worker 1: 25920 requests, p50_us=278 p99_us=573
+  first request of a connection: p50_us=204 p99_us=665
+== skew-closed before round 17
+probe_rps=31905 p50_us=68 p99_us=510 p999_us=848 max_us=3642 probe_conns=6381 hot_rps=3395
+  worker 0: 97940 requests, p50_us=65 p99_us=293
+  worker 1: 29680 requests, p50_us=281 p99_us=586
+  first request of a connection: p50_us=172 p99_us=655
+== skew-closed balanced round 17
+probe_rps=31420 p50_us=72 p99_us=501 p999_us=784 max_us=3905 probe_conns=6284 hot_rps=3538
+  worker 0: 99040 requests, p50_us=67 p99_us=313
+  worker 1: 26640 requests, p50_us=278 p99_us=564
+  first request of a connection: p50_us=183 p99_us=614
+== skew-closed before round 18
+probe_rps=31550 p50_us=70 p99_us=507 p999_us=728 max_us=4432 probe_conns=6310 hot_rps=3438
+  worker 0: 96340 requests, p50_us=67 p99_us=300
+  worker 1: 29860 requests, p50_us=280 p99_us=578
+  first request of a connection: p50_us=183 p99_us=649
+== skew-closed balanced round 18
+probe_rps=31590 p50_us=71 p99_us=496 p999_us=725 max_us=6314 probe_conns=6318 hot_rps=3528
+  worker 0: 99840 requests, p50_us=67 p99_us=308
+  worker 1: 26520 requests, p50_us=278 p99_us=577
+  first request of a connection: p50_us=188 p99_us=654
+== skew-closed before round 19
+probe_rps=33380 p50_us=70 p99_us=497 p999_us=656 max_us=2949 probe_conns=6676 hot_rps=3581
+  worker 0: 25340 requests, p50_us=275 p99_us=556
+  worker 1: 108180 requests, p50_us=67 p99_us=313
+  first request of a connection: p50_us=182 p99_us=612
+== skew-closed balanced round 19
+probe_rps=31670 p50_us=72 p99_us=503 p999_us=658 max_us=5189 probe_conns=6334 hot_rps=3504
+  worker 0: 99860 requests, p50_us=68 p99_us=310
+  worker 1: 26820 requests, p50_us=280 p99_us=573
+  first request of a connection: p50_us=192 p99_us=629
+== skew-closed before round 20
+probe_rps=29820 p50_us=75 p99_us=523 p999_us=759 max_us=9092 probe_conns=5964 hot_rps=3395
+  worker 0: 28900 requests, p50_us=284 p99_us=602
+  worker 1: 90380 requests, p50_us=72 p99_us=304
+  first request of a connection: p50_us=202 p99_us=725
+== skew-closed balanced round 20
+probe_rps=30905 p50_us=73 p99_us=509 p999_us=673 max_us=12254 probe_conns=6181 hot_rps=3452
+  worker 0: 26200 requests, p50_us=283 p99_us=584
+  worker 1: 97420 requests, p50_us=69 p99_us=315
+  first request of a connection: p50_us=197 p99_us=636
+== skew-closed before round 21
+probe_rps=30730 p50_us=71 p99_us=526 p999_us=836 max_us=7377 probe_conns=6146 hot_rps=3331
+  worker 0: 28880 requests, p50_us=287 p99_us=609
+  worker 1: 94040 requests, p50_us=67 p99_us=303
+  first request of a connection: p50_us=178 p99_us=758
+== skew-closed balanced round 21
+probe_rps=30225 p50_us=77 p99_us=505 p999_us=681 max_us=18440 probe_conns=6045 hot_rps=3462
+  worker 0: 26840 requests, p50_us=280 p99_us=580
+  worker 1: 94060 requests, p50_us=73 p99_us=312
+  first request of a connection: p50_us=192 p99_us=621
+== skew-closed before round 22
+probe_rps=31185 p50_us=71 p99_us=504 p999_us=681 max_us=13461 probe_conns=6237 hot_rps=3459
+  worker 0: 29540 requests, p50_us=281 p99_us=577
+  worker 1: 95200 requests, p50_us=68 p99_us=295
+  first request of a connection: p50_us=184 p99_us=657
+== skew-closed balanced round 22
+probe_rps=30740 p50_us=74 p99_us=496 p999_us=711 max_us=5009 probe_conns=6148 hot_rps=3476
+  worker 0: 96800 requests, p50_us=69 p99_us=305
+  worker 1: 26160 requests, p50_us=283 p99_us=577
+  first request of a connection: p50_us=190 p99_us=628
+== skew-closed before round 23
+probe_rps=30675 p50_us=72 p99_us=540 p999_us=741 max_us=3200 probe_conns=6135 hot_rps=3313
+  worker 0: 94440 requests, p50_us=68 p99_us=309
+  worker 1: 28260 requests, p50_us=289 p99_us=646
+  first request of a connection: p50_us=191 p99_us=787
+== skew-closed balanced round 23
+probe_rps=30545 p50_us=73 p99_us=505 p999_us=939 max_us=10228 probe_conns=6109 hot_rps=3477
+  worker 0: 96340 requests, p50_us=69 p99_us=316
+  worker 1: 25840 requests, p50_us=282 p99_us=574
+  first request of a connection: p50_us=193 p99_us=663
+== skew-closed before round 24
+probe_rps=27950 p50_us=71 p99_us=522 p999_us=677 max_us=4155 probe_conns=5590 hot_rps=3258
+  worker 0: 35180 requests, p50_us=296 p99_us=579
+  worker 1: 76620 requests, p50_us=66 p99_us=295
+  first request of a connection: p50_us=210 p99_us=662
+== skew-closed balanced round 24
+probe_rps=31655 p50_us=71 p99_us=476 p999_us=620 max_us=8401 probe_conns=6331 hot_rps=3522
+  worker 0: 26620 requests, p50_us=279 p99_us=556
+  worker 1: 100000 requests, p50_us=67 p99_us=291
+  first request of a connection: p50_us=180 p99_us=596
+== skew-closed before round 25
+probe_rps=33660 p50_us=69 p99_us=484 p999_us=652 max_us=10305 probe_conns=6732 hot_rps=3556
+  worker 0: 25560 requests, p50_us=274 p99_us=549
+  worker 1: 109080 requests, p50_us=67 p99_us=304
+  first request of a connection: p50_us=173 p99_us=603
+== skew-closed balanced round 25
+probe_rps=29870 p50_us=76 p99_us=510 p999_us=872 max_us=19795 probe_conns=5974 hot_rps=3479
+  worker 0: 25620 requests, p50_us=283 p99_us=585
+  worker 1: 93860 requests, p50_us=72 p99_us=322
+  first request of a connection: p50_us=205 p99_us=660
+== skew-closed before round 26
+probe_rps=31805 p50_us=74 p99_us=515 p999_us=683 max_us=7483 probe_conns=6361 hot_rps=3443
+  worker 0: 102840 requests, p50_us=71 p99_us=333
+  worker 1: 24380 requests, p50_us=282 p99_us=597
+  first request of a connection: p50_us=200 p99_us=688
+== skew-closed balanced round 26
+probe_rps=29590 p50_us=77 p99_us=508 p999_us=1015 max_us=9629 probe_conns=5918 hot_rps=3465
+  worker 0: 92460 requests, p50_us=73 p99_us=316
+  worker 1: 25900 requests, p50_us=282 p99_us=578
+  first request of a connection: p50_us=203 p99_us=643
+== skew-closed before round 27
+probe_rps=30570 p50_us=72 p99_us=511 p999_us=715 max_us=8389 probe_conns=6114 hot_rps=3365
+  worker 0: 28700 requests, p50_us=286 p99_us=591
+  worker 1: 93580 requests, p50_us=69 p99_us=301
+  first request of a connection: p50_us=188 p99_us=683
+== skew-closed balanced round 27
+probe_rps=31305 p50_us=72 p99_us=512 p999_us=768 max_us=4094 probe_conns=6261 hot_rps=3436
+  worker 0: 99640 requests, p50_us=68 p99_us=325
+  worker 1: 25580 requests, p50_us=285 p99_us=583
+  first request of a connection: p50_us=190 p99_us=637
+== skew-closed before round 28
+probe_rps=31845 p50_us=75 p99_us=487 p999_us=683 max_us=4356 probe_conns=6369 hot_rps=3592
+  worker 0: 25300 requests, p50_us=274 p99_us=559
+  worker 1: 102080 requests, p50_us=72 p99_us=307
+  first request of a connection: p50_us=192 p99_us=619
+== skew-closed balanced round 28
+probe_rps=31240 p50_us=72 p99_us=520 p999_us=757 max_us=5395 probe_conns=6248 hot_rps=3427
+  worker 0: 26180 requests, p50_us=283 p99_us=593
+  worker 1: 98780 requests, p50_us=69 p99_us=324
+  first request of a connection: p50_us=196 p99_us=674
+== skew-closed before round 29
+probe_rps=30375 p50_us=74 p99_us=533 p999_us=714 max_us=3304 probe_conns=6075 hot_rps=3299
+  worker 0: 28500 requests, p50_us=291 p99_us=611
+  worker 1: 93000 requests, p50_us=70 p99_us=310
+  first request of a connection: p50_us=197 p99_us=741
+== skew-closed balanced round 29
+probe_rps=30545 p50_us=75 p99_us=504 p999_us=639 max_us=8006 probe_conns=6109 hot_rps=3475
+  worker 0: 95800 requests, p50_us=71 p99_us=311
+  worker 1: 26380 requests, p50_us=283 p99_us=572
+  first request of a connection: p50_us=202 p99_us=626
+== skew-closed before round 30
+probe_rps=32160 p50_us=73 p99_us=507 p999_us=669 max_us=3438 probe_conns=6432 hot_rps=3505
+  worker 0: 24840 requests, p50_us=280 p99_us=563
+  worker 1: 103800 requests, p50_us=70 p99_us=328
+  first request of a connection: p50_us=194 p99_us=630
+== skew-closed balanced round 30
+probe_rps=30315 p50_us=74 p99_us=520 p999_us=823 max_us=15823 probe_conns=6063 hot_rps=3413
+  worker 0: 95760 requests, p50_us=70 p99_us=326
+  worker 1: 25500 requests, p50_us=286 p99_us=591
+  first request of a connection: p50_us=203 p99_us=664

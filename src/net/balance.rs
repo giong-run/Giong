@@ -20,9 +20,13 @@
 //! worker with thousands of idle connections still gets new ones while a
 //! worker with a few hot ones is saturated, and when every worker is about
 //! as busy, connection counts decide. When every worker is saturated
-//! ([`SATURATED`]), counts of tasks would mislead (the idle connections
-//! went to the workers that had room), so the work each one has waiting
-//! decides instead.
+//! ([`SATURATED`]), how busy says nothing more: a connection goes to a
+//! member with clearly less work waiting ([`BACKLOG_MARGIN`]), and
+//! otherwise counts decide again, but never in favour of a member whose
+//! task polls take clearly longer than the accepting worker's ([`SLOWER`]):
+//! a new connection there waits behind long-running work at every turn,
+//! and its counts mislead (it is the busy worker the idle connections were
+//! sent away from).
 
 use std::collections::VecDeque;
 use std::io;
@@ -63,8 +67,7 @@ const BAND: u64 = CORE / 20;
 
 /// When even the least busy member is expected to be this busy (80% of a
 /// core), every member counts as saturated, and new connections go by
-/// backlog: runnable tasks and work sent but not taken in yet (see
-/// [`BACKLOG_MARGIN`]).
+/// backlog, then by counts (see [`BACKLOG_MARGIN`] and [`SLOWER`]).
 const SATURATED: u64 = CORE * 8 / 10;
 
 /// When every member is saturated, how much more backlog than another
@@ -74,8 +77,16 @@ const SATURATED: u64 = CORE * 8 / 10;
 /// spreading hot connections evenly, which leaves light ones waiting behind
 /// as many hot ones wherever they land (`bench/placement.sh`, mixed); a
 /// larger one lets a queue of short requests build up on one worker
-/// (skewed, back to back).
+/// (skewed, back to back). Backlog is runnable tasks plus work sent but
+/// not taken in yet.
 const BACKLOG_MARGIN: usize = 2;
+
+/// When every member is saturated and backlogs do not decide, counts never
+/// favour a member whose average task poll took more than this many
+/// quarters (125%) of the accepting worker's: wide enough that workers
+/// running the same kind of work, measured with some noise, still even out
+/// their counts.
+const SLOWER: u64 = 5;
 
 /// The least each task taken on since the last sample is expected to cost
 /// (0.1% of a core), so that a burst of new connections within one sample
@@ -127,6 +138,11 @@ struct WorkerBusy {
     /// The share of its time it was busy, in parts per million: averaged
     /// over the last samples.
     share: AtomicU64,
+    /// Its task polls at the last sample.
+    polls_at: AtomicU64,
+    /// The CPU time an average task poll took, in nanoseconds: averaged
+    /// over the last samples; 0 until measured.
+    poll_ns: AtomicU64,
 }
 
 impl Busy {
@@ -140,6 +156,8 @@ impl Busy {
                     busy_at: AtomicU64::new(NO_BASE),
                     tasks_at: AtomicUsize::new(0),
                     share: AtomicU64::new(0),
+                    polls_at: AtomicU64::new(0),
+                    poll_ns: AtomicU64::new(0),
                 })
                 .collect(),
         }
@@ -173,6 +191,8 @@ impl Busy {
         for (i, w) in self.workers.iter().enumerate() {
             let (tasks, _, _) = rt.counts_of(i);
             w.tasks_at.store(tasks, Ordering::Relaxed);
+            let polls = rt.polls_of(i);
+            let polls_was = w.polls_at.swap(polls, Ordering::Relaxed);
             // A worker whose CPU time cannot be read (not started, ended, or
             // Miri) counts as idle: then counts of tasks decide.
             let Some(busy) = rt.busy_ns_of(i) else {
@@ -195,6 +215,15 @@ impl Busy {
                 now_share
             };
             w.share.store(share, Ordering::Relaxed);
+            if let Some(now_poll) = worked.checked_div(polls.wrapping_sub(polls_was)) {
+                let was = w.poll_ns.load(Ordering::Relaxed);
+                let poll_ns = if fresh && was != 0 {
+                    (was + now_poll) / 2
+                } else {
+                    now_poll
+                };
+                w.poll_ns.store(poll_ns, Ordering::Relaxed);
+            }
             busy_sum += share;
             tasks_sum += tasks as u64;
         }
@@ -347,11 +376,8 @@ impl Member {
             .min()?
             .min(mine);
         if least >= SATURATED {
-            // Every member is busy: how busy says nothing more, and counts
-            // of tasks mislead (idle connections sent away from a busy
-            // worker earlier make it look emptiest). Go by backlog, the
-            // work each one has waiting, and keep the connection unless
-            // another member has clearly more room (BACKLOG_MARGIN).
+            // Every member is busy: how busy says nothing more. First, a
+            // member with clearly less work waiting.
             let backlog = |i: usize| {
                 let (_, queued, incoming) = rt.counts_of(i);
                 queued + incoming
@@ -361,7 +387,15 @@ impl Member {
                 .map(|k| (self.worker + k) % n)
                 .filter(|&i| member(i))
                 .min_by_key(|&i| backlog(i))?;
-            return (backlog(self.worker) > backlog(target) + BACKLOG_MARGIN).then_some(target);
+            if backlog(self.worker) > backlog(target) + BACKLOG_MARGIN {
+                return Some(target);
+            }
+            // Then counts, as when every member is about as busy, among the
+            // members whose polls are not clearly longer than this worker's.
+            let poll_ns = |i: usize| busy.workers[i].poll_ns.load(Ordering::Relaxed);
+            let limit = poll_ns(self.worker).saturating_mul(SLOWER) / 4;
+            let target = rt.least_loaded_of(None, |i| member(i) && poll_ns(i) <= limit)?;
+            return (rt.score(self.worker) > rt.score(target) + MARGIN).then_some(target);
         }
         let limit = least.saturating_add(BAND);
         let target = rt.least_loaded_of(None, |i| member(i) && busy.expected(rt, i) <= limit)?;

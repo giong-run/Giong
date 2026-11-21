@@ -207,6 +207,11 @@ impl Counters {
         self.spin_ns.load(Ordering::Relaxed)
     }
 
+    /// Task polls so far.
+    pub(crate) fn polls(&self) -> u64 {
+        self.polls.load(Ordering::Relaxed)
+    }
+
     /// A task spawned at `location` is about to be polled.
     pub(crate) fn polling(&self, location: Location) {
         self.polling.store(

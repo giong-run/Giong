@@ -266,6 +266,11 @@ impl RuntimeShared {
         )
     }
 
+    /// Task polls worker `i` has made so far.
+    pub(crate) fn polls_of(&self, i: usize) -> u64 {
+        self.workers[i].counters.polls()
+    }
+
     /// Nanoseconds of CPU time worker `i` has spent working so far: the
     /// CPU time of its thread, less the time it spent spinning for work.
     /// `None` before its thread has started, after it has ended, and under

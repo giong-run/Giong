@@ -1,0 +1,12 @@
+# Soak with balanced listeners
+
+`tests/soak.rs` binds balanced listeners on its even-numbered workers, so connections are
+also handed from worker to worker.
+
+- `epoll-cc6aff2.log.gz`: `GIONG_DRIVER=epoll GIONG_SOAK_SECS=6900 cargo test --release
+  --test soak -- --ignored --nocapture` on commit cc6aff2 (the rule before the count step
+  for saturated workers), Linux 6.18, 4 vCPUs: 151,560,037 connections, 10,266,939
+  cross-worker hops, descriptors and memory flat, 0 unexpected errors.
+- The Soak workflow, 240 minutes, on commit 12a264f
+  ([run 44883087572](https://github.com/giong-run/Giong/actions/runs/44883087572)): all five
+  jobs passed (runner kernel: 317,381,629 connections; Linux 6.18 in QEMU: 829,766,373).
