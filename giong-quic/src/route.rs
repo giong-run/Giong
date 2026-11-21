@@ -267,13 +267,17 @@ mod tests {
     }
 
     #[test]
-    fn ids_name_their_worker_and_no_other() {
+    fn ids_name_their_worker_and_any_giong_id_validates() {
         let mut cids = WorkerCids { worker: 9 };
         let id = cids.generate_cid();
         assert_eq!(id.len(), cid::LEN);
         assert_eq!(cid::worker_of(&id), Some(9));
         assert!(cids.validate(&id).is_ok());
-        assert!(WorkerCids { worker: 8 }.validate(&id).is_err());
+        // Another worker's: valid, so that it can be answered with a
+        // stateless reset when that worker is gone.
+        assert!(WorkerCids { worker: 8 }.validate(&id).is_ok());
+        // Not laid out as giong issues them.
+        assert!(cids.validate(&ConnectionId::new(&[0; 7])).is_err());
         assert_ne!(id, cids.generate_cid());
     }
 
