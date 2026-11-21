@@ -37,6 +37,7 @@ jobs:
           flag=""; [ "${{ matrix.profile }}" = release ] && flag=--release
           cargo test -p giong $flag --test review_attacks --no-run
           cargo test -p giong $flag --test review_attacks diag -- --nocapture || true
+          cargo test -p giong $flag --test net send_file -- --nocapture
           for i in $(seq 1 10); do
             echo "::group::run $i"
             timeout 900 cargo test -p giong $flag --test review_attacks -- --nocapture --test-threads 2 --skip diag 2>&1 | tee run.log
