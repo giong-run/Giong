@@ -80,6 +80,7 @@ pub fn shared_port() -> (Socket, u16) {
 /// The socket holds the port, so no other test can bind it, and is
 /// connected elsewhere: a connected UDP socket only takes datagrams from its
 /// peer, so for anyone else nothing listens on the port.
+#[cfg(unix)]
 pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
     socket
@@ -89,16 +90,30 @@ pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
         .connect(&SocketAddr::from(([127, 0, 0, 1], 9)).into())
         .unwrap();
     let addr = socket.local_addr().unwrap().as_socket().unwrap();
-    // Windows drops a datagram that a connected socket does not take
-    // without telling the sender, so there the port is given back: a
-    // closed port answers, and the short race with another bind is
-    // accepted.
-    #[cfg(windows)]
-    let socket = {
-        drop(socket);
-        Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap()
-    };
     (socket, addr)
+}
+
+/// An address on 127.0.0.1 where a UDP datagram is refused (the kernel
+/// answers with "port unreachable").
+///
+/// Windows drops a datagram that a connected socket does not take without
+/// telling the sender, so the port cannot be held: it is a closed one. It
+/// is taken below the range Windows hands out for binds to port 0
+/// (49152 and up), so that no socket of a test running beside this one is
+/// given it in the meantime; one given it after a datagram to a closed
+/// ephemeral port went unanswered on a runner.
+#[cfg(windows)]
+pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
+    let start = 20_000 + (std::process::id() as u16 % 1000) * 20;
+    // At most 39,980 + 9,000, below 49,152.
+    let addr = (0..9_000u16)
+        .map(|i| SocketAddr::from(([127, 0, 0, 1], start + i)))
+        .find(|addr| {
+            let probe = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+            probe.bind(&(*addr).into()).is_ok()
+        })
+        .expect("no free UDP port below the ephemeral range");
+    (Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap(), addr)
 }
 
 /// Error numbers the tests compare against, as each system spells them.

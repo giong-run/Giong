@@ -69,7 +69,15 @@ impl FakeDns {
         let (t, q) = (table.clone(), queries.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            loop {
+                let (n, from) = match udp.recv_from(&mut buf) {
+                    Ok(got) => got,
+                    // Windows reports a "port unreachable" answer to an
+                    // earlier reply (its asker had gone) on the next
+                    // receive; the server carries on.
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(_) => return,
+                };
                 let Some(reply) = answer(&buf[..n], &t, &q, false) else {
                     continue;
                 };
