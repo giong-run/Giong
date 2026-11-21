@@ -51,7 +51,11 @@ pub(crate) fn owner_of_all(data: &[u8], segment: usize, me: u16) -> Result<Optio
 #[derive(Debug, PartialEq)]
 pub(crate) struct Mixed;
 
-type Group = HashMap<u16, Sender<Forwarded>>;
+/// The endpoints bound to one address, by worker. A worker normally has
+/// one; a second one bound on the same worker (a service that binds the
+/// new endpoint before it drops the old) waits behind the first, and takes
+/// its place when the first is dropped.
+type Group = HashMap<u16, Vec<(u64, Sender<Forwarded>)>>;
 
 fn groups() -> &'static Mutex<HashMap<SocketAddr, Group>> {
     static GROUPS: OnceLock<Mutex<HashMap<SocketAddr, Group>>> = OnceLock::new();
@@ -62,13 +66,14 @@ fn groups() -> &'static Mutex<HashMap<SocketAddr, Group>> {
 /// their peers up again.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Names every member, so that one can leave its group's list.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 /// A server endpoint's place among the endpoints bound to its address.
 pub(crate) struct Member {
     addr: SocketAddr,
     worker: u16,
-    /// Whether this endpoint is the one in the table: a second endpoint
-    /// on the same address and worker is not, and gets nothing passed on.
-    listed: bool,
+    id: u64,
     seen: u64,
     peers: HashMap<u16, Sender<Forwarded>>,
 }
@@ -78,17 +83,19 @@ impl Member {
     /// others pass on arrive.
     pub(crate) fn join(addr: SocketAddr, worker: u16) -> (Self, Receiver<Forwarded>) {
         let (tx, rx) = bounded(QUEUE);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut groups = groups().lock().unwrap_or_else(|e| e.into_inner());
-        let group = groups.entry(addr).or_default();
-        let listed = !group.contains_key(&worker);
-        if listed {
-            group.insert(worker, tx);
-        }
+        groups
+            .entry(addr)
+            .or_default()
+            .entry(worker)
+            .or_default()
+            .push((id, tx));
         GENERATION.fetch_add(1, Ordering::Release);
         let member = Member {
             addr,
             worker,
-            listed,
+            id,
             // Looked up at the first datagram that needs it.
             seen: u64::MAX,
             peers: HashMap::new(),
@@ -109,8 +116,13 @@ impl Member {
         let now = GENERATION.load(Ordering::Acquire);
         if self.seen != now {
             let groups = groups().lock().unwrap_or_else(|e| e.into_inner());
-            self.peers = groups.get(&self.addr).cloned().unwrap_or_default();
-            self.peers.remove(&self.worker);
+            self.peers = groups
+                .get(&self.addr)
+                .into_iter()
+                .flatten()
+                .filter(|(&worker, _)| worker != self.worker)
+                .filter_map(|(&worker, list)| Some((worker, list.first()?.1.clone())))
+                .collect();
             self.seen = now;
         }
         match self.peers.get(&worker) {
@@ -125,12 +137,14 @@ impl Member {
 
 impl Drop for Member {
     fn drop(&mut self) {
-        if !self.listed {
-            return;
-        }
         let mut groups = groups().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(group) = groups.get_mut(&self.addr) {
-            group.remove(&self.worker);
+            if let Some(list) = group.get_mut(&self.worker) {
+                list.retain(|(id, _)| *id != self.id);
+                if list.is_empty() {
+                    group.remove(&self.worker);
+                }
+            }
             if group.is_empty() {
                 groups.remove(&self.addr);
             }
@@ -180,6 +194,34 @@ mod tests {
         d.extend_from_slice(&cid::issue(worker, [0xab; 8]));
         d.extend_from_slice(&[0; 20]);
         d
+    }
+
+    fn datagram() -> Forwarded {
+        Forwarded {
+            data: vec![1],
+            from: "127.0.0.1:1".parse().unwrap(),
+            ecn: 0,
+            segment: None,
+        }
+    }
+
+    #[test]
+    fn a_second_endpoint_on_a_worker_takes_over_when_the_first_goes() {
+        let addr: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (mut sender, _) = Member::join(addr, 0);
+        let (old, mut old_rx) = Member::join(addr, 1);
+        let (new, mut new_rx) = Member::join(addr, 1);
+        // The first endpoint of worker 1 gets what worker 0 passes on.
+        assert!(sender.forward(1, datagram()).is_none());
+        assert!(old_rx.try_recv().is_ok());
+        assert!(new_rx.try_recv().is_err());
+        // Once it is gone, the second one does.
+        drop((old, old_rx));
+        assert!(sender.forward(1, datagram()).is_none());
+        assert!(new_rx.try_recv().is_ok());
+        // And with none left, the datagram comes back.
+        drop((new, new_rx));
+        assert!(sender.forward(1, datagram()).is_some());
     }
 
     #[test]
