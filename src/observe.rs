@@ -134,6 +134,7 @@ impl Counters {
         Self::bump(&self.ticks, 1);
     }
 
+    #[inline(always)]
     pub(crate) fn spawned(&self) {
         Self::bump(&self.spawned, 1);
     }

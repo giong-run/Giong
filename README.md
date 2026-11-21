@@ -297,8 +297,10 @@ fn main() -> std::io::Result<()> {
 | Area | API |
 |---|---|
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
-| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`; `giong::driver_kind()` |
+| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`, `.max_blocking_threads(n)`, `.compute_threads(n)`, `.compute_backlog(n)`; `giong::driver_kind()` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
+| Blocking and CPU work | `spawn_blocking(f)` (blocking calls: `std::fs`, C libraries; up to 128 threads), `spawn_compute(f)` (CPU-heavy work on one thread per CPU, below the workers' priority), `try_spawn_compute(f)` (sheds with `GIONG-E0014` when the lane is behind); all `-> BlockingHandle<T>`; `Handle::spawn_blocking` / `spawn_compute` from any thread, `Handle::lane_stats()` |
+| Tenants | `budget::Budget::new(name, Limits::new().tasks(n).memory(bytes).io(n).compute(n))`; `budget.spawn(fut).await`, `budget.reserve(bytes).await`, `budget.spawn_compute(f).await`, `budget.enter(fut)`; `try_spawn` / `try_reserve` / `try_spawn_compute` refuse with `GIONG-E0080`; `budget::current()`, `budget.stats()`. Spawns and compute closures inside a budgeted task are charged to it; an I/O slot is held until the kernel completes the operation, even when its future was dropped; the compute lane serves budgets fairly by compute time and weight |
 | TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`, on an IP address (a host name is refused: `lookup_host` first), shared by the workers of one process and refused to any other; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
 | Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
@@ -400,7 +402,7 @@ to poll. A crate of step 4 opens its own sockets (`connect(url)`), sleeps or spa
 
 ## Coming from Tokio
 
-giong has no macros and no `spawn_blocking`, and a worker's state is never shared with
+giong has no macros, and a worker's state is never shared with
 another thread, so some everyday Tokio code is written another way. Every row was run on
 giong 0.7.0.
 
@@ -410,7 +412,7 @@ giong 0.7.0.
 | `tokio::spawn(fut)` | `giong::spawn(fut)`: the task stays on the worker that spawned it, so the future need not be `Send`. From another thread or for another worker: `Handle::spawn_on`, `Handle::spawn_balanced` |
 | `JoinHandle`, `abort()` | the same: `handle.await` is `Err` for a task that panicked or was aborted |
 | `tokio::join!`, `tokio::select!` | `futures::join!` and `futures::select!` from the `futures` crate, which need no runtime |
-| `spawn_blocking(f).await` | nothing built in yet: `std::thread::spawn`, and a `giong::sync::oneshot` channel to await the result. A worker that blocks holds up every connection it owns |
+| `spawn_blocking(f).await` | `giong::spawn_blocking(f).await` for calls that wait, and `giong::spawn_compute(f).await` for work that keeps a CPU busy: compute threads run below the workers' priority, so network work keeps its latency. A worker that blocks holds up every connection it owns |
 | `Arc<Mutex<T>>` shared by handlers | state per worker in an `Rc<RefCell<T>>`, built inside `run(\|_\| async { .. })` and not borrowed across an `.await`. What every worker must see goes through atomics or a channel |
 | `tokio::sync::{Semaphore, Notify, watch, broadcast, Mutex}` | `giong::sync` has `mpsc` (unbounded and bounded) and `oneshot`. Tokio's `sync` module needs no Tokio runtime and works on giong as it is: `tokio = { version = "1", default-features = false, features = ["sync"] }` |
 | `tokio::time::{sleep, sleep_until, timeout}` | `giong::time::{sleep, sleep_until, timeout}` |
@@ -1035,6 +1037,31 @@ are within noise. Most of an echo's cost here is the kernel's UDP and veth path:
 giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for each one
 (`post-soak/udp-perf/`).
 
+### Two tenants on one small box
+
+A server in a cgroup of 1 CPU and 128 MiB (one worker and one compute thread, pinned to one
+CPU), shared by two tenants. Every request holds memory from its start to its answer and runs
+a CPU-bound job on the compute lane. Tenant B sends 100 requests per second and needs each
+answered within 50 ms; tenant A keeps 64 (or 128) requests in flight back to back, far more
+than the box can serve. Medians of 3 rounds of 20 s, both drivers alike
+(`bench/tenants.sh`, raw data in `bench/results/tenants/`, 4-vCPU cloud VM):
+
+| Requests | Service | B in deadline, alone | B in deadline, with A | B p99 with A |
+|---|---|---|---|---|
+| 2 ms CPU, 256 KiB | no limits | 2,000 | **0** | 10.1 s |
+| | one `Budget` for both tenants | 2,000 | **0** | 10.2 s |
+| | one `Budget` per tenant | 2,000 | **2,000 (100%)** | 4.4 ms |
+| 0.5 ms CPU, 2 MiB | no limits | 2,000 | **0**: OOM-killed in every round | |
+| | one `Budget` for both tenants | 2,000 | **0** | 232 ms |
+| | one `Budget` per tenant | 2,000 | **2,000 (100%)** | 3.1-4.4 ms |
+
+A limit for the whole service keeps it alive but lets A take all of it; a budget per tenant
+(32 MiB and 8 compute closures each, waiting forms only, nothing refused) keeps B at its
+solo level while the box stays fully used: A gets the CPU B leaves, and in the first
+scenario the box serves about 490 requests per second in total either way. Not measured yet:
+more than two tenants, tenants sharing a database pool, and HTTP/1.1 uploads, whose bytes
+`giong-http` still counts per worker, not per tenant.
+
 ### What has not been measured
 
 - **More than eight cores, and the other tables on a physical network.** The bare-metal
@@ -1047,8 +1074,8 @@ giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for e
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
 `bench/tls.sh`, `bench/fs.sh`, `bench/core.sh`, `bench/postgres.sh`, `bench/mysql.sh`,
-`bench/redis.sh`, `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh`
-and `bench/udp-echo.sh`; two cores with
+`bench/redis.sh`, `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh`,
+`bench/udp-echo.sh` and `bench/tenants.sh` (as root, for its cgroup); two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per
@@ -1076,6 +1103,8 @@ the example API describe theirs in their READMEs.
 | `tests/fs.rs` (25) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll), one stuck operation not holding up the others, offsets above `i64::MAX` and open options that cannot work refused with their codes, a pipe on standard input left blocking |
 | `tests/cancel.rs` (17) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; a dropped `send_file` leaves nothing behind; **a dropped open closes the descriptor it produced**; a stream or operation dropped by code the driver runs is still closed and cancelled; connections accepted for a listener that outlives its runtime are closed; teardown with everything in flight |
 | `tests/multi.rs` (16) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM (also after worker 0 returned), work sent to a stopped runtime cancelled, a panicking worker |
+| `tests/lane.rs` (11) | handles are `Send`; blocking and compute closures run on their own threads (compute at nice +10) and give their value; **a sleeping blocking closure does not stall its worker's timers**; a panic reaches the handle, not the worker; `abort` stops a closure that has not started; `try_spawn_compute` sheds with GIONG-E0014 at the backlog limit; the blocking lane never exceeds its thread limit; closures not started when the runtime stops, or sent after, are cancelled |
+| `tests/budget.rs` (15) | budgets are `Send`; `try_spawn`, `try_reserve`, `try_spawn_compute` refuse with GIONG-E0080 at their limits and a reservation larger than the budget with GIONG-E0081; waiting calls are served in order and **a large reservation is not overtaken by smaller ones**; dropped waiting calls leave the queue and granted ones give back what they were handed; tasks and compute closures spawned inside a budget are charged to it; **a cancelled read keeps its I/O slot until the kernel has completed its cancellation** (io_uring); **a light tenant's compute job waits for at most a couple of a heavy tenant's jobs**, and weights share the lane |
 | `tests/shutdown.rs` (10) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
 | `tests/driver.rs` (9), `tests/blocked.rs` (4) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; with the locked-memory limit used up, the same with GIONG-E0010; the optional io_uring features found are the kernel's; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
@@ -1217,6 +1246,10 @@ younger than both and has not run in production.
   `std::future` do. For PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for
   MySQL, [`giong-mysql`](giong-mysql/README.md); for Redis,
   [`giong-redis`](giong-redis/README.md); for HTTP requests, `giong-http`'s client.
+- **Budgets charge what they can see.** A `giong::budget::Budget` counts reserved memory and
+  task futures, not every allocation of the tenant's code; it does not charge time on the
+  workers (heavy work belongs on the compute lane, which it shares fairly), work spawned on
+  another worker, the blocking lane, or `giong-http`'s per-worker request byte budget.
 - **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
   `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
   `TcpListener::bind_balanced` hand new connections to less busy workers. A connection

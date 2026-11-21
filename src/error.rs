@@ -151,6 +151,22 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+    /// [`try_spawn_compute`](crate::try_spawn_compute) refused a closure:
+    /// as many closures as
+    /// [`Builder::compute_backlog`](crate::Builder::compute_backlog) allows
+    /// already wait for a compute thread. The closure was dropped without
+    /// running.
+    ComputeBusy = 14, WouldBlock, "the compute lane is full";
+    /// A `try_` call of a [`Budget`](crate::budget::Budget) refused work:
+    /// the budget is at one of its [`Limits`](crate::budget::Limits) (tasks,
+    /// memory or compute closures), or other calls already wait for room.
+    /// The work was dropped without running.
+    BudgetFull = 80, WouldBlock, "the budget is at its limit";
+    /// [`Budget::reserve`](crate::budget::Budget::reserve) or
+    /// [`try_reserve`](crate::budget::Budget::try_reserve) asked for more
+    /// bytes than the budget's whole memory limit, so it could never be
+    /// granted.
+    BudgetTooSmall = 81, InvalidInput, "a reservation larger than the budget";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.

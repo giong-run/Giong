@@ -1179,6 +1179,15 @@ def llms():
              "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
              "  connection from `pool.get().await?`; it comes back with its session reset.\n"
              ) if "giong-postgres" in names else ""
+    if released("src/lane.rs") is not None:
+        blocking = ("Never block a worker or compute on it for long:\n"
+                    "  `giong::spawn_blocking(f).await` runs blocking calls (`std::fs`, C libraries) on\n"
+                    "  a blocking lane, `giong::spawn_compute(f).await` runs CPU-heavy work (hashing,\n"
+                    "  images, compression) on threads below the workers' priority, and\n"
+                    "  `try_spawn_compute` sheds with `GIONG-E0014` when that lane is behind.")
+    else:
+        blocking = ("There is no `spawn_blocking`: use\n"
+                    "  `std::thread::spawn` and a `giong::sync::oneshot` channel, and never block a worker.")
     return f"""# giong
 
 > An async runtime for Rust services on Linux, built for code that AI agents write: a
@@ -1211,8 +1220,7 @@ Facts that are easy to get wrong:
   any other error answers `500` and logs the cause, never sending it.
 - Coming from Tokio: `giong::spawn` keeps a task on its worker, so nothing needs `Send` and
   per-worker state is an `Rc<RefCell<..>>`, not an `Arc<Mutex<..>>`. `futures::join!` and
-  `futures::select!` take the place of Tokio's macros. There is no `spawn_blocking`: use
-  `std::thread::spawn` and a `giong::sync::oneshot` channel, and never block a worker.
+  `futures::select!` take the place of Tokio's macros. {blocking}
   `giong::sync` has `mpsc` and `oneshot`; Tokio's `sync` module (`Semaphore`, `Notify`,
   `watch`, `broadcast`) needs no Tokio runtime and works on giong.
 - Choosing crates: use the giong crate for the job first. HTTP server: `giong-http`, not

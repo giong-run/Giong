@@ -5,21 +5,21 @@
 //! driver therefore hands file operations (opens, reads, writes, syncs,
 //! metadata) to these threads, the way other readiness-based runtimes do.
 //!
-//! One pool serves the whole process. A thread starts whenever more jobs are
-//! queued than idle threads can take, up to [`MAX_THREADS`], and stops after
-//! [`IDLE`] without work: a job that blocks for a long time (a FIFO with no
-//! writer, a hung network filesystem) holds up only its own thread. A
-//! finished job pushes its result onto its worker's [`Completions`] and pokes
-//! the worker's eventfd.
+//! One pool ([`crate::pool`]) serves the whole process, up to [`MAX_THREADS`]
+//! threads that stop after [`IDLE`] without work: a job that blocks for a long
+//! time (a FIFO with no writer, a hung network filesystem) holds up only its
+//! own thread. It is separate from the public blocking lane
+//! ([`crate::spawn_blocking`]), so application jobs cannot starve file
+//! operations. A finished job pushes its result onto its worker's
+//! [`Completions`] and pokes the worker's eventfd.
 
-use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::thread;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::pool::{Job, Pool, PoolConfig};
 use crate::runtime::lock;
 
 /// The most blocking threads at once. Enough for disks that serve many
@@ -30,90 +30,26 @@ const MAX_THREADS: usize = 64;
 /// How long a thread waits for work before it ends.
 const IDLE: Duration = Duration::from_secs(10);
 
-type Job = Box<dyn FnOnce() + Send>;
-
-struct State {
-    jobs: VecDeque<Job>,
-    threads: usize,
-    idle: usize,
-}
-
-struct Pool {
-    state: Mutex<State>,
-    work: Condvar,
-}
-
-fn pool() -> &'static Pool {
-    static POOL: OnceLock<Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool {
-        state: Mutex::new(State {
-            jobs: VecDeque::new(),
-            threads: 0,
-            idle: 0,
-        }),
-        work: Condvar::new(),
+fn pool() -> &'static Arc<Pool> {
+    static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        Pool::new(PoolConfig {
+            name: "giong-blocking",
+            max_threads: MAX_THREADS,
+            idle: IDLE,
+            nice: 0,
+            stack_size: None,
+            run_inline_on_failure: true,
+            fair: false,
+        })
     })
 }
 
 /// Runs `job` on a blocking thread, or on the calling thread if no thread
 /// can be started and none exists.
 pub(super) fn spawn(job: Job) {
-    let pool = pool();
-    let mut state = lock(&pool.state);
-    state.jobs.push_back(job);
-    // Each queued job needs a thread of its own. An idle thread is counted
-    // as idle until it runs again, so jobs queued before it wakes up must not
-    // all count on it: one that blocks would hold up the rest.
-    if state.jobs.len() <= state.idle {
-        drop(state);
-        pool.work.notify_one();
-        return;
-    }
-    if state.threads >= MAX_THREADS {
-        // Every thread is busy: the job waits its turn.
-        return;
-    }
-    state.threads += 1;
-    drop(state);
-    let started = thread::Builder::new()
-        .name("giong-blocking".into())
-        .spawn(|| work(self::pool()));
-    if started.is_err() {
-        let mut state = lock(&pool.state);
-        state.threads -= 1;
-        if state.threads == 0 {
-            // No thread will ever take it: run what is queued here rather
-            // than leave the operations hanging.
-            let jobs = std::mem::take(&mut state.jobs);
-            drop(state);
-            for job in jobs {
-                job();
-            }
-        }
-    }
-}
-
-fn work(pool: &'static Pool) {
-    let mut state = lock(&pool.state);
-    loop {
-        if let Some(job) = state.jobs.pop_front() {
-            drop(state);
-            job();
-            state = lock(&pool.state);
-            continue;
-        }
-        state.idle += 1;
-        let (next, timeout) = pool
-            .work
-            .wait_timeout(state, IDLE)
-            .unwrap_or_else(|e| e.into_inner());
-        state = next;
-        state.idle -= 1;
-        if timeout.timed_out() && state.jobs.is_empty() {
-            state.threads -= 1;
-            return;
-        }
-    }
+    // This pool is never stopped, so the job is always taken.
+    let _ = pool().spawn(job);
 }
 
 /// Results of one worker's blocking jobs, waiting for the worker.
