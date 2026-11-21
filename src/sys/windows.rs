@@ -512,6 +512,42 @@ impl Drop for SignalGuard {
     }
 }
 
+/// Readies a UDP socket for the runtime, once, when it is made or wrapped:
+///
+/// - Non-blocking, so the sends that do not wait (`send_to_nowait`) never
+///   block the worker. The driver sets it too, but only at the socket's
+///   first operation, and a send can come before any.
+/// - Without `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET`: otherwise an ICMP
+///   "port unreachable" for an earlier send to a peer that has gone fails
+///   the next receive with `WSAECONNRESET`, and a server's receive loop
+///   ends. Unix reports these only on a connected socket.
+///
+/// A failure leaves the socket as it was.
+pub(crate) fn ready_udp(sock: &socket2::Socket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET, SIO_UDP_NETRESET};
+    drop(sock.set_nonblocking(true));
+    for code in [SIO_UDP_CONNRESET, SIO_UDP_NETRESET] {
+        let off: BOOL = 0;
+        let mut returned = 0u32;
+        // SAFETY: an open socket; the input is a local of the size given,
+        // and there is no output.
+        unsafe {
+            WSAIoctl(
+                sock.as_raw_socket() as RawSock,
+                code,
+                (&off as *const BOOL).cast(),
+                mem::size_of::<BOOL>() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+    }
+}
+
 /// `recvfrom` on a non-blocking socket into `buf`: the bytes received,
 /// or -1 with the thread's last error set (`WSAEWOULDBLOCK` when nothing
 /// is waiting, `WSAEMSGSIZE` when the datagram was longer than `buf` and

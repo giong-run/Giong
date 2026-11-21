@@ -321,6 +321,8 @@ impl UdpSocket {
         // one that came from somewhere else (`from_std`).
         #[cfg(target_os = "macos")]
         drop(sock.set_nosigpipe(true));
+        #[cfg(windows)]
+        crate::sys::ready_udp(&sock);
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),

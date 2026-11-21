@@ -293,6 +293,84 @@ fn a_datagram_already_waiting_and_too_long_for_the_buffer_is_cut_safely() {
 }
 
 #[test]
+fn a_send_to_a_peer_that_has_gone_does_not_fail_later_receives() {
+    // The peer's port is closed, so the system answers the datagram with
+    // an ICMP "port unreachable". Unix reports that only on a connected
+    // socket; on Windows it would fail the next receive with a reset, and
+    // a server's receive loop would end there.
+    giong::block_on(async {
+        let (server, server_addr) = socket();
+        let (client, client_addr) = socket();
+        let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gone_addr = gone.local_addr().unwrap();
+        drop(gone);
+        for _ in 0..3 {
+            server
+                .send_to(b"late reply".to_vec(), gone_addr)
+                .await
+                .0
+                .unwrap();
+        }
+        sleep(Duration::from_millis(50)).await;
+        client
+            .send_to(b"next".to_vec(), server_addr)
+            .await
+            .0
+            .unwrap();
+        let (got, from) = timeout(Duration::from_secs(5), server.recv_from())
+            .await
+            .expect("the datagram arrives")
+            .expect("the receive goes on");
+        assert_eq!((&*got, from), (&b"next"[..], client_addr));
+        // And with a buffer of one's own.
+        let (server, server_addr) = socket();
+        for _ in 0..3 {
+            server
+                .send_to(b"late reply".to_vec(), gone_addr)
+                .await
+                .0
+                .unwrap();
+        }
+        sleep(Duration::from_millis(50)).await;
+        client
+            .send_to(b"again".to_vec(), server_addr)
+            .await
+            .0
+            .unwrap();
+        let (res, buf) = server.read_from(Vec::with_capacity(64)).await;
+        assert_eq!(res.unwrap(), (5, client_addr));
+        assert_eq!(buf, b"again");
+    });
+}
+
+/// The sends that do not wait rely on the socket being non-blocking from
+/// the start, before the driver has seen it.
+#[cfg(windows)]
+#[test]
+fn a_new_socket_is_non_blocking_before_its_first_operation() {
+    use std::os::windows::io::AsRawSocket;
+    giong::block_on(async {
+        let (sock, _) = socket();
+        let mut byte = [0u8; 1];
+        // A blocking socket would wait here for a datagram that never comes.
+        // SAFETY: an open socket and a local buffer of the size given.
+        let n = unsafe {
+            windows_sys::Win32::Networking::WinSock::recv(
+                sock.as_raw_socket() as _,
+                byte.as_mut_ptr(),
+                1,
+                0,
+            )
+        };
+        assert_eq!(n, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(10035), // WSAEWOULDBLOCK
+        );
+    });
+}
+
+#[test]
 fn larger_pool_buffers_carry_larger_datagrams() {
     giong::Builder::new()
         .recv_buffers(64, 65_536)
