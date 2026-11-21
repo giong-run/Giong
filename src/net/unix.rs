@@ -96,7 +96,7 @@ impl UnixStream {
     /// connection is left behind.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let addr = SockAddr::unix(path)?;
-        let inner = StreamSocket::connect(new_socket()?, addr).await?.unix();
+        let inner = StreamSocket::connect_new(new_socket, addr).await?.unix();
         Ok(Self { inner })
     }
 

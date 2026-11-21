@@ -32,7 +32,7 @@ io-uring = "0.7.2"
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.
 # `fuzzing` is set by cargo fuzz for the targets in fuzz/.
 # `kani` is set by the Kani model checker for the proofs (scripts/check.sh kani).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(giong_libkqueue)', 'cfg(loom)', 'cfg(fuzzing)', 'cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(giong_libkqueue)', 'cfg(giong_inject_enobufs)', 'cfg(loom)', 'cfg(fuzzing)', 'cfg(kani)'] }
 
 [profile.release]
 opt-level = 3

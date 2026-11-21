@@ -346,16 +346,34 @@ a claim the tests back.
 **Soak on macOS.** `.github/workflows/macos-soak.yml` runs the runtime
 and TLS soak tests (connection churn, cancellation, UDP, files, TLS
 handshakes and resumption) for 2 h on each runner, with every check the
-Linux soak makes, but a quarter of the clients (`GIONG_SOAK_CLIENTS`: 8
-per worker instead of 32, 4 instead of 16 for TLS). At the full load the
-macOS kernel ran out of buffers: it draws every socket buffer from one
-mbuf pool, the soak keeps a few hundred sockets holding unread data on
-purpose, and sends and connects then failed with `ENOBUFS` for 0.05-0.15%
-of connections (Linux makes the sender wait instead). Those runs had no
-hang and no leak (25 descriptors and 9 MB at the end of 102 million
-connections). A short TIME_WAIT (`net.inet.tcp.msl` 250 ms) keeps the
-churn from using up the ephemeral ports. Whether giong should wait and
-retry a send that fails with `ENOBUFS`, rather than report it, is open.
+Linux soak makes and the same load (`GIONG_SOAK_CLIENTS`: 32 per worker,
+16 for TLS). The first runs at that load found the macOS kernel out of
+buffers: it draws every socket buffer from one mbuf pool, the soak keeps a
+few hundred sockets holding unread data on purpose, and sends and connects
+then failed with `ENOBUFS` for 0.05-0.15% of connections, where Linux makes
+the sender wait. Those runs had no hang and no leak (25 descriptors and
+9 MB at the end of 102 million connections), and the soak ran a quarter of
+the clients until giong waited as well. A short TIME_WAIT
+(`net.inet.tcp.msl` 250 ms) keeps the churn from using up the ephemeral
+ports.
+
+**Waiting for network buffers.** On macOS a stream send (`send`,
+`sendmsg`, `sendfile`) or connect that gets `ENOBUFS` is tried again on a
+timer, since the socket stays writable and a readiness wait would spin:
+after 1 ms, then 2, 4, 8, 16 and every 32 ms, each step varied by up to a
+quarter, for at most 2 s (`driver/readiness/nobufs.rs`). The operation
+stays pending, so the worker runs its other tasks meanwhile, and a
+`time::timeout` or a dropped future ends the wait as it ends a readiness
+wait; `ENOBUFS` is all or nothing on a call, so nothing was sent. A
+connect the shortage broke after it began has a dead socket and starts
+over on a new one within the same 2 s (`StreamSocket::connect_new`). After
+2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`, kind
+`OutOfMemory`, the kernel's error as its source). A datagram send fails
+with E0028 at once. Rust's standard library, mio and Tokio return the
+kernel's `ENOBUFS` as it is. None of this is built on Linux; on macOS it
+costs one comparison per poll of an operation while nothing waits. Tests
+make the failures with a hook built only with `--cfg giong_inject_enobufs`
+(`tests/enobufs.rs`, on macOS CI and on Linux with epoll or libkqueue).
 
 **Speed on macOS.** `bench/core.sh` on the runners
 (`.github/workflows/macos-bench.yml`, 5 rounds, median wall time in ns per
