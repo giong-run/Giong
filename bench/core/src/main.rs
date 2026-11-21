@@ -8,7 +8,7 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn cpu_ns() -> u64 {
     // SAFETY: getrusage only writes into the struct we pass.
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
@@ -42,7 +42,7 @@ fn cpu_ns() -> u64 {
 }
 
 /// A yield that every runtime handles the same way: wake, then pending.
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn plain_yield() {
     let mut done = false;
     std::future::poll_fn(|cx| {

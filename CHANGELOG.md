@@ -8,6 +8,25 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- macOS support: a kqueue driver for the readiness loop (`DriverKind::Kqueue`, chosen by
+  default on macOS), with each worker woken through an `EVFILT_USER` event of its own
+  queue. The workers of a TCP port share one listening socket, bound without
+  `SO_REUSEPORT`, so no other process can take the port; UDP checks the port before the
+  first bind. Every socket has `SO_NOSIGPIPE`; streams are non-blocking from the start
+  (macOS waits in a send to a full socket even with `MSG_DONTWAIT`); UDP sockets that giong
+  binds take datagrams of every length UDP allows. `TlsConnector::with_system_roots` reads
+  the keychain's trust settings, `ResolverConfig::system` the resolver macOS writes to
+  `/etc/resolv.conf`, `Server::min_free_memory` the kernel's free and inactive pages, and
+  giong-mcp's process figures come from `proc_pidinfo`. The whole test suite passes on
+  macOS 15 and macOS 26 (Apple Silicon), as do ThreadSanitizer and the soak tests. What
+  still differs from Linux is listed in `docs/design/portability.md`
+  ([#173](https://github.com/giong-run/Giong/pull/173)).
+- The portability layer under the drivers (`src/sys/`, one `Poller` trait for epoll and
+  kqueue, a wake-up per driver), on which the macOS and Windows drivers are built; no
+  change on Linux ([#173](https://github.com/giong-run/Giong/pull/173)).
+
 ## [1.0.0] - 2026-11-21
 
 The first stable release. The code is that of 1.0.0-rc.1, unchanged: the API is frozen
