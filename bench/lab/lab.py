@@ -176,8 +176,10 @@ def loadgen(port, load_cpus, threads, args, duration, warmup, server=None):
         r["server_cpu_s"] = round(cpu["end"] - cpu["start"], 3)
         r["server_rss_kib"] = cpu["mem"].get("VmRSS")
         r["server_hwm_kib"] = cpu["mem"].get("VmHWM")
-        if r["requests"]:
-            r["cpu_us_per_req"] = round(r["server_cpu_s"] / r["requests"] * 1e6, 3)
+        # Every answer the server sent during the measurement, whenever its request fell due.
+        answered = r.get("goodput_rps", r["rps"]) * r["duration_s"]
+        if answered:
+            r["cpu_us_per_req"] = round(r["server_cpu_s"] / answered * 1e6, 3)
     return r
 
 
@@ -228,9 +230,13 @@ class Lab:
         with open(os.path.join(self.out, "raw", name), "w") as f:
             json.dump(r, f, indent=1)
         lat = r.get("latency", {})
+        if not lat.get("count") or scenario == "overload":
+            # No latency to show: nothing due in the measurement was answered, or (overload)
+            # the requests waited in the load generator, so their latency is its queue.
+            lat = {}
         row = {
             "scenario": scenario, "point": point, "runtime": rt, "round": rnd,
-            "rps": r.get("rps"), "p50_us": lat.get("p50_us"), "p99_us": lat.get("p99_us"),
+            "rps": r.get("rps"), "goodput_rps": r.get("goodput_rps"), "p50_us": lat.get("p50_us"), "p99_us": lat.get("p99_us"),
             "p999_us": lat.get("p999_us"), "max_us": lat.get("max_us"),
             "errors": r.get("errors"), "unfinished": r.get("unfinished"),
             "cpu_us_per_req": r.get("cpu_us_per_req"), "payload_mb_s": r.get("payload_mb_s"),
@@ -427,23 +433,26 @@ class Lab:
         metric_of = {
             "cores": [("rps", True), ("cpu_us_per_req", False)], "payload": [("payload_mb_s", True)],
             "conns": tail, "memory": [("kib_per_conn", False)], "mixed": tail,
-            "overload": [("rps", True), ("server_hwm_kib", False)], "loss": tail, "latency": tail,
+            "overload": [("goodput_rps", True), ("cpu_us_per_req", False), ("server_hwm_kib", False)], "loss": tail, "latency": tail,
             "soak": tail,
         }
-        cols = [("rps", "req/s"), ("p50_us", "p50 us"), ("p99_us", "p99 us"), ("p999_us", "p99.9 us"),
+        cols = [("rps", "req/s"), ("goodput_rps", "answers/s"), ("p50_us", "p50 us"), ("p99_us", "p99 us"), ("p999_us", "p99.9 us"),
                 ("cpu_us_per_req", "CPU us/req"), ("payload_mb_s", "payload MB/s"), ("kib_per_conn", "KiB/conn"),
                 ("server_hwm_kib", "peak KiB"), ("errors", "errors")]
         verdicts = []
         for scen, point in keys:
             sub = [r for r in rows if r["scenario"] == scen and r["point"] == point]
             rts = [rt for rt in self.a.runtimes if any(r["runtime"] == rt for r in sub)]
-            used = [c for c in cols if any(r[c[0]] not in ("", None) for r in sub)]
+            used = [c for c in cols if any(r.get(c[0]) not in ("", None) for r in sub)
+                    # Under overload only the answers count; elsewhere they equal req/s.
+                    and (c[0] != "goodput_rps" or scen == "overload")
+                    and not (c[0] == "rps" and scen == "overload")]
             stats = {rt: {c: med([r[c] for r in sub if r["runtime"] == rt]) for c, _ in used} for rt in rts}
             best = {}
             for c, _ in used:
                 vals = [(stats[rt][c][0], rt) for rt in rts if stats[rt][c]]
                 if vals:
-                    hi = c in ("rps", "payload_mb_s")
+                    hi = c in ("rps", "goodput_rps", "payload_mb_s")
                     if len({v for v, _ in vals}) == 1:
                         continue
                     best[c] = (max if hi else min)(vals)[1]

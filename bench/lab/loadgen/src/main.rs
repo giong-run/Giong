@@ -215,6 +215,8 @@ struct Totals {
     unfinished: u64,
     non_2xx: u64,
     bytes_in: u64,
+    /// Answers that arrived inside the measurement, whenever their request fell due.
+    answered: u64,
     hists: Vec<Hist>,
 }
 
@@ -503,6 +505,9 @@ impl Worker<'_> {
             self.sh.held.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if now >= self.sh.measure_from && now <= self.sh.measure_to {
+            self.t.answered += 1;
+        }
         if due >= self.sh.measure_from && now <= self.sh.measure_to {
             self.t.ok[c.req] += 1;
             self.t.hists[c.req].add(now.saturating_sub(due));
@@ -755,6 +760,7 @@ fn main() {
         total.unfinished += t.unfinished;
         total.non_2xx += t.non_2xx;
         total.bytes_in += t.bytes_in;
+        total.answered += t.answered;
     }
     let mut all = Hist::new();
     for h in &total.hists {
@@ -777,13 +783,14 @@ fn main() {
         })
         .collect();
     println!(
-        "{{\"conns\":{},\"threads\":{},\"rate\":{},\"duration_s\":{},\"requests\":{},\"rps\":{:.1},\"errors\":{},\"connect_errors\":{},\"unfinished\":{},\"non_2xx\":{},\"mb_in_per_s\":{:.2},\"latency\":{},\"paths\":[{}]}}",
+        "{{\"conns\":{},\"threads\":{},\"rate\":{},\"duration_s\":{},\"requests\":{},\"rps\":{:.1},\"goodput_rps\":{:.1},\"errors\":{},\"connect_errors\":{},\"unfinished\":{},\"non_2xx\":{},\"mb_in_per_s\":{:.2},\"latency\":{},\"paths\":[{}]}}",
         s.args.conns,
         s.args.threads,
         s.args.rate,
         secs,
         ok,
         ok as f64 / secs,
+        total.answered as f64 / secs,
         total.errors,
         total.connect_errors,
         total.unfinished,

@@ -35,12 +35,13 @@ indicative and decide on a bare-metal run.
 | mixed | 1 core at 4000 rps | p999_us | 3,383.3 | glommio 2,285.6 | 1.48 | behind |
 | mixed | 2 cores at 8000 rps | p99_us | 1,290.2 | tokio 780.3 | 1.65 | behind |
 | mixed | 2 cores at 8000 rps | p999_us | 2,859.0 | tokio 2,138.1 | 1.34 | behind |
-| overload | 1000 conns offered 600000 rps | rps | 41,666.2 | monoio 55,708.9 | 0.75 | behind |
-| overload | 1000 conns offered 600000 rps | server_hwm_kib | 12,180.0 | monoio 15,188.0 | 0.80 | ahead |
 | loss | 0.1% loss at 20000 rps | p99_us | 195,559.4 | tokio 191,365.1 | 1.02 | level |
 | loss | 0.1% loss at 20000 rps | p999_us | 328,204.3 | glommio 305,135.6 | 1.08 | behind |
 | loss | 1% loss at 20000 rps | p99_us | 2,084,569.1 | tokio 1,757,413.4 | 1.19 | behind |
 | loss | 1% loss at 20000 rps | p999_us | 3,414,163.5 | tokio 2,239,758.3 | 1.52 | behind |
+| overload | 1000 conns offered 600000 rps | goodput_rps | 147,892.0 | monoio 129,376.3 | 1.14 | ahead |
+| overload | 1000 conns offered 600000 rps | cpu_us_per_req | 6.7 | monoio 7.3 | 0.91 | ahead |
+| overload | 1000 conns offered 600000 rps | server_hwm_kib | 12,192.0 | monoio 15,208.0 | 0.80 | ahead |
 
 Higher is better for req/s and MB/s, lower for latency and memory.
 
@@ -216,22 +217,6 @@ Higher is better for req/s and MB/s, lower for latency and memory.
 - monoio: json p99 1585.2 us, p99.9 4374.5 us; json p99 1806.3 us, p99.9 8208.4 us; json p99 1601.5 us, p99.9 3924.0 us
 - glommio: json p99 1009.7 us, p99.9 4997.1 us; json p99 923.6 us, p99.9 1634.3 us; json p99 1241.1 us, p99.9 2842.6 us
 
-## overload: 1000 conns offered 600000 rps
-
-| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | peak KiB | errors |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| giong | 41,666 (33,034 to 44,429) | 7,432,307 (7,331,643 to 7,700,742) | 8,371,831 (8,304,722 to 8,506,048) | 8,371,831 (8,335,149 to 8,506,048) | 23.8 (22.3 to 30.0) | 12,180 (12,164 to 12,192) | 0.0 |
-| giong-epoll | 9,543 (7,779 to 14,312) | 8,539,603 (8,371,831 to 8,623,489) | 8,824,816 (8,757,707 to 8,889,171) | 8,861,368 (8,757,707 to 8,889,171) | 104 (69 to 128) | **11,732 (11,732 to 11,740)** | 0.0 |
-| tokio | 1,411 (247 to 1,544) | 8,539,603 (8,506,048 to 8,623,489) | 8,959,033 | 8,959,033 | 706 (641 to 4,016) | 16,068 (16,036 to 16,084) | 0.0 |
-| monoio | **55,709 (44,808 to 74,494)** | 7,197,426 (6,492,783 to 7,432,307) | 8,405,385 (8,069,841 to 8,573,157) | 8,506,048 (8,204,059 to 8,690,598) | **17.4 (13.0 to 21.4)** | 15,188 (15,188 to 15,204) | 0.0 |
-| glommio | 0.0 (0.0 to 10278.9) | **0.0 (0.0 to 8623489.0)** | **0.0 (0.0 to 8824815.6)** | **0.0 (0.0 to 8824815.6)** | 96.9 | 30,692 (30,680 to 30,752) | 0.0 |
-
-- giong: after: p99 212.5 us, p99.9 1013.8 us, errors 0; after: p99 349.2 us, p99.9 8683.5 us, errors 0; after: p99 255.5 us, p99.9 1052.7 us, errors 0
-- giong-epoll: after: p99 223.7 us, p99.9 636.9 us, errors 0; after: p99 367.6 us, p99.9 7749.6 us, errors 0; after: p99 229.9 us, p99.9 3432.4 us, errors 0
-- tokio: after: p99 203.3 us, p99.9 2170.9 us, errors 0; after: p99 229.9 us, p99.9 1544.2 us, errors 0; after: p99 420.9 us, p99.9 3448.8 us, errors 0
-- monoio: after: p99 293.9 us, p99.9 4538.4 us, errors 0; after: p99 277.5 us, p99.9 1691.6 us, errors 0; after: p99 470.0 us, p99.9 3072.0 us, errors 0
-- glommio: after: p99 388.1 us, p99.9 915.5 us, errors 0; after: p99 1005.6 us, p99.9 6340.6 us, errors 0; after: p99 731.1 us, p99.9 1658.9 us, errors 0
-
 ## loss: 0.1% loss at 20000 rps
 
 | runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | peak KiB | errors |
@@ -251,6 +236,22 @@ Higher is better for req/s and MB/s, lower for latency and memory.
 | tokio | 19,014 (18,957 to 19,072) | 264,765 (260,571 to 271,581) | **1,757,413 (1,715,470 to 1,992,294)** | **2,239,758 (2,206,204 to 2,692,743)** | 17.3 (16.3 to 17.5) | 4,296 (4,236 to 4,336) | 0.0 |
 | monoio | 18,862 (18,848 to 18,975) | 290,456 (275,776 to 290,456) | 2,042,626 (2,009,072 to 2,134,901) | 3,128,951 (2,558,525 to 3,464,495) | 20.1 (19.9 to 21.0) | 3,616 (3,604 to 3,620) | 0.0 |
 | glommio | **19,118 (18,958 to 19,186)** | 290,456 (277,873 to 298,844) | 2,101,346 (1,698,693 to 2,134,901) | 2,810,184 (2,059,403 to 2,860,515) | 27.4 (26.2 to 28.6) | 15,260 (15,172 to 15,280) | 0.0 |
+
+## overload: 1000 conns offered 600000 rps
+
+| runtime | answers/s | CPU us/req | peak KiB | errors |
+|---|---:|---:|---:|---:|
+| giong | **147,892 (143,853 to 148,682)** | **6.7 (6.7 to 6.9)** | 12,192 (12,176 to 12,208) | 0.0 |
+| giong-epoll | 118,104 (116,327 to 119,370) | 8.4 (8.3 to 8.5) | **11,780 (11,776 to 11,788)** | 0.0 |
+| tokio | 94,668 (94,294 to 94,732) | 10.5 (10.5 to 10.6) | 16,084 (16,084 to 16,096) | 0.0 |
+| monoio | 129,376 (118,291 to 159,835) | 7.3 (6.0 to 8.0) | 15,208 (15,188 to 15,228) | 0.0 |
+| glommio | 108,331 (90,299 to 128,041) | 9.2 (7.8 to 11.0) | 30,648 (30,632 to 30,760) | 0.0 |
+
+- giong: after: p99 209.4 us, p99.9 1126.4 us, errors 0; after: p99 254.5 us, p99.9 2662.4 us, errors 0; after: p99 682.0 us, p99.9 8945.7 us, errors 0
+- giong-epoll: after: p99 228.9 us, p99.9 2383.9 us, errors 0; after: p99 519.2 us, p99.9 16547.8 us, errors 0; after: p99 263.2 us, p99.9 3432.4 us, errors 0
+- tokio: after: p99 243.2 us, p99.9 2002.9 us, errors 0; after: p99 224.8 us, p99.9 1863.7 us, errors 0; after: p99 355.3 us, p99.9 13467.6 us, errors 0
+- monoio: after: p99 239.1 us, p99.9 1781.8 us, errors 0; after: p99 253.4 us, p99.9 2367.5 us, errors 0; after: p99 304.1 us, p99.9 5062.7 us, errors 0
+- glommio: after: p99 3727.4 us, p99.9 72089.6 us, errors 0; after: p99 302.1 us, p99.9 2826.2 us, errors 0; after: p99 453.6 us, p99.9 3104.8 us, errors 0
 
 ## The matrix
 

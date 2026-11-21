@@ -3,42 +3,43 @@
  "threads": 3,
  "rate": 600000,
  "duration_s": 9,
- "requests": 12698,
- "rps": 1410.9,
+ "requests": 5530,
+ "rps": 614.4,
+ "goodput_rps": 94667.9,
  "errors": 0,
  "connect_errors": 0,
- "unfinished": 179,
+ "unfinished": 101,
  "non_2xx": 0,
- "mb_in_per_s": 13.53,
+ "mb_in_per_s": 13.02,
  "latency": {
-  "count": 12698,
-  "p50_us": 8539602.9,
+  "count": 5530,
+  "p50_us": 8623489.0,
   "p90_us": 8891924.5,
   "p99_us": 8959033.3,
   "p999_us": 8959033.3,
-  "p9999_us": 8995310.1,
-  "max_us": 8995310.1
+  "p9999_us": 8993709.9,
+  "max_us": 8993709.9
  },
  "paths": [
   {
    "path": "/json",
-   "requests": 12698,
+   "requests": 5530,
    "latency": {
-    "count": 12698,
-    "p50_us": 8539602.9,
+    "count": 5530,
+    "p50_us": 8623489.0,
     "p90_us": 8891924.5,
     "p99_us": 8959033.3,
     "p999_us": 8959033.3,
-    "p9999_us": 8995310.1,
-    "max_us": 8995310.1
+    "p9999_us": 8993709.9,
+    "max_us": 8993709.9
    }
   }
  ],
- "server_cpu_s": 8.96,
- "server_rss_kib": 16068,
- "server_hwm_kib": 16068,
- "cpu_us_per_req": 705.623,
- "extra": "after: p99 229.9 us, p99.9 1544.2 us, errors 0",
+ "server_cpu_s": 8.95,
+ "server_rss_kib": 16084,
+ "server_hwm_kib": 16084,
+ "cpu_us_per_req": 10.505,
+ "extra": "after: p99 224.8 us, p99.9 1863.7 us, errors 0",
  "recovery": {
   "conns": 100,
   "threads": 3,
@@ -46,6 +47,7 @@
   "duration_s": 6,
   "requests": 120000,
   "rps": 20000.0,
+  "goodput_rps": 20000.0,
   "errors": 0,
   "connect_errors": 0,
   "unfinished": 0,
@@ -53,12 +55,12 @@
   "mb_in_per_s": 2.66,
   "latency": {
    "count": 120000,
-   "p50_us": 64.9,
-   "p90_us": 105.2,
-   "p99_us": 229.9,
-   "p999_us": 1544.2,
-   "p9999_us": 3924.0,
-   "max_us": 5350.6
+   "p50_us": 65.8,
+   "p90_us": 109.3,
+   "p99_us": 224.8,
+   "p999_us": 1863.7,
+   "p9999_us": 5161.0,
+   "max_us": 6750.9
   },
   "paths": [
    {
@@ -66,18 +68,18 @@
     "requests": 120000,
     "latency": {
      "count": 120000,
-     "p50_us": 64.9,
-     "p90_us": 105.2,
-     "p99_us": 229.9,
-     "p999_us": 1544.2,
-     "p9999_us": 3924.0,
-     "max_us": 5350.6
+     "p50_us": 65.8,
+     "p90_us": 109.3,
+     "p99_us": 224.8,
+     "p999_us": 1863.7,
+     "p9999_us": 5161.0,
+     "max_us": 6750.9
     }
    }
   ],
-  "server_cpu_s": 1.67,
-  "server_rss_kib": 4572,
-  "server_hwm_kib": 15900,
-  "cpu_us_per_req": 13.917
+  "server_cpu_s": 1.72,
+  "server_rss_kib": 6108,
+  "server_hwm_kib": 15920,
+  "cpu_us_per_req": 14.333
  }
 }

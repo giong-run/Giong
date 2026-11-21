@@ -44,7 +44,7 @@ The lab needs `cargo`, `python3` and `taskset`. The `loss` scenario needs root, 
 | | | 30k, 100k | needs 2N file descriptors |
 | payload | closed loop, 16 connections: payload MB/s | answers of 1, 16, 64, 1024 KB; uploads of 1, 64, 1024 KB | cloud VM |
 | mixed | open loop, 1 request in 20 computes for ~1 ms (`/compute?n=27`): latency of the short `/json` requests | 1, 2 cores | cloud VM |
-| overload | 1,000 connections offered 600,000 req/s: goodput, errors, peak memory; then 20,000 req/s again: did latency recover? | 1 core | cloud VM |
+| overload | 1,000 connections offered 600,000 req/s: answers per second, CPU µs per answer, errors, peak memory; then 20,000 req/s again: did latency recover? | 1 core | cloud VM |
 | loss | open loop at 20,000 req/s with 0.1% and 1% of packets dropped both ways (iptables) | | root |
 | latency | delay of 1 ms ± 0.5 ms, and Pareto spikes (tc netem) | | needs sch_netem (not on the cloud VM) |
 | soak | hours at steady load: memory and latency drift | | `--only soak`, on a dedicated machine |
@@ -56,4 +56,4 @@ When a machine cannot run a row (too few CPUs, too few file descriptors, or no n
 - Throughput rows are closed loop. On a small machine the load generator can be what limits throughput; CPU µs per request then says what a request costs the server, whatever load was offered.
 - **On a shared cloud VM, the tail (p99.9) moves by several times between rounds**, because one stall of the VM lands there. Treat tail rows from a cloud VM as indicative, and decide on a bare-metal run.
 - The `mixed` row is where the scheduling designs differ most. With work stealing (Tokio), a short request can move to another core while a long one computes. With thread-per-core (giong, Monoio, Glommio), a short request waits behind the long one on its core.
-- In `overload`, goodput above the recovery rate means the server answered more than it was later asked for. Look at the peak memory and the recovery latency to see whether it held up.
+- In `overload`, each connection carries one request at a time, so the server holds at most 1,000 requests and the rest queue in the load generator. Latency there would only measure that queue, so the row shows answers per second (every answer sent during the measurement, whenever its request fell due), CPU per answer and peak memory. The recovery run that follows says whether the server's latency came back. Overloading the server's own queues (more connections than it can serve, connection floods) needs more file descriptors than the cloud VM allows and belongs on bare metal.

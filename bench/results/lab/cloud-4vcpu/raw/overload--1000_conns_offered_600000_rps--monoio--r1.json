@@ -3,42 +3,43 @@
  "threads": 3,
  "rate": 600000,
  "duration_s": 9,
- "requests": 403268,
- "rps": 44807.6,
+ "requests": 145858,
+ "rps": 16206.4,
+ "goodput_rps": 129376.3,
  "errors": 0,
  "connect_errors": 0,
- "unfinished": 1000,
+ "unfinished": 805,
  "non_2xx": 0,
- "mb_in_per_s": 20.31,
+ "mb_in_per_s": 16.93,
  "latency": {
-  "count": 403268,
-  "p50_us": 7432306.7,
-  "p90_us": 8204058.6,
-  "p99_us": 8573157.4,
-  "p999_us": 8690597.9,
-  "p9999_us": 8690597.9,
-  "max_us": 8712371.7
+  "count": 145858,
+  "p50_us": 8002732.0,
+  "p90_us": 8573157.4,
+  "p99_us": 8891924.5,
+  "p999_us": 8959033.3,
+  "p9999_us": 8959033.3,
+  "max_us": 8994258.2
  },
  "paths": [
   {
    "path": "/json",
-   "requests": 403268,
+   "requests": 145858,
    "latency": {
-    "count": 403268,
-    "p50_us": 7432306.7,
-    "p90_us": 8204058.6,
-    "p99_us": 8573157.4,
-    "p999_us": 8690597.9,
-    "p9999_us": 8690597.9,
-    "max_us": 8712371.7
+    "count": 145858,
+    "p50_us": 8002732.0,
+    "p90_us": 8573157.4,
+    "p99_us": 8891924.5,
+    "p999_us": 8959033.3,
+    "p9999_us": 8959033.3,
+    "max_us": 8994258.2
    }
   }
  ],
- "server_cpu_s": 8.62,
- "server_rss_kib": 15188,
- "server_hwm_kib": 15188,
- "cpu_us_per_req": 21.375,
- "extra": "after: p99 293.9 us, p99.9 4538.4 us, errors 0",
+ "server_cpu_s": 8.54,
+ "server_rss_kib": 15208,
+ "server_hwm_kib": 15208,
+ "cpu_us_per_req": 7.334,
+ "extra": "after: p99 239.1 us, p99.9 1781.8 us, errors 0",
  "recovery": {
   "conns": 100,
   "threads": 3,
@@ -46,6 +47,7 @@
   "duration_s": 6,
   "requests": 120000,
   "rps": 20000.0,
+  "goodput_rps": 20000.2,
   "errors": 0,
   "connect_errors": 0,
   "unfinished": 0,
@@ -53,12 +55,12 @@
   "mb_in_per_s": 2.66,
   "latency": {
    "count": 120000,
-   "p50_us": 78.6,
-   "p90_us": 138.8,
-   "p99_us": 293.9,
-   "p999_us": 4538.4,
-   "p9999_us": 10780.7,
-   "max_us": 12491.1
+   "p50_us": 73.5,
+   "p90_us": 126.7,
+   "p99_us": 239.1,
+   "p999_us": 1781.8,
+   "p9999_us": 3006.5,
+   "max_us": 3625.7
   },
   "paths": [
    {
@@ -66,18 +68,18 @@
     "requests": 120000,
     "latency": {
      "count": 120000,
-     "p50_us": 78.6,
-     "p90_us": 138.8,
-     "p99_us": 293.9,
-     "p999_us": 4538.4,
-     "p9999_us": 10780.7,
-     "max_us": 12491.1
+     "p50_us": 73.5,
+     "p90_us": 126.7,
+     "p99_us": 239.1,
+     "p999_us": 1781.8,
+     "p9999_us": 3006.5,
+     "max_us": 3625.7
     }
    }
   ],
-  "server_cpu_s": 2.26,
-  "server_rss_kib": 6000,
-  "server_hwm_kib": 15416,
-  "cpu_us_per_req": 18.833
+  "server_cpu_s": 2.13,
+  "server_rss_kib": 6692,
+  "server_hwm_kib": 15360,
+  "cpu_us_per_req": 17.75
  }
 }

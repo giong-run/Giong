@@ -3,81 +3,83 @@
  "threads": 3,
  "rate": 600000,
  "duration_s": 9,
- "requests": 670445,
- "rps": 74493.9,
+ "requests": 403855,
+ "rps": 44872.8,
+ "goodput_rps": 159835.1,
  "errors": 0,
  "connect_errors": 0,
  "unfinished": 1000,
  "non_2xx": 0,
- "mb_in_per_s": 23.69,
+ "mb_in_per_s": 20.32,
  "latency": {
-  "count": 670445,
-  "p50_us": 6492782.6,
-  "p90_us": 7600078.8,
-  "p99_us": 8069840.9,
-  "p999_us": 8204058.6,
-  "p9999_us": 8271167.5,
-  "max_us": 8277641.7
+  "count": 403855,
+  "p50_us": 7432306.7,
+  "p90_us": 8204058.6,
+  "p99_us": 8573157.4,
+  "p999_us": 8690597.9,
+  "p9999_us": 8690597.9,
+  "max_us": 8714068.3
  },
  "paths": [
   {
    "path": "/json",
-   "requests": 670445,
+   "requests": 403855,
    "latency": {
-    "count": 670445,
-    "p50_us": 6492782.6,
-    "p90_us": 7600078.8,
-    "p99_us": 8069840.9,
-    "p999_us": 8204058.6,
-    "p9999_us": 8271167.5,
-    "max_us": 8277641.7
+    "count": 403855,
+    "p50_us": 7432306.7,
+    "p90_us": 8204058.6,
+    "p99_us": 8573157.4,
+    "p999_us": 8690597.9,
+    "p9999_us": 8690597.9,
+    "max_us": 8714068.3
    }
   }
  ],
- "server_cpu_s": 8.69,
- "server_rss_kib": 15204,
- "server_hwm_kib": 15204,
- "cpu_us_per_req": 12.962,
- "extra": "after: p99 470.0 us, p99.9 3072.0 us, errors 0",
+ "server_cpu_s": 8.68,
+ "server_rss_kib": 15228,
+ "server_hwm_kib": 15228,
+ "cpu_us_per_req": 6.034,
+ "extra": "after: p99 304.1 us, p99.9 5062.7 us, errors 0",
  "recovery": {
   "conns": 100,
   "threads": 3,
   "rate": 20000,
   "duration_s": 6,
-  "requests": 119999,
-  "rps": 19999.8,
+  "requests": 120000,
+  "rps": 20000.0,
+  "goodput_rps": 20000.0,
   "errors": 0,
   "connect_errors": 0,
   "unfinished": 0,
   "non_2xx": 0,
   "mb_in_per_s": 2.66,
   "latency": {
-   "count": 119999,
-   "p50_us": 77.6,
-   "p90_us": 132.6,
-   "p99_us": 470.0,
-   "p999_us": 3072.0,
-   "p9999_us": 4472.8,
-   "max_us": 5089.0
+   "count": 120000,
+   "p50_us": 71.4,
+   "p90_us": 126.7,
+   "p99_us": 304.1,
+   "p999_us": 5062.7,
+   "p9999_us": 8618.0,
+   "max_us": 10586.5
   },
   "paths": [
    {
     "path": "/json",
-    "requests": 119999,
+    "requests": 120000,
     "latency": {
-     "count": 119999,
-     "p50_us": 77.6,
-     "p90_us": 132.6,
-     "p99_us": 470.0,
-     "p999_us": 3072.0,
-     "p9999_us": 4472.8,
-     "max_us": 5089.0
+     "count": 120000,
+     "p50_us": 71.4,
+     "p90_us": 126.7,
+     "p99_us": 304.1,
+     "p999_us": 5062.7,
+     "p9999_us": 8618.0,
+     "max_us": 10586.5
     }
    }
   ],
-  "server_cpu_s": 2.13,
-  "server_rss_kib": 13168,
-  "server_hwm_kib": 15160,
-  "cpu_us_per_req": 17.75
+  "server_cpu_s": 2.08,
+  "server_rss_kib": 11632,
+  "server_hwm_kib": 15312,
+  "cpu_us_per_req": 17.333
  }
 }
