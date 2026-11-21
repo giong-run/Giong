@@ -1,0 +1,60 @@
+main  1048576 rps 3020.2 p99 10321.9 cpu_us 325.79 non2xx 0
+branch  1048576 rps 7240.0 p99 3760.1 cpu_us 135.99 non2xx 0
+main  262144 rps 12163.0 p99 2285.6 cpu_us 81.51 non2xx 0
+branch  262144 rps 20700.4 p99 1085.4 cpu_us 47.82 non2xx 0
+main  65536 rps 40922.4 p99 817.2 cpu_us 24.19 non2xx 0
+branch  65536 rps 46121.4 p99 504.8 cpu_us 21.57 non2xx 0
+main  4096 rps 111598.8 p99 300.0 cpu_us 8.87 non2xx 0
+branch  4096 rps 104863.0 p99 328.7 cpu_us 9.36 non2xx 0
+main  json rps 136566.8 p99 935.9 cpu_us 7.22 non2xx 0
+branch  json rps 130783.4 p99 944.1 cpu_us 7.57 non2xx 0
+main GIONG_DRIVER=epoll 1048576 rps 3460.0 p99 6373.4 cpu_us 286.34 non2xx 0
+branch GIONG_DRIVER=epoll 1048576 rps 7621.6 p99 3809.3 cpu_us 130.06 non2xx 0
+main GIONG_DRIVER=epoll 262144 rps 17061.6 p99 1585.2 cpu_us 57.62 non2xx 0
+branch GIONG_DRIVER=epoll 262144 rps 26753.0 p99 1046.5 cpu_us 37.0 non2xx 0
+main GIONG_DRIVER=epoll 65536 rps 40630.0 p99 596.0 cpu_us 24.45 non2xx 0
+branch GIONG_DRIVER=epoll 65536 rps 48928.8 p99 455.7 cpu_us 20.33 non2xx 0
+main GIONG_DRIVER=epoll 4096 rps 81860.8 p99 394.2 cpu_us 12.13 non2xx 0
+branch GIONG_DRIVER=epoll 4096 rps 81182.2 p99 322.6 cpu_us 12.21 non2xx 0
+main GIONG_DRIVER=epoll json rps 102487.2 p99 1159.2 cpu_us 9.43 non2xx 0
+branch GIONG_DRIVER=epoll json rps 107586.2 p99 989.2 cpu_us 9.23 non2xx 0
+main  1048576 rps 2928.8 p99 10190.8 cpu_us 338.79 non2xx 0
+branch  1048576 rps 7414.8 p99 3956.7 cpu_us 133.01 non2xx 0
+main  262144 rps 12174.0 p99 2383.9 cpu_us 81.16 non2xx 0
+branch  262144 rps 20153.8 p99 1388.5 cpu_us 49.36 non2xx 0
+main  65536 rps 41111.8 p99 813.1 cpu_us 24.08 non2xx 0
+branch  65536 rps 50318.8 p99 455.7 cpu_us 19.74 non2xx 0
+main  4096 rps 116516.0 p99 265.2 cpu_us 8.53 non2xx 0
+branch  4096 rps 110399.4 p99 281.6 cpu_us 8.98 non2xx 0
+main  json rps 143167.0 p99 907.3 cpu_us 6.9 non2xx 0
+branch  json rps 158560.0 p99 829.4 cpu_us 6.25 non2xx 0
+main GIONG_DRIVER=epoll 1048576 rps 3771.4 p99 5619.7 cpu_us 264.49 non2xx 0
+branch GIONG_DRIVER=epoll 1048576 rps 7551.8 p99 3989.5 cpu_us 131.48 non2xx 0
+main GIONG_DRIVER=epoll 262144 rps 16454.6 p99 1306.6 cpu_us 60.36 non2xx 0
+branch GIONG_DRIVER=epoll 262144 rps 24987.2 p99 911.4 cpu_us 39.88 non2xx 0
+main GIONG_DRIVER=epoll 65536 rps 41485.4 p99 571.4 cpu_us 24.02 non2xx 0
+branch GIONG_DRIVER=epoll 65536 rps 48431.8 p99 492.5 cpu_us 20.44 non2xx 0
+main GIONG_DRIVER=epoll 4096 rps 89668.8 p99 279.6 cpu_us 11.1 non2xx 0
+branch GIONG_DRIVER=epoll 4096 rps 80857.6 p99 326.7 cpu_us 12.28 non2xx 0
+main GIONG_DRIVER=epoll json rps 104676.4 p99 1034.2 cpu_us 9.44 non2xx 0
+branch GIONG_DRIVER=epoll json rps 107457.0 p99 1042.4 cpu_us 9.21 non2xx 0
+main  1048576 rps 3046.6 p99 9601.0 cpu_us 325.16 non2xx 0
+branch  1048576 rps 7418.4 p99 3448.8 cpu_us 133.17 non2xx 0
+main  262144 rps 13071.0 p99 2105.3 cpu_us 75.21 non2xx 0
+branch  262144 rps 21152.2 p99 1437.7 cpu_us 46.72 non2xx 0
+main  65536 rps 41495.8 p99 776.2 cpu_us 23.82 non2xx 0
+branch  65536 rps 49014.4 p99 616.4 cpu_us 20.03 non2xx 0
+main  4096 rps 108461.0 p99 328.7 cpu_us 9.13 non2xx 0
+branch  4096 rps 111519.0 p99 291.8 cpu_us 8.86 non2xx 0
+main  json rps 137272.0 p99 882.7 cpu_us 7.2 non2xx 0
+branch  json rps 136431.0 p99 956.4 cpu_us 7.22 non2xx 0
+main GIONG_DRIVER=epoll 1048576 rps 3698.4 p99 7553.0 cpu_us 267.9 non2xx 0
+branch GIONG_DRIVER=epoll 1048576 rps 7647.0 p99 3694.6 cpu_us 129.19 non2xx 0
+main GIONG_DRIVER=epoll 262144 rps 17283.6 p99 1298.4 cpu_us 57.56 non2xx 0
+branch GIONG_DRIVER=epoll 262144 rps 26196.8 p99 923.6 cpu_us 37.79 non2xx 0
+main GIONG_DRIVER=epoll 65536 rps 41061.2 p99 596.0 cpu_us 24.11 non2xx 0
+branch GIONG_DRIVER=epoll 65536 rps 46708.6 p99 517.1 cpu_us 21.27 non2xx 0
+main GIONG_DRIVER=epoll 4096 rps 80471.4 p99 412.7 cpu_us 12.28 non2xx 0
+branch GIONG_DRIVER=epoll 4096 rps 83586.6 p99 312.3 cpu_us 11.88 non2xx 0
+main GIONG_DRIVER=epoll json rps 104160.6 p99 1101.8 cpu_us 9.5 non2xx 0
+branch GIONG_DRIVER=epoll json rps 103117.8 p99 1191.9 cpu_us 9.55 non2xx 0

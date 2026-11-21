@@ -31,6 +31,11 @@ const FLUSH_AT: usize = 64 * 1024;
 /// A body at least this large is not copied after its head: the two go out
 /// in one vectored write instead (see `Transport::write_all_with_body`).
 const SEPARATE_BODY_AT: usize = 32 * 1024;
+
+/// The rest of a request body of at least this many bytes is received
+/// straight into the read buffer (`Transport::recv_into`), not copied out of
+/// the runtime's receive buffers.
+const RECV_INTO_AT: usize = 64 * 1024;
 /// After an error response, how long the connection keeps discarding input so
 /// that the client can read the response instead of getting a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
@@ -192,6 +197,28 @@ pub trait Transport: 'static {
     /// while the server can still read what it sends.
     fn close_write(&self) -> impl Future<Output = ()>;
 
+    /// Receives into the free capacity at the end of `buf` and hands it back
+    /// with the number of bytes added; `Ok(0)` is the end of the stream. The
+    /// server uses it for the rest of a large request body, whose size it
+    /// knows. Not part of the API: it may change in any release.
+    ///
+    /// The default appends what [`recv`](Self::recv) returns.
+    /// [`TcpStream`] and [`UnixStream`] receive straight into `buf`,
+    /// without copying the body out of the runtime's receive buffers.
+    #[doc(hidden)]
+    fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
+        async move {
+            let mut buf = buf;
+            match self.recv().await {
+                Ok(chunk) => {
+                    buf.extend_from_slice(&chunk);
+                    (Ok(chunk.len()), buf)
+                }
+                Err(e) => (Err(e), buf),
+            }
+        }
+    }
+
     /// The address of the remote end, if the transport has one. Handlers see
     /// it as [`Request::peer_addr`]. The default is `None`.
     fn peer_addr(&self) -> Option<SocketAddr> {
@@ -208,6 +235,10 @@ impl Transport for TcpStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         TcpStream::write_all(self, buf)
+    }
+
+    fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
+        TcpStream::recv_into(self, buf)
     }
 
     async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
@@ -248,6 +279,10 @@ impl Transport for UnixStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         UnixStream::write_all(self, buf)
+    }
+
+    fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
+        UnixStream::recv_into(self, buf)
     }
 
     async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
@@ -1181,6 +1216,10 @@ struct Conn<T> {
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
+    /// While a large body is awaited: how many bytes from `pos` the read
+    /// buffer must hold, received straight into it by `read_more`. Zero
+    /// otherwise. (A `u32` that fits beside the flags.)
+    body_into: u32,
     /// What the unparsed data and the body being decoded hold against the
     /// worker's budget for requests (see `budget`).
     charge: Charge,
@@ -1204,6 +1243,7 @@ impl<T: Transport> Conn<T> {
             closing: false,
             deadline: None,
             first: true,
+            body_into: 0,
             charge: Charge::none(),
             _slot: slot,
         }
@@ -1689,10 +1729,14 @@ impl<T: Transport> Conn<T> {
             // Refused before the body is read (and before `100 Continue`)
             // if it cannot fit in the worker's budget.
             self.admit(head.len + len)?;
+            if len >= RECV_INTO_AT {
+                self.body_into = u32::try_from(head.len + len).unwrap_or(0);
+            }
             while self.buf.len() - self.pos - head.len < len {
                 self.send_continue(&head, &mut interim_sent);
                 self.read_more(false).await?;
             }
+            self.body_into = 0;
             let start = self.pos + head.len;
             (BodyBytes::InBuffer(start..start + len), head.len + len)
         };
@@ -1721,6 +1765,42 @@ impl<T: Transport> Conn<T> {
         Ok((req, None))
     }
 
+    /// Receives until the read buffer holds `want` bytes from `pos` (a
+    /// request with a large body), straight into the buffer: the body is not
+    /// copied out of the runtime's receive buffers. Leaves the buffer as it
+    /// is if a handler still holds a request in it; the caller's usual loop
+    /// then receives the rest.
+    async fn recv_body_into(&mut self, want: usize) -> Result<(), End> {
+        let Some(buf) = Rc::get_mut(&mut self.buf) else {
+            return Ok(());
+        };
+        if self.pos > 0 {
+            buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        buf.reserve(want.saturating_sub(buf.len()));
+        let mut buf = mem::take(buf);
+        let request_timeout = self.cfg.request_timeout;
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + request_timeout);
+        while buf.len() < want {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (res, back) = match timeout(left, self.stream.recv_into(buf)).await {
+                Ok(received) => received,
+                Err(_) => return Err(End::Status(408)),
+            };
+            buf = back;
+            match res {
+                Ok(n) if n > 0 => {}
+                // Closed by the peer, or an I/O error.
+                _ => return Err(End::Close),
+            }
+        }
+        *Rc::get_mut(&mut self.buf).expect("the read buffer is not shared") = buf;
+        self.account(0)
+    }
+
     /// Answers `Expect: 100-continue` once, before waiting for the body.
     fn send_continue(&mut self, head: &crate::parse::Head, sent: &mut bool) {
         if head.expect_continue && head.minor == 1 && !*sent {
@@ -1740,6 +1820,11 @@ impl<T: Transport> Conn<T> {
             self.release_read_buffer();
         }
         self.flush().await?;
+        if self.body_into > 0 && Rc::get_mut(&mut self.buf).is_some() {
+            // Boxed, so that it adds nothing to the state every waiting
+            // connection keeps.
+            return Box::pin(self.recv_body_into(self.body_into as usize)).await;
+        }
         let received = if idle {
             if self.closing {
                 return Err(End::Close);

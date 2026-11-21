@@ -893,7 +893,7 @@ impl Epoll {
             _ => panic!("giong: polling an invalid multishot operation"),
         };
         let (fd, hdr) = match io {
-            MultiIo::Accept { fd } | MultiIo::Recv { fd } => (fd, None),
+            MultiIo::Accept { fd } | MultiIo::Recv { fd, .. } => (fd, None),
             MultiIo::RecvMsg { fd, hdr } => (fd, Some(hdr)),
         };
         if let Some(hdr) = hdr {

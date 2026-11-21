@@ -8,6 +8,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Changed
+
+- **giong-http**: a request body of 64 KiB or more is received straight into the request
+  buffer, instead of being copied there out of the runtime's receive buffers. Uploads of
+  1 MiB are 2.1 to 2.5 times as fast and use 51 to 59% less CPU, on both drivers
+  (`bench/results/upload-recv-into/`). Memory per idle connection and small requests are
+  unchanged.
+
 ## [1.0.0] - 2026-11-21
 
 The first stable release. The code is that of 1.0.0-rc.1, unchanged: the API is frozen
