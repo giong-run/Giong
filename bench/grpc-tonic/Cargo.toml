@@ -1,0 +1,25 @@
+# tonic for bench/grpc.sh: the server giong-grpc's is compared with, and
+# the load generator, which loads both servers and measures tonic's client.
+[package]
+name = "bench-grpc-tonic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protox = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

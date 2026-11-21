@@ -22,6 +22,7 @@ use super::h2::{check_field, Decoded, Request, ResponseHead, StreamError};
 use crate::h2::hpack::Index;
 use crate::h3::frame::{self, kind, Code, Header, Need, On, Settings, StreamType};
 use crate::h3::qpack::{self, Encoder};
+use crate::trailers::Trailers;
 
 /// The largest SETTINGS frame read. HTTP/3 defines three settings.
 const MAX_SETTINGS_FRAME: u64 = 4 * 1024;
@@ -179,6 +180,7 @@ impl Connection {
             received: 0,
             received_any: false,
             trailers: false,
+            trailer_fields: None,
             done: false,
             early,
         };
@@ -401,6 +403,8 @@ pub(crate) struct Stream {
     received_any: bool,
     /// The trailers were read: only the end of the stream may follow.
     trailers: bool,
+    /// The trailer fields the response ended with, if any.
+    trailer_fields: Option<Box<Trailers>>,
     /// The response ended and was read, or failed.
     done: bool,
     /// The stream was opened before the handshake ended, so the request
@@ -568,6 +572,12 @@ impl Stream {
 
     /// The length of the body, when known: none for a `HEAD` request or
     /// a `204` or `304` answer, otherwise what `content-length` says.
+    /// The trailer fields the response ended with: there once the body
+    /// has been read to its end, if the server sent any.
+    pub(crate) fn trailers(&self) -> Option<&Trailers> {
+        self.trailer_fields.as_deref()
+    }
+
     pub(crate) fn body_length(&self) -> Option<u64> {
         if self.bodiless() {
             Some(0)
@@ -634,12 +644,19 @@ impl Stream {
                 }
                 kind::DATA => self.left = header.len,
                 kind::HEADERS => {
-                    // Trailers: checked, and not given out.
                     let d = self.fields(header.len).await?;
                     if d.status.is_some() {
                         return Err(self.malformed("trailers with a :status"));
                     }
                     self.trailers = true;
+                    let mut trailers = Trailers::new();
+                    for (name, value) in &d.fields {
+                        // Checked when the block was decoded.
+                        trailers.received(&d.bytes[name.clone()], &d.bytes[value.clone()]);
+                    }
+                    if !trailers.is_empty() {
+                        self.trailer_fields = Some(Box::new(trailers));
+                    }
                 }
                 _ => {
                     if let Err(fail) = self.r.skip(header.len).await {

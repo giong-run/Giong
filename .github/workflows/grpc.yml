@@ -1,0 +1,48 @@
+name: gRPC
+
+# giong-grpc against grpc-go, both directions, with the test cases of gRPC's
+# interoperability specification, and grpcurl through reflection
+# (giong-grpc/interop/run.sh). The crate's own tests, clippy, docs and MSRV
+# run in CI with the rest of the workspace.
+
+on:
+  pull_request:
+    paths:
+      - "giong-grpc/**"
+      - "giong-grpc-build/**"
+      - "giong-proto/**"
+      - "giong-http/**"
+      - "src/**"
+      - ".github/workflows/grpc.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: grpc-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  GRPC_GO: v1.75.1
+  GRPCURL: v1.9.3
+
+jobs:
+  interop:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # The runner image ships Go; the script needs 1.24 or later.
+      - run: go version
+      # grpc-go's interop programs and grpcurl change only with their tags.
+      - name: Restore the grpc-go programs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target/grpc-interop/bin
+          key: grpc-interop-${{ env.GRPC_GO }}-${{ env.GRPCURL }}-ubuntu-24.04
+      - name: Run the interoperability cases
+        run: giong-grpc/interop/run.sh

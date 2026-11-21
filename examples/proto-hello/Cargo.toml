@@ -1,0 +1,13 @@
+[package]
+name = "proto-hello"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+description = "giong-proto and giong-grpc-build in one small program: build a message, encode it, decode it as a view"
+
+[dependencies]
+giong-proto = { path = "../../giong-proto" }
+
+[build-dependencies]
+giong-grpc-build = { path = "../../giong-grpc-build" }

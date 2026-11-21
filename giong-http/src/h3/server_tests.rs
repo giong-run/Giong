@@ -103,13 +103,36 @@ impl Handler for App {
                 giong::time::sleep(std::time::Duration::from_millis(200)).await;
                 Response::text("slept")
             }
+            "/trailers" => {
+                // Reads the body, then answers with its size, the trailers
+                // it came with echoed in trailers of the response.
+                let body = req.body_stream().expect("a streamed body");
+                let mut len = 0;
+                while let Some(piece) = body.chunk().await.unwrap() {
+                    len += piece.len();
+                }
+                let mut trailers = crate::Trailers::new()
+                    .field("x-size", len.to_string())
+                    .unwrap();
+                if let Some(sent) = body.trailers() {
+                    for (name, value) in sent.iter() {
+                        trailers = trailers.field(&format!("x-echo-{name}"), value).unwrap();
+                    }
+                }
+                let (tx, out) = Body::channel();
+                drop(giong::spawn(async move {
+                    tx.send(format!("{len} bytes")).await.unwrap();
+                    tx.send_trailers(trailers).unwrap();
+                }));
+                Response::new(200).body(out)
+            }
             "/panic" => panic!("the handler panics on purpose"),
             _ => Response::new(404),
         }
     }
 
     fn stream_body(&self, req: &Request) -> Option<u64> {
-        (req.path() == "/upload").then_some(1 << 20)
+        matches!(req.path(), "/upload" | "/trailers").then_some(1 << 20)
     }
 }
 
@@ -378,6 +401,32 @@ fn bodies_are_received_whole_or_as_a_stream() {
         let reply = parse(&recv.read_to_end(1 << 20).await.unwrap());
         assert_eq!(reply.status(), 413);
         drop(send);
+    });
+}
+
+#[test]
+fn trailers_travel_both_ways_after_streamed_bodies() {
+    run(|| async {
+        let client = connect().await;
+        let mut request = post("/trailers", &[]);
+        request.extend(data(b"one"));
+        request.extend(data(&[b'z'; 70_000]));
+        request.extend(headers(&[("x-checksum", "abc"), ("x-other", "1")]));
+        let reply = roundtrip(&client, request).await.unwrap();
+        assert_eq!(reply.status(), 200);
+        assert_eq!(reply.body, b"70003 bytes");
+        // The last HEADERS frame: the trailers.
+        assert_eq!(reply.field("x-size"), Some("70003"));
+        assert_eq!(reply.field("x-echo-x-checksum"), Some("abc"));
+        assert_eq!(reply.field("x-echo-x-other"), Some("1"));
+        assert_eq!(reply.fields.len(), 3);
+
+        // Without trailers: the response has its own only.
+        let mut request = post("/trailers", &[]);
+        request.extend(data(b"hello"));
+        let reply = roundtrip(&client, request).await.unwrap();
+        assert_eq!(reply.body, b"5 bytes");
+        assert_eq!(reply.fields, [("x-size".to_owned(), "5".to_owned())]);
     });
 }
 

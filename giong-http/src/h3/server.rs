@@ -29,10 +29,11 @@ use super::qpack::{self, Encoder};
 use crate::body::{Failure, Next, Pipe};
 use crate::budget::{self, Charge};
 use crate::h2::hpack::Index;
-use crate::h2::request::{Builder, Built, Trailers};
+use crate::h2::request::{Builder, Built, TrailerBlock};
 use crate::request::BodyBytes;
 use crate::response::{Body, Response};
 use crate::server::{catching, drop_quietly, panicked, Config, Handler};
+use crate::trailers::Trailers;
 
 /// The largest SETTINGS frame read. The three settings HTTP/3 defines take
 /// under 30 bytes.
@@ -596,6 +597,11 @@ struct BodyState {
     received: u64,
     /// The trailers were read: nothing but unknown frames may follow.
     trailers: bool,
+    /// The trailer fields are kept, up to this many bytes (a body the
+    /// handler streams); `None`: checked, not kept.
+    keep: Option<usize>,
+    /// The trailer fields kept.
+    kept: Option<Trailers>,
     /// Unknown frames and empty DATA frames so far.
     idle: u32,
 }
@@ -629,10 +635,13 @@ async fn body_piece(
                     return Err(Stop::Stream(Code::ExcessiveLoad));
                 }
                 let block = r.exact(header.len as usize).await?;
-                let mut trailers = Trailers::new();
+                let mut trailers = TrailerBlock::new(st.keep);
                 qpack::decode(&block, |name, value| trailers.field(name, value))?;
                 if trailers.error.is_some() {
                     return Err(Stop::Stream(Code::MessageError));
+                }
+                if st.keep.is_some() {
+                    st.kept = Some(trailers.fields);
                 }
             }
             _ => {
@@ -842,7 +851,10 @@ async fn exchange<H: Handler>(
     req.body = BodyBytes::Stream(pipe.clone());
     let request_timeout = cfg.request_timeout;
     let pump = async {
-        let mut st = BodyState::default();
+        let mut st = BodyState {
+            keep: Some(max_head),
+            ..BodyState::default()
+        };
         loop {
             let piece = match timeout(request_timeout, body_piece(r, &mut st, max_head)).await {
                 Ok(Ok(Some(piece))) => piece,
@@ -876,7 +888,7 @@ async fn exchange<H: Handler>(
             pipe.finish(Err(Failure::Malformed));
             return Err(Stop::Stream(Code::MessageError));
         }
-        pipe.finish(Ok(()));
+        pipe.finish_with(Ok(()), st.kept.take());
         Ok(())
     };
     let answer = async {
@@ -1004,6 +1016,23 @@ fn write_head(out: &mut Vec<u8>, resp: &Response, content_length: Option<u64>) {
     out.extend_from_slice(&block);
 }
 
+/// Appends a HEADERS frame of the trailer fields to `out` (RFC 9114,
+/// section 4.1).
+fn write_trailers(out: &mut Vec<u8>, trailers: &Trailers) {
+    let mut block = Vec::with_capacity(128);
+    Encoder::begin(&mut block);
+    for (name, value) in trailers.iter() {
+        let index = if value.len() > 256 {
+            Index::No
+        } else {
+            Index::Yes
+        };
+        Encoder::field(name.as_bytes(), value, index, &mut block);
+    }
+    Header::write(out, kind::HEADERS, block.len() as u64);
+    out.extend_from_slice(&block);
+}
+
 /// Writes `resp` and ends the stream.
 async fn respond(
     conn: &Conn,
@@ -1044,7 +1073,13 @@ async fn respond(
                             write(conn, send, &piece).await?;
                         }
                     }
-                    Next::End => break,
+                    Next::End(None) => break,
+                    Next::End(Some(trailers)) => {
+                        out.clear();
+                        write_trailers(&mut out, &trailers);
+                        write(conn, send, &out).await?;
+                        break;
+                    }
                     // The producer gave up: the response is cut, and the
                     // client must be able to tell.
                     Next::Aborted => return Err(Stop::Stream(Code::InternalError)),

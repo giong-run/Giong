@@ -162,7 +162,7 @@ What a handler sees:
 - Streams are served at once and answered as their handlers finish; a slow handler holds up no other stream. Each handler runs in its connection's task, like an HTTP/1.1 one, on the same core. A handler that panics has its stream answered with `500`; the other streams and the connection go on (over HTTP/1.1, the `500` is followed by the end of the connection).
 - The response is written as HEADERS and DATA frames. Its headers are sent in lowercase, without those HTTP/2 forbids (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`); a streamed body (`Body::channel`) goes out as DATA frames instead of chunks.
 - A stream the client resets (`RST_STREAM`) drops its handler at once, as a dropped future: whatever it was waiting on is cancelled. A handler that answers before the request body has all arrived has its response sent, then the rest of the body is refused with `RST_STREAM(NO_ERROR)`; the connection stays open.
-- Streamed request bodies (`Handler::stream_body`), `Expect: 100-continue` and request trailers work as over HTTP/1.1. Graceful shutdown sends a GOAWAY, and the streams in progress finish within the grace period.
+- Streamed request bodies (`Handler::stream_body`), `Expect: 100-continue` and trailers (`BodyStream::trailers`, `BodySender::send_trailers`) work as over HTTP/1.1, and a handler can read the request body while it writes the response's (full duplex). Graceful shutdown sends a GOAWAY, and the streams in progress finish within the grace period.
 - Not done: server push, and priorities (the server says so with `SETTINGS_NO_RFC7540_PRIORITIES` and serves streams in turn). Extended CONNECT (WebSockets over HTTP/2) is not supported.
 
 ### Limits

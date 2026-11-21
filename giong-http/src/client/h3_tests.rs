@@ -103,6 +103,20 @@ impl Handler for App {
                 giong::time::sleep(Duration::from_millis(30)).await;
                 Response::text("slow")
             }
+            "/trailers" => {
+                let te = String::from_utf8_lossy(req.header("te").unwrap_or_default()).into_owned();
+                let (tx, body) = Body::channel();
+                drop(giong::spawn(async move {
+                    tx.send("body").await.unwrap();
+                    let trailers = crate::Trailers::new()
+                        .field("grpc-status", "0")
+                        .unwrap()
+                        .field("x-te", te)
+                        .unwrap();
+                    tx.send_trailers(trailers).unwrap();
+                }));
+                Response::new(200).body(body)
+            }
             "/events" => {
                 let (tx, body) = Body::channel();
                 drop(giong::spawn(async move {
@@ -322,6 +336,56 @@ fn a_response_is_read_as_it_arrives_and_can_be_given_up() {
         let res = client.get(&format!("{url}/")).send().await.unwrap();
         assert_eq!(res.status(), 200);
         assert_eq!(PEERS.with(|p| p.borrow().len()), 1);
+    });
+}
+
+#[test]
+fn the_trailers_of_a_streamed_response_are_read_over_http3() {
+    run(|| async {
+        let (url, client) = served();
+        let mut res = client
+            .get(&format!("{url}/trailers"))
+            .send_streaming()
+            .await
+            .unwrap();
+        assert_eq!(res.version(), Version::Http3);
+        assert!(res.trailers().is_none(), "no trailers before the end");
+        let mut body = Vec::new();
+        while let Some(piece) = res.chunk().await.unwrap() {
+            body.extend_from_slice(&piece);
+        }
+        assert_eq!(body, b"body");
+        let trailers = res.trailers().expect("the server's trailers");
+        assert_eq!(trailers.get_str("grpc-status"), Some("0"));
+        // The request said it reads them.
+        assert_eq!(trailers.get_str("x-te"), Some("trailers"));
+        assert_eq!(trailers.len(), 2);
+    });
+}
+
+#[test]
+fn a_streamed_request_body_is_not_sent_over_http3() {
+    run(|| async {
+        let (url, client) = served();
+        // The HTTP/3 client sends bodies it has whole: this one goes over
+        // TCP, where nothing listens here.
+        let (request, body) = client.post(&format!("{url}/echo")).streamed_body();
+        body.send("piece").await.unwrap();
+        drop(body);
+        let err = request.send().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Connect, "{err}");
+        assert!(
+            PEERS.with(|p| p.borrow().is_empty()),
+            "nothing reached the HTTP/3 server"
+        );
+        // Whole bodies still go over HTTP/3.
+        let res = client
+            .post(&format!("{url}/echo"))
+            .body("whole")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!((res.version(), res.body()), (Version::Http3, &b"whole"[..]));
     });
 }
 

@@ -13,5 +13,6 @@
   ([#172](https://github.com/giong-run/Giong/pull/172)).
 - **giong-http**: HTTP/3 (RFC 9114) behind the `unstable-http3` feature: `Server::serve_h3`,
   and a client that follows `Alt-Svc`, sends 0-RTT only for requests that are safe to replay,
-  and falls back to the next address when one does not answer
+  and falls back to the next address when one does not answer. Trailer fields travel both
+  ways as over HTTP/2; the client sends a streamed request body over TCP
   ([#172](https://github.com/giong-run/Giong/pull/172)).

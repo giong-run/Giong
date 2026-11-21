@@ -94,6 +94,7 @@ when it is no longer raised.
 | [GIONG-E1119](E1119.md) | `HttpInvalidResponse` | invalid HTTP response |
 | [GIONG-E1120](E1120.md) | `HttpServerBusy` | request refused: the server's memory budget for requests is full |
 | [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
+| [GIONG-E1122](E1122.md) | `HttpInvalidTrailer` | invalid HTTP trailer field |
 
 ## giong-web
 
@@ -201,3 +202,35 @@ when it is no longer raised.
 | [GIONG-E3603](E3603.md) | `QuicConnectionLost` | the QUIC connection was lost |
 | [GIONG-E3604](E3604.md) | `QuicStreamReset` | the QUIC stream was reset |
 | [GIONG-E3605](E3605.md) | `QuicEarlyDataRejected` | the server refused the 0-RTT data |
+
+## giong-proto
+
+A prototype for giong 1.1, not published yet; its codes are `giong_proto::ErrorKind` until it joins `giong::error::Code`.
+
+| Code | `ErrorKind::` | Meaning |
+|---|---|---|
+| [GIONG-E4001](E4001.md) | `ErrorKind::Truncated` | the message ends in the middle of a field |
+| [GIONG-E4002](E4002.md) | `ErrorKind::BadVarint` | malformed varint |
+| [GIONG-E4003](E4003.md) | `ErrorKind::BadTag` | invalid field tag |
+| [GIONG-E4004](E4004.md) | `ErrorKind::BadGroup` | unbalanced group |
+| [GIONG-E4005](E4005.md) | `ErrorKind::BadUtf8` | string field is not UTF-8 |
+| [GIONG-E4006](E4006.md) | `ErrorKind::TooDeep` | messages nested too deeply |
+| [GIONG-E4007](E4007.md) | `ErrorKind::BadPacked` | malformed packed field |
+| [GIONG-E4008](E4008.md) | `ErrorKind::TooLarge` | message larger than 2 GiB |
+
+## giong-grpc
+
+New in giong 1.1. A call that fails ends with a gRPC status; the statuses giong-grpc raises itself carry one of these codes at the start of their message and in `Status::error_code`.
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E4101](E4101.md) | `GrpcInvalidMetadata` | invalid gRPC metadata |
+| [GIONG-E4102](E4102.md) | `GrpcMessageTooLarge` | gRPC message too large |
+| [GIONG-E4103](E4103.md) | `GrpcProtocol` | gRPC protocol error |
+| [GIONG-E4104](E4104.md) | `GrpcEncoding` | unsupported gRPC message encoding |
+| [GIONG-E4105](E4105.md) | `GrpcDecode` | gRPC message is not valid protobuf |
+| [GIONG-E4106](E4106.md) | `GrpcTransport` | gRPC connection failed |
+| [GIONG-E4107](E4107.md) | `GrpcEndpoint` | invalid gRPC endpoint |
+| [GIONG-E4108](E4108.md) | `GrpcDeadline` | gRPC deadline exceeded |
+| [GIONG-E4109](E4109.md) | `GrpcCancelled` | gRPC call cancelled |
+| [GIONG-E4110](E4110.md) | `GrpcUnimplemented` | gRPC method not found |

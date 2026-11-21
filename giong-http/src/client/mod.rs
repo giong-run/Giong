@@ -50,6 +50,13 @@
 //!   response holds back no other. A request the server rejected
 //!   unprocessed is sent again, and a server that says it is going away
 //!   (GOAWAY) gets its next requests on a new connection.
+//! * Request bodies written piece by piece
+//!   ([`RequestBuilder::streamed_body`], [`RequestBody`]), with trailer
+//!   fields after them; over HTTP/2 the response is read while the request
+//!   is still being written (full duplex). The trailer fields of a response
+//!   are read with [`StreamingResponse::trailers`]; an HTTP/2 or HTTP/3
+//!   request sent with [`RequestBuilder::send_streaming`] says
+//!   `te: trailers`. A client with HTTP/3 sends a streamed body over TCP.
 //! * Every request has a timeout (30 s by default) that covers waiting for
 //!   a connection, connecting, sending, and reading the whole response,
 //!   redirects included; connecting has its own (10 s).
@@ -103,7 +110,9 @@ use self::decode::{DecodeError, Encoding, Inflate};
 use self::head::Head;
 use self::proxy::Route;
 use self::url::Url;
+use crate::body::{BodySender, StreamBody};
 use crate::parse::{is_field_value, is_token_str};
+use crate::trailers::Trailers;
 use crate::Version;
 
 pub use self::error::{Error, ErrorKind};
@@ -340,19 +349,19 @@ impl ClientBuilder {
     /// following redirects. [`RequestBuilder::timeout`] changes it for one
     /// request.
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
+        self.timeout = crate::bounded(timeout);
         self
     }
 
     /// How long opening a connection may take, TLS included (default 10 s).
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
+        self.connect_timeout = crate::bounded(timeout);
         self
     }
 
     /// How long an unused connection is kept open (default 60 s).
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
+        self.idle_timeout = crate::bounded(timeout);
         self
     }
 
@@ -720,6 +729,7 @@ impl Client {
             url,
             headers: Vec::new(),
             body: None,
+            source: None,
             timeout: None,
             error,
         }
@@ -896,8 +906,11 @@ impl Client {
         url: &Url,
         headers: &[(String, String)],
         body: Option<&[u8]>,
+        source: &mut Option<StreamBody>,
+        trailers: bool,
     ) -> Result<Pending, Error> {
         let config = &self.shared.config;
+        let streamed = source.is_some();
         let route = self.route(url);
         let what = format!("{method} {url}");
         let decompress = config.decompress
@@ -905,7 +918,10 @@ impl Client {
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case("accept-encoding"));
         #[cfg(feature = "unstable-http3")]
-        if let (Some(http3), true, None) = (&config.http3, url.https, &route.proxy) {
+        // A streamed request body goes over HTTP/1.1 or HTTP/2: the HTTP/3
+        // client sends bodies it has whole.
+        if let (Some(http3), true, None, false) = (&config.http3, url.https, &route.proxy, streamed)
+        {
             let origin = url.origin();
             let to = if http3.prior_knowledge {
                 Some((origin.port, config.connect_timeout))
@@ -924,7 +940,9 @@ impl Client {
             };
             if let Some(to) = to {
                 return self
-                    .execute_h3(http3, to, method, url, headers, body, decompress, what)
+                    .execute_h3(
+                        http3, to, method, url, headers, body, decompress, trailers, what,
+                    )
                     .await;
             }
         }
@@ -949,23 +967,50 @@ impl Client {
                             method,
                             url,
                             headers,
-                            body,
+                            if streamed {
+                                Payload::Streamed
+                            } else {
+                                Payload::Whole(body)
+                            },
                             &config.user_agent,
                             route.absolute_form(),
                             decompress,
                         )
                     });
                     let reused = lease.reused;
-                    match lease
-                        .conn()
-                        .send(
-                            request.clone(),
-                            method == "HEAD",
-                            config.max_head_size,
-                            &what,
-                        )
-                        .await
-                    {
+                    let mut pulled = false;
+                    let sent = match source.as_ref() {
+                        Some(source) => {
+                            lease
+                                .conn()
+                                .send_streamed(
+                                    request.clone(),
+                                    source,
+                                    &mut pulled,
+                                    method == "HEAD",
+                                    config.max_head_size,
+                                    &what,
+                                )
+                                .await
+                        }
+                        None => {
+                            lease
+                                .conn()
+                                .send(
+                                    request.clone(),
+                                    method == "HEAD",
+                                    config.max_head_size,
+                                    &what,
+                                )
+                                .await
+                        }
+                    };
+                    if pulled || sent.is_ok() {
+                        // Dropped, which tells its sender that nothing more
+                        // of the body is taken.
+                        *source = None;
+                    }
+                    match sent {
                         Ok(answer) => {
                             #[cfg(feature = "unstable-http3")]
                             if route.proxy.is_none() {
@@ -980,7 +1025,17 @@ impl Client {
                                 decompress,
                             ));
                         }
-                        Err(Failure::NothingReceived(_)) if reused && is_idempotent(method) => {
+                        // A streamed body nothing was taken from is whole:
+                        // the request can be sent again as it is. One that
+                        // was taken from cannot be, whatever its method.
+                        Err(Failure::NothingReceived(_))
+                            if reused
+                                && if streamed {
+                                    source.is_some()
+                                } else {
+                                    is_idempotent(method)
+                                } =>
+                        {
                             drop(lease);
                             fresh = true;
                             continue;
@@ -992,7 +1047,15 @@ impl Client {
                     }
                 }
             };
-            let fields = h2_fields(method, headers, body, &config.user_agent, decompress);
+            let fields = h2_fields(
+                method,
+                headers,
+                body,
+                &config.user_agent,
+                decompress,
+                streamed,
+                trailers,
+            );
             let authority = headers
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case("host"))
@@ -1006,7 +1069,7 @@ impl Client {
                 body,
                 head_request: method == "HEAD",
             };
-            let Some(mut stream) = conn.send(&req) else {
+            let Some(mut stream) = conn.send(&req, source) else {
                 // Its room went to another request meanwhile.
                 continue;
             };
@@ -1027,6 +1090,18 @@ impl Client {
                     ));
                 }
                 Err(h2::StreamError::Refused(m)) => {
+                    if streamed {
+                        *source = stream.unused_source();
+                        if source.is_none() {
+                            return Err(Error::new(
+                                ErrorKind::Closed,
+                                format!(
+                                    "{what}: {m}; part of the streamed request body had \
+                                     been sent, so the request is not sent again by itself"
+                                ),
+                            ));
+                        }
+                    }
                     refused += 1;
                     if refused > 5 {
                         return Err(Error::new(
@@ -1040,7 +1115,12 @@ impl Client {
                     message,
                 }) if reused => {
                     let e = Error::new(ErrorKind::Closed, format!("{what}: {message}"));
-                    if !is_idempotent(method) {
+                    if streamed {
+                        *source = stream.unused_source();
+                        if source.is_none() {
+                            return Err(not_sent_again(e, method));
+                        }
+                    } else if !is_idempotent(method) {
                         return Err(not_sent_again(e, method));
                     }
                     fresh = true;
@@ -1064,11 +1144,20 @@ impl Client {
         headers: &[(String, String)],
         body: Option<&[u8]>,
         decompress: bool,
+        trailers: bool,
         what: String,
     ) -> Result<Pending, Error> {
         let config = &self.shared.config;
         let origin = url.origin();
-        let fields = h2_fields(method, headers, body, &config.user_agent, decompress);
+        let fields = h2_fields(
+            method,
+            headers,
+            body,
+            &config.user_agent,
+            decompress,
+            false,
+            trailers,
+        );
         let authority = headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("host"))
@@ -1426,16 +1515,27 @@ impl Client {
         mut url: Url,
         mut headers: Vec<(String, String)>,
         mut body: Option<Vec<u8>>,
+        mut source: Option<StreamBody>,
+        trailers: bool,
     ) -> Result<Pending, Error> {
         let config = &self.shared.config;
         let max = config.redirects;
+        let streamed = source.is_some();
         let mut hops = 0;
         loop {
             let pending = self
-                .execute(&method, &url, &headers, body.as_deref())
+                .execute(
+                    &method,
+                    &url,
+                    &headers,
+                    body.as_deref(),
+                    &mut source,
+                    trailers,
+                )
                 .await?;
             let status = pending.head.status;
-            if max == 0 || !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            // A streamed body cannot be sent a second time.
+            if max == 0 || streamed || !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 return Ok(pending);
             }
             let Some(location) = pending.header("location").map(str::to_owned) else {
@@ -1522,6 +1622,16 @@ impl Body {
             Body::H2(s) => &s.head().bytes,
             #[cfg(feature = "unstable-http3")]
             Body::H3(s) => &s.head().bytes,
+        }
+    }
+
+    /// The trailer fields the body ended with, once it was read to its end.
+    fn trailers(&self) -> Option<&Trailers> {
+        match self {
+            Body::H1(b) => b.trailers(),
+            Body::H2(s) => s.trailers(),
+            #[cfg(feature = "unstable-http3")]
+            Body::H3(s) => s.trailers(),
         }
     }
 
@@ -1781,8 +1891,10 @@ fn h2_fields(
     body: Option<&[u8]>,
     user_agent: &str,
     accept_encoding: bool,
+    streamed: bool,
+    trailers: bool,
 ) -> Vec<(String, String)> {
-    let mut fields = Vec::with_capacity(headers.len() + 3);
+    let mut fields = Vec::with_capacity(headers.len() + 4);
     let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     if !has("user-agent") && !user_agent.is_empty() {
         fields.push(("user-agent".to_owned(), user_agent.to_owned()));
@@ -1799,7 +1911,15 @@ fn h2_fields(
         }
         fields.push((name.to_ascii_lowercase(), value.clone()));
     }
-    if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
+    if trailers {
+        // The response is read as a stream, trailers included
+        // (StreamingResponse::trailers), and some servers (gRPC) only send
+        // them to a client that says it reads them.
+        fields.push(("te".to_owned(), "trailers".to_owned()));
+    }
+    if streamed {
+        // No length: the body ends with the stream.
+    } else if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
         fields.push((
             "content-length".to_owned(),
             body.map_or(0, <[u8]>::len).to_string(),
@@ -1868,15 +1988,29 @@ fn is_idempotent(method: &str) -> bool {
     )
 }
 
+/// The body of a request being encoded for HTTP/1.1.
+#[derive(Clone, Copy)]
+enum Payload<'a> {
+    /// In memory, if there is one: sent with the head, with its length.
+    Whole(Option<&'a [u8]>),
+    /// Produced piece by piece: sent chunked, after the head.
+    Streamed,
+}
+
 fn encode_request(
     method: &str,
     url: &Url,
     headers: &[(String, String)],
-    body: Option<&[u8]>,
+    body: Payload<'_>,
     user_agent: &str,
     proxy: Option<&proxy::Server>,
     accept_encoding: bool,
 ) -> Vec<u8> {
+    let streamed = matches!(body, Payload::Streamed);
+    let body = match body {
+        Payload::Whole(body) => body,
+        Payload::Streamed => None,
+    };
     let body_len = body.map_or(0, <[u8]>::len);
     let mut out = Vec::with_capacity(256 + url.target.len() + body_len);
     let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
@@ -1915,7 +2049,9 @@ fn encode_request(
         out.extend_from_slice(value.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
+    if streamed {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    } else if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
         out.extend_from_slice(format!("Content-Length: {body_len}\r\n").as_bytes());
     }
     out.extend_from_slice(b"\r\n");
@@ -1936,6 +2072,8 @@ pub struct RequestBuilder {
     url: Result<Url, Error>,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
+    /// The receiving half of a streamed body.
+    source: Option<StreamBody>,
     timeout: Option<Duration>,
     error: Option<Error>,
 }
@@ -1974,9 +2112,80 @@ impl RequestBuilder {
     }
 
     /// Sets the body; `Content-Length` is set from it.
+    ///
+    /// A request has one body: after [`streamed_body`](Self::streamed_body)
+    /// this is an error, which `send` returns.
     pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        if self.source.is_some() && self.error.is_none() {
+            self.error = Some(Error::request(
+                "the request already has a streamed body (RequestBuilder::streamed_body); \
+                 a request has one body"
+                    .to_owned(),
+            ));
+        }
         self.body = Some(body.into());
         self
+    }
+
+    /// Makes the body one that is written piece by piece, with the
+    /// [`RequestBody`] returned: for uploads that should not be held whole,
+    /// and for exchanges where requests and responses alternate on one
+    /// HTTP/2 stream (gRPC streaming).
+    ///
+    /// The request is sent by [`send_streaming`](Self::send_streaming) (or
+    /// [`send`](Self::send)), and the body is written while that future is
+    /// polled or after it returned, so the two run in two tasks, or the
+    /// body is written from the task that reads the response:
+    ///
+    /// ```no_run
+    /// use giong_http::client::Client;
+    ///
+    /// # fn main() -> Result<(), giong_http::client::Error> {
+    /// # giong::block_on(async {
+    /// let client = Client::new();
+    /// let (request, body) = client.post("https://example.com/upload").streamed_body();
+    /// let upload = giong::spawn(async move {
+    ///     for piece in [&b"first"[..], b"second"] {
+    ///         body.send(piece).await?;
+    ///     }
+    ///     Ok::<(), giong_http::client::Error>(())
+    /// });
+    /// let response = request.send().await?;
+    /// upload.await.expect("the upload task")?;
+    /// println!("{}", response.status());
+    /// # Ok(())
+    /// # })
+    /// # }
+    /// ```
+    ///
+    /// Over HTTP/2 the response can arrive while the body is still being
+    /// written (full duplex): `send_streaming` returns when the head of the
+    /// response does, whether or not the body has ended. Over HTTP/1.1 the
+    /// body goes out with `Transfer-Encoding: chunked` and the response is
+    /// read once the body has ended. A client with HTTP/3 sends the request
+    /// over HTTP/1.1 or HTTP/2 instead: its HTTP/3 requests carry bodies held
+    /// in memory.
+    ///
+    /// What differs from a body held in memory, because it cannot be sent
+    /// twice: redirects are not followed (the 3xx response is returned),
+    /// and a request the server did not process is sent again only if no
+    /// piece had been taken yet. Dropping the request, or its response,
+    /// makes [`RequestBody::send`] fail.
+    ///
+    /// A request has one body: after [`body`](Self::body) or
+    /// [`json`](Self::json), or a second time, this is an error, which
+    /// `send` returns.
+    pub fn streamed_body(mut self) -> (Self, RequestBody) {
+        if (self.body.is_some() || self.source.is_some()) && self.error.is_none() {
+            self.error = Some(Error::request(
+                "the request already has a body (RequestBuilder::body, json or \
+                 streamed_body); a request has one body"
+                    .to_owned(),
+            ));
+        }
+        let (sender, source) = crate::body::channel();
+        self.source = Some(source);
+        (self, RequestBody { sender })
     }
 
     /// Sets a JSON body (already serialized) and `Content-Type:
@@ -1996,7 +2205,7 @@ impl RequestBuilder {
     /// The timeout for this request instead of the client's
     /// ([`ClientBuilder::timeout`]).
     pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
+        self.timeout = Some(crate::bounded(timeout));
         self
     }
 
@@ -2021,7 +2230,14 @@ impl RequestBuilder {
         let what = format!("{} {url}", self.method);
         let run = async {
             let pending = client
-                .run(self.method, url, self.headers, self.body)
+                .run(
+                    self.method,
+                    url,
+                    self.headers,
+                    self.body,
+                    self.source,
+                    false,
+                )
                 .await?;
             pending.read_whole(&client.shared.config).await
         };
@@ -2050,7 +2266,7 @@ impl RequestBuilder {
         let client = self.client;
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
         let what = format!("{} {url}", self.method);
-        let run = client.run(self.method, url, self.headers, self.body);
+        let run = client.run(self.method, url, self.headers, self.body, self.source, true);
         match giong::time::timeout(timeout, run).await {
             Ok(Ok(pending)) => Ok(StreamingResponse {
                 pending,
@@ -2061,6 +2277,82 @@ impl RequestBuilder {
             Err(_) => Err(timed_out(&what, timeout)),
         }
     }
+}
+
+/// Writes a request body piece by piece: the other half of
+/// [`RequestBuilder::streamed_body`].
+///
+/// Dropping it ends the body; [`abort`](Self::abort) cancels the request
+/// instead, and [`send_trailers`](Self::send_trailers) ends the body with
+/// trailer fields after it.
+pub struct RequestBody {
+    sender: BodySender,
+}
+
+impl RequestBody {
+    /// Sends one piece of the body, after waiting until the connection has
+    /// taken the previous one: one piece in flight, so a slow server slows
+    /// the producer down instead of filling memory. Over HTTP/2 each piece
+    /// goes out as DATA frames within the server's flow-control windows.
+    /// Empty pieces are skipped.
+    ///
+    /// Cancel safe: if the future is dropped before it returns, the piece
+    /// was not sent.
+    ///
+    /// # Errors
+    ///
+    /// An error of kind [`ErrorKind::Closed`] when the body can no longer
+    /// be sent: the response ended or failed, the server reset the stream
+    /// or closed the connection, or the request or its response was
+    /// dropped. Stop producing then; the response (or the error of
+    /// `send`) says what happened.
+    pub async fn send(&self, piece: impl Into<Vec<u8>>) -> Result<(), Error> {
+        self.sender.send(piece).await.map_err(|_| body_closed())
+    }
+
+    /// Ends the body, then sends `trailers` after it: in a last HEADERS
+    /// frame over HTTP/2, after the last chunk over HTTP/1.1. Empty
+    /// trailers end the body as dropping the sender does.
+    ///
+    /// # Errors
+    ///
+    /// As [`send`](Self::send): the trailers were not sent either.
+    pub fn send_trailers(self, trailers: Trailers) -> Result<(), Error> {
+        self.sender
+            .send_trailers(trailers)
+            .map_err(|_| body_closed())
+    }
+
+    /// Cancels the request: over HTTP/2 the stream is reset
+    /// (`RST_STREAM`, `CANCEL`), over HTTP/1.1 the connection closes
+    /// without the end of the body. The server sees an incomplete request,
+    /// and the response fails with [`ErrorKind::Closed`].
+    pub fn abort(self) {
+        self.sender.abort();
+    }
+
+    /// `true` once the body can no longer be sent (see [`send`](Self::send)).
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+impl fmt::Debug for RequestBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequestBody")
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+fn body_closed() -> Error {
+    Error::new(
+        ErrorKind::Closed,
+        "the request body can no longer be sent: the response ended or failed, the server \
+         reset the stream or closed the connection, or the request was dropped; stop \
+         producing the body and read the response or the error of the request"
+            .to_owned(),
+    )
 }
 
 fn timed_out(what: &str, timeout: Duration) -> Error {
@@ -2293,6 +2585,24 @@ impl StreamingResponse {
         &self.pending().url
     }
 
+    /// The trailer fields the server sent after the body: in a last
+    /// HEADERS frame over HTTP/2, after the last chunk of a chunked
+    /// HTTP/1.1 body.
+    ///
+    /// `None` until [`chunk`](Self::chunk) has returned `Ok(None)`, and
+    /// after that if the server sent none. Fields that mean nothing in
+    /// trailers (`content-length`, `set-cookie` and the like) are dropped.
+    /// The trailers of one response are limited to 16 KiB over HTTP/1.1
+    /// and to [`ClientBuilder::max_head_size`] over HTTP/2. Over HTTP/2
+    /// the request said `te: trailers`, for the servers that only send
+    /// trailers to a client that reads them.
+    pub fn trailers(&self) -> Option<&Trailers> {
+        if !self.pending.finished() {
+            return None;
+        }
+        self.pending.body.trailers()
+    }
+
     /// The next piece of the body (decompressed if it was compressed, at
     /// most 64 KiB), or `None` at its end. Waits at most the request's
     /// timeout for it. After an error, the connection is closed and every
@@ -2407,7 +2717,7 @@ mod tests {
             "POST",
             &url,
             &[("X-Id".into(), "7".into())],
-            Some(b"hi"),
+            Payload::Whole(Some(b"hi")),
             "ua/1",
             None,
             true,
@@ -2420,12 +2730,12 @@ mod tests {
         );
         let url = Url::parse("https://example.com/").unwrap();
         let headers = [("host".to_owned(), "other".to_owned())];
-        let out = encode_request("GET", &url, &headers, None, "", None, false);
+        let out = encode_request("GET", &url, &headers, Payload::Whole(None), "", None, false);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "GET / HTTP/1.1\r\nhost: other\r\n\r\n"
         );
-        let out = encode_request("PUT", &url, &[], None, "", None, false);
+        let out = encode_request("PUT", &url, &[], Payload::Whole(None), "", None, false);
         assert!(String::from_utf8(out)
             .unwrap()
             .ends_with("Content-Length: 0\r\n\r\n"));
@@ -2434,7 +2744,15 @@ mod tests {
         let proxy = Proxy::all("http://u:p@proxy:3128").unwrap();
         let url = Url::parse("http://example.com:8080/a?b=1").unwrap();
         let route = proxy.route(&url);
-        let out = encode_request("GET", &url, &[], None, "", route.absolute_form(), false);
+        let out = encode_request(
+            "GET",
+            &url,
+            &[],
+            Payload::Whole(None),
+            "",
+            route.absolute_form(),
+            false,
+        );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "GET http://example.com:8080/a?b=1 HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n\
