@@ -112,8 +112,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "1.0.1", features = ["tls"] }
-giong-tls = "1.0.1"
+giong-http = { version = "1.1.0", features = ["tls"] }
+giong-tls = "1.1.0"
 ```
 
 ```rust,no_run
@@ -219,7 +219,7 @@ An idle connection gives its buffers back, so what it keeps is its task, its HPA
 The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "1.0.1", features = ["client"] }
+giong-http = { version = "1.1.0", features = ["client"] }
 ```
 
 ```rust,no_run
@@ -293,4 +293,4 @@ Server push. Routing and compression of responses are in [`giong-web`](../giong-
 
 ## Tests
 
-`cargo test -p giong-http --all-features`: 66 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 100,000 responses read by the client on a connection in random pieces, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, 3,000 HTTP/2 connections whose every frame is checked, and 3,000 from the client's side, checking what it holds and writes), 44 HTTP/2 tests (22 end-to-end on real sockets with a client that writes its frames by hand, 22 of frames, HPACK, requests and stream memory), 27 end-to-end tests of the server on real sockets (one of them over a Unix socket, three of the memory budget for requests being received), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 12 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 15 of the client over HTTP/2 (against this server through ALPN, over kernel TLS where the kernel has it, and with prior knowledge, and against servers that refuse streams, send GOAWAY, reset streams, send malformed responses, close early, send past the window or wait for a window the client grants only once the connection has gone quiet), 15 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.
+`cargo test -p giong-http --all-features`: 66 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 100,000 responses read by the client on a connection in random pieces, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, 3,000 HTTP/2 connections whose every frame is checked, and 3,000 from the client's side, checking what it holds and writes), 44 HTTP/2 tests (22 end-to-end on real sockets with a client that writes its frames by hand, 22 of frames, HPACK, requests and stream memory), 30 end-to-end tests of the server on real sockets (one of them over a Unix socket, four of the memory budget for requests being received, one of them with bodies received straight into the request buffer, one of bodies from 64 KiB to 3 MiB received straight into the request buffer between other requests), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 12 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 15 of the client over HTTP/2 (against this server through ALPN, over kernel TLS where the kernel has it, and with prior knowledge, and against servers that refuse streams, send GOAWAY, reset streams, send malformed responses, close early, send past the window or wait for a window the client grants only once the connection has gone quiet), 15 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.

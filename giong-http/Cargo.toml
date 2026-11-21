@@ -1,6 +1,6 @@
 [package]
 name = "giong-http"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "A small, strict HTTP/1.1 and HTTP/2 server and client for the giong thread-per-core runtime"
@@ -23,8 +23,8 @@ client = ["dep:giong-tls", "dep:libc", "dep:miniz_oxide"]
 unstable-http3 = ["dep:giong-quic", "giong/unstable-udp-offload"]
 
 [dependencies]
-giong = { path = "..", version = "1.0.1" }
-giong-tls = { path = "../giong-tls", version = "1.0.1", optional = true }
+giong = { path = "..", version = "1.1.0" }
+giong-tls = { path = "../giong-tls", version = "1.1.0", optional = true }
 giong-quic = { path = "../giong-quic", version = "0.0.0", optional = true }
 libc = { version = "0.2.172", optional = true }
 miniz_oxide = { version = "0.9", optional = true }

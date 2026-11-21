@@ -112,6 +112,22 @@ impl MultiSlot {
     }
 }
 
+/// A pooled receive of less than this is a small message.
+const SMALL_RECV: usize = 2048;
+
+/// After this many small messages in a row, a stream in `bulk` mode goes
+/// back to the multishot receive: its traffic is small messages again. (One
+/// small receive alone proves nothing: the rest of a buffer the kernel has
+/// partly filled can be small.)
+const SMALL_RECVS_TO_LEAVE_BULK: u8 = 8;
+
+/// What [`StreamSocket::recv_into`] found when it stopped the pooled receive.
+enum Stopped {
+    Data(RecvBuf),
+    Item(i32),
+    Empty,
+}
+
 /// A task's place among those waiting on one [`MultiSlot`], for a future
 /// that polls it. Several tasks may wait on the same datagram socket; each
 /// completion wakes one of them. A future
@@ -265,6 +281,11 @@ pub(crate) struct StreamSocket {
     /// Data was taken from the multishot receive since the socket was last
     /// checked for an end of stream the kernel did not report.
     check_end: Cell<bool>,
+    /// `recv_into` has been used, and small messages have not come in a row
+    /// since: the pooled receive takes one buffer at a time instead of all
+    /// the data there is (io_uring).
+    /// 0, or 1 plus the number of small messages received in a row since.
+    bulk: Cell<u8>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -311,6 +332,7 @@ impl StreamSocket {
             send_abandoned: Cell::new(false),
             unix: Cell::new(false),
             check_end: Cell::new(false),
+            bulk: Cell::new(0),
             _not_send: PhantomData,
         }
     }
@@ -428,6 +450,16 @@ impl StreamSocket {
                     }
                     MultiPoll::Data(buf) => {
                         self.check_end.set(true);
+                        let bulk = self.bulk.get();
+                        if bulk > 0 {
+                            self.bulk.set(match buf.len() < SMALL_RECV {
+                                // Small messages again: back to the multishot
+                                // receive, which costs less for them.
+                                true if bulk > SMALL_RECVS_TO_LEAVE_BULK => 0,
+                                true => bulk + 1,
+                                false => 1,
+                            });
+                        }
                         return Poll::Ready(Ok(buf));
                     }
                     MultiPoll::NeedArm => {
@@ -435,7 +467,13 @@ impl StreamSocket {
                             return Poll::Pending;
                         }
                         let fd = self.sock.as_raw_fd();
-                        driver.arm_multi(key, MultiIo::Recv { fd });
+                        driver.arm_multi(
+                            key,
+                            MultiIo::Recv {
+                                fd,
+                                once: self.bulk.get() > 0,
+                            },
+                        );
                     }
                     MultiPoll::Pending => {
                         if driver.kind() == crate::DriverKind::IoUring && self.end_was_missed() {
@@ -472,6 +510,84 @@ impl StreamSocket {
         // SAFETY: the kernel wrote `res` bytes at the start of the buffer.
         unsafe { buf.set_init(res as usize) };
         (Ok(res as usize), buf)
+    }
+
+    /// Receives into the free capacity at the end of `buf` (8 KiB is made
+    /// free if there is none), after whatever [`recv`](Self::recv) has taken
+    /// from the socket already. Unlike `read`, it may follow `recv` on the
+    /// same stream, and `recv` may follow it: the kernel's receive into the
+    /// pool is stopped first, and the next `recv` starts it again. For a
+    /// large body whose size is known, this saves copying it out of pool
+    /// buffers. `Ok(0)` is the end of the stream. Until the pooled receive
+    /// brings several small messages in a row, the stream's pooled receives
+    /// take one buffer at a time.
+    ///
+    /// Not cancel safe, like `read`: if the future is dropped, bytes the
+    /// receive had already taken from the socket are lost.
+    pub(crate) async fn recv_into(&self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        // From now on the pooled receive takes one buffer at a time, so the
+        // next large body is still in the socket when its head is parsed.
+        self.bulk.set(1);
+        if runtime::with_worker(|w| self.recv.is_active(w)) {
+            match poll_fn(|cx| self.poll_stop_recv(cx)).await {
+                Stopped::Data(chunk) => {
+                    buf.extend_from_slice(&chunk);
+                    return (Ok(chunk.len()), buf);
+                }
+                Stopped::Item(0) => return (Ok(0), buf),
+                Stopped::Item(res) if res < 0 => return (Err(os_err(res)), buf),
+                Stopped::Item(_) => {
+                    return (
+                        Err(unexpected("io_uring returned data without a buffer")),
+                        buf,
+                    )
+                }
+                Stopped::Empty => {}
+            }
+        }
+        if buf.capacity() == buf.len() {
+            buf.reserve(8192);
+        }
+        let start = buf.len();
+        let len = (buf.capacity() - start).min(u32::MAX as usize) as u32;
+        let io = Io::Recv {
+            fd: self.sock.as_raw_fd(),
+            // SAFETY: `start` is within the allocation (at most its capacity).
+            buf: unsafe { buf.as_mut_ptr().add(start) },
+            len,
+        };
+        // SAFETY: a `Vec`'s bytes stay put when it moves, and nothing else
+        // touches them until the operation hands the vector back.
+        let (res, _, mut buf) = unsafe { Op::new(io, buf) }.await;
+        if res < 0 {
+            return (Err(os_err(res)), buf);
+        }
+        // SAFETY: the kernel wrote `res` bytes after the first `start`.
+        unsafe { buf.set_len(start + res as usize) };
+        (Ok(res as usize), buf)
+    }
+
+    /// For [`recv_into`](Self::recv_into): what the pooled receive holds, in
+    /// order, then `Empty` once it is stopped and holds nothing. The epoll
+    /// driver receives only when asked, so it never holds anything.
+    fn poll_stop_recv(&self, cx: &mut Context<'_>) -> Poll<Stopped> {
+        runtime::with_worker(|w| {
+            let key = self.recv.key(w);
+            let mut driver = w.driver.borrow_mut();
+            if driver.kind() != crate::DriverKind::IoUring {
+                return Poll::Ready(Stopped::Empty);
+            }
+            match driver.poll_multi(key, cx.waker()) {
+                MultiPoll::Item(res) => Poll::Ready(Stopped::Item(res)),
+                MultiPoll::Data(buf) => Poll::Ready(Stopped::Data(buf)),
+                MultiPoll::NeedArm => Poll::Ready(Stopped::Empty),
+                MultiPoll::Pending => {
+                    // Its last completion wakes this task.
+                    driver.restart_multi(key);
+                    Poll::Pending
+                }
+            }
+        })
     }
 
     pub(crate) async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
@@ -1192,6 +1308,18 @@ impl TcpStream {
     /// already taken from the socket are lost. [`recv`](Self::recv) is.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.read(buf).await
+    }
+
+    /// Receives into the free capacity at the end of `buf`, after what
+    /// [`recv`](Self::recv) has already taken; `recv` may come before and
+    /// after it. For the crates of this workspace (giong-http reads large
+    /// request bodies with it), not part of the API.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost.
+    #[doc(hidden)]
+    pub async fn recv_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.inner.recv_into(buf).await
     }
 
     /// Writes some bytes of `buf`, returning how many were written.

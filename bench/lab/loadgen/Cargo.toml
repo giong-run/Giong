@@ -1,0 +1,17 @@
+[package]
+name = "lab-loadgen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "The benchmark lab's HTTP/1.1 load generator: open or closed loop, latency without coordinated omission, many connections"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = false
+
+[workspace]

@@ -166,6 +166,41 @@ impl Completions {
         self.any.load(Ordering::Acquire)
     }
 
+    /// Resets the bell if no result is waiting. A job that finishes while
+    /// [`take`](Self::take) runs can ring the bell after `take` reset it
+    /// and took the job's result: the bell then stays readable with nothing
+    /// to take, and a level-triggered watch would report it on every wait.
+    /// A job's ring comes after its `any`, so a reset here never hides a
+    /// result: `any` already says it.
+    pub(super) fn quiet(&self) {
+        if !self.any() {
+            let mut count: u64 = 0;
+            // SAFETY: reads 8 bytes into a valid u64; the eventfd is
+            // non-blocking, so an empty one returns EAGAIN at once.
+            unsafe {
+                libc::read(
+                    self.eventfd.as_raw_fd(),
+                    &mut count as *mut u64 as *mut libc::c_void,
+                    8,
+                );
+            }
+        }
+    }
+
+    /// Rings the bell as a job does, with no result.
+    #[cfg(test)]
+    pub(super) fn ring(&self) {
+        let one: u64 = 1;
+        // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own.
+        unsafe {
+            libc::write(
+                self.eventfd.as_raw_fd(),
+                &one as *const u64 as *const libc::c_void,
+                8,
+            );
+        }
+    }
+
     /// Takes the waiting results, and resets the eventfd.
     pub(super) fn take(&self, into: &mut Vec<(usize, i32)>) {
         let mut count: u64 = 0;
