@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] `scripts/preflight.sh` passes (`--deep` when it lists slow checks), and so does `scripts/check.sh test`
+- [ ] `scripts/preflight.sh` passes (the gate, not `--quick`), and so does `scripts/check.sh test` when Rust changed
 - [ ] New behaviour has tests, including what happens when an operation is dropped mid-flight
 - [ ] Every new `unsafe` block has a `// SAFETY:` comment, and `scripts/valgrind.sh` and `scripts/check.sh tsan` are clean
 - [ ] Performance claims come with before/after numbers and the method

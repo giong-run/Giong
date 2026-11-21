@@ -1,35 +1,64 @@
 #!/usr/bin/env bash
-# The checks a branch needs before it is pushed, chosen from the files it changes.
+# The gate a branch passes before it is pushed: every check CI runs that the files it
+# changes call for, chosen from those files, plus a merge check against main and, on
+# request, against open pull requests.
 #
-#   scripts/preflight.sh                 plan, then run the quick checks
+#   scripts/preflight.sh                 the gate: run everything the change calls for
+#   scripts/preflight.sh --quick         while iterating: merge check, release.py check,
+#                                        fmt, clippy, docs and the tests of the crates
+#                                        that changed on the default driver
 #   scripts/preflight.sh --plan          only print what changed and what it needs
-#   scripts/preflight.sh --deep          also run the slow checks the change calls for
-#                                        (ThreadSanitizer, loom, a minute of each fuzz
-#                                        target, the minimum Rust version)
 #   scripts/preflight.sh --against 172,173
-#                                        also check that the branch merges without a
-#                                        conflict with those open pull requests, so the
-#                                        merge queue does not eject one of them
+#                                        also merge with those open pull requests and
+#                                        name the files that conflict
 #   scripts/preflight.sh --base <ref>    compare with <ref> instead of origin/main
+#   scripts/preflight.sh --install       install the toolchains and tools the gate uses
 #
-# A red CI run costs about 20 minutes before anyone sees it, and another run after the
-# fix; this script catches the usual causes (formatting, clippy, a doc link, CHANGELOG
-# form, a test of the crate that changed, a conflict with main) in a few minutes. It runs
-# a subset of what CI runs and never replaces it: the merge queue still runs every job.
+# What the gate runs, by what changed:
+#   always                    merge into the base, scripts/release.py check
+#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, Rust 1.80 check,
+#                             the tests on io_uring and on epoll: of the crates that
+#                             changed, or of the whole workspace when the runtime did
+#   a published crate's src   scripts/semver.sh (no breaking change since the release)
+#   unsafe code, the drivers, buffers, the executor, anything that crosses threads
+#                             scripts/check.sh tsan, one round
+#   wake-ups (src/notify.rs, the executor's injector)
+#                             scripts/check.sh loom
+#   code that parses bytes from the network
+#                             every fuzz target of that crate for FUZZ_SECS (30) seconds
+# A missing tool fails the gate with the command that installs it; nothing is skipped
+# quietly. CI still runs every job on the pull request and again in the merge queue
+# (kernels, fallback tiers, Miri, Kani, instr, the server versions), so the gate makes a
+# green run likely; it does not replace it.
 # Exit status: 0 when every check it ran passed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 BASE=origin/main
 AGAINST=""
-MODE=quick
+MODE=gate
+FUZZ_SECS="${FUZZ_SECS:-30}"
+MSRV=1.80.0
+SEMVER_CHECKS=0.51.0   # the version CI installs (.github/workflows/ci.yml, job semver)
+
+install_tools() {
+    set -e
+    rustup toolchain install "$MSRV" --profile minimal
+    rustup toolchain install nightly --profile minimal -c rust-src
+    rustup component add rustfmt clippy
+    cargo install --locked cargo-fuzz
+    cargo install --locked cargo-semver-checks --version "$SEMVER_CHECKS"
+    echo "ok: $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --plan) MODE=plan ;;
-        --deep) MODE=deep ;;
+        --quick) MODE=quick ;;
         --base) BASE="$2"; shift ;;
         --against) AGAINST="$2"; shift ;;
-        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --install) install_tools; exit $? ;;
+        -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
     esac
     shift
@@ -51,13 +80,14 @@ fi
 
 # ------------------------------------------------------------------ classify
 declare -A CRATES=()   # workspace packages whose code or tests changed
+declare -A FUZZ=()     # crate directories with fuzz targets whose parsing code changed
 RUST=0                 # anything cargo builds
+ALL=0                  # the runtime changed: every crate is built on it
+SEMVER=0               # a published crate's library code changed
+TSAN=0                 # ThreadSanitizer applies
+LOOM=0                 # the loom models apply
 SOAK=()                # files on a soak path (docs/RELEASING.md, "How long to soak")
-UNSAFE_CORE=0          # code ThreadSanitizer, valgrind and Kani watch
-NOTIFY=0               # the loom-modelled wake-ups
 CHANGELOG_ENTRY=0
-USER_VISIBLE=0
-declare -A FUZZ=()     # crates with fuzz targets whose parsing code changed
 OTHER_WS=()            # bench/ and sim/ are workspaces of their own
 
 for f in "${FILES[@]}"; do
@@ -69,15 +99,18 @@ for f in "${FILES[@]}"; do
         bench/*|sim/*) OTHER_WS+=("$f"); continue ;;
     esac
     case "$f" in
-        *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock|build.rs) RUST=1 ;;
+        *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock) RUST=1 ;;
     esac
     case "$f" in
-        src/*|tests/*|Cargo.toml|build.rs|fuzz/*) CRATES[giong]=1 ;;
+        src/*|Cargo.toml|Cargo.lock) ALL=1 ;;
+    esac
+    case "$f" in
+        src/*|tests/*|Cargo.toml|fuzz/*) CRATES[giong]=1 ;;
         examples/rest-api/*) CRATES[rest-api]=1 ;;
         giong-*/*) CRATES[${f%%/*}]=1 ;;
     esac
     case "$f" in
-        src/*.rs|giong-*/src/*.rs) USER_VISIBLE=1 ;;
+        src/*.rs|giong-*/src/*.rs) SEMVER=1 ;;
     esac
     case "$f" in
         src/driver/*|src/op.rs|src/buf.rs|src/kbox.rs|src/slab.rs|src/runtime.rs|src/executor.rs|\
@@ -87,36 +120,47 @@ for f in "${FILES[@]}"; do
         giong-http/src/*) SOAK+=("$f") ;;
     esac
     case "$f" in
-        src/driver/*|src/op.rs|src/buf.rs|src/kbox.rs|src/slab.rs|src/notify.rs|src/executor.rs) UNSAFE_CORE=1 ;;
+        src/driver/*|src/op.rs|src/buf.rs|src/kbox.rs|src/slab.rs|src/notify.rs|src/executor.rs|\
+        src/runtime.rs|src/sync/*|src/sync.rs|src/observe.rs) TSAN=1 ;;
     esac
     case "$f" in
-        src/notify.rs) NOTIFY=1 ;;
+        src/notify.rs|src/executor.rs) LOOM=1 ;;
     esac
     case "$f" in
-        src/net/dns.rs|src/net/dns/*|fuzz/*) FUZZ[giong]=1 ;;
+        src/net/dns.rs|src/net/dns/*|fuzz/*) FUZZ[.]=1 ;;
         giong-http/src/*|giong-http/fuzz/*) FUZZ[giong-http]=1 ;;
         giong-tls/src/ktls*|giong-tls/fuzz/*) FUZZ[giong-tls]=1 ;;
-        giong-postgres/src/*|giong-mysql/src/*|giong-redis/src/*|giong-web/src/*|giong-mcp/src/*)
-            [ -d "${f%%/*}/fuzz" ] && FUZZ[${f%%/*}]=1 ;;
+        giong-*/src/*|giong-*/fuzz/*) [ -d "${f%%/*}/fuzz" ] && FUZZ[${f%%/*}]=1 ;;
     esac
 done
-# The runtime's code reaches every crate built on it.
-ALL=0
-for f in "${FILES[@]}"; do
-    case "$f" in src/*|Cargo.toml|Cargo.lock) ALL=1 ;; esac
-done
+# New or changed unsafe code anywhere is ThreadSanitizer's business too.
+if git diff "$FORK" -- '*.rs' | grep -qE '^\+.*\bunsafe\b'; then
+    TSAN=1
+fi
+[ "$RUST" = 0 ] && SEMVER=0
+[ ${#CRATES[@]} -eq 0 ] && [ "$RUST" = 1 ] && ALL=1
 
 # ------------------------------------------------------------------ plan
-echo "== $((${#FILES[@]})) files changed since $BASE ($(git rev-parse --short "$FORK"))"
+echo "== ${#FILES[@]} files changed since $BASE ($(git rev-parse --short "$FORK"))"
 printf '   %s\n' "${FILES[@]:0:40}"
 [ ${#FILES[@]} -gt 40 ] && echo "   ... and $((${#FILES[@]} - 40)) more"
 echo
 if [ "$RUST" = 0 ]; then
-    echo "Docs or configuration only: no cargo build needed here."
+    echo "Docs, scripts or configuration only: no cargo build needed."
 elif [ "$ALL" = 1 ]; then
     echo "Tests: the whole workspace, on io_uring and on epoll (the runtime changed)."
 else
-    echo "Tests: ${!CRATES[*]}"
+    echo "Tests: ${!CRATES[*]}, on io_uring and on epoll."
+fi
+GATE=()
+[ "$RUST" = 1 ] && GATE+=("Rust $MSRV check")
+[ "$SEMVER" = 1 ] && GATE+=("semver (scripts/semver.sh)")
+[ "$TSAN" = 1 ] && GATE+=("ThreadSanitizer, one round (scripts/check.sh tsan)")
+[ "$LOOM" = 1 ] && GATE+=("loom (scripts/check.sh loom)")
+for d in "${!FUZZ[@]}"; do GATE+=("fuzz ${d/#./giong}: every target, ${FUZZ_SECS}s each"); done
+if [ ${#GATE[@]} -gt 0 ]; then
+    echo "The gate also runs (not --quick):"
+    printf '   %s\n' "${GATE[@]}"
 fi
 if [ ${#SOAK[@]} -gt 0 ]; then
     echo "Soak: on a soak path, so a release that contains it needs 2 to 4 hours per driver"
@@ -124,19 +168,10 @@ if [ ${#SOAK[@]} -gt 0 ]; then
 else
     echo "Soak: none needed for this change."
 fi
-[ ${#OTHER_WS[@]} -gt 0 ] && echo "bench/ or sim/ changed: they are separate workspaces; build them where they changed."
-if [ "$USER_VISIBLE" = 1 ] && [ "$CHANGELOG_ENTRY" = 0 ]; then
+[ ${#OTHER_WS[@]} -gt 0 ] && echo "bench/ or sim/ changed: separate workspaces; build and test them where they changed."
+if [ "$SEMVER" = 1 ] && [ "$CHANGELOG_ENTRY" = 0 ]; then
     echo "Changelog: library code changed and no changelog.d/ entry was added. Add one if a"
     echo "           user would notice (changelog.d/README.md); skip it for internal changes."
-fi
-SLOW=()
-[ "$UNSAFE_CORE" = 1 ] && SLOW+=("scripts/check.sh tsan")
-[ "$NOTIFY" = 1 ] && SLOW+=("scripts/check.sh loom")
-[ "$RUST" = 1 ] && SLOW+=("cargo +1.80.0 check --workspace --all-features")
-for c in "${!FUZZ[@]}"; do SLOW+=("fuzz: $c (a minute per target)"); done
-if [ ${#SLOW[@]} -gt 0 ]; then
-    echo "Slow checks this change calls for (--deep runs them):"
-    printf '   %s\n' "${SLOW[@]}"
 fi
 echo
 [ "$MODE" = plan ] && exit 0
@@ -147,7 +182,19 @@ PASSED=()
 step() {
     local name="$1"; shift
     echo "== $name"
-    if "$@"; then PASSED+=("$name"); else FAILED+=("$name"); echo "!! $name failed"; fi
+    local start=$SECONDS
+    if "$@"; then
+        PASSED+=("$name ($((SECONDS - start))s)")
+    else
+        FAILED+=("$name"); echo "!! $name failed"
+    fi
+}
+need() {   # need <command to test> <what> : fail the gate with the install hint
+    if ! eval "$1" > /dev/null 2>&1; then
+        echo "!! $2 is not installed: scripts/preflight.sh --install"
+        FAILED+=("$2 missing")
+        return 1
+    fi
 }
 
 merges_cleanly() {
@@ -177,33 +224,44 @@ if [ "$RUST" = 1 ]; then
     step "clippy" cargo clippy --workspace --all-targets --all-features --quiet -- -D warnings
     step "doc" env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --quiet
     if [ "$ALL" = 1 ]; then
-        step "tests (io_uring)" cargo test --workspace --all-features --quiet
-        step "tests (epoll)" env GIONG_DRIVER=epoll cargo test --workspace --all-features --quiet
+        TEST_ARGS=(--workspace)
     else
-        for c in "${!CRATES[@]}"; do
-            step "tests $c" cargo test -p "$c" --all-features --quiet
-        done
-        [ -n "${CRATES[giong]:-}" ] && \
-            step "tests giong (epoll)" env GIONG_DRIVER=epoll cargo test -p giong --all-features --quiet
+        TEST_ARGS=()
+        for c in "${!CRATES[@]}"; do TEST_ARGS+=(-p "$c"); done
     fi
+    step "tests (io_uring)" cargo test "${TEST_ARGS[@]}" --all-features --quiet
+    [ "$MODE" = gate ] && \
+        step "tests (epoll)" env GIONG_DRIVER=epoll cargo test "${TEST_ARGS[@]}" --all-features --quiet
 fi
 
-if [ "$MODE" = deep ]; then
-    [ "$UNSAFE_CORE" = 1 ] && step "tsan" scripts/check.sh tsan
-    [ "$NOTIFY" = 1 ] && step "loom" scripts/check.sh loom
-    [ "$RUST" = 1 ] && step "msrv" cargo +1.80.0 check --workspace --all-features --quiet
-    for c in "${!FUZZ[@]}"; do
-        dir=.; [ "$c" != giong ] && dir="$c"
-        for t in $(cd "$dir" && cargo +nightly fuzz list 2>/dev/null); do
-            step "fuzz $c/$t" bash -c "cd '$dir' && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu '$t' -- -max_total_time=60"
-        done
-    done
+if [ "$MODE" = gate ]; then
+    if [ "$RUST" = 1 ] && need "cargo +$MSRV --version" "Rust $MSRV"; then
+        step "Rust $MSRV" cargo +"$MSRV" check --workspace --all-features --quiet
+    fi
+    if [ "$SEMVER" = 1 ] && need "cargo semver-checks --version" "cargo-semver-checks"; then
+        step "semver" scripts/semver.sh
+    fi
+    if { [ "$TSAN" = 1 ] || [ "$LOOM" = 1 ] || [ ${#FUZZ[@]} -gt 0 ]; } && \
+        need "rustup run nightly rustc --print sysroot && test -d \"\$(rustup run nightly rustc --print sysroot)/lib/rustlib/src\"" "nightly with rust-src"; then
+        [ "$TSAN" = 1 ] && step "tsan" env ROUNDS=1 scripts/check.sh tsan
+        [ "$LOOM" = 1 ] && step "loom" scripts/check.sh loom
+        if [ ${#FUZZ[@]} -gt 0 ] && need "cargo fuzz --version" "cargo-fuzz"; then
+            target="$(rustc -vV | sed -n 's/^host: //p')"
+            for d in "${!FUZZ[@]}"; do
+                for t in $(cd "$d" && cargo +nightly fuzz list 2>/dev/null); do
+                    step "fuzz ${d/#./giong}/$t" bash -c "cd '$d' && cargo +nightly fuzz run --target '$target' '$t' -- -max_total_time=$FUZZ_SECS"
+                done
+            done
+        fi
+    fi
 fi
 
 echo
 echo "== passed: ${#PASSED[@]}, failed: ${#FAILED[@]}"
+[ ${#PASSED[@]} -gt 0 ] && printf '   ok: %s\n' "${PASSED[@]}"
 if [ ${#FAILED[@]} -gt 0 ]; then
-    printf '   failed: %s\n' "${FAILED[@]}"
+    printf '   FAILED: %s\n' "${FAILED[@]}"
     exit 1
 fi
-echo "CI still runs every job (kernels, fallback tiers, TSan, Miri, Kani, semver, instr) on the pull request and in the merge queue."
+[ "$MODE" = quick ] && echo "Quick mode: run scripts/preflight.sh without --quick before pushing."
+echo "CI runs every job on the pull request and again in the merge queue."

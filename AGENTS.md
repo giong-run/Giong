@@ -94,9 +94,10 @@ Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README
 Run these from the repository root. All tests use loopback; none needs the internet.
 
 ```bash
-scripts/preflight.sh         # before every push: the checks the changed files need, and the merge into main
-scripts/preflight.sh --deep  # also the slow ones they call for (TSan, loom, fuzzing, MSRV)
+scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
+scripts/preflight.sh --quick  # the fast part, while iterating
 scripts/preflight.sh --against 172,173   # also merge with those open pull requests
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
 
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
@@ -203,7 +204,9 @@ is loaded.
 ## Changes, commits and pull requests
 
 - Branch from `main` as `<type>/<short-description>`. Never push to `main`; it is
-  protected.
+  protected. Leave nothing behind: a superseded pull request is closed with a comment
+  naming what replaces it and its branch deleted; a branch never stays without a pull
+  request (docs/DEVELOPMENT.md, *Leave nothing behind*).
 - Commits follow Conventional Commits: `<type>(<scope>): <imperative summary, lower case,
   no full stop>`. Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`,
   `ci`, `chore`. Scopes: the runtime's parts (`runtime`, `executor`, `driver`, `net`,

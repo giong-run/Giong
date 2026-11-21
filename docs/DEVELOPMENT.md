@@ -26,22 +26,29 @@ and the merge queue runs the same jobs again. The time is lost to:
 4. **Lost context.** A new session re-learns what the last one knew, when that lived only
    in a conversation.
 
+5. **Leftovers.** Branches and draft pull requests that nobody owns any more hide the ones
+   that matter and get rebased, reviewed or merged by mistake.
+
 Each section below removes one of them.
 
 ## One change, start to finish
 
-1. **Take one item.** One concern per pull request. Work too large to review in one sitting
+1. **Take one item** from the backlog of your line of work (see [The backlog](#the-backlog)).
+   One concern per pull request. Work too large to review in one sitting
    is split into pull requests that each pass CI on their own; a long line of work keeps a
    draft pull request open and lands in pieces.
 2. **Branch from the newest `main`**: `git fetch origin main && git switch -c <type>/<name> origin/main`.
 3. **Test first for a fix**: the test fails before the change and passes after.
-4. **Run `scripts/preflight.sh` before every push.** It reads the files the branch changes
-   and runs what they need: the merge into `main`, `scripts/release.py check`, fmt, clippy
-   and docs when Rust changed, and the tests of the crates that changed (the whole
-   workspace on both drivers when the runtime changed). It prints the slow checks the
-   change calls for (ThreadSanitizer for the unsafe core, loom for `src/notify.rs`, fuzzing
-   for parsers, the minimum Rust version), which `--deep` runs, and the soak a release
-   containing the change will need. `--plan` only prints.
+4. **Pass the gate, `scripts/preflight.sh`, before every push.** It reads the files the
+   branch changes and runs every check CI runs that they call for: the merge into `main`,
+   `scripts/release.py check`, and when Rust changed fmt, clippy and docs with warnings as
+   errors, the Rust 1.80 check and the tests on io_uring and on epoll (of the crates that
+   changed, or of the whole workspace when the runtime did); `scripts/semver.sh` when a
+   published crate's code changed; one round of ThreadSanitizer for unsafe code and
+   anything that crosses threads; loom for the wake-ups; and every fuzz target of a crate
+   whose parsing code changed. A missing tool fails the gate (`--install` installs them);
+   nothing is skipped quietly. `--quick` runs the fast part while iterating, `--plan` only
+   prints. The gate also says which soak a release containing the change will need.
 5. **Write the changelog entry as a file in [`changelog.d/`](../changelog.d/README.md)**,
    never in `CHANGELOG.md`.
 6. **Push and open the pull request**, as a draft until the preflight passes. Fill in the
@@ -53,7 +60,8 @@ Each section below removes one of them.
    `scripts/preflight.sh --against <n>,<n>` merges the branch with each of them and names
    the files that conflict. Agree the order with their authors when two conflict, rather
    than letting the queue eject one.
-9. **After the merge**, delete the branch, close the item, and take the next one.
+9. **After the merge**, check that the branch was deleted, remove the item from the
+   backlog, and take the next one.
 
 ## Working in parallel without collisions
 
@@ -77,15 +85,42 @@ Each section below removes one of them.
 
 | The change touches | Before pushing | Soak before a release |
 |---|---|---|
-| docs, the site, `changelog.d/`, benches | `scripts/preflight.sh` (no build) | none |
-| a crate off the soak paths: the database clients, `giong-web`, `giong-mcp`, the HTTP client | preflight; `--deep` fuzzes the parsers that changed | none |
-| a soak path: the drivers, the scheduler, cancellation, sockets, channels, timers, files, the HTTP/2 or TLS state of the servers | preflight (both drivers), `--deep` | 2 to 4 hours per driver |
+| docs, the site, `changelog.d/`, benches | the gate (no build) | none |
+| a crate off the soak paths: the database clients, `giong-web`, `giong-mcp`, the HTTP client | the gate, which fuzzes the parsers that changed | none |
+| a soak path: the drivers, the scheduler, cancellation, sockets, channels, timers, files, the HTTP/2 or TLS state of the servers | the gate (both drivers, TSan), `scripts/check.sh fallback` | 2 to 4 hours per driver |
 | the unsafe core: `src/driver/`, `src/op.rs`, `src/buf.rs`, `src/kbox.rs`, `src/slab.rs` | the above, `scripts/valgrind.sh`, `scripts/check.sh kani` | 2 to 4 hours per driver |
-| cross-thread wake-ups: `src/notify.rs`, the injector, `TaskWaker` | the above, `scripts/check.sh loom` | 2 to 4 hours per driver |
+| cross-thread wake-ups: `src/notify.rs`, the injector, `TaskWaker` | the above (the gate runs loom) | 2 to 4 hours per driver |
 
 The soak tiers are defined in [RELEASING.md](RELEASING.md#how-long-to-soak); a major
 release soaks for 72 hours whatever changed. CI runs every job on every pull request
-whatever the table says: it tells you what to run first, not what may be skipped.
+whatever the table says, including what no local machine runs (kernels 5.15 to 6.18, the
+older ring tiers, Miri, Kani, instruction counts, other server versions): the gate makes a
+green run likely, it does not replace it.
+
+## The backlog
+
+Work is taken from a backlog, one section per line of work (a driver, a protocol, a
+release), each item with a one-line acceptance test. An agent works through its section in
+order, notes the item it takes, and removes it once merged. When its section is empty, or
+while CI runs and nothing else in the section is independent, it takes an item from the
+unassigned section. New work found along the way goes at the end of the right section
+instead of into the current pull request.
+
+## Leave nothing behind
+
+- **Merged**: GitHub deletes the branch of a merged pull request
+  (`delete_branch_on_merge`). Check it did.
+- **Superseded or abandoned**: close the pull request with a comment naming what replaces
+  it, then delete its branch. GitHub keeps the commits at `refs/pull/<n>/head` and can
+  restore the branch from the pull request page, so nothing is lost.
+- **A branch with no pull request** is work in progress for at most a day: open a draft
+  pull request for it, or list it in `.github/hygiene-keep.txt` with the reason it stays.
+- **A draft that waits** says in its description what it waits for (a release, another
+  pull request, a measurement).
+- **Every Monday** the Hygiene workflow (`scripts/hygiene.py`) puts the branches with no
+  open pull request and the pull requests untouched for a week into the issue labelled
+  `hygiene`. Whoever owns an entry deals with it that week; the issue closes itself when
+  nothing is left.
 
 ## Never idle
 
