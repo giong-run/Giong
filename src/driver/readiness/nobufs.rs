@@ -1,10 +1,12 @@
 //! Waiting out a shortage of network buffers (macOS).
 //!
-//! macOS takes the buffers of every socket from one pool for the whole
-//! machine. When it is empty, `send` and `connect` fail at once with
-//! `ENOBUFS`, where Linux makes the sender wait. The socket itself usually
-//! has room, so it stays writable and a wait for readiness would spin, and
-//! nothing reports that the pool has recovered. So a stream send or connect
+//! When macOS has no network buffer for a call, `send` and `connect` fail
+//! at once with `ENOBUFS`, where Linux makes the sender wait. Sockets
+//! holding much unread data bring it on, and the CI runners (virtual
+//! machines) also get it in short bursts with buffers far from any limit.
+//! The socket itself usually has room, so it stays writable and a wait for
+//! readiness would spin, and nothing reports that buffers are back. So a
+//! stream send or connect
 //! that gets `ENOBUFS` is tried again on a timer: after 1 ms, then 2, 4, 8,
 //! 16 and every 32 ms, each step varied by up to a quarter so that many
 //! waiting tasks spread out, for at most [`GIVE_UP`]. The operation stays

@@ -347,13 +347,13 @@ a claim the tests back.
 and TLS soak tests (connection churn, cancellation, UDP, files, TLS
 handshakes and resumption) for 2 h on each runner, with every check the
 Linux soak makes and the same load (`GIONG_SOAK_CLIENTS`: 32 per worker,
-16 for TLS). The first runs at that load found the macOS kernel out of
-buffers: it draws every socket buffer from one mbuf pool, the soak keeps a
-few hundred sockets holding unread data on purpose, and sends and connects
-then failed with `ENOBUFS` for 0.05-0.15% of connections, where Linux makes
-the sender wait. Those runs had no hang and no leak (25 descriptors and
-9 MB at the end of 102 million connections), and the soak ran a quarter of
-the clients until giong waited as well. A short TIME_WAIT
+16 for TLS). In the first runs, sends and connects failed with `ENOBUFS`
+for 0.05-0.15% of connections at that load (the soak keeps a few hundred
+sockets holding unread data on purpose), and in bursts even at a quarter
+of it, with `netstat -m` far from any limit, where Linux makes the sender
+wait. Those runs had no hang and no leak (25 descriptors and 9 MB at the
+end of 102 million connections), and the soak ran a quarter of the
+clients until giong waited as well. A short TIME_WAIT
 (`net.inet.tcp.msl` 250 ms) keeps the churn from using up the ephemeral
 ports.
 
@@ -371,8 +371,8 @@ giong-tls sends its queued records without waiting in two places, and
 leaves them queued on `ENOBUFS` as on `EAGAIN`, for the next send, which
 waits. After 2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`,
 kind `OutOfMemory`, the kernel's error as its source). A datagram send
-keeps the kernel's `ENOBUFS`, as on Linux. Rust's standard library, mio and Tokio return the
-kernel's `ENOBUFS` as it is. None of this is built on Linux; on macOS it
+keeps the kernel's `ENOBUFS`, as on Linux. Rust's standard library, mio
+and Tokio return the kernel's `ENOBUFS` as it is. None of this is built on Linux; on macOS it
 costs one comparison per poll of an operation while nothing waits. Tests
 make the failures with a hook built only with `--cfg giong_inject_enobufs`
 (`tests/enobufs.rs`, on macOS CI and on Linux with epoll or libkqueue).

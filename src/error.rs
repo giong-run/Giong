@@ -153,9 +153,10 @@ codes! {
     WrongWorker = 13, Other, "an operation was polled on another worker";
 
     // -------------------------------------------------------------- macOS
-    /// macOS ran out of network buffers (`ENOBUFS`): the mbuf pool that
-    /// every socket on the machine draws from is empty, usually because
-    /// sockets hold data that nobody reads. A stream send or connect waits
+    /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
+    /// longer than giong waits: sockets holding much unread data bring it
+    /// on, and some virtual machines get it in bursts. A stream send or
+    /// connect waits
     /// for buffers and is tried again for up to 2 seconds before it fails
     /// with this code (a datagram send keeps the kernel's error). The
     /// kernel's error is the [`source`](std::error::Error::source), so

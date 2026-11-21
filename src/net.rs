@@ -98,8 +98,9 @@ pub(crate) mod nobufs {
             Code::NetworkBuffersExhausted,
             "the system ran out of network buffers (ENOBUFS), and still had none after 2 s",
             "read from every connection promptly, cap how many connections can hold unread \
-             data at once, and lower SO_RCVBUF if the program raised it: macOS takes every \
-             socket's buffers from one pool for the whole machine (netstat -m shows it).",
+             data at once, and lower SO_RCVBUF if the program raised it; netstat -m shows how \
+             many requests for network buffers macOS denied. If it keeps happening with \
+             little in use, treat the error as transient and try again later.",
         )
         .with_source(err)
         .into()

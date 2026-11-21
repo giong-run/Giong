@@ -313,10 +313,10 @@ fn broken() -> io::Error {
     )
 }
 
-/// `true` for `ENOBUFS` on macOS, where every socket's buffers come from one
-/// pool for the whole machine: a send it refuses sent nothing, and giong's
-/// own sends wait for buffers (GIONG-E0028), so the sends here made without
-/// waiting treat it as a full socket. Linux makes a TCP sender wait instead.
+/// `true` for `ENOBUFS` on macOS, which has no network buffer for the send
+/// at that moment: the send sent nothing, and giong's own sends wait for
+/// buffers (GIONG-E0028), so the sends here made without waiting treat it
+/// as a full socket. Linux makes a TCP sender wait instead.
 #[inline]
 fn no_buffers(e: &io::Error) -> bool {
     cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::ENOBUFS)
