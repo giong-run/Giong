@@ -648,6 +648,7 @@ impl Pool {
         &self,
         mut decide: impl FnMut(&mut State, usize) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Pool, "redis");
         // A timeout too long for the clock (`Duration::MAX`) means none.
         let deadline = Instant::now().checked_add(self.inner.wait_timeout);
         loop {

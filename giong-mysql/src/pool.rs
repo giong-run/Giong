@@ -752,6 +752,7 @@ impl Pool {
         &self,
         mut decide: impl FnMut(&mut State, usize, Instant) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Pool, "mysql");
         let deadline = Instant::now() + self.inner.wait_timeout;
         loop {
             let decision = {

@@ -13,7 +13,7 @@
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1405.4,1
 io_uring,spawn,allocations,1.000,1
-io_uring,yield,instructions,501.2,1
+io_uring,yield,instructions,497.2,1
 io_uring,yield,allocations,0.000,1
 io_uring,oneshot,instructions,280.1,1
 io_uring,oneshot,allocations,1.000,1
@@ -56,7 +56,7 @@ io_uring,idle-https,rss_bytes,11173.9,10
 io_uring,idle-https,allocations,216.130,1
 epoll,spawn,instructions,1124.5,1
 epoll,spawn,allocations,1.000,1
-epoll,yield,instructions,360.7,1
+epoll,yield,instructions,356.7,1
 epoll,yield,allocations,0.000,1
 epoll,oneshot,instructions,280.1,1
 epoll,oneshot,allocations,1.000,1

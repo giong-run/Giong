@@ -58,6 +58,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use giong::error::Code;
+use giong::observe::RequestTrace;
 use giong::time::sleep_until;
 
 use super::frame::{self, Head, Reason, PREFACE};
@@ -2146,12 +2147,41 @@ fn itoa(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     }
 }
 
+/// The traces of the streams' requests while request tracing is on (see
+/// `giong::observe::RequestTrace`), by slot; `None` otherwise, so that
+/// tracing costs every connection one pointer.
+///
+/// A request is followed from its handler's start to its answer handed to
+/// the connection: its arrival and the writing of its answer are not timed
+/// on HTTP/2 yet.
+type Traces = Option<Box<Vec<Option<RequestTrace>>>>;
+
+fn trace_of(traces: &mut Traces, slot: usize) -> Option<&mut RequestTrace> {
+    traces.as_mut()?.get_mut(slot)?.as_mut()
+}
+
+/// Ends the trace of the request in `slot`, answered with `status`.
+fn trace_answered(traces: &mut Traces, slot: usize, status: u16) {
+    if let Some(mut trace) = traces
+        .as_mut()
+        .and_then(|t| t.get_mut(slot))
+        .and_then(Option::take)
+    {
+        trace.responded(status);
+        trace.finish();
+    }
+}
+
 /// Drops the handlers of the streams that are gone.
-fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
+fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>], traces: &mut Traces) {
     while let Some(event) = s.pop_event() {
         let Event::Stop(slot) = event;
         if let Some(task) = tasks.get_mut(slot) {
             drop_quietly(task.take());
+        }
+        // Counted as abandoned.
+        if let Some(trace) = traces.as_mut().and_then(|t| t.get_mut(slot)) {
+            drop(trace.take());
         }
     }
 }
@@ -2161,6 +2191,7 @@ fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
 fn poll_handler<F: Future<Output = Response>>(
     s: &mut Session,
     tasks: &mut [Option<HeapFuture<F>>],
+    traces: &mut Traces,
     slot: usize,
 ) {
     let Some(Some(task)) = tasks.get_mut(slot) else {
@@ -2168,14 +2199,20 @@ fn poll_handler<F: Future<Output = Response>>(
     };
     let waker = s.wakers.get(slot).clone();
     let mut cx = Context::from_waker(&waker);
-    match catching(|| Pin::new(task).poll(&mut cx)) {
+    let polled = match trace_of(traces, slot) {
+        Some(trace) => trace.poll(|| catching(|| Pin::new(task).poll(&mut cx))),
+        None => catching(|| Pin::new(task).poll(&mut cx)),
+    };
+    match polled {
         Ok(Poll::Pending) => {}
         Ok(Poll::Ready(resp)) => {
             tasks[slot] = None;
+            trace_answered(traces, slot, resp.status());
             s.respond(slot, resp);
         }
         Err(()) => {
             drop_quietly(tasks[slot].take());
+            trace_answered(traces, slot, 500);
             s.handler_panicked(slot);
         }
     }
@@ -2225,6 +2262,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
     input.drain(..PREFACE.len());
 
     let mut tasks: Vec<Option<HeapFuture<_>>> = Vec::new();
+    let mut traces: Traces = None;
     let mut polls: Vec<usize> = Vec::new();
     // Handlers woken while handlers wait for the client to take responses.
     let mut parked: Vec<usize> = Vec::new();
@@ -2248,22 +2286,33 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
                 give_buffer(mem::take(&mut input));
             }
         }
-        stop_handlers(&mut s, &mut tasks);
+        stop_handlers(&mut s, &mut tasks, &mut traces);
         // Handlers to start, each polled at once, so that its answer counts
         // against the budget for responses before the next one starts.
         while let Some((slot, req)) = s.next_start() {
             if tasks.len() <= slot {
                 tasks.resize_with(slot + 1, || None);
             }
+            if let Some(mut trace) = RequestTrace::start("h2") {
+                trace.started();
+                let t = traces.get_or_insert_with(Box::default);
+                if t.len() <= slot {
+                    t.resize_with(slot + 1, || None);
+                }
+                t[slot] = Some(trace);
+            }
             match catching(|| HeapFuture::new(handler.call(req))) {
                 Ok(task) => {
                     tasks[slot] = Some(task);
-                    poll_handler(&mut s, &mut tasks, slot);
+                    poll_handler(&mut s, &mut tasks, &mut traces, slot);
                 }
-                Err(()) => s.handler_panicked(slot),
+                Err(()) => {
+                    trace_answered(&mut traces, slot, 500);
+                    s.handler_panicked(slot);
+                }
             }
             s.service(slot);
-            stop_handlers(&mut s, &mut tasks);
+            stop_handlers(&mut s, &mut tasks, &mut traces);
         }
         // Then the woken ones, unless handlers wait.
         if !s.handlers_wait() {
@@ -2275,13 +2324,13 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             if s.handlers_wait() {
                 parked.push(slot);
             } else {
-                poll_handler(&mut s, &mut tasks, slot);
+                poll_handler(&mut s, &mut tasks, &mut traces, slot);
             }
             s.service(slot);
-            stop_handlers(&mut s, &mut tasks);
+            stop_handlers(&mut s, &mut tasks, &mut traces);
         }
         s.fill();
-        stop_handlers(&mut s, &mut tasks);
+        stop_handlers(&mut s, &mut tasks, &mut traces);
 
         if write.is_none() && !s.out.is_empty() {
             let out = mem::replace(&mut s.out, take_buffer());
@@ -2297,6 +2346,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             s.release();
             if !s.keeps_streams() && tasks.capacity() > 0 {
                 tasks = Vec::new();
+                traces = None;
             }
         }
 
