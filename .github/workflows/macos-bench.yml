@@ -1,45 +1,46 @@
-# Gióng against Tokio and smol on macOS (the kqueue driver): the core
-# micro-benchmarks of bench/core.sh (spawn, polls, channels, timers,
-# cross-thread wake-ups, TCP round trips, connects, lookups), on macOS 15
-# and 26. The summary goes to the job summary and the artifact.
-#
-# Run it from the Actions tab, or by pushing a branch named bench/macos-*.
-
-name: macOS bench
-
+# Temporary: where the time goes in the yield, tcp-rr and connect benches on macOS.
+name: macOS bench profile
 on:
   push:
     branches: ["bench/macos-*"]
-  workflow_dispatch:
-    inputs:
-      rounds:
-        description: Rounds of every runtime and workload
-        default: "5"
-
 permissions:
   contents: read
-
 jobs:
-  core:
+  prof:
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
-      - run: sw_vers && sysctl -n hw.ncpu machdep.cpu.brand_string
-      - name: Core benchmarks
+      - name: Profile
         run: |
           ulimit -n 65536 || ulimit -n 10240
-          bench/core.sh ${{ inputs.rounds || '5' }} "$PWD/results"
-          { echo '```'; cat results/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: bench-core-${{ matrix.os }}
-          path: results/
+          cd bench/core
+          CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release --quiet
+          B=target/release/bench-core
+          for w in yield tcp-rr connect; do
+            for r in giong tokio-ct smol; do
+              for i in 1 2 3; do
+                echo "== $r $w $i"
+                /usr/bin/time -l $B $r $w 2>&1 | grep -E "^$r,|real|context switches" || true
+                [ "$w" = connect ] && sleep 31
+              done
+            done
+          done
+          for w in tcp-rr connect; do
+            for r in giong tokio-ct; do
+              $B $r $w >/dev/null & pid=$!
+              sleep 0.5
+              sample $pid 2 -file /tmp/$r-$w.txt >/dev/null 2>&1 || true
+              wait $pid || true
+              echo "== sample $r $w (heaviest stack)"
+              sed -n '/Sort by top of stack/,/^$/p' /tmp/$r-$w.txt | head -30
+              [ "$w" = connect ] && sleep 31
+            done
+          done
