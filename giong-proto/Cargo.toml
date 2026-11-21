@@ -1,6 +1,6 @@
 [package]
 name = "giong-proto"
-version = "0.7.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Protocol Buffers for giong: messages decoded as views over the receive buffer, with no copies and no allocation per field"
@@ -10,8 +10,6 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong-proto"
 keywords = ["protobuf", "zero-copy", "grpc", "serialization"]
 categories = ["encoding", "network-programming"]
-# Prototype for 1.1: not published until giong 1.0.0 is out.
-publish = false
 
 [dependencies]
 

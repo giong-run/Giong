@@ -36,9 +36,9 @@ jobs:
       GIONG_TEST_EXPECT_DRIVER: kqueue
       # The clients the soak runs on Linux (32 per worker for runtime, 16
       # for TLS), same scenarios and checks. Sends and connects on these
-      # runners got ENOBUFS for 0.05-0.15% of connections at this load, and
-      # in bursts even at a quarter of it with buffers far from any limit,
-      # where Linux makes the sender wait. They now wait too
+      # runners got ENOBUFS (no buffer) for 0.05-0.15% of connections at
+      # this load, and in rare bursts even at a quarter of it (0.01% once,
+      # see portability.md section 7), where Linux makes the sender wait. They now wait too
       # (driver/readiness/nobufs.rs), so the full load must pass with no
       # failed connection; `clients` sets a lighter one.
       GIONG_SOAK_CLIENTS: ${{ inputs.clients || (matrix.workload == 'runtime' && '32' || '16') }}

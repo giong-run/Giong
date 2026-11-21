@@ -45,10 +45,8 @@ use giong_tls::{ktls_stats, ktls_support, Ktls, TlsAcceptor, TlsConnector, TlsSt
 /// Client tasks per worker.
 const CLIENTS: usize = 16;
 
-/// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS`. The macOS
-/// runners take fewer: their kernel draws every socket buffer from one
-/// mbuf pool, too small for this many sockets holding unread data, and a
-/// send or connect then fails with `ENOBUFS` (Linux makes the sender wait).
+/// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS` for a
+/// lighter run.
 fn clients() -> usize {
     std::env::var("GIONG_SOAK_CLIENTS")
         .ok()

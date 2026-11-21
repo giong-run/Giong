@@ -1,0 +1,85 @@
+{
+ "conns": 1000,
+ "threads": 3,
+ "rate": 600000,
+ "duration_s": 9,
+ "requests": 348268,
+ "rps": 38696.4,
+ "goodput_rps": 143853.3,
+ "errors": 0,
+ "connect_errors": 0,
+ "unfinished": 1000,
+ "non_2xx": 0,
+ "mb_in_per_s": 19.61,
+ "latency": {
+  "count": 348268,
+  "p50_us": 7600078.8,
+  "p90_us": 8237613.1,
+  "p99_us": 8405385.2,
+  "p999_us": 8427912.1,
+  "p9999_us": 8427912.1,
+  "max_us": 8427912.1
+ },
+ "paths": [
+  {
+   "path": "/json",
+   "requests": 348268,
+   "latency": {
+    "count": 348268,
+    "p50_us": 7600078.8,
+    "p90_us": 8237613.1,
+    "p99_us": 8405385.2,
+    "p999_us": 8427912.1,
+    "p9999_us": 8427912.1,
+    "max_us": 8427912.1
+   }
+  }
+ ],
+ "server_cpu_s": 8.91,
+ "server_rss_kib": 12192,
+ "server_hwm_kib": 12192,
+ "cpu_us_per_req": 6.882,
+ "extra": "after: p99 254.5 us, p99.9 2662.4 us, errors 0",
+ "recovery": {
+  "conns": 100,
+  "threads": 3,
+  "rate": 20000,
+  "duration_s": 6,
+  "requests": 120000,
+  "rps": 20000.0,
+  "goodput_rps": 20000.0,
+  "errors": 0,
+  "connect_errors": 0,
+  "unfinished": 0,
+  "non_2xx": 0,
+  "mb_in_per_s": 2.66,
+  "latency": {
+   "count": 120000,
+   "p50_us": 70.9,
+   "p90_us": 116.5,
+   "p99_us": 254.5,
+   "p999_us": 2662.4,
+   "p9999_us": 6242.3,
+   "max_us": 7672.8
+  },
+  "paths": [
+   {
+    "path": "/json",
+    "requests": 120000,
+    "latency": {
+     "count": 120000,
+     "p50_us": 70.9,
+     "p90_us": 116.5,
+     "p99_us": 254.5,
+     "p999_us": 2662.4,
+     "p9999_us": 6242.3,
+     "max_us": 7672.8
+    }
+   }
+  ],
+  "server_cpu_s": 1.84,
+  "server_rss_kib": 12288,
+  "server_hwm_kib": 12288,
+  "cpu_us_per_req": 15.333
+ }
+}

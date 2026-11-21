@@ -347,15 +347,17 @@ a claim the tests back.
 and TLS soak tests (connection churn, cancellation, UDP, files, TLS
 handshakes and resumption) for 2 h on each runner, with every check the
 Linux soak makes and the same load (`GIONG_SOAK_CLIENTS`: 32 per worker,
-16 for TLS). In the first runs, sends and connects failed with `ENOBUFS`
-for 0.05-0.15% of connections at that load (the soak keeps a few hundred
-sockets holding unread data on purpose), and in bursts even at a quarter
-of it, with `netstat -m` far from any limit, where Linux makes the sender
-wait. Those runs had no hang and no leak (25 descriptors and 9 MB at the
-end of 102 million connections), and the soak ran a quarter of the
-clients until giong waited as well. A short TIME_WAIT
-(`net.inet.tcp.msl` 250 ms) keeps the churn from using up the ephemeral
-ports.
+16 for TLS). Before giong waited for buffers, sends and connects failed
+with `ENOBUFS` (the kernel had no buffer for them) for 0.05-0.15% of
+connections at that load; Linux makes the sender wait instead. At a
+quarter of the clients the runtime soak on both runners and the TLS soak
+on macOS 26 had no error at all, and the TLS soak on macOS 15 met two
+short bursts of `ENOBUFS` (1,590 errors in 15.4 million connections,
+0.01%) while the kernel's buffer use, logged every minute, stayed well
+below what it had reached before. So the load is not the whole cause.
+None of these runs hung or leaked (23-25 descriptors at the end, flat
+memory). A short TIME_WAIT (`net.inet.tcp.msl` 250 ms) keeps the churn
+from using up the ephemeral ports.
 
 **Waiting for network buffers.** On macOS a stream send (`send`,
 `sendmsg`, `sendfile`) or connect that gets `ENOBUFS` is tried again on a
@@ -372,10 +374,11 @@ leaves them queued on `ENOBUFS` as on `EAGAIN`, for the next send, which
 waits. After 2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`,
 kind `OutOfMemory`, the kernel's error as its source). A datagram send
 keeps the kernel's `ENOBUFS`, as on Linux. Rust's standard library, mio
-and Tokio return the kernel's `ENOBUFS` as it is. None of this is built on Linux; on macOS it
-costs one comparison per poll of an operation while nothing waits. Tests
-make the failures with a hook built only with `--cfg giong_inject_enobufs`
-(`tests/enobufs.rs`, on macOS CI and on Linux with epoll or libkqueue).
+and Tokio return the kernel's `ENOBUFS` as it is. None of this is built
+on Linux; on macOS it costs one comparison per poll of an operation while
+nothing waits. Tests make the failures with a hook built only with
+`--cfg giong_inject_enobufs` (`tests/enobufs.rs`, on macOS CI and on Linux
+with epoll or libkqueue).
 
 **Speed on macOS.** `bench/core.sh` on the runners
 (`.github/workflows/macos-bench.yml`, 5 rounds, median wall time in ns per
