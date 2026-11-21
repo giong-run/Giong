@@ -1137,6 +1137,7 @@ mod tests {
     /// (`fe80::1%en0`); the zone becomes the address's scope. One naming no
     /// interface, or zone 0 on a link-local address, is skipped.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call if_nametoindex")]
     fn a_nameserver_with_a_zone_gets_its_scope() {
         let lo = if cfg!(target_os = "linux") {
             "lo"
@@ -1169,7 +1170,6 @@ mod tests {
             "# comment\n\
              nameserver 10.96.0.10\n\
              nameserver 2001:db8::53 ; trailing comment\n\
-             nameserver fe80::1%nosuchif0\n\
              nameserver 10.0.0.3\nnameserver 10.0.0.4\n\
              domain ignored.example\n\
              search default.svc.cluster.local svc.cluster.local cluster.local.\n\

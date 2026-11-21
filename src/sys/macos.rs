@@ -169,11 +169,16 @@ pub(crate) unsafe fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> 
 /// its end, a device that went away) is a real error, and a plain read
 /// there would read the wrong place.
 fn no_offsets_on_a_terminal(fd: RawFd, res: isize) -> isize {
-    // SAFETY: the calling thread's own `errno`; `isatty` only on the
-    // failure path, and it leaves `errno` alone for a terminal.
+    // SAFETY: the calling thread's own `errno`. `isatty` sets it to
+    // ENOTTY on anything but a terminal, so the read's ENXIO is put back
+    // then.
     unsafe {
-        if res < 0 && *libc::__error() == libc::ENXIO && libc::isatty(fd) == 1 {
-            *libc::__error() = libc::ESPIPE;
+        if res < 0 && *libc::__error() == libc::ENXIO {
+            *libc::__error() = if libc::isatty(fd) == 1 {
+                libc::ESPIPE
+            } else {
+                libc::ENXIO
+            };
         }
     }
     res
