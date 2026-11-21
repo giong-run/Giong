@@ -837,11 +837,18 @@ next, and 4 clients keep opening short connections (20 requests of 20 µs of wor
 the last is answered. Paced, the short connections' p99 drops by two thirds and the hot
 connection gets 9% more done. Back to back both workers are saturated, and the result is
 the same as before within the spread of the rounds (requests 32.2-33.9k now against
-32.1-34.6k, p50 66-72 against 66-69 µs). With 24 connections arriving in random order (6
-hot, 18 light) the medians are the same too (17.2k req/s of hot work, light p50 355 against
-357 µs, p99 724 against 736 µs); the single slowest light request was slower (5.3 against
-3.2 ms), a figure that varies between rounds from 1.3 to 19.6 ms in both. Raw data:
-`bench/results/placement/`.
+32.1-34.6k, p50 66-72 against 66-69 µs).
+
+**Mixed, a loss:** 24 connections arrive in random order (6 hot, 18 light); 40 rounds
+(`bench/results/placement-mixed-40/`, compared round by round with
+`bench/placement/compare.py`). Hot work done is the same (17.1k req/s), and so are the
+light requests' p99 (723 against 772 µs), p99.9 (2.9 against 2.5 ms) and slowest request
+(4.9 ms both): the rounds spread far more than the modes differ (Mann-Whitney p 0.43 to
+0.58). The light requests' **p50 is worse: 358 against 286 µs** (p < 0.01). The old rule,
+blind to which connections are hot, splits them unevenly in about half the arrival orders
+(4 and 2, or 5 and 1) and then gives the worker with fewer hot ones more light ones, whose
+requests wait behind less hot work; the new rule splits the hot ones 3 and 3 every time.
+Raw data: `bench/results/placement/`.
 
 ### HTTPS
 

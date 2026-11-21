@@ -282,10 +282,11 @@ fn mixed(port: u16, secs: u64, seed: u64) {
         // can see the hot ones; only what happens after the last one is
         // open is counted.
         threads.push(thread::spawn(move || {
-            let (mut n, mut lat) = (0u64, Vec::new());
+            let (mut n, mut lat, mut at) = (0u64, Vec::new(), 0);
             while !stop.load(Ordering::Relaxed) {
                 let us = if is_hot { 100 } else { 20 };
-                let Ok((d, _)) = call(&mut s, us) else { break };
+                let Ok((d, w)) = call(&mut s, us) else { break };
+                at = w;
                 if !measuring.load(Ordering::Relaxed) {
                 } else if is_hot {
                     n += 1;
@@ -296,7 +297,7 @@ fn mixed(port: u16, secs: u64, seed: u64) {
                     thread::sleep(Duration::from_millis(20));
                 }
             }
-            (n, lat)
+            (n, lat, is_hot, at)
         }));
         thread::sleep(Duration::from_millis(10));
     }
@@ -306,10 +307,12 @@ fn mixed(port: u16, secs: u64, seed: u64) {
     thread::sleep(Duration::from_secs(secs));
     stop.store(true, Ordering::Relaxed);
     let (mut hot_n, mut lat) = (0, Vec::new());
+    let mut placed = [[0u32; 2]; 8];
     for t in threads {
-        let (n, l) = t.join().unwrap();
+        let (n, l, is_hot, at) = t.join().unwrap();
         hot_n += n;
         lat.extend(l);
+        placed[(at as usize).min(7)][usize::from(!is_hot)] += 1;
     }
     let el = t0.elapsed().as_secs_f64();
     lat.sort();
@@ -321,4 +324,9 @@ fn mixed(port: u16, secs: u64, seed: u64) {
         percentile(&lat, 0.999),
         percentile(&lat, 1.0),
     );
+    // Where the connections ended up: hot/light on each worker.
+    let workers = placed.iter().rposition(|p| p != &[0, 0]).map_or(1, |i| i + 1);
+    for (w, [hot, light]) in placed.iter().take(workers).enumerate() {
+        println!("  worker {w}: {hot} hot, {light} light");
+    }
 }

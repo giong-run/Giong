@@ -10,8 +10,9 @@
   idle ones (it had the fewest tasks); now they go to the worker with room. In
   `bench/placement.sh` (2 workers, 4 vCPUs, medians of 10 rounds), short connections paced
   next to a hot one went from 503 to 170 µs at p99 and the hot connection got 9% more
-  done; with every worker saturated, and with mixed arrivals, the results match the old
-  rule within the spread of the rounds. Nothing is added to the workers' loops: the
+  done; with every worker saturated the results match the old rule within the spread of
+  the rounds. With 6 hot and 18 light connections arriving in random order, the light
+  requests' p50 is worse (358 against 286 µs over 40 rounds; p99 and slower the same). Nothing is added to the workers' loops: the
   accepting listener reads each worker thread's CPU time from the kernel, less the time it
   spent spinning before a sleep (now counted), at most every 5 ms. No connection ever moves
   once it is served
