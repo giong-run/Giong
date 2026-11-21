@@ -2,3 +2,4 @@
 # scripts/hygiene.py reports them apart instead of asking for them to be deleted.
 # Give a reason a later reader can check; remove the line when the reason is gone.
 perf/sq-poll the only copy of the SQPOLL experiment (06ef0aa): measured, left out of main, never had a pull request
+feat/spin-governor governor retest on bare metal (K): the code of closed #186 (92dccf2), restored after the first prune
