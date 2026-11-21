@@ -43,6 +43,8 @@ when it is no longer raised.
 | [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
 | [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
 | [GIONG-E0014](E0014.md) | `ComputeBusy` | the compute lane is full |
+| [GIONG-E0080](E0080.md) | `BudgetFull` | the budget is at its limit |
+| [GIONG-E0081](E0081.md) | `BudgetTooSmall` | a reservation larger than the budget |
 
 ## Network and name resolution
 

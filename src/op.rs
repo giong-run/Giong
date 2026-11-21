@@ -7,6 +7,7 @@ use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::budget::{self, IoSlot};
 use crate::driver::{Io, Start, ZeroCopyHold};
 use crate::runtime;
 
@@ -26,6 +27,9 @@ pub(crate) struct Op<T: 'static> {
     /// What a zero-copy send leaves with the driver when it returns at its
     /// result (a [`ZeroCopyHold`](crate::driver::ZeroCopyHold)).
     hold: Option<Box<ZeroCopyHold>>,
+    /// The I/O slot of the budget the operation runs in, if any: held from
+    /// submission until the kernel completes it (see `Drop`).
+    budget: Option<IoSlot>,
     /// The worker whose driver owns `key`.
     worker_uid: usize,
     /// Operations are tied to one worker thread.
@@ -50,6 +54,7 @@ impl<T: 'static> Op<T> {
             key: None,
             data: Some(data),
             hold: None,
+            budget: None,
             worker_uid: 0,
             _not_send: PhantomData,
         }
@@ -77,7 +82,11 @@ impl<T: 'static> Future for Op<T> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        runtime::with_worker(|w| {
+        if this.key.is_none() && budget::poll_io(&mut this.budget, cx.waker()).is_pending() {
+            // Its budget has as many operations in flight as it may.
+            return Poll::Pending;
+        }
+        let ready = runtime::with_worker(|w| {
             let mut driver = w.driver.borrow_mut();
             loop {
                 let (res, flags) = match this.key {
@@ -132,7 +141,13 @@ impl<T: 'static> Future for Op<T> {
                 let data = this.data.take().expect("operation resources");
                 return Poll::Ready((res, flags, data));
             }
-        })
+        });
+        if ready.is_ready() {
+            // The kernel is done with it: the slot goes back, outside the
+            // driver's borrow, since it may wake another operation's task.
+            this.budget = None;
+        }
+        ready
     }
 }
 
@@ -140,7 +155,12 @@ impl<T: 'static> Drop for Op<T> {
     fn drop(&mut self) {
         // Never submitted, or already completed: nothing is in flight.
         let Some(key) = self.key.take() else { return };
-        let mut data = self.data.take().map(|data| (data, self.hold.take()));
+        // The budget's I/O slot travels with the resources, so that it is
+        // given back when the kernel completes the operation, not now.
+        let mut data = self
+            .data
+            .take()
+            .map(|data| (data, self.hold.take(), self.budget.take()));
         let result_is_fd = self.io.is_some_and(|io| io.result_is_fd());
         let finish = self.io.is_some_and(|io| io.finishes_when_dropped());
         let handed_over = runtime::try_with_worker(|w| {

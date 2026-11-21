@@ -764,6 +764,11 @@ where
     F: Future + 'static,
 {
     let location = std::panic::Location::caller();
+    // Inside a budgeted task the new task is charged to the same budget.
+    let fut = match crate::budget::spawn_inherited(fut, location) {
+        Ok(handle) => return handle,
+        Err(fut) => fut,
+    };
     runtime::with_worker(|w| w.spawn_local(fut, location))
 }
 

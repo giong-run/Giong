@@ -80,6 +80,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
+use crate::budget::ComputeCharge;
 use crate::error::{raise, Code};
 use crate::executor::JoinError;
 pub use crate::pool::PoolStats;
@@ -120,6 +121,7 @@ impl Lanes {
                 nice: 0,
                 stack_size: None,
                 run_inline_on_failure: false,
+                fair: false,
             }),
             compute: Pool::new(PoolConfig {
                 name: "giong-lane-cpu",
@@ -128,6 +130,7 @@ impl Lanes {
                 nice: COMPUTE_NICE,
                 stack_size: None,
                 run_inline_on_failure: false,
+                fair: true,
             }),
             compute_backlog: cfg.compute_backlog,
         }
@@ -165,8 +168,30 @@ impl Lanes {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        // Inside a budgeted task: in the budget's queue, charged to it.
+        if let Some(charge) = crate::budget::charge_compute() {
+            return self.spawn_compute_in(charge, f);
+        }
         let (handle, job) = job(f);
         drop(self.compute.spawn(job));
+        handle
+    }
+
+    /// Queues `f` in the compute queue of the budget `charge` belongs to.
+    /// The charge is given back when `f` returns, or when it is dropped
+    /// without running.
+    pub(crate) fn spawn_compute_in<F, T>(&self, charge: ComputeCharge, f: F) -> BlockingHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (class, weight) = (charge.class(), charge.weight());
+        let (handle, job) = job(move || {
+            let value = f();
+            drop(charge);
+            value
+        });
+        drop(self.compute.spawn_in(class, weight, job));
         handle
     }
 
@@ -175,6 +200,10 @@ impl Lanes {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        // Inside a budgeted task: the budget's limit decides.
+        if let Some(budget) = crate::budget::current() {
+            return budget.try_spawn_compute(f);
+        }
         let (handle, job) = job(f);
         let backlog = self.compute_backlog;
         let mut refused = false;

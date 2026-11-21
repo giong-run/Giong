@@ -40,6 +40,7 @@ fn pool() -> &'static Arc<Pool> {
             nice: 0,
             stack_size: None,
             run_inline_on_failure: true,
+            fair: false,
         })
     })
 }

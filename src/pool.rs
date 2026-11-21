@@ -6,11 +6,18 @@
 //! threads can take, up to the pool's limit, and ends after its idle time
 //! without work: a job that blocks for a long time holds up only its own
 //! thread.
+//!
+//! A pool with [`PoolConfig::fair`] (the compute lane) keeps one queue per
+//! class of jobs, a [`Budget`](crate::budget::Budget) each, and gives the
+//! next free thread to the class that has used the least thread time for
+//! its weight (start-time fair queueing, as Linux's CFS does for threads):
+//! a class with long jobs cannot make another class's short jobs wait for
+//! more than about one of its jobs per thread. Other pools are plain FIFOs.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::runtime::lock;
 
@@ -33,10 +40,116 @@ pub(crate) struct PoolConfig {
     /// When no thread can be started and none exists: `true` runs the
     /// queued jobs on the calling thread, `false` drops them.
     pub(crate) run_inline_on_failure: bool,
+    /// One queue per class, served by thread time used for the class's
+    /// weight, instead of one FIFO.
+    pub(crate) fair: bool,
+}
+
+/// The class of jobs queued with [`Pool::spawn`]: no budget.
+pub(crate) const NO_CLASS: u64 = 0;
+
+/// Virtual time is thread time in nanoseconds times this, over the weight.
+const WEIGHT_SCALE: u64 = 1024;
+
+struct Class {
+    jobs: VecDeque<Job>,
+    /// Thread time this class has used, scaled by [`WEIGHT_SCALE`] over its
+    /// weight. Only compared with other classes' virtual time.
+    vtime: u64,
+    weight: u64,
+    /// Jobs of the class running now.
+    running: usize,
+}
+
+/// The queue of a pool: one FIFO, or one per class served fairly.
+#[derive(Default)]
+struct Queue {
+    /// The single FIFO of a pool that is not fair.
+    fifo: VecDeque<Job>,
+    classes: HashMap<u64, Class>,
+    /// Classes with queued jobs, by virtual time.
+    ready: BTreeSet<(u64, u64)>,
+    /// The virtual time of the job started last: a class that had nothing
+    /// queued starts from here, so time it spent idle is no credit.
+    floor: u64,
+    len: usize,
+}
+
+impl Queue {
+    fn push(&mut self, fair: bool, class: u64, weight: u32, job: Job) {
+        self.len += 1;
+        if !fair {
+            self.fifo.push_back(job);
+            return;
+        }
+        let floor = self.floor;
+        let c = self.classes.entry(class).or_insert_with(|| Class {
+            jobs: VecDeque::new(),
+            vtime: floor,
+            weight: 1,
+            running: 0,
+        });
+        c.weight = u64::from(weight.max(1));
+        if c.jobs.is_empty() {
+            c.vtime = c.vtime.max(floor);
+            self.ready.insert((c.vtime, class));
+        }
+        c.jobs.push_back(job);
+    }
+
+    fn pop(&mut self, fair: bool) -> Option<(u64, Job)> {
+        if !fair {
+            let job = self.fifo.pop_front()?;
+            self.len -= 1;
+            return Some((NO_CLASS, job));
+        }
+        let (vtime, class) = self.ready.pop_first()?;
+        let c = self.classes.get_mut(&class).expect("a ready class exists");
+        let job = c.jobs.pop_front().expect("a ready class has a job");
+        c.running += 1;
+        if !c.jobs.is_empty() {
+            self.ready.insert((vtime, class));
+        }
+        self.floor = self.floor.max(vtime);
+        self.len -= 1;
+        Some((class, job))
+    }
+
+    /// A job of `class` ran for `took`.
+    fn charge(&mut self, class: u64, took: Duration) {
+        let floor = self.floor;
+        let Some(c) = self.classes.get_mut(&class) else {
+            return;
+        };
+        c.running -= 1;
+        let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        let next = c
+            .vtime
+            .saturating_add(nanos.saturating_mul(WEIGHT_SCALE) / c.weight);
+        if !c.jobs.is_empty() {
+            self.ready.remove(&(c.vtime, class));
+            self.ready.insert((next, class));
+        }
+        c.vtime = next;
+        if c.jobs.is_empty() && c.running == 0 && c.vtime <= floor {
+            // Nothing to remember: it would start from the floor anyway.
+            self.classes.remove(&class);
+        }
+    }
+
+    fn take_all(&mut self) -> VecDeque<Job> {
+        let mut jobs = std::mem::take(&mut self.fifo);
+        for c in self.classes.values_mut() {
+            jobs.append(&mut c.jobs);
+        }
+        self.ready.clear();
+        self.len = 0;
+        jobs
+    }
 }
 
 struct State {
-    jobs: VecDeque<Job>,
+    jobs: Queue,
     threads: usize,
     idle: usize,
     /// Jobs finished, for [`PoolStats`].
@@ -70,7 +183,7 @@ impl Pool {
     pub(crate) fn new(cfg: PoolConfig) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
-                jobs: VecDeque::new(),
+                jobs: Queue::default(),
                 threads: 0,
                 idle: 0,
                 completed: 0,
@@ -89,6 +202,12 @@ impl Pool {
         self.spawn_if(job, |_| true)
     }
 
+    /// Queues `job` in `class` with `weight` (a fair pool's share). Gives it
+    /// back if the pool was stopped.
+    pub(crate) fn spawn_in(self: &Arc<Self>, class: u64, weight: u32, job: Job) -> Result<(), Job> {
+        self.queue(class, weight, job, |_| true)
+    }
+
     /// Queues `job` if `admit(jobs already waiting)` agrees, under the same
     /// lock that queues it. Gives the job back if the pool was stopped or
     /// `admit` said no.
@@ -97,16 +216,26 @@ impl Pool {
         job: Job,
         admit: impl FnOnce(usize) -> bool,
     ) -> Result<(), Job> {
+        self.queue(NO_CLASS, 1, job, admit)
+    }
+
+    fn queue(
+        self: &Arc<Self>,
+        class: u64,
+        weight: u32,
+        job: Job,
+        admit: impl FnOnce(usize) -> bool,
+    ) -> Result<(), Job> {
         let mut state = lock(&self.state);
-        if state.stopped || !admit(state.jobs.len()) {
+        if state.stopped || !admit(state.jobs.len) {
             return Err(job);
         }
-        state.jobs.push_back(job);
+        state.jobs.push(self.cfg.fair, class, weight, job);
         // Each queued job needs a thread of its own. An idle thread is
         // counted as idle until it runs again, so jobs queued before it wakes
         // up must not all count on it: one that blocks would hold up the
         // rest.
-        if state.jobs.len() <= state.idle {
+        if state.jobs.len <= state.idle {
             drop(state);
             self.work.notify_one();
             return Ok(());
@@ -129,7 +258,7 @@ impl Pool {
                 // No thread will ever take them. Run what is queued here
                 // rather than leave the operations hanging, or drop it,
                 // which cancels each job's handle.
-                let jobs = std::mem::take(&mut state.jobs);
+                let jobs = state.jobs.take_all();
                 drop(state);
                 if self.cfg.run_inline_on_failure {
                     for job in jobs {
@@ -155,10 +284,14 @@ impl Pool {
         }
         let mut state = lock(&self.state);
         loop {
-            if let Some(job) = state.jobs.pop_front() {
+            if let Some((class, job)) = state.jobs.pop(self.cfg.fair) {
                 drop(state);
+                let start = self.cfg.fair.then(Instant::now);
                 job();
                 state = lock(&self.state);
+                if let Some(start) = start {
+                    state.jobs.charge(class, start.elapsed());
+                }
                 state.completed += 1;
                 continue;
             }
@@ -173,7 +306,7 @@ impl Pool {
                 .unwrap_or_else(|e| e.into_inner());
             state = next;
             state.idle -= 1;
-            if timeout.timed_out() && state.jobs.is_empty() {
+            if timeout.timed_out() && state.jobs.len == 0 {
                 state.threads -= 1;
                 return;
             }
@@ -187,7 +320,7 @@ impl Pool {
         let jobs = {
             let mut state = lock(&self.state);
             state.stopped = true;
-            std::mem::take(&mut state.jobs)
+            state.jobs.take_all()
         };
         self.work.notify_all();
         jobs
@@ -198,7 +331,7 @@ impl Pool {
         PoolStats {
             threads: state.threads,
             busy: state.threads - state.idle,
-            queued: state.jobs.len(),
+            queued: state.jobs.len,
             completed: state.completed,
             max_threads: self.cfg.max_threads,
         }

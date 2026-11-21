@@ -716,6 +716,16 @@ impl Worker {
                 }
             }
 
+            // Resources of operations cancelled in this turn that the kernel
+            // no longer uses (the epoll driver frees them at once): dropping
+            // them may give back a budget's I/O slot and wake a task, which
+            // must run before the worker sleeps.
+            let graveyard = self.driver.borrow_mut().take_graveyard();
+            if !graveyard.is_empty() {
+                drop(graveyard);
+                continue;
+            }
+
             let wait = match self.timers.borrow().next_deadline() {
                 None => Park::Wait(None),
                 Some(deadline) => {

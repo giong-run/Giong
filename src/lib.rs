@@ -90,6 +90,7 @@ mod pool;
 mod runtime;
 mod slab;
 
+pub mod budget;
 pub mod error;
 pub mod fs;
 pub mod lane;
