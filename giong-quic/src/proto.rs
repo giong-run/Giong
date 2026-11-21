@@ -1374,7 +1374,7 @@ fn handshake_end(d: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::handshake_end;
+    use super::{add_waker, handshake_end, Arc, Waker};
 
     fn long(ty: u8, payload: usize) -> Vec<u8> {
         let mut p = vec![0xc0 | ty << 4, 0, 0, 0, 1, 4, 1, 2, 3, 4, 0];
