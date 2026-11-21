@@ -95,6 +95,9 @@ struct Conn {
     closing: Arc<AtomicBool>,
     /// Server: the peer opened a stream in 0-RTT data.
     saw_early: bool,
+    /// Handed over early (0-RTT) and its handshake not over yet: the
+    /// client's address is not validated (counted in `State::unvalidated`).
+    unvalidated: bool,
 }
 
 /// A stream as a handle knows it.
@@ -155,6 +158,11 @@ struct State {
     closed: bool,
     /// Incoming connections the application has not taken yet.
     unaccepted: usize,
+    /// Connections handed over early whose clients' addresses are not
+    /// validated yet. They count with `unaccepted` towards Retry and
+    /// refusal: a recorded 0-RTT flight replayed from spoofed addresses
+    /// would otherwise take connections without a limit.
+    unvalidated: usize,
     /// Server: the TLS configuration accepts early data.
     early_data: bool,
     scratch: Vec<u8>,
@@ -268,6 +276,7 @@ impl State {
             early_bi: VecDeque::new(),
             closing,
             saw_early: false,
+            unvalidated: false,
         });
         if let Some(c) = &mut self.conns[slot] {
             // The first datagram may hold 0-RTT packets after the Initial.
@@ -338,9 +347,10 @@ impl State {
                         return;
                     }
                     self.scratch.clear();
-                    let answer = if self.unaccepted >= MAX_UNACCEPTED {
+                    let pending = self.unaccepted + self.unvalidated;
+                    let answer = if pending >= MAX_UNACCEPTED {
                         Some(self.ep.refuse(inc, &mut self.scratch))
-                    } else if self.unaccepted >= RETRY_ABOVE && !inc.remote_address_validated() {
+                    } else if pending >= RETRY_ABOVE && !inc.remote_address_validated() {
                         match self.ep.retry(inc, &mut self.scratch) {
                             Ok(t) => Some(t),
                             Err(e) => {
@@ -449,9 +459,17 @@ impl State {
                             &mut self.accept_waker,
                             now,
                         );
+                        if conn.handed && !conn.connected && !conn.unvalidated {
+                            conn.unvalidated = true;
+                            self.unvalidated += 1;
+                        }
                     }
                     Event::Connected => {
                         conn.connected = true;
+                        if conn.unvalidated {
+                            conn.unvalidated = false;
+                            self.unvalidated -= 1;
+                        }
                         if conn.incoming && !conn.handed {
                             hand_over(
                                 conn,
@@ -524,6 +542,9 @@ impl State {
         if conn.c.is_drained() && conn.refs == 0 {
             if conn.incoming && !conn.handed {
                 self.unaccepted -= 1;
+            }
+            if conn.unvalidated {
+                self.unvalidated -= 1;
             }
             self.conns[i] = None;
             self.free.push(i);
@@ -743,8 +764,10 @@ pub(crate) fn bind(
     // On a wildcard bind, each datagram's local address, so that the answer
     // leaves from the address the peer sent to: on a machine with several
     // addresses the route may pick another, which the peer drops.
+    // Where the platform cannot report it, the route picks the source, as
+    // before: the bind itself must not fail for that.
     if addr.ip().is_unspecified() {
-        sock.set_recv_local_addr(true)?;
+        let _ = sock.set_recv_local_addr(true);
     }
     let segments = if sock.gso_supported() {
         GSO_SEGMENTS
@@ -781,6 +804,7 @@ pub(crate) fn bind(
             wake: false,
             closed: false,
             unaccepted: 0,
+            unvalidated: 0,
             early_data,
             scratch: Vec::with_capacity(65_536),
             sends: Vec::new(),

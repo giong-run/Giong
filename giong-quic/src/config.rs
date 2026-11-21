@@ -137,10 +137,15 @@ impl ServerConfig {
     /// Early data can be replayed: someone who recorded it can send it
     /// again in a new connection, and the server cannot tell. What came in
     /// it is marked ([`RecvStream::is_early`](crate::RecvStream::is_early));
-    /// act on it only if doing it twice is harmless (RFC 8470). rustls's
-    /// default session cache lets each ticket carry early data once, on
-    /// this server; servers behind one address that do not share it can
-    /// each take the same early data.
+    /// act on it only if doing it twice is harmless (RFC 8470). rustls
+    /// takes early data only on resumptions from its session cache (never
+    /// with a stateless `ticketer`), which lets each ticket carry it once
+    /// on this server, every worker sharing the configuration's cache;
+    /// servers behind one address that do not share it can each take the
+    /// same early data. Until such a client's handshake ends its address
+    /// is not validated (a forged source can replay a recorded flight),
+    /// and those connections count towards the bound past which clients
+    /// must prove their address with a Retry.
     pub fn early_data(mut self, on: bool) -> Self {
         let mut tls = (*self.tls).clone();
         // QUIC allows no other values (RFC 9001, section 4.6.1).

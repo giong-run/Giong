@@ -948,3 +948,94 @@ fn a_server_with_the_same_reset_key_ends_connections_it_does_not_know() {
         })
         .unwrap();
 }
+
+/// Clients that resume with 0-RTT data and never finish their handshakes
+/// (from addresses that never answer, as when a recorded flight is
+/// replayed to servers that do not share one session cache): past the
+/// Retry bound, those handed over early but not validated make the next
+/// unvalidated clients prove their address, instead of each taking a
+/// connection.
+#[test]
+fn early_connections_that_never_validate_are_bounded() {
+    giong::Builder::new()
+        .workers(1)
+        .recv_buffers(512, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let config = ServerConfig::new(tls).unwrap().early_data(true);
+            let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+            let addr = server.local_addr().unwrap();
+            let accepted = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let count = accepted.clone();
+            giong::spawn(async move {
+                let mut held = Vec::new();
+                while let Some(conn) = server.accept().await {
+                    count.set(count.get() + 1);
+                    held.push(conn);
+                }
+            });
+            let mut client_tls = client_tls(ca);
+            client_tls.enable_early_data = true;
+            let cfg = ClientConfig::new(client_tls.clone())
+                .unwrap()
+                .early_data(true);
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let crypto =
+                quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls))
+                    .unwrap();
+            let qcfg = quinn_proto::ClientConfig::new(Arc::new(crypto));
+            let mut ep = quinn_proto::Endpoint::new(Default::default(), None, true, None);
+            // First flights with a request in 0-RTT, one ticket each; real
+            // connections fill the shared ticket store when it runs out.
+            let mut flights = Vec::new();
+            while flights.len() < 150 {
+                let now = std::time::Instant::now();
+                let (_, mut qconn) = ep.connect(now, qcfg.clone(), addr, "localhost").unwrap();
+                let Some(id) = qconn.streams().open(quinn_proto::Dir::Bi) else {
+                    let conn = client.connect_early(addr, "localhost", &cfg).await.unwrap();
+                    conn.handshake().await.unwrap();
+                    giong::time::sleep(Duration::from_millis(20)).await;
+                    conn.close(0, b"");
+                    continue;
+                };
+                qconn.send_stream(id).write(b"GET /").unwrap();
+                let mut flight = Vec::new();
+                loop {
+                    let mut buf = Vec::new();
+                    match qconn.poll_transmit(now, 1, &mut buf) {
+                        Some(t) => {
+                            buf.truncate(t.size);
+                            flight.push(buf);
+                        }
+                        None => break,
+                    }
+                }
+                flights.push(flight);
+            }
+            giong::time::sleep(Duration::from_millis(100)).await;
+            accepted.set(0);
+            // Each from an address that never answers.
+            let mut sockets = Vec::new();
+            for (i, flight) in flights.iter().enumerate() {
+                let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                for datagram in flight {
+                    sock.send_to(datagram, addr).unwrap();
+                }
+                sockets.push(sock);
+                if i % 25 == 0 {
+                    giong::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            giong::time::sleep(Duration::from_millis(300)).await;
+            let taken = accepted.get();
+            assert!(
+                taken > 0,
+                "none was handed over early: the test checks nothing"
+            );
+            assert!(
+                taken <= 80,
+                "{taken} unvalidated clients took a connection each"
+            );
+        })
+        .unwrap();
+}

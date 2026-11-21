@@ -15,7 +15,6 @@
 
 use std::cell::Cell;
 use std::future::{poll_fn, Future};
-use std::net::SocketAddr;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -74,7 +73,6 @@ fn fatal(code: Code, what: &'static str) -> Stop {
 struct Conn {
     quic: Connection,
     cfg: Config,
-    peer: SocketAddr,
     /// A connection error was sent, or the connection was closed.
     closed: Cell<bool>,
     /// Which of the client's critical streams exist: control (1), QPACK
@@ -279,7 +277,6 @@ async fn race<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> 
 /// Serves one HTTP/3 connection until it ends.
 pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc<H>) {
     let conn = Rc::new(Conn {
-        peer: quic.remote_addr(),
         quic,
         cfg,
         closed: Cell::new(false),
@@ -688,7 +685,10 @@ async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
     let block = r.exact(header.len as usize).await?;
     let mut builder = Builder::with_scratch(max_head, Vec::new()).http3();
     qpack::decode(&block, |name, value| builder.field(name, value))?;
-    Ok(builder.finish(Some(conn.peer)))
+    // Read for each request: a client that moves (a NAT rebinding, or a
+    // new network) is seen where it is now. For a request that came in
+    // 0-RTT data the address is not validated yet and may be forged.
+    Ok(builder.finish(Some(conn.quic.remote_addr())))
 }
 
 /// A handler's future, on the heap. A panic of the handler becomes the
