@@ -344,12 +344,14 @@ fn a_send_to_a_peer_that_has_gone_does_not_fail_later_receives() {
 }
 
 /// The sends that do not wait rely on the socket being non-blocking from
-/// the start, before the driver has seen it.
-#[cfg(windows)]
+/// the start, before the driver has seen it: on Windows, where no send has
+/// a flag that says so. (One name on every system, for the simulator's
+/// index; the body is Windows'.)
 #[test]
 fn a_new_socket_is_non_blocking_before_its_first_operation() {
-    use std::os::windows::io::AsRawSocket;
+    #[cfg(windows)]
     giong::block_on(async {
+        use std::os::windows::io::AsRawSocket;
         let (sock, _) = socket();
         let mut byte = [0u8; 1];
         // A blocking socket would wait here for a datagram that never comes.
