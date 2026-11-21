@@ -22,10 +22,10 @@ jobs:
         run: |
           cargo test --release -p giong --test wake --no-run
           fails=0
+          set -o pipefail
           for i in $(seq 1 20); do
             echo "== $i"
-            cargo test --release -q -p giong --test wake -- --ignored 2>&1 | grep -E "test |left|right" || true
-            cargo test --release -q -p giong --test wake -- --ignored >/dev/null 2>&1 || fails=$((fails+1))
+            cargo test --release -q -p giong --test wake -- --ignored --nocapture 2>&1 | grep -E "test |left|right|iteration|late" || fails=$((fails+1))
           done
           echo "failed runs: $fails"
           [ "$fails" = 0 ]
