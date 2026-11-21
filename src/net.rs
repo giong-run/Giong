@@ -582,8 +582,9 @@ impl StreamSocket {
     }
 
     /// For [`recv_into`](Self::recv_into): what the pooled receive holds, in
-    /// order, then `Empty` once it is stopped and holds nothing. The epoll
-    /// driver receives only when asked, so it never holds anything.
+    /// order, then `Empty` once it is stopped and holds nothing. The readiness
+    /// drivers (epoll, kqueue) receive only when asked, so they never hold
+    /// anything.
     fn poll_stop_recv(&self, cx: &mut Context<'_>) -> Poll<Stopped> {
         runtime::with_worker(|w| {
             let key = self.recv.key(w);
