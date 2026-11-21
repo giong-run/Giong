@@ -782,7 +782,9 @@ impl Client {
     ///
     /// With HTTP/3 (`ClientBuilder::http3_prior_knowledge`, or an `Alt-Svc`
     /// alternative the client already knows), the origin gets its QUIC
-    /// connection instead, and this returns [`Version::Http3`].
+    /// connection instead, and this returns [`Version::Http3`]. An
+    /// alternative that does not answer within the short time requests give
+    /// it leaves the origin to TCP, as it leaves requests.
     ///
     /// Returns at once when the origin has a connection already: an HTTP/2
     /// one that can take requests ([`Version::Http2`]), or an idle HTTP/1.1
@@ -800,18 +802,25 @@ impl Client {
         let route = self.route(&url);
         let run = async {
             // An origin requests go to over HTTP/3 gets its QUIC connection.
+            // A known alternative is tried as requests try it: briefly, with
+            // TCP to fall back on.
             #[cfg(feature = "unstable-http3")]
             if let (Some(http3), true, None) = (&config.http3, url.https, &route.proxy) {
                 let origin = url.origin();
-                let port = if http3.prior_knowledge {
-                    Some(origin.port)
-                } else {
-                    self.h3_alternative(&origin)
-                };
-                if let Some(port) = port {
-                    self.h3_connection(&http3.quic, &origin, port, config.connect_timeout)
+                if http3.prior_knowledge {
+                    self.h3_connection(&http3.quic, &origin, origin.port, config.connect_timeout)
                         .await?;
                     return Ok(Version::Http3);
+                }
+                if let Some(port) = self.h3_alternative(&origin) {
+                    let within = config.connect_timeout.min(ALTERNATIVE_TIMEOUT);
+                    if self
+                        .h3_connection(&http3.quic, &origin, port, within)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(Version::Http3);
+                    }
                 }
             }
             loop {

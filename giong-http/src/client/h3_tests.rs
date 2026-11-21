@@ -1020,6 +1020,26 @@ mod alt_svc {
     }
 
     #[test]
+    fn preconnect_takes_a_known_alternative_or_falls_back_to_tcp() {
+        run(|| async {
+            let (url, client) = origin(|port| format!("h3=\":{port}\"; ma=60"), true);
+            // Nothing known yet: TCP.
+            assert_eq!(client.preconnect(&url).await.unwrap(), Version::Http2);
+            client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(client.preconnect(&url).await.unwrap(), Version::Http3);
+
+            // An alternative that does not answer: TCP, after one short wait.
+            let (url, client) = origin(|port| format!("h3=\":{port}\""), false);
+            client.get(&format!("{url}/")).send().await.unwrap();
+            let started = std::time::Instant::now();
+            assert_eq!(client.preconnect(&url).await.unwrap(), Version::Http2);
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+        });
+    }
+
+    #[test]
     fn a_new_advertisement_replaces_the_old_one() {
         run(|| async {
             let (url, client) = origin(|port| format!("h3=\":{port}\"; ma=60"), true);
