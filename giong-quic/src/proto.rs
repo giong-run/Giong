@@ -113,7 +113,8 @@ impl Conn {
     /// Server: takes the bidirectional streams that the datagram just
     /// handled opened, when it came before the end of the handshake.
     fn take_early(&mut self, handshaking: bool) {
-        if self.incoming && self.early && handshaking {
+        // Without 0-RTT keys nothing came in early data.
+        if self.incoming && self.early && handshaking && self.c.has_0rtt() {
             while let Some(id) = self.c.streams().accept(Dir::Bi) {
                 self.early_bi.push_back(id);
                 self.saw_early = true;
@@ -264,13 +265,37 @@ impl State {
         let seg = seg.unwrap_or(data.len()).max(1);
         let ecn = EcnCodepoint::from_bits(ecn);
         while !data.is_empty() {
-            let one = data.split_to(seg.min(data.len()));
+            let mut one = data.split_to(seg.min(data.len()));
+            // With early data on, the 1-RTT packets that follow the
+            // client's Finished in one datagram are handled apart, after
+            // the handshake has ended, so that their streams do not count
+            // as opened in 0-RTT data.
+            let rest = if self.early_data {
+                handshake_end(&one).map(|end| one.split_off(end))
+            } else {
+                None
+            };
+            self.handle_one(now, from, ecn, one);
+            if let Some(rest) = rest {
+                self.handle_one(now, from, ecn, rest);
+            }
+        }
+    }
+
+    fn handle_one(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        one: BytesMut,
+    ) {
+        {
             self.scratch.clear();
             match self.ep.handle(now, from, None, ecn, one, &mut self.scratch) {
                 Some(DatagramEvent::NewConnection(inc)) => {
                     if self.closed {
                         self.ep.ignore(inc);
-                        continue;
+                        return;
                     }
                     self.scratch.clear();
                     match self.ep.accept(inc, now, &mut self.scratch, None) {
@@ -294,9 +319,6 @@ impl State {
                             let handshaking = c.c.is_handshaking();
                             c.c.handle_event(ev);
                             c.adopt();
-                            // A datagram that ends the handshake may also
-                            // hold 1-RTT packets: their streams count as
-                            // early too, which errs on the safe side.
                             c.take_early(handshaking);
                             self.mark(slot);
                         }
@@ -1080,5 +1102,95 @@ impl quinn_proto::congestion::Controller for ClosableController {
 
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
+    }
+}
+
+/// Where the last long-header Handshake packet of a datagram ends, when
+/// short-header (1-RTT) packets follow it (RFC 9000, sections 12.2 and
+/// 17.2). `None` when there is no such boundary or the datagram cannot be
+/// read; quinn-proto then gets it whole.
+fn handshake_end(d: &[u8]) -> Option<usize> {
+    fn varint(d: &[u8], at: &mut usize) -> Option<u64> {
+        let first = *d.get(*at)?;
+        let len = 1usize << (first >> 6);
+        let bytes = d.get(*at..*at + len)?;
+        let mut v = u64::from(first & 0x3f);
+        for b in &bytes[1..] {
+            v = v << 8 | u64::from(*b);
+        }
+        *at += len;
+        Some(v)
+    }
+    let mut at = 0;
+    let mut end = None;
+    while at < d.len() {
+        let first = d[at];
+        if first & 0x80 == 0 {
+            // A short header runs to the end of the datagram.
+            return end.filter(|&e| e == at);
+        }
+        let version = u32::from_be_bytes(d.get(at + 1..at + 5)?.try_into().ok()?);
+        if version != 1 {
+            return None;
+        }
+        let ty = (first >> 4) & 0x03;
+        let mut p = at + 5;
+        let dcid = usize::from(*d.get(p)?);
+        p += 1 + dcid;
+        let scid = usize::from(*d.get(p)?);
+        p += 1 + scid;
+        if ty == 0 {
+            let token = usize::try_from(varint(d, &mut p)?).ok()?;
+            p = p.checked_add(token)?;
+        }
+        if ty == 3 {
+            // Retry: no length, and nothing follows it.
+            return None;
+        }
+        let len = usize::try_from(varint(d, &mut p)?).ok()?;
+        at = p.checked_add(len)?;
+        if at > d.len() {
+            return None;
+        }
+        if ty == 2 {
+            end = Some(at);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handshake_end;
+
+    fn long(ty: u8, payload: usize) -> Vec<u8> {
+        let mut p = vec![0xc0 | ty << 4, 0, 0, 0, 1, 4, 1, 2, 3, 4, 0];
+        if ty == 0 {
+            p.push(0);
+        }
+        p.extend_from_slice(&[0x40 | (payload >> 8) as u8, payload as u8]);
+        p.extend(std::iter::repeat(0).take(payload));
+        p
+    }
+
+    #[test]
+    fn the_boundary_after_a_handshake_packet_is_found() {
+        let mut d = long(0, 30);
+        d.extend(long(2, 50));
+        let end = d.len();
+        d.extend_from_slice(&[0x40, 1, 2, 3, 4, 9, 9, 9]);
+        assert_eq!(handshake_end(&d), Some(end));
+        // Nothing to split: no 1-RTT packet, or no Handshake packet before it.
+        assert_eq!(handshake_end(&d[..end]), None);
+        let mut zero_rtt = long(0, 30);
+        zero_rtt.extend(long(1, 40));
+        zero_rtt.extend_from_slice(&[0x40, 1, 2]);
+        assert_eq!(handshake_end(&zero_rtt), None);
+        // A length past the end, or another version.
+        assert_eq!(handshake_end(&d[..end - 1]), None);
+        let mut other = d.clone();
+        other[4] = 2;
+        assert_eq!(handshake_end(&other), None);
+        assert_eq!(handshake_end(&[]), None);
     }
 }

@@ -203,6 +203,9 @@ fn a_resumed_client_sends_safe_requests_in_early_data_and_waits_with_the_others(
         // The first connection gets a session ticket and sends nothing early.
         let first = client();
         assert_eq!(early(&first, false).await, "false");
+        // A POST on a connection without 0-RTT is never taken for early
+        // data, even when it shares a datagram with the client's Finished.
+        assert_eq!(early(&first, true).await, "false");
         drop(first);
 
         // A new connection resumes: the GET goes out in early data, the
@@ -212,6 +215,7 @@ fn a_resumed_client_sends_safe_requests_in_early_data_and_waits_with_the_others(
         let post = giong::spawn(early(&second, true));
         assert_eq!(get.await.unwrap(), "true");
         assert_eq!(post.await.unwrap(), "false");
+        assert_eq!(early(&second, true).await, "false");
         drop(second);
 
         // A server that refuses the early data gets the request again
