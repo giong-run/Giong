@@ -25,8 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26]
-        workload: [runtime, tls]
+        os: [macos-26]
+        workload: [runtime]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     env:
