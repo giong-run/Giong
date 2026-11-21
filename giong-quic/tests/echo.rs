@@ -603,3 +603,51 @@ fn a_server_without_early_data_waits_for_the_handshake() {
         })
         .unwrap();
 }
+
+#[test]
+fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
+    giong::Builder::new()
+        .workers(1)
+        .recv_buffers(512, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            // Nobody accepts on this endpoint.
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let client =
+                std::rc::Rc::new(Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap());
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let (mut made, mut refused) = (Vec::new(), 0);
+            // In waves, so that the client's own socket keeps up.
+            for _ in 0..12 {
+                let tasks: Vec<_> = (0..100)
+                    .map(|_| {
+                        let (client, cfg) = (client.clone(), cfg.clone());
+                        giong::spawn(async move {
+                            giong::time::timeout(
+                                Duration::from_secs(10),
+                                client.connect(addr, "localhost", &cfg),
+                            )
+                            .await
+                        })
+                    })
+                    .collect();
+                for t in tasks {
+                    match t.await.unwrap().expect("a connect never ends") {
+                        Ok(conn) => made.push(conn),
+                        Err(e) => {
+                            assert!(e.to_string().contains("refused"), "{e}");
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!((made.len(), refused), (1024, 176));
+            drop(server);
+        })
+        .unwrap();
+}

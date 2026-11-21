@@ -34,6 +34,12 @@ use crate::route::{self, Forwarded, Member};
 const GSO_SEGMENTS: usize = 10;
 /// Datagrams handled before the driver runs connections again.
 const RECV_BATCH: usize = 64;
+/// Connections a server endpoint holds that the application has not taken
+/// with `accept` yet, handshakes included. More are refused
+/// (CONNECTION_REFUSED), so that a flood of handshakes, or an application
+/// that stopped accepting (`max_connections` reached), cannot make the
+/// endpoint hold connections without bound.
+const MAX_UNACCEPTED: usize = 1024;
 
 pub(crate) struct Shared {
     sock: UdpSocket,
@@ -146,6 +152,8 @@ struct State {
     wake: bool,
     /// The `Endpoint` handle is gone: no new connections.
     closed: bool,
+    /// Incoming connections the application has not taken yet.
+    unaccepted: usize,
     /// Server: the TLS configuration accepts early data.
     early_data: bool,
     scratch: Vec<u8>,
@@ -210,6 +218,7 @@ impl State {
         incoming: bool,
         early: bool,
     ) -> usize {
+        self.unaccepted += usize::from(incoming);
         let slot = self.free.pop().unwrap_or_else(|| {
             self.conns.push(None);
             self.conns.len() - 1
@@ -295,6 +304,14 @@ impl State {
                 Some(DatagramEvent::NewConnection(inc)) => {
                     if self.closed {
                         self.ep.ignore(inc);
+                        return;
+                    }
+                    if self.unaccepted >= MAX_UNACCEPTED {
+                        self.scratch.clear();
+                        let t = self.ep.refuse(inc, &mut self.scratch);
+                        let d = std::mem::take(&mut self.scratch);
+                        self.out(t.destination, &d[..t.size], 0, 0);
+                        self.scratch = d;
                         return;
                     }
                     self.scratch.clear();
@@ -454,6 +471,9 @@ impl State {
             }
         }
         if conn.c.is_drained() && conn.refs == 0 {
+            if conn.incoming && !conn.handed {
+                self.unaccepted -= 1;
+            }
             self.conns[i] = None;
             self.free.push(i);
         }
@@ -668,6 +688,7 @@ pub(crate) fn bind(
             driver_waker: None,
             wake: false,
             closed: false,
+            unaccepted: 0,
             early_data,
             scratch: Vec::with_capacity(65_536),
             sends: Vec::new(),
@@ -697,6 +718,7 @@ impl Shared {
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             if let Some(h) = st.accepted.pop_front() {
+                st.unaccepted -= 1;
                 return Poll::Ready(Some(h));
             }
             if st.closed {
