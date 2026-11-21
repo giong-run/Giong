@@ -1385,7 +1385,10 @@ impl Epoll {
                         libc::read(self.wake_fd, &mut count as *mut u64 as *mut libc::c_void, 8)
                     };
                 }
-                DONE => {} // collected below
+                // Collected below; a ring left over from results that
+                // were already taken is reset, or every wait would end
+                // at once.
+                DONE => self.completions.quiet(),
                 token => {
                     let fd = token as u32 as usize;
                     let gen = (token >> 32) as u32;
@@ -1567,4 +1570,40 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A blocking job that finishes while its worker takes the results
+    /// rings the bell after the results are gone. The next wait sees the
+    /// ring and resets it: the one after waits again.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call epoll_wait")]
+    fn a_late_ring_of_the_blocking_threads_does_not_end_every_wait() {
+        // SAFETY: plain syscall; the result is checked and closed below.
+        let wake_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(wake_fd >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: a fresh descriptor we own; it outlives the driver.
+        let wake = unsafe { OwnedFd::from_raw_fd(wake_fd) };
+        let mut driver = Epoll::new(BufPool::new(2, 64).unwrap(), wake.as_raw_fd()).unwrap();
+        driver.completions.push(usize::MAX, 0);
+        let mut taken = Vec::new();
+        driver.completions.take(&mut taken);
+        assert_eq!(taken.len(), 1);
+        // The ring of a job whose result was already taken.
+        driver.completions.ring();
+        driver.park(Park::Wait(Some(Duration::from_millis(1))));
+        let wait = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        driver.park(Park::Wait(Some(wait)));
+        assert!(
+            start.elapsed() >= wait - Duration::from_millis(5),
+            "{:?}",
+            start.elapsed()
+        );
+        drop(driver);
+        drop(wake);
+    }
 }
