@@ -1109,3 +1109,87 @@ fn finishing_a_stream_the_peer_stopped_gives_its_code() {
         })
         .unwrap();
 }
+
+/// A relay from a local address to `target`, which can be switched.
+fn switchable_relay(target: Arc<std::sync::Mutex<SocketAddr>>) -> SocketAddr {
+    let front = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let back = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let addr = front.local_addr().unwrap();
+    let client = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (front, back, client) = (front.clone(), back.clone(), client.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok((n, from)) = front.recv_from(&mut buf) {
+                *client.lock().unwrap() = Some(from);
+                let to = *target.lock().unwrap();
+                let _ = back.send_to(&buf[..n], to);
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok((n, _)) = back.recv_from(&mut buf) {
+            if let Some(to) = *client.lock().unwrap() {
+                let _ = front.send_to(&buf[..n], to);
+            }
+        }
+    });
+    addr
+}
+
+/// After a restart with fewer workers: a client whose connection IDs name
+/// a worker that has no endpoint any more is still told at once that its
+/// connection is gone (a stateless reset with the shared key).
+#[test]
+fn a_connection_id_of_a_worker_that_is_gone_gets_a_stateless_reset() {
+    let (tls, ca) = server_tls();
+    let key = [9u8; 32];
+    // The new server: two workers, an endpoint on worker 1 only.
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let second: SocketAddr = ([127, 0, 0, 1], port).into();
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let new_tls = tls.clone();
+    std::thread::spawn(move || {
+        rt.run(move |_| {
+            let tls = new_tls.clone();
+            async move {
+                if giong::worker_id() == 1 {
+                    let config = ServerConfig::new(tls).unwrap().stateless_reset_key(key);
+                    let ep = Endpoint::server(second, config).unwrap();
+                    serve(ep).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            }
+        })
+        .unwrap();
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            // The old server: its connection IDs name worker 0.
+            let config = ServerConfig::new(tls).unwrap().stateless_reset_key(key);
+            let ep = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+            let first = ep.local_addr().unwrap();
+            giong::spawn(serve(ep));
+            let target = Arc::new(std::sync::Mutex::new(first));
+            let relay = switchable_relay(target.clone());
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = client.connect(relay, "localhost", &cfg).await.unwrap();
+            assert_eq!(echo_on(&conn, b"abc").await.unwrap(), b"cba");
+            *target.lock().unwrap() = second;
+            let ended = giong::time::timeout(Duration::from_secs(3), async {
+                while echo_on(&conn, b"abc").await.is_ok() {}
+            })
+            .await;
+            assert!(ended.is_ok(), "the client waited for its idle timeout");
+        })
+        .unwrap();
+}

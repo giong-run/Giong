@@ -170,8 +170,14 @@ impl ConnectionIdGenerator for WorkerCids {
         ConnectionId::new(&cid::issue(self.worker, random))
     }
 
+    // Any connection ID laid out as giong issues them, whichever worker it
+    // names: quinn-proto drops a packet whose ID does not validate before
+    // it would answer with a stateless reset, and a packet comes here for
+    // another worker only when that worker has no endpoint (after a
+    // restart with fewer workers, say), which is when the client should
+    // be told its connection is gone.
     fn validate(&self, id: &ConnectionId) -> Result<(), InvalidCid> {
-        if cid::worker_of(id) == Some(self.worker) {
+        if cid::worker_of(id).is_some() {
             Ok(())
         } else {
             Err(InvalidCid)
