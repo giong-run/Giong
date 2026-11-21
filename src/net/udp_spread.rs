@@ -224,11 +224,15 @@ impl Group {
         let mut scratch = vec![0u8; DATAGRAM_MAX];
         let mut wait = None;
         loop {
-            match events.wait(wait) {
-                AcceptWake::Stop => return,
-                AcceptWake::Accept | AcceptWake::Timeout => {}
+            // A pause is for work the socket has that cannot be taken yet:
+            // waiting on the socket would end at once, and spin.
+            let woke = match wait.take() {
+                Some(ms) => events.pause(ms),
+                None => events.wait(None),
+            };
+            if let AcceptWake::Stop = woke {
+                return;
             }
-            wait = None;
             loop {
                 // SAFETY: all-zero is a valid address buffer.
                 let mut from: SockAddrStorage = unsafe { std::mem::zeroed() };

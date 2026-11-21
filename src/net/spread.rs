@@ -197,11 +197,15 @@ impl Spread {
         let listener = self.master.as_raw_socket() as RawSock;
         let mut wait = None;
         loop {
-            match events.wait(wait) {
-                AcceptWake::Stop => return,
-                AcceptWake::Accept | AcceptWake::Timeout => {}
+            // A pause is for work the socket has that cannot be taken yet:
+            // waiting on the socket would end at once, and spin.
+            let woke = match wait.take() {
+                Some(ms) => events.pause(ms),
+                None => events.wait(None),
+            };
+            if let AcceptWake::Stop = woke {
+                return;
             }
-            wait = None;
             loop {
                 // A place first, then the connection: one that nobody has
                 // room for stays in the kernel's backlog.

@@ -51,7 +51,7 @@ use std::task::{Poll, Waker};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    ERROR_NETNAME_DELETED, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockname, ioctlsocket, recv, recvfrom, setsockopt, TransmitFile,
@@ -59,9 +59,9 @@ use windows_sys::Win32::Networking::WinSock::{
     WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX,
     LPFN_WSARECVMSG, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN,
     SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-    SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAEINVAL, WSAEMSGSIZE, WSAEOPNOTSUPP, WSAEWOULDBLOCK,
-    WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG, WSA_FLAG_NO_HANDLE_INHERIT,
-    WSA_FLAG_OVERLAPPED,
+    SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED, WSAECONNRESET, WSAEINVAL, WSAEMSGSIZE,
+    WSAENOTCONN, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, SetFileCompletionNotificationModes, WriteFile,
@@ -237,6 +237,21 @@ struct Datagram {
 /// lingers ([`State::Lingering`]) and goes when its packet comes.
 fn ended_with_a_warning(code: i32) -> bool {
     code == WSAEMSGSIZE || code == ERROR_MORE_DATA as i32
+}
+
+/// Whether a failed accept (`res`, negated) failed for its connection
+/// alone, which its peer reset or abandoned before the accept took it:
+/// `ERROR_NETNAME_DELETED` is how a completed `AcceptEx` reports that, and
+/// `WSAENOTCONN` comes from readying a socket whose connection is gone.
+/// Unix accepts never report these; the listener is fine.
+fn connection_gone(res: i32) -> bool {
+    [
+        ERROR_NETNAME_DELETED as i32,
+        WSAECONNRESET,
+        WSAECONNABORTED,
+        WSAENOTCONN,
+    ]
+    .contains(&-res)
 }
 
 /// Bytes of the header in front of every datagram of a multishot receive:
@@ -901,10 +916,15 @@ impl Iocp {
     pub(crate) fn poll_multi(&mut self, key: usize, waker: &Waker) -> MultiPoll {
         let multi = self.multi(key);
         if let Some(res) = multi.accepted.take() {
-            if res < 0 {
-                multi.io = None;
+            let accepting = matches!(multi.io, Some(MultiIo::Accept { .. }));
+            if !(accepting && connection_gone(res)) {
+                if res < 0 {
+                    multi.io = None;
+                }
+                return MultiPoll::Item(res);
             }
-            return MultiPoll::Item(res);
+            // A connection that its peer reset before the accept took it:
+            // the next `AcceptEx` takes the next one, as Unix does.
         }
         if multi.last {
             // What the receive in flight took is still the reader's.
@@ -1168,18 +1188,25 @@ impl Iocp {
     }
 
     fn poll_accept(&mut self, key: usize, listener: SOCKET, waker: &Waker) -> MultiPoll {
-        let started = self
-            .register(listener as HANDLE, true)
-            .and_then(|()| self.start_accept(key, listener));
-        match started {
-            Ok(Some(res)) => MultiPoll::Item(res),
-            Ok(None) => {
-                self.multi(key).wait(waker);
-                MultiPoll::Pending
-            }
-            Err(e) => {
-                self.disarm(key);
-                MultiPoll::Item(e)
+        if let Err(e) = self.register(listener as HANDLE, true) {
+            self.disarm(key);
+            return MultiPoll::Item(e);
+        }
+        loop {
+            match self.start_accept(key, listener) {
+                // A connection that its peer reset before the accept took
+                // it: take the next one, as Unix does. Each try takes one
+                // off the backlog, so this ends.
+                Ok(Some(res)) | Err(res) if connection_gone(res) => continue,
+                Ok(Some(res)) => return MultiPoll::Item(res),
+                Ok(None) => {
+                    self.multi(key).wait(waker);
+                    return MultiPoll::Pending;
+                }
+                Err(e) => {
+                    self.disarm(key);
+                    return MultiPoll::Item(e);
+                }
             }
         }
     }

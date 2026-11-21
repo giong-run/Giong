@@ -624,14 +624,35 @@ impl AcceptEvents {
         }
     }
 
+    /// Waits `ms` milliseconds without looking at the socket, or until
+    /// [`stop`](Self::stop): for when the socket has work that cannot be
+    /// taken yet, which would end a [`wait`](Self::wait) at once.
+    pub(crate) fn pause(&self, ms: u32) -> AcceptWake {
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            return AcceptWake::Stop;
+        }
+        match self.select(ms, false) {
+            AcceptWake::Accept => AcceptWake::Stop,
+            woke => woke,
+        }
+    }
+
     fn wait_once(&self, timeout: u32) -> AcceptWake {
+        self.select(timeout, true)
+    }
+
+    /// `select` on the wake socket, and on the listener if `listener`.
+    fn select(&self, timeout: u32, listener: bool) -> AcceptWake {
         // SAFETY: the set and the timeout are locals; both sockets are
         // open while `self` lives.
         unsafe {
             let mut read: WinSock::FD_SET = std::mem::zeroed();
-            read.fd_count = 2;
-            read.fd_array[0] = self.listener;
-            read.fd_array[1] = self.wake;
+            read.fd_count = 1;
+            read.fd_array[0] = self.wake;
+            if listener {
+                read.fd_count = 2;
+                read.fd_array[1] = self.listener;
+            }
             let limit = WinSock::TIMEVAL {
                 tv_sec: (timeout / 1000) as i32,
                 tv_usec: (timeout % 1000 * 1000) as i32,

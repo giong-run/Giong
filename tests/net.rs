@@ -85,6 +85,47 @@ async fn recv_exact(stream: &TcpStream, len: usize) -> Vec<u8> {
 }
 
 #[test]
+fn connections_reset_before_they_are_accepted_do_not_end_the_accept_loop() {
+    // A port scan or a health check: connect, then reset at once, before
+    // the server takes the connection. The accept loop must carry on and
+    // serve the next client, as on Unix.
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let resets = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                    .unwrap();
+                s.connect(&addr.into()).unwrap();
+                // Closing with a zero linger sends RST, not FIN.
+                s.set_linger(Some(Duration::ZERO)).unwrap();
+                drop(s);
+            }
+            // Let the resets reach the server first.
+            std::thread::sleep(Duration::from_millis(100));
+            let mut good = std::net::TcpStream::connect(addr).unwrap();
+            good.write_all(b"hello").unwrap();
+            good
+        });
+        sleep(Duration::from_millis(50)).await;
+        let served = timeout(Duration::from_secs(10), async {
+            loop {
+                // Never an error: a reset connection is skipped, or
+                // accepted and then fails to read.
+                let s = l.accept().await.expect("accept goes on after resets");
+                let (res, buf) = s.read(vec![0u8; 16]).await;
+                if let Ok(5) = res {
+                    assert_eq!(&buf[..5], b"hello");
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(served.is_ok(), "the good client was not served");
+        drop(resets.join().unwrap());
+    });
+}
+
+#[test]
 fn echo_roundtrip() {
     giong::block_on(async {
         let (l, addr) = listener();
