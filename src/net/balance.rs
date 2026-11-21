@@ -63,8 +63,19 @@ const BAND: u64 = CORE / 20;
 
 /// When even the least busy member is expected to be this busy (80% of a
 /// core), every member counts as saturated, and new connections go by
-/// backlog: runnable tasks and work sent but not taken in yet.
+/// backlog: runnable tasks and work sent but not taken in yet (see
+/// [`BACKLOG_MARGIN`]).
 const SATURATED: u64 = CORE * 8 / 10;
+
+/// When every member is saturated, how much more backlog than another
+/// member the accepting worker must have before it hands a connection
+/// over. Hot connections keep a worker's backlog moving between 0 and a few;
+/// a smaller margin hands connections over on that noise and ends up
+/// spreading hot connections evenly, which leaves light ones waiting behind
+/// as many hot ones wherever they land (`bench/placement.sh`, mixed); a
+/// larger one lets a queue of short requests build up on one worker
+/// (skewed, back to back).
+const BACKLOG_MARGIN: usize = 2;
 
 /// The least each task taken on since the last sample is expected to cost
 /// (0.1% of a core), so that a burst of new connections within one sample
@@ -340,7 +351,7 @@ impl Member {
             // of tasks mislead (idle connections sent away from a busy
             // worker earlier make it look emptiest). Go by backlog, the
             // work each one has waiting, and keep the connection unless
-            // another member has clearly less.
+            // another member has clearly more room (BACKLOG_MARGIN).
             let backlog = |i: usize| {
                 let (_, queued, incoming) = rt.counts_of(i);
                 queued + incoming
@@ -350,7 +361,7 @@ impl Member {
                 .map(|k| (self.worker + k) % n)
                 .filter(|&i| member(i))
                 .min_by_key(|&i| backlog(i))?;
-            return (backlog(self.worker) > backlog(target) + 1).then_some(target);
+            return (backlog(self.worker) > backlog(target) + BACKLOG_MARGIN).then_some(target);
         }
         let limit = least.saturating_add(BAND);
         let target = rt.least_loaded_of(None, |i| member(i) && busy.expected(rt, i) <= limit)?;

@@ -983,7 +983,8 @@ impl TcpListener {
     /// ones while another worker has room, however many idle connections
     /// that one holds; when the workers are about as busy, the connection
     /// counts even out. When every worker is at least 80% busy, the work
-    /// each one has waiting (runnable tasks) decides instead. Nothing is
+    /// each one has waiting decides instead: a connection moves only to a
+    /// worker with at least three fewer runnable tasks. Nothing is
     /// added to the workers' loops: the listener that accepts a connection
     /// reads each worker's CPU time from the kernel at most every 5 ms, and
     /// never waits for another thread.
