@@ -241,6 +241,99 @@ The [Security Profiles Operator](https://github.com/kubernetes-sigs/security-pro
 can distribute the profile to the nodes for you. Managed platforms differ in what they
 let you change; check that yours allows `Localhost` profiles.
 
+## CPU limits
+
+giong starts one worker per CPU the process may use: the CPUs it may run on (`--cpuset-cpus`,
+the exclusive CPUs of Kubernetes' static CPU manager), fewer when a CPU quota allows less
+(`--cpus`, `resources.limits.cpu`), rounded down, and at least one. A pod limited to 2 CPUs
+on a 64-core node gets 2 workers. Tokio and `std::thread::available_parallelism` count the
+same way.
+
+A fraction is rounded down on purpose. Measured with the `defaults` example, wrk with 64
+connections, io_uring ([raw data](../bench/results/containers/cpu-quota.txt)):
+
+| Quota | Workers | Requests/s | p99 |
+| --- | --- | --- | --- |
+| 2 CPUs | 2 (default) | 285k | 0.55 ms |
+| 2 CPUs | 4 | 248k | 4.1 ms |
+| 1.5 CPUs | 1 (default) | 147k | 1.0-2.0 ms |
+| 1.5 CPUs | 2 | 214k | 23 ms |
+| 0.5 CPUs | 1 (default) | 70k | 50 ms |
+
+More workers than the quota run until the quota is used up and then wait for the next
+100 ms period: more requests per second, and a p99 10 to 20 times higher. Set
+`Builder::workers` above the default only when throughput matters more than tail latency.
+Under one CPU, the 100 ms period itself sets the p99 near 50 ms whatever the program does;
+give a latency-sensitive service at least one whole CPU.
+
+Kubernetes CPU requests without a limit set no quota: the process sees every CPU of the node,
+and giong starts a worker for each. That costs little memory (about 0.4 MiB per worker under
+load, [raw data](../bench/results/containers/memory-workers.txt)), but the workers share the
+CPU time the pod gets. Pass the request to the program and use it, for example:
+
+```yaml
+env:
+  - name: WORKERS
+    valueFrom:
+      resourceFieldRef:
+        resource: requests.cpu   # whole CPUs, rounded up
+```
+
+```rust
+let mut builder = giong::Builder::new();
+if let Some(n) = std::env::var("WORKERS").ok().and_then(|n| n.parse().ok()) {
+    builder = builder.workers(n);
+}
+```
+
+## Thread and file limits
+
+Each worker is a thread, and so is each of up to 64 threads that run file operations on the
+epoll driver. A container's PID limit counts threads (`docker run --pids-limit`, the
+kubelet's `podPidsLimit`, `TasksMax` in systemd): when it is reached, `Runtime::run`
+returns [GIONG-E0020](errors/E0020.md), which names the worker that could not start and the
+container's `pids.max`. Allow at least the workers, your own threads and 64 more.
+
+Each connection is a file descriptor, and the soft `RLIMIT_NOFILE` (`ulimit -n`) bounds
+them. containerd from 1.8 on, and so Kubernetes on most nodes today, starts containers with
+the systemd default of 1,024 soft and 524,288 hard. At the soft limit giong-http's accept loop
+waits 50 ms and tries again, serving the connections it has, while new clients wait in the
+listen queue: measured with the `defaults` example in a container limited to 1,024 files,
+1,071 of 1,100 keep-alive clients were answered and 29 were not. Raise the soft limit to the
+hard one when the process starts, as Go programs do by themselves:
+
+```rust
+// Before Builder::build. A process may raise its own soft limit up to the hard one.
+let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+// SAFETY: getrlimit and setrlimit read and write the struct they are given.
+unsafe {
+    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+        lim.rlim_cur = lim.rlim_max;
+        libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+    }
+}
+```
+
+With Docker, `--ulimit nofile=65536:65536` (`ulimits` in Compose) does the same from outside.
+
+## Stopping: SIGTERM and process 1
+
+`docker stop` and Kubernetes send `SIGTERM`, then `SIGKILL` 10 seconds later (Kubernetes:
+`terminationGracePeriodSeconds`, 30 by default). A program that runs as process 1 of a
+container gets no default action for `SIGTERM`: unless it handles the signal, it keeps
+running until it is killed. With `Builder::shutdown_on_signals(true)` giong handles
+`SIGINT` and `SIGTERM`, and with `shutdown_grace` the requests in flight are answered first;
+the `rest-api` example stops in under half a second. Without it, run the container with
+`--init` (`init: true` in Docker Compose), which forwards the signal and stops the process.
+
+## Container image
+
+[examples/rest-api/Dockerfile](../examples/rest-api/Dockerfile) builds the `rest-api` example
+into a 44 MB image (distroless, glibc, no shell, an unprivileged user), and
+[compose.yaml](../examples/rest-api/compose.yaml) runs it with PostgreSQL and Redis, a CPU
+and a memory limit, and the lines that allow io_uring. Copy them for a service of your own:
+giong needs nothing in the image besides the program.
+
 ## Sandboxes
 
 Runtimes that put a user-space kernel between the container and Linux, such as gVisor

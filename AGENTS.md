@@ -27,7 +27,7 @@ workspace, nine crates and an example service:
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
-| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
+| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server; `Dockerfile` and `compose.yaml` run it in containers |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.
@@ -49,6 +49,12 @@ Where the code is:
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
+
+A service built on giong for a container (Docker, Kubernetes, a sandbox): start from
+`examples/rest-api/Dockerfile`; set `Builder::shutdown_on_signals(true)`, raise the soft
+`RLIMIT_NOFILE` to the hard one at startup, and leave the worker count to giong unless the
+pod has a CPU request and no limit. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) has the why and
+the numbers.
 
 Which crate to use, in this repository and in a service built on giong: the giong crate
 for the job first (HTTP server and client, routing, TLS, PostgreSQL, MySQL, Redis, files,
