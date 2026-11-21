@@ -146,6 +146,10 @@ impl Connection {
                 return Err(StreamError::Refused(e.to_string()));
             }
         };
+        // A request cut short (its future dropped mid-body) is cancelled
+        // with H3_REQUEST_CANCELLED, never ended with a FIN inside a frame.
+        let mut cancel = Cancel(Some(send));
+        let send = cancel.0.as_mut().expect("just put there");
         if state.goaway.get().is_some_and(|first| send.id() >= first) {
             send.reset(Code::RequestCancelled as u32);
             return Err(StreamError::Refused(
@@ -197,7 +201,21 @@ impl Connection {
                 return Err(stream.failed(e));
             }
         }
+        // Finished: nothing to cancel.
+        drop(cancel.0.take());
         Ok(stream)
+    }
+}
+
+/// Holds a request's sending half while it is written: dropped holding
+/// it, it resets the stream with H3_REQUEST_CANCELLED.
+struct Cancel(Option<SendStream>);
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        if let Some(mut send) = self.0.take() {
+            send.reset(Code::RequestCancelled as u32);
+        }
     }
 }
 

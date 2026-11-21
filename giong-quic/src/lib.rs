@@ -304,7 +304,11 @@ pub fn reset_code(error: &io::Error) -> Option<u64> {
     error::reset_code(error)
 }
 
-/// The sending half of a stream. Dropping it finishes the stream.
+/// The sending half of a stream. Dropping it before
+/// [`finish`](SendStream::finish) abandons the stream with code 0
+/// (`RESET_STREAM`), so that the peer never takes a stream cut short, by a
+/// cancelled write say, for a whole one; a protocol with its own code for
+/// that calls [`reset`](SendStream::reset) first.
 pub struct SendStream {
     sh: Rc<proto::Shared>,
     h: usize,
@@ -352,7 +356,7 @@ impl SendStream {
 impl Drop for SendStream {
     fn drop(&mut self) {
         if !self.finished {
-            let _ = self.sh.finish(self.h, self.id);
+            self.sh.reset(self.h, self.id, 0);
         }
         self.sh.release(self.h);
     }

@@ -525,6 +525,30 @@ fn a_bad_request_loses_its_stream_and_the_connection_goes_on() {
     });
 }
 
+#[test]
+fn a_request_dropped_mid_frame_is_cancelled_and_the_connection_lives_on() {
+    run(|| async {
+        let client = connect().await;
+        // An upload whose sending half is dropped inside a DATA frame, as
+        // when its future is cancelled: the stream is reset, not ended
+        // with a FIN the server would read as a frame cut short (a
+        // connection error).
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        let mut request = post("/echo", &[("content-length", "100000")]);
+        let mut frame = Vec::new();
+        Header::write(&mut frame, kind::DATA, 100_000);
+        request.extend(frame);
+        request.extend(pattern(5000));
+        send.write_all(&request).await.unwrap();
+        drop(send);
+        assert!(recv.read_to_end(1 << 20).await.is_err());
+        // Other requests on the connection go on.
+        for _ in 0..3 {
+            assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+        }
+    });
+}
+
 /// What a client sees of a connection the server closed with an error.
 async fn closed_with(client: &Client) -> String {
     // The next thing done on the connection reports its end.
