@@ -461,18 +461,6 @@ fn rss_kib() -> u64 {
     counters.WorkingSetSize as u64 / 1024
 }
 
-/// Opens, once, what Windows keeps open for the rest of the process after
-/// its first use: Winsock and its helper handles, the thread that hands
-/// round the connections of a shared address, the runtime's blocking
-/// threads, the file system's. The handle count before the soak is taken
-/// after this, so that it compares like with like
-/// (`the_descriptor_count_is_flat_over_runtime_lives` checks that what this
-/// opens is opened once).
-#[cfg(windows)]
-fn warm_up() {
-    runtime_life();
-}
-
 /// One short life of a runtime, using what the soak uses: two workers
 /// share a listening address and take connections that carry a message
 /// each, a datagram goes round, a file is written, synced and removed.
@@ -565,10 +553,87 @@ fn soak() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    // On Windows, a short soak first. Windows opens handles once per process
+    // for some of what the soak does (Winsock's helpers, the thread that
+    // hands round a shared address's connections), and they stay open: the
+    // count before the soak is taken once they are
+    // (`the_descriptor_count_is_flat_over_runtime_lives` checks that they
+    // are opened once, not per runtime).
     #[cfg(windows)]
-    warm_up();
+    run(workers, 5);
     let fds_before = open_fds();
+    let (counters, samples, idle) = run(workers, secs);
 
+    let c = &counters;
+
+    // 1. Every scenario behaved as designed.
+    assert_eq!(c.unexpected.load(Ordering::Relaxed), 0, "unexpected errors");
+    // Refused connects are the kernel's (see `Counters::connects_refused`):
+    // one in 317 million was measured, so one in 50 million leaves room and
+    // still fails when a listener stops answering.
+    let (refused, connections) = (
+        c.connects_refused.load(Ordering::Relaxed),
+        c.connections.load(Ordering::Relaxed),
+    );
+    assert!(
+        refused <= 1 + connections / 50_000_000,
+        "{refused} of {connections} connects were refused while every listener was up"
+    );
+    assert_eq!(
+        c.ports_used_up.load(Ordering::Relaxed),
+        0,
+        "connects found no free local port: the clients' pace is too fast"
+    );
+    assert!(c.connections.load(Ordering::Relaxed) > 0);
+    assert!(c.cancelled_recvs.load(Ordering::Relaxed) > 0);
+
+    // 2. Every worker's driver went back to idle.
+    for (worker, stats, quiet) in &idle {
+        assert!(quiet, "worker {worker} did not go idle: {stats}");
+    }
+
+    // 3. Descriptors: nothing left once the runtime is gone, and no growth
+    //    during the run beyond the connections that happen to be open.
+    let fds_after = settled_fds(fds_before);
+    assert!(
+        fds_after <= fds_before,
+        "descriptors leaked: {fds_after} open, {fds_before} before the soak"
+    );
+    if samples.len() >= 8 {
+        let half = samples.len() / 2;
+        let first = samples[1..half].iter().map(|s| s.0).max().unwrap();
+        let second = samples[half..samples.len() - 1]
+            .iter()
+            .map(|s| s.0)
+            .max()
+            .unwrap();
+        // Each open connection holds two descriptors, client and server.
+        let slack = (2 * workers * CLIENTS + 16) as u64;
+        assert!(
+            second <= first + slack,
+            "descriptor count grew: at most {first} in the first half, {second} in the second"
+        );
+
+        // 4. Memory levels off after the first quarter: compare the medians
+        //    of the second and the last quarter.
+        let quarter = samples.len() / 4;
+        let mut q2: Vec<u64> = samples[quarter..2 * quarter].iter().map(|s| s.1).collect();
+        let mut q4: Vec<u64> = samples[3 * quarter..].iter().map(|s| s.1).collect();
+        let (q2, q4) = (median(&mut q2), median(&mut q4));
+        assert!(
+            q4 <= q2 + q2 / 10 + 8 * 1024,
+            "resident memory kept growing: median {q2} KiB in the second quarter, {q4} KiB in the last"
+        );
+    }
+}
+
+/// What [`soak`] checks after a run: the counters, the descriptor count and
+/// resident memory sampled once a second, and how each worker's driver
+/// ended.
+type Run = (Arc<Counters>, Vec<(u64, u64)>, Vec<(usize, String, bool)>);
+
+/// The soak's traffic on `workers` workers for `secs` seconds.
+fn run(workers: usize, secs: u64) -> Run {
     // A free port for every worker's listener (SO_REUSEPORT), and one UDP
     // socket per worker, bound up front so that every worker knows the others.
     let (port_holder, port) = common::shared_port();
@@ -702,6 +767,7 @@ fn soak() {
     stop.store(true, Ordering::Relaxed);
     sampler.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+    drop(port_holder);
 
     let c = &counters;
     eprintln!(
@@ -719,68 +785,9 @@ fn soak() {
         c.connects_refused.load(Ordering::Relaxed),
         c.ports_used_up.load(Ordering::Relaxed),
     );
-
-    // 1. Every scenario behaved as designed.
-    assert_eq!(c.unexpected.load(Ordering::Relaxed), 0, "unexpected errors");
-    // Refused connects are the kernel's (see `Counters::connects_refused`):
-    // one in 317 million was measured, so one in 50 million leaves room and
-    // still fails when a listener stops answering.
-    let (refused, connections) = (
-        c.connects_refused.load(Ordering::Relaxed),
-        c.connections.load(Ordering::Relaxed),
-    );
-    assert!(
-        refused <= 1 + connections / 50_000_000,
-        "{refused} of {connections} connects were refused while every listener was up"
-    );
-    assert_eq!(
-        c.ports_used_up.load(Ordering::Relaxed),
-        0,
-        "connects found no free local port: the clients' pace is too fast"
-    );
-    assert!(c.connections.load(Ordering::Relaxed) > 0);
-    assert!(c.cancelled_recvs.load(Ordering::Relaxed) > 0);
-
-    // 2. Every worker's driver went back to idle.
-    for (worker, stats, quiet) in idle.lock().unwrap().iter() {
-        assert!(quiet, "worker {worker} did not go idle: {stats}");
-    }
-
-    // 3. Descriptors: nothing left once the runtime is gone, and no growth
-    //    during the run beyond the connections that happen to be open.
-    drop(port_holder);
-    let fds_after = settled_fds(fds_before);
-    assert!(
-        fds_after <= fds_before,
-        "descriptors leaked: {fds_after} open, {fds_before} before the soak"
-    );
-    let samples = samples.lock().unwrap();
-    if samples.len() >= 8 {
-        let half = samples.len() / 2;
-        let first = samples[1..half].iter().map(|s| s.0).max().unwrap();
-        let second = samples[half..samples.len() - 1]
-            .iter()
-            .map(|s| s.0)
-            .max()
-            .unwrap();
-        // Each open connection holds two descriptors, client and server.
-        let slack = (2 * workers * CLIENTS + 16) as u64;
-        assert!(
-            second <= first + slack,
-            "descriptor count grew: at most {first} in the first half, {second} in the second"
-        );
-
-        // 4. Memory levels off after the first quarter: compare the medians
-        //    of the second and the last quarter.
-        let quarter = samples.len() / 4;
-        let mut q2: Vec<u64> = samples[quarter..2 * quarter].iter().map(|s| s.1).collect();
-        let mut q4: Vec<u64> = samples[3 * quarter..].iter().map(|s| s.1).collect();
-        let (q2, q4) = (median(&mut q2), median(&mut q4));
-        assert!(
-            q4 <= q2 + q2 / 10 + 8 * 1024,
-            "resident memory kept growing: median {q2} KiB in the second quarter, {q4} KiB in the last"
-        );
-    }
+    let samples = std::mem::take(&mut *samples.lock().unwrap());
+    let idle = std::mem::take(&mut *idle.lock().unwrap());
+    (counters, samples, idle)
 }
 
 /// What a runtime opens once per process (Winsock's helpers, the shared
