@@ -860,15 +860,23 @@ impl StreamSocket {
             let sent = if count == 0 {
                 0
             } else {
+                // A dropped send is left to finish (a cancelled one would
+                // abort the connection), and closing the last handle to a
+                // file aborts the sends that read it: the caller's `File`
+                // usually goes with the future. So the send reads through a
+                // handle of its own, which the driver keeps until the
+                // completion arrives.
+                let own = file.second_handle()?;
                 let io = Io::SendFile {
                     fd,
-                    file: file.as_raw_handle(),
+                    file: own.as_raw_handle(),
                     len: count,
                     offset,
                 };
-                // SAFETY: the operation has no pointers; the kernel keeps
-                // the file open for as long as it reads from it.
-                let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
+                // SAFETY: the operation has no pointers; the handle it reads
+                // through lives in the operation until its completion.
+                let (res, _, own) = unsafe { Op::new(io, own) }.await;
+                drop(own);
                 if res < 0 {
                     return Err(os_err(res));
                 }

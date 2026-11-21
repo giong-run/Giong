@@ -556,6 +556,60 @@ fn send_file_sends_the_file_and_leaves_the_stream_usable() {
 }
 
 #[test]
+fn a_dropped_send_file_whose_file_is_closed_leaves_the_stream_usable() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = Rc::new(l.accept().await.unwrap());
+        // Larger than the socket buffers, so the first send is in flight
+        // when its future is dropped.
+        let first = TempFile::new("dropped-send-file-1", &[0x11; 8 << 20]);
+        let second = TempFile::new("dropped-send-file-2", &[0x22; 4096]);
+        let reader = {
+            let s = s.clone();
+            giong::spawn(async move {
+                let mut out = Vec::new();
+                loop {
+                    let chunk = s.recv().await.unwrap();
+                    if chunk.is_empty() {
+                        break out;
+                    }
+                    out.extend_from_slice(&chunk);
+                }
+            })
+        };
+        let file = giong::fs::File::open(&first.0).await.unwrap();
+        {
+            // Started (one poll hands it to the kernel), then dropped, and
+            // the file closed with it, as when a handler is cancelled.
+            let mut send = std::pin::pin!(c.send_file(&file, 0, 8 << 20));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(send.as_mut(), cx).is_pending(),
+                    "the send ended at once"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(file);
+        let file = giong::fs::File::open(&second.0).await.unwrap();
+        c.send_file(&file, 0, 4096).await.unwrap();
+        c.shutdown(Shutdown::Write).unwrap();
+        let got = reader.await.unwrap();
+        let ones = got.iter().take_while(|&&b| b == 0x11).count();
+        assert!(
+            got[ones..] == [0x22; 4096][..],
+            "{} bytes after the first file's",
+            got.len() - ones
+        );
+        // Windows sends the piece in flight to its end.
+        #[cfg(windows)]
+        assert_eq!(ones, 8 << 20);
+    });
+}
+
+#[test]
 fn send_file_past_the_end_sends_what_there_is_and_says_so() {
     giong::block_on(async {
         let (l, addr) = listener();

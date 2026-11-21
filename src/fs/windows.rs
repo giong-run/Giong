@@ -376,9 +376,9 @@ impl File {
         mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(self.handle) })
     }
 
-    /// A second handle to the file, for a blocking thread: it stays valid
-    /// there even if this `File` is closed meanwhile.
-    fn second_handle(&self) -> io::Result<std::fs::File> {
+    /// A second handle to the file, for a blocking thread or a send in
+    /// flight: it stays valid there even if this `File` is closed meanwhile.
+    pub(crate) fn second_handle(&self) -> io::Result<std::fs::File> {
         self.borrowed().try_clone()
     }
 
