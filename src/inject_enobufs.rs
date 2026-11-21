@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 static SENDS: AtomicU32 = AtomicU32::new(0);
 static CONNECTS: AtomicU32 = AtomicU32::new(0);
 static LATE_CONNECTS: AtomicU32 = AtomicU32::new(0);
+static SOCKETS: AtomicU32 = AtomicU32::new(0);
 static HANDED_OUT: AtomicU32 = AtomicU32::new(0);
 
 /// The next `n` stream sends (`send`, `sendmsg`) fail with `ENOBUFS`
@@ -29,6 +30,12 @@ pub fn fail_connects_late(n: u32) {
     LATE_CONNECTS.store(n, Relaxed);
 }
 
+/// The next `n` sockets a stream connect makes fail with `ENOBUFS`
+/// without reaching the kernel, as when `socket(2)` had no buffer for them.
+pub fn fail_sockets(n: u32) {
+    SOCKETS.store(n, Relaxed);
+}
+
 /// How many failures were handed out since the last [`reset`].
 pub fn handed_out() -> u32 {
     HANDED_OUT.load(Relaxed)
@@ -39,6 +46,7 @@ pub fn reset() {
     SENDS.store(0, Relaxed);
     CONNECTS.store(0, Relaxed);
     LATE_CONNECTS.store(0, Relaxed);
+    SOCKETS.store(0, Relaxed);
     HANDED_OUT.store(0, Relaxed);
 }
 
@@ -62,4 +70,8 @@ pub(crate) fn connect() -> bool {
 
 pub(crate) fn late_connect() -> bool {
     take(&LATE_CONNECTS)
+}
+
+pub(crate) fn socket() -> bool {
+    take(&SOCKETS)
 }

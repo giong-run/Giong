@@ -1,6 +1,6 @@
-//! Sends and connects that get `ENOBUFS`, as on macOS when the system's
-//! network buffers run out: the readiness driver tries them again on a
-//! timer for up to 2 s, then fails with GIONG-E0028. The failures come from
+//! Sends, connects and new sockets that get `ENOBUFS`, as on macOS when
+//! the system's network buffers run out: giong tries them again on a timer
+//! for up to 2 s, then fails with GIONG-E0028. The failures come from
 //! the test hook, so this file is built only with
 //! `--cfg giong_inject_enobufs`; on Linux it runs on the epoll driver (or on
 //! kqueue through libkqueue, with `GIONG_DRIVER=kqueue`).
@@ -237,6 +237,51 @@ fn a_refused_connect_is_made_again() {
 }
 
 #[test]
+fn a_socket_refused_for_want_of_buffers_is_made_again() {
+    let _h = hooked();
+    run(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        hook::fail_sockets(5);
+        let start = Instant::now();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let waited = start.elapsed();
+        assert_eq!(hook::handed_out(), 5);
+        // 1 + 2 + 4 + 8 + 16 ms.
+        assert!(waited >= Duration::from_millis(31), "{waited:?}");
+        let server = listener.accept().await.unwrap();
+        client.write_all(b"up".to_vec()).await.0.unwrap();
+        assert_eq!(read_n(&server, 2).await, b"up");
+    });
+}
+
+#[test]
+fn a_socket_refused_for_two_seconds_fails_with_the_code() {
+    let _h = hooked();
+    run(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        hook::fail_sockets(u32::MAX);
+        let start = Instant::now();
+        let err = TcpStream::connect(addr).await.map(drop).unwrap_err();
+        let waited = start.elapsed();
+        assert_exhausted(&err);
+        assert!(
+            waited >= Duration::from_millis(1900) && waited < Duration::from_millis(2500),
+            "{waited:?}"
+        );
+        let tries = hook::handed_out();
+        assert!((50..=100).contains(&tries), "{tries} tries in {waited:?}");
+        // Sockets come back: the next connect is made at once.
+        hook::reset();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        client.write_all(b"up".to_vec()).await.0.unwrap();
+        assert_eq!(read_n(&server, 2).await, b"up");
+    });
+}
+
+#[test]
 fn a_refused_unix_connect_is_made_again() {
     let _h = hooked();
     let dir = std::env::temp_dir().join(format!("giong-enobufs-{}", std::process::id()));
@@ -245,9 +290,10 @@ fn a_refused_unix_connect_is_made_again() {
     let _ = std::fs::remove_file(&path);
     run(async {
         let listener = UnixListener::bind(&path).unwrap();
+        hook::fail_sockets(2);
         hook::fail_connects(3);
         let client = UnixStream::connect(&path).await.unwrap();
-        assert_eq!(hook::handed_out(), 3);
+        assert_eq!(hook::handed_out(), 5);
         let server = listener.accept().await.unwrap();
         client.write_all(b"up".to_vec()).await.0.unwrap();
         assert_eq!(&server.recv().await.unwrap()[..], b"up");

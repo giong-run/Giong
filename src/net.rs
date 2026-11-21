@@ -85,6 +85,8 @@ pub(crate) mod nobufs {
     use std::io;
     use std::time::{Duration, Instant};
 
+    use socket2::Socket;
+
     use crate::error::{Code, Error};
 
     const GIVE_UP: Duration = Duration::from_secs(2);
@@ -144,6 +146,23 @@ pub(crate) mod nobufs {
         pub(crate) fn left(&self) -> Duration {
             GIVE_UP.saturating_sub(self.since.elapsed())
         }
+    }
+
+    /// A socket from `make`. `socket(2)` fails with `ENOBUFS` when macOS
+    /// has no buffer for the new socket; that error comes back with its
+    /// code, for the caller to wait and try again.
+    pub(crate) fn socket(make: impl Fn() -> io::Result<Socket>) -> io::Result<Socket> {
+        #[cfg(giong_inject_enobufs)]
+        if crate::inject_enobufs::socket() {
+            return Err(exhausted(io::Error::from_raw_os_error(libc::ENOBUFS)));
+        }
+        make().map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOBUFS) {
+                exhausted(e)
+            } else {
+                e
+            }
+        })
     }
 }
 
@@ -501,11 +520,12 @@ impl StreamSocket {
         Some(copied.clone())
     }
 
-    /// Connects a socket made by `make` to `addr`. On macOS, a connect
-    /// that a shortage of network buffers broke after it began is made again
-    /// on a new socket. All of it stays within the 2 s the driver waits for
-    /// buffers: a connect on a new socket gets what is left of them, not 2 s
-    /// of its own.
+    /// Connects a socket made by `make` to `addr`. On macOS, a socket that
+    /// could not be made for want of network buffers is made again, and a
+    /// connect that the shortage broke after it began is made again on a new
+    /// socket. All of it stays within the 2 s the driver waits for buffers:
+    /// a connect on a new socket gets what is left of them, not 2 s of its
+    /// own.
     pub(crate) async fn connect_new(
         make: impl Fn() -> io::Result<Socket>,
         addr: SockAddr,
@@ -513,16 +533,25 @@ impl StreamSocket {
         #[cfg(any(target_os = "macos", giong_inject_enobufs))]
         {
             let mut backoff = nobufs::Backoff::new();
-            let mut res = Self::connect(make()?, addr.clone()).await;
+            let mut res = match nobufs::socket(&make) {
+                Ok(sock) => Self::connect(sock, addr.clone()).await,
+                Err(e) => Err(e),
+            };
             loop {
                 match res {
                     Err(e) if nobufs::is_exhausted(&e) && backoff.wait().await => {
-                        let connect = Self::connect(make()?, addr.clone());
-                        res = match crate::time::timeout(backoff.left(), connect).await {
-                            Ok(res) => res,
-                            // Out of time while the driver waited for buffers
-                            // (dropping the connect closed its socket).
-                            Err(_) => Err(e),
+                        res = match nobufs::socket(&make) {
+                            Ok(sock) => {
+                                let connect = Self::connect(sock, addr.clone());
+                                match crate::time::timeout(backoff.left(), connect).await {
+                                    Ok(res) => res,
+                                    // Out of time while the driver waited for
+                                    // buffers (dropping the connect closed its
+                                    // socket).
+                                    Err(_) => Err(e),
+                                }
+                            }
+                            Err(again) => Err(again),
                         };
                     }
                     res => return res,

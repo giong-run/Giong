@@ -368,7 +368,9 @@ stays pending, so the worker runs its other tasks meanwhile, and a
 `time::timeout` or a dropped future ends the wait as it ends a readiness
 wait; `ENOBUFS` is all or nothing on a call, so nothing was sent. A
 connect the shortage broke after it began has a dead socket and starts
-over on a new one within the same 2 s (`StreamSocket::connect_new`).
+over on a new one, and a connect whose socket could not be made
+(`socket(2)` fails with `ENOBUFS` too) makes it again, within the same
+2 s (`StreamSocket::connect_new`).
 giong-tls sends its queued records without waiting in two places, and
 leaves them queued on `ENOBUFS` as on `EAGAIN`, for the next send, which
 waits. After 2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`,
