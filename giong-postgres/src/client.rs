@@ -250,13 +250,6 @@ enum Role {
     End,
 }
 
-impl Role {
-    /// Answered by a `CommandComplete` or an error, before the batch ends.
-    fn in_batch(self) -> bool {
-        matches!(self, Role::Member | Role::Guard)
-    }
-}
-
 enum Kind {
     Prepare {
         sql: Rc<str>,
@@ -781,23 +774,35 @@ impl Client {
             )));
         }
         let cached = stmt.conn.is_none();
-        let batch = batch && cached && !stmt.writes.get();
-        let slot =
-            self.conn
-                .enqueue_statement(Kind::Execute { stmt: stmt.clone() }, batch, |out| {
-                    protocol::bind(
-                        out,
-                        &stmt.name,
-                        params.len(),
-                        |i, out| {
-                            params[i].to_sql(stmt.params[i], out).map_err(|e| {
-                                e.context(&format!("parameter ${} ({})", i + 1, stmt.params[i]))
-                            })
-                        },
-                        stmt.columns.iter().map(|c| c.ty().binary_result()),
-                    )?;
-                    protocol::execute(out)
-                })?;
+        let encode = |out: &mut Vec<u8>| {
+            protocol::bind(
+                out,
+                &stmt.name,
+                params.len(),
+                |i, out| {
+                    params[i].to_sql(stmt.params[i], out).map_err(|e| {
+                        e.context(&format!("parameter ${} ({})", i + 1, stmt.params[i]))
+                    })
+                },
+                stmt.columns.iter().map(|c| c.ty().binary_result()),
+            )?;
+            protocol::execute(out)
+        };
+        let kind = Kind::Execute { stmt: stmt.clone() };
+        let slot = if batch
+            && cached
+            && !stmt.writes.get()
+            && self.conn.shared.get()
+            && self.conn.tx.get() == Tx::None
+        {
+            self.conn.enqueue_batched(kind, encode)?
+        } else {
+            self.conn.enqueue(kind, |out| {
+                encode(out)?;
+                protocol::sync(out);
+                Ok(())
+            })?
+        };
         if !cached {
             // In a request of its own: after an error the server skips the
             // rest of a request, and the statement must go either way.
@@ -896,24 +901,17 @@ impl Conn {
     }
 
     /// Appends a statement's Bind and Execute (`encode`) and a `Sync`, and
-    /// queues its slot. With `batch`, the statement joins the batch that
-    /// ends `out` when there is one with room, or may start one: its `Sync`
-    /// is then taken off and the statement's messages go before it (see
-    /// [`Config::batch_reads`]).
-    fn enqueue_statement(
+    /// queues its slot: the statement joins the batch that ends `out` when
+    /// there is one with room, or may start one; its `Sync` is then taken
+    /// off and the statement's messages go before it (see
+    /// [`Config::batch_reads`]). On a shared connection outside a
+    /// transaction only.
+    #[inline(never)]
+    fn enqueue_batched(
         &self,
         kind: Kind,
-        batch: bool,
         encode: impl FnOnce(&mut Vec<u8>) -> Result<(), Error>,
     ) -> Result<Rc<Slot>, Error> {
-        let batch = batch && self.shared.get() && self.tx.get() == Tx::None;
-        if !batch {
-            return self.enqueue(kind, |out| {
-                encode(out)?;
-                protocol::sync(out);
-                Ok(())
-            });
-        }
         let mut st = self.state.borrow_mut();
         if let Some(e) = &st.broken {
             return Err(e.clone());
@@ -1203,7 +1201,25 @@ impl Conn {
             }
             _ => {}
         }
-        let slot = self.front()?;
+        let slot = loop {
+            let slot = self.front()?;
+            if slot.batch.get() != Role::Alone
+                && matches!(
+                    msg,
+                    Backend::CommandComplete(_)
+                        | Backend::ErrorResponse(_)
+                        | Backend::ReadyForQuery(_)
+                )
+            {
+                if self.handle_batched(slot, &msg)? {
+                    // A skipped statement's slot is done; the message is
+                    // the next slot's.
+                    continue;
+                }
+                return Ok(());
+            }
+            break slot;
+        };
         let mut inner = slot.inner.borrow_mut();
         match msg {
             Backend::BindComplete => inner.bound = true,
@@ -1235,48 +1251,10 @@ impl Conn {
                     self.user_prepared.set(true);
                 }
                 inner.tag = Some(tag.to_owned());
-                if slot.batch.get().in_batch() {
-                    drop(inner);
-                    self.finish_member(&slot);
-                }
             }
             Backend::ErrorResponse(fields) => {
                 if inner.error.is_none() {
-                    let db = DbError::parse(fields)?;
-                    if db.code() == "25006" && self.on_standby() {
-                        self.retire.set(true);
-                    }
-                    // Only a note: the message is translated on servers whose
-                    // lc_messages is not English, and then there is none.
-                    let note = (db.code() == "57014" && db.message().contains("statement timeout"))
-                        .then(|| match self.config.statement_timeout {
-                            Some(limit) => format!(
-                                "the statement ran longer than the statement timeout ({limit:?}; \
-                                 Config::statement_timeout)"
-                            ),
-                            None => "the statement ran longer than the server's statement_timeout"
-                                .to_owned(),
-                        });
-                    let writes = db.code() == "25006";
-                    inner.error = Some(Error::from_db(db, note));
-                    if slot.batch.get().in_batch() {
-                        if slot.batch.get() == Role::Guard {
-                            // Prepared again with the next batch (after a
-                            // `DEALLOCATE`, say); the batch's statements are
-                            // skipped and sent again alone.
-                            self.state.borrow_mut().read_only_prepared = false;
-                        }
-                        if writes {
-                            // It would have run alone: send it alone.
-                            if let Kind::Execute { stmt } = &slot.kind {
-                                stmt.writes.set(true);
-                                inner.alone = true;
-                            }
-                        }
-                        drop(inner);
-                        self.finish_member(&slot);
-                        return Ok(());
-                    }
+                    inner.error = Some(self.db_error(fields)?);
                 }
             }
             Backend::CopyOutResponse | Backend::CopyData | Backend::CopyDone => {
@@ -1292,18 +1270,6 @@ impl Conn {
                     "the statement started COPY FROM STDIN or replication, which giong-postgres \
                      does not support yet; the connection was closed",
                 ));
-            }
-            Backend::ReadyForQuery(_) if slot.batch.get().in_batch() => {
-                // The batch ended before this statement ran: a statement
-                // before it failed, and the server skipped the rest.
-                inner.error = Some(Error::new(
-                    ErrorKind::Closed,
-                    "a statement before this one in its batch failed, so the server skipped it",
-                ));
-                inner.alone = matches!(slot.kind, Kind::Execute { .. });
-                drop(inner);
-                self.finish_member(&slot);
-                return self.handle(tag, body);
             }
             Backend::ReadyForQuery(status) => {
                 // A statement sent on a shared connection opened a
@@ -1326,9 +1292,6 @@ impl Conn {
                     let mut st = self.state.borrow_mut();
                     st.status = status;
                     st.queue.pop_front();
-                    if slot.batch.get() == Role::End {
-                        st.extra -= 1;
-                    }
                     self.head_since
                         .set((!st.queue.is_empty()).then(giong::time::Instant::now));
                     st.queue.is_empty()
@@ -1353,6 +1316,95 @@ impl Conn {
             }
         }
         Ok(())
+    }
+
+    /// The request's error from an `ErrorResponse`.
+    fn db_error(&self, fields: &[u8]) -> Result<Error, Error> {
+        let db = DbError::parse(fields)?;
+        if db.code() == "25006" && self.on_standby() {
+            self.retire.set(true);
+        }
+        // Only a note: the message is translated on servers whose
+        // lc_messages is not English, and then there is none.
+        let note = (db.code() == "57014" && db.message().contains("statement timeout")).then(
+            || match self.config.statement_timeout {
+                Some(limit) => format!(
+                    "the statement ran longer than the statement timeout ({limit:?}; \
+                     Config::statement_timeout)"
+                ),
+                None => "the statement ran longer than the server's statement_timeout".to_owned(),
+            },
+        );
+        Ok(Error::from_db(db, note))
+    }
+
+    /// The `CommandComplete`, `ErrorResponse` or `ReadyForQuery` of a slot
+    /// of a batch ([`Config::batch_reads`]). Apart from [`handle`](Self::handle),
+    /// which every request goes through, so that it stays as small as it was.
+    #[cold]
+    #[inline(never)]
+    ///
+    /// Returns whether the message is still to be handled, by the next slot.
+    fn handle_batched(&self, slot: Rc<Slot>, msg: &Backend<'_>) -> Result<bool, Error> {
+        let mut inner = slot.inner.borrow_mut();
+        match *msg {
+            Backend::CommandComplete(command) => {
+                inner.tag = Some(command.to_owned());
+            }
+            Backend::ErrorResponse(fields) => {
+                let error = self.db_error(fields)?;
+                if slot.batch.get() == Role::Guard {
+                    // Prepared again with the next batch (after a
+                    // `DEALLOCATE`, say); the batch's statements are
+                    // skipped and sent again alone.
+                    self.state.borrow_mut().read_only_prepared = false;
+                }
+                if error.server_code() == Some("25006") {
+                    // It would have run alone: send it alone.
+                    if let Kind::Execute { stmt } = &slot.kind {
+                        stmt.writes.set(true);
+                        inner.alone = true;
+                    }
+                }
+                inner.error = Some(error);
+            }
+            Backend::ReadyForQuery(status) if slot.batch.get() == Role::End => {
+                // The batch's transaction ended, committed or rolled back:
+                // the outcome is as outside a transaction.
+                inner.status = status;
+                drop(inner);
+                let idle = {
+                    let mut st = self.state.borrow_mut();
+                    st.status = status;
+                    st.queue.pop_front();
+                    st.extra -= 1;
+                    self.head_since
+                        .set((!st.queue.is_empty()).then(giong::time::Instant::now));
+                    st.queue.is_empty()
+                };
+                self.complete(&slot);
+                if idle {
+                    self.wake_idle();
+                }
+                return Ok(false);
+            }
+            Backend::ReadyForQuery(_) => {
+                // The batch ended before this statement ran: a statement
+                // before it failed, and the server skipped the rest.
+                inner.error = Some(Error::new(
+                    ErrorKind::Closed,
+                    "a statement before this one in its batch failed, so the server skipped it",
+                ));
+                inner.alone = matches!(slot.kind, Kind::Execute { .. });
+                drop(inner);
+                self.finish_member(&slot);
+                return Ok(true);
+            }
+            _ => unreachable!("only these three come here"),
+        }
+        drop(inner);
+        self.finish_member(&slot);
+        Ok(false)
     }
 
     /// Works out a finished request's outcome and wakes whoever waits.
