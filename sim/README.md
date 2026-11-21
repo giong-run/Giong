@@ -56,7 +56,7 @@ compares runs; `Report::first_difference` finds where two runs part.
 
 | Test | What it checks |
 |---|---|
-| `suite` | The core crate's own tests (`tests/*.rs` of the root crate), each in a child process: 183 pass, 17 are skipped with a reason (see `build.rs`). `GIONG_SIM_FAULTS=loopback` runs them under faults. |
+| `suite` | The core crate's own tests (`tests/*.rs` of the root crate), each in a child process: 197 pass, 19 are skipped with a reason (see `build.rs`). `GIONG_SIM_FAULTS=loopback` runs them under faults. |
 | `basics`, `workers` | Virtual time, turn taking, the same seed giving the same trace, a seed replaying the same in a fresh process. |
 | `hostile` | A TCP echo server and its clients under 100 hostile seeds; benign faults never show as errors; a partition makes connects time out. |
 | `http` | giong-http over plain TCP, TLS and HTTP/2: a response never goes to the wrong request, benign faults never show as errors. |
