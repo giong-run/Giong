@@ -8,6 +8,25 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- **Blocking and compute lanes** (`giong::lane`): `spawn_blocking(f)` runs a closure that
+  waits (`std::fs`, C libraries, `getaddrinfo`) on a pool of up to 128 threads
+  (`Builder::max_blocking_threads`); `spawn_compute(f)` runs CPU-bound work on at most one
+  thread per CPU of the process's budget (`Builder::compute_threads`), at nice +10 so the
+  workers get their core back as soon as they have work; `try_spawn_compute(f)` refuses
+  with the new code `GIONG-E0014` (`Code::ComputeBusy`) once `Builder::compute_backlog`
+  closures wait. All three return a `Send` `BlockingHandle<T>` that resolves to
+  `Result<T, JoinError>`; a panic stays in the handle. `Handle::spawn_blocking`,
+  `Handle::spawn_compute` and `Handle::try_spawn_compute` work from any thread, and
+  `Handle::lane_stats()` reports threads, busy threads and queued closures. With one
+  CPU-bound job per CPU running next to an echo server, the 99th percentile echo time
+  stays at the idle level with the compute lane and grows several times without its
+  lower priority or with Tokio's `spawn_blocking` (`bench/lanes.sh`, numbers in
+  `bench/results/lanes/`). The epoll driver's file pool now shares the pool code
+  (`src/pool.rs`) but stays a separate pool, so application jobs cannot starve file
+  operations.
+
 ## [1.0.0-rc.1] - 2026-11-20
 
 ### Security

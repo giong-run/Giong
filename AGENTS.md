@@ -39,7 +39,8 @@ Where the code is:
 | `src/driver/mod.rs` | the driver facade: `Io` (one operation, driver-neutral), `DriverKind`, choosing a driver and falling back |
 | `src/driver/uring.rs` | io_uring setup, submission and completion, the ring tiers |
 | `src/driver/epoll.rs` | the epoll driver: readiness, edge-triggered registration, the per-task budget |
-| `src/driver/blocking.rs` | the thread pool the epoll driver runs file operations on |
+| `src/driver/blocking.rs` | the epoll driver's file-operation pool (an instance of `src/pool.rs`) and its completions |
+| `src/pool.rs`, `src/lane.rs` | the growable thread pool; the public blocking and compute lanes on it (`spawn_blocking`, `spawn_compute`) |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
@@ -249,6 +250,10 @@ is loaded.
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
   cannot fix that (see `giong-compat/README.md`).
+- **Blocking or CPU-heavy code in a task.** A task that blocks or computes for more than
+  about 100 µs holds up every connection on its worker. Put it in `giong::spawn_blocking`
+  (waiting) or `giong::spawn_compute` (computing), never `std::thread::spawn` per call.
+  Closures there run on plain threads: giong's I/O and timers panic in them (`GIONG-E0011`).
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 
