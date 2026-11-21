@@ -1,0 +1,43 @@
+# Cost of tracing one request, measured without a server
+#
+# One worker, tracing on: start, started, one poll that names the route,
+# responded, finish, 1,000,000 times per line. Same machine as
+# conditions.txt. Program (run as a cargo example from the repository root):
+#
+#     use giong::observe::{RequestTrace, Route};
+#     use std::time::Instant;
+#     fn main() {
+#         giong::block_on(async {
+#             giong::handle().set_request_tracing(true);
+#             giong::yield_now().await;
+#             static R: Route = Route::from_static("GET /users/{id}");
+#             let shared = Route::new("GET /users/{id}");
+#             for (name, route) in [("static", &R), ("shared", &shared)] {
+#                 for _ in 0..3 {
+#                     let n = 1_000_000;
+#                     let t = Instant::now();
+#                     for _ in 0..n {
+#                         let mut tr = RequestTrace::start("bench").unwrap();
+#                         tr.started();
+#                         tr.poll(|| giong::observe::set_route(route));
+#                         tr.responded(200);
+#                         tr.finish();
+#                     }
+#                     println!("{name}: {:.1} ns per request", t.elapsed().as_nanos() as f64 / n as f64);
+#                     let _ = giong::observe::take_requests();
+#                 }
+#             }
+#             let n = 1_000_000;
+#             let t = Instant::now();
+#             for _ in 0..n { std::hint::black_box(Instant::now()); }
+#             println!("Instant::now: {:.1} ns", t.elapsed().as_nanos() as f64 / n as f64);
+#         });
+#     }
+
+static: 256.8 ns per request
+static: 255.4 ns per request
+static: 267.8 ns per request
+shared: 277.3 ns per request
+shared: 215.6 ns per request
+shared: 271.2 ns per request
+Instant::now: 26.0 ns
