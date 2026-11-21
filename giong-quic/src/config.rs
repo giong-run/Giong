@@ -74,7 +74,8 @@ impl TransportConfig {
             .receive_window(self.connection_window.into())
             .send_window(u64::from(self.connection_window))
             .max_idle_timeout(Some(idle))
-            .keep_alive_interval(self.keep_alive);
+            .keep_alive_interval(self.keep_alive)
+            .congestion_controller_factory(crate::proto::Closable::factory());
         Ok(t)
     }
 }

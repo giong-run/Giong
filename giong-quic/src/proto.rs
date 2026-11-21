@@ -3,16 +3,19 @@
 //! One endpoint per giong worker: a driver task owns the socket and runs
 //! quinn-proto; connection and stream handles reach the state through an
 //! `Rc<RefCell<..>>`. Everything stays on the worker that made it, so there
-//! is no lock, channel or atomic anywhere (quinn on Tokio has a mutex per
-//! connection and channels between endpoint and connections).
+//! is no lock or channel anywhere (quinn on Tokio has a mutex per
+//! connection and channels between endpoint and connections). The one
+//! atomic is the flag of [`Closable`], which quinn-proto requires to be
+//! `Send`; only its own worker touches it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Poll, Waker};
 use std::time::Instant;
@@ -73,6 +76,9 @@ struct Conn {
     /// Server: bidirectional streams the peer opened before the handshake
     /// ended, so in 0-RTT data, taken ahead of `accept_bi` to remember it.
     early_bi: VecDeque<StreamId>,
+    /// Set once the connection is over, so that its CONNECTION_CLOSE is
+    /// not held back by congestion control (see [`Closable`]).
+    closing: Arc<AtomicBool>,
     /// Server: the peer opened a stream in 0-RTT data.
     saw_early: bool,
 }
@@ -92,6 +98,16 @@ impl Conn {
     /// A stream of the early data the server rejected.
     fn stale(&self, s: Sid) -> bool {
         s.epoch != self.epoch
+    }
+
+    /// Takes the flag of a congestion controller that quinn-proto just
+    /// built for this connection, which it does when the peer moves to
+    /// another address.
+    fn adopt(&mut self) {
+        if let Some(flag) = Closable::built() {
+            flag.store(self.lost.is_some(), Ordering::Relaxed);
+            self.closing = flag;
+        }
     }
 
     /// Server: takes the bidirectional streams that the datagram just
@@ -144,6 +160,7 @@ impl Conn {
         if self.lost.is_none() {
             self.lost = Some(reason);
         }
+        self.closing.store(true, Ordering::Relaxed);
         wake_all(&mut self.waiters);
         for w in self.streams.values_mut() {
             if let Some(w) = w.read.take() {
@@ -214,6 +231,7 @@ impl State {
             early,
             epoch: 0,
             early_bi: VecDeque::new(),
+            closing: Closable::built().unwrap_or_default(),
             saw_early: false,
         });
         if let Some(c) = &mut self.conns[slot] {
@@ -275,6 +293,7 @@ impl State {
                         if c.ch == ch {
                             let handshaking = c.c.is_handshaking();
                             c.c.handle_event(ev);
+                            c.adopt();
                             // A datagram that ends the handshake may also
                             // hold 1-RTT packets: their streams count as
                             // early too, which errs on the safe side.
@@ -301,6 +320,7 @@ impl State {
             if let Some(c) = &mut self.conns[i] {
                 if c.c.poll_timeout().is_some_and(|t| t <= now) {
                     c.c.handle_timeout(now);
+                    c.adopt();
                     self.mark(i);
                 }
             }
@@ -327,6 +347,7 @@ impl State {
             while let Some(ev) = conn.c.poll_endpoint_events() {
                 if let Some(cev) = self.ep.handle_event(ch, ev) {
                     conn.c.handle_event(cev);
+                    conn.adopt();
                     again = true;
                 }
             }
@@ -940,5 +961,124 @@ impl Shared {
                 c.streams.remove(&s.id);
             }
         }
+    }
+}
+
+thread_local! {
+    /// The flag of the controller [`Closable`] built last on this thread,
+    /// until the connection it was built for takes it.
+    static BUILT: Cell<Option<Arc<AtomicBool>>> = const { Cell::new(None) };
+}
+
+/// Builds quinn-proto's default congestion controller (CUBIC) behind a
+/// flag that lifts the congestion window once the connection is over.
+///
+/// quinn-proto holds a CONNECTION_CLOSE back like data when the
+/// connection still has stream data or frames to send and its window is
+/// full, and it stops the timers that would free the window: the close is
+/// then never sent and the peer waits for its idle timeout. Seen when a
+/// server closed a connection right after writing a large response.
+pub(crate) struct Closable(Arc<quinn_proto::congestion::CubicConfig>);
+
+impl Closable {
+    pub(crate) fn factory() -> Arc<Self> {
+        Arc::new(Closable(Arc::default()))
+    }
+
+    /// The flag of the controller built since the last call, if any.
+    /// quinn-proto builds controllers inside the calls that make a
+    /// connection or handle its datagrams, on the endpoint's thread.
+    fn built() -> Option<Arc<AtomicBool>> {
+        BUILT.with(Cell::take)
+    }
+}
+
+impl quinn_proto::congestion::ControllerFactory for Closable {
+    fn build(
+        self: Arc<Self>,
+        now: Instant,
+        current_mtu: u16,
+    ) -> Box<dyn quinn_proto::congestion::Controller> {
+        let closing = Arc::new(AtomicBool::new(false));
+        BUILT.with(|b| b.set(Some(closing.clone())));
+        Box::new(ClosableController {
+            inner: self.0.clone().build(now, current_mtu),
+            closing,
+        })
+    }
+}
+
+struct ClosableController {
+    inner: Box<dyn quinn_proto::congestion::Controller>,
+    closing: Arc<AtomicBool>,
+}
+
+impl quinn_proto::congestion::Controller for ClosableController {
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.inner.on_sent(now, bytes, last_packet_number);
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &quinn_proto::RttEstimator,
+    ) {
+        self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        self.inner
+            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.inner
+            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.inner.on_mtu_update(new_mtu);
+    }
+
+    fn window(&self) -> u64 {
+        if self.closing.load(Ordering::Relaxed) {
+            u64::MAX / 2
+        } else {
+            self.inner.window()
+        }
+    }
+
+    fn metrics(&self) -> quinn_proto::congestion::ControllerMetrics {
+        self.inner.metrics()
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn_proto::congestion::Controller> {
+        Box::new(ClosableController {
+            inner: self.inner.clone_box(),
+            closing: self.closing.clone(),
+        })
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.inner.initial_window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }

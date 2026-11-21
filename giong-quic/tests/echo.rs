@@ -2,6 +2,7 @@
 //! quinn (on Tokio, another thread) against a giong-quic server.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -387,6 +388,76 @@ fn closing_a_connection_ends_what_waits_on_it() {
             assert!(accepted.unwrap_err().to_string().contains("GIONG-E3603"));
             assert!(conn.open_bi().await.is_err());
             drop(send);
+        })
+        .unwrap();
+}
+
+/// A relay between a client and `server` over loopback that drops what
+/// the client sends once `cut` is set. Returns the address to connect to.
+fn relay(server: SocketAddr, cut: Arc<AtomicBool>) -> SocketAddr {
+    let front = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let back = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let addr = front.local_addr().unwrap();
+    let client = Arc::new(std::sync::Mutex::new(None));
+    let (f, b, c) = (front.clone(), back.clone(), client.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok((n, from)) = f.recv_from(&mut buf) {
+            *c.lock().unwrap() = Some(from);
+            if !cut.load(Ordering::Relaxed) {
+                let _ = b.send_to(&buf[..n], server);
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok((n, _)) = back.recv_from(&mut buf) {
+            if let Some(to) = *client.lock().unwrap() {
+                let _ = front.send_to(&buf[..n], to);
+            }
+        }
+    });
+    addr
+}
+
+#[test]
+fn a_close_reaches_the_peer_while_data_waits_to_be_sent() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let cut = Arc::new(AtomicBool::new(false));
+            let addr = relay(server.local_addr().unwrap(), cut.clone());
+            // The server answers with more than its congestion window,
+            // whose ACKs never come, and closes the connection while the
+            // rest of the answer waits to be sent.
+            giong::spawn(async move {
+                let conn = server.accept().await.unwrap();
+                let (mut send, _recv) = conn.accept_bi().await.unwrap();
+                cut.store(true, Ordering::Relaxed);
+                giong::spawn(async move {
+                    let _ = send.write_all(&payload(1 << 20)).await;
+                });
+                giong::time::sleep(Duration::from_millis(50)).await;
+                conn.close(9, b"enough");
+                giong::time::sleep(Duration::from_secs(10)).await;
+            });
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"go").await.unwrap();
+            // The idle timeout is 30 s: an answer within 3 s is the close.
+            let read = giong::time::timeout(Duration::from_secs(3), recv.read_to_end(8 << 20))
+                .await
+                .expect("the close never reached the client");
+            let e = read.unwrap_err().to_string();
+            assert!(e.contains("closed by peer: enough (code 9)"), "{e}");
         })
         .unwrap();
 }
