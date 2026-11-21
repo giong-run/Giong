@@ -144,7 +144,7 @@ extern "C" fn on_signal(signal: libc::c_int) {
     let saved = unsafe { *errno };
     if let Some(count) = usize::try_from(signal).ok().and_then(|i| COUNTS.get(i)) {
         count.fetch_add(1, Ordering::SeqCst);
-        let fd = WAKE_FD.load(Ordering::Relaxed);
+        let fd = WAKE_FD.load(Ordering::Acquire);
         if fd >= 0 {
             let byte = signal as u8;
             // SAFETY: `write` is async-signal-safe; the descriptor is never

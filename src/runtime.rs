@@ -1325,7 +1325,7 @@ extern "C" fn on_signal(signal: libc::c_int) {
 /// requests a shutdown. Also called by the handler of [`crate::signal`] when
 /// that one is installed for these signals. Async-signal-safe.
 pub(crate) fn on_shutdown_signal(_signal: libc::c_int) {
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
+    let fd = SIGNAL_FD.load(Ordering::Acquire);
     if fd >= 0 {
         let one: u64 = 1;
         // SAFETY: `write` is async-signal-safe; `errno` is restored afterwards.
