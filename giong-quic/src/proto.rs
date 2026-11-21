@@ -214,6 +214,15 @@ fn hand_over(
     }
 }
 
+/// Adds `w`, unless the last one added wakes the same task: a future polled
+/// again and again before anything happens would otherwise add itself
+/// each time.
+fn add_waker(list: &mut Vec<Waker>, w: &Waker) {
+    if !list.last().is_some_and(|last| last.will_wake(w)) {
+        list.push(w.clone());
+    }
+}
+
 fn wake_all(w: &mut Vec<Waker>) {
     for w in w.drain(..) {
         w.wake();
@@ -583,13 +592,21 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
                 }
                 let (sent, mut v) = sh.sock.send_to_with(s.data, s.to, &options).await;
                 if s.segment > 0 && s.segment < v.len() && gso_refused(&sent) {
-                    // The route refuses segmentation offload (no checksum
-                    // offload on a tun, VPN or veth device): one datagram
-                    // per send from now on, and this batch again so.
-                    sh.st.borrow_mut().segments = 1;
+                    // The route may refuse segmentation offload (no
+                    // checksum offload on a tun, VPN or veth device). EINVAL
+                    // also comes from a source address the machine no
+                    // longer has, so one datagram is sent alone first: if
+                    // that goes, it was the offload, and every send is one
+                    // datagram from now on.
                     let options = options.segment_size(0);
-                    for one in v.chunks(s.segment) {
-                        let _ = sh.sock.send_to_with(one.to_vec(), s.to, &options).await;
+                    let mut ones = v.chunks(s.segment);
+                    let first = ones.next().unwrap_or_default().to_vec();
+                    let (alone, _) = sh.sock.send_to_with(first, s.to, &options).await;
+                    if alone.is_ok() {
+                        sh.st.borrow_mut().segments = 1;
+                        for one in ones {
+                            let _ = sh.sock.send_to_with(one.to_vec(), s.to, &options).await;
+                        }
                     }
                 }
                 // Other send errors are losses, which QUIC recovers from.
@@ -901,7 +918,7 @@ impl Shared {
             if c.connected {
                 return Poll::Ready(Ok(()));
             }
-            c.waiters.push(cx.waker().clone());
+            add_waker(&mut c.waiters, cx.waker());
             Poll::Pending
         })
         .await?;
@@ -953,7 +970,7 @@ impl Shared {
             if let Some(e) = &c.lost {
                 return Poll::Ready(Err(error::lost(e)));
             }
-            c.waiters.push(cx.waker().clone());
+            add_waker(&mut c.waiters, cx.waker());
             Poll::Pending
         })
         .await
@@ -998,7 +1015,7 @@ impl Shared {
                     Poll::Ready(Ok(sid))
                 }
                 None => {
-                    c.waiters.push(cx.waker().clone());
+                    add_waker(&mut c.waiters, cx.waker());
                     Poll::Pending
                 }
             }
@@ -1367,6 +1384,24 @@ mod tests {
         p.extend_from_slice(&[0x40 | (payload >> 8) as u8, payload as u8]);
         p.extend(std::iter::repeat(0).take(payload));
         p
+    }
+
+    #[test]
+    fn a_task_polled_again_is_not_added_again() {
+        struct Task;
+        impl std::task::Wake for Task {
+            fn wake(self: Arc<Self>) {}
+        }
+        let a = Waker::from(Arc::new(Task));
+        let b = Waker::from(Arc::new(Task));
+        let mut list = Vec::new();
+        for _ in 0..100 {
+            add_waker(&mut list, &a);
+        }
+        assert_eq!(list.len(), 1);
+        add_waker(&mut list, &b);
+        add_waker(&mut list, &b);
+        assert_eq!(list.len(), 2);
     }
 
     #[test]
