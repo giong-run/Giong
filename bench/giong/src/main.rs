@@ -120,6 +120,12 @@ fn main() {
     if let Some(us) = std::env::var("GIONG_SPIN_US").ok().and_then(|v| v.parse().ok()) {
         builder = builder.spin_before_park(std::time::Duration::from_micros(us));
     }
+    // GIONG_SPIN_ADAPTIVE_US=<microseconds>: the same, tuned per worker,
+    // spinning at most GIONG_SPIN_CPU_PCT percent of the time (default 100).
+    if let Some(us) = std::env::var("GIONG_SPIN_ADAPTIVE_US").ok().and_then(|v| v.parse().ok()) {
+        let cap = std::env::var("GIONG_SPIN_CPU_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+        builder = builder.adaptive_spin(std::time::Duration::from_micros(us), cap);
+    }
     // GIONG_RECV_BUFS=<count>,<size> overrides the receive buffer pool.
     if let Some((count, size)) = std::env::var("GIONG_RECV_BUFS").ok().and_then(|v| {
         let (count, size) = v.split_once(',')?;

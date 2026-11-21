@@ -372,6 +372,10 @@ struct Config {
     /// Where `driver` came from.
     chosen_by: ChosenBy,
     spin: Option<Duration>,
+    /// `spin` is a maximum, tuned per worker (see [`crate::spin`]).
+    spin_adaptive: bool,
+    /// The share of a worker's time adaptive spinning may take.
+    spin_cpu_percent: u8,
     ring_entries: u32,
     buf_count: u16,
     buf_size: usize,
@@ -429,6 +433,8 @@ pub(crate) struct Worker {
     pub(crate) next_task_uid: Cell<u64>,
     /// How long to busy-poll for new work before blocking in the kernel.
     spin: Option<Duration>,
+    /// Tunes `spin` to what spinning catches, when it is adaptive.
+    spin_governor: Option<crate::spin::Governor>,
     /// Tasks on this worker waiting for a shutdown request.
     shutdown_waiters: RefCell<Slab<Waker>>,
     /// How long remaining tasks may keep running after the main future is done.
@@ -520,6 +526,10 @@ impl Worker {
             pool,
             next_task_uid: Cell::new(1),
             spin: cfg.spin,
+            spin_governor: cfg
+                .spin
+                .filter(|_| cfg.spin_adaptive)
+                .map(|max| crate::spin::Governor::new(max, u32::from(cfg.spin_cpu_percent))),
             shutdown_waiters: RefCell::new(Slab::new()),
             shutdown_grace: cfg.shutdown_grace,
             draining: Cell::new(false),
@@ -700,14 +710,35 @@ impl Worker {
                 continue;
             }
 
+            // When the worker ran out of work, for the spin governor.
+            let mut idle_since = None;
             if let Some(spin) = self.spin {
                 // Hand queued submissions (responses!) to the kernel first, then
                 // watch for new work without giving up the CPU.
                 let graveyard = self.driver.borrow_mut().park(Park::Poll);
                 drop(graveyard);
                 self.fire_timers();
-                if !self.queue.borrow().is_empty() || self.spin_for_work(spin) {
+                if !self.queue.borrow().is_empty() {
                     continue;
+                }
+                match &self.spin_governor {
+                    None => {
+                        if self.spin_for_work(spin) {
+                            continue;
+                        }
+                    }
+                    Some(governor) => {
+                        let start = Instant::now();
+                        let window = governor.window(start);
+                        if !window.is_zero() {
+                            let found = self.spin_for_work(window);
+                            governor.spun(start.elapsed());
+                            if found {
+                                continue;
+                            }
+                        }
+                        idle_since = Some(start);
+                    }
                 }
             }
 
@@ -742,6 +773,9 @@ impl Worker {
             self.shared.bell.unpark();
             if sleeps {
                 self.shared.counters.woke();
+            }
+            if let (Some(governor), Some(since), true) = (&self.spin_governor, idle_since, sleeps) {
+                governor.slept(since.elapsed());
             }
             // Buffers of cancelled operations: dropped outside the driver borrow.
             drop(graveyard);
@@ -981,6 +1015,8 @@ pub struct Builder {
     buf_size: usize,
     signals: bool,
     spin: Option<Duration>,
+    spin_adaptive: bool,
+    spin_cpu_percent: u8,
     shutdown_grace: Duration,
 }
 
@@ -1005,6 +1041,8 @@ impl Builder {
             buf_size: 16 * 1024,
             signals: false,
             spin: None,
+            spin_adaptive: false,
+            spin_cpu_percent: 100,
             shutdown_grace: Duration::ZERO,
         }
     }
@@ -1112,6 +1150,28 @@ impl Builder {
     /// order of the gaps between requests (tens to hundreds of microseconds).
     pub fn spin_before_park(mut self, duration: Duration) -> Self {
         self.spin = (!duration.is_zero()).then_some(duration);
+        self.spin_adaptive = false;
+        self
+    }
+
+    /// Like [`spin_before_park`](Self::spin_before_park), but tuned per
+    /// worker: `max` is the longest spin, and each worker spins only while
+    /// spinning has recently been catching new work.
+    ///
+    /// After each sleep a worker looks at how long it was idle in all. Idle
+    /// no longer than `max` (the next event came soon after it gave up) doubles
+    /// its spin, up to `max`; idle more than twice `max` halves it, down to
+    /// none; in between nothing changes. Spinning never takes more than
+    /// `cpu_percent` of a worker's time (100: no cap), whatever the load.
+    ///
+    /// Where requests come further apart than `max`, a worker stops spinning
+    /// and costs the CPU of one that never spins, and the latency too (fixed
+    /// spinning is a few microseconds faster there, `bench/spin.sh`); where
+    /// they come closer, it spins like `spin_before_park(max)`.
+    pub fn adaptive_spin(mut self, max: Duration, cpu_percent: u8) -> Self {
+        self.spin = (!max.is_zero()).then_some(max);
+        self.spin_adaptive = true;
+        self.spin_cpu_percent = cpu_percent.clamp(1, 100);
         self
     }
 
@@ -1174,6 +1234,8 @@ impl Builder {
             driver,
             chosen_by,
             spin: self.spin,
+            spin_adaptive: self.spin_adaptive,
+            spin_cpu_percent: self.spin_cpu_percent,
             ring_entries: self.ring_entries,
             buf_count: self.buf_count,
             buf_size: self.buf_size,

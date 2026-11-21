@@ -90,6 +90,7 @@ mod notify;
 mod op;
 mod runtime;
 mod slab;
+mod spin;
 
 pub mod error;
 pub mod fs;
