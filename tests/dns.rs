@@ -47,14 +47,23 @@ impl FakeDns {
         // connections in TIME_WAIT, which UDP ports never are, and Windows
         // hands out ports in sequence, so the twin of a fresh UDP port was
         // often one that this suite's own connections had just closed.
+        // Listeners whose twin is busy stay open until a pair is found:
+        // closed at once, the next bind may be given the same port again.
+        let mut busy = Vec::new();
         let (udp, tcp, addr) = (0..100)
             .find_map(|_| {
                 let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
                 let addr = tcp.local_addr().unwrap();
-                let udp = StdUdpSocket::bind(addr).ok()?;
-                Some((udp, tcp, addr))
+                match StdUdpSocket::bind(addr) {
+                    Ok(udp) => Some((udp, tcp, addr)),
+                    Err(_) => {
+                        busy.push(tcp);
+                        None
+                    }
+                }
             })
             .expect("no free UDP and TCP port pair");
+        drop(busy);
         let queries = Arc::new(Mutex::new(Vec::new()));
 
         let (t, q) = (table.clone(), queries.clone());
