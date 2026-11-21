@@ -121,6 +121,7 @@ pub struct Config {
     pub(crate) statement_timeout: Option<Duration>,
     pub(crate) max_result_size: usize,
     pub(crate) statement_cache: usize,
+    pub(crate) batch_reads: bool,
 }
 
 impl Default for Config {
@@ -163,6 +164,7 @@ impl Config {
             statement_timeout: Some(Duration::from_secs(30)),
             max_result_size: 64 << 20,
             statement_cache: 256,
+            batch_reads: false,
         }
     }
 
@@ -301,6 +303,72 @@ impl Config {
     /// size.
     pub fn statement_cache_capacity(mut self, statements: usize) -> Self {
         self.statement_cache = statements;
+        self
+    }
+
+    /// Lets [`Pool`](crate::Pool) send the `SELECT` statements it runs on
+    /// its shared connections (`query`, `query_one`, `query_opt`) in batches:
+    /// off by default.
+    ///
+    /// The server sends its answers to the statements before one `Sync`
+    /// message in one write, where it otherwise makes a write, and wakes the
+    /// client, for each statement; when it is the busy side, it then answers
+    /// more statements a second (on PostgreSQL 16, about 50% more one-row
+    /// `SELECT`s, measured with pgbench in batches of 16). A batch is the
+    /// `SELECT`s that are waiting to be written to one connection when it
+    /// writes, at most 16: a statement never waits for others to join it.
+    ///
+    /// A `SELECT` whose text contains `set_config` runs alone, never in a
+    /// batch: the statements of a batch share one transaction, and a
+    /// transaction-local setting (`set_config(name, value, true)`, as
+    /// row-level security set up per request uses) would apply to the
+    /// statements of other tasks after it. The text is matched in any case,
+    /// quoted strings and comments included; a false match only costs the
+    /// statement its batch. **Do not turn it on if functions that
+    /// statements call make such settings** (`set_config(.., true)` or
+    /// `SET LOCAL` inside a function): those calls cannot be seen in the
+    /// statement's text.
+    ///
+    /// What changes for a statement in a batch:
+    ///
+    /// * It runs in one transaction with the others, made read-only first
+    ///   (`set_config('transaction_read_only', 'on', true)`). A `SELECT`
+    ///   that writes (one that calls a function that writes, or takes a row
+    ///   lock with `FOR UPDATE`) fails with the server's `25006` and is sent
+    ///   again on its own, where it runs as it would without batches; it is
+    ///   not batched again on that connection.
+    /// * When a statement in a batch fails, or the batch's commit does (a
+    ///   deferred constraint on a temporary table, say), the batch's
+    ///   transaction is rolled back: the statement that failed fails, and
+    ///   every other statement of the batch is sent again, on its own,
+    ///   whether it had run (what it did was rolled back) or the server had
+    ///   skipped it. What a transaction's rollback does not undo happens
+    ///   twice then: a sequence advanced by `nextval` (allowed on temporary
+    ///   sequences) is advanced again, and a session-level advisory lock
+    ///   (`pg_advisory_lock`, `pg_try_advisory_lock`) is taken twice, so one
+    ///   unlock leaves it held. One statement that fails on its input (a bad
+    ///   `$1::int4`, say) also makes up to 15 statements before it run
+    ///   again: bounded, but more work for a database that is the limit.
+    /// * Its answer arrives when the batch ends, once its commit is known:
+    ///   a statement waits for up to 15 others that were written after it.
+    ///   They run one after another on the server either way, so this is
+    ///   added only to the statements early in a batch; keep slow statements
+    ///   and fast ones in different pools when that matters.
+    /// * `now()` and `transaction_timestamp()` give the time the batch
+    ///   started, and a transaction-scoped advisory lock is held until the
+    ///   batch ends.
+    /// * The locks its statements take are held until the batch ends, so a
+    ///   statement of a batch waits at most 50 ms for a lock: past that, or
+    ///   when it fails with a deadlock (`40P01`) or a serialization failure
+    ///   (`40001`), the batch is rolled back and the statement is sent
+    ///   again alone, where it waits as it would without batches (a
+    ///   `lock_timeout` shorter than 50 ms then applies to that run). Without
+    ///   that, a batch could deadlock with a transaction that the same
+    ///   statements one by one never would (a migration that locks two
+    ///   tables the batch reads), and the server would roll one of them
+    ///   back.
+    pub fn batch_reads(mut self, batch: bool) -> Self {
+        self.batch_reads = batch;
         self
     }
 

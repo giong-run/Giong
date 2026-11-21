@@ -1,5 +1,7 @@
 //! Incremental decoder for `Transfer-Encoding: chunked` request bodies.
 
+use crate::trailers::Trailers;
+
 /// Longest accepted chunk-size line or trailer line.
 const MAX_LINE: usize = 4096;
 
@@ -52,6 +54,11 @@ pub(crate) struct Decoder {
     /// Decoded bytes so far, including those taken out of `body`.
     decoded: usize,
     pub(crate) body: Vec<u8>,
+    /// The trailer fields read so far; complete once `feed` returns `Done`.
+    /// Fields that mean nothing in trailers are not kept.
+    /// On the heap, and only once a field has come: most bodies have
+    /// none, and the decoder is part of every connection's state.
+    pub(crate) trailers: Option<Box<Trailers>>,
     max: usize,
 }
 
@@ -64,6 +71,7 @@ impl Decoder {
             extension_bytes: 0,
             decoded: 0,
             body: Vec::new(),
+            trailers: None,
             max,
         }
     }
@@ -162,16 +170,20 @@ impl Decoder {
                     if nl == 1 {
                         return Ok(Progress::Done(self.pos));
                     }
-                    // Trailer fields are read and dropped, within a budget.
+                    // Trailer fields are kept within a budget.
                     self.trailer_bytes += nl + 1;
                     if nl > MAX_LINE || self.trailer_bytes > 4 * MAX_LINE {
                         return Err(400);
                     }
-                    // Dropped, but held to the rules of a header line all
-                    // the same: a proxy in front that ends lines at a bare
-                    // CR, or reads a line without a colon some other way,
-                    // would see a different message.
+                    // Held to the rules of a header line: a proxy in front
+                    // that ends lines at a bare CR, or reads a line without
+                    // a colon some other way, would see a different message.
                     if !is_header_line(line) {
+                        return Err(400);
+                    }
+                    let colon = line.iter().position(|&b| b == b':').unwrap_or(0);
+                    let trailers = self.trailers.get_or_insert_with(Box::default);
+                    if !trailers.received(&line[..colon], &line[colon + 1..]) {
                         return Err(400);
                     }
                 }
