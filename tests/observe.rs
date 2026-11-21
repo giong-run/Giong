@@ -367,6 +367,7 @@ async fn serve_traced<F: std::future::Future>(
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "timing: compares phases with sleeps")]
 fn requests_are_split_into_phases_and_grouped_by_route() {
     use observe::{RequestTrace, Route, Wait};
     static CHECKOUT: Route = Route::from_static("POST /checkout");
@@ -490,6 +491,7 @@ fn requests_are_split_into_phases_and_grouped_by_route() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "timing: compares phases with sleeps")]
 fn a_request_holding_the_worker_is_named_by_its_route() {
     use observe::{RequestTrace, Route};
     let report = giong::block_on(async {
@@ -534,4 +536,48 @@ fn a_request_holding_the_worker_is_named_by_its_route() {
         .unwrap();
     assert_eq!(report_route.slowest[0].blocked, Duration::ZERO);
     assert!(report_route.slowest[0].longest_poll >= Duration::from_millis(30));
+}
+
+/// What the tests above check without timing, so that Miri runs the code
+/// that finds the request being served from inside its handler.
+#[test]
+fn waits_and_routes_reach_the_request_being_served() {
+    use observe::{RequestTrace, Route, Wait};
+    static ROUTE: Route = Route::from_static("GET /any");
+    let report = giong::block_on(async {
+        let h = giong::handle();
+        h.set_request_tracing(true);
+        giong::yield_now().await;
+        let mut trace = RequestTrace::start("test").expect("tracing is on");
+        trace.started();
+        serve_traced(&mut trace, async {
+            observe::set_route(&ROUTE);
+            let _query = observe::wait(Wait::Query, "redis");
+            giong::yield_now().await;
+        })
+        .await;
+        // Outside the handler: belongs to no request.
+        drop(observe::wait(Wait::Pool, "redis"));
+        trace.responded(204);
+        trace.finish();
+        drop(RequestTrace::start("test").unwrap());
+        h.set_request_tracing(false);
+        giong::yield_now().await;
+        assert!(RequestTrace::start("test").is_none());
+        observe::take_requests()
+    });
+    let any = report
+        .routes
+        .iter()
+        .find(|r| r.route.as_ref() == Some(&ROUTE))
+        .expect("the route is named");
+    assert_eq!(any.requests, 1);
+    let r = &any.slowest[0];
+    assert_eq!(r.status, 204);
+    assert_eq!(r.polls, 2);
+    assert_eq!(r.query.count, 1);
+    assert_eq!(r.query.what, Some("redis"));
+    assert_eq!(r.pool.count, 0);
+    let unnamed = report.routes.iter().find(|r| r.route.is_none()).unwrap();
+    assert_eq!((unnamed.requests, unnamed.abandoned), (0, 1));
 }
