@@ -26,3 +26,7 @@
 - **giong**: `Builder::build` refuses a driver the operating system does not have:
   io_uring with `GIONG-E0001`, the others with `GIONG-E0004`, whether named through
   `Builder::driver` or `GIONG_DRIVER` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: `ResolverConfig::parse` (and so `ResolverConfig::system`) keeps a
+  `nameserver` with a zone, such as `fe80::1%en0`, as a scoped IPv6 address; it was skipped,
+  which could leave only the `127.0.0.1` fallback
+  ([#173](https://github.com/giong-run/Giong/pull/173)).
