@@ -465,55 +465,75 @@ fn rss_kib() -> u64 {
 /// its first use: Winsock and its helper handles, the thread that hands
 /// round the connections of a shared address, the runtime's blocking
 /// threads, the file system's. The handle count before the soak is taken
-/// after this, so that it compares like with like.
+/// after this, so that it compares like with like
+/// (`the_descriptor_count_is_flat_over_runtime_lives` checks that what this
+/// opens is opened once).
 #[cfg(windows)]
 fn warm_up() {
-    let dir = std::env::temp_dir().join(format!("giong-soak-warm-{}", std::process::id()));
-    let (_holder, port) = common::shared_port();
+    runtime_life();
+}
+
+/// One short life of a runtime, using what the soak uses: two workers
+/// share a listening address and take connections that carry a message
+/// each, a datagram goes round, a file is written, synced and removed.
+fn runtime_life() {
+    const CONNECTIONS: usize = 20;
+    let (holder, port) = common::shared_port();
     let shared: SocketAddr = ([127, 0, 0, 1], port).into();
+    let dir = std::env::temp_dir().join(format!("giong-soak-life-{}", std::process::id()));
     giong::Builder::new()
         .workers(2)
         .build()
         .unwrap()
         .run(move |worker| {
-            let dir = dir.clone();
+            let path = dir.with_extension(format!("{worker}.tmp"));
             async move {
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let addr = listener.local_addr().unwrap();
-                let accept = giong::spawn(async move { listener.accept().await.map(drop) });
-                let connected = TcpStream::connect(addr).await.unwrap();
-                accept.await.unwrap().unwrap();
-                drop(connected);
-                // Both workers on one address, as in the soak: the second
-                // listener starts the thread that hands connections round.
                 let listener = TcpListener::bind(shared).unwrap();
+                // Let both listeners come up, so that the address is shared.
                 sleep(Duration::from_millis(100)).await;
                 let accept = giong::spawn(async move {
                     while let Ok(Ok(stream)) =
                         timeout(Duration::from_millis(500), listener.accept()).await
                     {
-                        drop(stream);
+                        giong::spawn(async move {
+                            while let Ok(data) = stream.recv().await {
+                                if data.is_empty()
+                                    || stream.write_all(data.to_vec()).await.0.is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        });
                     }
                 });
-                drop(TcpStream::connect(shared).await.unwrap());
+                for _ in 0..CONNECTIONS {
+                    let stream = TcpStream::connect(shared).await.unwrap();
+                    stream.write_all(vec![ECHO; 8]).await.0.unwrap();
+                    let mut back = 0;
+                    while back < 8 {
+                        let data = stream.recv().await.unwrap();
+                        assert!(!data.is_empty(), "the echo server hung up");
+                        back += data.len();
+                    }
+                }
                 accept.await.unwrap();
+
                 let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
                 udp.send_to(vec![1u8], udp.local_addr().unwrap())
                     .await
                     .0
                     .unwrap();
                 drop(udp.recv_from().await.unwrap());
-                if worker == 0 {
-                    let path = dir.with_extension("tmp");
-                    let file = giong::fs::File::create(&path).await.unwrap();
-                    file.write_all_at(vec![0u8; 16], 0).await.0.unwrap();
-                    file.sync_all().await.unwrap();
-                    drop(file);
-                    giong::fs::remove_file(&path).await.unwrap();
-                }
+
+                let file = giong::fs::File::create(&path).await.unwrap();
+                file.write_all_at(vec![0u8; 16], 0).await.0.unwrap();
+                file.sync_all().await.unwrap();
+                drop(file);
+                giong::fs::remove_file(&path).await.unwrap();
             }
         })
         .unwrap();
+    drop(holder);
 }
 
 /// The descriptor count once it is back to `before` or below, or after 15
@@ -761,4 +781,29 @@ fn soak() {
             "resident memory kept growing: median {q2} KiB in the second quarter, {q4} KiB in the last"
         );
     }
+}
+
+/// What a runtime opens once per process (Winsock's helpers, the shared
+/// address's thread) stays; what each runtime opens goes with it. Five
+/// lives of a runtime: after the first, the count stays where the first
+/// left it. The soak's final check relies on this.
+#[test]
+fn the_descriptor_count_is_flat_over_runtime_lives() {
+    let before = open_fds();
+    runtime_life();
+    let first = settled_fds(open_fds());
+    let mut counts = vec![before, first];
+    for _ in 0..4 {
+        runtime_life();
+        counts.push(settled_fds(first));
+    }
+    eprintln!(
+        "descriptors: {before} before, then after each life: {:?}",
+        &counts[1..]
+    );
+    assert!(
+        counts[2..].iter().all(|&n| n <= first),
+        "descriptors grew over runtime lives: {before} before, then {:?}",
+        &counts[1..]
+    );
 }
