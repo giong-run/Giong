@@ -923,7 +923,10 @@ impl Shared {
             }
             let (id, early) = if open {
                 // Opened before the handshake ends: its bytes go in 0-RTT.
-                (c.c.streams().open(dir), c.early && !c.connected)
+                (
+                    c.c.streams().open(dir),
+                    !c.incoming && c.early && !c.connected,
+                )
             } else if dir == Dir::Bi && !c.early_bi.is_empty() {
                 (c.early_bi.pop_front(), true)
             } else {

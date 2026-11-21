@@ -838,3 +838,43 @@ fn a_wildcard_server_answers_from_the_address_it_was_sent_to() {
         })
         .unwrap();
 }
+
+#[test]
+fn streams_a_server_opens_are_never_early() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let config = ServerConfig::new(tls).unwrap().early_data(true);
+            let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+            let addr = server.local_addr().unwrap();
+            let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let noted = seen.clone();
+            giong::spawn(async move {
+                while let Some(conn) = server.accept().await {
+                    // At once, which for a resumed client is before its
+                    // handshake ends: what the server sends is not 0-RTT.
+                    let mut send = conn.open_uni().await.unwrap();
+                    noted.borrow_mut().push(send.is_early());
+                    send.write_all(b"hi").await.unwrap();
+                    send.finish().unwrap();
+                    giong::spawn(async move {
+                        let _stream = conn.accept_bi().await;
+                        giong::time::sleep(Duration::from_secs(2)).await;
+                    });
+                }
+            });
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap().early_data(true);
+            for _ in 0..2 {
+                let conn = client.connect_early(addr, "localhost", &cfg).await.unwrap();
+                let (mut send, _recv) = conn.open_bi().await.unwrap();
+                send.write_all(b"x").await.unwrap();
+                let mut uni = conn.accept_uni().await.unwrap();
+                assert_eq!(uni.read_to_end(16).await.unwrap(), b"hi");
+                conn.close(0, b"");
+            }
+            assert_eq!(*seen.borrow(), [false, false]);
+        })
+        .unwrap();
+}
