@@ -882,6 +882,10 @@ impl Iocp {
             return MultiPoll::Item(res);
         }
         if multi.last {
+            // What the receive in flight took is still the reader's.
+            if let Some(data) = multi.data.take() {
+                return MultiPoll::Data(data);
+            }
             if !multi.pending.is_null() {
                 multi.wait(waker);
             }

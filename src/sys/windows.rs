@@ -224,13 +224,18 @@ pub(crate) unsafe fn write_at(
 pub(crate) mod errno {
     use windows_sys::Win32::Foundation::ERROR_IO_DEVICE;
     use windows_sys::Win32::Networking::WinSock::{
-        WSAEADDRINUSE, WSAEINTR, WSAEOPNOTSUPP, WSAEWOULDBLOCK,
+        WSAEADDRINUSE, WSAECONNRESET, WSAEINTR, WSAEMSGSIZE, WSAENETRESET, WSAEOPNOTSUPP,
+        WSAEWOULDBLOCK,
     };
 
     pub(crate) const EADDRINUSE: i32 = WSAEADDRINUSE;
     pub(crate) const EAGAIN: i32 = WSAEWOULDBLOCK;
     pub(crate) const EINTR: i32 = WSAEINTR;
     pub(crate) const EIO: i32 = ERROR_IO_DEVICE as i32;
+    pub(crate) const EMSGSIZE: i32 = WSAEMSGSIZE;
+    pub(crate) const ENETRESET: i32 = WSAENETRESET;
+    /// A datagram sent earlier was refused by its peer.
+    pub(crate) const NO_PEER: i32 = WSAECONNRESET;
     pub(crate) const EOPNOTSUPP: i32 = WSAEOPNOTSUPP;
 }
 
@@ -504,6 +509,36 @@ impl Drop for SignalGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(id, _)| *id != self.id);
+    }
+}
+
+/// `recvfrom` on a non-blocking socket into `buf`: the bytes received,
+/// or -1 with the thread's last error set (`WSAEWOULDBLOCK` when nothing
+/// is waiting, `WSAEMSGSIZE` when the datagram was longer than `buf` and
+/// its start fills it). The sender's address goes to `from`, its length to
+/// `from_len`.
+///
+/// # Safety
+///
+/// `buf` must be valid for writes of `len` bytes, `from` for a
+/// `SOCKADDR_STORAGE` and `from_len` for an `i32` holding its size.
+pub(crate) unsafe fn recv_from_nowait(
+    sock: RawSock,
+    buf: *mut u8,
+    len: usize,
+    from: *mut SockAddrStorage,
+    from_len: *mut SockLen,
+) -> isize {
+    // SAFETY: as the caller guarantees.
+    unsafe {
+        WinSock::recvfrom(
+            sock,
+            buf,
+            len.min(i32::MAX as usize) as i32,
+            0,
+            from.cast(),
+            from_len,
+        ) as isize
     }
 }
 

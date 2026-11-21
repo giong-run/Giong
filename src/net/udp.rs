@@ -26,6 +26,10 @@ use crate::op::Op;
 use crate::runtime;
 #[cfg(windows)]
 use crate::sys::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+#[cfg(windows)]
+#[path = "udp_spread.rs"]
+mod spread;
 use crate::sys::{IoVec, MsgHdr, SockAddrStorage};
 
 /// What the kernel puts in front of every datagram of a multishot receive
@@ -194,6 +198,10 @@ pub struct UdpSocket {
     /// The socket's hold on its port, for one that [`bind`](Self::bind)
     /// made on a port of the caller's choice (see `share`).
     held: Option<share::Held>,
+    /// The socket's share of an address that other sockets of this process
+    /// hold too (see `spread`). Dropped after the socket is closed.
+    #[cfg(windows)]
+    spread: Option<spread::Member>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -222,6 +230,15 @@ impl UdpSocket {
     /// share a port between processes on purpose, create the sockets
     /// yourself and pass them to [`from_std`](Self::from_std).
     ///
+    /// Windows has no `SO_REUSEPORT`, and a port there has one socket: the
+    /// sockets of the workers are handles to the socket that the first of
+    /// them bound. From the second on, a thread of giong's receives for all
+    /// of them and hands each datagram to a socket chosen by a hash of the
+    /// sender's address, as Linux does; the sockets send on the one socket,
+    /// so replies come from the port that datagrams went to. Up to 4096
+    /// datagrams wait for each socket, and later ones are dropped until it
+    /// is read, as the kernel drops them for a socket read too slowly.
+    ///
     /// Port 0 asks the kernel for a port of the socket's own, which no other
     /// socket can share.
     ///
@@ -245,12 +262,34 @@ impl UdpSocket {
         // and join the two. Datagrams for either socket would then be split
         // between them by a hash of the sender's address.
         let share = addr.port() != 0;
-        let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
-            Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
-        })?;
-        let mut socket = Self::from_socket(sock);
-        socket.held = held;
-        Ok(socket)
+        let bind = || -> io::Result<Self> {
+            let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
+                Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+            })?;
+            let mut socket = Self::from_socket(sock);
+            socket.held = held;
+            Ok(socket)
+        };
+        #[cfg(unix)]
+        return bind();
+        // A port has one socket on Windows: a socket for an address that
+        // sockets of this process hold already joins them.
+        #[cfg(windows)]
+        {
+            if !share {
+                return bind();
+            }
+            let mut bound = None;
+            let (sock, _, member) = spread::bind(addr, || {
+                let socket = bind()?;
+                let handle = socket.sock.try_clone()?;
+                bound = Some(socket);
+                Ok((handle, ()))
+            })?;
+            let mut socket = bound.unwrap_or_else(|| Self::from_socket(sock));
+            socket.spread = member;
+            Ok(socket)
+        }
     }
 
     /// Wraps a socket created by the standard library, with the options it
@@ -266,6 +305,8 @@ impl UdpSocket {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
             held: None,
+            #[cfg(windows)]
+            spread: None,
             _not_send: PhantomData,
         }
     }
@@ -319,9 +360,28 @@ impl UdpSocket {
     }
 
     fn poll_recv_from(&self, cx: &mut Context<'_>) -> Poll<io::Result<(Datagram, SocketAddr)>> {
+        #[cfg(windows)]
+        let finishing = match &self.spread {
+            Some(member) => {
+                if let Poll::Ready(datagram) = member.poll_inbox(cx) {
+                    return Poll::Ready(Datagram::parse(RecvBuf::heap(datagram)));
+                }
+                if !member.is_first() {
+                    return Poll::Pending;
+                }
+                member.dispatching()
+            }
+            None => false,
+        };
         runtime::with_worker(|w| {
             let key = self.recv.key(w);
             let mut driver = w.driver.borrow_mut();
+            // The thread receives for the address now: the receive this
+            // socket has in flight is its last.
+            #[cfg(windows)]
+            if finishing {
+                driver.finish_multi(key);
+            }
             loop {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res) => {
@@ -331,7 +391,15 @@ impl UdpSocket {
                             Err(unexpected("io_uring returned a datagram without a buffer"))
                         });
                     }
-                    MultiPoll::Data(buf) => return Poll::Ready(Datagram::parse(buf)),
+                    MultiPoll::Data(buf) => {
+                        // `finishing` may have become true since it was
+                        // read: `passed_on` looks again.
+                        #[cfg(windows)]
+                        if self.passed_on(&buf) {
+                            continue;
+                        }
+                        return Poll::Ready(Datagram::parse(buf));
+                    }
                     MultiPoll::NeedArm => {
                         if !wait_for_pool(&mut driver, cx, true) {
                             return Poll::Pending;
@@ -381,6 +449,10 @@ impl UdpSocket {
             );
             return (Err(err), buf);
         }
+        #[cfg(windows)]
+        if let Some(member) = self.spread.as_ref().filter(|m| m.receives_from_inbox()) {
+            return read_inbox(member, buf).await;
+        }
         let msg = Message::new(buf.as_mut_ptr(), buf.capacity(), None);
         let io = Io::RecvMsg {
             fd: self.sock.as_raw_fd(),
@@ -404,7 +476,18 @@ impl UdpSocket {
                 mem::size_of::<SockAddrStorage>(),
             )
         };
-        match parse_addr(&name[..crate::sys::msg_name_len(&msg.hdr).min(name.len())]) {
+        let name = &name[..crate::sys::msg_name_len(&msg.hdr).min(name.len())];
+        // Started before the thread took over the address: a datagram whose
+        // sender maps to another socket goes there (see `passed_on`).
+        #[cfg(windows)]
+        if let Some(member) = &self.spread {
+            // SAFETY: the kernel wrote `res` bytes at the start of `buf`.
+            let payload = unsafe { std::slice::from_raw_parts(buf.as_mut_ptr(), res as usize) };
+            if member.pass_on(name, payload, false) {
+                return read_inbox(member, buf).await;
+            }
+        }
+        match parse_addr(name) {
             Some(from) => (Ok((res as usize, from)), buf),
             None => (
                 Err(unexpected(
@@ -461,6 +544,11 @@ impl UdpSocket {
             } else {
                 (Ok(res as usize), buf)
             };
+        }
+        #[cfg(windows)]
+        if self.is_joined() {
+            let res = self.send_when_room(&buf, Some(&addr)).await;
+            return (sent_result(res), buf);
         }
         let (res, buf) = if sends_to {
             let addr = KernelBox::new(addr);
@@ -532,6 +620,11 @@ impl UdpSocket {
                 (Ok(res as usize), buf)
             };
         }
+        #[cfg(windows)]
+        if self.is_joined() {
+            let res = self.send_when_room(&buf, None).await;
+            return (sent_result(res), buf);
+        }
         let len = buf.len().min(u32::MAX as usize) as u32;
         let io = Io::Send {
             fd: self.sock.as_raw_fd(),
@@ -563,6 +656,91 @@ impl UdpSocket {
     pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
         self.sock.set_broadcast(broadcast)
     }
+
+    /// For a datagram the first socket of a shared address received itself
+    /// after the thread took over: `true` if it went to the socket its
+    /// sender maps to instead.
+    #[cfg(windows)]
+    fn passed_on(&self, buf: &RecvBuf) -> bool {
+        let Some(member) = &self.spread else {
+            return false;
+        };
+        if buf.len() < OVERHEAD {
+            return false;
+        }
+        let field = |i: usize| {
+            let bytes: [u8; 4] = buf[i * 4..i * 4 + 4].try_into().expect("four bytes");
+            u32::from_ne_bytes(bytes) as usize
+        };
+        let name = &buf[OUT_HEADER..OUT_HEADER + field(0).min(NAME_LEN)];
+        let truncated = field(3) as i32 & crate::sys::MSG_TRUNC != 0;
+        member.pass_on(name, &buf[OVERHEAD..], truncated)
+    }
+
+    /// `true` for a socket that joined an address another socket of this
+    /// process bound: a handle to that socket, whose completions go to the
+    /// other socket's worker, so nothing of this one goes through the
+    /// completion port.
+    #[cfg(windows)]
+    fn is_joined(&self) -> bool {
+        self.spread.as_ref().is_some_and(|m| !m.is_first())
+    }
+
+    /// A send for a socket that [`is_joined`](Self::is_joined), once the
+    /// socket has room: bytes sent, or a negative error code.
+    #[cfg(windows)]
+    async fn send_when_room<B: IoBuf>(&self, buf: &B, addr: Option<&SockAddr>) -> isize {
+        let fd = self.sock.as_raw_fd();
+        loop {
+            // SAFETY: an `IoBuf` has `len()` initialised bytes at
+            // `as_ptr()`, and `addr` is a whole address; non-blocking.
+            let res = unsafe {
+                match addr {
+                    Some(a) => crate::sys::send_to_nowait(
+                        fd,
+                        buf.as_ptr(),
+                        buf.len(),
+                        a.as_ptr().cast(),
+                        a.len(),
+                    ),
+                    None => crate::sys::send_nowait(fd, buf.as_ptr(), buf.len()),
+                }
+            };
+            if res >= 0 {
+                return res;
+            }
+            let err = crate::sys::neg_errno();
+            if -err != crate::sys::errno::EAGAIN {
+                return err as isize;
+            }
+            // The socket's send buffer is full, and only the worker that
+            // bound the address hears when it drains: look again shortly.
+            crate::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+}
+
+/// [`UdpSocket::read_from`] for a socket whose datagrams come from its
+/// inbox: copies the next one into `buf`, cut off at its capacity.
+#[cfg(windows)]
+async fn read_inbox<B: IoBufMut>(
+    member: &spread::Member,
+    mut buf: B,
+) -> (io::Result<(usize, SocketAddr)>, B) {
+    let datagram = poll_fn(|cx| member.poll_inbox(cx)).await;
+    let (datagram, from) = match Datagram::parse(RecvBuf::heap(datagram)) {
+        Ok(parsed) => parsed,
+        Err(e) => return (Err(e), buf),
+    };
+    let payload = datagram.as_slice();
+    let len = payload.len().min(buf.capacity());
+    // SAFETY: `buf` has room for `capacity()` bytes at its start, and `len`
+    // of them are written before they are marked.
+    unsafe {
+        ptr::copy_nonoverlapping(payload.as_ptr(), buf.as_mut_ptr(), len);
+        buf.set_init(len);
+    }
+    (Ok((len, from)), buf)
 }
 
 #[cfg(unix)]

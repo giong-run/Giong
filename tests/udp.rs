@@ -448,10 +448,6 @@ fn a_task_that_only_sends_lets_the_others_run() {
     });
 }
 
-#[cfg_attr(
-    windows,
-    ignore = "a port has one socket on Windows; the workers will share it by handing sockets out"
-)]
 #[test]
 fn every_worker_can_bind_the_same_port() {
     // No other test binds to 127.0.0.2, and the port is one the kernel never
@@ -500,6 +496,90 @@ fn every_worker_can_bind_the_same_port() {
     handle.shutdown();
     server.join().unwrap();
     assert_eq!(received.load(Ordering::SeqCst), SENDERS);
+}
+
+#[test]
+fn a_shared_port_keeps_each_sender_on_one_socket() {
+    // The socket that binds first receives through `recv_from`.
+    shared_port_keeps_senders_apart([127, 0, 0, 3], 0);
+}
+
+#[test]
+fn a_shared_port_keeps_each_sender_on_one_socket_with_read_from() {
+    // The socket that binds first receives through `read_from`.
+    shared_port_keeps_senders_apart([127, 0, 0, 4], 1);
+}
+
+/// Each worker's socket answers with the order in which it was bound, half
+/// of them through `recv_from` and half through `read_from` (those whose
+/// order has the parity `read_from_parity`). Every datagram of one sender
+/// must reach the same socket, and the senders must not all reach one.
+/// Afterwards the port is free again.
+fn shared_port_keeps_senders_apart(ip: [u8; 4], read_from_parity: usize) {
+    const WORKERS: usize = 4;
+    let addr = port_outside_ephemeral_range(ip);
+    let bound = Arc::new(AtomicUsize::new(0));
+    let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
+    let handle = rt.handle();
+    let b = bound.clone();
+    let server = std::thread::spawn(move || {
+        rt.run(move |_| {
+            let b = b.clone();
+            async move {
+                let socket = UdpSocket::bind(addr).unwrap();
+                let index = b.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    let from = if index % 2 != read_from_parity {
+                        match giong::until_shutdown(socket.recv_from()).await {
+                            Some(Ok((_, from))) => from,
+                            _ => break,
+                        }
+                    } else {
+                        let read = socket.read_from(Vec::with_capacity(64));
+                        match giong::until_shutdown(read).await {
+                            Some((Ok((_, from)), _)) => from,
+                            _ => break,
+                        }
+                    };
+                    let reply = vec![index as u8];
+                    socket.send_to(reply, from).await.0.unwrap();
+                }
+            }
+        })
+        .unwrap();
+    });
+    while bound.load(Ordering::SeqCst) < WORKERS {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    const SENDERS: usize = 40;
+    let mut reached = std::collections::HashSet::new();
+    for i in 0..SENDERS {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut seen = None;
+        for _ in 0..5 {
+            client.send_to(b"which", addr).unwrap();
+            let mut buf = [0u8; 8];
+            let (n, _) = client.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 1);
+            let socket = buf[0];
+            assert_eq!(
+                *seen.get_or_insert(socket),
+                socket,
+                "sender {i} reached two sockets"
+            );
+        }
+        reached.extend(seen);
+    }
+    assert!(
+        reached.len() > 1,
+        "{SENDERS} senders all reached one socket"
+    );
+    handle.shutdown();
+    server.join().unwrap();
+    std::net::UdpSocket::bind(addr).expect("the port is still held");
 }
 
 #[cfg(unix)]
@@ -988,8 +1068,13 @@ fn a_port_held_by_another_process_is_refused() {
 /// is the obvious pick for anything else on the machine doing the same.
 fn port_outside_ephemeral_range(ip: [u8; 4]) -> std::net::SocketAddr {
     use std::hash::{BuildHasher, Hasher};
-    let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
-    let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
+    // Windows hands out ports from 49152 on unless told otherwise.
+    let low: u16 = if cfg!(windows) {
+        49_152
+    } else {
+        let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        range.split_whitespace().next().unwrap().parse().unwrap()
+    };
     assert!(
         low > 2048,
         "ephemeral range starts at {low}: no room below it"
