@@ -2,7 +2,7 @@
 """Open pull requests, issues and branches that need someone: a weekly report. Python 3.8+,
 standard library and the `gh` CLI only.
 
-    python3 scripts/hygiene.py [--stale-days N] [--issue]
+    python3 scripts/hygiene.py [--stale-days N] [--prune] [--issue]
 
 Lists, for giong-run/Giong:
 
@@ -19,7 +19,14 @@ Branches kept on purpose are listed, with the reason, in .github/hygiene-keep.tx
 `<branch> <reason>` per line) and reported apart. With --issue the report goes into the
 open issue labelled `hygiene` (created when needed), which is closed when nothing is left.
 The Hygiene workflow (.github/workflows/hygiene.yml) runs it every Monday.
-It only reads, apart from that one issue: it never deletes a branch or closes a pull request.
+Without --prune it only reads, apart from that one issue.
+
+With --prune it first deletes the branches whose commits are kept elsewhere: a branch whose
+tip is the head of a closed or merged pull request of this repository (GitHub keeps it at
+refs/pull/N/head, and the pull request page can restore the branch), or whose tip is
+already in main. It never deletes main, release/*, the merge queue's branches, a branch an
+open pull request uses as head or base, or one listed in .github/hygiene-keep.txt. Each
+deletion is printed with the commit it pointed at. It never closes a pull request.
 """
 
 import argparse
@@ -88,7 +95,8 @@ def report(stale_days):
 
     delete, unknown, kept = [], [], []
     for name, sha in sorted(branches.items()):
-        if name == "main" or name in in_use:
+        # gh-readonly-queue/... are the merge queue's own branches, created and deleted by GitHub.
+        if name == "main" or name in in_use or name.startswith("gh-readonly-queue/"):
             continue
         if name in keep:
             kept.append(f"- `{name}`: {keep[name]}")
@@ -146,6 +154,42 @@ def report(stale_days):
     return "\n".join(body), findings
 
 
+PROTECTED_PREFIXES = ("release/", "gh-readonly-queue/")
+
+
+def contained_in_main(sha):
+    r = subprocess.run(["gh", "api", f"repos/{REPO}/compare/main...{sha}", "--jq", ".status"],
+                       text=True, capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() in ("identical", "behind")
+
+
+def prune(dry_run):
+    """Delete the branches whose commits are kept elsewhere. Returns the lines to report."""
+    branches = {b["name"]: b["commit"]["sha"] for b in api_list(f"repos/{REPO}/branches?per_page=100")}
+    prs = api_list(f"repos/{REPO}/pulls?state=all&per_page=100&sort=updated&direction=desc")
+    open_prs = [p for p in prs if p["state"] == "open"]
+    in_use = {p["head"]["ref"] for p in open_prs} | {p["base"]["ref"] for p in open_prs}
+    closed_heads = {}
+    for p in prs:
+        if p["state"] == "closed" and p["head"]["repo"] and p["head"]["repo"]["full_name"] == REPO:
+            closed_heads.setdefault(p["head"]["sha"], p["number"])
+    keep = keep_list()
+    done = []
+    for name, sha in sorted(branches.items()):
+        if (name == "main" or name.startswith(PROTECTED_PREFIXES) or name in in_use or name in keep):
+            continue
+        if sha in closed_heads:
+            where = f"the head of #{closed_heads[sha]}, kept at refs/pull/{closed_heads[sha]}/head"
+        elif contained_in_main(sha):
+            where = "already in main"
+        else:
+            continue
+        if not dry_run:
+            gh("api", "-X", "DELETE", f"repos/{REPO}/git/refs/heads/{name}")
+        done.append(f"- `{name}` at {sha[:12]}: {where}" + (" (dry run, not deleted)" if dry_run else ""))
+    return done
+
+
 def sync_issue(body, findings):
     issues = json.loads(gh("issue", "list", "--repo", REPO, "--label", LABEL, "--state", "open",
                            "--json", "number", "--limit", "5"))
@@ -170,8 +214,15 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--stale-days", type=int, default=7)
     p.add_argument("--issue", action="store_true", help="write the report into the `hygiene` issue")
+    p.add_argument("--prune", action="store_true", help="first delete the branches whose commits are kept elsewhere")
+    p.add_argument("--dry-run", action="store_true", help="with --prune: list what would be deleted, delete nothing")
     args = p.parse_args()
+    pruned = prune(args.dry_run) if args.prune else []
     body, findings = report(args.stale_days)
+    if pruned:
+        title = "Would be deleted (dry run)" if args.dry_run else "Deleted by this run"
+        body += f"\n\n### {title}\n\nRestore one with `git push origin <sha>:refs/heads/<name>` " \
+                "or the Restore branch button of its pull request.\n\n" + "\n".join(pruned)
     print(body)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
