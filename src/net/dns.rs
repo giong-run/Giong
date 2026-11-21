@@ -250,6 +250,48 @@ fn adapters_as_resolv_conf(servers: &[IpAddr], search: &[String]) -> String {
     text
 }
 
+/// Where the system's DNS servers are set, for the fixes of errors.
+#[cfg(unix)]
+macro_rules! servers_where {
+    () => {
+        "/etc/resolv.conf"
+    };
+}
+#[cfg(windows)]
+macro_rules! servers_where {
+    () => {
+        "the settings of the network adapter (`ipconfig /all` lists them)"
+    };
+}
+
+/// Where the system's hosts file is, for the fixes of errors.
+#[cfg(unix)]
+macro_rules! hosts_where {
+    () => {
+        "/etc/hosts"
+    };
+}
+#[cfg(windows)]
+macro_rules! hosts_where {
+    () => {
+        "the hosts file (%SystemRoot%\\System32\\drivers\\etc\\hosts)"
+    };
+}
+
+/// How to give a slow DNS server longer, for the fixes of errors.
+#[cfg(unix)]
+macro_rules! longer_where {
+    () => {
+        "options timeout:N and attempts:N there give it longer"
+    };
+}
+#[cfg(windows)]
+macro_rules! longer_where {
+    () => {
+        "ResolverConfig::timeout and ResolverConfig::attempts give it longer"
+    };
+}
+
 fn read_optional(path: impl AsRef<std::path::Path>) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
@@ -374,8 +416,13 @@ impl Resolver {
             raise(
                 Code::HostNotFound,
                 format!("no address found for {host}"),
-                "check the spelling of the name, /etc/hosts, and the DNS servers in \
-                 /etc/resolv.conf (in a container, the network it is attached to).",
+                concat!(
+                    "check the spelling of the name, ",
+                    hosts_where!(),
+                    ", and the DNS servers in ",
+                    servers_where!(),
+                    " (in a container, the network it is attached to)."
+                ),
             )
         }))
     }
@@ -460,8 +507,13 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
             Err(_) => Err(raise(
                 Code::DnsTimeout,
                 format!("DNS server {server} did not answer for {name} within {wait:?}"),
-                "check that the server in /etc/resolv.conf is reachable (firewall, VPN, \
-                 container network); options timeout:N and attempts:N there give it longer.",
+                concat!(
+                    "check that the server in ",
+                    servers_where!(),
+                    " is reachable (firewall, VPN, container network); ",
+                    longer_where!(),
+                    "."
+                ),
             )),
         }
     };
@@ -488,9 +540,12 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
                     crate::error::Error::new(
                         Code::DnsServerUnreachable,
                         format!("cannot reach DNS server {server} to look up {name}: {e}"),
-                        "check that a DNS server runs at the address in /etc/resolv.conf (in a \
-                         container, the network it is attached to) and that a firewall lets \
-                         UDP and TCP port 53 through.",
+                        concat!(
+                            "check that a DNS server runs at the address in ",
+                            servers_where!(),
+                            " (in a container, the network it is attached to) and that a \
+                             firewall lets UDP and TCP port 53 through."
+                        ),
                     )
                     .with_source(e)
                     .into(),
@@ -694,8 +749,11 @@ fn malformed() -> io::Error {
     raise(
         Code::DnsBadResponse,
         "malformed DNS response",
-        "check the DNS server in /etc/resolv.conf; something between giong and it may be \
-         changing the packets.",
+        concat!(
+            "check the DNS server in ",
+            servers_where!(),
+            "; something between giong and it may be changing the packets."
+        ),
     )
 }
 
@@ -822,8 +880,12 @@ fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Ans
                 format!(
                     "the DNS answer for {name} has a chain of more than {MAX_CNAMES} CNAME records"
                 ),
-                "check the DNS server in /etc/resolv.conf and the records of the name; \
-                 resolvers stop following aliases long before this.",
+                concat!(
+                    "check the DNS server in ",
+                    servers_where!(),
+                    " and the records of the name; resolvers stop following aliases long \
+                     before this."
+                ),
             ));
         }
         min_ttl = min_ttl.min(*ttl);
