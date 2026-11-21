@@ -686,3 +686,227 @@ fn timeouts_too_long_for_the_clock_mean_no_limit() {
         assert_eq!(pool.stats().opened, 1);
     });
 }
+
+/// Runs `n` copies of `SELECT $1::int4 + 1` at once on `pool`, after one
+/// that prepares the statement (only prepared statements join a batch).
+async fn add_one_at_once(pool: &Pool, n: i32) {
+    pool.query_one("SELECT $1::int4 + 1", &[&0i32])
+        .await
+        .unwrap();
+    let tasks: Vec<_> = (0..n)
+        .map(|i| {
+            let pool = pool.clone();
+            giong::spawn(async move {
+                let row = pool.query_one("SELECT $1::int4 + 1", &[&i]).await.unwrap();
+                row.get::<i32>(0).unwrap()
+            })
+        })
+        .collect();
+    for (i, t) in tasks.into_iter().enumerate() {
+        assert_eq!(t.await.unwrap(), i as i32 + 1);
+    }
+}
+
+#[test]
+fn batched_reads_return_each_statement_its_own_rows() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 2);
+        add_one_at_once(&pool, 500).await;
+        // Several rows, and none.
+        pool.query("SELECT generate_series(1, 3)", &[])
+            .await
+            .unwrap();
+        let tasks: Vec<_> = (0..50i32)
+            .map(|i| {
+                let pool = pool.clone();
+                giong::spawn(async move {
+                    let rows = pool
+                        .query("SELECT generate_series(1, $1::int4)", &[&(i % 4)])
+                        .await
+                        .unwrap();
+                    (i, rows.len())
+                })
+            })
+            .collect();
+        for t in tasks {
+            let (i, n) = t.await.unwrap();
+            assert_eq!(n, (i % 4) as usize);
+        }
+        // Statements of one batch share one transaction, so one `now()`.
+        pool.query_one("SELECT now()::text", &[]).await.unwrap();
+        let tasks: Vec<_> = (0..16)
+            .map(|_| {
+                let pool = pool.clone();
+                giong::spawn(async move {
+                    let row = pool.query_one("SELECT now()::text", &[]).await.unwrap();
+                    row.get::<String>(0).unwrap()
+                })
+            })
+            .collect();
+        let mut times = Vec::new();
+        for t in tasks {
+            times.push(t.await.unwrap());
+        }
+        times.sort();
+        times.dedup();
+        assert!(
+            times.len() < 16,
+            "no two statements shared a batch: {times:?}"
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.in_flight, 0, "{stats:?}");
+    });
+}
+
+#[test]
+fn an_error_in_a_batch_fails_only_its_own_statement() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 1);
+        pool.query_one("SELECT 1 / $1::int4", &[&1i32])
+            .await
+            .unwrap();
+        for round in 0..20 {
+            let tasks: Vec<_> = (0..40i32)
+                .map(|i| {
+                    let pool = pool.clone();
+                    giong::spawn(async move {
+                        // Every seventh divides by zero.
+                        let d = if (i + round) % 7 == 0 { 0 } else { i + 1 };
+                        (d, pool.query_one("SELECT 1 / $1::int4", &[&d]).await)
+                    })
+                })
+                .collect();
+            for t in tasks {
+                match t.await.unwrap() {
+                    (0, r) => {
+                        let e = r.unwrap_err();
+                        assert_eq!(e.server_code(), Some("22012"), "{e}");
+                    }
+                    (d, r) => assert_eq!(r.unwrap().get::<i32>(0).unwrap(), 1 / d),
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn a_select_that_writes_runs_alone_and_its_write_stays() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 1);
+        pool.batch_execute(
+            "DROP TABLE IF EXISTS batch_writes; CREATE TABLE batch_writes (id int);
+             CREATE OR REPLACE FUNCTION batch_write(i int) RETURNS int
+             LANGUAGE sql AS 'INSERT INTO batch_writes VALUES (i) RETURNING id'",
+        )
+        .await
+        .unwrap();
+        pool.query_one("SELECT $1::int4 + 1", &[&0i32])
+            .await
+            .unwrap();
+        pool.query_one("SELECT batch_write($1)", &[&0i32])
+            .await
+            .unwrap();
+        for round in 1..=5i32 {
+            let tasks: Vec<_> = (0..30i32)
+                .map(|i| {
+                    let pool = pool.clone();
+                    giong::spawn(async move {
+                        let id = round * 100 + i;
+                        if i % 5 == 0 {
+                            let row = pool.query_one("SELECT batch_write($1)", &[&id]).await;
+                            assert_eq!(row.unwrap().get::<i32>(0).unwrap(), id);
+                        } else {
+                            let row = pool.query_one("SELECT $1::int4 + 1", &[&id]).await;
+                            assert_eq!(row.unwrap().get::<i32>(0).unwrap(), id + 1);
+                        }
+                    })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        let row = pool
+            .query_one("SELECT count(*)::int4 FROM batch_writes", &[])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i32>(0).unwrap(), 1 + 5 * 6);
+        // A locking read is a write too.
+        pool.batch_execute("INSERT INTO batch_writes VALUES (-1)")
+            .await
+            .unwrap();
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let pool = pool.clone();
+                giong::spawn(async move {
+                    pool.query_one("SELECT id FROM batch_writes WHERE id = -1 FOR UPDATE", &[])
+                        .await
+                        .unwrap()
+                        .get::<i32>(0)
+                        .unwrap()
+                })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), -1);
+        }
+    });
+}
+
+#[test]
+fn batched_reads_see_writes_made_before_them() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 2);
+        pool.batch_execute("DROP TABLE IF EXISTS batch_seen; CREATE TABLE batch_seen (id int)")
+            .await
+            .unwrap();
+        pool.query_one("SELECT count(*)::int4 FROM batch_seen", &[])
+            .await
+            .unwrap();
+        for i in 1..=20i32 {
+            pool.execute("INSERT INTO batch_seen VALUES ($1)", &[&i])
+                .await
+                .unwrap();
+            let tasks: Vec<_> = (0..10)
+                .map(|_| {
+                    let pool = pool.clone();
+                    giong::spawn(async move {
+                        pool.query_one("SELECT count(*)::int4 FROM batch_seen", &[])
+                            .await
+                            .unwrap()
+                            .get::<i32>(0)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for t in tasks {
+                assert_eq!(t.await.unwrap(), i);
+            }
+        }
+    });
+}
+
+#[test]
+fn batches_survive_statements_leaving_the_cache() {
+    run(|s| async move {
+        let config = s.local().batch_reads(true).statement_cache_capacity(2);
+        let pool = Pool::new(config, 1);
+        for round in 0..10i32 {
+            let tasks: Vec<_> = (0..60i32)
+                .map(|i| {
+                    let pool = pool.clone();
+                    giong::spawn(async move {
+                        // Five statements take turns in a cache of two.
+                        let sql = format!("SELECT $1::int4 + {}", (i + round) % 5);
+                        let row = pool.query_one(&sql, &[&i]).await.unwrap();
+                        assert_eq!(row.get::<i32>(0).unwrap(), i + (i + round) % 5);
+                    })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        assert_eq!(pool.stats().in_flight, 0);
+    });
+}

@@ -513,7 +513,8 @@ impl Pool {
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
         refuse_on_shared(sql, false)?;
         let client = self.shared().await?;
-        client.query(sql, params).await
+        let batch = self.inner.config.batch_reads && is_select(sql);
+        client.query_shared(sql, params, batch).await
     }
 
     /// Runs a statement that returns exactly one row; see
@@ -524,7 +525,8 @@ impl Pool {
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
         refuse_on_shared(sql, false)?;
         let client = self.shared().await?;
-        client.query_one(sql, params).await
+        let batch = self.inner.config.batch_reads && is_select(sql);
+        crate::client::one_row(client.query_shared(sql, params, batch).await?)
     }
 
     /// Runs a statement that returns at most one row; see
@@ -535,7 +537,8 @@ impl Pool {
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
         refuse_on_shared(sql, false)?;
         let client = self.shared().await?;
-        client.query_opt(sql, params).await
+        let batch = self.inner.config.batch_reads && is_select(sql);
+        crate::client::at_most_one_row(client.query_shared(sql, params, batch).await?)
     }
 
     /// Runs a statement and returns the number of rows it changed; see
@@ -970,6 +973,15 @@ impl Drop for Lent<'_> {
     }
 }
 
+/// Whether `sql` starts with the word `SELECT`, the statements a batch may
+/// take ([`Config::batch_reads`]).
+fn is_select(sql: &str) -> bool {
+    let sql = sql.trim_start();
+    sql.get(..6)
+        .is_some_and(|w| w.eq_ignore_ascii_case("select"))
+        && !sql[6..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Refuses, before anything is sent, a statement that must not run on a
 /// shared connection: one that controls a transaction (unless in a `batch`),
 /// changes the session, or starts `COPY ... FROM STDIN`. It is on the path of
@@ -1384,6 +1396,23 @@ mod tests {
 
     fn refused_in_batch(sql: &str) -> bool {
         refuse_on_shared(sql, true).is_err()
+    }
+
+    #[test]
+    fn only_select_statements_may_join_a_batch() {
+        for sql in ["SELECT 1", "  select\n1", "Select(1)", "SELECT"] {
+            assert!(is_select(sql), "{sql}");
+        }
+        for sql in [
+            "SELECTED",
+            "select_x()",
+            "WITH a AS (SELECT 1) SELECT 1",
+            "INSERT 1",
+            "sel",
+            "",
+        ] {
+            assert!(!is_select(sql), "{sql}");
+        }
     }
 
     #[test]
