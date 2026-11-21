@@ -210,6 +210,11 @@ fn main() -> std::io::Result<()> {
                 if let Some(n) = std::env::var("GIONG_MAX_CONNS").ok().and_then(|v| v.parse().ok()) {
                     server = server.max_connections(n);
                 }
+                // GIONG_MAX_BODY=N: the largest request body instead of the
+                // default 1 MiB (bench/results/upload-recv-into uploads 3 MiB).
+                if let Some(n) = std::env::var("GIONG_MAX_BODY").ok().and_then(|v| v.parse().ok()) {
+                    server = server.max_body_size(n);
+                }
                 // GIONG_IDLE_TIMEOUT_SECS=N: how long a keep-alive connection
                 // may stay idle instead of the default 60 s (likewise).
                 if let Some(n) = std::env::var("GIONG_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()) {

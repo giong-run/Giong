@@ -147,6 +147,18 @@ impl UnixStream {
         self.inner.read(buf).await
     }
 
+    /// Receives into the free capacity at the end of `buf`, after what
+    /// [`recv`](Self::recv) has already taken; `recv` may come before and
+    /// after it. For the crates of this workspace (giong-http reads large
+    /// request bodies with it), not part of the API.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost.
+    #[doc(hidden)]
+    pub async fn recv_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.inner.recv_into(buf).await
+    }
+
     /// Writes some bytes of `buf`, returning how many were written.
     ///
     /// Not cancel safe: if the future is dropped, some bytes may have been

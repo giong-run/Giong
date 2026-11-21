@@ -998,3 +998,76 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         assert!(all[..all.len() - 3].iter().all(|&b| b == b'a'));
     });
 }
+
+/// Byte `i` of the test stream: a pattern that shows any byte out of place.
+fn pattern(i: usize) -> u8 {
+    (i % 251) as u8
+}
+
+/// `recv_into` (hidden, used by giong-http for large bodies) after `recv`,
+/// with data already taken into pool buffers, then `recv` again: every byte
+/// arrives once and in order, under either driver.
+#[test]
+fn recv_into_follows_recv_and_keeps_the_order() {
+    const TOTAL: usize = 6 << 20;
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let writer = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let data: Vec<u8> = (0..TOTAL).map(pattern).collect();
+            // In rounds, so that each round starts with `recv` and the pooled
+            // receive has taken part of it by the time `recv_into` runs.
+            for round in data.chunks(TOTAL / 6) {
+                c.write_all(round).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let s = l.accept().await.unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let mut round = 0;
+        while got.len() < TOTAL {
+            // A round: some through `recv`, the rest straight into `got`.
+            let chunk = s.recv().await.unwrap();
+            assert!(!chunk.is_empty(), "the stream ended at {}", got.len());
+            got.extend_from_slice(&chunk);
+            drop(chunk);
+            let end = ((round + 1) * (TOTAL / 6)).min(TOTAL);
+            got.reserve(end.saturating_sub(got.len()));
+            while got.len() < end {
+                let (res, back) = s.recv_into(got).await;
+                got = back;
+                assert!(res.unwrap() > 0);
+            }
+            round += 1;
+        }
+        writer.join().unwrap();
+        assert_eq!(got.len(), TOTAL);
+        if let Some(i) = (0..TOTAL).find(|&i| got[i] != pattern(i)) {
+            panic!("byte {i} is {}, not {}", got[i], pattern(i));
+        }
+        // The stream ends: `recv_into` says so, and so does `recv` after it.
+        let (res, _) = s.recv_into(Vec::new()).await;
+        assert_eq!(res.unwrap(), 0);
+        assert!(s.recv().await.unwrap().is_empty());
+    });
+}
+
+/// `recv_into` on a stream that never used `recv`, and with no free
+/// capacity in the buffer it is given: it makes room and appends.
+#[test]
+fn recv_into_appends_without_recv_first() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = l.accept().await.unwrap();
+        c.write_all(&b"world"[..]).await.0.unwrap();
+        let mut buf = b"hello ".to_vec();
+        buf.shrink_to_fit();
+        let (res, buf) = s.recv_into(buf).await;
+        assert_eq!(res.unwrap(), 5);
+        assert_eq!(buf, b"hello world");
+        // `recv` works after it.
+        c.write_all(&b"!"[..]).await.0.unwrap();
+        assert_eq!(&*s.recv().await.unwrap(), b"!");
+    });
+}

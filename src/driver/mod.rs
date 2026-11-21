@@ -554,8 +554,16 @@ pub(crate) fn event_loop_failed(call: &str, err: io::Error) -> ! {
 pub(crate) enum MultiIo {
     /// Accepted connections, as close-on-exec descriptors.
     Accept { fd: RawSock },
-    /// Data into the worker's pool buffers.
-    Recv { fd: RawSock },
+    /// Data into the worker's pool buffers. `once`: a single receive of at
+    /// most one buffer (io_uring), for a stream that reads large bodies with
+    /// `recv_into` and should leave them in the socket until then.
+    Recv {
+        fd: RawSock,
+        // Read by io_uring only: the readiness drivers receive once per
+        // readiness anyway.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        once: bool,
+    },
     /// Datagrams into pool buffers, each laid out as io_uring's
     /// `io_uring_recvmsg_out` header, then the sender's address in a field
     /// of `hdr.msg_namelen` bytes, then the payload.
