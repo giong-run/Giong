@@ -173,6 +173,12 @@ struct State {
     extra: usize,
     /// [`READ_ONLY`] is prepared (or its Parse is queued).
     read_only_prepared: bool,
+    /// The statements of the batch being answered that have their answer:
+    /// they complete with the batch's `ReadyForQuery`, once it is known
+    /// whether its transaction committed.
+    held: Vec<Rc<Slot>>,
+    /// The batch being answered had an error: its transaction rolled back.
+    batch_failed: bool,
 }
 
 /// Statements in `out` that end with one `Sync` (see [`Config::batch_reads`]).
@@ -438,6 +444,8 @@ impl Client {
                 queue: VecDeque::new(),
                 extra: 0,
                 read_only_prepared: false,
+                held: Vec::new(),
+                batch_failed: false,
                 broken: None,
                 closing: false,
                 status,
@@ -629,7 +637,7 @@ impl Client {
     /// How many requests have been sent and not answered yet.
     pub fn in_flight(&self) -> usize {
         let st = self.conn.state.borrow();
-        st.queue.len() - st.extra
+        st.queue.len() - st.extra + st.held.len()
     }
 
     /// How long the oldest unanswered request has been waiting for its
@@ -982,20 +990,21 @@ impl Conn {
 
     /// A statement of a batch is done: its `CommandComplete` or its error
     /// arrived, or the batch ended without running it.
+    /// Its result is held until the batch's end, when it is known whether
+    /// the batch's transaction committed.
     fn finish_member(&self, slot: &Rc<Slot>) {
-        // The batch's transaction ends with its `Sync`, rolled back if a
-        // statement failed: the outcome is as outside a transaction.
+        // The batch's transaction ends with its `Sync`: the outcome is as
+        // outside a transaction.
         slot.inner.borrow_mut().status = b'I';
-        {
-            let mut st = self.state.borrow_mut();
-            st.queue.pop_front();
-            if slot.batch.get() == Role::Guard {
-                st.extra -= 1;
-            }
-            self.head_since
-                .set((!st.queue.is_empty()).then(giong::time::Instant::now));
+        let mut st = self.state.borrow_mut();
+        st.queue.pop_front();
+        if slot.batch.get() == Role::Guard {
+            st.extra -= 1;
+        } else {
+            st.held.push(slot.clone());
         }
-        self.complete(slot);
+        self.head_since
+            .set((!st.queue.is_empty()).then(giong::time::Instant::now));
     }
 
     /// The prepared statement for `sql`: from the cache, from a prepare
@@ -1091,7 +1100,10 @@ impl Conn {
             }
             st.extra = 0;
             st.read_only_prepared = false;
-            std::mem::take(&mut st.queue)
+            st.batch_failed = false;
+            let mut slots = std::mem::take(&mut st.held);
+            slots.extend(std::mem::take(&mut st.queue));
+            slots
         };
         for slot in slots {
             let mut inner = slot.inner.borrow_mut();
@@ -1254,7 +1266,7 @@ impl Conn {
             }
             Backend::ErrorResponse(fields) => {
                 if inner.error.is_none() {
-                    inner.error = Some(self.db_error(fields)?);
+                    inner.error = Some(self.db_error(fields, true)?);
                 }
             }
             Backend::CopyOutResponse | Backend::CopyData | Backend::CopyDone => {
@@ -1319,9 +1331,9 @@ impl Conn {
     }
 
     /// The request's error from an `ErrorResponse`.
-    fn db_error(&self, fields: &[u8]) -> Result<Error, Error> {
+    fn db_error(&self, fields: &[u8], may_retire: bool) -> Result<Error, Error> {
         let db = DbError::parse(fields)?;
-        if db.code() == "25006" && self.on_standby() {
+        if may_retire && db.code() == "25006" && self.on_standby() {
             self.retire.set(true);
         }
         // Only a note: the message is translated on servers whose
@@ -1352,12 +1364,20 @@ impl Conn {
                 inner.tag = Some(command.to_owned());
             }
             Backend::ErrorResponse(fields) => {
-                let error = self.db_error(fields)?;
-                if slot.batch.get() == Role::Guard {
-                    // Prepared again with the next batch (after a
-                    // `DEALLOCATE`, say); the batch's statements are
-                    // skipped and sent again alone.
-                    self.state.borrow_mut().read_only_prepared = false;
+                // Not a sign of a standby: the batch is read-only on purpose.
+                let error = self.db_error(fields, false)?;
+                self.state.borrow_mut().batch_failed = true;
+                match slot.batch.get() {
+                    // At the `Sync`: the commit failed (a deferred
+                    // constraint, say). The `ReadyForQuery` follows.
+                    Role::End => return Ok(false),
+                    // The guard's statement is gone (a `DEALLOCATE`): it is
+                    // prepared again with the next batch. Its other errors
+                    // (a cancel, a timeout) leave it prepared.
+                    Role::Guard if error.server_code() == Some("26000") => {
+                        self.state.borrow_mut().read_only_prepared = false;
+                    }
+                    _ => {}
                 }
                 if error.server_code() == Some("25006") {
                     // It would have run alone: send it alone.
@@ -1373,15 +1393,32 @@ impl Conn {
                 // the outcome is as outside a transaction.
                 inner.status = status;
                 drop(inner);
-                let idle = {
+                let (idle, held, failed) = {
                     let mut st = self.state.borrow_mut();
                     st.status = status;
                     st.queue.pop_front();
                     st.extra -= 1;
                     self.head_since
                         .set((!st.queue.is_empty()).then(giong::time::Instant::now));
-                    st.queue.is_empty()
+                    let failed = std::mem::take(&mut st.batch_failed);
+                    (st.queue.is_empty(), std::mem::take(&mut st.held), failed)
                 };
+                for member in &held {
+                    if failed {
+                        let mut inner = member.inner.borrow_mut();
+                        if inner.error.is_none() {
+                            // It ran, but what it did was rolled back with
+                            // the batch: it runs again, alone.
+                            inner.error = Some(Error::new(
+                                ErrorKind::Closed,
+                                "another statement of this one's batch failed, so the batch \
+                                 was rolled back",
+                            ));
+                            inner.alone = matches!(member.kind, Kind::Execute { .. });
+                        }
+                    }
+                    self.complete(member);
+                }
                 self.complete(&slot);
                 if idle {
                     self.wake_idle();

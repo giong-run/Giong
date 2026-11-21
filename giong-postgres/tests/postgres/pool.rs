@@ -850,6 +850,8 @@ fn a_select_that_writes_runs_alone_and_its_write_stays() {
         for t in tasks {
             assert_eq!(t.await.unwrap(), -1);
         }
+        // A batch's 25006 is not a standby's: the connection stays.
+        assert_eq!(pool.stats().opened, 1, "{:?}", pool.stats());
     });
 }
 
@@ -908,5 +910,174 @@ fn batches_survive_statements_leaving_the_cache() {
             }
         }
         assert_eq!(pool.stats().in_flight, 0);
+    });
+}
+
+/// Runs `a` and `b` on `pool` from two tasks started in the same tick, so
+/// that both are written together: in one batch, with batches on.
+async fn together(
+    pool: &Pool,
+    a: (&'static str, i32),
+    b: (&'static str, i32),
+) -> [Result<Vec<giong_postgres::Row>, giong_postgres::Error>; 2] {
+    let run = |(sql, arg): (&'static str, i32)| {
+        let pool = pool.clone();
+        giong::spawn(async move { pool.query(sql, &[&arg]).await })
+    };
+    let (ta, tb) = (run(a), run(b));
+    [ta.await.unwrap(), tb.await.unwrap()]
+}
+
+#[test]
+fn an_error_at_a_batch_commit_fails_only_its_statement() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 1);
+        pool.batch_execute(
+            "CREATE OR REPLACE FUNCTION batch_commit_setup() RETURNS int LANGUAGE plpgsql AS $$
+             BEGIN
+               CREATE TEMP TABLE IF NOT EXISTS batch_commit
+                 (x int UNIQUE DEFERRABLE INITIALLY DEFERRED);
+               RETURN 0;
+             END $$;
+             CREATE OR REPLACE FUNCTION batch_commit_dup(i int) RETURNS int LANGUAGE plpgsql AS
+               'BEGIN INSERT INTO batch_commit VALUES (i), (i); RETURN i; END'",
+        )
+        .await
+        .unwrap();
+        // Not batched (`execute`), and on the pool's one connection, whose
+        // session the temporary table belongs to.
+        pool.execute("SELECT batch_commit_setup()", &[])
+            .await
+            .unwrap();
+        for round in 0..20 {
+            let tasks: Vec<_> = (0..20i32)
+                .map(|i| {
+                    let pool = pool.clone();
+                    giong::spawn(async move {
+                        if i == round % 20 {
+                            // Its two rows break the deferred constraint at
+                            // the commit, after the statement ran.
+                            let e = pool
+                                .query("SELECT batch_commit_dup($1)", &[&i])
+                                .await
+                                .unwrap_err();
+                            assert_eq!(e.server_code(), Some("23505"), "{e}");
+                        } else {
+                            let row = pool.query_one("SELECT $1::int4 + 1", &[&i]).await;
+                            assert_eq!(row.unwrap().get::<i32>(0).unwrap(), i + 1);
+                        }
+                    })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap();
+            }
+        }
+        let row = pool
+            .query_one("SELECT $1::int4 + 1", &[&41i32])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i32>(0).unwrap(), 42);
+        let stats = pool.stats();
+        assert_eq!((stats.in_flight, stats.opened), (0, 1), "{stats:?}");
+    });
+}
+
+#[test]
+fn statements_before_a_failure_in_their_batch_run_again() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 1);
+        pool.batch_execute(
+            "CREATE OR REPLACE FUNCTION batch_again_setup() RETURNS int LANGUAGE plpgsql AS $$
+             BEGIN
+               CREATE TEMP TABLE IF NOT EXISTS batch_again (x int);
+               RETURN 0;
+             END $$;
+             CREATE OR REPLACE FUNCTION batch_again_add(i int) RETURNS int LANGUAGE plpgsql AS
+               'BEGIN INSERT INTO batch_again VALUES (i); RETURN i; END'",
+        )
+        .await
+        .unwrap();
+        pool.execute("SELECT batch_again_setup()", &[])
+            .await
+            .unwrap();
+        // Temporary tables can be written in a read-only transaction, so
+        // the insert runs in the batch, which the division by zero after it
+        // rolls back.
+        for i in 0..10 {
+            let [added, failed] = together(
+                &pool,
+                ("SELECT batch_again_add($1)", i),
+                ("SELECT 1 / $1::int4", 0),
+            )
+            .await;
+            assert_eq!(added.unwrap()[0].get::<i32>(0).unwrap(), i);
+            assert_eq!(failed.unwrap_err().server_code(), Some("22012"));
+        }
+        let row = pool
+            .query_one("SELECT count(*)::int4 FROM batch_again", &[])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i32>(0).unwrap(), 10, "each insert stayed, once");
+    });
+}
+
+#[test]
+fn transaction_local_settings_reach_the_rest_of_their_batch() {
+    run(|s| async move {
+        // What `Config::batch_reads` warns about, pinned: a setting made
+        // with `set_config(.., true)` lasts until the end of the batch.
+        const SET: &str = "SELECT set_config('giong.tenant', $1::int4::text, true)";
+        const GET: &str =
+            "SELECT coalesce(current_setting('giong.tenant', true), '') || $1::int4::text";
+        for batch in [false, true] {
+            let pool = Pool::new(s.local().batch_reads(batch), 1);
+            // Prepared, so that both may join a batch.
+            pool.query(SET, &[&0i32]).await.unwrap();
+            pool.query(GET, &[&0i32]).await.unwrap();
+            for i in 1..=5 {
+                let [_, seen] = together(&pool, (SET, i), (GET, 0)).await;
+                let seen: String = seen.unwrap()[0].get::<&str>(0).unwrap().to_owned();
+                if batch {
+                    assert_eq!(seen, format!("{i}0"), "the other task's setting");
+                } else {
+                    assert_eq!(seen, "0", "no setting from another statement");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn the_read_only_guard_is_prepared_again_after_a_deallocate() {
+    run(|s| async move {
+        let pool = Pool::new(s.local().batch_reads(true), 1);
+        const NOW: &str = "SELECT now()::text || $1::int4::text";
+        pool.query(NOW, &[&0i32]).await.unwrap();
+        let shared = |[a, b]: [Result<Vec<giong_postgres::Row>, giong_postgres::Error>; 2]| {
+            let a: String = a.unwrap()[0].get::<&str>(0).unwrap().to_owned();
+            let b: String = b.unwrap()[0].get::<&str>(0).unwrap().to_owned();
+            a[..a.len() - 1] == b[..b.len() - 1]
+        };
+        assert!(
+            shared(together(&pool, (NOW, 1), (NOW, 2)).await),
+            "one batch"
+        );
+        {
+            let conn = pool.get().await.unwrap();
+            conn.batch_execute("DEALLOCATE \"__giong_read_only\"")
+                .await
+                .unwrap();
+        }
+        // The guard fails (26000): both are sent again alone.
+        let [a, b] = together(&pool, (NOW, 1), (NOW, 2)).await;
+        a.unwrap();
+        b.unwrap();
+        // Then the guard is prepared again, and batches work as before.
+        assert!(
+            shared(together(&pool, (NOW, 1), (NOW, 2)).await),
+            "one batch again"
+        );
+        assert_eq!(pool.stats().opened, 1);
     });
 }

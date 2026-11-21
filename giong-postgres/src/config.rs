@@ -318,6 +318,13 @@ impl Config {
     /// `SELECT`s that are waiting to be written to one connection when it
     /// writes, at most 16: a statement never waits for others to join it.
     ///
+    /// **Do not turn it on if statements set transaction-local settings**
+    /// (`set_config(name, value, true)`, `SET LOCAL`, directly or in a
+    /// function they call), as row-level security set up per request
+    /// does: the statements of a batch share one transaction, so such a
+    /// setting made by one task's statement applies to the statements of
+    /// other tasks after it in the same batch.
+    ///
     /// What changes for a statement in a batch:
     ///
     /// * It runs in one transaction with the others, made read-only first
@@ -325,13 +332,17 @@ impl Config {
     ///   that writes (one that calls a function that writes, or takes a row
     ///   lock with `FOR UPDATE`) fails with the server's `25006` and is sent
     ///   again on its own, where it runs as it would without batches; it is
-    ///   not batched again on that connection. Nothing a batch does is rolled
-    ///   back that would otherwise have stayed.
-    /// * When a statement in a batch fails, the server skips the ones after
-    ///   it in the batch; they had not started, and are sent again, each on
-    ///   its own.
-    /// * Its answer arrives when the batch's last statement is done: a
-    ///   statement waits for up to 15 others that were written after it.
+    ///   not batched again on that connection.
+    /// * When a statement in a batch fails, or the batch's commit does (a
+    ///   deferred constraint on a temporary table, say), the batch's
+    ///   transaction is rolled back: the statement that failed fails, and
+    ///   every other statement of the batch is sent again, on its own,
+    ///   whether it had run (what it did was rolled back) or the server had
+    ///   skipped it. What a transaction's rollback does not undo happens
+    ///   twice then: a sequence advanced by `nextval` (allowed on temporary
+    ///   sequences) is advanced again.
+    /// * Its answer arrives when the batch ends, once its commit is known:
+    ///   a statement waits for up to 15 others that were written after it.
     ///   They run one after another on the server either way, so this is
     ///   added only to the statements early in a batch; keep slow statements
     ///   and fast ones in different pools when that matters.
