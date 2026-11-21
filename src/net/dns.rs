@@ -960,6 +960,28 @@ fn file_stamps() -> Stamps {
     (hosts, crate::sys::dns_config().ok())
 }
 
+/// The system configuration, read again.
+#[cfg(unix)]
+fn system_config(_stamps: &Stamps) -> io::Result<ResolverConfig> {
+    ResolverConfig::system()
+}
+
+/// The system configuration, with what the adapters reported for `stamps`.
+#[cfg(windows)]
+fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
+    match &stamps.1 {
+        Some((servers, search)) => {
+            let hosts = read_optional(crate::sys::hosts_path())?;
+            Ok(ResolverConfig::parse(
+                &adapters_as_resolv_conf(servers, search),
+                &hosts,
+            ))
+        }
+        // Asked again, for the error.
+        None => ResolverConfig::system(),
+    }
+}
+
 /// The current thread's resolver for the system configuration, reloaded when
 /// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds; on
 /// Windows, the hosts file and what the adapters report).
@@ -967,18 +989,21 @@ pub(crate) fn system_resolver() -> io::Result<Resolver> {
     SYSTEM.with(|slot| {
         let mut slot = slot.borrow_mut();
         let now = Instant::now();
-        if let Some(sys) = slot.as_mut() {
+        if let Some(sys) = slot.as_ref() {
             if now.duration_since(sys.checked) < RELOAD_CHECK {
                 return Ok(sys.resolver.clone());
             }
+        }
+        // Read once per check: on Windows, asking the adapters is not
+        // cheap, and the stamps hold what they said.
+        let stamps = file_stamps();
+        if let Some(sys) = slot.as_mut() {
             sys.checked = now;
-            let stamps = file_stamps();
             if stamps == sys.stamps {
                 return Ok(sys.resolver.clone());
             }
         }
-        let stamps = file_stamps();
-        let resolver = Resolver::new(ResolverConfig::system()?);
+        let resolver = Resolver::new(system_config(&stamps)?);
         *slot = Some(SystemResolver {
             resolver: resolver.clone(),
             checked: now,

@@ -14,7 +14,10 @@ use windows_sys::Win32::Networking::WinSock::{
     self, SOCKADDR, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, WSABUF, WSAMSG,
 };
 use windows_sys::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
-use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT};
+use windows_sys::Win32::System::Console::{
+    SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
+    CTRL_SHUTDOWN_EVENT,
+};
 use windows_sys::Win32::System::Memory::{
     VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
@@ -99,7 +102,20 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> bool {
     // The process-wide generator Windows seeds from the kernel; it is the
     // source the standard library uses, and it cannot fail on Windows 10
     // and later.
-    #[link(name = "bcryptprimitives", kind = "raw-dylib")]
+    // 32-bit x86 decorates `stdcall` names (`_ProcessPrng@8`); the DLL
+    // exports the plain name, as the standard library declares it.
+    #[cfg_attr(
+        target_arch = "x86",
+        link(
+            name = "bcryptprimitives",
+            kind = "raw-dylib",
+            import_name_type = "undecorated"
+        )
+    )]
+    #[cfg_attr(
+        not(target_arch = "x86"),
+        link(name = "bcryptprimitives", kind = "raw-dylib")
+    )]
     extern "system" {
         fn ProcessPrng(data: *mut u8, len: usize) -> i32;
     }
@@ -456,10 +472,22 @@ type OnSignal = std::sync::Arc<dyn Fn() + Send + Sync>;
 static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new(Vec::new());
 
 /// Called by Windows, on a thread it starts for the purpose, for Ctrl+C and
-/// Ctrl+Break. `TRUE` says the event is handled, so the process is not
-/// ended; with no runtime listening the default handler ends it as usual.
+/// Ctrl+Break, and when the console is closed or the user logs off or the
+/// system shuts down. `TRUE` says the event is handled, so the process is
+/// not ended; with no runtime listening the default handler ends it as
+/// usual.
+///
+/// The last three are what `SIGTERM` is on Unix, with a difference: the
+/// process ends as soon as the handler returns, or a few seconds after the
+/// event at the latest. So for those the handler waits, which gives the
+/// runtimes that time to shut down; the process ends when its main thread
+/// does, or when Windows ends it.
 unsafe extern "system" fn console_event(kind: u32) -> BOOL {
-    if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT {
+    let ends_process = matches!(
+        kind,
+        CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
+    );
+    if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT && !ends_process {
         return 0;
     }
     let listeners: Vec<OnSignal> = match ON_SIGNAL.lock() {
@@ -468,6 +496,10 @@ unsafe extern "system" fn console_event(kind: u32) -> BOOL {
     };
     for on_signal in &listeners {
         on_signal();
+    }
+    if ends_process && !listeners.is_empty() {
+        // Longer than Windows waits (5 s for a closed console).
+        std::thread::sleep(std::time::Duration::from_secs(30));
     }
     BOOL::from(!listeners.is_empty())
 }
@@ -484,16 +516,21 @@ impl SignalGuard {
     /// each event, so it may block and take locks.
     pub(crate) fn install(on_signal: impl Fn() + Send + Sync + 'static) -> std::io::Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        static HANDLER: std::sync::Once = std::sync::Once::new();
-        let mut installed = Ok(());
-        HANDLER.call_once(|| {
+        // The outcome of the one install is kept: a failure is reported to
+        // every caller, not only the first.
+        static HANDLER: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+        let failed = *HANDLER.get_or_init(|| {
             // SAFETY: `console_event` has the signature of a handler routine
             // and stays valid for the life of the process.
             if unsafe { SetConsoleCtrlHandler(Some(console_event), 1) } == 0 {
-                installed = Err(std::io::Error::last_os_error());
+                std::io::Error::last_os_error().raw_os_error()
+            } else {
+                None
             }
         });
-        installed?;
+        if let Some(code) = failed {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ON_SIGNAL
             .lock()

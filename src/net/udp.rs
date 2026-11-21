@@ -245,6 +245,8 @@ impl UdpSocket {
     /// so replies come from the port that datagrams went to. Up to 4096
     /// datagrams wait for each socket, and later ones are dropped until it
     /// is read, as the kernel drops them for a socket read too slowly.
+    /// Being one socket, they also share a peer: see
+    /// [`connect`](Self::connect).
     ///
     /// Port 0 asks the kernel for a port of the socket's own, which no other
     /// socket can share.
@@ -339,6 +341,11 @@ impl UdpSocket {
     /// `addr` is an IP address with a port: a host name is refused with
     /// `GIONG-E0100`. Resolve one first with
     /// [`lookup_host`](crate::net::lookup_host).
+    ///
+    /// On Windows the sockets that workers bind to one port are handles to
+    /// one socket (see [`bind`](Self::bind)), so connecting one sets the
+    /// peer of all of them. Connect a socket with a port of its own (port
+    /// 0, or an address no other worker binds).
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let mut last_err = None;
         for addr in resolved(&addr, "UdpSocket::connect")? {
