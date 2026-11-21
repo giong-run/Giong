@@ -50,9 +50,8 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED,
-    HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockname, ioctlsocket, recv, recvfrom, setsockopt, TransmitFile,
@@ -1565,7 +1564,10 @@ mod tests {
             assert!(!port.is_null());
             assert!(!CreateIoCompletionPort(socket as HANDLE, port, 0, 0).is_null());
             let modes = FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
-            assert_ne!(SetFileCompletionNotificationModes(socket as HANDLE, modes), 0);
+            assert_ne!(
+                SetFileCompletionNotificationModes(socket as HANDLE, modes),
+                0
+            );
             let mut buf = [0u8; 512];
             let wsabuf = WSABUF {
                 len: 512,
@@ -1573,8 +1575,20 @@ mod tests {
             };
             let mut overlapped: Box<OVERLAPPED> = Box::new(mem::zeroed());
             let (mut n, mut flags) = (0u32, 0u32);
-            let rc = WSARecv(socket, &wsabuf, 1, &mut n, &mut flags, &mut *overlapped, None);
-            assert_eq!((rc, wsa_error()), (-1, WSAEMSGSIZE), "cut off inside the call");
+            let rc = WSARecv(
+                socket,
+                &wsabuf,
+                1,
+                &mut n,
+                &mut flags,
+                &mut *overlapped,
+                None,
+            );
+            assert_eq!(
+                (rc, wsa_error()),
+                (-1, WSAEMSGSIZE),
+                "cut off inside the call"
+            );
             let (mut bytes, mut key, mut got) = (0u32, 0usize, ptr::null_mut());
             let ok = GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 2000);
             let reported = !got.is_null();
