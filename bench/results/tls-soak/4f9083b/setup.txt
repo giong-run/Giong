@@ -1,0 +1,17 @@
+TLS soak (giong-tls/tests/soak.rs) at commit 4f9083b, 2026-11-20
+
+Machine: cloud virtual machine, 4 vCPU (Intel Xeon @ 2.30 GHz), 16 GB memory,
+Linux 6.18.44, rustc 1.97.0. The kernel has no tls module, so these two runs
+use in-process TLS only (0 stream ends encrypted by the kernel).
+
+soak-io_uring.log.gz
+    GIONG_SOAK_SECS=1800 cargo test --release -p giong-tls --all-features --test soak -- --ignored --nocapture
+soak-epoll.log.gz
+    the same with GIONG_DRIVER=epoll
+
+Each log has one line every 10 s (descriptors, resident memory, counters) and a
+final "soak: done" line. Both runs passed.
+
+qemu-6.18.63-ktls-60s.log
+    KTLS=1 SOAK_SECS=60 scripts/kernels.sh on Linux 6.18.63 in QEMU without KVM
+    (emulated, slow), tls module loaded: the soak passed with kernel TLS on.
