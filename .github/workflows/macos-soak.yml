@@ -1,0 +1,55 @@
+# The soak tests on macOS (the kqueue driver): connection churn, UDP, file
+# and cross-worker traffic (tests/soak.rs), and TLS handshakes, traffic and
+# interrupted operations (giong-tls/tests/soak.rs), each followed by checks
+# that no descriptor, memory or driver state was left behind. On macOS 15
+# and 26, side by side.
+#
+# Run it from the Actions tab, or by pushing a branch named soak/macos-*.
+
+name: macOS soak
+
+on:
+  push:
+    branches: ["soak/macos-*"]
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to run each workload
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        workload: [runtime, tls]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      GIONG_TEST_EXPECT_DRIVER: kqueue
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: sw_vers && sysctl -n hw.ncpu && ulimit -n
+      # The runtime soak opens and closes thousands of loopback connections
+      # a second. macOS keeps each closed one's port for 30 s (TIME_WAIT,
+      # twice net.inet.tcp.msl) out of 16,384 ephemeral ports, so within
+      # seconds the runner's own connections to GitHub found no free port
+      # and the job was cancelled. Linux runners have a wider range and
+      # reuse such ports. A shorter TIME_WAIT and a wider range here.
+      - name: Ports for connection churn
+        run: |
+          sudo sysctl -w net.inet.tcp.msl=1000 net.inet.ip.portrange.first=10240 net.inet.ip.portrange.hifirst=10240
+          sysctl net.inet.tcp.msl net.inet.ip.portrange.first net.inet.ip.portrange.last
+      - name: Soak
+        run: |
+          ulimit -n 65536 || ulimit -n 10240
+          # Every minute, how many sockets wait in TIME_WAIT, for the log.
+          (while sleep 60; do echo "time_wait: $(netstat -an -p tcp | grep -c TIME_WAIT)"; done) &
+          SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak ${{ matrix.workload }}

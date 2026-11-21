@@ -20,6 +20,14 @@ pub fn refusing_addr() -> (Socket, SocketAddr) {
         .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
         .unwrap();
     let addr = socket.local_addr().unwrap().as_socket().unwrap();
+    // macOS drops a SYN to a socket that is bound but not listening (Linux
+    // answers with a reset), so there the port is given back: a closed port
+    // is refused, and the short race with another bind is accepted.
+    #[cfg(target_os = "macos")]
+    let socket = {
+        drop(socket);
+        Socket::new(Domain::IPV4, Type::STREAM, None).unwrap()
+    };
     (socket, addr)
 }
 
@@ -29,6 +37,11 @@ pub fn refusing_addr() -> (Socket, SocketAddr) {
 /// The socket is bound with the same options but does not listen, so it gets
 /// no connections, and no socket of another test can take the port before
 /// the listeners have bound it. Keep it until they have.
+///
+/// On macOS the listeners of a process share one socket, bound without
+/// `SO_REUSEPORT`, which a holder would keep from binding: there the port is
+/// given back at once (the returned socket holds nothing), and the short
+/// race with another bind is accepted.
 pub fn shared_port() -> (Socket, u16) {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.set_reuse_address(true).unwrap();
@@ -37,6 +50,11 @@ pub fn shared_port() -> (Socket, u16) {
         .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
         .unwrap();
     let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    #[cfg(target_os = "macos")]
+    let socket = {
+        drop(socket);
+        Socket::new(Domain::IPV4, Type::STREAM, None).unwrap()
+    };
     (socket, port)
 }
 

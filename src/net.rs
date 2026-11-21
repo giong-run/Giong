@@ -189,6 +189,12 @@ pub(crate) struct ListenSocket {
 
 impl ListenSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option, and the connections it accepts inherit it. socket2
+        // sets it on the sockets it creates; this covers a listener that
+        // came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
@@ -299,10 +305,19 @@ impl Drop for SendInFlight<'_> {
 
 impl StreamSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS waits in a send to a full socket even with `MSG_DONTWAIT`
+        // (the flag only keeps a receive from waiting there), so a stream is
+        // non-blocking from the start: a send made outside the driver, as
+        // giong-compat's direct sends are, must never hold the worker. The
+        // driver would set the mode at the first operation anyway.
+        #[cfg(target_os = "macos")]
+        let nonblocking = sock.set_nonblocking(true).is_ok();
+        #[cfg(target_os = "linux")]
+        let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
-            nonblocking: Cell::new(false),
+            nonblocking: Cell::new(nonblocking),
             zero_copy: Cell::new(true),
             zero_copy_copied: OnceCell::new(),
             sends_in_flight: Cell::new(0),
@@ -345,13 +360,14 @@ impl StreamSocket {
         }
         let mut fd = libc::pollfd {
             fd: self.sock.as_raw_fd(),
-            events: libc::POLLRDHUP,
+            events: crate::sys::POLL_PEER_CLOSED,
             revents: 0,
         };
         // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
         // the socket's state.
         let ready = unsafe { libc::poll(&mut fd, 1, 0) };
-        ready > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+        ready > 0
+            && fd.revents & (crate::sys::POLL_PEER_CLOSED | libc::POLLHUP | libc::POLLERR) != 0
     }
 
     /// Where a send of `len` bytes from buffers that cannot change should go
@@ -549,7 +565,7 @@ impl StreamSocket {
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             msg: msg.as_ptr(),
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: hold.is_some(),
         };
         let in_flight = SendInFlight::new(self);
@@ -653,7 +669,7 @@ impl StreamSocket {
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             msg: msg.as_ptr(),
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
         let in_flight = SendInFlight::new(self);
@@ -694,12 +710,11 @@ impl StreamSocket {
         let (mut offset, mut left) = (offset, len);
         let mut since_yield = 0;
         while left > 0 {
-            let mut off = offset as libc::off_t;
             let count = left.min(SENDFILE_MAX) as usize;
-            // SAFETY: plain system call on descriptors the caller keeps open;
-            // `off` is a valid `off_t` the kernel reads and advances. The
-            // socket is non-blocking, so the call never waits.
-            let n = unsafe { libc::sendfile64(fd, file, &mut off, count) };
+            // The socket is non-blocking, so the call never waits; `offset`
+            // moves past what was sent.
+            let mut moved = offset;
+            let n = crate::sys::sendfile(fd, file, &mut moved, count);
             match n {
                 n if n > 0 => {
                     let n = n as u64;
@@ -729,8 +744,8 @@ impl StreamSocket {
                 _ => {
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
-                        Some(libc::EINTR) => {}
-                        Some(libc::EAGAIN) => {
+                        Some(crate::sys::errno::EINTR) => {}
+                        Some(crate::sys::errno::EAGAIN) => {
                             // SAFETY: the operation has no pointers.
                             let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
                             if res < 0 {
@@ -776,7 +791,7 @@ impl StreamSocket {
             fd: self.sock.as_raw_fd(),
             buf: ptr,
             len,
-            flags: libc::MSG_NOSIGNAL,
+            flags: crate::sys::MSG_NOSIGNAL,
             zero_copy: hold.is_some(),
         };
         let in_flight = SendInFlight::new(self);
@@ -916,6 +931,18 @@ impl TcpListener {
     /// before the old one has stopped), create the sockets yourself with
     /// `SO_REUSEPORT` set and pass them to [`from_std`](Self::from_std).
     ///
+    /// On macOS the workers share one listening socket instead (each
+    /// listener is a duplicate of the first one bound to the address), and
+    /// take connections from its one queue as they come: whichever worker
+    /// accepts first gets the next connection. Every worker waiting in
+    /// `accept` is woken for each connection, and all but one find nothing.
+    /// The socket is bound without `SO_REUSEPORT`, so no other user's
+    /// process can bind the address while a listener lives. A process of
+    /// the same user still can bind one specific IP address of a port that
+    /// giong listens on with the wildcard address, by setting
+    /// `SO_REUSEADDR` (the BSD rule); listen on the specific address to
+    /// refuse that too.
+    ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
     /// `"localhost:8080"` is refused with `GIONG-E0100`, which says what to
@@ -1003,8 +1030,11 @@ impl TcpListener {
     }
 
     /// Wraps a listener created by the standard library, with the options
-    /// it was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// it was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(listener: std::net::TcpListener) -> Self {
         // SAFETY: we take over the descriptor that `listener` owned.
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };
@@ -1144,6 +1174,11 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> Self {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             inner: StreamSocket::new(sock),
         }
@@ -1359,7 +1394,11 @@ mod tests {
         for addr in [asked, any_port] {
             let err = check_bound(&unbound, addr).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{addr}");
-            assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE), "{addr}");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(crate::sys::errno::EADDRINUSE),
+                "{addr}"
+            );
         }
 
         let bound = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();

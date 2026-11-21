@@ -79,7 +79,16 @@
 #![warn(missing_docs)]
 
 mod certs;
+#[cfg(target_os = "macos")]
+mod keychain;
 mod ktls;
+
+/// The flag that makes a send to a closed peer fail with `EPIPE` instead of
+/// raising `SIGPIPE`. macOS has none: giong's sockets carry `SO_NOSIGPIPE`.
+#[cfg(target_os = "linux")]
+const NO_SIGNAL: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(target_os = "macos")]
+const NO_SIGNAL: libc::c_int = 0;
 mod received;
 
 pub use certs::Certificates;
@@ -829,6 +838,12 @@ impl TlsConnector {
     /// Arch, `/etc/pki/tls/certs/ca-bundle.crt` on Fedora and RHEL, and so
     /// on), or else from the files in `/etc/ssl/certs`.
     ///
+    /// On macOS, when neither variable is set, they are the certificates
+    /// the keychain trusts for TLS servers: the roots Apple ships and the
+    /// ones the administrator or the user added, without the ones either
+    /// turned off. If the keychain cannot be read, the bundle in
+    /// `/etc/ssl/cert.pem` is used.
+    ///
     /// Fails with [`io::ErrorKind::NotFound`] if there are none, as in a
     /// container image built `FROM scratch` or without the `ca-certificates`
     /// package. Install that package, or enable the `webpki-roots` feature and
@@ -836,6 +851,14 @@ impl TlsConnector {
     pub fn with_system_roots() -> io::Result<Self> {
         let file = std::env::var_os("SSL_CERT_FILE");
         let dirs = std::env::var_os("SSL_CERT_DIR");
+        #[cfg(target_os = "macos")]
+        if file.is_none() && dirs.is_none() {
+            let mut roots = RootCertStore::empty();
+            roots.add_parsable_certificates(keychain::trusted_roots());
+            if !roots.is_empty() {
+                return Self::from_roots(roots);
+            }
+        }
         let roots = load_roots(
             file.as_deref(),
             dirs.as_deref(),
@@ -1499,7 +1522,7 @@ impl TlsStream {
                     std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
                     unsent.as_ptr().cast(),
                     len,
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    libc::MSG_DONTWAIT | NO_SIGNAL,
                 )
             };
             if n >= 0 {
@@ -1910,13 +1933,20 @@ impl TlsStream {
                 conn.write_tls(wire)?;
             }
         }
+        // Linux holds the bytes for the FIN (`MSG_MORE`) and takes
+        // `MSG_NOSIGNAL`; elsewhere this is a plain send that does not wait,
+        // on a socket giong made with `SO_NOSIGPIPE`.
+        #[cfg(target_os = "linux")]
+        const FLAGS: libc::c_int = libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        #[cfg(target_os = "macos")]
+        const FLAGS: libc::c_int = libc::MSG_DONTWAIT;
         // SAFETY: `wire` is valid for `wire.len()` bytes for the call.
         let n = unsafe {
             libc::send(
                 std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
                 wire.as_ptr().cast(),
                 wire.len(),
-                libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                FLAGS,
             )
         };
         if n >= 0 {
