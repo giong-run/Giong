@@ -221,6 +221,23 @@ pub(crate) fn h2_with_room(pool: &Shared) -> Option<h2::Connection> {
         .map(|(_, c)| c.clone())
 }
 
+/// Whether the pool holds an HTTP/2 connection that can take requests, now
+/// or once a stream ends.
+pub(crate) fn has_usable_h2(pool: &Shared) -> bool {
+    pool.borrow().h2.iter().any(|(_, c)| c.is_usable())
+}
+
+/// The HTTP/2 connections that can take requests and have none in
+/// progress, with their identifiers.
+pub(crate) fn idle_h2(pool: &Shared) -> Vec<(u64, h2::Connection)> {
+    pool.borrow()
+        .h2
+        .iter()
+        .filter(|(_, c)| c.is_usable() && c.streams() == 0)
+        .map(|(id, c)| (*id, c.clone()))
+        .collect()
+}
+
 /// An identifier for the next HTTP/2 connection.
 pub(crate) fn next_h2_id(pool: &Shared) -> u64 {
     let mut p = pool.borrow_mut();

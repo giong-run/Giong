@@ -1187,3 +1187,108 @@ fn the_budget_shows_in_debug_and_defaults_to_auto() {
     let text = format!("{:?}", Server::new().max_buffered_request_bytes(1234));
     assert!(text.contains("max_buffered_request_bytes: 1234"), "{text}");
 }
+
+/// Answers with the body's length and a checksum that notices any byte out
+/// of place.
+async fn checksum(req: Request) -> Response {
+    Response::text(checksum_of(req.body()))
+}
+
+fn checksum_of(body: &[u8]) -> String {
+    let sum = body.iter().enumerate().fold(0u64, |a, (i, &b)| {
+        a.wrapping_mul(31).wrapping_add(u64::from(b) ^ i as u64)
+    });
+    format!("{} {sum}", body.len())
+}
+
+/// Bodies from 64 KiB up are received straight into the request buffer
+/// (`Transport::recv_into`). Large and small requests in turn on one
+/// connection, some pipelined behind a large body, some sent in pieces or
+/// after `100 Continue`: each body arrives whole and in order.
+#[test]
+fn large_bodies_arrive_whole_between_other_requests() {
+    let server = TestServer::start(Server::new().max_body_size(4 << 20), checksum);
+    let mut c = server.client();
+    let body = |len: usize, seed: u8| -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+            .collect()
+    };
+    let post = |len: usize| format!("POST /u HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\n\r\n");
+    for (round, &len) in [70_000usize, 10, 1 << 20, 65_536, 300_000, 3 << 20]
+        .iter()
+        .enumerate()
+    {
+        let b = body(len, round as u8);
+        // A large body, with a small request pipelined right behind it.
+        let mut bytes = post(len).into_bytes();
+        bytes.extend_from_slice(&b);
+        bytes.extend_from_slice(b"GET /after HTTP/1.1\r\nHost: t\r\n\r\n");
+        c.send(&bytes);
+        let r = c.reply();
+        assert_eq!(
+            (r.status, r.text()),
+            (200, checksum_of(&b).as_str()),
+            "round {round}"
+        );
+        let r = c.reply();
+        assert_eq!((r.status, r.text()), (200, "0 0"), "round {round}");
+        // The same body in pieces, with pauses between them.
+        c.send(post(len));
+        for piece in b.chunks(len / 3 + 1) {
+            std::thread::sleep(Duration::from_millis(5));
+            c.send(piece);
+        }
+        let r = c.reply();
+        assert_eq!(
+            (r.status, r.text()),
+            (200, checksum_of(&b).as_str()),
+            "round {round}"
+        );
+    }
+    // After `100 Continue`.
+    let b = body(500_000, 9);
+    c.send("POST /u HTTP/1.1\r\nHost: t\r\nContent-Length: 500000\r\nExpect: 100-continue\r\n\r\n");
+    while !c.buf.ends_with(b"\r\n\r\n") {
+        assert!(c.fill());
+    }
+    assert_eq!(c.buf, b"HTTP/1.1 100 Continue\r\n\r\n");
+    c.buf.clear();
+    c.send(&b);
+    let r = c.reply();
+    assert_eq!((r.status, r.text()), (200, checksum_of(&b).as_str()));
+}
+
+/// Bodies of 64 KiB and more are received straight into the request buffer,
+/// and charged against the worker's budget as they arrive, like any other:
+/// two uploads admitted together cannot both hold more than the budget.
+#[test]
+fn large_bodies_received_straight_into_the_buffer_are_charged_as_they_arrive() {
+    let server = TestServer::start(
+        Server::new().max_buffered_request_bytes(256 * 1024),
+        budgeted,
+    );
+    let head = "POST /big HTTP/1.1\r\nHost: t\r\nContent-Length: 200000\r\n\r\n";
+    // Both are admitted while nothing is held yet.
+    let mut a = server.client();
+    let mut b = server.client();
+    a.send(head);
+    b.send(head);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The first holds 150,000 bytes: a probe for as much again is refused.
+    a.send(vec![b'a'; 150_000]);
+    let refused = wait_until_refused(&server, 150_000);
+    assert_eq!(refused.status, 503);
+
+    // The second sends as much: it does not fit next to the first, and is
+    // refused once its bytes arrive.
+    let _ = b.stream.write_all(&vec![b'b'; 150_000]);
+    let cut = b.reply();
+    assert_eq!(cut.status, 503);
+    assert!(cut.text().starts_with("GIONG-E1120"), "{}", cut.text());
+
+    // The first completes.
+    a.send(vec![b'a'; 50_000]);
+    assert_eq!(a.reply().text(), "got 200000");
+}
