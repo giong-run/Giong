@@ -361,19 +361,24 @@ features.
 
 What only real machines and a real service can show. No new public features.
 
-- [ ] A 72-hour soak on bare metal.
-- [ ] Benchmarks on bare metal against Tokio and the other runtimes, compared with 0.5.0's
+- [x] A 72-hour soak on bare metal: both drivers ran 72 hours with no leak, crash or stall
+      (`bench/results/bare-metal-epyc-4345p/linux-7.0/soak-72h/`, #155).
+- [x] Benchmarks on bare metal against Tokio and the other runtimes, compared with 0.5.0's
       pass, with method and raw data in the repository; the README and giong.run take their
-      numbers from them.
-- [ ] UDP segmentation offload measured in the same rental, as input for HTTP/3 (no API).
-- [ ] The server held to the cheapest class of machine, 1 CPU and 512 MB (a container on
+      numbers from them (`bench/results/bare-metal-epyc-4345p/linux-7.0/`, #155).
+- [x] UDP segmentation offload measured in the same rental, as input for HTTP/3 (no API):
+      sending within 1.4% of the kernel's own, receive offload not verified there
+      (`post-soak/two-host/gso/`).
+- [x] The server held to the cheapest class of machine, 1 CPU and 512 MB (a container on
       the rental), against Tokio, Go and nginx: requests per second, idle HTTPS connections
       held, and memory per idle connection with kernel TLS, which a virtual machine cannot
-      measure. Input for 1.5.
-- [ ] Real use: giong in a production service, with its user reporting back.
+      measure. Input for 1.5 (`small-box/`).
+- [x] Real use: giong in a service, with its user reporting back. The author's own service
+      moved from 0.8.0 to 1.0.0-rc.1 and reported no error (2026-11-20); its earlier
+      feedback is issue #154, whose fix is #156.
 
 **Exit criteria:** the soak ends with no leak, crash or stall, and the service's user
-reports no blocker.
+reports no blocker. Met. 0.9.0 itself was never published: its work shipped in 1.0.0-rc.1.
 
 ## 1.0
 
@@ -381,16 +386,19 @@ A stable API. No features are added between 0.6 and 1.0; what is left is a serie
 gates (0.6, 0.7, 0.8, 0.9), and 1.0.0 follows release candidates (`1.0.0-rc.N`) that pass
 them all.
 
-- [ ] Documentation: every public item documented, and the limitations section of the
-      README reduced to deliberate non-goals.
-- [ ] 0.8 and 0.9 passed.
-- [ ] `1.0.0-rc.N`: release candidates that change nothing but fixes, until one passes
-      every gate; that one becomes 1.0.0.
+- [x] Documentation: every public item documented, and the limitations section of the
+      README reduced to deliberate non-goals and a short list of missing pieces (Unix
+      datagram sockets, multicast, `set_len`, file locks) that 1.x can add without a
+      breaking change.
+- [x] 0.8 and 0.9 passed.
+- [x] `1.0.0-rc.N`: release candidates that change nothing but fixes, until one passes
+      every gate; that one becomes 1.0.0. 1.0.0-rc.1 passed them, and 1.0.0 is its code
+      with the version changed.
 
 Before the freeze, the behaviour callers rely on is settled, and each commitment has a test
 that fails without it. 1.0 stays small: nothing here adds an API.
 
-- [ ] **What a cancelled operation does**, written once for every I/O API in
+- [x] **What a cancelled operation does**, written once for every I/O API in
       [STABILITY.md](docs/STABILITY.md#cancellation): the operation may still happen, the
       driver keeps buffers and descriptors until the kernel is done with them, slots come
       back when the operation ends, and that is the earliest moment a 1.x budget gives
@@ -415,13 +423,13 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       not block the commit. The same test runs against giong-mysql.
       `a_statement_given_up_inside_a_transaction_stops_the_commit` in both crates'
       tests (#158).
-- [ ] **Defaults callers rely on**, in [STABILITY.md](docs/STABILITY.md#defaults-you-can-rely-on):
+- [x] **Defaults callers rely on**, in [STABILITY.md](docs/STABILITY.md#defaults-you-can-rely-on):
       whether each limit waits or refuses by default, and the rule that 1.x never changes
       which; a new early refusal (overload, tenant budget) is a setting that is off by
       default. *Proved by* the slow-uploads and idle-connections CI jobs (`E1120`,
       `E1121`) and the pools' wait-timeout tests. The names of 1.x's budget types, its
       ledger and how it shares quotas wait for the prototype of 1.5.
-- [ ] **The release candidate says what it was verified on**: the rc.1 release pull
+- [x] **The release candidate says what it was verified on**: the rc.1 release pull
       request names the soaked commit, the release commit and the change between them,
       which tests ran again on the release commit, and the soak that change got
       ([RELEASING.md](docs/RELEASING.md#release-candidates-of-10)). A soak is sized by what
@@ -429,8 +437,11 @@ that fails without it. 1.0 stays small: nothing here adds an API.
       a cancellation path, 72 hours for a new major version, driver or scheduler. rc.1
       stands on 0.9's 72 hours (tree `f1b23074`), and the changes since (#134's bind, the
       channel, UDP, close and TLS receive fixes) get 4 hours per driver once they have all
-      merged.
-- [ ] **The removals**: the checklist in
+      merged: run on `892d904`, about 320 million connections per driver
+      (`bench/results/bare-metal-epyc-4345p/linux-7.0/rc-short-soak/`, #169). rc.1 differs from that commit in `src` only by the
+      removed aliases and the bounded channel's type names. TLS has its own soak since
+      #171 (`bench/results/tls-soak/`).
+- [x] **The removals**: the checklist in
       [STABILITY.md](docs/STABILITY.md#changes-made-before-10), in one release pull request.
 
 The API freeze also makes sure that nothing public ties the API to Linux or to HTTP/2 in a

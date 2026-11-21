@@ -14,10 +14,10 @@ categories = ["network-programming", "asynchronous", "web-programming"]
 publish = false
 
 [dependencies]
-giong = { path = "..", version = "1.0.0-rc.1" }
-giong-http = { path = "../giong-http", version = "1.0.0-rc.1", features = ["client"] }
+giong = { path = "..", version = "1.0.0" }
+giong-http = { path = "../giong-http", version = "1.0.0", features = ["client"] }
 giong-proto = { path = "../giong-proto", version = "0.7.0" }
-giong-tls = { path = "../giong-tls", version = "1.0.0-rc.1" }
+giong-tls = { path = "../giong-tls", version = "1.0.0" }
 # gzip message compression: deflate in pure Rust, already a dependency of
 # giong-http's client.
 miniz_oxide = "0.9"
