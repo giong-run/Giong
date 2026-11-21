@@ -240,7 +240,7 @@ class Lab:
         self.rows.append(row)
         new = not os.path.exists(self.csv_path)
         with open(self.csv_path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(row))
+            w = csv.DictWriter(f, fieldnames=list(row), lineterminator="\n")
             if new:
                 w.writeheader()
             w.writerow(row)
