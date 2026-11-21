@@ -1,0 +1,16 @@
+[package]
+name = "grpc-hello"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+description = "A gRPC server and client on giong: a unary method and a server stream, health and reflection"
+
+[dependencies]
+giong = { path = "../.." }
+giong-http = { path = "../../giong-http" }
+giong-grpc = { path = "../../giong-grpc" }
+giong-proto = { path = "../../giong-proto" }
+
+[build-dependencies]
+giong-grpc-build = { path = "../../giong-grpc-build" }

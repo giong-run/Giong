@@ -26,9 +26,11 @@ use std::time::{Duration, Instant};
 use giong::time::sleep_until;
 
 use super::conn::Stream as Socket;
+use crate::body::{Next, StreamBody};
 use crate::h2::frame::{self, Head, Reason, PREFACE};
 use crate::h2::hpack::{Decoder, Encoder, Index, TABLE_SIZE};
 use crate::parse::{is_field_value, is_token_str};
+use crate::trailers::Trailers;
 
 /// The window each stream starts with: how much of a response the server
 /// may send before the client has read any of it.
@@ -203,19 +205,26 @@ impl Connection {
     }
 
     /// Sends `request` on a new stream, or returns `None` when the
-    /// connection has no room for one.
-    pub(crate) fn send(&self, request: &Request<'_>) -> Option<Stream> {
+    /// connection has no room for one. A `source` is taken when the
+    /// request is sent: its pieces are the request body, written as they
+    /// are produced.
+    pub(crate) fn send(
+        &self,
+        request: &Request<'_>,
+        source: &mut Option<StreamBody>,
+    ) -> Option<Stream> {
         let mut st = self.inner.state.borrow_mut();
         if !st.has_room() {
             return None;
         }
-        let id = st.open(request);
+        let id = st.open(request, source.take());
         Some(Stream {
             inner: self.inner.clone(),
             id,
             head: None,
             head_request: request.head_request,
             done: false,
+            trailers: None,
         })
     }
 }
@@ -283,6 +292,9 @@ pub(crate) struct Stream {
     /// The response ended and was read, or failed: the stream is gone from
     /// the connection.
     done: bool,
+    /// The trailer fields the response ended with, once it was read to
+    /// its end.
+    trailers: Option<Box<Trailers>>,
 }
 
 impl Stream {
@@ -342,8 +354,10 @@ impl Stream {
 
     /// Appends what has arrived of the body to `out`, waiting for some if
     /// nothing has: whole frames, and no more than `limit` bytes unless
-    /// one frame is larger. Returns `false`, with nothing appended, at the
-    /// end. Cancel safe: what is appended is taken off the stream.
+    /// one frame is larger; into an empty `out`, one frame (small frames
+    /// arrive joined), which is moved rather than copied. Returns `false`,
+    /// with nothing appended, at the end. Cancel safe: what is appended is
+    /// taken off the stream.
     pub(crate) async fn read(
         &mut self,
         out: &mut Vec<u8>,
@@ -354,6 +368,7 @@ impl Stream {
         }
         let id = self.id;
         let inner = self.inner.clone();
+        let mut trailers = None;
         let result = poll_fn(|cx| {
             let mut guard = inner.state.borrow_mut();
             let st = &mut *guard;
@@ -368,11 +383,13 @@ impl Stream {
                     }
                     let chunk = s.data.pop_front().expect("the front was there");
                     n += chunk.len();
-                    if out.is_empty() && out.capacity() < chunk.len() {
+                    if out.is_empty() {
+                        // The frame's buffer is handed over as it is:
+                        // joining the frames that wait would copy them.
                         *out = chunk;
-                    } else {
-                        out.extend_from_slice(&chunk);
+                        break;
                     }
+                    out.extend_from_slice(&chunk);
                 }
                 s.buffered -= n;
                 st.consumed(id, n);
@@ -382,6 +399,7 @@ impl Stream {
                 return Poll::Ready(Err(e.clone()));
             }
             if s.ended {
+                trailers = s.trailers.take();
                 return Poll::Ready(Ok(false));
             }
             s.waker = Some(cx.waker().clone());
@@ -389,6 +407,7 @@ impl Stream {
         })
         .await;
         if !matches!(result, Ok(true)) {
+            self.trailers = trailers;
             self.finish();
         }
         result
@@ -403,6 +422,24 @@ impl Stream {
         st.streams
             .get(&self.id)
             .map_or(true, |s| s.ended && s.data.is_empty() && s.error.is_none())
+    }
+
+    /// The trailer fields the response ended with: there once
+    /// [`read`](Self::read) has returned `false`, if the server sent any.
+    pub(crate) fn trailers(&self) -> Option<&Trailers> {
+        self.trailers.as_deref()
+    }
+
+    /// The source of a streamed request body, if the connection took
+    /// nothing from it: after a request the server did not process, for
+    /// sending it again.
+    pub(crate) fn unused_source(&mut self) -> Option<StreamBody> {
+        let mut st = self.inner.state.borrow_mut();
+        let s = st.streams.get_mut(&self.id)?;
+        if s.pulled {
+            return None;
+        }
+        s.source.take()
     }
 
     /// The response ended or failed, and the stream is off the connection.
@@ -436,9 +473,17 @@ impl Drop for Stream {
 
 /// The state of one stream.
 struct StreamState {
-    /// The request body, and how much of it is sent.
+    /// The request body (the current piece of a streamed one), and how
+    /// much of it is sent.
     body: Vec<u8>,
     sent: usize,
+    /// Where the next pieces of a streamed request body come from, until
+    /// it ends.
+    source: Option<StreamBody>,
+    /// Something was taken from `source`.
+    pulled: bool,
+    /// In `State::pulling`.
+    waiting: bool,
     /// Every frame of the request is written.
     request_done: bool,
     /// In `State::sending`.
@@ -461,6 +506,8 @@ struct StreamState {
     buffered: usize,
     /// END_STREAM arrived.
     ended: bool,
+    /// The trailer fields that ended the response.
+    trailers: Option<Box<Trailers>>,
     error: Option<StreamError>,
     /// The stream is closed on the wire (reset by either side).
     reset: bool,
@@ -524,6 +571,9 @@ struct State {
     streams: HashMap<u32, StreamState>,
     /// Streams with request body to send, served in turn.
     sending: VecDeque<u32>,
+    /// Streams whose streamed request body has sent its last piece and
+    /// waits for the next from its source.
+    pulling: Vec<u32>,
     peer_max_streams: u32,
     /// The server's `SETTINGS_INITIAL_WINDOW_SIZE`.
     peer_window: i64,
@@ -560,6 +610,7 @@ impl State {
             next_id: 1,
             streams: HashMap::new(),
             sending: VecDeque::new(),
+            pulling: Vec::new(),
             peer_max_streams: INITIAL_MAX_STREAMS,
             peer_window: i64::from(frame::DEFAULT_WINDOW),
             peer_frame: frame::DEFAULT_FRAME_SIZE,
@@ -626,7 +677,7 @@ impl State {
 
     /// Opens a stream for `req`, and wakes the connection's task to send
     /// it; returns its identifier.
-    fn open(&mut self, req: &Request<'_>) -> u32 {
+    fn open(&mut self, req: &Request<'_>, source: Option<StreamBody>) -> u32 {
         let id = self.next_id;
         self.next_id += 2;
         let mut block = Vec::with_capacity(64 + req.path.len());
@@ -656,15 +707,19 @@ impl State {
             e.field(name.as_bytes(), value.as_bytes(), index, &mut block);
         }
         let body = req.body.unwrap_or_default();
-        let end_stream = body.is_empty();
+        let streamed = source.is_some();
+        let end_stream = body.is_empty() && !streamed;
         frame::write_headers(&mut self.out, id, &block, end_stream, self.peer_frame);
         self.streams.insert(
             id,
             StreamState {
                 body: body.to_vec(),
                 sent: 0,
+                source,
+                pulled: false,
+                waiting: streamed,
                 request_done: end_stream,
-                queued: !end_stream,
+                queued: !end_stream && !streamed,
                 send_window: self.peer_window,
                 recv_window: i64::from(STREAM_WINDOW),
                 consumed: 0,
@@ -679,12 +734,15 @@ impl State {
                 data: VecDeque::new(),
                 buffered: 0,
                 ended: false,
+                trailers: None,
                 error: None,
                 reset: false,
                 waker: None,
             },
         );
-        if !end_stream {
+        if streamed {
+            self.pulling.push(id);
+        } else if !end_stream {
             self.sending.push_back(id);
         }
         self.poke();
@@ -720,6 +778,83 @@ impl State {
         frame::write_goaway(&mut self.out, 0, Reason::NoError, b"");
         self.end(message.to_owned(), false);
         self.poke();
+    }
+
+    /// Takes the next piece from the source of every streamed request
+    /// body that has sent its last one; `waker` is woken when a source
+    /// that had none has one. Returns whether there is something new to
+    /// write.
+    fn pull(&mut self, waker: &Waker) -> bool {
+        if self.pulling.is_empty() {
+            return false;
+        }
+        let mut progress = false;
+        let mut at = 0;
+        while at < self.pulling.len() {
+            let id = self.pulling[at];
+            let Some(s) = self.streams.get_mut(&id) else {
+                self.pulling.swap_remove(at);
+                continue;
+            };
+            let next = match &s.source {
+                Some(source) if !s.request_done => source.poll_next(waker),
+                _ => {
+                    s.waiting = false;
+                    self.pulling.swap_remove(at);
+                    continue;
+                }
+            };
+            let Poll::Ready(next) = next else {
+                at += 1;
+                continue;
+            };
+            s.pulled = true;
+            s.waiting = false;
+            self.pulling.swap_remove(at);
+            progress = true;
+            match next {
+                Next::Piece(piece) => {
+                    s.body = piece;
+                    s.sent = 0;
+                    self.enqueue(id);
+                }
+                Next::End(trailers) => {
+                    s.source = None;
+                    s.request_done = true;
+                    match trailers {
+                        Some(trailers) => {
+                            let mut block = Vec::with_capacity(64);
+                            self.encoder.begin(&mut block);
+                            for (name, value) in trailers.iter() {
+                                let index = if value.len() > 256 {
+                                    Index::No
+                                } else {
+                                    Index::Yes
+                                };
+                                self.encoder
+                                    .field(name.as_bytes(), value, index, &mut block);
+                            }
+                            frame::write_headers(&mut self.out, id, &block, true, self.peer_frame);
+                        }
+                        None => {
+                            frame::write_head(&mut self.out, 0, frame::DATA, frame::END_STREAM, id);
+                        }
+                    }
+                }
+                Next::Aborted => {
+                    self.fail_stream(
+                        id,
+                        StreamError::Reset(
+                            "the request body was aborted (RequestBody::abort), so the \
+                             request was cancelled"
+                                .into(),
+                        ),
+                        Some(Reason::Cancel),
+                    );
+                }
+            }
+        }
+        progress
     }
 
     /// `n` bytes of stream `id`'s body were read: let the server send more
@@ -790,6 +925,11 @@ impl State {
         }
         s.reset = true;
         s.body = Vec::new();
+        if s.pulled {
+            // Dropped, which tells its sender. One nothing was taken from
+            // stays until the stream is given up, to be sent again.
+            s.source = None;
+        }
         s.request_done = true;
         let dropped = mem::take(&mut s.buffered);
         s.data.clear();
@@ -821,7 +961,7 @@ impl State {
                 s.queued = false;
                 continue;
             }
-            let end = n == left;
+            let end = n == left && s.source.is_none();
             frame::write_head(
                 &mut self.out,
                 n,
@@ -838,6 +978,15 @@ impl State {
                 s.sent = 0;
                 s.request_done = true;
                 s.queued = false;
+            } else if n == left {
+                // The piece is out: the next one comes from the source.
+                s.body = Vec::new();
+                s.sent = 0;
+                s.queued = false;
+                if !s.waiting {
+                    s.waiting = true;
+                    self.pulling.push(id);
+                }
             } else {
                 self.sending.push_back(id);
             }
@@ -1083,6 +1232,7 @@ impl State {
             // The server answered before the whole request was sent: stop
             // sending it (RFC 9113, section 8.1).
             s.body = Vec::new();
+            s.source = None;
             s.request_done = true;
             s.reset = true;
             frame::write_rst(&mut self.out, id, Reason::NoError);
@@ -1222,6 +1372,14 @@ impl State {
                     StreamError::Protocol("trailers with a :status".into()),
                     Reason::Protocol,
                 );
+            }
+            let mut trailers = Trailers::new();
+            for (name, value) in &d.fields {
+                // Checked when the block was decoded.
+                trailers.received(&d.bytes[name.clone()], &d.bytes[value.clone()]);
+            }
+            if !trailers.is_empty() {
+                s.trailers = Some(Box::new(trailers));
             }
             self.end_of_response(id);
             return Ok(());
@@ -1659,7 +1817,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
             }
             {
                 let mut st = inner.state.borrow_mut();
-                if st.poked {
+                if st.pull(cx.waker()) || st.poked {
                     st.poked = false;
                     return Poll::Ready(Wake::Poked);
                 }
@@ -2017,15 +2175,18 @@ pub(crate) mod fuzzing {
         ];
         let path = a.pick(&["/", "/a?b=c"]);
         let id = awake(st, |st| {
-            st.open(&Request {
-                method,
-                scheme: "https",
-                authority: "example.com",
-                path,
-                fields: &fields,
-                body: (!body.is_empty()).then_some(&body[..]),
-                head_request: method == "HEAD",
-            })
+            st.open(
+                &Request {
+                    method,
+                    scheme: "https",
+                    authority: "example.com",
+                    path,
+                    fields: &fields,
+                    body: (!body.is_empty()).then_some(&body[..]),
+                    head_request: method == "HEAD",
+                },
+                None,
+            )
         });
         bodies.insert(id, body.len());
     }

@@ -1,0 +1,60 @@
+[package]
+name = "giong-grpc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+giong-grpc = { path = ".." }
+
+# Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip"
+path = "fuzz_targets/gzip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "timeout"
+path = "fuzz_targets/timeout.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "status_message"
+path = "fuzz_targets/status_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata"
+path = "fuzz_targets/metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "descriptors"
+path = "fuzz_targets/descriptors.rs"
+test = false
+doc = false
+bench = false

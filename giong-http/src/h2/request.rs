@@ -15,6 +15,7 @@ use std::rc::Rc;
 use crate::budget::Charge;
 use crate::parse::{is_field_value, is_token_str, same_authority, Head};
 use crate::request::{BodyBytes, Request};
+use crate::trailers::Trailers;
 
 /// Per-field overhead counted against the header list size (RFC 9113,
 /// section 6.5.2).
@@ -361,16 +362,27 @@ impl NoneOrEq for Option<u64> {
     }
 }
 
-/// Checks the fields of a trailer block: no pseudo-header fields, and the
-/// same rules as other fields. The values themselves are dropped: a
-/// [`Request`] has no trailers.
-pub(crate) struct Trailers {
+/// The fields of a trailer block, checked as they are decoded: no
+/// pseudo-header fields and the same rules as other fields. Kept only for
+/// a body read as a stream, whose handler can read them, and then no more
+/// than `limit` bytes (names, values and 32 bytes for each field, as for a
+/// header list); a body received whole drops them, as it always has.
+pub(crate) struct TrailerBlock {
     pub(crate) error: Option<&'static str>,
+    pub(crate) fields: Trailers,
+    size: usize,
+    /// `None`: checked, not kept.
+    limit: Option<usize>,
 }
 
-impl Trailers {
-    pub(crate) fn new() -> Self {
-        Self { error: None }
+impl TrailerBlock {
+    pub(crate) fn new(limit: Option<usize>) -> Self {
+        Self {
+            error: None,
+            fields: Trailers::new(),
+            size: 0,
+            limit,
+        }
     }
 
     pub(crate) fn field(&mut self, name: &[u8], value: &[u8]) {
@@ -379,7 +391,19 @@ impl Trailers {
         }
         if name.starts_with(b":") {
             self.error = Some("a pseudo-header field in trailers");
-        } else if !valid_name(name) || !valid_value(value) || connection_specific(name) {
+            return;
+        }
+        if !valid_name(name) || !valid_value(value) || connection_specific(name) {
+            self.error = Some("an invalid field in trailers");
+            return;
+        }
+        let Some(limit) = self.limit else {
+            return;
+        };
+        self.size += name.len() + value.len() + 32;
+        if self.size > limit {
+            self.error = Some("trailers larger than the limit for a header list");
+        } else if !self.fields.received(name, value) {
             self.error = Some("an invalid field in trailers");
         }
     }

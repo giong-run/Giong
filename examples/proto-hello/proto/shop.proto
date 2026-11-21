@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package shop.v1;
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PENDING = 1;
+  STATUS_PAID = 2;
+  STATUS_SHIPPED = 3;
+}
+
+message LineItem {
+  string sku = 1;
+  uint32 quantity = 2;
+  int64 unit_price_cents = 3;
+}
+
+message Card {
+  string last4 = 1;
+  string brand = 2;
+}
+
+message Order {
+  uint64 id = 1;
+  string customer = 2;
+  repeated LineItem items = 3;
+  Status status = 4;
+  map<string, string> metadata = 5;
+  oneof payment {
+    Card card = 6;
+    string voucher_code = 7;
+  }
+  optional string note = 8;
+  repeated uint32 coupon_ids = 9;
+}
+
+message GetOrderRequest {
+  uint64 id = 1;
+}
+
+service Orders {
+  rpc GetOrder(GetOrderRequest) returns (Order);
+  rpc WatchOrders(GetOrderRequest) returns (stream Order);
+}
