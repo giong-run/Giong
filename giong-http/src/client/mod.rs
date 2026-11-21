@@ -129,8 +129,8 @@ pub mod fuzzing {
                 assert!(!max_age.is_zero() && max_age <= std::time::Duration::from_secs(604_800));
                 true
             }
-            super::alt_svc::AltSvc::Clear => true,
-            super::alt_svc::AltSvc::Nothing => false,
+            super::alt_svc::AltSvc::Clear | super::alt_svc::AltSvc::NoH3 => true,
+            super::alt_svc::AltSvc::Malformed => false,
         }
     }
 
@@ -551,6 +551,9 @@ enum H3Slot {
 #[derive(Default)]
 struct Gate {
     open: Cell<bool>,
+    /// Why the opener could not connect: the requests that waited for it
+    /// give up with it at once, rather than each trying again in turn.
+    failed: RefCell<Option<Error>>,
     waiting: RefCell<Vec<std::task::Waker>>,
 }
 
@@ -1166,6 +1169,9 @@ impl Client {
                 Ok(gate) => gate,
                 Err(gate) => {
                     gate.passed().await;
+                    if let Some(e) = gate.failed.borrow().clone() {
+                        return Err(e);
+                    }
                     continue;
                 }
             };
@@ -1180,6 +1186,7 @@ impl Client {
                     if let Some(alternative) = pool.alternatives.borrow_mut().get_mut(origin) {
                         alternative.broken_until = Some(Instant::now() + ALTERNATIVE_BROKEN_FOR);
                     }
+                    *opening.gate.failed.borrow_mut() = Some(e.clone());
                     return Err(e);
                 }
             };
@@ -1303,13 +1310,25 @@ impl Client {
         {
             return;
         }
-        let Some(value) = header_in(head, bytes, "alt-svc") else {
+        // Every field line, as one comma-separated value (RFC 9110
+        // section 5.3).
+        let mut value = Vec::new();
+        for (n, v) in &head.fields {
+            if bytes[n.clone()].eq_ignore_ascii_case(b"alt-svc") {
+                if !value.is_empty() {
+                    value.extend_from_slice(b", ");
+                }
+                value.extend_from_slice(&bytes[v.clone()]);
+            }
+        }
+        if value.is_empty() {
             return;
-        };
+        }
         let mut alternatives = shared.h3.alternatives.borrow_mut();
-        match alt_svc::parse(value) {
-            alt_svc::AltSvc::Nothing => {}
-            alt_svc::AltSvc::Clear => {
+        match alt_svc::parse(&value) {
+            alt_svc::AltSvc::Malformed => {}
+            // A valid value replaces what was known (RFC 7838 section 3).
+            alt_svc::AltSvc::Clear | alt_svc::AltSvc::NoH3 => {
                 alternatives.remove(&url.origin());
             }
             alt_svc::AltSvc::H3 { port, max_age } => {

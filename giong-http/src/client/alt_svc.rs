@@ -17,56 +17,61 @@ const MAX_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// What an `Alt-Svc` header field says about HTTP/3.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AltSvc {
-    /// Nothing the client uses: no HTTP/3 on this host, or a value that
-    /// does not parse (which is ignored, section 3).
-    Nothing,
+    /// A value that does not parse: ignored, and what was known of the
+    /// origin stays (section 3).
+    Malformed,
+    /// A valid value with no HTTP/3 the client follows (another protocol,
+    /// another host, `ma=0`). It replaces what was cached for the origin
+    /// (section 3), so the origin no longer has an HTTP/3 alternative.
+    NoH3,
     /// `clear`: the origin takes back what it advertised.
     Clear,
     /// HTTP/3 on the origin's host at this UDP port, for this long.
     H3 { port: u16, max_age: Duration },
 }
 
-/// Reads the value of an `Alt-Svc` header field.
+/// Reads the value of an `Alt-Svc` header field. Several field lines are
+/// read as one value, joined with commas.
 pub(crate) fn parse(value: &[u8]) -> AltSvc {
     let value = trim(value);
     if value == b"clear" {
         return AltSvc::Clear;
     }
     // The alternatives come in the order the server prefers them.
-    let mut found = AltSvc::Nothing;
+    let mut found = AltSvc::NoH3;
     for entry in split(value, b',') {
         let mut parts = split(entry, b';');
         let Some((protocol, authority)) = parts.next().and_then(pair) else {
-            return AltSvc::Nothing;
+            return AltSvc::Malformed;
         };
-        let mut max_age = Some(DEFAULT_MAX_AGE);
+        let mut max_age = DEFAULT_MAX_AGE;
         for parameter in parts {
             let Some((name, value)) = pair(parameter) else {
-                return AltSvc::Nothing;
+                return AltSvc::Malformed;
             };
             if name == b"ma" {
-                max_age = seconds(unquoted(value));
+                let Some(ma) = seconds(unquoted(value)) else {
+                    return AltSvc::Malformed;
+                };
+                max_age = ma;
             }
-        }
-        if found != AltSvc::Nothing || protocol != b"h3" {
-            continue;
         }
         // "[host]:port" in quotes; an empty host is the origin's own.
-        let Some(port) = authority
-            .strip_prefix(b"\":")
+        let Some((host, port)) = authority
+            .strip_prefix(b"\"")
             .and_then(|rest| rest.strip_suffix(b"\""))
-            .and_then(port)
+            .and_then(|inner| {
+                let at = inner.iter().rposition(|&b| b == b':')?;
+                Some((&inner[..at], port(&inner[at + 1..])?))
+            })
         else {
-            continue;
+            return AltSvc::Malformed;
         };
-        match max_age {
-            Some(max_age) if !max_age.is_zero() => {
-                found = AltSvc::H3 {
-                    port,
-                    max_age: max_age.min(MAX_MAX_AGE),
-                };
-            }
-            _ => {}
+        if found == AltSvc::NoH3 && protocol == b"h3" && host.is_empty() && !max_age.is_zero() {
+            found = AltSvc::H3 {
+                port,
+                max_age: max_age.min(MAX_MAX_AGE),
+            };
         }
     }
     found
@@ -162,36 +167,51 @@ mod tests {
     }
 
     #[test]
-    fn what_the_client_does_not_follow_is_nothing() {
+    fn a_valid_value_without_http3_here_says_there_is_none() {
         for value in [
-            &b""[..],
-            b"h2=\":443\"",
+            &b"h2=\":443\""[..],
             // Another host, or one named at all.
             b"h3=\"other.example:443\"",
             b"h3=\"example.com:443\"",
             // Already expired.
             b"h3=\":443\"; ma=0",
-            // Not as RFC 7838 writes it.
+            b"h2=\":443\", h3=\"[::1]:443\"",
+        ] {
+            assert_eq!(
+                parse(value),
+                AltSvc::NoH3,
+                "{}",
+                String::from_utf8_lossy(value)
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_does_not_parse_is_ignored() {
+        for value in [
+            &b""[..],
             b"h3=:443",
             b"h3=\":0\"",
             b"h3=\":65536\"",
             b"h3=\":44a\"",
+            b"h3=\"443\"",
             b"h3=\":443\"; ma=soon",
             b"h3",
             b"h3=\":443\"; ma",
             b"=\":443\"",
             b"Clear",
             b"clear, h3=\":443\"",
+            b"h3=\":443\", h2",
         ] {
             assert_eq!(
                 parse(value),
-                AltSvc::Nothing,
+                AltSvc::Malformed,
                 "{}",
                 String::from_utf8_lossy(value)
             );
         }
         // A comma or semicolon inside quotes does not split.
-        assert_eq!(parse(b"x=\"a,b;c\\\"d\"; ma=5, h3=\":9\""), h3(9, 86_400));
+        assert_eq!(parse(b"x=\"a,b;c\\\"d:1\"; ma=5, h3=\":9\""), h3(9, 86_400));
     }
 
     #[test]

@@ -93,6 +93,12 @@ impl Handler for App {
             "/empty" => Response::new(204),
             "/early" => Response::text(req.is_early_data().to_string()),
             "/clear" => Response::text("cleared").header("alt-svc", "clear"),
+            // Valid, with no HTTP/3: it replaces what was advertised.
+            "/h2-only" => Response::text("h2 only").header("alt-svc", "h2=\":443\""),
+            // Read as one value, which does not parse: ignored.
+            "/two-lines" => Response::text("two lines")
+                .header("alt-svc", "h2=\":443\"")
+                .header("alt-svc", "h3=:1"),
             "/slow" => {
                 giong::time::sleep(Duration::from_millis(30)).await;
                 Response::text("slow")
@@ -930,6 +936,53 @@ mod alt_svc {
                 assert_eq!(res.version(), Version::Http2);
             }
             assert!(started.elapsed() < Duration::from_millis(300));
+        });
+    }
+
+    #[test]
+    fn a_new_advertisement_replaces_the_old_one() {
+        run(|| async {
+            let (url, client) = origin(|port| format!("h3=\":{port}\"; ma=60"), true);
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            // A value that does not parse, once its lines are joined,
+            // changes nothing.
+            let res = client
+                .get(&format!("{url}/two-lines"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.version(), Version::Http3);
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http3);
+            // A valid one without HTTP/3 takes it back (RFC 7838 section 3).
+            let res = client.get(&format!("{url}/h2-only")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http3);
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+        });
+    }
+
+    #[test]
+    fn a_burst_to_an_alternative_that_does_not_answer_waits_once() {
+        run(|| async {
+            let (url, client) = origin(|port| format!("h3=\":{port}\""), false);
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            // All at once: one tries the alternative, the others wait for
+            // it and go over TCP with it, not each after the other.
+            let started = std::time::Instant::now();
+            let tasks: Vec<_> = (0..8)
+                .map(|_| {
+                    let (client, url) = (client.clone(), format!("{url}/"));
+                    giong::spawn(async move { client.get(&url).send().await.unwrap().version() })
+                })
+                .collect();
+            for task in tasks {
+                assert_eq!(task.await.unwrap(), Version::Http2);
+            }
+            let waited = started.elapsed();
+            assert!(waited < Duration::from_millis(1500), "{waited:?}");
         });
     }
 
