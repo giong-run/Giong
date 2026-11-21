@@ -201,7 +201,7 @@ is loaded.
 - Commits follow Conventional Commits: `<type>(<scope>): <imperative summary, lower case,
   no full stop>`. Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`,
   `ci`, `chore`. Scopes: the runtime's parts (`runtime`, `executor`, `driver`, `net`,
-  `fs`, `time`, `sync`, `buf`), a companion crate by its name without `giong-` (`http`,
+  `fs`, `ipc`, `time`, `sync`, `buf`), a companion crate by its name without `giong-` (`http`,
   `tls`, `web`, `postgres`, `mysql`, `redis`, `mcp`, `compat`), and `examples`, `bench`,
   `site`, `release`. Leave the scope out when a change spans several. A breaking change
   takes `!` after the scope and a `BREAKING CHANGE:` footer. The body says why.

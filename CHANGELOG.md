@@ -8,6 +8,20 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+### Added
+
+- `giong::ipc`: message channels between two processes on one host, over shared memory.
+  `IpcListener::bind` and `ipc::connect` meet on a Unix socket path, hand over a sealed
+  memfd and four eventfds, and give each side a `Sender` and a `Receiver`. Messages are
+  bounded (a quarter of the capacity), sending waits while the channel is full, and the
+  receiver reads in place. A process that dies is reported (`GIONG-E0094`), and so is one
+  that corrupts the ring (`GIONG-E0091`); the receiving process checks every position and
+  length it reads. On a spinning worker (`spin_before_park`), a waiting receiver is watched
+  from the spin loop and neither side makes a system call. Measured between two pinned
+  processes on a 4 vCPU VM: a round trip of 0.91 µs against 6.53 µs over giong's
+  `UnixStream`, with 7.2 times less CPU; streaming is even without spinning and 42% slower
+  with it (`bench/results/ipc-giong/`). Codes `GIONG-E0090` to `GIONG-E0095`.
+
 ### Fixed
 
 - A worker with `spin_before_park` could stop blocking for good and burn its core: the

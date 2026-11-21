@@ -429,6 +429,13 @@ pub(crate) struct Worker {
     pub(crate) next_task_uid: Cell<u64>,
     /// How long to busy-poll for new work before blocking in the kernel.
     spin: Option<Duration>,
+    /// Work that arrives without a completion (an IPC ring another process
+    /// writes), watched while the worker spins (see [`SpinProbe`]).
+    probes: RefCell<Vec<Probe>>,
+    /// The id the next probe gets (see [`Worker::remove_probe`]).
+    next_probe: Cell<u64>,
+    /// `probes` is not empty: read in the spin loop without borrowing it.
+    has_probes: Cell<bool>,
     /// Tasks on this worker waiting for a shutdown request.
     shutdown_waiters: RefCell<Slab<Waker>>,
     /// How long remaining tasks may keep running after the main future is done.
@@ -439,6 +446,25 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+}
+
+/// Something a spinning worker can watch for work that arrives without a
+/// completion: the peer of an IPC channel writes shared memory, and wakes
+/// this worker through the kernel only when told it sleeps.
+///
+/// While the worker spins it calls [`ready`](Self::ready); before it
+/// blocks in the kernel it calls [`arm`](Self::arm), after which the peer
+/// must wake it through the kernel. A probe found ready, and every armed
+/// probe, is removed and the task that registered it woken.
+/// A registered [`SpinProbe`]: its id, the probe, and the waker of the task
+/// waiting for it.
+type Probe = (u64, Box<dyn SpinProbe>, Waker);
+
+pub(crate) trait SpinProbe {
+    /// Whether the work is there. Called many times per microsecond.
+    fn ready(&self) -> bool;
+    /// Switches the peer to waking through the kernel.
+    fn arm(&self);
 }
 
 thread_local! {
@@ -520,6 +546,9 @@ impl Worker {
             pool,
             next_task_uid: Cell::new(1),
             spin: cfg.spin,
+            probes: RefCell::new(Vec::new()),
+            next_probe: Cell::new(0),
+            has_probes: Cell::new(false),
             shutdown_waiters: RefCell::new(Slab::new()),
             shutdown_grace: cfg.shutdown_grace,
             draining: Cell::new(false),
@@ -725,7 +754,10 @@ impl Worker {
             // Announce that we are going to sleep, then re-check for injected
             // work (see `WorkerShared::inject`) and balanced jobs (see
             // `RuntimeShared::push_job`): `prepare_park` ends with the fence.
-            let mode = if self.shared.bell.prepare_park() || self.rt.jobs_len.any() {
+            let mode = if (self.has_probes.get() && self.fire_probes(true))
+                || self.shared.bell.prepare_park()
+                || self.rt.jobs_len.any()
+            {
                 Park::Poll
             } else {
                 wait
@@ -748,6 +780,66 @@ impl Worker {
 
             self.fire_timers();
         }
+    }
+
+    /// Whether this worker busy-polls before blocking (`spin_before_park`):
+    /// only then are [`SpinProbe`]s watched.
+    pub(crate) fn spins(&self) -> bool {
+        self.spin.is_some()
+    }
+
+    /// Registers `probe`; `waker` is woken when it fires. Returns the id
+    /// that [`remove_probe`](Self::remove_probe) takes.
+    pub(crate) fn add_probe(&self, probe: Box<dyn SpinProbe>, waker: Waker) -> u64 {
+        let id = self.next_probe.get();
+        self.next_probe.set(id.wrapping_add(1));
+        self.probes.borrow_mut().push((id, probe, waker));
+        self.has_probes.set(true);
+        id
+    }
+
+    /// Removes the probe `id` if it has not fired: its task stopped
+    /// waiting for it (woken for another reason, or cancelled).
+    pub(crate) fn remove_probe(&self, id: u64) {
+        let mut probes = self.probes.borrow_mut();
+        if let Some(i) = probes.iter().position(|(p, _, _)| *p == id) {
+            let removed = probes.swap_remove(i);
+            self.has_probes.set(!probes.is_empty());
+            drop(probes);
+            // The probe and waker are dropped outside the borrow.
+            drop(removed);
+        }
+    }
+
+    /// Wakes the tasks of the probes that are ready (`arm`: after arming
+    /// each one, before blocking; every probe is removed then) and removes
+    /// them. `true` if any task was woken.
+    fn fire_probes(&self, arm: bool) -> bool {
+        let mut fired = Vec::new();
+        {
+            let mut probes = self.probes.borrow_mut();
+            let mut i = 0;
+            while i < probes.len() {
+                let (_, probe, _) = &probes[i];
+                // An armed probe's task is woken whatever `arm` found: it
+                // now waits through the kernel, which it sets up when polled.
+                if arm || probe.ready() {
+                    if arm {
+                        probe.arm();
+                    }
+                    let (_, _, waker) = probes.swap_remove(i);
+                    fired.push(waker);
+                } else {
+                    i += 1;
+                }
+            }
+            self.has_probes.set(!probes.is_empty());
+        }
+        let any = !fired.is_empty();
+        for waker in fired {
+            waker.wake();
+        }
+        any
     }
 
     /// Hands a descriptor that was given up while the driver was borrowed to
@@ -846,6 +938,7 @@ impl Worker {
                 if self.shared.bell.peek()
                     || self.rt.jobs_len.any()
                     || self.driver.borrow_mut().has_completions()
+                    || (self.has_probes.get() && self.fire_probes(false))
                 {
                     return true;
                 }
