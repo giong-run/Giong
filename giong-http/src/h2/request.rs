@@ -57,6 +57,9 @@ pub(crate) struct Builder {
     limit: usize,
     error: Option<&'static str>,
     status: Option<u16>,
+    /// The fields are those of an HTTP/3 request: the same rules, another
+    /// version on the request.
+    h3: bool,
 }
 
 /// The fields HTTP/2 forbids because they are about one connection
@@ -120,7 +123,16 @@ impl Builder {
             limit,
             error: None,
             status: None,
+            h3: false,
         }
+    }
+
+    /// The same builder for the fields of an HTTP/3 request, which follow
+    /// the rules of HTTP/2 (RFC 9114, sections 4.2 and 4.3).
+    #[cfg(feature = "unstable-http3")]
+    pub(crate) fn http3(mut self) -> Self {
+        self.h3 = true;
+        self
     }
 
     fn fail(&mut self, why: &'static str) {
@@ -279,6 +291,15 @@ impl Builder {
             if !(value.starts_with(b"/") || (options && value == b"*")) {
                 return Built::Malformed("a :path that is neither absolute nor *");
             }
+            // RFC 9114, section 4.3.1: a request for an http or https
+            // resource names its authority, one way or the other. HTTP/2
+            // does not ask for it (RFC 9113, section 8.3.1).
+            if self.h3 && self.authority.is_none() && self.host.is_none() {
+                let scheme = self.scheme.clone().map_or(&b""[..], |s| &pseudo[s]);
+                if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https") {
+                    return Built::Malformed("neither :authority nor a host header field");
+                }
+            }
             path
         };
         // RFC 9113, section 8.3.1. HTTP/1.1 holds an absolute target's
@@ -298,7 +319,11 @@ impl Builder {
         let target_start = buf.len();
         buf.extend_from_slice(&pseudo[target.clone()]);
         let target_end = buf.len();
-        buf.extend_from_slice(b" HTTP/2\r\n");
+        buf.extend_from_slice(if self.h3 {
+            b" HTTP/3\r\n"
+        } else {
+            b" HTTP/2\r\n"
+        });
         let headers_start = buf.len();
         if self.host.is_none() {
             if let Some(authority) = self.authority.clone().filter(|a| !a.is_empty()) {
@@ -328,6 +353,7 @@ impl Builder {
             keep_alive: true,
             expect_continue: self.expect_continue,
             h2: true,
+            h3: self.h3,
         };
         Built::Request(Request {
             buf: Rc::new(buf),
@@ -336,6 +362,7 @@ impl Builder {
             body: BodyBytes::InBuffer(len..len),
             peer,
             charge: Charge::none(),
+            early_data: false,
         })
     }
 
@@ -437,6 +464,33 @@ mod tests {
             names,
             ["host", "accept", "x-id", "content-length", "cookie"]
         );
+    }
+
+    #[cfg(feature = "unstable-http3")]
+    #[test]
+    fn http3_asks_for_an_authority_and_http2_does_not() {
+        let bare = [(":method", "GET"), (":scheme", "https"), (":path", "/")];
+        let h3 = |fields: &[(&str, &str)]| {
+            let mut b = Builder::new(16 * 1024).http3();
+            for (n, v) in fields {
+                b.field(n.as_bytes(), v.as_bytes());
+            }
+            b.finish(None)
+        };
+        assert!(matches!(build(&bare), Built::Request(_)));
+        assert!(matches!(h3(&bare), Built::Malformed(_)));
+        for named in [(":authority", "example.com"), ("host", "example.com")] {
+            let mut fields = bare.to_vec();
+            if named.0 == "host" {
+                fields.push(named);
+            } else {
+                fields.insert(2, named);
+            }
+            assert!(matches!(h3(&fields), Built::Request(_)), "{named:?}");
+        }
+        // Another scheme may have no authority.
+        let other = [(":method", "GET"), (":scheme", "urn"), (":path", "/")];
+        assert!(matches!(h3(&other), Built::Request(_)));
     }
 
     #[test]
