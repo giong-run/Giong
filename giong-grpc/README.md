@@ -202,33 +202,33 @@ One server thread, loaded from three other cores until its core is the limit, wi
 
 | Workload | Load | tonic | giong-grpc | | Server CPU per call or message, tonic → giong-grpc |
 |---|---|---:|---:|---:|---:|
-| unary, 100 B | tonic | 148,951 calls/s | 213,803 | +44% | 6.39 → 4.22 µs |
-| unary, 100 B | giong | 156,884 | 202,924 | +29% | 6.07 → 4.54 µs |
-| unary, 10 kB | tonic | 67,694 | 62,597 | **−7.5%** | 14.06 → 13.00 µs |
-| unary, 10 kB | giong | 67,517 | 91,249 | +35% | 14.16 → 10.43 µs |
-| bidirectional round trips | tonic | 492,739 msg/s | 741,107 | +50% | 1.94 → 1.29 µs |
-| bidirectional round trips | giong | 474,737 | 726,118 | +53% | 2.01 → 1.30 µs |
-| server stream | tonic | 2,716,306 msg/s | 10,497,599 | 3.9× | 0.351 → 0.091 µs |
-| server stream | giong | 2,597,898 | 10,887,413 | 4.2× | 0.366 → 0.087 µs |
+| unary, 100 B | tonic | 165,091 calls/s | 228,965 | +39% | 5.78 → 4.05 µs |
+| unary, 100 B | giong | 163,347 | 211,936 | +30% | 5.85 → 4.47 µs |
+| unary, 10 kB | tonic | 69,817 | 77,734 | +11% | 13.69 → 11.92 µs |
+| unary, 10 kB | giong | 70,406 | 91,655 | +30% | 13.52 → 10.23 µs |
+| bidirectional round trips | tonic | 539,816 msg/s | 774,357 | +43% | 1.76 → 1.23 µs |
+| bidirectional round trips | giong | 516,770 | 796,185 | +54% | 1.85 → 1.20 µs |
+| server stream | tonic | 2,725,969 msg/s | 11,084,927 | 4.1× | 0.351 → 0.086 µs |
+| server stream | giong | 2,844,257 | 11,215,869 | 3.9× | 0.336 → 0.085 µs |
 
-The loss: 10,000-byte unary calls from tonic's client. The giong-grpc server used less CPU per call there and only 81% of its core, so it waited for the client more than tonic's server did; why is not found yet. The server stream is ahead by that much because the messages a handler sends in a row leave in one write.
+No workload is behind with the default load of 16 calls in flight per connection. 10,000-byte unary calls from tonic's client were 7.5% behind until giong-http's HTTP/2 server sent the answers to a burst of short requests in one write instead of cutting the output at 64 KiB, which left the server waiting a turn of its worker for each further write. With 64 calls in flight per connection (`TASKS=128`) the bursts are larger than that one write, and in quick runs that case was still about 10% behind tonic's server, at 91% of the server's core: not fixed yet. The server stream is ahead by that much because the messages a handler sends in a row leave in one write.
 
 One client thread, against a server with three threads (tonic's, then giong-grpc's):
 
 | Workload | Server | tonic client | giong-grpc client | |
 |---|---|---:|---:|---:|
-| unary, 100 B | tonic | 80,149 calls/s | 88,485 | +10% |
-| unary, 100 B | giong | 120,009 | 135,058 | +13% |
-| unary, 10 kB | tonic | 47,037 | 54,514 | +16% |
-| unary, 10 kB | giong | 49,786 | 56,654 | +14% |
-| bidirectional round trips | tonic | 232,646 msg/s | 235,285 | +1% |
-| bidirectional round trips | giong | 431,257 | 471,006 | +9% |
-| server stream | tonic | 4,977,440 msg/s | 5,399,038 | +8% |
-| server stream | giong | 6,664,968 | 7,924,423 | +19% |
+| unary, 100 B | tonic | 84,122 calls/s | 93,485 | +11% |
+| unary, 100 B | giong | 126,729 | 147,193 | +16% |
+| unary, 10 kB | tonic | 47,935 | 58,117 | +21% |
+| unary, 10 kB | giong | 55,356 | 58,723 | +6% |
+| bidirectional round trips | tonic | 244,025 msg/s | 245,930 | +1% |
+| bidirectional round trips | giong | 462,899 | 484,126 | +5% |
+| server stream | tonic | 5,297,471 msg/s | 5,484,479 | +4% |
+| server stream | giong | 7,483,429 | 7,905,792 | +6% |
 
 Round trips against tonic's server are level: both clients used about three quarters of their core, so that row measures the server. Not measured: client streams of many messages in a row, where the giong-grpc client still hands the connection one message at a time.
 
-Memory: with 1,000 bidirectional streams open on 10 connections, the server's resident memory grew by 5.4 kB a stream with giong-grpc and 11.6 kB with tonic.
+Memory: with 1,000 bidirectional streams open on 10 connections, the server's resident memory grew by 5.5 kB a stream with giong-grpc and 11.6 kB with tonic.
 
 The giong-http server in these runs has `max_body_size(4 << 20)`: the HTTP/2 window a stream starts with is a share of the server's body budget (half of it divided by `max_concurrent_streams`, 5 KiB with the defaults), and a request larger than that window waits for a WINDOW_UPDATE. A service whose requests are larger than 5 KiB should set `max_body_size` to its message limit, which makes the first window 20 KiB for 4 MiB.
 

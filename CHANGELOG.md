@@ -38,11 +38,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `GIONG-E4101` to `GIONG-E4110` with the cause and the fix. Tested against grpc-go in
   both directions with the cases of gRPC's interoperability specification, on io_uring and
   epoll (`giong-grpc/interop/run.sh`, the `gRPC` workflow). Measured against tonic 0.14
-  with `bench/grpc.sh` (4-core cloud VM, median of 5 rounds): a one-thread server does 29%
-  to 44% more 100-byte unary calls a second, 50% more round trips on bidirectional streams
-  and 3.9 to 4.2 times the messages of a server stream, and holds 5.4 kB instead of 11.6 kB
-  per open stream; with 10,000-byte unary calls it is 35% ahead under giong-grpc's own
-  client and 7.5% behind under tonic's. A one-thread client is 1% to 19% ahead. Tables and
+  with `bench/grpc.sh` (4-core cloud VM, median of 5 rounds): a one-thread server does 30%
+  to 39% more 100-byte unary calls a second, 43% to 54% more round trips on bidirectional
+  streams, 3.9 to 4.1 times the messages of a server stream and 11% to 30% more 10,000-byte
+  unary calls, and holds 5.5 kB instead of 11.6 kB per open stream. A one-thread client is
+  1% to 21% ahead. Tables and
   what was not measured: `giong-grpc/README.md`; raw data: `bench/results/grpc/`.
 - **giong-grpc: health checking and server reflection.** `giong_grpc::health::Health`
   serves `grpc.health.v1.Health` (Check, List, Watch) from statuses the program sets from
@@ -72,6 +72,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   are ready in the same turn of the connection, and lets handlers that were woken while it
   polled them go on for up to 32 rounds before it writes, instead of a frame and a write
   for each piece. `send` waits for the connection to take each piece as before.
+- **giong-http** (performance): the HTTP/2 server sends the answers to a burst of short
+  requests in one write: answers whose bytes fit in one DATA frame fill the output up to
+  192 KiB, where it stopped at 64 KiB, and with one write in flight a connection waited a
+  turn of the worker for each further write. Streamed and file bodies still stop at 64 KiB.
+  10,000-byte gRPC unary calls from tonic's client, 16 in flight per connection: 62,597 to
+  77,734 calls a second on one server thread (`bench/grpc.sh`, 4-core cloud VM, io_uring).
 
 ### Fixed
 

@@ -90,6 +90,12 @@ const MAX_FRAME: usize = frame::DEFAULT_FRAME_SIZE;
 const DATA_FRAME: usize = 16 * 1024;
 /// DATA frames are added to the output until it holds this much.
 const OUT_HIGH: usize = 64 * 1024;
+/// Short answers, whose bytes held in memory fit in one DATA frame (and the
+/// ends of streams), are added until the output holds this much: with one
+/// write in flight, the answers to a burst of short requests cut at
+/// `OUT_HIGH` each waited a turn of the worker for the next write. Below
+/// `OUT_PAUSE`, and the output's capacity stays within 256 KiB.
+const OUT_SHORT_HIGH: usize = 192 * 1024;
 /// How many times in a row the connection polls the handlers that were
 /// woken while it polled them, before it lets the rest of the worker run.
 const ROUNDS_PER_TURN: usize = 32;
@@ -261,6 +267,19 @@ enum Send {
     End(Option<Trailers>),
     /// END_STREAM sent.
     Done,
+}
+
+impl Send {
+    /// Whether what is left to send of the bytes in memory fits in one DATA
+    /// frame: a short answer, or the last frame of one.
+    fn short(&self) -> bool {
+        match self {
+            Send::Bytes { body, at } => body.as_bytes().len() - at <= DATA_FRAME,
+            Send::Stream { piece, at, .. } => piece.len() - at <= DATA_FRAME,
+            Send::File { .. } => false,
+            Send::Waiting | Send::End(_) | Send::Done => true,
+        }
+    }
 }
 
 /// A read of a file body's next piece.
@@ -1902,7 +1921,7 @@ impl Session {
             self.grant();
         }
         let now = Instant::now();
-        while self.out.len() < OUT_HIGH && !self.failed {
+        while self.out.len() < OUT_SHORT_HIGH && !self.failed {
             let Some(&slot) = self.queue.front() else {
                 break;
             };
@@ -1912,6 +1931,9 @@ impl Session {
                 self.queue.pop_front();
                 continue;
             };
+            if self.out.len() >= OUT_HIGH && !st.send.short() {
+                break;
+            }
             let needs_window = st.has_data();
             if needs_window && conn_send <= 0 {
                 // Everything waits for the connection window.
