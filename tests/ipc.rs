@@ -226,6 +226,32 @@ fn a_cancelled_recv_loses_no_message() {
     });
 }
 
+#[test]
+fn a_message_is_seen_as_soon_as_its_sender_awaits_something_else() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
+        let server = giong::spawn(async move { listener.accept().await.unwrap() });
+        let (mut tx, _rx) = ipc::connect(&path.0, 1 << 16).await.unwrap();
+        let (_ptx, mut prx) = server.await.unwrap();
+        let sender = giong::spawn(async move {
+            // Far below the size that publishes at once: held back until
+            // this task gives the worker back.
+            tx.send(b"early").await.unwrap();
+            sleep(Duration::from_secs(5)).await;
+            drop(tx);
+        });
+        let got = timeout(Duration::from_secs(1), prx.recv())
+            .await
+            .expect("the message waited for its sender's sleep")
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*got, b"early");
+        drop(got);
+        sender.abort();
+    });
+}
+
 // ------------------------------------------- workers that spin before parking
 
 /// While the worker spins (`spin_before_park`), a waiting receiver is

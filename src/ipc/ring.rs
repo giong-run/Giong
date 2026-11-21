@@ -39,11 +39,11 @@ pub(crate) const MAX_CAPACITY: usize = 1 << 30;
 const SKIP: u32 = u32::MAX;
 const HEAD: usize = 8;
 
-/// `consumer_sleeping` values: awake, asleep in the kernel (wake it), and
-/// watched by its spinning worker (nothing to do).
+/// `consumer_sleeping` and `producer_sleeping` values: awake (or watched
+/// by its spinning worker: nothing to do), and asleep in the kernel (wake
+/// it). A third value from a peer counts as awake.
 pub(crate) const AWAKE: u32 = 0;
 pub(crate) const ASLEEP: u32 = 1;
-pub(crate) const SPINNING: u32 = 2;
 
 /// The producer has dropped its half: no more records come.
 pub(crate) const PRODUCER_CLOSED: u32 = 1;
@@ -65,9 +65,9 @@ pub(crate) struct Header {
 pub(crate) struct Dir {
     pub(crate) tail: Line<AtomicU64>,
     pub(crate) head: Line<AtomicU64>,
-    /// 1 while the consumer is about to sleep or sleeps; the producer swaps
-    /// it to 0 and, if it was 1, wakes it. [`SPINNING`] while the consumer's
-    /// worker busy-polls the ring itself: the producer then does nothing.
+    /// [`ASLEEP`] while the consumer is about to sleep or sleeps; the
+    /// producer swaps it to [`AWAKE`] and, if it was asleep, wakes it. It
+    /// stays awake while the consumer's worker busy-polls the ring.
     pub(crate) consumer_sleeping: Line<AtomicU32>,
     /// The same for a producer waiting for room.
     pub(crate) producer_sleeping: Line<AtomicU32>,
@@ -231,12 +231,17 @@ impl Ring {
         }
         pos += total;
         self.pos = pos;
-        // Sequentially consistent, as is the producer's next look at
-        // `consumer_sleeping`: with the consumer's store of that flag and
-        // its next look at `tail` (also sequentially consistent), one of
-        // the two sees the other, so a wake-up is never missed.
-        self.dir().tail.0.store(pos, Ordering::SeqCst);
+        // Not visible to the consumer until `tail` is published (see
+        // `Pending` in ipc.rs), so that a burst of records costs one store
+        // to the line the consumer polls.
         Ok(Push::Done)
+    }
+
+    /// Producer: makes every pushed record visible (tests; the channel
+    /// publishes through `Pending`).
+    #[cfg(test)]
+    pub(crate) fn publish(&self) {
+        self.dir().tail.0.store(self.pos, Ordering::SeqCst);
     }
 
     /// Producer: whether a message of `len` bytes would fit now.
@@ -356,6 +361,12 @@ mod tests {
         }
     }
 
+    fn push(tx: &mut Ring, msg: &[u8]) -> Push {
+        let r = tx.push(msg).unwrap();
+        tx.publish();
+        r
+    }
+
     fn pop(r: &mut Ring) -> Option<Vec<u8>> {
         let (ptr, len, total) = r.peek().unwrap()?;
         // SAFETY: as returned by `peek`.
@@ -376,7 +387,7 @@ mod tests {
         for i in 0..count {
             let len = (i as usize * 37) % (max_message(cap) + 1);
             let msg: Vec<u8> = (0..len).map(|b| (b as u32 ^ i) as u8).collect();
-            while tx.push(&msg).unwrap() == Push::Full {
+            while push(&mut tx, &msg) == Push::Full {
                 let got = pop(&mut rx).unwrap();
                 let want_len = (next_out as usize * 37) % (max_message(cap) + 1);
                 assert_eq!(got.len(), want_len);
@@ -401,7 +412,7 @@ mod tests {
         let (mut tx, mut rx) = mem.rings(cap);
         let msg = vec![1u8; max_message(cap)];
         let mut n = 0;
-        while tx.push(&msg).unwrap() == Push::Done {
+        while push(&mut tx, &msg) == Push::Done {
             n += 1;
         }
         assert!(n >= 3, "{n}");
@@ -415,7 +426,7 @@ mod tests {
         let cap = MIN_CAPACITY;
         let mut mem = Mem::new(cap);
         let (mut tx, mut rx) = mem.rings(cap);
-        tx.push(b"hello").unwrap();
+        push(&mut tx, b"hello");
         // A sending peer claims more data than the ring holds.
         rx.dir().tail.0.store(cap as u64 * 2, Ordering::Release);
         assert!(rx.peek().is_err());
@@ -431,7 +442,7 @@ mod tests {
         let cap = MIN_CAPACITY;
         let mut mem = Mem::new(cap);
         let (mut tx, mut rx) = mem.rings(cap);
-        tx.push(b"hello").unwrap();
+        push(&mut tx, b"hello");
         // Overwrite the record head with a huge length.
         // SAFETY: offset 0 of the data area, inside the buffer.
         unsafe { std::ptr::write_unaligned(tx.data.cast::<u32>(), 100_000) };

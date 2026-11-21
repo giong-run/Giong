@@ -17,10 +17,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   receiver reads in place. A process that dies is reported (`GIONG-E0094`), and so is one
   that corrupts the ring (`GIONG-E0091`); the receiving process checks every position and
   length it reads. On a spinning worker (`spin_before_park`), a waiting receiver is watched
-  from the spin loop and neither side makes a system call. Measured between two pinned
-  processes on a 4 vCPU VM: a round trip of 0.91 µs against 6.53 µs over giong's
-  `UnixStream`, with 7.2 times less CPU; streaming is even without spinning and 42% slower
-  with it (`bench/results/ipc-giong/`). Codes `GIONG-E0090` to `GIONG-E0095`.
+  from the spin loop and neither side makes a system call. A sender publishes a burst of
+  messages with one store, at the end of the worker's turn or before it waits for an
+  answer. Measured between two pinned processes on a 4 vCPU VM against giong's
+  `UnixStream`: round trips 6.7 times faster with spinning workers (1.00 against 6.73 µs)
+  and 8.3 times without, streams of 64-byte messages 2.0 to 2.1 times the rate at half the
+  CPU (`bench/results/ipc-giong/`). Codes `GIONG-E0090` to `GIONG-E0095`.
 
 ### Fixed
 

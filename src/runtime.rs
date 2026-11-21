@@ -436,6 +436,10 @@ pub(crate) struct Worker {
     next_probe: Cell<u64>,
     /// `probes` is not empty: read in the spin loop without borrowing it.
     has_probes: Cell<bool>,
+    /// Writes held back until the end of the turn (see [`Publish`]).
+    publishers: RefCell<Vec<Rc<dyn Publish>>>,
+    /// `publishers` is not empty.
+    publish_waiting: Cell<bool>,
     /// Tasks on this worker waiting for a shutdown request.
     shutdown_waiters: RefCell<Slab<Waker>>,
     /// How long remaining tasks may keep running after the main future is done.
@@ -465,6 +469,15 @@ pub(crate) trait SpinProbe {
     fn ready(&self) -> bool;
     /// Switches the peer to waking through the kernel.
     fn arm(&self);
+}
+
+/// A write to memory another process polls, held back until the tasks of
+/// this turn have run: an IPC sender makes a burst of messages visible
+/// with one store instead of one per message. The worker calls
+/// [`publish`](Self::publish) once the runnable tasks have been polled,
+/// before it looks for I/O, spins or blocks.
+pub(crate) trait Publish {
+    fn publish(&self);
 }
 
 thread_local! {
@@ -549,6 +562,8 @@ impl Worker {
             probes: RefCell::new(Vec::new()),
             next_probe: Cell::new(0),
             has_probes: Cell::new(false),
+            publishers: RefCell::new(Vec::new()),
+            publish_waiting: Cell::new(false),
             shutdown_waiters: RefCell::new(Slab::new()),
             shutdown_grace: cfg.shutdown_grace,
             draining: Cell::new(false),
@@ -699,6 +714,9 @@ impl Worker {
                 0
             };
             self.run_tasks(&mut || done = poll_main());
+            if self.publish_waiting.get() {
+                self.publish_deferred();
+            }
             if self.sends_waiting.get() {
                 self.flush_sends(tick);
             }
@@ -808,6 +826,29 @@ impl Worker {
             drop(probes);
             // The probe and waker are dropped outside the borrow.
             drop(removed);
+        }
+    }
+
+    /// Holds `p` until the end of this turn (see [`Publish`]).
+    pub(crate) fn defer_publish(&self, p: Rc<dyn Publish>) {
+        self.publishers.borrow_mut().push(p);
+        self.publish_waiting.set(true);
+    }
+
+    /// Publishes what is held back now: a task about to busy-wait for an
+    /// answer must not hold back its own question.
+    pub(crate) fn publish_now(&self) {
+        if self.publish_waiting.get() {
+            self.publish_deferred();
+        }
+    }
+
+    fn publish_deferred(&self) {
+        self.publish_waiting.set(false);
+        // `publish` stores and may write an eventfd; it never reaches back
+        // into the worker, so the list stays borrowed (and keeps its room).
+        for p in self.publishers.borrow_mut().drain(..) {
+            p.publish();
         }
     }
 

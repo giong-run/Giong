@@ -53,6 +53,7 @@
 
 mod ring;
 
+use std::cell::Cell;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::ops::Deref;
@@ -70,7 +71,7 @@ use crate::kbox::KernelBox;
 use crate::net::{UnixListener, UnixStream};
 use crate::op::Op;
 use crate::runtime;
-use ring::{Corrupt, Dir, Push, Ring, ASLEEP, AWAKE, CONSUMER_CLOSED, PRODUCER_CLOSED, SPINNING};
+use ring::{Corrupt, Dir, Push, Ring, ASLEEP, AWAKE, CONSUMER_CLOSED, PRODUCER_CLOSED};
 
 /// The eventfds of a channel: who waits on each.
 const D0_DATA: usize = 0; // acceptor's receiver
@@ -233,9 +234,21 @@ struct RingProbe {
     dir: *const Dir,
     /// The consumer's position when it went to wait.
     pos: u64,
+    /// Set by [`arm`](runtime::SpinProbe::arm), read by the waiting
+    /// consumer.
+    armed: Rc<Cell<bool>>,
+    /// Calls of `ready`, to read the producer's line on one in
+    /// [`LOOK_EVERY`] only.
+    looks: Cell<u32>,
     /// Keeps the mapping `dir` points into alive.
     _shared: Rc<Shared>,
 }
+
+/// The spin loop calls `ready` every few tens of nanoseconds. Reading the
+/// line the producer writes that often takes it from the producer before
+/// nearly every message it sends; one look in four lets it write several
+/// messages in a row, at a cost of about a hundred nanoseconds of latency.
+const LOOK_EVERY: u32 = 4;
 
 impl RingProbe {
     fn dir(&self) -> &Dir {
@@ -246,6 +259,11 @@ impl RingProbe {
 
 impl runtime::SpinProbe for RingProbe {
     fn ready(&self) -> bool {
+        let n = self.looks.get().wrapping_add(1);
+        self.looks.set(n);
+        if n % LOOK_EVERY != 0 {
+            return false;
+        }
         // A hint: the woken consumer reads the ring properly.
         let dir = self.dir();
         dir.tail.0.load(Ordering::Relaxed) != self.pos
@@ -253,22 +271,26 @@ impl runtime::SpinProbe for RingProbe {
     }
     fn arm(&self) {
         // From now on the producer wakes the consumer through the eventfd.
-        // The woken consumer looks at the ring again before it sleeps.
-        let _ = self.dir().consumer_sleeping.0.compare_exchange(
-            SPINNING,
-            ASLEEP,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        // The woken consumer looks at the ring again (after its own
+        // sequentially consistent store of ASLEEP) before it sleeps. The
+        // probe is only registered while its consumer waits on this
+        // worker's thread, so nothing races with this store here.
+        self.dir()
+            .consumer_sleeping
+            .0
+            .store(ASLEEP, Ordering::SeqCst);
+        self.armed.set(true);
     }
 }
 
 /// Takes a probe that has not fired off the worker when the consumer stops
 /// waiting for it: woken for another reason, or its `recv` was cancelled
-/// (then the producer is told the consumer is awake again).
+/// after the worker armed it (then the producer is told the consumer is
+/// awake again).
 struct ProbeGuard<'a> {
     id: Option<u64>,
     flag: &'a AtomicU32,
+    armed: &'a Cell<bool>,
     finished: bool,
 }
 
@@ -277,10 +299,8 @@ impl Drop for ProbeGuard<'_> {
         if let Some(id) = self.id {
             runtime::try_with_worker(|w| w.remove_probe(id));
         }
-        if !self.finished {
-            let _ = self
-                .flag
-                .compare_exchange(SPINNING, AWAKE, Ordering::SeqCst, Ordering::SeqCst);
+        if !self.finished && self.armed.get() {
+            self.flag.store(AWAKE, Ordering::SeqCst);
         }
     }
 }
@@ -363,9 +383,61 @@ async fn sleep(efd: RawFd, watch: &mut Watch) -> io::Result<()> {
 pub struct Sender {
     ring: Ring,
     wait: usize,
-    wake: usize,
     watch: Watch,
+    /// What has been written and not yet published.
+    pending: Rc<Pending>,
+    /// Unpublished bytes after which `send` publishes at once.
+    publish_at: u64,
     shared: Rc<Shared>,
+}
+
+/// The producer's `tail`, published once per turn of the worker (see
+/// [`runtime::Publish`]) or when much is waiting, rather than after every
+/// message: the consumer polls that line, and a store to it per message
+/// takes it back from the consumer's core each time.
+struct Pending {
+    dir: *const Dir,
+    /// The position up to which records are written.
+    tail: Cell<u64>,
+    /// The position last stored to `tail`.
+    published: Cell<u64>,
+    /// In the worker's list for the end of the turn.
+    queued: Cell<bool>,
+    wake: usize,
+    /// Keeps the mapping `dir` points into, and the eventfds, alive.
+    shared: Rc<Shared>,
+}
+
+impl Pending {
+    fn dir(&self) -> &Dir {
+        // SAFETY: inside the mapping `shared` keeps alive; all atomics.
+        unsafe { &*self.dir }
+    }
+
+    /// Makes every written record visible, and wakes a sleeping consumer.
+    fn flush(&self) {
+        let tail = self.tail.get();
+        if tail == self.published.get() {
+            return;
+        }
+        self.published.set(tail);
+        // Sequentially consistent, as is the look at `consumer_sleeping`
+        // that follows: with the consumer's store of that flag and its next
+        // look at `tail` (also sequentially consistent), one of the two
+        // sees the other, so a wake-up is never missed.
+        self.dir().tail.0.store(tail, Ordering::SeqCst);
+        wake_if_sleeping(
+            &self.dir().consumer_sleeping.0,
+            &self.shared.efds[self.wake],
+        );
+    }
+}
+
+impl runtime::Publish for Pending {
+    fn publish(&self) {
+        self.queued.set(false);
+        self.flush();
+    }
 }
 
 impl Sender {
@@ -376,6 +448,14 @@ impl Sender {
     }
 
     /// Copies `msg` into the channel. Waits while the channel is full.
+    ///
+    /// The receiver sees the message once this task gives the worker back
+    /// (it awaits something not ready, or returns), when this task waits in
+    /// [`Receiver::recv`], when a sixteenth of the capacity is waiting, or
+    /// when the `Sender` is dropped: a burst of messages is published with
+    /// one store to the memory the receiver polls. A task that sends and
+    /// then computes for long without awaiting holds the message back
+    /// until then.
     ///
     /// Fails with `GIONG-E0090` for a message longer than
     /// [`max_message`](Self::max_message), `GIONG-E0095` once the other
@@ -411,12 +491,18 @@ impl Sender {
                 return Err(peer_gone());
             }
             if self.ring.push(msg).map_err(corrupt)? == Push::Done {
-                wake_if_sleeping(
-                    &self.ring.dir().consumer_sleeping.0,
-                    &self.shared.efds[self.wake],
-                );
+                let pending = &self.pending;
+                pending.tail.set(self.ring.pos());
+                if self.ring.pos() - pending.published.get() >= self.publish_at {
+                    pending.flush();
+                } else if !pending.queued.replace(true) {
+                    let p: Rc<dyn runtime::Publish> = pending.clone();
+                    runtime::with_worker(|w| w.defer_publish(p));
+                }
                 return Ok(());
             }
+            // Full: the consumer must see everything before it can make room.
+            self.pending.flush();
             self.ring
                 .dir()
                 .producer_sleeping
@@ -446,12 +532,13 @@ impl Sender {
 
 impl Drop for Sender {
     fn drop(&mut self) {
+        self.pending.flush();
         self.ring
             .dir()
             .flags
             .0
             .fetch_or(PRODUCER_CLOSED, Ordering::AcqRel);
-        wake(&self.shared.efds[self.wake]);
+        wake(&self.shared.efds[self.pending.wake]);
     }
 }
 
@@ -502,6 +589,9 @@ impl Receiver {
                 }
                 return if closed { Ok(None) } else { Err(peer_gone()) };
             }
+            // Messages this worker sent and still holds back go out first:
+            // the answer awaited here may depend on them.
+            runtime::with_worker(|w| w.publish_now());
             // A record is often a few hundred nanoseconds away when the
             // producer is streaming: look for it briefly before paying for
             // a wait (a probe, or a sleep in the kernel and a wake-up).
@@ -558,29 +648,26 @@ impl Receiver {
     /// stopped spinning and the producer now wakes through the eventfd
     /// (the flag is [`ASLEEP`]): wait in the kernel.
     async fn spin_wait(&mut self) -> bool {
-        self.ring
-            .dir()
-            .consumer_sleeping
-            .0
-            .store(SPINNING, Ordering::SeqCst);
         if self.ring.has_data()
             || self.ring.dir().flags.0.load(Ordering::Acquire) & PRODUCER_CLOSED != 0
         {
-            self.ring
-                .dir()
-                .consumer_sleeping
-                .0
-                .store(AWAKE, Ordering::Relaxed);
             return true;
         }
+        // The shared flag stays AWAKE while the worker spins, so the
+        // producer, which reads it after every message, keeps its copy of
+        // the line: the probe is what notices the next message.
+        let armed = Rc::new(Cell::new(false));
         let mut probe = Some(RingProbe {
             dir: self.ring.dir_ptr(),
             pos: self.ring.pos(),
+            armed: armed.clone(),
+            looks: Cell::new(0),
             _shared: self.shared.clone(),
         });
         let mut guard = ProbeGuard {
             id: None,
             flag: &self.ring.dir().consumer_sleeping.0,
+            armed: &armed,
             finished: false,
         };
         // Registers the probe with this task's waker, then waits for it.
@@ -595,12 +682,10 @@ impl Receiver {
         .await;
         guard.finished = true;
         drop(guard);
-        let flag = &self.ring.dir().consumer_sleeping.0;
-        // Still SPINNING: the probe saw work (or the task was woken for
-        // another reason); look again. ASLEEP: the worker armed the probe
-        // before blocking.
-        flag.compare_exchange(SPINNING, AWAKE, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        // Not armed: the probe saw work (or the task was woken for another
+        // reason); look again. Armed: the worker is about to block and the
+        // flag says ASLEEP: wait in the kernel.
+        !armed.get()
     }
 
     fn release(&mut self, total: u64) {
@@ -684,9 +769,17 @@ fn halves(shared: Shared, connector: bool) -> io::Result<(Sender, Receiver)> {
     };
     Ok((
         Sender {
+            pending: Rc::new(Pending {
+                dir: tx_ring.dir_ptr(),
+                tail: Cell::new(tx_ring.pos()),
+                published: Cell::new(tx_ring.pos()),
+                queued: Cell::new(false),
+                wake: tx_wake,
+                shared: shared.clone(),
+            }),
+            publish_at: (shared.capacity / 16) as u64,
             ring: tx_ring,
             wait: tx_wait,
-            wake: tx_wake,
             watch: tx_watch,
             shared: shared.clone(),
         },
