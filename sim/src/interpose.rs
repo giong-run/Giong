@@ -1597,6 +1597,14 @@ pub unsafe extern "C" fn clock_gettime(clk: libc::clockid_t, ts: *mut libc::time
     let Some((mut g, me)) = world::enter() else {
         return real();
     };
+    // Another thread's CPU-time clock (from `pthread_getcpuclockid`; dynamic
+    // clock ids are negative): not simulated, and the real one would let the
+    // host decide a run. Refused, as the kernel refuses the clock of a thread
+    // that has ended, so balanced listeners go by counts of tasks here.
+    if clk < 0 {
+        drop(g);
+        return libc_ret(-i64::from(libc::EINVAL)) as c_int;
+    }
     // A thread that only spins on the clock (watching a counter another
     // thread changes) gives the others a turn now and then.
     let wr = w(&mut g);
