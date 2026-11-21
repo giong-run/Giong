@@ -234,6 +234,15 @@ impl RuntimeShared {
             + awake
     }
 
+    /// [`score`](Self::score) without the term for being awake: the work
+    /// worker `i` has, whatever it is doing right now.
+    pub(crate) fn work(&self, i: usize) -> usize {
+        let w = &self.workers[i];
+        w.load.tasks.load(Ordering::Relaxed)
+            + w.load.queued.load(Ordering::Relaxed)
+            + w.load.incoming.load(Ordering::Relaxed)
+    }
+
     /// Counts work about to be sent to `worker` from any thread, before it
     /// is visible to the worker, so that the next choice in the same burst
     /// takes it into account. The worker calls [`received`](Self::received)
