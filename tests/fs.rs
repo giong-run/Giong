@@ -1449,7 +1449,14 @@ fn a_pipe_message_longer_than_the_buffer_is_read_in_parts() {
         use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_MESSAGE};
         let (server, name) = named_pipe("message", true);
         giong::block_on(async move {
-            let file = File::open(&name).await.unwrap();
+            // Changing the read mode needs write access to the pipe's
+            // attributes, which a read-only open does not have.
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&name)
+                .await
+                .unwrap();
             let mode = PIPE_READMODE_MESSAGE;
             // SAFETY: the client end, open; the mode is a local.
             let ok = unsafe {
