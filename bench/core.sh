@@ -34,6 +34,9 @@ for round in $(seq "$ROUNDS"); do
                 case "$r" in monoio | glommio | compio) continue ;; esac
             fi
             $PIN target/release/bench-core "$r" "$w" >>"$OUT/raw.csv"
+            # macOS: let the connections' ports leave TIME_WAIT (30 s), so
+            # the next run does not run out of them (see CONNECTS).
+            if [ "$w" = connect ] && [ "$(uname)" = Darwin ]; then sleep 31; fi
         done
     done
     echo "round $round done" >&2
