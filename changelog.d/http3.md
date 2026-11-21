@@ -15,5 +15,5 @@
   and a client that follows `Alt-Svc`, sends 0-RTT only for requests that are safe to replay,
   and falls back to the next address when one does not answer. Trailer fields travel both
   ways as over HTTP/2; a streamed request body goes over HTTP/1.1 or HTTP/2, and is refused
-  by a client with `http3_prior_knowledge`
+  by a client with `http3_prior_knowledge`; `Client::preconnect` opens the QUIC connection
   ([#172](https://github.com/giong-run/Giong/pull/172)).

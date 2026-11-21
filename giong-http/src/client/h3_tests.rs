@@ -390,6 +390,20 @@ fn a_streamed_request_body_is_refused_with_prior_knowledge() {
     });
 }
 
+#[test]
+fn preconnect_opens_the_quic_connection_requests_then_use() {
+    run(|| async {
+        let (url, client) = served();
+        assert_eq!(client.preconnect(&url).await.unwrap(), Version::Http3);
+        // Again: the connection is there.
+        assert_eq!(client.preconnect(&url).await.unwrap(), Version::Http3);
+        let res = client.get(&format!("{url}/")).send().await.unwrap();
+        assert_eq!(res.version(), Version::Http3);
+        // One connection for both, and nothing tried over TCP.
+        assert_eq!(PEERS.with(|p| p.borrow().len()), 1);
+    });
+}
+
 /// What a scripted server sends first: its control stream with SETTINGS.
 async fn control(conn: &Connection) -> SendStream {
     let mut control = conn.open_uni().await.unwrap();
