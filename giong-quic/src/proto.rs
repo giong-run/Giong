@@ -514,10 +514,20 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
         for s in sends {
             let sh = sh.clone();
             giong::spawn(async move {
-                let (_, mut v) = sh
+                let (sent, mut v) = sh
                     .sock
                     .send_segments_to(s.data, s.to, s.segment, s.ecn)
                     .await;
+                if s.segment > 0 && s.segment < v.len() && gso_refused(&sent) {
+                    // The route refuses segmentation offload (no checksum
+                    // offload on a tun, VPN or veth device): one datagram
+                    // per send from now on, and this batch again so.
+                    sh.st.borrow_mut().segments = 1;
+                    for one in v.chunks(s.segment) {
+                        let _ = sh.sock.send_segments_to(one.to_vec(), s.to, 0, s.ecn).await;
+                    }
+                }
+                // Other send errors are losses, which QUIC recovers from.
                 v.clear();
                 sh.st.borrow_mut().spare.push(v);
             });
@@ -1146,6 +1156,15 @@ impl quinn_proto::congestion::Controller for ClosableController {
     }
 }
 
+/// Whether a send failed because the route refuses `UDP_SEGMENT`: Linux
+/// answers `EIO` where the device has no checksum offload, `EINVAL` where
+/// the segments do not fit it.
+fn gso_refused(sent: &io::Result<usize>) -> bool {
+    const EIO: i32 = 5;
+    const EINVAL: i32 = 22;
+    matches!(sent, Err(e) if matches!(e.raw_os_error(), Some(EIO | EINVAL)))
+}
+
 /// Where the last long-header Handshake packet of a datagram ends, when
 /// short-header (1-RTT) packets follow it (RFC 9000, sections 12.2 and
 /// 17.2). `None` when there is no such boundary or the datagram cannot be
@@ -1212,6 +1231,16 @@ mod tests {
         p.extend_from_slice(&[0x40 | (payload >> 8) as u8, payload as u8]);
         p.extend(std::iter::repeat(0).take(payload));
         p
+    }
+
+    #[test]
+    fn a_refused_segmentation_offload_is_told_from_other_errors() {
+        use std::io::{Error, ErrorKind};
+        assert!(super::gso_refused(&Err(Error::from_raw_os_error(5))));
+        assert!(super::gso_refused(&Err(Error::from_raw_os_error(22))));
+        assert!(!super::gso_refused(&Err(Error::from_raw_os_error(11))));
+        assert!(!super::gso_refused(&Err(Error::from(ErrorKind::Other))));
+        assert!(!super::gso_refused(&Ok(1200)));
     }
 
     #[test]
