@@ -8,9 +8,9 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` and `scripts/check.sh test` pass
+- [ ] `scripts/preflight.sh` passes (the gate, not `--quick`), and so does `scripts/check.sh test` when Rust changed
 - [ ] New behaviour has tests, including what happens when an operation is dropped mid-flight
 - [ ] Every new `unsafe` block has a `// SAFETY:` comment, and `scripts/valgrind.sh` and `scripts/check.sh tsan` are clean
 - [ ] Performance claims come with before/after numbers and the method
-- [ ] `CHANGELOG.md` has an entry under "Unreleased" for user-visible changes
+- [ ] User-visible changes have an entry in a new file in `changelog.d/` (see its README)
 - [ ] The pull request title follows the commit convention in `CONTRIBUTING.md`
