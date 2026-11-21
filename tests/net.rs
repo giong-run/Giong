@@ -140,9 +140,21 @@ fn no_other_socket_can_bind_over_a_live_listener_or_udp_socket() {
         ] {
             let other = socket2::Socket::new(socket2::Domain::IPV4, kind, None).unwrap();
             other.set_reuse_address(true).unwrap();
-            let err = other
-                .bind(&addr.into())
-                .expect_err("bound over a live socket");
+            let err = match other.bind(&addr.into()) {
+                Err(err) => err,
+                // Linux 6.0.16 to 6.0.19 report success for a TCP bind to a
+                // busy address and leave the socket unbound (see
+                // `binding_a_busy_address_fails_and_says_so`): not bound
+                // over the live socket either.
+                Ok(()) => {
+                    let at = other.local_addr().unwrap().as_socket();
+                    assert!(
+                        at.map_or(true, |a| a.port() == 0),
+                        "{kind:?}: bound over a live socket, at {at:?}"
+                    );
+                    continue;
+                }
+            };
             // Windows says "access denied" to a socket that asked to share.
             let refused = [std::io::ErrorKind::AddrInUse]
                 .into_iter()
