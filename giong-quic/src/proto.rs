@@ -177,6 +177,29 @@ impl Conn {
     }
 }
 
+/// Gives a server connection to `accept`, or closes it when the endpoint is
+/// closed and no one will accept it.
+fn hand_over(
+    conn: &mut Conn,
+    i: usize,
+    closed: bool,
+    accepted: &mut VecDeque<usize>,
+    accept_waker: &mut Option<Waker>,
+    now: Instant,
+) {
+    if closed {
+        conn.c.close(now, 0u32.into(), Bytes::new());
+        conn.closing.store(true, Ordering::Relaxed);
+        return;
+    }
+    conn.handed = true;
+    conn.refs += 1;
+    accepted.push_back(i);
+    if let Some(w) = accept_waker.take() {
+        w.wake();
+    }
+}
+
 fn wake_all(w: &mut Vec<Waker>) {
     for w in w.drain(..) {
         w.wake();
@@ -403,22 +426,26 @@ impl State {
                         // the connection now, to answer what came in 0-RTT.
                         // Without 0-RTT keys it waits for the handshake,
                         // so that a forged Initial never reaches it.
-                        conn.handed = true;
-                        conn.refs += 1;
-                        self.accepted.push_back(i);
-                        if let Some(w) = self.accept_waker.take() {
-                            w.wake();
-                        }
+                        hand_over(
+                            conn,
+                            i,
+                            self.closed,
+                            &mut self.accepted,
+                            &mut self.accept_waker,
+                            now,
+                        );
                     }
                     Event::Connected => {
                         conn.connected = true;
                         if conn.incoming && !conn.handed {
-                            conn.handed = true;
-                            conn.refs += 1;
-                            self.accepted.push_back(i);
-                            if let Some(w) = self.accept_waker.take() {
-                                w.wake();
-                            }
+                            hand_over(
+                                conn,
+                                i,
+                                self.closed,
+                                &mut self.accepted,
+                                &mut self.accept_waker,
+                                now,
+                            );
                         }
                         if !conn.incoming && conn.early && !conn.c.accepted_0rtt() {
                             // The server refused the early data: what was
@@ -726,6 +753,19 @@ impl Shared {
     pub(crate) fn close(&self) {
         let mut st = self.st.borrow_mut();
         st.closed = true;
+        // Connections no one will accept now are closed, instead of being
+        // held until their peers time out.
+        let now = Instant::now();
+        while let Some(h) = st.accepted.pop_front() {
+            st.unaccepted -= 1;
+            let c = st.conn(h);
+            c.refs -= 1;
+            if c.lost.is_none() {
+                c.c.close(now, 0u32.into(), Bytes::new());
+                c.closing.store(true, Ordering::Relaxed);
+            }
+            st.mark(h);
+        }
         if let Some(w) = st.accept_waker.take() {
             w.wake();
         }

@@ -733,3 +733,30 @@ fn a_flood_of_forged_initials_does_not_lock_real_clients_out() {
         })
         .unwrap();
 }
+
+#[test]
+fn connections_not_accepted_are_closed_with_their_endpoint() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            // Connected, and waiting for an accept that never comes.
+            let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
+            drop(server);
+            // The idle timeout is 30 s: an end within 3 s is the close.
+            let ended = giong::time::timeout(Duration::from_secs(3), conn.accept_uni())
+                .await
+                .expect("the connection outlived its endpoint");
+            let e = ended.err().unwrap().to_string();
+            assert!(e.contains("closed by peer"), "{e}");
+        })
+        .unwrap();
+}
