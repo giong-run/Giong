@@ -1177,13 +1177,15 @@ impl Client {
             };
             let opening = H3Opening { pool, origin, gate };
             // Boxed for the reason `checkout` boxes `Conn::open`.
+            let started = Instant::now();
             let opened = Box::pin(self.h3_open(quic, origin, port, connect_timeout)).await;
             // With a ticket, a connection opens without a packet from the
             // server (0-RTT). An origin's advertised alternative is used
-            // only once the server has answered, so that a network that
-            // blocks UDP sends the requests over TCP at once rather than
-            // after their timeout. With prior knowledge there is no TCP to
-            // go to, and 0-RTT is kept.
+            // only once the server has answered, within the same connect
+            // timeout, so that a network that blocks UDP sends the
+            // requests over TCP at once rather than after their timeout.
+            // With prior knowledge there is no TCP to go to, and 0-RTT is
+            // kept.
             let prior_knowledge = self
                 .shared
                 .config
@@ -1192,9 +1194,17 @@ impl Client {
                 .is_some_and(|http3| http3.prior_knowledge);
             let opened = match opened {
                 Ok(conn) if !prior_knowledge => {
-                    match giong::time::timeout(connect_timeout, conn.handshake()).await {
+                    let left = connect_timeout.saturating_sub(started.elapsed());
+                    match giong::time::timeout(left, conn.handshake()).await {
                         Ok(()) if conn.is_open() => Ok(conn),
-                        _ => Err(Error::new(
+                        Ok(()) => Err(Error::new(
+                            ErrorKind::Connect,
+                            format!(
+                                "the HTTP/3 handshake with {origin} (UDP port {port}) failed; \
+                                 the request goes over TCP"
+                            ),
+                        )),
+                        Err(_) => Err(Error::new(
                             ErrorKind::Timeout,
                             format!(
                                 "no answer from {origin} over HTTP/3 (UDP port {port}) within \
@@ -1235,8 +1245,6 @@ impl Client {
         port: u16,
         connect_timeout: Duration,
     ) -> Result<h3::Connection, Error> {
-        let config = &self.shared.config;
-        let pool = &self.shared.h3;
         let failed = |e: io::Error| {
             Error::io(
                 ErrorKind::Connect,
@@ -1251,48 +1259,9 @@ impl Client {
             let addrs = giong::net::lookup_host((origin.host.as_str(), port))
                 .await
                 .map_err(failed)?;
-            // Nothing answers a QUIC packet sent to an address that does
-            // not listen, so each address gets its share of the time and
-            // the next one is tried when it has passed.
-            let share = connect_timeout / addrs.len().max(1) as u32;
-            let mut last = None;
-            for addr in addrs {
-                let (slot, any) = if addr.is_ipv4() {
-                    (&pool.v4, "0.0.0.0:0")
-                } else {
-                    (&pool.v6, "[::]:0")
-                };
-                let endpoint = match slot.get() {
-                    Some(endpoint) => endpoint,
-                    None => {
-                        let any = any.parse().expect("a literal address");
-                        match giong_quic::Endpoint::client(any) {
-                            Ok(endpoint) => slot.get_or_init(|| endpoint),
-                            Err(e) => {
-                                last = Some(e);
-                                continue;
-                            }
-                        }
-                    }
-                };
-                let made = async {
-                    let conn = endpoint.connect_early(addr, &origin.host, quic).await?;
-                    h3::Connection::start(conn, config.max_head_size).await
-                };
-                match giong::time::timeout(share, made).await {
-                    Ok(Ok(conn)) => return Ok(conn),
-                    Ok(Err(e)) => last = Some(e),
-                    Err(_) => {
-                        last = Some(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("no answer from {addr} within {share:?}"),
-                        ));
-                    }
-                }
-            }
-            Err(failed(last.unwrap_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "the host name has no address")
-            })))
+            self.h3_open_any(quic, origin, &addrs, connect_timeout)
+                .await
+                .map_err(failed)
         };
         match giong::time::timeout(connect_timeout, connect).await {
             Ok(result) => result,
@@ -1305,6 +1274,76 @@ impl Client {
                 ),
             )),
         }
+    }
+
+    /// Connects to the first of `addrs` that answers, each in its turn.
+    #[cfg(feature = "unstable-http3")]
+    async fn h3_open_any(
+        &self,
+        quic: &giong_quic::ClientConfig,
+        origin: &url::Origin,
+        addrs: &[std::net::SocketAddr],
+        connect_timeout: Duration,
+    ) -> io::Result<h3::Connection> {
+        let config = &self.shared.config;
+        let pool = &self.shared.h3;
+        // Nothing answers a QUIC packet sent to an address that does not
+        // listen, so each address gets its share of the time and the next
+        // one is tried when it has passed.
+        let share = connect_timeout / addrs.len().max(1) as u32;
+        let mut last = None;
+        for &addr in addrs {
+            let (slot, any) = if addr.is_ipv4() {
+                (&pool.v4, "0.0.0.0:0")
+            } else {
+                (&pool.v6, "[::]:0")
+            };
+            let endpoint = match slot.get() {
+                Some(endpoint) => endpoint,
+                None => {
+                    let any = any.parse().expect("a literal address");
+                    match giong_quic::Endpoint::client(any) {
+                        Ok(endpoint) => slot.get_or_init(|| endpoint),
+                        Err(e) => {
+                            last = Some(e);
+                            continue;
+                        }
+                    }
+                }
+            };
+            let made = async {
+                let conn = endpoint.connect_early(addr, &origin.host, quic).await?;
+                let conn = h3::Connection::start(conn, config.max_head_size).await?;
+                // With a ticket the connection opens before any packet
+                // comes back. When there are other addresses to try, this
+                // one counts only once it has answered, or a dead first
+                // address (an unreachable IPv6 one before a working IPv4
+                // one, say) would be the only one ever tried.
+                if addrs.len() > 1 {
+                    conn.handshake().await;
+                    if !conn.is_open() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            format!("the handshake with {addr} failed"),
+                        ));
+                    }
+                }
+                Ok(conn)
+            };
+            match giong::time::timeout(share, made).await {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => {
+                    last = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("no answer from {addr} within {share:?}"),
+                    ));
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "the host name has no address")
+        }))
     }
 
     /// The UDP port `origin` advertised HTTP/3 on, while that holds and the

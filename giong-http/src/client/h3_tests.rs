@@ -1180,3 +1180,48 @@ fn a_hostile_server_made_of_fuzz_data_neither_hangs_nor_fools_the_client() {
         assert!(failed > 50, "{answered} answered, {failed} failed");
     });
 }
+
+/// With prior knowledge and a ticket, a connection opens before any packet
+/// comes back: a host whose first address does not answer still gets its
+/// next one tried.
+#[test]
+fn a_dead_first_address_does_not_hide_the_next_one_with_a_ticket() {
+    run(|| async {
+        let (server_tls, client_tls) = tls();
+        let endpoint = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerConfig::new(server_tls).unwrap().early_data(true),
+        )
+        .unwrap();
+        let addr: SocketAddr = endpoint.local_addr().unwrap();
+        drop(giong::spawn(async move {
+            Server::new().serve_h3(endpoint, App).await
+        }));
+        let client = Client::builder()
+            .http3_prior_knowledge(ClientConfig::new(client_tls).unwrap().early_data(true))
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(10))
+            .build();
+        let url = format!("https://{addr}");
+        // A first request leaves a ticket behind.
+        let res = client.get(&format!("{url}/")).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        giong::time::sleep(Duration::from_millis(100)).await;
+        // An address where nothing answers, listed first.
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addrs = [dead.local_addr().unwrap(), addr];
+        let quic = client.shared.config.http3.as_ref().unwrap().quic.clone();
+        let origin = super::url::Url::parse(&url).unwrap().origin();
+        let conn = giong::time::timeout(
+            Duration::from_secs(3),
+            client.h3_open_any(&quic, &origin, &addrs, Duration::from_secs(2)),
+        )
+        .await
+        .expect("the addresses took too long")
+        .expect("no address answered");
+        giong::time::timeout(Duration::from_secs(1), conn.handshake())
+            .await
+            .expect("the connection is to the address that does not answer");
+        assert!(conn.is_open());
+    });
+}
