@@ -78,9 +78,16 @@
 #![warn(missing_docs)]
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
+// Windows uses less of the shared code than Unix does: it has no Unix
+// sockets yet, and its files do not go through the path operations of the
+// driver.
+#![cfg_attr(windows, allow(dead_code))]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("giong only supports Linux: it is built on io_uring and epoll");
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!(
+    "giong supports Linux (io_uring and epoll), Windows (completion ports) and, as a development \
+     platform, macOS (kqueue)"
+);
 
 mod buf;
 mod driver;
@@ -90,8 +97,13 @@ mod notify;
 mod op;
 mod runtime;
 mod slab;
+mod sys;
 
 pub mod error;
+#[cfg(unix)]
+pub mod fs;
+#[cfg(windows)]
+#[path = "fs/windows.rs"]
 pub mod fs;
 pub mod net;
 pub mod observe;

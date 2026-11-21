@@ -1,4 +1,5 @@
-//! The blocking threads of the epoll driver.
+//! The blocking threads of the epoll driver, and of the Windows driver for
+//! the file operations Windows has no overlapped form of.
 //!
 //! A regular file is always "ready" as far as epoll is concerned, so a read
 //! that has to wait for the disk would hold up the whole worker. The epoll
@@ -13,10 +14,12 @@
 //! the worker's eventfd.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::Arc;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -25,7 +28,7 @@ use crate::runtime::lock;
 /// The most blocking threads at once. Enough for disks that serve many
 /// requests in parallel (NVMe), and a bound on what a hung network
 /// filesystem can tie up.
-const MAX_THREADS: usize = 64;
+pub(super) const MAX_THREADS: usize = 64;
 
 /// How long a thread waits for work before it ends.
 const IDLE: Duration = Duration::from_secs(10);
@@ -117,48 +120,37 @@ fn work(pool: &'static Pool) {
 }
 
 /// Results of one worker's blocking jobs, waiting for the worker.
+#[cfg(unix)]
 pub(super) struct Completions {
     done: Mutex<Vec<(usize, i32)>>,
     /// Set while `done` is not empty, so the worker can check without the
     /// lock.
     any: AtomicBool,
-    /// Poked after a push; the worker watches it with epoll.
-    eventfd: OwnedFd,
+    /// Rung after a push; the worker watches it for readability.
+    bell: crate::sys::Bell,
 }
 
+#[cfg(unix)]
 impl Completions {
     pub(super) fn new() -> io::Result<Arc<Self>> {
-        // SAFETY: plain syscall; the result is checked.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let bell = crate::sys::Bell::new()?;
         Ok(Arc::new(Self {
             done: Mutex::new(Vec::new()),
             any: AtomicBool::new(false),
-            // SAFETY: a fresh descriptor we own.
-            eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            bell,
         }))
     }
 
     pub(super) fn fd(&self) -> i32 {
-        self.eventfd.as_raw_fd()
+        self.bell.read_fd()
     }
 
     /// Called on a blocking thread when the job for `key` is done.
     pub(super) fn push(&self, key: usize, res: i32) {
         lock(&self.done).push((key, res));
         self.any.store(true, Ordering::Release);
-        let one: u64 = 1;
-        // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own (the
-        // `Arc` keeps it open while any job can still call this).
-        unsafe {
-            libc::write(
-                self.eventfd.as_raw_fd(),
-                &one as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
+        // The `Arc` keeps the bell open while any job can still call this.
+        self.bell.ring();
     }
 
     /// `true` if results are waiting; no lock, no system call.
@@ -166,18 +158,9 @@ impl Completions {
         self.any.load(Ordering::Acquire)
     }
 
-    /// Takes the waiting results, and resets the eventfd.
+    /// Takes the waiting results, and resets the bell.
     pub(super) fn take(&self, into: &mut Vec<(usize, i32)>) {
-        let mut count: u64 = 0;
-        // SAFETY: reads 8 bytes into a valid u64; the eventfd is
-        // non-blocking, so an empty one returns EAGAIN at once.
-        unsafe {
-            libc::read(
-                self.eventfd.as_raw_fd(),
-                &mut count as *mut u64 as *mut libc::c_void,
-                8,
-            );
-        }
+        self.bell.drain();
         let mut done = lock(&self.done);
         self.any.store(false, Ordering::Relaxed);
         into.append(&mut done);

@@ -1,5 +1,8 @@
 //! The thread-per-core runtime: workers, cross-thread wake-ups, shutdown.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
@@ -417,6 +420,7 @@ fn a_panicking_worker_stops_the_runtime_and_propagates() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_triggers_a_graceful_shutdown() {
@@ -465,6 +469,7 @@ fn sigterm_triggers_a_graceful_shutdown() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_still_works_after_worker_0_returned() {
@@ -539,90 +544,100 @@ fn sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down() {
     // block it, often one the runtime knows nothing about. Its handler must
     // still find the runtime's eventfd, and (under ThreadSanitizer) do so
     // without a data race with the runtime that created it.
-    if std::env::var_os("GIONG_SIGNAL_CHILD_OTHER").is_some() {
-        use std::sync::atomic::AtomicBool;
-        static DONE: AtomicBool = AtomicBool::new(false);
-        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-        // Started before the runtime, so nothing orders it after the
-        // runtime's set-up but the handler's own load.
-        let bystander = std::thread::spawn(move || {
-            // SAFETY: gettid has no preconditions.
-            tid_tx.send(unsafe { libc::gettid() }).unwrap();
-            while !DONE.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        });
-        let tid = tid_rx.recv().unwrap();
-        giong::Builder::new()
-            .workers(2)
-            .shutdown_on_signals(true)
-            .build()
-            .unwrap()
-            .run(move |index| async move {
-                if index == 0 {
-                    println!("ready {tid}");
+    //
+    // Linux only: sending a signal to one thread of another process needs
+    // tgkill, which macOS does not have (there a process-wide signal is
+    // what the other SIGTERM tests send). The test is kept by name on every
+    // system, as the suite's index expects.
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("skipped: no tgkill on this system");
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("GIONG_SIGNAL_CHILD_OTHER").is_some() {
+            use std::sync::atomic::AtomicBool;
+            static DONE: AtomicBool = AtomicBool::new(false);
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            // Started before the runtime, so nothing orders it after the
+            // runtime's set-up but the handler's own load.
+            let bystander = std::thread::spawn(move || {
+                // SAFETY: gettid has no preconditions.
+                tid_tx.send(unsafe { libc::gettid() }).unwrap();
+                while !DONE.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
-                giong::shutdown_signal().await;
-            })
+            });
+            let tid = tid_rx.recv().unwrap();
+            giong::Builder::new()
+                .workers(2)
+                .shutdown_on_signals(true)
+                .build()
+                .unwrap()
+                .run(move |index| async move {
+                    if index == 0 {
+                        println!("ready {tid}");
+                    }
+                    giong::shutdown_signal().await;
+                })
+                .unwrap();
+            DONE.store(true, Ordering::SeqCst);
+            bystander.join().unwrap();
+            println!("clean exit");
+            return;
+        }
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe().unwrap();
+        let mut child = Command::new(exe)
+            .args([
+                "--exact",
+                "sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GIONG_SIGNAL_CHILD_OTHER", "1")
+            .stdout(Stdio::piped())
+            .spawn()
             .unwrap();
-        DONE.store(true, Ordering::SeqCst);
-        bystander.join().unwrap();
-        println!("clean exit");
-        return;
+        let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+        let tid: libc::pid_t = lines
+            .by_ref()
+            .find_map(|l| {
+                // libtest may print the test's name on the same line first.
+                let l = l.unwrap();
+                l.split_once("ready ")
+                    .map(|(_, t)| t.trim().parse().unwrap())
+            })
+            .expect("child never became ready");
+        // SAFETY: tgkill with the child's pid and one of its thread ids.
+        let sent = unsafe {
+            libc::syscall(
+                libc::SYS_tgkill,
+                child.id() as libc::pid_t,
+                tid,
+                libc::SIGTERM,
+            )
+        };
+        assert_eq!(sent, 0, "tgkill: {}", std::io::Error::last_os_error());
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
+        assert!(status.is_some(), "SIGTERM was ignored: {rest:?}");
+        assert!(status.unwrap().success(), "child output: {rest:?}");
+        assert!(
+            rest.iter().any(|l| l.contains("clean exit")),
+            "child output: {rest:?}"
+        );
     }
-    use std::io::BufRead;
-    use std::process::{Command, Stdio};
-    let exe = std::env::current_exe().unwrap();
-    let mut child = Command::new(exe)
-        .args([
-            "--exact",
-            "sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env("GIONG_SIGNAL_CHILD_OTHER", "1")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
-    let tid: libc::pid_t = lines
-        .by_ref()
-        .find_map(|l| {
-            // libtest may print the test's name on the same line first.
-            let l = l.unwrap();
-            l.split_once("ready ")
-                .map(|(_, t)| t.trim().parse().unwrap())
-        })
-        .expect("child never became ready");
-    // SAFETY: tgkill with the child's pid and one of its thread ids.
-    let sent = unsafe {
-        libc::syscall(
-            libc::SYS_tgkill,
-            child.id() as libc::pid_t,
-            tid,
-            libc::SIGTERM,
-        )
-    };
-    assert_eq!(sent, 0, "tgkill: {}", std::io::Error::last_os_error());
-    let start = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break Some(status);
-        }
-        if start.elapsed() > Duration::from_secs(20) {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
-    assert!(status.is_some(), "SIGTERM was ignored: {rest:?}");
-    assert!(status.unwrap().success(), "child output: {rest:?}");
-    assert!(
-        rest.iter().any(|l| l.contains("clean exit")),
-        "child output: {rest:?}"
-    );
 }
 
 #[test]

@@ -636,6 +636,11 @@ fn a_server_that_does_not_answer_hits_the_timeout() {
             .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
             .unwrap();
         let port = refusing.local_addr().unwrap().as_socket().unwrap().port();
+        // macOS drops a SYN to a socket that is bound but not listening
+        // (Linux answers with a reset), so there the port is given back: a
+        // closed port is refused.
+        #[cfg(target_os = "macos")]
+        drop(refusing);
         let e = client
             .get(&format!("http://127.0.0.1:{port}/"))
             .send()

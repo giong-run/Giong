@@ -98,9 +98,19 @@ fn send_now(fd: std::os::fd::RawFd, bufs: &[IoSlice<'_>]) -> Option<io::Result<u
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     // `IoSlice` is ABI compatible with `iovec`; `sendmsg` only reads them.
     msg.msg_iov = bufs.as_ptr() as *mut libc::iovec;
-    msg.msg_iovlen = bufs.len().min(libc::UIO_MAXIOV as usize) as _;
+    // The most slices one call takes (`UIO_MAXIOV`, `IOV_MAX`): 1024 on
+    // Linux and macOS.
+    const MAX_SLICES: usize = 1024;
+    // Off Linux the socket has `SO_NOSIGPIPE` instead of the flag, and is
+    // non-blocking itself (giong makes every stream so on macOS, where
+    // `MSG_DONTWAIT` does not keep a send from waiting).
+    #[cfg(target_os = "linux")]
+    const FLAGS: libc::c_int = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+    #[cfg(target_os = "macos")]
+    const FLAGS: libc::c_int = libc::MSG_DONTWAIT;
+    msg.msg_iovlen = bufs.len().min(MAX_SLICES) as _;
     // SAFETY: `msg` points at `bufs`, which outlive the call.
-    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+    let n = unsafe { libc::sendmsg(fd, &msg, FLAGS) };
     if n >= 0 {
         return Some(Ok(n as usize));
     }

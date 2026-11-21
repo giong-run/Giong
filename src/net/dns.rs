@@ -67,10 +67,36 @@ impl Default for ResolverConfig {
 impl ResolverConfig {
     /// Reads `/etc/resolv.conf` and `/etc/hosts`. A missing file counts as
     /// empty.
+    ///
+    /// On macOS `/etc/resolv.conf` is written by the system from its network
+    /// configuration, and holds the servers and search domains of the
+    /// primary resolver (the first one `scutil --dns` lists), so this follows
+    /// the network the machine is on. Resolvers that macOS uses for some
+    /// domains only (files in `/etc/resolver`, a VPN's own domains) are not
+    /// in that file and are not consulted.
+    /// On Windows, which has no `resolv.conf`, the name servers are those of
+    /// the network adapters that are up (the first three, in the order
+    /// Windows lists the adapters), the search domains are the machine's
+    /// primary DNS suffix and each adapter's own suffix, and the hosts file
+    /// is `%SystemRoot%\System32\drivers\etc\hosts`. IPv6 servers that are
+    /// site-local (`fec0::/10`, listed on adapters with no IPv6 server) or
+    /// link-local are left out. The other settings are the defaults.
     pub fn system() -> io::Result<Self> {
-        let resolv = read_optional("/etc/resolv.conf")?;
-        let hosts = read_optional("/etc/hosts")?;
-        Ok(Self::parse(&resolv, &hosts))
+        #[cfg(unix)]
+        {
+            let resolv = read_optional("/etc/resolv.conf")?;
+            let hosts = read_optional("/etc/hosts")?;
+            Ok(Self::parse(&resolv, &hosts))
+        }
+        #[cfg(windows)]
+        {
+            let (servers, search) = crate::sys::dns_config()?;
+            let hosts = read_optional(crate::sys::hosts_path())?;
+            Ok(Self::parse(
+                &adapters_as_resolv_conf(&servers, &search),
+                &hosts,
+            ))
+        }
     }
 
     /// Builds a configuration from the text of a `resolv.conf` and a `hosts`
@@ -216,7 +242,63 @@ fn is_loopback(ip: &IpAddr) -> bool {
     }
 }
 
-fn read_optional(path: &str) -> io::Result<String> {
+/// What Windows reports, written as a `resolv.conf`, so that it is read by
+/// the same rules.
+#[cfg(windows)]
+fn adapters_as_resolv_conf(servers: &[IpAddr], search: &[String]) -> String {
+    let mut text = String::new();
+    for server in servers {
+        text.push_str(&format!("nameserver {server}\n"));
+    }
+    if !search.is_empty() {
+        text.push_str(&format!("search {}\n", search.join(" ")));
+    }
+    text
+}
+
+/// Where the system's DNS servers are set, for the fixes of errors.
+#[cfg(unix)]
+macro_rules! servers_where {
+    () => {
+        "/etc/resolv.conf"
+    };
+}
+#[cfg(windows)]
+macro_rules! servers_where {
+    () => {
+        "the settings of the network adapter (`ipconfig /all` lists them)"
+    };
+}
+
+/// Where the system's hosts file is, for the fixes of errors.
+#[cfg(unix)]
+macro_rules! hosts_where {
+    () => {
+        "/etc/hosts"
+    };
+}
+#[cfg(windows)]
+macro_rules! hosts_where {
+    () => {
+        "the hosts file (%SystemRoot%\\System32\\drivers\\etc\\hosts)"
+    };
+}
+
+/// How to give a slow DNS server longer, for the fixes of errors.
+#[cfg(unix)]
+macro_rules! longer_where {
+    () => {
+        "options timeout:N and attempts:N there give it longer"
+    };
+}
+#[cfg(windows)]
+macro_rules! longer_where {
+    () => {
+        "ResolverConfig::timeout and ResolverConfig::attempts give it longer"
+    };
+}
+
+fn read_optional(path: impl AsRef<std::path::Path>) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
@@ -340,8 +422,13 @@ impl Resolver {
             raise(
                 Code::HostNotFound,
                 format!("no address found for {host}"),
-                "check the spelling of the name, /etc/hosts, and the DNS servers in \
-                 /etc/resolv.conf (in a container, the network it is attached to).",
+                concat!(
+                    "check the spelling of the name, ",
+                    hosts_where!(),
+                    ", and the DNS servers in ",
+                    servers_where!(),
+                    " (in a container, the network it is attached to)."
+                ),
             )
         }))
     }
@@ -426,8 +513,13 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
             Err(_) => Err(raise(
                 Code::DnsTimeout,
                 format!("DNS server {server} did not answer for {name} within {wait:?}"),
-                "check that the server in /etc/resolv.conf is reachable (firewall, VPN, \
-                 container network); options timeout:N and attempts:N there give it longer.",
+                concat!(
+                    "check that the server in ",
+                    servers_where!(),
+                    " is reachable (firewall, VPN, container network); ",
+                    longer_where!(),
+                    "."
+                ),
             )),
         }
     };
@@ -454,9 +546,12 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
                     crate::error::Error::new(
                         Code::DnsServerUnreachable,
                         format!("cannot reach DNS server {server} to look up {name}: {e}"),
-                        "check that a DNS server runs at the address in /etc/resolv.conf (in a \
-                         container, the network it is attached to) and that a firewall lets \
-                         UDP and TCP port 53 through.",
+                        concat!(
+                            "check that a DNS server runs at the address in ",
+                            servers_where!(),
+                            " (in a container, the network it is attached to) and that a \
+                             firewall lets UDP and TCP port 53 through."
+                        ),
                     )
                     .with_source(e)
                     .into(),
@@ -588,9 +683,7 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 
 fn random_id() -> u16 {
     let mut id = [0u8; 2];
-    // SAFETY: getrandom writes at most `id.len()` bytes into `id`.
-    let n = unsafe { libc::getrandom(id.as_mut_ptr().cast(), id.len(), 0) };
-    if n != 2 {
+    if !crate::sys::random_bytes(&mut id) {
         // Not cryptographic, but never the same twice in a row.
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -662,8 +755,11 @@ fn malformed() -> io::Error {
     raise(
         Code::DnsBadResponse,
         "malformed DNS response",
-        "check the DNS server in /etc/resolv.conf; something between giong and it may be \
-         changing the packets.",
+        concat!(
+            "check the DNS server in ",
+            servers_where!(),
+            "; something between giong and it may be changing the packets."
+        ),
     )
 }
 
@@ -790,8 +886,12 @@ fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Ans
                 format!(
                     "the DNS answer for {name} has a chain of more than {MAX_CNAMES} CNAME records"
                 ),
-                "check the DNS server in /etc/resolv.conf and the records of the name; \
-                 resolvers stop following aliases long before this.",
+                concat!(
+                    "check the DNS server in ",
+                    servers_where!(),
+                    " and the records of the name; resolvers stop following aliases long \
+                     before this."
+                ),
             ));
         }
         min_ttl = min_ttl.min(*ttl);
@@ -836,31 +936,80 @@ thread_local! {
 struct SystemResolver {
     resolver: Resolver,
     checked: Instant,
-    stamps: [Option<SystemTime>; 2],
+    stamps: Stamps,
 }
 
-fn file_stamps() -> [Option<SystemTime>; 2] {
+/// What the system configuration was read from, to tell when it changed.
+#[cfg(unix)]
+type Stamps = [Option<SystemTime>; 2];
+/// The hosts file's time, and what the adapters report: Windows keeps the
+/// rest in no file.
+#[cfg(windows)]
+type Stamps = (Option<SystemTime>, Option<(Vec<IpAddr>, Vec<String>)>);
+
+#[cfg(unix)]
+fn file_stamps() -> Stamps {
     ["/etc/resolv.conf", "/etc/hosts"].map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+#[cfg(windows)]
+fn file_stamps() -> Stamps {
+    let hosts = std::fs::metadata(crate::sys::hosts_path())
+        .and_then(|m| m.modified())
+        .ok();
+    (hosts, crate::sys::dns_config().ok())
+}
+
+/// The system configuration, read again.
+#[cfg(unix)]
+fn system_config(_stamps: &Stamps) -> io::Result<ResolverConfig> {
+    ResolverConfig::system()
+}
+
+/// The system configuration, with what the adapters reported for `stamps`.
+#[cfg(windows)]
+fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
+    match &stamps.1 {
+        Some((servers, search)) => {
+            let hosts = read_optional(crate::sys::hosts_path())?;
+            Ok(ResolverConfig::parse(
+                &adapters_as_resolv_conf(servers, search),
+                &hosts,
+            ))
+        }
+        // Asked again, for the error.
+        None => ResolverConfig::system(),
+    }
+}
+
 /// The current thread's resolver for the system configuration, reloaded when
-/// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds).
+/// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds; on
+/// Windows, the hosts file and what the adapters report).
 pub(crate) fn system_resolver() -> io::Result<Resolver> {
     SYSTEM.with(|slot| {
         let mut slot = slot.borrow_mut();
         let now = Instant::now();
-        if let Some(sys) = slot.as_mut() {
+        if let Some(sys) = slot.as_ref() {
             if now.duration_since(sys.checked) < RELOAD_CHECK {
                 return Ok(sys.resolver.clone());
             }
+        }
+        // Read once per check: on Windows, asking the adapters is not
+        // cheap, and the stamps hold what they said.
+        let stamps = file_stamps();
+        if let Some(sys) = slot.as_mut() {
             sys.checked = now;
-            let stamps = file_stamps();
             if stamps == sys.stamps {
                 return Ok(sys.resolver.clone());
             }
+            // The adapters could not be asked this time: what they said
+            // last still holds, and they are asked again at the next check.
+            #[cfg(windows)]
+            if stamps.1.is_none() {
+                return Ok(sys.resolver.clone());
+            }
         }
-        let stamps = file_stamps();
-        let resolver = Resolver::new(ResolverConfig::system()?);
+        let resolver = Resolver::new(system_config(&stamps)?);
         *slot = Some(SystemResolver {
             resolver: resolver.clone(),
             checked: now,
@@ -1096,6 +1245,26 @@ mod tests {
         assert_eq!((nx.rcode, nx.addrs.len()), (RCODE_NXDOMAIN, 0));
         let tc = parse_response(&response(&q, 0, true, &[]), 3, "gone.example", TYPE_A).unwrap();
         assert!(tc.truncated);
+    }
+
+    #[test]
+    fn windows_takes_the_name_servers_of_its_adapters() {
+        // One test on every platform (the simulation's index is built from
+        // test names), with nothing to check off Windows.
+        #[cfg(windows)]
+        {
+            let (servers, search) = crate::sys::dns_config().unwrap();
+            assert!(!servers.is_empty(), "no adapter reports a DNS server");
+            let cfg = ResolverConfig::parse(&adapters_as_resolv_conf(&servers, &search), "");
+            let expected: Vec<SocketAddr> = servers
+                .iter()
+                .take(3)
+                .map(|&ip| SocketAddr::new(ip, 53))
+                .collect();
+            assert_eq!(cfg.nameservers, expected);
+            assert_eq!(cfg.search, search);
+            ResolverConfig::system().unwrap();
+        }
     }
 
     #[test]

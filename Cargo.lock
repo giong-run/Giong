@@ -285,6 +285,7 @@ dependencies = [
  "libc",
  "loom",
  "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -331,6 +332,7 @@ version = "1.0.0"
 dependencies = [
  "giong",
  "giong-http",
+ "libc",
  "serde_json",
 ]
 
