@@ -43,6 +43,15 @@ const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
+// The control messages are read and written with the 64-bit layout:
+// `cmsg_len` a `size_t` in the first eight bytes, and every message aligned
+// to eight. A target where that does not hold fails to build here rather
+// than misreading what the kernel hands over.
+#[cfg(feature = "unstable-udp-offload")]
+const _: () = assert!(
+    CMSG_HDR == 16 && mem::size_of::<usize>() == 8 && mem::align_of::<libc::cmsghdr>() == 8,
+    "unstable-udp-offload reads control messages with the 64-bit layout only"
+);
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_INT_SPACE: usize = (CMSG_HDR + 4 + 7) & !7;
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
