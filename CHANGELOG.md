@@ -10,6 +10,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [1.1.0] - 2026-11-21
 
+gRPC on giong: three new crates, giong-proto, giong-grpc-build and giong-grpc. Also HTTP
+trailers and streamed request bodies, a client that connects ahead of requests and pings
+idle HTTP/2 connections, batched PostgreSQL reads (off by default), faster large uploads,
+and a fix for an idle epoll worker spinning after a file operation. Nothing is removed or
+changed in meaning; upgrading from 1.0 needs no code changes.
+
 ### Added
 
 - **giong-http: trailer fields.** `Trailers` holds the fields sent after a body. A streamed
