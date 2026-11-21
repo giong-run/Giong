@@ -55,8 +55,9 @@ fi
 cargo build --release --workspace --all-features --example defaults
 
 # The tests that share ports between workers or bind them again at once,
-# the runtime's own tests, and giong-http's servers.
-pick() { grep -E "/deps/($1)-[0-9a-f]+$" "$list" || { echo "no test binary $1 in $list" >&2; exit 2; }; }
+# the runtime's own tests, and giong-http's servers. Any directory: CI's shared
+# release build keeps its test binaries outside target/release/deps.
+pick() { grep -E "/($1)-[0-9a-f]+$" "$list" || { echo "no test binary $1 in $list" >&2; exit 2; }; }
 tests="$(pick 'giong|balance|multi|proc_readers|udp|unix|shutdown|server|streaming')"
 
 docker run --rm --runtime=runsc -v "$PWD:$PWD" -w "$PWD" \
