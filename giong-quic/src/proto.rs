@@ -1097,9 +1097,7 @@ impl Shared {
         r.map_err(|e| match e {
             // The peer asked to stop sending: its code, as `write` gives it.
             quinn_proto::FinishError::Stopped(code) => error::reset(code.into_inner()),
-            quinn_proto::FinishError::ClosedStream => {
-                error::lost(&ConnectionError::LocallyClosed)
-            }
+            quinn_proto::FinishError::ClosedStream => error::lost(&ConnectionError::LocallyClosed),
         })
     }
 

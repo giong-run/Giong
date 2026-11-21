@@ -88,6 +88,10 @@ pub struct ServerConfig {
     pub(crate) transport: TransportConfig,
     pub(crate) early_data: bool,
     pub(crate) reset_key: [u8; 32],
+    /// The secret address validation tokens (Retry, NEW_TOKEN) are made
+    /// with: one for every endpoint built from this configuration, so that
+    /// a token one worker gave is good on another.
+    pub(crate) token_key: Arc<[u8; 64]>,
 }
 
 impl ServerConfig {
@@ -103,20 +107,23 @@ impl ServerConfig {
             ));
         }
         let mut reset_key = [0; 32];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut reset_key).map_err(
-            |_| {
+        let mut token_key = [0; 64];
+        let random = ring::rand::SystemRandom::new();
+        ring::rand::SecureRandom::fill(&random, &mut reset_key)
+            .and_then(|()| ring::rand::SecureRandom::fill(&random, &mut token_key))
+            .map_err(|_| {
                 error::config(
                     "the system's random number generator failed",
                     "check that /dev/urandom and the getrandom system call work in this \
                      environment.",
                 )
-            },
-        )?;
+            })?;
         let mut cfg = Self {
             tls: Arc::new(tls),
             transport: TransportConfig::default(),
             early_data: false,
             reset_key,
+            token_key: Arc::new(token_key),
         };
         cfg = cfg.early_data(false);
         cfg.to_proto()?;
@@ -179,7 +186,9 @@ impl ServerConfig {
             })?;
         // With the check of the ClientHello that rustls leaves open.
         let crypto = crate::crypto::ServerCrypto(Arc::new(crypto));
-        let mut cfg = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+        let token_key =
+            ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, &[]).extract(&*self.token_key);
+        let mut cfg = quinn_proto::ServerConfig::new(Arc::new(crypto), Arc::new(token_key));
         cfg.transport_config(Arc::new(self.transport.to_proto()?));
         Ok(cfg)
     }
@@ -191,6 +200,10 @@ impl ServerConfig {
 pub struct ClientConfig {
     pub(crate) tls: Arc<rustls::ClientConfig>,
     pub(crate) transport: TransportConfig,
+    /// Address validation tokens servers gave (NEW_TOKEN), kept across the
+    /// connections made with this configuration and its clones, so that a
+    /// returning client skips a Retry round trip.
+    pub(crate) tokens: Arc<quinn_proto::TokenMemoryCache>,
 }
 
 impl ClientConfig {
@@ -207,6 +220,7 @@ impl ClientConfig {
         let cfg = Self {
             tls: Arc::new(tls),
             transport: TransportConfig::default(),
+            tokens: Arc::default(),
         };
         cfg.to_proto()?;
         Ok(cfg)
@@ -240,6 +254,7 @@ impl ClientConfig {
             })?;
         let mut cfg = quinn_proto::ClientConfig::new(Arc::new(crypto));
         cfg.transport_config(Arc::new(self.transport.to_proto()?));
+        cfg.token_store(self.tokens.clone());
         Ok(cfg)
     }
 }
