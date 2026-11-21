@@ -323,6 +323,9 @@ pub(crate) fn read_dir_batch(
 ) -> io::Result<usize> {
     buf.clear();
     let cap = buf.capacity();
+    if let Some(errno) = state.failed.take() {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
     if state.dir.is_null() {
         // SAFETY: plain syscalls; `fdopendir` owns the duplicate on success.
         unsafe {
@@ -351,10 +354,15 @@ pub(crate) fn read_dir_batch(
                 };
                 if ent.is_null() {
                     let errno = io::Error::last_os_error();
-                    if errno.raw_os_error().unwrap_or(0) != 0 {
-                        return Err(errno);
+                    match errno.raw_os_error().unwrap_or(0) {
+                        0 => return Ok(buf.len()),
+                        // The entries read so far first, then the error.
+                        e if !buf.is_empty() => {
+                            state.failed = Some(e);
+                            return Ok(buf.len());
+                        }
+                        _ => return Err(errno),
                     }
-                    return Ok(buf.len());
                 }
                 // SAFETY: readdir returned a valid entry, valid until the
                 // next call; the name is copied out at once.
@@ -392,6 +400,9 @@ pub(crate) fn read_dir_batch(
 pub(crate) struct DirState {
     dir: *mut libc::DIR,
     pending: Option<(u64, u8, Vec<u8>)>,
+    /// An error `readdir` gave after entries of the same batch, for the
+    /// next call.
+    failed: Option<i32>,
 }
 
 impl Default for DirState {
@@ -399,6 +410,7 @@ impl Default for DirState {
         Self {
             dir: std::ptr::null_mut(),
             pending: None,
+            failed: None,
         }
     }
 }
@@ -442,9 +454,10 @@ std::thread_local! {
     static SEND_ERROR: std::cell::Cell<(RawFd, i32)> = const { std::cell::Cell::new((-1, 0)) };
 }
 
-/// Whether `errno` only says that there was nothing (more) to do.
+/// Whether `errno` says nothing about the socket: there was nothing (more)
+/// to do, or a signal came. A batch stops there and keeps no error.
 fn would_block(errno: i32) -> bool {
-    errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
+    errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR
 }
 
 /// Receives up to `count` datagrams, one `recvmsg` each (macOS has no
