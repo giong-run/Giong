@@ -87,6 +87,15 @@ while IFS=$'\t' read -r pkg name exe manifest; do
   echo "::notice title=$os $crate/$name::passed $p, failed $f, ignored $i, hung $h"
   if [ -n "${failed_names// /}" ]; then
     echo "::warning title=$os $crate/$name failed::$(echo $failed_names | cut -c1-900)"
+    # The panic messages, in the job's log too: the artifact is not always
+    # at hand.
+    echo "::group::$crate/$name failures"
+    if [ -s "logs/$crate-$name.each.log" ]; then
+      grep -B2 -A20 -E 'panicked at|^=== .* \(exit [1-9]' "logs/$crate-$name.each.log" | head -200
+    else
+      sed -n '/^failures:$/,/^test result:/p' "$log" | head -200
+    fi
+    echo "::endgroup::"
   fi
   if [ -n "${hung_names// /}" ]; then
     echo "::warning title=$os $crate/$name hung (>${test_limit}s)::$(echo $hung_names | cut -c1-900)"
