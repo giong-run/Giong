@@ -55,6 +55,11 @@ struct Counters {
     /// counter has the program). Counted and held to a small share, since a
     /// listener that went away would refuse thousands.
     connects_refused: AtomicU64,
+    /// Connects that found no free local port. Windows keeps a closed
+    /// connection's port in TIME_WAIT and has about 16,000 of them, which
+    /// this churn of short connections uses up; the clients then wait for
+    /// ports to come free. Counted, and connects must still go on.
+    ports_used_up: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
 }
@@ -203,6 +208,11 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
             Ok(stream) => stream,
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
                 Counters::bump(&counters.connects_refused);
+                continue;
+            }
+            Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::AddrInUse => {
+                Counters::bump(&counters.ports_used_up);
+                sleep(Duration::from_millis(100)).await;
                 continue;
             }
             Err(err) => {
@@ -628,7 +638,8 @@ fn soak() {
     eprintln!(
         "soak: done after {secs}s on {workers} workers: {} connections, {} echoes, \
          {} cancelled receives, {} messages received in pieces, {} datagrams, {} files, \
-         {} cross-worker hops, {} connects refused by the kernel",
+         {} cross-worker hops, {} connects refused by the kernel, {} connects that \
+         found no free local port",
         c.connections.load(Ordering::Relaxed),
         c.round_trips.load(Ordering::Relaxed),
         c.cancelled_recvs.load(Ordering::Relaxed),
@@ -637,6 +648,7 @@ fn soak() {
         c.files.load(Ordering::Relaxed),
         c.cross_worker.load(Ordering::Relaxed),
         c.connects_refused.load(Ordering::Relaxed),
+        c.ports_used_up.load(Ordering::Relaxed),
     );
 
     // 1. Every scenario behaved as designed.
