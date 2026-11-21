@@ -22,9 +22,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   connection to an origin and waits up to `deadline` for the acknowledgements; it returns
   how many answered. A connection that answers counts as used (its idle timeout starts
   again). One that does not answer in time and still carries no request is closed at once
-  and takes no more requests (`GIONG-E1103`); one that a request started on during the
-  probe is left to that request. Only acknowledgements of the client's own PINGs count.
-  The client never pings unless asked. (#154)
+  and takes no more requests (`GIONG-E1103`); one that carried a request during the probe
+  is left open. A probe in flight keeps the idle timeout from closing the connection, and
+  a GOAWAY read with the acknowledgement fails the call (`GIONG-E1106`). Only
+  acknowledgements of the client's own PINGs count. The client never pings unless asked.
+  (#154)
 
 ## [1.0.0] - 2026-11-21
 

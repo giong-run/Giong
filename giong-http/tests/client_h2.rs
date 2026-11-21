@@ -1823,3 +1823,128 @@ fn probing_an_origin_that_speaks_http1_finds_nothing_to_ping() {
         assert_eq!(e.kind(), ErrorKind::Request, "{e}");
     });
 }
+
+// ------------------------------------------- review of #184: regressions
+
+#[test]
+fn the_idle_timeout_does_not_end_a_connection_while_its_ping_is_out() {
+    giong::block_on(async {
+        let base = scripted(|_, mut h2| async move {
+            while let Some(f) = h2.frame().await {
+                match f.kind {
+                    SETTINGS if f.flags & 1 == 0 => h2.send(frame(SETTINGS, 1, 0, &[])).await,
+                    HEADERS => h2.respond(f.stream, OK, b"ok").await,
+                    // A slow acknowledgement, which arrives after the
+                    // client's idle deadline.
+                    PING if f.flags & 1 == 0 => {
+                        sleep(Duration::from_millis(300)).await;
+                        h2.send(frame(PING, 1, 0, &f.payload)).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let client = Client::builder()
+            .http2_prior_knowledge(true)
+            .idle_timeout(Duration::from_millis(300))
+            .build();
+        client.get(&base).send().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+        // The idle deadline passes about 200 ms into the probe.
+        assert_eq!(
+            client
+                .ping_idle_http2(&base, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(client.connections(&base), (1, 1));
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
+        // Once the probe is over, the idle timeout applies again.
+        eventually("the idle connection is closed", || {
+            client.connections(&base) == (0, 0)
+        })
+        .await;
+    });
+}
+
+#[test]
+fn a_connection_that_answered_a_request_during_the_probe_is_not_closed() {
+    giong::block_on(async {
+        let connections = Rc::new(Cell::new(0));
+        let base = scripted({
+            let connections = connections.clone();
+            move |_, h2| {
+                connections.set(connections.get() + 1);
+                // Answers requests at once and never acknowledges a PING.
+                async move {
+                    answer_requests(h2, |_| None).await;
+                }
+            }
+        });
+        let client = h2c();
+        client.get(&base).send().await.unwrap();
+        let probe = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move {
+                client
+                    .ping_idle_http2(&url, Duration::from_millis(300))
+                    .await
+            }
+        });
+        sleep(Duration::from_millis(20)).await;
+        // Sent, answered and read well before the deadline.
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
+        assert_eq!(client.connections(&base), (1, 1));
+        let e = probe.await.unwrap().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        assert!(e.to_string().contains("1 left open"), "{e}");
+        assert_eq!(client.connections(&base), (1, 1), "not closed");
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
+        assert_eq!(connections.get(), 1);
+    });
+}
+
+#[test]
+fn a_goaway_read_with_the_acknowledgement_is_not_an_answer() {
+    giong::block_on(async {
+        let base = scripted(|n, h2| async move {
+            answer_requests(h2, move |payload| {
+                (n == 0).then(|| {
+                    // GOAWAY and the acknowledgement in one write.
+                    let mut goaway = 1u32.to_be_bytes().to_vec();
+                    goaway.extend(0u32.to_be_bytes());
+                    let mut out = frame(GOAWAY, 0, 0, &goaway);
+                    out.extend(frame(PING, 1, 0, payload));
+                    out
+                })
+            })
+            .await;
+        });
+        let client = h2c();
+        client.get(&base).send().await.unwrap();
+        let e = client
+            .ping_idle_http2(&base, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Closed, "{e}");
+        assert!(e.to_string().contains("GOAWAY"), "{e}");
+        eventually("the connection leaves the pool", || {
+            client.connections(&base) == (0, 0)
+        })
+        .await;
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
+    });
+}

@@ -640,13 +640,19 @@ impl Client {
     ///   all busy with requests, or the origin speaks HTTP/1.1): call
     ///   [`preconnect`](Self::preconnect) to open one.
     /// * [`ErrorKind::Timeout`]: a connection did not acknowledge in time.
-    ///   If no request has started on it meanwhile, it is closed at once
-    ///   and takes no more requests; one that a request started on during
-    ///   the probe is left open for that request, whose own timeout
-    ///   applies. The message says how many of each. Connections that
-    ///   acknowledged stay.
-    /// * [`ErrorKind::Closed`]: a connection ended while it was probed (the
-    ///   server said GOAWAY or closed it); it left the pool.
+    ///   If no request was sent on it during the probe, it is closed at
+    ///   once and takes no more requests; one that carried a request
+    ///   meanwhile (still going or already answered) is left open, and a
+    ///   request still going has its own timeout. The message says how
+    ///   many of each. Connections that acknowledged stay.
+    /// * [`ErrorKind::Closed`]: a connection ended while it was probed, or
+    ///   the server said GOAWAY on it, even alongside the acknowledgement;
+    ///   it takes no more requests and leaves the pool. The message says
+    ///   why it ended.
+    ///
+    /// A probe in flight keeps the connection from being closed for being
+    /// idle: the idle timeout is not checked until the PING is
+    /// acknowledged or given up.
     ///
     /// After an error, the next request opens a new connection; call
     /// [`preconnect`](Self::preconnect) to open it now. A `deadline` of zero
@@ -668,11 +674,15 @@ impl Client {
         };
         let mut probes: Vec<_> = pool::idle_h2(&pool)
             .into_iter()
-            .filter_map(|(id, conn)| conn.ping().map(|ping| (id, conn, ping, None)))
+            .filter_map(|(id, conn)| {
+                // Requests sent from here on show up in `opened`.
+                let opened = conn.opened();
+                conn.ping().map(|ping| (id, conn, opened, ping, None))
+            })
             .collect();
         let all = std::future::poll_fn(|cx| {
             let mut waiting = false;
-            for (_, _, ping, result) in &mut probes {
+            for (_, _, _, ping, result) in &mut probes {
                 if result.is_none() {
                     match ping.poll_acked(cx) {
                         std::task::Poll::Ready(r) => *result = Some(r),
@@ -690,14 +700,18 @@ impl Client {
         let origin = url.origin();
         let (mut answered, mut retired, mut busy, mut ended) = (0, 0, 0, None);
         let probed = probes.len();
-        for (id, conn, ping, result) in probes {
+        for (id, conn, opened, ping, result) in probes {
             drop(ping);
             match result {
+                // Acknowledged, but the server said GOAWAY too (often in
+                // the same read): it takes no more requests.
+                Some(Ok(())) if !conn.is_usable() => ended = conn.unusable_because(),
                 Some(Ok(())) => answered += 1,
                 Some(Err(why)) => ended = Some(why),
                 // Checked and closed in one go: no request can start on it
-                // in between.
-                None if conn.streams() == 0 => {
+                // in between. One that carried a request during the probe,
+                // even one already over, is not judged by the PING alone.
+                None if conn.streams() == 0 && conn.opened() == opened => {
                     conn.retire(&format!(
                         "the server did not acknowledge a PING within {deadline:?}"
                     ));
@@ -717,8 +731,8 @@ impl Client {
             }
             if busy > 0 {
                 what.push(format!(
-                    "{busy} left open because a request started on it meanwhile (its own \
-                     timeout applies)"
+                    "{busy} left open because a request was sent on it meanwhile (a request \
+                     still going has its own timeout)"
                 ));
             }
             return Err(Error::new(

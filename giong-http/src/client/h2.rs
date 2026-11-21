@@ -163,6 +163,22 @@ impl Connection {
         st.dead.is_none() && st.goaway.is_none()
     }
 
+    /// Why the connection takes no more requests, if it does not: it
+    /// ended, or the server said GOAWAY.
+    pub(crate) fn unusable_because(&self) -> Option<String> {
+        let st = self.inner.state.borrow();
+        st.dead.clone().or_else(|| {
+            st.goaway
+                .map(|_| "the server is closing the connection (GOAWAY)".to_owned())
+        })
+    }
+
+    /// How many streams were ever opened: it changes whenever a request
+    /// is sent on the connection.
+    pub(crate) fn opened(&self) -> u32 {
+        self.inner.state.borrow().next_id / 2
+    }
+
     /// Streams in progress.
     pub(crate) fn streams(&self) -> usize {
         self.inner.state.borrow().streams.len()
@@ -242,6 +258,11 @@ impl Drop for Ping {
     fn drop(&mut self) {
         if let Ok(mut st) = self.inner.state.try_borrow_mut() {
             st.pings.remove(&self.id);
+            if st.pings.is_empty() {
+                // The idle timeout applies again: the connection's task
+                // works out its deadline anew.
+                st.poke();
+            }
         }
     }
 }
@@ -588,6 +609,13 @@ impl State {
             && self.goaway.is_none()
             && self.next_id <= MAX_STREAM_ID
             && self.streams.len() < self.peer_max_streams as usize
+    }
+
+    /// Nothing in progress: no stream, and no PING waiting for its
+    /// acknowledgement (a probe in flight is not idleness, and must not be
+    /// ended by the idle timeout).
+    fn is_idle(&self) -> bool {
+        self.dead.is_none() && self.streams.is_empty() && self.pings.is_empty()
     }
 
     fn reading(&self) -> bool {
@@ -1596,7 +1624,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
             let out = (write.is_none() && !st.out.is_empty()).then(|| mem::take(&mut st.out));
             st.poked = false;
             // Once the connection is over, only the last write is waited for.
-            let idle_since = (st.dead.is_none() && st.streams.is_empty()).then_some(st.idle_since);
+            let idle_since = st.is_idle().then_some(st.idle_since);
             (out, st.dead.is_some(), st.reading(), idle_since)
         };
         if let Some(out) = out {
@@ -1689,10 +1717,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
                     );
                     break;
                 }
-                if st.streams.is_empty()
-                    && st.dead.is_none()
-                    && st.idle_since + settings.idle_timeout <= now
-                {
+                if st.is_idle() && st.idle_since + settings.idle_timeout <= now {
                     frame::write_goaway(&mut st.out, 0, Reason::NoError, b"");
                     st.end("the connection was idle for too long".into(), false);
                 }
