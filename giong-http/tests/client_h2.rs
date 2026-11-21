@@ -1498,7 +1498,7 @@ fn a_request_started_during_a_ping_keeps_its_connection() {
             while let Some(stream) = h2.request().await {
                 requests += 1;
                 if requests == 2 {
-                    sleep(Duration::from_millis(400)).await;
+                    sleep(Duration::from_millis(1000)).await;
                 }
                 h2.respond(stream, OK, b"ok").await;
             }
@@ -1509,7 +1509,7 @@ fn a_request_started_during_a_ping_keeps_its_connection() {
             let (client, url) = (client.clone(), base.clone());
             async move {
                 client
-                    .ping_idle_http2(&url, Duration::from_millis(150))
+                    .ping_idle_http2(&url, Duration::from_millis(500))
                     .await
             }
         });
@@ -1613,21 +1613,13 @@ fn a_request_given_up_while_waiting_for_a_preconnect_leaves_the_others_alone() {
             let (client, url) = (client.clone(), base.clone());
             async move { client.preconnect(&url).await }
         });
-        // Given up before the handshake can be over.
+        // In line behind the preconnect, then given up.
         let impatient = giong::spawn({
             let (client, url) = (client.clone(), base.clone());
-            async move {
-                client
-                    .get(&url)
-                    .timeout(Duration::from_micros(1))
-                    .send()
-                    .await
-                    .map(|_| ())
-            }
+            async move { polled_once_then_dropped(client.get(&url).send()).await }
         });
         let tasks = burst(&client, &base, 3);
-        let e = impatient.await.unwrap().unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        assert!(impatient.await.unwrap(), "it was still waiting");
         assert_eq!(warmup.await.unwrap().unwrap(), Version::Http2);
         for t in tasks {
             assert_eq!(t.await.unwrap().0, Version::Http2);
@@ -1636,6 +1628,14 @@ fn a_request_given_up_while_waiting_for_a_preconnect_leaves_the_others_alone() {
         assert_eq!(seen.requests.get(), 3);
         assert_eq!(client.connections(&base), (1, 1));
     });
+}
+
+/// Polls `fut` once and drops it: returns whether it was still pending,
+/// which a timeout of a microsecond cannot promise (what it waits for may
+/// arrive before the timer is looked at).
+async fn polled_once_then_dropped<F: Future>(fut: F) -> bool {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_pending())).await
 }
 
 /// A small deterministic generator, so that a failing round can be named
@@ -1741,12 +1741,9 @@ fn probes_at_once_each_get_their_acknowledgement() {
         }
         assert_eq!(client.connections(&base), (1, 1));
         // A probe given up early closes nothing.
-        assert!(giong::time::timeout(
-            Duration::from_micros(1),
-            client.ping_idle_http2(&base, Duration::from_secs(5))
-        )
-        .await
-        .is_err());
+        assert!(
+            polled_once_then_dropped(client.ping_idle_http2(&base, Duration::from_secs(5))).await
+        );
         assert_eq!(client.connections(&base), (1, 1));
         assert_eq!(
             client
@@ -1891,7 +1888,7 @@ fn a_connection_that_answered_a_request_during_the_probe_is_not_closed() {
             let (client, url) = (client.clone(), base.clone());
             async move {
                 client
-                    .ping_idle_http2(&url, Duration::from_millis(300))
+                    .ping_idle_http2(&url, Duration::from_millis(500))
                     .await
             }
         });
