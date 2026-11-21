@@ -1100,3 +1100,79 @@ fn the_read_only_guard_is_prepared_again_after_a_deallocate() {
         assert_eq!(pool.stats().opened, 1);
     });
 }
+
+/// Statements of a batch hold the locks they take until the batch ends, so
+/// two batches taking two locks in opposite orders could deadlock where the
+/// same statements one by one never do: a statement of a batch gives up a
+/// lock wait within 50 ms and runs again alone.
+#[test]
+fn batches_taking_locks_in_opposite_orders_do_not_deadlock() {
+    for batch in [false, true] {
+        run(move |s| async move {
+            let a = Pool::new(s.local().batch_reads(batch), 1);
+            let b = Pool::new(s.local().batch_reads(batch), 1);
+            let slow = "SELECT 1::int4 FROM pg_advisory_xact_lock($1::int8), pg_sleep(0.3)";
+            let fast = "SELECT 2::int4 FROM pg_advisory_xact_lock($1::int8)";
+            for pool in [&a, &b] {
+                pool.query_one(slow, &[&100i64]).await.unwrap();
+                pool.query_one(fast, &[&100i64]).await.unwrap();
+            }
+            let mut tasks = Vec::new();
+            for (pool, first, second) in [(&a, 1i64, 2i64), (&b, 2, 1)] {
+                let p = pool.clone();
+                tasks.push(giong::spawn(
+                    async move { p.query_one(slow, &[&first]).await },
+                ));
+                let p = pool.clone();
+                tasks.push(giong::spawn(
+                    async move { p.query_one(fast, &[&second]).await },
+                ));
+            }
+            for t in tasks {
+                if let Err(e) = t.await.unwrap() {
+                    panic!("batch_reads({batch}): {e}");
+                }
+            }
+        });
+    }
+}
+
+/// A migration that locks two tables while a batch reads both: without the
+/// cap on the batch's lock waits, the two deadlock and the server rolls the
+/// migration back.
+#[test]
+fn a_migration_locking_two_tables_is_not_rolled_back_by_a_batch() {
+    for batch in [false, true] {
+        run(move |s| async move {
+            let pool = Pool::new(s.local().batch_reads(batch), 2);
+            pool.batch_execute(
+                "DROP TABLE IF EXISTS ta, tb; CREATE TABLE ta (x int); CREATE TABLE tb (x int)",
+            )
+            .await
+            .unwrap();
+            let s1 = "SELECT count(*)::int4 FROM ta, pg_sleep(0.3)";
+            let s2 = "SELECT count(*)::int4 FROM tb";
+            let reads = Pool::new(s.local().batch_reads(batch), 1);
+            reads.query_one(s1, &[]).await.unwrap();
+            reads.query_one(s2, &[]).await.unwrap();
+            let r = reads.clone();
+            let t1 = giong::spawn(async move { r.query_one(s1, &[]).await.map(|_| ()) });
+            let r = reads.clone();
+            let t2 = giong::spawn(async move { r.query_one(s2, &[]).await.map(|_| ()) });
+            let migrate = giong::spawn({
+                let pool = pool.clone();
+                async move {
+                    giong::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let c = pool.get().await.unwrap();
+                    c.batch_execute("BEGIN; LOCK tb; SELECT pg_sleep(0.05); LOCK ta; COMMIT")
+                        .await
+                }
+            });
+            t1.await.unwrap().unwrap();
+            t2.await.unwrap().unwrap();
+            if let Err(e) = migrate.await.unwrap() {
+                panic!("batch_reads({batch}): the migration failed: {e}");
+            }
+        });
+    }
+}

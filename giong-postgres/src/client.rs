@@ -196,7 +196,19 @@ const SYNC_LEN: usize = 5;
 /// Makes the transaction of a batch read-only, until its `Sync`: a
 /// statement that writes then fails instead of writing what the batch's
 /// rollback would undo.
-const READ_ONLY: &str = "SELECT set_config('transaction_read_only', 'on', true)";
+///
+/// It also caps how long a statement of the batch waits for a lock, at 50 ms
+/// (a constant: computed from the session's `lock_timeout`, the guard cost
+/// the batch 10% of its speed): a batch holds the locks its statements took
+/// until it ends, so a statement that waits behind
+/// another transaction while earlier ones hold their locks could close a
+/// cycle that the statements one by one never would (a migration that locks
+/// two tables, say), and the server would roll back one side after its
+/// `deadlock_timeout`. Given up within 50 ms instead, the wait fails the
+/// batch, whose statements run again on their own and wait as they would
+/// without batches.
+const READ_ONLY: &str =
+    "SELECT set_config('transaction_read_only', 'on', true), set_config('lock_timeout', '50ms', true)";
 
 /// The name [`READ_ONLY`] is prepared under, once per connection.
 const READ_ONLY_NAME: &str = "__giong_read_only";
@@ -1378,6 +1390,17 @@ impl Conn {
                         self.state.borrow_mut().read_only_prepared = false;
                     }
                     _ => {}
+                }
+                if matches!(error.server_code(), Some("55P03" | "40P01" | "40001"))
+                    && slot.batch.get() == Role::Member
+                {
+                    // A lock waited for, a deadlock or a serialization
+                    // failure the batch may have caused by holding its
+                    // locks: run again alone, where it is as without
+                    // batches.
+                    if let Kind::Execute { .. } = &slot.kind {
+                        inner.alone = true;
+                    }
                 }
                 if error.server_code() == Some("25006") {
                     // It would have run alone: send it alone.

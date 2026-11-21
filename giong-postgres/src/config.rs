@@ -353,6 +353,16 @@ impl Config {
     /// * `now()` and `transaction_timestamp()` give the time the batch
     ///   started, and a transaction-scoped advisory lock is held until the
     ///   batch ends.
+    /// * The locks its statements take are held until the batch ends, so a
+    ///   statement of a batch waits at most 50 ms for a lock: past that, or
+    ///   when it fails with a deadlock (`40P01`) or a serialization failure
+    ///   (`40001`), the batch is rolled back and the statement is sent
+    ///   again alone, where it waits as it would without batches (a
+    ///   `lock_timeout` shorter than 50 ms then applies to that run). Without
+    ///   that, a batch could deadlock with a transaction that the same
+    ///   statements one by one never would (a migration that locks two
+    ///   tables the batch reads), and the server would roll one of them
+    ///   back.
     pub fn batch_reads(mut self, batch: bool) -> Self {
         self.batch_reads = batch;
         self

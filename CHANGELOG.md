@@ -23,7 +23,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   commit rolled back. A `SELECT` that calls `set_config` runs alone, so that a
   transaction-local setting does not reach other tasks' statements; not for functions that
   make such settings (row-level security set up per request), which a statement's text does
-  not show. MySQL's protocol has no equivalent.
+  not show. A batch holds the locks its statements took until it ends, so a statement of a
+  batch gives up a lock wait within 50 ms, and one
+  that fails in a batch with a lock timeout, a deadlock or a serialization failure is sent
+  again alone: a batch cannot deadlock with a transaction that its statements one by one
+  would not (a migration locking two tables). MySQL's protocol has no equivalent.
 - `bench/db-path.sh`: an HTTP request that reads one row from PostgreSQL or MySQL, answered
   as JSON, on giong against axum with deadpool-postgres and with SQLx, for throughput,
   p50/p99 under load and the latency of one request at a time.
