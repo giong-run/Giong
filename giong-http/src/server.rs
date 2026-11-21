@@ -1204,6 +1204,8 @@ struct Conn<T> {
     /// Where the unparsed data starts in `buf`.
     pos: usize,
     /// How much of the unparsed data has been searched for the end of a head.
+    /// While a large body is awaited (`body_into`), how many bytes from `pos`
+    /// the read buffer must hold instead: no head is searched for then.
     scanned: usize,
     /// Responses not sent yet.
     out: Vec<u8>,
@@ -1216,10 +1218,11 @@ struct Conn<T> {
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
-    /// While a large body is awaited: how many bytes from `pos` the read
-    /// buffer must hold, received straight into it by `read_more`. Zero
-    /// otherwise. (A `u32` that fits beside the flags.)
-    body_into: u32,
+    /// A large body is awaited: `read_more` receives it straight into the
+    /// read buffer, until the buffer holds `scanned` bytes from `pos`. (A
+    /// flag beside the others, and a field that is idle meanwhile, so that
+    /// no connection grows.)
+    body_into: bool,
     /// What the unparsed data and the body being decoded hold against the
     /// worker's budget for requests (see `budget`).
     charge: Charge,
@@ -1243,7 +1246,7 @@ impl<T: Transport> Conn<T> {
             closing: false,
             deadline: None,
             first: true,
-            body_into: 0,
+            body_into: false,
             charge: Charge::none(),
             _slot: slot,
         }
@@ -1730,13 +1733,14 @@ impl<T: Transport> Conn<T> {
             // if it cannot fit in the worker's budget.
             self.admit(head.len + len)?;
             if len >= RECV_INTO_AT {
-                self.body_into = u32::try_from(head.len + len).unwrap_or(0);
+                self.body_into = true;
+                self.scanned = head.len + len;
             }
             while self.buf.len() - self.pos - head.len < len {
                 self.send_continue(&head, &mut interim_sent);
                 self.read_more(false).await?;
             }
-            self.body_into = 0;
+            self.body_into = false;
             let start = self.pos + head.len;
             (BodyBytes::InBuffer(start..start + len), head.len + len)
         };
@@ -1820,10 +1824,10 @@ impl<T: Transport> Conn<T> {
             self.release_read_buffer();
         }
         self.flush().await?;
-        if self.body_into > 0 && Rc::get_mut(&mut self.buf).is_some() {
+        if self.body_into && Rc::get_mut(&mut self.buf).is_some() {
             // Boxed, so that it adds nothing to the state every waiting
             // connection keeps.
-            return Box::pin(self.recv_body_into(self.body_into as usize)).await;
+            return Box::pin(self.recv_body_into(self.scanned)).await;
         }
         let received = if idle {
             if self.closing {
