@@ -15,6 +15,8 @@ use std::task::{Poll, Waker};
 
 use giong::error::{Code, Error};
 
+use crate::trailers::Trailers;
+
 /// How a request body read as a stream ended badly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
@@ -88,6 +90,8 @@ struct Inlet {
     asked: bool,
     /// Bytes handed to the handler so far.
     taken: u64,
+    /// The trailer fields a body that ended well ended with.
+    trailers: Option<Trailers>,
     reader: Option<Waker>,
     writer: Option<Waker>,
 }
@@ -180,8 +184,17 @@ impl Pipe {
 
     /// Ends the body, well or badly. The first end counts.
     pub(crate) fn finish(&self, end: Result<(), Failure>) {
+        self.finish_with(end, None);
+    }
+
+    /// Ends the body as [`finish`](Self::finish), with the trailer fields
+    /// that came after it.
+    pub(crate) fn finish_with(&self, end: Result<(), Failure>, trailers: Option<Trailers>) {
         let mut inlet = self.inlet.borrow_mut();
         if inlet.end.is_none() {
+            if end.is_ok() {
+                inlet.trailers = trailers.filter(|t| !t.is_empty());
+            }
             inlet.end = Some(end);
         }
         if let Some(reader) = inlet.reader.take() {
@@ -316,6 +329,22 @@ impl BodyStream {
     pub fn bytes_read(&self) -> u64 {
         self.pipe.inlet.borrow().taken
     }
+
+    /// The trailer fields the client sent after the body: in a last HEADERS
+    /// frame over HTTP/2, after the last chunk of a chunked HTTP/1.1 body.
+    ///
+    /// `None` until [`chunk`](Self::chunk) has returned `Ok(None)`, and
+    /// after that if the client sent none. Fields that mean nothing in
+    /// trailers (`content-length`, `host` and the like) are dropped. The
+    /// trailers of one request are limited to 16 KiB over HTTP/1.1 and to
+    /// the server's `max_head_size` over HTTP/2.
+    pub fn trailers(&self) -> Option<Trailers> {
+        let inlet = self.pipe.inlet.borrow();
+        if inlet.piece.is_some() {
+            return None;
+        }
+        inlet.trailers.clone()
+    }
 }
 
 impl fmt::Debug for BodyStream {
@@ -334,19 +363,24 @@ impl fmt::Debug for BodyStream {
 #[derive(Default)]
 struct Outlet {
     piece: Option<Vec<u8>>,
-    /// The sender is done: `Ok` for a complete body, `Err` for an aborted
-    /// one.
-    end: Option<Result<(), ()>>,
+    /// The sender is done: `Ok` for a complete body (with the trailer
+    /// fields to send after it, until the connection takes them), `Err`
+    /// for an aborted one.
+    end: Option<Result<Option<Trailers>, ()>>,
     /// The connection stopped taking pieces (client gone, `HEAD`, 204).
     closed: bool,
     sender: Option<Waker>,
     receiver: Option<Waker>,
+    /// Woken when the connection stops taking pieces: the task waiting in
+    /// [`BodySender::closed`], which may not be the one that sends.
+    watcher: Option<Waker>,
 }
 
 /// What the connection gets from a streamed response body.
 pub(crate) enum Next {
     Piece(Vec<u8>),
-    End,
+    /// The end of the body, and the trailer fields to send after it.
+    End(Option<Trailers>),
     Aborted,
 }
 
@@ -374,14 +408,32 @@ impl StreamBody {
             }
             return Poll::Ready(Next::Piece(piece));
         }
-        match outlet.end {
-            Some(Ok(())) => Poll::Ready(Next::End),
+        match &mut outlet.end {
+            Some(Ok(trailers)) => Poll::Ready(Next::End(trailers.take())),
             Some(Err(())) => Poll::Ready(Next::Aborted),
             None => {
                 set_waker(&mut outlet.receiver, waker);
                 Poll::Pending
             }
         }
+    }
+}
+
+impl StreamBody {
+    /// Appends the piece that waits to `into`, if it is no more than
+    /// `room` bytes: small pieces sent one after the other leave together.
+    pub(crate) fn take_small(&self, into: &mut Vec<u8>, room: usize) -> bool {
+        let mut outlet = self.outlet.borrow_mut();
+        if !outlet.piece.as_ref().is_some_and(|p| p.len() <= room) {
+            return false;
+        }
+        if let Some(piece) = outlet.piece.take() {
+            into.extend_from_slice(&piece);
+        }
+        if let Some(sender) = outlet.sender.take() {
+            sender.wake();
+        }
+        true
     }
 }
 
@@ -392,6 +444,9 @@ impl Drop for StreamBody {
         outlet.piece = None;
         if let Some(sender) = outlet.sender.take() {
             sender.wake();
+        }
+        if let Some(watcher) = outlet.watcher.take() {
+            watcher.wake();
         }
     }
 }
@@ -462,12 +517,60 @@ impl BodySender {
         self.end(Err(()));
     }
 
+    /// Ends the body, then sends `trailers` after it: in a last HEADERS
+    /// frame over HTTP/2, after the last chunk over HTTP/1.1. Pieces
+    /// already sent go out first. Empty trailers end the body as dropping
+    /// the sender does.
+    ///
+    /// An HTTP/1.0 client gets the body without the trailers, since its
+    /// response is not chunked. Over HTTP/1.1 the trailers are sent whether
+    /// or not the request had `TE: trailers`; a client that does not expect
+    /// them ignores them.
+    ///
+    /// # Errors
+    ///
+    /// `GIONG-E1114` when the body can no longer be sent (see
+    /// [`send`](Self::send)): the trailers were not sent either.
+    pub fn send_trailers(self, trailers: Trailers) -> io::Result<()> {
+        if self.outlet.borrow().closed {
+            return Err(not_sent());
+        }
+        self.end(Ok(Some(trailers).filter(|t| !t.is_empty())));
+        Ok(())
+    }
+
     /// `true` once the body can no longer be sent (see [`send`](Self::send)).
     pub fn is_closed(&self) -> bool {
         self.outlet.borrow().closed
     }
 
-    fn end(&self, end: Result<(), ()>) {
+    /// Waits until the body can no longer be sent (see
+    /// [`send`](Self::send)): for a producer that waits on something else
+    /// (a queue, a timer, the request's own body) and should stop when the
+    /// client resets its HTTP/2 stream or its connection closes. It does
+    /// not return when the body ends well: the sender is gone by then.
+    ///
+    /// Over HTTP/1.1 a connection that is writing a streamed body does not
+    /// read, so a client that goes away is only noticed when the next
+    /// piece is written: there, [`send`](Self::send) is what tells.
+    ///
+    /// May be awaited in another task than the one that sends, by one task
+    /// at a time.
+    ///
+    /// Cancel safe: a dropped future leaves nothing behind.
+    pub async fn closed(&self) {
+        poll_fn(|cx| {
+            let mut outlet = self.outlet.borrow_mut();
+            if outlet.closed {
+                return Poll::Ready(());
+            }
+            set_waker(&mut outlet.watcher, cx.waker());
+            Poll::Pending
+        })
+        .await
+    }
+
+    fn end(&self, end: Result<Option<Trailers>, ()>) {
         let mut outlet = self.outlet.borrow_mut();
         if outlet.end.is_none() {
             outlet.end = Some(end);
@@ -480,7 +583,7 @@ impl BodySender {
 
 impl Drop for BodySender {
     fn drop(&mut self) {
-        self.end(Ok(()));
+        self.end(Ok(None));
     }
 }
 
