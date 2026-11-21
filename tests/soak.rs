@@ -462,12 +462,15 @@ fn rss_kib() -> u64 {
 }
 
 /// Opens, once, what Windows keeps open for the rest of the process after
-/// its first use: Winsock and its helper handles, the runtime's blocking
+/// its first use: Winsock and its helper handles, the thread that hands
+/// round the connections of a shared address, the runtime's blocking
 /// threads, the file system's. The handle count before the soak is taken
 /// after this, so that it compares like with like.
 #[cfg(windows)]
 fn warm_up() {
     let dir = std::env::temp_dir().join(format!("giong-soak-warm-{}", std::process::id()));
+    let (_holder, port) = common::shared_port();
+    let shared: SocketAddr = ([127, 0, 0, 1], port).into();
     giong::Builder::new()
         .workers(2)
         .build()
@@ -481,6 +484,19 @@ fn warm_up() {
                 let connected = TcpStream::connect(addr).await.unwrap();
                 accept.await.unwrap().unwrap();
                 drop(connected);
+                // Both workers on one address, as in the soak: the second
+                // listener starts the thread that hands connections round.
+                let listener = TcpListener::bind(shared).unwrap();
+                sleep(Duration::from_millis(100)).await;
+                let accept = giong::spawn(async move {
+                    while let Ok(Ok(stream)) =
+                        timeout(Duration::from_millis(500), listener.accept()).await
+                    {
+                        drop(stream);
+                    }
+                });
+                drop(TcpStream::connect(shared).await.unwrap());
+                accept.await.unwrap();
                 let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
                 udp.send_to(vec![1u8], udp.local_addr().unwrap())
                     .await
@@ -498,6 +514,22 @@ fn warm_up() {
             }
         })
         .unwrap();
+}
+
+/// The descriptor count once it is back to `before` or below, or after 15
+/// seconds. On Linux and macOS it is back at once. Windows' handle count
+/// also holds what threads that are still ending use, such as the blocking
+/// pool's, which stop after 10 idle seconds: those come down, a leak stays.
+fn settled_fds(before: usize) -> usize {
+    let give_up = Instant::now() + Duration::from_secs(15);
+    loop {
+        let now = open_fds();
+        if now <= before || Instant::now() > give_up {
+            return now;
+        }
+        eprintln!("soak: {now} descriptors open, {before} before the soak; waiting");
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn median(values: &mut [u64]) -> u64 {
@@ -697,7 +729,11 @@ fn soak() {
     // 3. Descriptors: nothing left once the runtime is gone, and no growth
     //    during the run beyond the connections that happen to be open.
     drop(port_holder);
-    assert_eq!(open_fds(), fds_before, "descriptors leaked");
+    let fds_after = settled_fds(fds_before);
+    assert!(
+        fds_after <= fds_before,
+        "descriptors leaked: {fds_after} open, {fds_before} before the soak"
+    );
     let samples = samples.lock().unwrap();
     if samples.len() >= 8 {
         let half = samples.len() / 2;
