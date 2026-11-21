@@ -108,6 +108,7 @@ const DATA: u8 = 0;
 const HEADERS: u8 = 1;
 const RST_STREAM: u8 = 3;
 const SETTINGS: u8 = 4;
+const PING: u8 = 6;
 const GOAWAY: u8 = 7;
 const WINDOW_UPDATE: u8 = 8;
 const END_STREAM: u8 = 1;
@@ -117,6 +118,7 @@ struct Frame {
     kind: u8,
     flags: u8,
     stream: u32,
+    payload: Vec<u8>,
 }
 
 fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
@@ -182,6 +184,7 @@ impl H2 {
                         flags: self.buf[4],
                         stream: u32::from_be_bytes(self.buf[5..9].try_into().unwrap())
                             & 0x7fff_ffff,
+                        payload: self.buf[9..9 + len].to_vec(),
                     };
                     self.buf.drain(..9 + len);
                     return Some(f);
@@ -1110,5 +1113,438 @@ fn dropping_the_client_closes_its_connections() {
         assert_eq!(other.get(&base).send().await.unwrap().text().unwrap(), "ok");
         drop(other);
         eventually("the connection is closed", || closed.get()).await;
+    });
+}
+
+// ------------------------------------------------------------- preconnect
+
+/// Counts the requests a server answers, and the TCP connections they came
+/// on.
+#[derive(Clone, Default)]
+struct Seen {
+    peers: Rc<RefCell<HashSet<SocketAddr>>>,
+    requests: Rc<Cell<usize>>,
+}
+
+impl Seen {
+    fn handler(&self) -> impl Fn(Request) -> std::future::Ready<Response> + 'static {
+        let seen = self.clone();
+        move |req: Request| {
+            seen.peers.borrow_mut().insert(req.peer_addr().unwrap());
+            seen.requests.set(seen.requests.get() + 1);
+            std::future::ready(Response::text(req.version().as_str()))
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.peers.borrow().len()
+    }
+}
+
+/// Starts `count` GET requests to `url`, each in a task of its own.
+fn burst(client: &Client, url: &str, count: usize) -> Vec<giong::JoinHandle<(Version, Vec<u8>)>> {
+    (0..count)
+        .map(|_| {
+            let (client, url) = (client.clone(), url.to_owned());
+            giong::spawn(async move {
+                let response = client.get(&url).send().await.unwrap();
+                (response.version(), response.into_body())
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn preconnect_opens_one_http2_connection_that_requests_join_and_sends_no_request() {
+    giong::block_on(async {
+        let seen = Seen::default();
+        let (base, tls) = serve_tls(seen.handler());
+        let client = Client::builder().tls(tls).build();
+        let warmup = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move { client.preconnect(&url).await }
+        });
+        // Asked while the handshake is going on: they wait for it.
+        let tasks = burst(&client, &format!("{base}/chat"), 4);
+        assert_eq!(warmup.await.unwrap().unwrap(), Version::Http2);
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), (Version::Http2, b"HTTP/2".to_vec()));
+        }
+        assert_eq!(seen.connections(), 1, "one TCP and TLS connection");
+        assert_eq!(seen.requests.get(), 4, "no request of the warm-up's own");
+
+        // Warm already: no other connection.
+        assert_eq!(client.preconnect(&base).await.unwrap(), Version::Http2);
+        assert_eq!(client.connections(&base), (1, 1));
+
+        // Alone, it opens the connection and the request finds it.
+        let seen = Seen::default();
+        let (base, tls) = serve_tls(seen.handler());
+        let client = Client::builder().tls(tls).build();
+        assert_eq!(client.preconnect(&base).await.unwrap(), Version::Http2);
+        assert_eq!(client.connections(&base), (1, 1));
+        assert_eq!(seen.requests.get(), 0);
+        client.get(&base).send().await.unwrap();
+        assert_eq!((seen.connections(), seen.requests.get()), (1, 1));
+    });
+}
+
+#[test]
+fn preconnect_parks_the_connection_when_alpn_picks_http1() {
+    giong::block_on(async {
+        let seen = Seen::default();
+        let (acceptor, tls) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let handler = seen.handler();
+        giong::spawn(async move {
+            Server::new()
+                .http2(false)
+                .serve_tls(listener, acceptor, handler)
+                .await
+        });
+        let client = Client::builder()
+            .tls(tls)
+            .max_connections_per_host(4)
+            .build();
+        let warmup = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move { client.preconnect(&url).await }
+        });
+        let tasks = burst(&client, &base, 8);
+        assert_eq!(warmup.await.unwrap().unwrap(), Version::Http11);
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), (Version::Http11, b"HTTP/1.1".to_vec()));
+        }
+        assert!(
+            seen.connections() <= 4,
+            "{} connections",
+            seen.connections()
+        );
+        assert_eq!(seen.requests.get(), 8);
+
+        // Alone, the connection waits among the idle ones for the next
+        // request.
+        let seen = Seen::default();
+        let (acceptor, tls) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let handler = seen.handler();
+        giong::spawn(async move {
+            Server::new()
+                .http2(false)
+                .serve_tls(listener, acceptor, handler)
+                .await
+        });
+        let client = Client::builder().tls(tls).build();
+        assert_eq!(client.preconnect(&base).await.unwrap(), Version::Http11);
+        assert_eq!(client.connections(&base), (1, 1));
+        assert_eq!(client.preconnect(&base).await.unwrap(), Version::Http11);
+        assert_eq!(client.connections(&base), (1, 1), "the idle one is enough");
+        client.get(&base).send().await.unwrap();
+        assert_eq!((seen.connections(), seen.requests.get()), (1, 1));
+    });
+}
+
+/// Passes connections on to `to`, except the first, which it closes at once.
+fn closes_the_first_connection(to: SocketAddr) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    giong::spawn(async move {
+        for n in 0.. {
+            let Ok(client) = listener.accept().await else {
+                return;
+            };
+            if n == 0 {
+                drop(client);
+                continue;
+            }
+            let server = TcpStream::connect(to).await.unwrap();
+            let (client, server) = (Rc::new(client), Rc::new(server));
+            for (from, to) in [(client.clone(), server.clone()), (server, client)] {
+                giong::spawn(async move {
+                    while let Ok(chunk) = from.recv().await {
+                        if chunk.is_empty() || to.write_all(chunk.to_vec()).await.0.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        }
+    });
+    port
+}
+
+#[test]
+fn a_failed_preconnect_hands_its_place_to_the_requests_waiting() {
+    giong::block_on(async {
+        let seen = Seen::default();
+        let (acceptor, tls) = tls_pair();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = listener.local_addr().unwrap();
+        let handler = seen.handler();
+        giong::spawn(async move { Server::new().serve_tls(listener, acceptor, handler).await });
+        let base = format!("https://localhost:{}", closes_the_first_connection(server));
+        let client = Client::builder().tls(tls).build();
+        let warmup = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move { client.preconnect(&url).await }
+        });
+        let tasks = burst(&client, &base, 3);
+        let e = warmup.await.unwrap().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), (Version::Http2, b"HTTP/2".to_vec()));
+        }
+        assert_eq!((seen.connections(), seen.requests.get()), (1, 3));
+        assert_eq!(client.connections(&base), (1, 1));
+    });
+}
+
+#[test]
+fn a_cancelled_preconnect_hands_its_place_to_the_requests_waiting() {
+    giong::block_on(async {
+        let seen = Seen::default();
+        let (acceptor, tls) = tls_pair();
+        // Nothing accepts at first: the TLS handshake waits in the backlog.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!(
+            "https://localhost:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let client = Client::builder().tls(tls).build();
+        let warmup = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move {
+                giong::time::timeout(Duration::from_millis(100), client.preconnect(&url)).await
+            }
+        });
+        let tasks = burst(&client, &base, 3);
+        assert!(warmup.await.unwrap().is_err(), "the warm-up was cut short");
+        let handler = seen.handler();
+        giong::spawn(async move { Server::new().serve_tls(listener, acceptor, handler).await });
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), (Version::Http2, b"HTTP/2".to_vec()));
+        }
+        assert_eq!((seen.connections(), seen.requests.get()), (1, 3));
+        assert_eq!(client.connections(&base), (1, 1));
+    });
+}
+
+#[test]
+fn preconnect_reports_a_bad_url_and_a_server_that_is_not_there() {
+    giong::block_on(async {
+        let client = Client::new();
+        let e = client.preconnect("ftp://example.com/").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Request, "{e}");
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let e = client
+            .preconnect(&format!("http://127.0.0.1:{port}"))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+        assert_eq!(
+            client.connections(&format!("http://127.0.0.1:{port}")),
+            (0, 0)
+        );
+    });
+}
+
+// ------------------------------------------------------- PINGs when idle
+
+#[test]
+fn an_acknowledged_ping_keeps_the_connection_and_its_idle_time_starts_again() {
+    giong::block_on(async {
+        let seen = Seen::default();
+        let (base, tls) = serve_tls(seen.handler());
+        let client = Client::builder()
+            .tls(tls)
+            .idle_timeout(Duration::from_secs(2))
+            .build();
+        assert_eq!(
+            client
+                .ping_idle_http2(&base, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            0,
+            "nothing to ping yet"
+        );
+        client.get(&base).send().await.unwrap();
+        sleep(Duration::from_millis(1400)).await;
+        assert_eq!(
+            client
+                .ping_idle_http2(&base, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            1
+        );
+        // Past the idle timeout counted from the request, not from the PING.
+        sleep(Duration::from_millis(1400)).await;
+        assert_eq!(client.connections(&base), (1, 1));
+        client.get(&base).send().await.unwrap();
+        assert_eq!((seen.connections(), seen.requests.get()), (1, 2));
+
+        let e = client
+            .ping_idle_http2(&base, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Request, "{e}");
+    });
+}
+
+/// The server's side of a connection that answers requests and does with
+/// the client's PINGs what `on_ping` says; returns the requests it saw.
+async fn answer_requests(mut h2: H2, on_ping: impl Fn(&[u8]) -> Option<Vec<u8>>) -> usize {
+    let mut requests = 0;
+    while let Some(f) = h2.frame().await {
+        match f.kind {
+            SETTINGS if f.flags & 1 == 0 => h2.send(frame(SETTINGS, 1, 0, &[])).await,
+            HEADERS => {
+                requests += 1;
+                h2.respond(f.stream, OK, b"ok").await;
+            }
+            PING if f.flags & 1 == 0 => {
+                if let Some(reply) = on_ping(&f.payload) {
+                    h2.send(reply).await;
+                }
+            }
+            _ => {}
+        }
+    }
+    requests
+}
+
+#[test]
+fn a_ping_left_unanswered_closes_the_idle_connection() {
+    giong::block_on(async {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let base = scripted({
+            let requests = requests.clone();
+            move |n, h2| {
+                let requests = requests.clone();
+                async move {
+                    let seen = answer_requests(h2, move |payload| match n {
+                        // Silent, then an acknowledgement of another PING.
+                        0 => {
+                            let mut other = payload.to_vec();
+                            other[7] ^= 0xff;
+                            Some(frame(PING, 1, 0, &other))
+                        }
+                        _ => Some(frame(PING, 1, 0, payload)),
+                    })
+                    .await;
+                    requests.borrow_mut().push((n, seen));
+                }
+            }
+        });
+        let client = h2c();
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
+        let e = client
+            .ping_idle_http2(&base, Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        assert!(e.to_string().contains("did not acknowledge"), "{e}");
+        // Gone at once: the next request opens a new connection.
+        assert_eq!(client.connections(&base), (0, 0));
+        assert_eq!(client.preconnect(&base).await.unwrap(), Version::Http2);
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            client
+                .ping_idle_http2(&base, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            1
+        );
+        drop(client);
+        eventually("both connections end", || requests.borrow().len() == 2).await;
+        let mut requests = requests.borrow().clone();
+        requests.sort_unstable();
+        assert_eq!(requests, [(0, 1), (1, 1)], "one request on each");
+    });
+}
+
+#[test]
+fn a_request_started_during_a_ping_keeps_its_connection() {
+    giong::block_on(async {
+        let base = scripted(|_, mut h2| async move {
+            // Never acknowledges a PING; answers the second request late.
+            let mut requests = 0;
+            while let Some(stream) = h2.request().await {
+                requests += 1;
+                if requests == 2 {
+                    sleep(Duration::from_millis(400)).await;
+                }
+                h2.respond(stream, OK, b"ok").await;
+            }
+        });
+        let client = h2c();
+        client.get(&base).send().await.unwrap();
+        let probe = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move {
+                client
+                    .ping_idle_http2(&url, Duration::from_millis(150))
+                    .await
+            }
+        });
+        sleep(Duration::from_millis(20)).await;
+        let request = giong::spawn({
+            let (client, url) = (client.clone(), base.clone());
+            async move { client.get(&url).send().await.map(|r| r.into_body()) }
+        });
+        let e = probe.await.unwrap().unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Timeout, "{e}");
+        assert!(e.to_string().contains("1 left open"), "{e}");
+        assert_eq!(client.connections(&base), (1, 0), "left to the request");
+        assert_eq!(request.await.unwrap().unwrap(), b"ok");
+        assert_eq!(client.connections(&base), (1, 1));
+    });
+}
+
+#[test]
+fn a_goaway_during_a_ping_is_reported_and_the_connection_leaves_the_pool() {
+    giong::block_on(async {
+        let base = scripted(|n, h2| async move {
+            answer_requests(h2, move |_| {
+                (n == 0).then(|| {
+                    let mut payload = 1u32.to_be_bytes().to_vec();
+                    payload.extend(0u32.to_be_bytes());
+                    frame(GOAWAY, 0, 0, &payload)
+                })
+            })
+            .await;
+        });
+        let client = h2c();
+        client.get(&base).send().await.unwrap();
+        let e = client
+            .ping_idle_http2(&base, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Closed, "{e}");
+        eventually("the connection leaves the pool", || {
+            client.connections(&base) == (0, 0)
+        })
+        .await;
+        assert_eq!(
+            client.get(&base).send().await.unwrap().text().unwrap(),
+            "ok"
+        );
     });
 }

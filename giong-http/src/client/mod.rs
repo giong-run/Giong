@@ -43,6 +43,9 @@
 //!   dropped request resets its stream instead of closing the connection.
 //!   [`ClientBuilder::http2_prior_knowledge`] speaks it to `http` servers
 //!   known to accept it; [`Response::version`] says which was spoken.
+//! * [`Client::preconnect`] opens a connection before the first request
+//!   needs it, and [`Client::ping_idle_http2`] checks idle HTTP/2
+//!   connections with a PING, closing those that do not answer in time.
 //! * Every request has a timeout (30 s by default) that covers waiting for
 //!   a connection, connecting, sending, and reading the whole response,
 //!   redirects included; connecting has its own (10 s).
@@ -540,6 +543,205 @@ impl Client {
             Some(pool) => pool.borrow().counts(),
             None => (0, 0),
         }
+    }
+
+    /// Opens a connection to `url`'s origin before the first request needs
+    /// it, and returns the version it speaks: DNS, TCP, the proxy tunnel
+    /// and the TLS handshake are done, with the client's usual settings,
+    /// and no request is sent. Only the origin of `url` (scheme, host and
+    /// port) is used.
+    ///
+    /// For a service that should not make its first requests wait for a
+    /// handshake: call it when the service starts, alongside accepting
+    /// connections, and again whenever [`ping_idle_http2`](Self::ping_idle_http2)
+    /// had to close a connection.
+    ///
+    /// * An origin that speaks HTTP/2 gets one connection, which joins the
+    ///   pool as soon as it can take requests. Requests made while it is
+    ///   being opened wait for it and then share it, rather than each
+    ///   opening its own; their wait is bounded by
+    ///   [`connect_timeout`](ClientBuilder::connect_timeout) for the
+    ///   connection and by their own timeout in all.
+    /// * Should ALPN pick HTTP/1.1, the connection is put among the idle
+    ///   ones for the next request, the requests that were waiting for it
+    ///   open their own, and this returns [`Version::Http11`]. So does an
+    ///   `http` origin without
+    ///   [`http2_prior_knowledge`](ClientBuilder::http2_prior_knowledge).
+    /// * Should the connection fail, this returns the error
+    ///   ([`ErrorKind::Connect`]), and the first request waiting for it
+    ///   opens a connection of its own. No request is sent before it has a
+    ///   connection, so none is sent twice.
+    ///
+    /// Returns at once when the origin has a connection already: an HTTP/2
+    /// one that can take requests ([`Version::Http2`]), or an idle HTTP/1.1
+    /// one ([`Version::Http11`]). When the origin has as many connections
+    /// open as [`max_connections_per_host`](ClientBuilder::max_connections_per_host)
+    /// allows, it waits in line like a request. Everything is bounded by the
+    /// client's [`timeout`](ClientBuilder::timeout) ([`ErrorKind::Timeout`]).
+    ///
+    /// Cancel safe: if the future is dropped, nothing was sent; a
+    /// connection being opened is abandoned, and the first request waiting
+    /// for it opens one of its own.
+    pub async fn preconnect(&self, url: &str) -> Result<Version, Error> {
+        let url = Url::parse(url).map_err(Error::request)?;
+        let config = &self.shared.config;
+        let route = self.route(&url);
+        let run = async {
+            loop {
+                let pool = self.host(&route);
+                if pool::has_usable_h2(&pool) {
+                    return Ok(Version::Http2);
+                }
+                drop(pool);
+                match self.checkout(&route, false).await? {
+                    Checkout::Retry => continue,
+                    Checkout::H2(_) | Checkout::Shared(_) => return Ok(Version::Http2),
+                    Checkout::H1(mut lease) => {
+                        // Back unused: its idle time is not reset.
+                        if let Some(conn) = lease.conn.take() {
+                            pool::put_back(&lease.pool, conn, config.idle_timeout);
+                        }
+                        return Ok(Version::Http11);
+                    }
+                }
+            }
+        };
+        match giong::time::timeout(config.timeout, run).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::new(
+                ErrorKind::Timeout,
+                format!(
+                    "preconnecting to {} did not finish within {:?}; if the server is known \
+                     to be this slow, raise ClientBuilder::timeout (and \
+                     ClientBuilder::connect_timeout, for the handshake)",
+                    url.origin(),
+                    config.timeout
+                ),
+            )),
+        }
+    }
+
+    /// Checks that the idle HTTP/2 connections to `url`'s origin still
+    /// work: sends each one a PING and waits up to `deadline` for the
+    /// server to acknowledge it. Returns how many did. Only the origin of
+    /// `url` is used. Nothing happens unless this is called: the client
+    /// never pings on its own.
+    ///
+    /// For a connection that may have died silently while idle (a NAT or
+    /// load balancer dropped it, the server vanished without closing it),
+    /// which a request would otherwise find only when its own timeout ran
+    /// out. A request sent while the probe is running goes on the
+    /// connection as usual.
+    ///
+    /// * `Ok(n)`: every connection probed acknowledged its PING, `n` of
+    ///   them; an acknowledged connection counts as used, so its
+    ///   [`idle_timeout`](ClientBuilder::idle_timeout) starts again. `Ok(0)`
+    ///   means there was no idle HTTP/2 connection to probe (none open,
+    ///   all busy with requests, or the origin speaks HTTP/1.1): call
+    ///   [`preconnect`](Self::preconnect) to open one.
+    /// * [`ErrorKind::Timeout`]: a connection did not acknowledge in time.
+    ///   If no request has started on it meanwhile, it is closed at once
+    ///   and takes no more requests; one that a request started on during
+    ///   the probe is left open for that request, whose own timeout
+    ///   applies. The message says how many of each. Connections that
+    ///   acknowledged stay.
+    /// * [`ErrorKind::Closed`]: a connection ended while it was probed (the
+    ///   server said GOAWAY or closed it); it left the pool.
+    ///
+    /// After an error, the next request opens a new connection; call
+    /// [`preconnect`](Self::preconnect) to open it now. A `deadline` of zero
+    /// is refused ([`ErrorKind::Request`]); the client's timeouts do not
+    /// apply, `deadline` does.
+    ///
+    /// Cancel safe: if the future is dropped, no connection is closed and
+    /// acknowledgements that arrive later are ignored.
+    pub async fn ping_idle_http2(&self, url: &str, deadline: Duration) -> Result<usize, Error> {
+        let url = Url::parse(url).map_err(Error::request)?;
+        if deadline.is_zero() {
+            return Err(Error::request(
+                "a PING deadline of zero cannot be met; give ping_idle_http2 the longest time \
+                 a healthy server may take to answer, such as a few round trips",
+            ));
+        }
+        let Some(pool) = self.shared.hosts.borrow().get(&self.route(&url)).cloned() else {
+            return Ok(0);
+        };
+        let mut probes: Vec<_> = pool::idle_h2(&pool)
+            .into_iter()
+            .filter_map(|(id, conn)| conn.ping().map(|ping| (id, conn, ping, None)))
+            .collect();
+        let all = std::future::poll_fn(|cx| {
+            let mut waiting = false;
+            for (_, _, ping, result) in &mut probes {
+                if result.is_none() {
+                    match ping.poll_acked(cx) {
+                        std::task::Poll::Ready(r) => *result = Some(r),
+                        std::task::Poll::Pending => waiting = true,
+                    }
+                }
+            }
+            if waiting {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        });
+        let _ = giong::time::timeout(deadline, all).await;
+        let origin = url.origin();
+        let (mut answered, mut retired, mut busy, mut ended) = (0, 0, 0, None);
+        let probed = probes.len();
+        for (id, conn, ping, result) in probes {
+            drop(ping);
+            match result {
+                Some(Ok(())) => answered += 1,
+                Some(Err(why)) => ended = Some(why),
+                // Checked and closed in one go: no request can start on it
+                // in between.
+                None if conn.streams() == 0 => {
+                    conn.retire(&format!(
+                        "the server did not acknowledge a PING within {deadline:?}"
+                    ));
+                    pool::h2_closed(&pool, id);
+                    retired += 1;
+                }
+                None => busy += 1,
+            }
+        }
+        if retired + busy > 0 {
+            let mut what = Vec::new();
+            if retired > 0 {
+                what.push(format!(
+                    "{retired} closed (the next request opens a new connection; \
+                     Client::preconnect opens it now)"
+                ));
+            }
+            if busy > 0 {
+                what.push(format!(
+                    "{busy} left open because a request started on it meanwhile (its own \
+                     timeout applies)"
+                ));
+            }
+            return Err(Error::new(
+                ErrorKind::Timeout,
+                format!(
+                    "{origin}: {} of {probed} idle HTTP/2 connections did not acknowledge a PING \
+                     within {deadline:?}: {}; if the server is known to answer this slowly, give \
+                     ping_idle_http2 a longer deadline",
+                    retired + busy,
+                    what.join(", and ")
+                ),
+            ));
+        }
+        if let Some(why) = ended {
+            return Err(Error::new(
+                ErrorKind::Closed,
+                format!(
+                    "{origin}: an idle HTTP/2 connection ended while it was pinged ({why}); the \
+                     next request opens a new one (Client::preconnect opens it now)"
+                ),
+            ));
+        }
+        Ok(answered)
     }
 
     fn tls(&self) -> Result<TlsConnector, Error> {
