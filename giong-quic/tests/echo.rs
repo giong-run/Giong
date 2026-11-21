@@ -420,11 +420,14 @@ fn relay(server: SocketAddr, cut: Arc<AtomicBool>) -> SocketAddr {
     addr
 }
 
-#[test]
-fn a_close_reaches_the_peer_while_data_waits_to_be_sent() {
+/// The server answers with more than its congestion window, whose ACKs
+/// never come, and closes the connection while the rest of the answer
+/// waits to be sent: with `Connection::close`, or by dropping the last
+/// handle. The client must hear of the close well before its idle timeout.
+fn close_while_data_waits(by_drop: bool) {
     giong::Builder::new()
         .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
-        .block_on(async {
+        .block_on(async move {
             let (tls, ca) = server_tls();
             let server = Endpoint::server(
                 "127.0.0.1:0".parse().unwrap(),
@@ -433,18 +436,23 @@ fn a_close_reaches_the_peer_while_data_waits_to_be_sent() {
             .unwrap();
             let cut = Arc::new(AtomicBool::new(false));
             let addr = relay(server.local_addr().unwrap(), cut.clone());
-            // The server answers with more than its congestion window,
-            // whose ACKs never come, and closes the connection while the
-            // rest of the answer waits to be sent.
             giong::spawn(async move {
                 let conn = server.accept().await.unwrap();
-                let (mut send, _recv) = conn.accept_bi().await.unwrap();
+                let (mut send, recv) = conn.accept_bi().await.unwrap();
                 cut.store(true, Ordering::Relaxed);
-                giong::spawn(async move {
-                    let _ = send.write_all(&payload(1 << 20)).await;
-                });
+                // Hands QUIC the answer (or what flow control takes of it).
+                let _ = giong::time::timeout(
+                    Duration::from_millis(50),
+                    send.write_all(&payload(1 << 20)),
+                )
+                .await;
+                // Long enough for a window of it to go out unacknowledged.
                 giong::time::sleep(Duration::from_millis(50)).await;
-                conn.close(9, b"enough");
+                if by_drop {
+                    drop((send, recv, conn));
+                } else {
+                    conn.close(9, b"enough");
+                }
                 giong::time::sleep(Duration::from_secs(10)).await;
             });
             let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -457,9 +465,24 @@ fn a_close_reaches_the_peer_while_data_waits_to_be_sent() {
                 .await
                 .expect("the close never reached the client");
             let e = read.unwrap_err().to_string();
-            assert!(e.contains("closed by peer: enough (code 9)"), "{e}");
+            let expected = if by_drop {
+                "closed by peer"
+            } else {
+                "closed by peer: enough (code 9)"
+            };
+            assert!(e.contains(expected), "{e}");
         })
         .unwrap();
+}
+
+#[test]
+fn a_close_reaches_the_peer_while_data_waits_to_be_sent() {
+    close_while_data_waits(false);
+}
+
+#[test]
+fn dropping_the_last_handle_closes_while_data_waits_to_be_sent() {
+    close_while_data_waits(true);
 }
 
 /// A server endpoint that answers every stream with its bytes reversed,

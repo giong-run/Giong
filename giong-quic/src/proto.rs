@@ -8,7 +8,7 @@
 //! atomic is the flag of [`Closable`], which quinn-proto requires to be
 //! `Send`; only its own worker touches it.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::io;
@@ -104,16 +104,6 @@ impl Conn {
     /// A stream of the early data the server rejected.
     fn stale(&self, s: Sid) -> bool {
         s.epoch != self.epoch
-    }
-
-    /// Takes the flag of a congestion controller that quinn-proto just
-    /// built for this connection, which it does when the peer moves to
-    /// another address.
-    fn adopt(&mut self) {
-        if let Some(flag) = Closable::built() {
-            flag.store(self.lost.is_some(), Ordering::Relaxed);
-            self.closing = flag;
-        }
     }
 
     /// Server: takes the bidirectional streams that the datagram just
@@ -217,6 +207,7 @@ impl State {
         c: quinn_proto::Connection,
         incoming: bool,
         early: bool,
+        closing: Arc<AtomicBool>,
     ) -> usize {
         self.unaccepted += usize::from(incoming);
         let slot = self.free.pop().unwrap_or_else(|| {
@@ -241,7 +232,7 @@ impl State {
             early,
             epoch: 0,
             early_bi: VecDeque::new(),
-            closing: Closable::built().unwrap_or_default(),
+            closing,
             saw_early: false,
         });
         if let Some(c) = &mut self.conns[slot] {
@@ -315,10 +306,14 @@ impl State {
                         return;
                     }
                     self.scratch.clear();
-                    match self.ep.accept(inc, now, &mut self.scratch, None) {
+                    let closing = Arc::new(AtomicBool::new(false));
+                    let accepted = Closable::building_for(&closing, || {
+                        self.ep.accept(inc, now, &mut self.scratch, None)
+                    });
+                    match accepted {
                         Ok((ch, c)) => {
                             let early = self.early_data;
-                            self.insert(ch, c, true, early);
+                            self.insert(ch, c, true, early, closing);
                         }
                         Err(e) => {
                             if let Some(t) = e.response {
@@ -334,8 +329,8 @@ impl State {
                     if let Some(Some(c)) = self.conns.get_mut(slot) {
                         if c.ch == ch {
                             let handshaking = c.c.is_handshaking();
-                            c.c.handle_event(ev);
-                            c.adopt();
+                            let closing = c.closing.clone();
+                            Closable::building_for(&closing, || c.c.handle_event(ev));
                             c.take_early(handshaking);
                             self.mark(slot);
                         }
@@ -358,8 +353,8 @@ impl State {
         for i in 0..self.conns.len() {
             if let Some(c) = &mut self.conns[i] {
                 if c.c.poll_timeout().is_some_and(|t| t <= now) {
-                    c.c.handle_timeout(now);
-                    c.adopt();
+                    let closing = c.closing.clone();
+                    Closable::building_for(&closing, || c.c.handle_timeout(now));
                     self.mark(i);
                 }
             }
@@ -385,8 +380,8 @@ impl State {
             let mut again = false;
             while let Some(ev) = conn.c.poll_endpoint_events() {
                 if let Some(cev) = self.ep.handle_event(ch, ev) {
-                    conn.c.handle_event(cev);
-                    conn.adopt();
+                    let closing = conn.closing.clone();
+                    Closable::building_for(&closing, || conn.c.handle_event(cev));
                     again = true;
                 }
             }
@@ -741,12 +736,12 @@ impl Shared {
     ) -> io::Result<usize> {
         let h = {
             let mut st = self.st.borrow_mut();
-            let (ch, c) = st
-                .ep
-                .connect(Instant::now(), cfg, to, name)
-                .map_err(error::connect)?;
+            let closing = Arc::new(AtomicBool::new(false));
+            let (ch, c) =
+                Closable::building_for(&closing, || st.ep.connect(Instant::now(), cfg, to, name))
+                    .map_err(error::connect)?;
             let early = early && c.has_0rtt();
-            let h = st.insert(ch, c, false, early);
+            let h = st.insert(ch, c, false, early, closing);
             if early {
                 return Ok(h);
             }
@@ -995,6 +990,8 @@ impl Shared {
         c.refs -= 1;
         if c.refs == 0 && c.lost.is_none() {
             c.c.close(Instant::now(), 0u32.into(), Bytes::new());
+            // Like any close, not held back by congestion control.
+            c.closing.store(true, Ordering::Relaxed);
         }
         st.mark(h);
     }
@@ -1009,9 +1006,9 @@ impl Shared {
 }
 
 thread_local! {
-    /// The flag of the controller [`Closable`] built last on this thread,
-    /// until the connection it was built for takes it.
-    static BUILT: Cell<Option<Arc<AtomicBool>>> = const { Cell::new(None) };
+    /// The flag of the connection whose call into quinn-proto is running on
+    /// this thread, for the controllers [`Closable`] builds during it.
+    static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 
 /// Builds quinn-proto's default congestion controller (CUBIC) behind a
@@ -1029,11 +1026,17 @@ impl Closable {
         Arc::new(Closable(Arc::default()))
     }
 
-    /// The flag of the controller built since the last call, if any.
-    /// quinn-proto builds controllers inside the calls that make a
-    /// connection or handle its datagrams, on the endpoint's thread.
-    fn built() -> Option<Arc<AtomicBool>> {
-        BUILT.with(Cell::take)
+    /// Runs a call into quinn-proto for the connection whose flag is
+    /// `closing`: every controller built during it (the first one, and the
+    /// new ones of a path change or of its revert) shares that one flag, so
+    /// that setting it covers whichever controller the connection ends with.
+    /// quinn-proto builds controllers only inside such calls, on the
+    /// endpoint's thread.
+    fn building_for<R>(closing: &Arc<AtomicBool>, call: impl FnOnce() -> R) -> R {
+        CURRENT.with(|c| *c.borrow_mut() = Some(closing.clone()));
+        let r = call();
+        CURRENT.with(|c| *c.borrow_mut() = None);
+        r
     }
 }
 
@@ -1043,8 +1046,11 @@ impl quinn_proto::congestion::ControllerFactory for Closable {
         now: Instant,
         current_mtu: u16,
     ) -> Box<dyn quinn_proto::congestion::Controller> {
-        let closing = Arc::new(AtomicBool::new(false));
-        BUILT.with(|b| b.set(Some(closing.clone())));
+        // Outside a call of `building_for` (none is known) the controller
+        // gets a flag of its own, which nothing sets.
+        let closing = CURRENT
+            .with(|c| c.borrow().clone())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         Box::new(ClosableController {
             inner: self.0.clone().build(now, current_mtu),
             closing,
