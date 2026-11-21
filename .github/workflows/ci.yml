@@ -65,6 +65,21 @@ jobs:
       # dependencies need a newer compiler.
       - run: cargo check --workspace --all-features
 
+  # giong as most users build it: no features at all. Every other job turns
+  # on all features, so code that only compiles, or only passes, with a
+  # feature on (unstable-udp-offload, say) would go unseen. Both drivers.
+  default-features:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy -p giong --all-targets -- -D warnings
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && cargo test -p giong
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && GIONG_DRIVER=epoll cargo test -p giong
+
   # The release build of every test binary, once for the whole run: fat LTO
   # makes it the slowest step by far, and the jobs `test`, `fallback`, `docker`
   # and `kernels` all run these binaries. They take this job's target/release
@@ -746,7 +761,7 @@ jobs:
   # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
   # versions, the simulation) hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, h3spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic]
+    needs: [lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic]
     if: always()
     runs-on: ubuntu-24.04
     steps:
