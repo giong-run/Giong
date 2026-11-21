@@ -1,7 +1,7 @@
 //! The HTTP/3 client: against `Server::serve_h3`, and against servers
 //! scripted frame by frame that do what a real one rarely does.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -170,6 +170,53 @@ fn early_server(tls: rustls::ServerConfig) -> String {
         Server::new().serve_h3(endpoint, App).await
     }));
     url
+}
+
+thread_local! {
+    /// Requests `TooEarly` saw.
+    static TOO_EARLY_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Answers every request 425, as a server that wants no early data at all
+/// might.
+struct TooEarly;
+
+impl Handler for TooEarly {
+    async fn call(&self, _: Request) -> Response {
+        TOO_EARLY_CALLS.with(|c| c.set(c.get() + 1));
+        Response::new(425)
+    }
+}
+
+#[test]
+fn a_post_that_waited_for_the_handshake_is_not_sent_again_after_a_425() {
+    run(|| async {
+        let (server_tls, client_tls) = tls();
+        let config = ServerConfig::new(server_tls).unwrap().early_data(true);
+        let endpoint = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+        let url = format!("https://{}/", endpoint.local_addr().unwrap());
+        drop(giong::spawn(async move {
+            Server::new().serve_h3(endpoint, TooEarly).await
+        }));
+        let quic = ClientConfig::new(client_tls).unwrap().early_data(true);
+        let client = || {
+            Client::builder()
+                .http3_prior_knowledge(quic.clone())
+                .timeout(Duration::from_secs(10))
+                .build()
+        };
+        // A first connection for the session ticket.
+        let first = client();
+        first.get(&url).send().await.unwrap();
+        drop(first);
+        TOO_EARLY_CALLS.with(|c| c.set(0));
+        // A resumed connection: the POST opens its stream before the
+        // handshake ends, waits for it, and must reach the server once.
+        let second = client();
+        let res = second.post(&url).body("x").send().await.unwrap();
+        assert_eq!(res.status(), 425);
+        assert_eq!(TOO_EARLY_CALLS.with(Cell::get), 1);
+    });
 }
 
 #[test]

@@ -154,12 +154,15 @@ impl Connection {
         }
         // Early data can be replayed (RFC 8470), so only a request that is
         // harmless to repeat goes out in it; others wait for the handshake.
-        let early = send.is_early();
+        let mut early = send.is_early();
         if early && !(req.body.is_none() && matches!(req.method, "GET" | "HEAD" | "OPTIONS")) {
             if let Err(e) = shared.quic.handshake().await {
                 state.lost(&e);
                 return Err(StreamError::Refused(e.to_string()));
             }
+            // Nothing of it goes out in 0-RTT data now: a 425 for it is
+            // the server's answer, never a reason to send it again.
+            early = false;
         }
         let mut stream = Stream {
             conn: self.clone(),
