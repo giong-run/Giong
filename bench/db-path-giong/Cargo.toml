@@ -1,0 +1,22 @@
+[package]
+name = "bench-db-path-giong"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The HTTP -> database -> HTTP path on giong, for bench/db-path.sh: giong-web,
+# giong-postgres and giong-mysql on one worker.
+[dependencies]
+giong = { path = "../.." }
+giong-mysql = { path = "../../giong-mysql" }
+giong-postgres = { path = "../../giong-postgres" }
+giong-web = { path = "../../giong-web", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]
