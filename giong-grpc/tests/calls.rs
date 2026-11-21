@@ -540,17 +540,17 @@ fn many_calls_share_one_connection() {
 }
 
 #[test]
-fn a_bidirectional_response_starts_before_the_first_request() {
+fn a_bidirectional_response_starts_with_its_first_message() {
     giong::block_on(async {
         let client = TestServiceClient::new(channel(&serve(test_server())));
         let mut metadata = Metadata::new();
         metadata.add("x-grpc-test-echo-initial", "early").unwrap();
         let (mut requests, mut responses) =
             client.full_duplex_call(CallOptions::new().metadata(metadata));
-        // Some clients (tonic's) wait for the response's headers before
-        // they send anything: the server must not wait for a request first.
-        let initial = responses.metadata().await.unwrap();
-        assert_eq!(initial.get_str("x-grpc-test-echo-initial"), Some("early"));
+        // Like grpc-go's and tonic's servers, nothing is sent while the
+        // handler waits for the first request.
+        let early = giong::time::timeout(Duration::from_millis(200), responses.metadata()).await;
+        assert!(early.is_err(), "the response started before any message");
         let parameters = [sized(3)];
         requests
             .send(&StreamingOutputCallRequest {
@@ -559,6 +559,8 @@ fn a_bidirectional_response_starts_before_the_first_request() {
             })
             .await
             .unwrap();
+        let initial = responses.metadata().await.unwrap();
+        assert_eq!(initial.get_str("x-grpc-test-echo-initial"), Some("early"));
         let received = responses.message().await.unwrap().unwrap();
         assert_eq!(
             received.message().unwrap().payload().unwrap().body().len(),

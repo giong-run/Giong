@@ -37,7 +37,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   shares HTTP/2 connections between calls. The statuses it raises itself carry
   `GIONG-E4101` to `GIONG-E4110` with the cause and the fix. Tested against grpc-go in
   both directions with the cases of gRPC's interoperability specification, on io_uring and
-  epoll (`giong-grpc/interop/run.sh`, the `gRPC` workflow). Measured against tonic 0.14
+  epoll (`giong-grpc/interop/run.sh`, the `gRPC` workflow), and by hand against tonic
+  0.14.2's interop client and server (the eleven cases they implement). Measured against tonic 0.14
   with `bench/grpc.sh` (4-core cloud VM, median of 10 rounds): a one-thread server does 30%
   to 50% more 100-byte unary calls a second, 21% to 25% more 10,000-byte ones, 48% to 50%
   more round trips on bidirectional streams and 3.8 to 4.0 times the messages of a server

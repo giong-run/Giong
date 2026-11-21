@@ -414,7 +414,6 @@ impl Call {
             timeout: self.timeout,
             peer: self.peer,
             done: false,
-            response: None,
             marker: PhantomData,
         }
     }
@@ -508,10 +507,11 @@ impl Call {
     /// [`server_streaming`](Self::server_streaming).
     ///
     /// The response starts (its headers are sent, with the metadata set
-    /// until then) when the handler first sends a message or first reads
-    /// a request, whichever comes first: a client that waits for the
-    /// response to start before it sends its first request, as some do,
-    /// is not left waiting.
+    /// until then) with the first message the handler sends; a handler
+    /// that ends first answers with the status alone (Trailers-Only), as
+    /// grpc-go's and tonic's servers do. A client that waits for the
+    /// response to start before it sends its first request is left waiting
+    /// unless the handler sends first, with this server as with those.
     pub fn bidi<Req, Resp, F, Fut>(mut self, handler: F) -> CallFuture
     where
         Req: MessageType,
@@ -520,11 +520,8 @@ impl Call {
         Fut: Future<Output = Result<(), Status>> + 'static,
     {
         Box::pin(async move {
-            let mut stream = self.incoming::<Req>();
-            let start = move |sink: Sink<Resp>| {
-                stream.response = Some(sink.shared.clone());
-                handler(stream, sink)
-            };
+            let stream = self.incoming::<Req>();
+            let start = move |sink: Sink<Resp>| handler(stream, sink);
             Answer(self.stream(start).await)
         })
     }
@@ -1109,18 +1106,11 @@ pub struct RequestStream<M> {
     timeout: Option<Duration>,
     peer: Option<SocketAddr>,
     done: bool,
-    /// The response of a bidirectional call, which starts when the
-    /// requests are first read.
-    response: Option<Rc<Shared>>,
     marker: PhantomData<fn() -> M>,
 }
 
 impl<M: MessageType> RequestStream<M> {
     /// The next message, or `None` once the client has sent its last.
-    ///
-    /// In a bidirectional call the first call starts the response: its
-    /// headers are sent, with the metadata set until then
-    /// ([`Sink::set_metadata`]).
     ///
     /// Cancel safe: a message is only taken when it is returned.
     ///
@@ -1143,9 +1133,11 @@ impl<M: MessageType> RequestStream<M> {
                     return Err(status);
                 }
             }
-            if let Some(response) = self.response.take() {
-                response.start_streaming();
-            }
+            // The head is not sent while the handler waits for the client:
+            // it goes out with the first message, or as the status alone
+            // (Trailers-Only) when the call ends first, like grpc-go's and
+            // tonic's servers, whose clients (tonic's) report a call that
+            // fails before any message only through Trailers-Only.
             let piece = match &mut self.body {
                 Some(body) => body.chunk().await,
                 None => Ok(None),
