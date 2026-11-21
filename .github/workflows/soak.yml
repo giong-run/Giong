@@ -69,6 +69,36 @@ jobs:
           GIONG_SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) \
             cargo test -p giong --release --locked --test soak -- --ignored --nocapture
 
+  # The ported suites again and again on the other Windows image for as
+  # long: cancellation and wake-up races that one pass in a hundred hits.
+  repeat-windows:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      SUITES: >-
+        --lib --test executor --test channels --test time --test shutdown
+        --test observe --test spin --test net --test udp --test cancel
+        --test multi --test balance --test dns --test fs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: cargo test -p giong --release --locked --no-run $SUITES
+      - name: Repeat the suites
+        run: |
+          end=$(( SECONDS + ${{ inputs.minutes || '120' }} * 60 ))
+          runs=0
+          while [ "$SECONDS" -lt "$end" ]; do
+            runs=$(( runs + 1 ))
+            cargo test -p giong --release --locked -q $SUITES > run.log 2>&1 ||
+              { echo "run $runs failed"; cat run.log; exit 1; }
+          done
+          echo "$runs runs passed" | tee -a "$GITHUB_STEP_SUMMARY"
+
   soak-packed-buffers:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
