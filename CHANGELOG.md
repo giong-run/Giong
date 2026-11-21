@@ -34,7 +34,9 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   kinds of call (unary, server streaming, client streaming, bidirectional), deadlines sent
   and enforced on both sides, cancellation that drops the server's handler, text and
   binary metadata, statuses with details, gzip per message, message size limits (4 MiB by
-  default), TLS through ALPN. `giong_grpc::Server` is a giong-http handler; a `Channel`
+  default), TLS through ALPN. A streaming response's headers go out with its first message, or as
+  a Trailers-Only response when the handler ends without sending one, as grpc-go and tonic
+  do: metadata set before the first message still arrives first. `giong_grpc::Server` is a giong-http handler; a `Channel`
   shares HTTP/2 connections between calls. The statuses it raises itself carry
   `GIONG-E4101` to `GIONG-E4110` with the cause and the fix. Tested against grpc-go in
   both directions with the cases of gRPC's interoperability specification, on io_uring and
