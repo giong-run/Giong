@@ -111,6 +111,8 @@ fn tasks_spawned_inside_a_budget_are_charged_to_it() {
     giong::block_on(async {
         let b = Budget::new("t", Limits::new().tasks(1));
         let (tx, rx) = giong::sync::oneshot::channel::<()>();
+        // The parent returns its child's handle, which is a future.
+        #[allow(clippy::async_yields_async)]
         let parent = b
             .spawn(async move {
                 assert_eq!(budget::current().unwrap().name(), "t");

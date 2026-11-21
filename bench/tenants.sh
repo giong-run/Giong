@@ -134,7 +134,7 @@ key = lambda r: (r['scenario'], r['driver'], r['mode'])
 groups = {}
 for r in rows:
     groups.setdefault(key(r), {}).setdefault(r['load'], []).append(r)
-print(f"{'scenario':<8}{'driver':<10}{'mode':<10}{'B solo ok':>11}{'B overload ok':>15}{'kept':>8}{'B p99 ms':>10}{'A ok':>9}{'peak MiB':>10}{'OOM':>5}")
+print(f"{'scenario':<9}{'driver':<10}{'mode':<10}{'B solo ok':>11}{'B overload ok':>15}{'kept':>8}{'B p99 ms':>10}{'A ok':>9}{'peak MiB':>10}{'OOM':>5}")
 for k in sorted(groups):
     g = groups[k]
     solo = statistics.median(int(r['b_ok_in_deadline']) for r in g.get('solo', []))
@@ -144,6 +144,6 @@ for k in sorted(groups):
     aok = statistics.median(int(r['a_ok']) for r in over)
     peak = max(int(r['peak_mib']) for r in over)
     ooms = sum(int(r['oom_kills']) for r in over)
-    print(f"{k[0]:<8}{k[1]:<10}{k[2]:<10}{solo:>11.0f}{ov:>15.0f}{100*ov/solo if solo else 0:>7.1f}%{p99:>10.1f}{aok:>9.0f}{peak:>10}{ooms:>5}")
+    print(f"{k[0]:<9}{k[1]:<10}{k[2]:<10}{solo:>11.0f}{ov:>15.0f}{100*ov/solo if solo else 0:>7.1f}%{p99:>10.1f}{aok:>9.0f}{peak:>10}{ooms:>5}")
 print("kept = B's in-deadline successes under overload / solo (medians over rounds); A ok = total over the run")
 PY

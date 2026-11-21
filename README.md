@@ -1036,6 +1036,31 @@ are within noise. Most of an echo's cost here is the kernel's UDP and veth path:
 giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for each one
 (`post-soak/udp-perf/`).
 
+### Two tenants on one small box
+
+A server in a cgroup of 1 CPU and 128 MiB (one worker and one compute thread, pinned to one
+CPU), shared by two tenants. Every request holds memory from its start to its answer and runs
+a CPU-bound job on the compute lane. Tenant B sends 100 requests per second and needs each
+answered within 50 ms; tenant A keeps 64 (or 128) requests in flight back to back, far more
+than the box can serve. Medians of 3 rounds of 20 s, both drivers alike
+(`bench/tenants.sh`, raw data in `bench/results/tenants/`, 4-vCPU cloud VM):
+
+| Requests | Service | B in deadline, alone | B in deadline, with A | B p99 with A |
+|---|---|---|---|---|
+| 2 ms CPU, 256 KiB | no limits | 2,000 | **0** | 10.1 s |
+| | one `Budget` for both tenants | 2,000 | **0** | 10.2 s |
+| | one `Budget` per tenant | 2,000 | **2,000 (100%)** | 4.4 ms |
+| 0.5 ms CPU, 2 MiB | no limits | 2,000 | **0**: OOM-killed in every round | |
+| | one `Budget` for both tenants | 2,000 | **0** | 232 ms |
+| | one `Budget` per tenant | 2,000 | **2,000 (100%)** | 3.1-4.4 ms |
+
+A limit for the whole service keeps it alive but lets A take all of it; a budget per tenant
+(32 MiB and 8 compute closures each, waiting forms only, nothing refused) keeps B at its
+solo level while the box stays fully used: A gets the CPU B leaves, and in the first
+scenario the box serves about 490 requests per second in total either way. Not measured yet:
+more than two tenants, tenants sharing a database pool, and HTTP/1.1 uploads, whose bytes
+`giong-http` still counts per worker, not per tenant.
+
 ### What has not been measured
 
 - **More than eight cores, and the other tables on a physical network.** The bare-metal
@@ -1048,8 +1073,8 @@ giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for e
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
 `bench/tls.sh`, `bench/fs.sh`, `bench/core.sh`, `bench/postgres.sh`, `bench/mysql.sh`,
-`bench/redis.sh`, `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh`
-and `bench/udp-echo.sh`; two cores with
+`bench/redis.sh`, `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh`,
+`bench/udp-echo.sh` and `bench/tenants.sh` (as root, for its cgroup); two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per
@@ -1220,6 +1245,10 @@ younger than both and has not run in production.
   `std::future` do. For PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for
   MySQL, [`giong-mysql`](giong-mysql/README.md); for Redis,
   [`giong-redis`](giong-redis/README.md); for HTTP requests, `giong-http`'s client.
+- **Budgets charge what they can see.** A `giong::budget::Budget` counts reserved memory and
+  task futures, not every allocation of the tenant's code; it does not charge time on the
+  workers (heavy work belongs on the compute lane, which it shares fairly), work spawned on
+  another worker, the blocking lane, or `giong-http`'s per-worker request byte budget.
 - **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
   `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
   `TcpListener::bind_balanced` hand new connections to less busy workers. A connection
