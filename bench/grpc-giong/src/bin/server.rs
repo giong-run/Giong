@@ -68,7 +68,7 @@ fn main() {
         .build()
         .unwrap()
         .run(move |_| async move {
-            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let listener = TcpListener::bind_balanced(("127.0.0.1", port)).unwrap();
             let grpc = Server::new().add(BenchServer::new(Service));
             // The HTTP/2 window a stream starts with is a share of the body
             // budget, which follows max_body_size: with gRPC's 4 MiB message

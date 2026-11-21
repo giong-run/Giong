@@ -26,6 +26,9 @@
 #     on CLIENT_CPU, CONNS connections and TASKS tasks, against each server
 #     with three threads on PEER_CPUS, so that the client's core is the
 #     limit. `cpu%` and `us/op` are the client's.
+#     The giong-grpc server there listens with `bind_balanced`, so that the
+#     two connections land on two of its workers rather than where the
+#     kernel's hash puts them (sometimes both on one).
 #   * Both servers have their defaults, but for one setting of giong-http's:
 #     `max_body_size(4 MiB)`, gRPC's message limit, which makes the HTTP/2
 #     window a stream starts with 20 KiB instead of 5 KiB (it is a share of

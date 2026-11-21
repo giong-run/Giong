@@ -766,6 +766,22 @@ impl<M: MessageType> ResponseStream<M> {
     /// server did not answer as gRPC specifies. After an error, or `None`,
     /// the call is over and every further call returns `None`.
     pub async fn message(&mut self) -> Result<Option<Received<M>>, Status> {
+        // A message already received is returned without the future that
+        // waits for more: that one is large (it holds the wait for the
+        // response and the deadline), and setting it up for each message
+        // cost more than taking the message out.
+        if self.opened && matches!(self.source, Source::Open(_)) {
+            match self.deframer.next() {
+                Ok(Some(payload)) => return Ok(Some(Received::new(payload))),
+                Ok(None) => {}
+                Err(status) => return Err(self.fail(status)),
+            }
+        }
+        Box::pin(self.wait_message()).await
+    }
+
+    /// [`message`](Self::message) when no message is ready.
+    async fn wait_message(&mut self) -> Result<Option<Received<M>>, Status> {
         if matches!(self.source, Source::Done) {
             return Ok(None);
         }

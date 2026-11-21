@@ -179,6 +179,10 @@ pub(crate) struct Deframer {
     max: usize,
     /// Whether the other side said it compresses with gzip.
     gzip: bool,
+    /// The piece that arrived while `buf` ended in a message: `buf` holds
+    /// that message completed with the first bytes of the piece, and the
+    /// piece goes on from here once it is taken.
+    after: Option<(Vec<u8>, usize)>,
 }
 
 impl Deframer {
@@ -188,6 +192,7 @@ impl Deframer {
             at: 0,
             max,
             gzip,
+            after: None,
         }
     }
 
@@ -200,6 +205,16 @@ impl Deframer {
                 Some(buf) => *buf = piece,
                 None => self.buf = Rc::new(piece),
             }
+        } else if let Some(head) = self.completes(&piece) {
+            // A message goes on in this piece and ends in it: only the
+            // message is put together, and the piece is read where it was
+            // received, instead of copied behind the message's start.
+            let rest = &self.buf[self.at..];
+            let mut joined = Vec::with_capacity(rest.len() + head);
+            joined.extend_from_slice(rest);
+            joined.extend_from_slice(&piece[..head]);
+            self.buf = Rc::new(joined);
+            self.after = Some((piece, head));
         } else {
             // A message goes on in this piece: its start moves in front.
             match Rc::get_mut(&mut self.buf) {
@@ -219,8 +234,32 @@ impl Deframer {
         self.at = 0;
     }
 
+    /// How many bytes of `piece` complete the message that `buf` ends in,
+    /// when it ends in one, the piece holds the rest of it and more, and
+    /// the message is shorter than the piece: then putting the message
+    /// together costs less than copying the piece.
+    fn completes(&self, piece: &[u8]) -> Option<usize> {
+        let rest = &self.buf[self.at..];
+        let mut prefix = [0; PREFIX];
+        let have = rest.len().min(PREFIX);
+        prefix[..have].copy_from_slice(&rest[..have]);
+        prefix[have..].copy_from_slice(piece.get(..PREFIX - have)?);
+        let len = u32::from_be_bytes([prefix[1], prefix[2], prefix[3], prefix[4]]) as usize;
+        let head = (PREFIX + len).checked_sub(rest.len())?;
+        (head < piece.len() && PREFIX + len < piece.len()).then_some(head)
+    }
+
     /// The next complete message, if one has arrived.
     pub(crate) fn next(&mut self) -> Result<Option<Payload>, Status> {
+        if self.at == self.buf.len() {
+            if let Some((piece, at)) = self.after.take() {
+                match Rc::get_mut(&mut self.buf) {
+                    Some(buf) => *buf = piece,
+                    None => self.buf = Rc::new(piece),
+                }
+                self.at = at;
+            }
+        }
         let rest = &self.buf[self.at..];
         let Some(prefix) = rest.get(..PREFIX) else {
             return Ok(None);
@@ -286,13 +325,17 @@ impl Deframer {
 
     /// The body ended: nothing may be left over.
     pub(crate) fn finish(&self) -> Result<(), Status> {
-        if self.at == self.buf.len() {
+        let left = self.buf.len() - self.at
+            + self
+                .after
+                .as_ref()
+                .map_or(0, |(piece, at)| piece.len() - at);
+        if left == 0 {
             Ok(())
         } else {
             Err(protocol(format!(
-                "the stream ended in the middle of a message ({} bytes of an incomplete \
-                 frame)",
-                self.buf.len() - self.at
+                "the stream ended in the middle of a message ({left} bytes of an incomplete \
+                 frame)"
             )))
         }
     }
@@ -521,6 +564,53 @@ mod tests {
             deframer.finish().unwrap();
             assert_eq!(got, messages, "step {step}");
         }
+    }
+
+    #[test]
+    fn messages_split_between_large_pieces_survive_any_split() {
+        // Short messages in pieces larger than they are: a message cut by
+        // the end of a piece is put together alone, and the next piece is
+        // read where it is.
+        let messages: Vec<Vec<u8>> = (0..200).map(|i| vec![i as u8; i % 37 * 3]).collect();
+        let mut wire = Vec::new();
+        for m in &messages {
+            wire.extend(encode_frame(&Raw(m.clone()), false, 1 << 20).unwrap());
+        }
+        for step in [6, 50, 113, 500, 1021, 4096] {
+            let mut deframer = Deframer::new(1 << 20, false);
+            let mut got = Vec::new();
+            let mut held = Vec::new();
+            for piece in wire.chunks(step) {
+                deframer.push(piece.to_vec());
+                while let Some(m) = deframer.next().unwrap() {
+                    got.push(m.as_slice().to_vec());
+                    // Some messages are still held when the next piece
+                    // arrives.
+                    if got.len() % 3 == 0 {
+                        held.push((got.len() - 1, m));
+                    }
+                }
+            }
+            deframer.finish().unwrap();
+            assert_eq!(got, messages, "step {step}");
+            for (i, m) in &held {
+                assert_eq!(m.as_slice(), &messages[*i][..], "step {step}, message {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_that_ends_inside_a_message_is_refused() {
+        let mut wire = encode_frame(&Raw(vec![1; 10]), false, 1000).unwrap();
+        wire.extend(encode_frame(&Raw(vec![2; 300]), false, 1000).unwrap());
+        let mut deframer = Deframer::new(1000, false);
+        deframer.push(wire[..12].to_vec());
+        assert!(deframer.next().unwrap().is_none());
+        // The second piece completes the first message and cuts the second.
+        deframer.push(wire[12..200].to_vec());
+        assert_eq!(deframer.next().unwrap().unwrap().as_slice(), &[1; 10]);
+        assert!(deframer.next().unwrap().is_none());
+        assert!(deframer.finish().is_err());
     }
 
     #[test]

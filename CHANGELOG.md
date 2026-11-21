@@ -38,12 +38,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   `GIONG-E4101` to `GIONG-E4110` with the cause and the fix. Tested against grpc-go in
   both directions with the cases of gRPC's interoperability specification, on io_uring and
   epoll (`giong-grpc/interop/run.sh`, the `gRPC` workflow). Measured against tonic 0.14
-  with `bench/grpc.sh` (4-core cloud VM, median of 5 rounds): a one-thread server does 31%
-  to 43% more 100-byte unary calls a second, 19% to 24% more 10,000-byte ones, 50% to 60%
-  more round trips on bidirectional streams and 3.9 to 4.1 times the messages of a server
-  stream, and holds 5.6 kB instead of 11.6 kB per open stream. A one-thread client is 2% to
-  17% ahead, except against giong-grpc's own server: level on 10,000-byte unary calls and
-  behind on server streams (10.6% to 18.2% in two runs). Tables and
+  with `bench/grpc.sh` (4-core cloud VM, median of 10 rounds): a one-thread server does 30%
+  to 50% more 100-byte unary calls a second, 21% to 25% more 10,000-byte ones, 48% to 50%
+  more round trips on bidirectional streams and 3.8 to 4.0 times the messages of a server
+  stream, and holds 5.7 kB instead of 11.6 kB per open stream. A one-thread client is level
+  to 14% ahead (round trips against tonic's server, which that row measures: −1.7%). Tables and
   what was not measured: `giong-grpc/README.md`; raw data: `bench/results/grpc/`.
 - **giong-grpc: health checking and server reflection.** `giong_grpc::health::Health`
   serves `grpc.health.v1.Health` (Check, List, Watch) from statuses the program sets from
@@ -80,7 +79,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   The bytes in the output now count against the connection's budget for unsent responses
   until they are written, so a connection holds no more than before. 10,000-byte gRPC unary
   calls from tonic's client on one server thread (`bench/grpc.sh`, 4-core cloud VM,
-  io_uring): 62,597 to 88,338 calls a second with 16 in flight per connection.
+  io_uring): 62,597 to 89,862 calls a second with 16 in flight per connection.
+- **giong-http client** (performance): over HTTP/2, `StreamingResponse::chunk` hands over a
+  received DATA frame's buffer as it is (small frames still arrive joined) instead of
+  copying the frames that wait into one piece. Pieces stay within 64 KiB as documented.
 
 ### Fixed
 

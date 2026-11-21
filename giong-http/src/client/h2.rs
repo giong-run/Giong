@@ -260,8 +260,10 @@ impl Stream {
 
     /// Appends what has arrived of the body to `out`, waiting for some if
     /// nothing has: whole frames, and no more than `limit` bytes unless
-    /// one frame is larger. Returns `false`, with nothing appended, at the
-    /// end. Cancel safe: what is appended is taken off the stream.
+    /// one frame is larger; into an empty `out`, one frame (small frames
+    /// arrive joined), which is moved rather than copied. Returns `false`,
+    /// with nothing appended, at the end. Cancel safe: what is appended is
+    /// taken off the stream.
     pub(crate) async fn read(
         &mut self,
         out: &mut Vec<u8>,
@@ -287,11 +289,13 @@ impl Stream {
                     }
                     let chunk = s.data.pop_front().expect("the front was there");
                     n += chunk.len();
-                    if out.is_empty() && out.capacity() < chunk.len() {
+                    if out.is_empty() {
+                        // The frame's buffer is handed over as it is:
+                        // joining the frames that wait would copy them.
                         *out = chunk;
-                    } else {
-                        out.extend_from_slice(&chunk);
+                        break;
                     }
+                    out.extend_from_slice(&chunk);
                 }
                 s.buffered -= n;
                 st.consumed(id, n);

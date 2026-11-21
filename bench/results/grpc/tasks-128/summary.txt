@@ -1,12 +1,12 @@
-5 rounds of 5 s; median, min and max of the rounds; 2 connections and 128 tasks per load process
+10 rounds of 5 s; median, min and max of the rounds; 2 connections and 128 tasks per load process
 
 server: one server thread, loaded by 3 processes of `load`
 workload  load   server   ops/s median       min       max  p50 us  p99 us  cpu%   us/op  vs tonic
 
-unary10k  tonic  tonic           71231     68162     72050    5424    6930    96  13.449          
-unary10k  tonic  giong           77211     75197     83220    5100    7908    91  11.904     +8.4%
-unary10k  giong  tonic           69857     63745     72542    5351    8984    96  13.742          
-unary10k  giong  giong          100782     96640    113636    3650    5820    95   9.296    +44.3%
+unary10k  tonic  tonic           70778     65620     74142    5423    7822    96  13.549          
+unary10k  tonic  giong           78401     72004     84588    4920    7834    91  11.645    +10.8%
+unary10k  giong  tonic           70002     67287     77566    5402    8472    96  13.643          
+unary10k  giong  giong          103618     99214    114711    3657    5562    95   9.207    +48.0%
 
 
 
