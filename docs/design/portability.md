@@ -343,6 +343,20 @@ for this repository, and its Intel runners were not used. Nothing in the
 driver is specific to Apple Silicon or to these versions, but that is not
 a claim the tests back.
 
+**Soak on macOS.** `.github/workflows/macos-soak.yml` runs the runtime
+and TLS soak tests (connection churn, cancellation, UDP, files, TLS
+handshakes and resumption) for 2 h on each runner, with every check the
+Linux soak makes, but a quarter of the clients (`GIONG_SOAK_CLIENTS`: 8
+per worker instead of 32, 4 instead of 16 for TLS). At the full load the
+macOS kernel ran out of buffers: it draws every socket buffer from one
+mbuf pool, the soak keeps a few hundred sockets holding unread data on
+purpose, and sends and connects then failed with `ENOBUFS` for 0.05-0.15%
+of connections (Linux makes the sender wait instead). Those runs had no
+hang and no leak (25 descriptors and 9 MB at the end of 102 million
+connections). A short TIME_WAIT (`net.inet.tcp.msl` 250 ms) keeps the
+churn from using up the ephemeral ports. Whether giong should wait and
+retry a send that fails with `ENOBUFS`, rather than report it, is open.
+
 **Speed on macOS.** `bench/core.sh` on the runners
 (`.github/workflows/macos-bench.yml`, 5 rounds, median wall time in ns per
 operation, CPU time in brackets; one runtime thread except `tokio-mt`;

@@ -31,6 +31,13 @@ jobs:
     timeout-minutes: 300
     env:
       GIONG_TEST_EXPECT_DRIVER: kqueue
+      # A quarter of the clients the soak runs on Linux (8 instead of 32 per
+      # worker for runtime, 4 instead of 16 for TLS), same scenarios and
+      # checks. macOS draws every socket buffer from one mbuf pool; at the
+      # full load the sockets holding unread data (stalled echoes,
+      # cancelled receives) used it up, and sends and connects failed with
+      # ENOBUFS for 0.05-0.15% of connections. Linux makes the sender wait.
+      GIONG_SOAK_CLIENTS: ${{ matrix.workload == 'runtime' && '8' || '4' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -55,5 +62,5 @@ jobs:
         run: |
           ulimit -n 65536 || ulimit -n 10240
           # Every minute, how many sockets wait in TIME_WAIT, for the log.
-          (while sleep 60; do echo "time_wait: $(netstat -an -p tcp | grep -c TIME_WAIT)"; done) &
+          (while sleep 60; do echo "time_wait: $(netstat -an -p tcp | grep -c TIME_WAIT) $(netstat -m | grep -m1 'mbufs in use')"; done) &
           SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak ${{ matrix.workload }}
