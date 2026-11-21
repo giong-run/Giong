@@ -38,6 +38,10 @@ jobs:
       - name: Core benchmarks
         env:
           RUNTIMES: giong tokio-ct tokio-local tokio-mt smol
+          # No `connect`: each run opens 10,000 connections, and Windows
+          # keeps a closed one's port in TIME_WAIT for two minutes, so the
+          # 16,384 ephemeral ports run out by the second runtime.
+          WORKLOADS: spawn yield pingpong mpsc bounded oneshot chain timers timeout xthread tcp-rr lookup
         run: bench/core.sh 5 "../results/core/${{ matrix.os }}"
       - run: cat "bench/results/core/${{ matrix.os }}/summary.txt" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
