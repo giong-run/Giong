@@ -168,7 +168,18 @@ impl Wait {
 /// dropped.
 #[must_use = "the wait is timed until this is dropped"]
 pub struct WaitTimer {
-    started: Option<(u64, Wait, &'static str, Instant)>,
+    // Boxed, so that the timer is one pointer in the futures that hold it
+    // across an `.await` (a database command, a pool's `get`), and nothing
+    // is allocated when no traced request is being served.
+    started: Option<Box<Started>>,
+}
+
+/// A wait being timed: the request's id, what it waits for, and since when.
+struct Started {
+    id: u64,
+    kind: Wait,
+    what: &'static str,
+    at: Instant,
 }
 
 impl WaitTimer {
@@ -180,15 +191,16 @@ impl Drop for WaitTimer {
     #[inline]
     fn drop(&mut self) {
         if let Some(started) = self.started.take() {
-            charge(started);
+            charge(&started);
         }
     }
 }
 
 /// Adds a wait that ended to the request it belongs to.
 #[cold]
-fn charge((id, kind, what, start): (u64, Wait, &'static str, Instant)) {
-    let took = start.elapsed();
+fn charge(started: &Started) {
+    let Started { id, kind, what, at } = *started;
+    let took = at.elapsed();
     with_current(|active| {
         // Dropped while another request's handler is polled, or none (the
         // request's future dropped by its connection): the wait belongs to a
@@ -234,8 +246,18 @@ impl fmt::Debug for WaitTimer {
 pub fn wait(kind: Wait, what: &'static str) -> WaitTimer {
     let id = with_current(|active| active.id);
     WaitTimer {
-        started: id.map(|id| (id, kind, what, Instant::now())),
+        started: id.map(|id| start_wait(id, kind, what)),
     }
+}
+
+#[cold]
+fn start_wait(id: u64, kind: Wait, what: &'static str) -> Box<Started> {
+    Box::new(Started {
+        id,
+        kind,
+        what,
+        at: Instant::now(),
+    })
 }
 
 /// Names the route of the request being served, for grouping: see

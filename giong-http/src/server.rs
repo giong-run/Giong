@@ -87,27 +87,38 @@ impl<F: Future> Future for Caught<F> {
         // it is never moved out, and `Caught` has no `Drop` of its own.
         // `trace` is not pinned.
         let this = unsafe { self.get_unchecked_mut() };
-        let mut fut = unsafe { Pin::new_unchecked(&mut this.fut) };
-        let polled = match &mut this.trace {
-            None => catching(|| fut.as_mut().poll(cx)),
-            Some(trace) => trace.poll(|| catching(|| fut.as_mut().poll(cx))),
-        };
-        let answer = match polled {
-            Ok(Poll::Pending) => return Poll::Pending,
-            Ok(Poll::Ready(value)) => Ok(value),
-            Err(()) => Err(()),
-        };
+        let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
         if this.trace.is_some() {
-            hand_back(&mut this.trace);
+            return poll_traced(fut, &mut this.trace, cx);
         }
-        Poll::Ready(answer)
+        match catching(|| fut.poll(cx)) {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(()) => Poll::Ready(Err(())),
+        }
     }
 }
 
-/// See `handed_back`.
+/// `Caught::poll` while requests are traced: polls the handler through its
+/// trace, and hands the trace back once the handler is done.
 #[cold]
-fn hand_back(trace: &mut Option<Box<RequestTrace>>) {
+#[inline(never)]
+fn poll_traced<F: Future>(
+    mut fut: Pin<&mut F>,
+    trace: &mut Option<Box<RequestTrace>>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<F::Output, ()>> {
+    let polled = match trace {
+        Some(t) => t.poll(|| catching(|| fut.as_mut().poll(cx))),
+        None => catching(|| fut.as_mut().poll(cx)),
+    };
+    let answer = match polled {
+        Ok(Poll::Pending) => return Poll::Pending,
+        Ok(Poll::Ready(value)) => Ok(value),
+        Err(()) => Err(()),
+    };
     HANDED_BACK.set(trace.take());
+    Poll::Ready(answer)
 }
 
 /// The answer to a request whose handler panicked.
@@ -1228,10 +1239,12 @@ struct Conn<T> {
     /// What the unparsed data and the body being decoded hold against the
     /// worker's budget for requests (see `budget`).
     charge: Charge,
-    /// Requests followed while request tracing is on (see
-    /// `giong::observe::RequestTrace`); `None` otherwise, so that tracing
-    /// costs every connection one pointer.
-    traces: Option<Box<Traces>>,
+    /// Where the requests followed while request tracing is on (see
+    /// `giong::observe::RequestTrace`) are kept, in the worker's `TRACES`:
+    /// its index plus one, 0 for none. Kept there and not in the connection,
+    /// so that tracing does not make idle connections larger (this fits in
+    /// what the connection's layout leaves free).
+    traces: u32,
     /// The connection's place under `max_connections`, given back when the
     /// connection is dropped. Declared last, so that the stream is closed
     /// first.
@@ -1249,6 +1262,86 @@ struct Traces {
     answered: Vec<RequestTrace>,
 }
 
+thread_local! {
+    /// The worker's `Traces`, by connection (see `Conn::traces`); `None`
+    /// marks a free entry, listed in `free`.
+    static TRACES: RefCell<TraceSlab> = const {
+        RefCell::new(TraceSlab {
+            entries: Vec::new(),
+            free: Vec::new(),
+        })
+    };
+}
+
+struct TraceSlab {
+    entries: Vec<Option<Traces>>,
+    free: Vec<u32>,
+}
+
+/// A new entry in `TRACES`, as `Conn::traces` names it.
+fn new_traces() -> u32 {
+    TRACES
+        .try_with(|slab| {
+            let mut slab = slab.borrow_mut();
+            if let Some(i) = slab.free.pop() {
+                slab.entries[i as usize] = Some(Traces::default());
+                return i + 1;
+            }
+            let Ok(i) = u32::try_from(slab.entries.len()) else {
+                return 0;
+            };
+            if i == u32::MAX {
+                return 0;
+            }
+            slab.entries.push(Some(Traces::default()));
+            i + 1
+        })
+        .unwrap_or(0)
+}
+
+/// Runs `f` on the entry `slot` of `TRACES` (not 0).
+fn with_traces<R>(slot: u32, f: impl FnOnce(&mut Traces) -> R) -> Option<R> {
+    TRACES
+        .try_with(|slab| {
+            let mut slab = slab.borrow_mut();
+            slab.entries
+                .get_mut(slot as usize - 1)
+                .and_then(Option::as_mut)
+                .map(f)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Frees the entry `slot` of `TRACES` (not 0). The requests it still
+/// follows are dropped, after the slab is released: they count as
+/// abandoned.
+fn free_traces(slot: u32) {
+    let traces = TRACES
+        .try_with(|slab| {
+            let mut slab = slab.borrow_mut();
+            let traces = slab
+                .entries
+                .get_mut(slot as usize - 1)
+                .and_then(Option::take);
+            if traces.is_some() {
+                slab.free.push(slot - 1);
+            }
+            traces
+        })
+        .ok()
+        .flatten();
+    drop(traces);
+}
+
+impl<T> Drop for Conn<T> {
+    fn drop(&mut self) {
+        if self.traces != 0 {
+            free_traces(self.traces);
+        }
+    }
+}
+
 impl<T: Transport> Conn<T> {
     fn new(stream: T, cfg: Config, slot: Option<Slot>) -> Self {
         Self {
@@ -1264,61 +1357,72 @@ impl<T: Transport> Conn<T> {
             deadline: None,
             first: true,
             charge: Charge::none(),
-            traces: None,
+            traces: 0,
             _slot: slot,
         }
     }
 
-    /// Starts following a request whose first bytes are in, if requests are
-    /// traced and it is not followed yet.
-    #[inline]
-    fn trace_arrival(&mut self) {
-        if self.traces.is_some() || RequestTrace::is_on() {
-            self.trace_arrival_slow();
-        }
-    }
-
+    /// Starts following a request whose first bytes are in, if it is not
+    /// followed yet. Called when `RequestTrace::is_on`.
     #[cold]
     #[inline(never)]
-    fn trace_arrival_slow(&mut self) {
-        if self.traces.as_ref().is_some_and(|t| t.current.is_some()) {
+    fn trace_arrival(&mut self) {
+        if self.traces != 0 && with_traces(self.traces, |t| t.current.is_some()) == Some(true) {
             return;
         }
         if let Some(trace) = RequestTrace::start("http/1.1") {
-            self.traces.get_or_insert_with(Box::default).current = Some(Box::new(trace));
+            if self.traces == 0 {
+                self.traces = new_traces();
+            }
+            if self.traces != 0 {
+                with_traces(self.traces, |t| t.current = Some(Box::new(trace)));
+            }
         }
     }
 
     /// The trace of the request whose handler is about to be called, taken
     /// out for the handler's wrapper to hold.
+    #[cold]
+    #[inline(never)]
     fn trace_handler(&mut self) -> Option<Box<RequestTrace>> {
-        let mut trace = self.traces.as_mut()?.current.take()?;
+        if self.traces == 0 {
+            return None;
+        }
+        let mut trace = with_traces(self.traces, |t| t.current.take()).flatten()?;
         trace.started();
         Some(trace)
     }
 
     /// The handler is done with the trace `trace_handler` took.
+    #[cold]
+    #[inline(never)]
     fn trace_back(&mut self, trace: Option<Box<RequestTrace>>) {
-        if let (Some(t), Some(trace)) = (&mut self.traces, trace) {
-            t.current = Some(trace);
+        if let (true, Some(trace)) = (self.traces != 0, trace) {
+            with_traces(self.traces, |t| t.current = Some(trace));
         }
     }
 
     /// The handler answered with `status`: the answer goes out with the
-    /// next write.
+    /// next write. The trace is the one given back with `trace_back`, or
+    /// else the one its wrapper (`Caught`) just handed back.
+    #[cold]
+    #[inline(never)]
     fn trace_answered(&mut self, status: u16) {
-        if let Some(t) = &mut self.traces {
-            if let Some(mut trace) = t.current.take() {
-                trace.responded(status);
-                t.answered.push(*trace);
-            }
+        let handed = handed_back();
+        if self.traces != 0 {
+            with_traces(self.traces, |t| {
+                if let Some(mut trace) = t.current.take().or(handed) {
+                    trace.responded(status);
+                    t.answered.push(*trace);
+                }
+            });
         }
     }
 
     /// Everything answered has been written.
     #[inline]
     fn trace_written(&mut self) {
-        if self.traces.is_some() {
+        if self.traces != 0 {
             self.trace_written_slow();
         }
     }
@@ -1326,11 +1430,12 @@ impl<T: Transport> Conn<T> {
     #[cold]
     #[inline(never)]
     fn trace_written_slow(&mut self) {
-        if let Some(t) = &mut self.traces {
+        // Finishing a trace does not reach `TRACES`.
+        with_traces(self.traces, |t| {
             for trace in t.answered.drain(..) {
                 trace.finish();
             }
-        }
+        });
     }
 
     /// The connection's task.
@@ -1379,7 +1484,7 @@ impl<T: Transport> Conn<T> {
                 (minor, head_only, wants_keep_alive, req)
             };
 
-            let traced = self.traces.is_some();
+            let traced = self.traces != 0;
             let (resp, body_read) = match streamed {
                 None => {
                     // Poll the handler once before deciding what to do with
@@ -1421,9 +1526,6 @@ impl<T: Transport> Conn<T> {
                         }
                         Err(()) => Err(()),
                     };
-                    if traced {
-                        self.trace_back(handed_back());
-                    }
                     match answer {
                         Ok(resp) => (resp, true),
                         // The connection closes after the answer, as after
@@ -1753,10 +1855,12 @@ impl<T: Transport> Conn<T> {
                 }
                 self.first = false;
             }
-            if !data.is_empty() {
+            let data = if !data.is_empty() && RequestTrace::is_on() {
                 self.trace_arrival();
-            }
-            let data = &self.buf[self.pos..];
+                &self.buf[self.pos..]
+            } else {
+                data
+            };
             if let Some(end) = find_head_end(data, self.scanned) {
                 if end > self.cfg.max_head_size {
                     return Err(End::Status(431));
