@@ -21,6 +21,7 @@ mod balance;
 pub(crate) mod dns;
 mod sendq;
 mod share;
+mod steer;
 mod udp;
 mod unix;
 
@@ -896,6 +897,8 @@ pub struct TcpListener {
     /// The listener's hold on its port, for one that [`bind`](Self::bind)
     /// made (see `share`).
     held: Option<share::Held>,
+    /// The listener's place in its port's steered group (see `steer`).
+    steered: Option<steer::Steered>,
 }
 
 impl TcpListener {
@@ -947,13 +950,18 @@ impl TcpListener {
         let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
             Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
         })?;
-        let listener = Self {
+        let mut listener = Self {
             inner: ListenSocket::new(sock),
             balance: None,
             held,
+            steered: None,
         };
         // A failure from here on drops `listener`, which gives the port up.
-        listener.inner.socket().listen(4096)?;
+        if steer::enabled() {
+            listener.steered = Some(steer::listen(listener.inner.socket(), 4096)?);
+        } else {
+            listener.inner.socket().listen(4096)?;
+        }
         Ok(listener)
     }
 
@@ -1012,6 +1020,7 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held: None,
+            steered: None,
         }
     }
 
@@ -1047,6 +1056,9 @@ impl TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         // Before the socket is closed, which happens when `inner` is dropped.
+        if let Some(steered) = self.steered.take() {
+            steered.leave(self.inner.socket());
+        }
         if let Some(held) = self.held.take() {
             held.release(self.inner.socket());
         }
