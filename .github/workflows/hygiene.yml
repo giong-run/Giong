@@ -1,7 +1,8 @@
 name: Hygiene
 
-# Every Monday: the branches with no open pull request and the open pull requests
-# nobody has touched for a week, in the issue labelled `hygiene` (scripts/hygiene.py,
+# Every Monday: the branches with no open pull request, the open pull requests
+# nobody has touched for a week and the issues nobody has touched for two, in the
+# issue labelled `hygiene` (scripts/hygiene.py,
 # docs/DEVELOPMENT.md, "Leave nothing behind"). It reads branches and pull requests
 # and writes that one issue; it never deletes a branch or closes a pull request.
 

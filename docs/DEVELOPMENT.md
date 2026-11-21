@@ -124,9 +124,14 @@ instead of into the current pull request.
   pull request for it, or list it in `.github/hygiene-keep.txt` with the reason it stays.
 - **A draft that waits** says in its description what it waits for (a release, another
   pull request, a measurement).
+- **Issues**: a pull request that resolves an issue says `Fixes #<n>` in its description,
+  so the merge closes it. An issue answered some other way (by measurements already in
+  the repository, by a change that has merged) is closed with a comment linking what
+  answered it and stating any part left undone, which goes to the backlog. An issue that
+  is not being worked on says what it waits for.
 - **Every Monday** the Hygiene workflow (`scripts/hygiene.py`) puts the branches with no
-  open pull request and the pull requests untouched for a week into the issue labelled
-  `hygiene`. Whoever owns an entry deals with it that week; the issue closes itself when
+  open pull request, the pull requests untouched for a week and the issues untouched for
+  two into the issue labelled `hygiene`. Whoever owns an entry deals with it that week; the issue closes itself when
   nothing is left.
 
 ## Never idle
