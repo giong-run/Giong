@@ -5,7 +5,7 @@
 #![cfg_attr(windows, allow(dead_code, unused_imports))]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,11 +22,20 @@ fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
     let handle = rt.handle();
     let ran_on = Arc::new(Mutex::new(Vec::new()));
     let r = ran_on.clone();
+    let started = Arc::new(AtomicUsize::new(0));
     rt.run(move |index| {
         let handle = handle.clone();
         let ran_on = r.clone();
+        let started = started.clone();
         async move {
+            started.fetch_add(1, Ordering::SeqCst);
             if index == 0 {
+                // A worker that has not started cannot take a job: on the
+                // Windows runners one took longer to start than the burst
+                // took to run, and got none.
+                while started.load(Ordering::SeqCst) < WORKERS {
+                    sleep(Duration::from_millis(1)).await;
+                }
                 // Jobs that hold their worker's thread, as CPU-heavy work does.
                 let jobs: Vec<_> = (0..JOBS)
                     .map(|_| {
