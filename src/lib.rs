@@ -93,6 +93,7 @@ mod slab;
 
 pub mod error;
 pub mod fs;
+pub mod ipc;
 pub mod net;
 pub mod observe;
 pub mod sync;
