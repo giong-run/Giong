@@ -346,6 +346,13 @@ impl UdpSocket {
     /// one socket (see [`bind`](Self::bind)), so connecting one sets the
     /// peer of all of them. Connect a socket with a port of its own (port
     /// 0, or an address no other worker binds).
+    ///
+    /// Where Unix fails the next receive on a connected socket with
+    /// `ConnectionRefused` when the peer's port is closed (an ICMP "port
+    /// unreachable" came back), Windows reports nothing: giong turns those
+    /// reports off there, since Windows would otherwise give them to
+    /// unconnected sockets too and end a server's receive loop. Datagrams
+    /// to a closed port are lost silently, as UDP allows.
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let mut last_err = None;
         for addr in resolved(&addr, "UdpSocket::connect")? {
