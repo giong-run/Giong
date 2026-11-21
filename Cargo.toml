@@ -63,10 +63,12 @@ loom = "0.7"
 [dev-dependencies]
 libc = "0.2.172"
 
-# The soak test reads the process's handle count and memory.
+# The soak test reads the process's handle count and memory; a driver
+# test asks whether it runs under Wine.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }

@@ -266,6 +266,33 @@ fn long_datagrams_are_truncated_by_recv_from_and_whole_with_read_from() {
 }
 
 #[test]
+fn a_datagram_already_waiting_and_too_long_for_the_buffer_is_cut_safely() {
+    // The datagram is there before the receive starts, so the receive ends
+    // inside the call, cut off. On Windows that is a warning status, which
+    // still reports through the completion port: the receive's record must
+    // live until then, while the worker goes on with other I/O.
+    giong::block_on(async {
+        let (a, a_addr) = socket();
+        let (b, b_addr) = socket();
+        let data = payload(2000, 7);
+        let mut buf = Vec::with_capacity(512);
+        for round in 0..200 {
+            a.send_to(data.clone(), b_addr).await.0.unwrap();
+            // Let the datagram arrive first.
+            sleep(Duration::from_millis(1)).await;
+            let (res, got) = b.read_from(buf).await;
+            assert_eq!(res.unwrap(), (512, a_addr), "round {round}");
+            assert!(got == data[..512], "round {round}");
+            buf = got;
+            // Other I/O on the worker meanwhile, in both directions.
+            b.send_to(vec![round as u8; 64], a_addr).await.0.unwrap();
+            let (back, from) = a.recv_from().await.unwrap();
+            assert_eq!((back.len(), back[0], from), (64, round as u8, b_addr));
+        }
+    });
+}
+
+#[test]
 fn larger_pool_buffers_carry_larger_datagrams() {
     giong::Builder::new()
         .recv_buffers(64, 65_536)

@@ -50,7 +50,8 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_NOT_SUPPORTED, HANDLE,
+    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NOT_SUPPORTED,
+    HANDLE,
     INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
@@ -196,6 +197,10 @@ enum State {
     Orphan(Option<Box<dyn Any>>),
     /// The waiting part of the multishot operation under this key.
     Multi(usize),
+    /// Ended inside the call with a warning status and reported then; a
+    /// completion packet may still name it (see [`ended_with_a_warning`]).
+    /// The kernel no longer writes to its buffers.
+    Lingering,
 }
 
 /// One operation in flight. The kernel holds a pointer to `overlapped`,
@@ -221,6 +226,18 @@ struct Datagram {
     overhead: usize,
     from_len: i32,
     flags: u32,
+}
+
+/// Whether an overlapped call that returned `code` ended at once with a
+/// warning status, not an error: a datagram or pipe message longer than
+/// the buffer (`STATUS_BUFFER_OVERFLOW`, which Winsock reports as
+/// `WSAEMSGSIZE` and files as `ERROR_MORE_DATA`). The data is in the
+/// buffer, so the result is reported at once. But the I/O manager may
+/// still queue a completion for it: `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`
+/// skips the packet only for success. So the record is not freed: it
+/// lingers ([`State::Lingering`]) and goes when its packet comes.
+fn ended_with_a_warning(code: i32) -> bool {
+    code == WSAEMSGSIZE || code == ERROR_MORE_DATA as i32
 }
 
 /// Bytes of the header in front of every datagram of a multishot receive:
@@ -637,6 +654,15 @@ impl Iocp {
                 self.inflight += 1;
                 Start::Submitted(self.ops.insert(Slot::Single(record)))
             }
+            Err(code) if ended_with_a_warning(code) => {
+                // SAFETY: the call has ended, so the kernel no longer
+                // writes to the record; its packet may still name it.
+                let after = unsafe {
+                    (*record).state = State::Lingering;
+                    (*record).after
+                };
+                Start::Done(Self::cut(after, -code), 0)
+            }
             done => {
                 // Nothing is in flight: no completion will name the record.
                 // SAFETY: it came from `Box::into_raw` and the kernel does
@@ -788,7 +814,7 @@ impl Iocp {
                 }
                 Poll::Pending
             }
-            State::Orphan(_) | State::Multi(_) => {
+            State::Orphan(_) | State::Multi(_) | State::Lingering => {
                 unreachable!("giong: an operation was polled after its drop")
             }
         }
@@ -1099,6 +1125,23 @@ impl Iocp {
                 // SAFETY: the operation completed; this reads its count.
                 unsafe { (*record).overlapped.InternalHigh as i32 }
             }
+            Err(code) if ended_with_a_warning(code) => {
+                // Cut off, inside the call: the datagram is in the buffer,
+                // but a packet may still name the record, which lingers.
+                // SAFETY: the call has ended; the kernel no longer writes
+                // to the record or the datagram it owned.
+                let mut datagram = unsafe {
+                    (*record).state = State::Lingering;
+                    (*record).datagram.take().expect("a datagram receive")
+                };
+                return match Self::datagram(&mut datagram, -code) {
+                    Ok(data) => MultiPoll::Data(data),
+                    Err(e) => {
+                        self.disarm(key);
+                        MultiPoll::Item(e)
+                    }
+                };
+            }
             Err(code) => -code,
         };
         // SAFETY: nothing is in flight for this record.
@@ -1319,6 +1362,15 @@ impl Iocp {
         // SAFETY: every OVERLAPPED this port reports heads a record made
         // by this driver, alive until this very report.
         let rec = unsafe { &mut *record };
+        if let State::Lingering = rec.state {
+            // Reported when its call returned; this is the packet that
+            // the warning status still queued. It was never counted in
+            // flight.
+            // SAFETY: reported, so neither the kernel nor the port holds
+            // it any more.
+            drop(unsafe { Box::from_raw(record) });
+            return;
+        }
         self.inflight -= 1;
         // `Internal` is the NTSTATUS; 0 is success.
         let res = if rec.overlapped.Internal == 0 {
@@ -1400,13 +1452,23 @@ impl Iocp {
                     waker.wake();
                 }
             }
-            State::Done(_) => unreachable!("giong: an operation completed twice"),
+            State::Done(_) | State::Lingering => {
+                unreachable!("giong: an operation completed twice")
+            }
         }
     }
 
     /// Cancels what is left and waits for it. `false` means the kernel may
     /// still use the driver's memory: the caller must leak it.
     pub(crate) fn shutdown(&mut self) -> bool {
+        // Completions that `has_completions` collected and nobody
+        // processed: the waits below would overwrite them.
+        for i in 0..mem::take(&mut self.ready) {
+            let entry = self.events[i];
+            if !entry.lpOverlapped.is_null() {
+                self.complete(entry);
+            }
+        }
         for slot in self.ops.iter() {
             let record = match slot {
                 Slot::Single(record) => *record,
@@ -1462,6 +1524,67 @@ impl Drop for Iocp {
                     drop(unsafe { Box::from_raw(*record) });
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::windows::io::AsRawSocket;
+    use std::time::Duration;
+
+    use super::*;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    use windows_sys::Win32::System::IO::GetQueuedCompletionStatus;
+
+    fn under_wine() -> bool {
+        // SAFETY: looks up an export of a module every process has.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    }
+
+    /// What `State::Lingering` is for: a datagram receive that ends inside
+    /// the call, cut off (`WSAEMSGSIZE`), still queues a completion packet
+    /// with skip-on-success set. Wine queues none, so it is not asked there.
+    #[test]
+    fn a_receive_cut_off_inside_the_call_still_reports_through_the_port() {
+        if under_wine() {
+            return;
+        }
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        tx.send_to(&[7u8; 2000], rx.local_addr().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let socket = rx.as_raw_socket() as SOCKET;
+        // SAFETY: a new port, and a socket this test owns associated with
+        // it; the buffer and OVERLAPPED outlive the wait below.
+        unsafe {
+            let port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1);
+            assert!(!port.is_null());
+            assert!(!CreateIoCompletionPort(socket as HANDLE, port, 0, 0).is_null());
+            let modes = FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+            assert_ne!(SetFileCompletionNotificationModes(socket as HANDLE, modes), 0);
+            let mut buf = [0u8; 512];
+            let wsabuf = WSABUF {
+                len: 512,
+                buf: buf.as_mut_ptr(),
+            };
+            let mut overlapped: Box<OVERLAPPED> = Box::new(mem::zeroed());
+            let (mut n, mut flags) = (0u32, 0u32);
+            let rc = WSARecv(socket, &wsabuf, 1, &mut n, &mut flags, &mut *overlapped, None);
+            assert_eq!((rc, wsa_error()), (-1, WSAEMSGSIZE), "cut off inside the call");
+            let (mut bytes, mut key, mut got) = (0u32, 0usize, ptr::null_mut());
+            let ok = GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 2000);
+            let reported = !got.is_null();
+            assert!(
+                ok != 0 || reported,
+                "no packet came for the cut-off receive (error {})",
+                last_error()
+            );
+            assert_eq!(got, &mut *overlapped as *mut OVERLAPPED);
+            CloseHandle(port);
         }
     }
 }
