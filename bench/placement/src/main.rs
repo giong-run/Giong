@@ -314,10 +314,11 @@ fn mixed(port: u16, secs: u64, seed: u64) {
     let el = t0.elapsed().as_secs_f64();
     lat.sort();
     println!(
-        "hot_rps={:.0} light_p50_us={:.0} light_p99_us={:.0} light_max_us={:.0}",
+        "hot_rps={:.0} light_p50_us={:.0} light_p99_us={:.0} light_p999_us={:.0} light_max_us={:.0}",
         hot_n as f64 / el,
         percentile(&lat, 0.50),
         percentile(&lat, 0.99),
+        percentile(&lat, 0.999),
         percentile(&lat, 1.0),
     );
 }

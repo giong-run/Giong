@@ -22,6 +22,8 @@
 #     per round), 6 hot (100 us of work back to back) and 18 light (20 us
 #     every 20 ms). Reported: hot requests per second (work done) and the
 #     light requests' latency.
+#   * CASES (default "closed paced mixed") picks the cases; ONLY_MODES picks
+#     among the modes below (default: all that apply).
 #   * Modes: "plain" (TcpListener::bind, the kernel's hash decides) and
 #     "balanced" (TcpListener::bind_balanced) of this checkout; with
 #     BEFORE=<path of another giong checkout>, also "before": balanced
@@ -51,6 +53,8 @@ if [ -n "${BEFORE:-}" ]; then
   BIN[before]="$BEFORE/bench/placement/target/release/bench-placement"
   MODES="plain before balanced"
 fi
+MODES=${ONLY_MODES:-$MODES}
+CASES=${CASES:-closed paced mixed}
 
 PID=
 cleanup() { if [ -n "$PID" ]; then kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi; PID=; }
@@ -74,11 +78,13 @@ echo "case,mode,round,metrics" > "$CSV"
 : > "$OUT/client.log"; : > "$OUT/server.log"
 for round in $(seq 1 "$ROUNDS"); do
   for mode in $MODES; do
-    for case in closed paced; do
+    for case in $CASES; do
+      [ "$case" = mixed ] && continue
       gap=0; [ "$case" = paced ] && gap=250
       echo "== skew-$case $mode round $round" >> "$OUT/client.log"
       echo "skew-$case,$mode,$round,\"$(measure "$mode" skew "$PORT" "$SECS" "$gap")\"" >> "$CSV"
     done
+    case " $CASES " in *" mixed "*) ;; *) continue ;; esac
     echo "== mixed $mode round $round" >> "$OUT/client.log"
     echo "mixed,$mode,$round,\"$(measure "$mode" mixed "$PORT" "$SECS" "$round")\"" >> "$CSV"
   done
@@ -92,12 +98,13 @@ def kv(s): return {k: float(v) for k, v in (p.split("=") for p in s.split())}
 print(f"bench/placement.sh: 2 workers, {rounds} rounds of {secs} s, medians of the rounds")
 cases = {"skew-closed": ["probe_rps", "p50_us", "p99_us", "p999_us", "hot_rps"],
          "skew-paced": ["probe_rps", "p50_us", "p99_us", "p999_us", "hot_rps"],
-         "mixed": ["hot_rps", "light_p50_us", "light_p99_us", "light_max_us"]}
+         "mixed": ["hot_rps", "light_p50_us", "light_p99_us", "light_p999_us", "light_max_us"]}
 modes = [m for m in ("plain", "before", "balanced") if any(r["mode"] == m for r in rows)]
 for case, keys in cases.items():
     print(f"\n{case}")
     print(f"{'mode':<10}" + "".join(f"{k:>14}" for k in keys))
     for m in modes:
         vals = [kv(r["metrics"]) for r in rows if r["case"] == case and r["mode"] == m]
-        print(f"{m:<10}" + "".join(f"{statistics.median(v[k] for v in vals):14.0f}" for k in keys))
+        if not vals: continue
+        print(f"{m:<10}" + "".join(f"{statistics.median(v.get(k, float("nan")) for v in vals):14.0f}" for k in keys))
 PY
