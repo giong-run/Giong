@@ -210,6 +210,15 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
                 Counters::bump(&counters.connects_refused);
                 continue;
             }
+            // Windows drops the connects that find the listener's backlog
+            // full rather than refusing them, and the connect times out
+            // after its retries. That happens when ports come free (see
+            // `ports_used_up`) and thousands of clients connect at once: it
+            // is the kernel's refusal, held to the same small share.
+            Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::TimedOut => {
+                Counters::bump(&counters.connects_refused);
+                continue;
+            }
             Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::AddrInUse => {
                 Counters::bump(&counters.ports_used_up);
                 sleep(Duration::from_millis(100)).await;
