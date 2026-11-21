@@ -816,32 +816,32 @@ shows the one-worker numbers (giong 218.9k, Monoio 214.2k, giong-http 186.1k, Gl
 
 Where `TcpListener::bind_balanced` puts new connections when the workers are busy in
 uneven ways (`bench/placement.sh`, 10 rounds of 4 s, medians; 2 workers on 2 vCPUs, the
-client on the other 2). "Before" is the 1.0.0-rc.1 rule, which compared counts of tasks
-only; "now" compares the CPU time each worker used lately first, and counts only among
-workers within 5% of a core of the least busy one.
+client on the other 2). "Before" is the 1.0.0 rule, which compared counts of tasks only;
+"now" compares the CPU time each worker used lately first, counts only among workers
+within 5% of a core of the least busy one, and waiting work when every worker is at least
+80% busy.
 
-**Skewed:** one hot connection keeps its worker about 75% busy, 300 idle connections sit on
-the other worker, and 4 clients keep opening short connections (20 requests of 20 µs of
-work each). By counts the hot worker looks least busy, so it got a quarter of the short
-connections.
+**Skewed:** one hot connection keeps its worker 75-85% busy, 300 idle connections arrive
+next, and 4 clients keep opening short connections (20 requests of 20 µs of work each).
 
 | Listeners | Requests | p50 | p99 | p99.9 | Hot connection |
 |---|---|---|---|---|---|
-| Plain (`bind`), paced | 16,000/s | 92 µs | 574 µs | 981 µs | 3,394 req/s |
-| Balanced before, paced | 16,000/s | 66 µs | 503 µs | 710 µs | 3,734 req/s |
-| **Balanced now, paced** | 16,000/s | **55 µs** | **172 µs** | **588 µs** | **4,076 req/s** |
-| Plain, back to back | 20,878/s | 96 µs | 598 µs | 824 µs | 3,086 req/s |
-| Balanced before, back to back | **33,575/s** | **67 µs** | 498 µs | **656 µs** | 3,548 req/s |
-| Balanced now, back to back | 28,538/s | 98 µs | **483 µs** | 821 µs | **3,742 req/s** |
+| Plain (`bind`), paced | 16,000/s | 93 µs | 580 µs | 922 µs | 3,381 req/s |
+| Balanced before, paced | 16,000/s | 63 µs | 503 µs | 682 µs | 3,754 req/s |
+| **Balanced now, paced** | 16,000/s | **57 µs** | **170 µs** | **606 µs** | **4,075 req/s** |
+| Plain, back to back | 20,560/s | 98 µs | 612 µs | 1,032 µs | 3,054 req/s |
+| Balanced before, back to back | 33,405/s | 67 µs | 500 µs | 670 µs | 3,512 req/s |
+| Balanced now, back to back | 33,105/s | 68 µs | 494 µs | 648 µs | 3,565 req/s |
 
 "Paced" sends one request per 250 µs per client; "back to back" sends the next as soon as
 the last is answered. Paced, the short connections' p99 drops by two thirds and the hot
-connection gets 9% more done. **Back to back it is a loss:** the short connections pile
-onto the quiet worker and queue behind each other there, so their median rises by half and
-they get 15% fewer requests through, for a 3% better p99 and 5% more for the hot
-connection. With 24 connections arriving in random order (6 hot, 18 light), the work done
-is the same (17.2k req/s), the light requests' p99 is 11% lower (664 against 742 µs) and
-their median 15% higher (316 against 274 µs). Raw data: `bench/results/placement/`.
+connection gets 9% more done. Back to back both workers are saturated, and the result is
+the same as before within the spread of the rounds (requests 32.2-33.9k now against
+32.1-34.6k, p50 66-72 against 66-69 µs). With 24 connections arriving in random order (6
+hot, 18 light) the medians are the same too (17.2k req/s of hot work, light p50 355 against
+357 µs, p99 724 against 736 µs); the single slowest light request was slower (5.3 against
+3.2 ms), a figure that varies between rounds from 1.3 to 19.6 ms in both. Raw data:
+`bench/results/placement/`.
 
 ### HTTPS
 

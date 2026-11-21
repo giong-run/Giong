@@ -19,7 +19,10 @@
 //! those, by counts of tasks, as before (see `RuntimeShared::score`). So a
 //! worker with thousands of idle connections still gets new ones while a
 //! worker with a few hot ones is saturated, and when every worker is about
-//! as busy, connection counts decide.
+//! as busy, connection counts decide. When every worker is saturated
+//! ([`SATURATED`]), counts of tasks would mislead (the idle connections
+//! went to the workers that had room), so the work each one has waiting
+//! decides instead.
 
 use std::collections::VecDeque;
 use std::io;
@@ -57,6 +60,11 @@ const STALE_NS: u64 = 4 * SAMPLE_EVERY_NS;
 /// noise does not move connections; narrow enough that a worker busy 40% of
 /// the time does not get the same share of new connections as one busy 20%.
 const BAND: u64 = CORE / 20;
+
+/// When even the least busy member is expected to be this busy (80% of a
+/// core), every member counts as saturated, and new connections go by
+/// backlog: runnable tasks and work sent but not taken in yet.
+const SATURATED: u64 = CORE * 8 / 10;
 
 /// The least each task taken on since the last sample is expected to cost
 /// (0.1% of a core), so that a burst of new connections within one sample
@@ -327,6 +335,23 @@ impl Member {
             .map(|i| busy.expected(rt, i))
             .min()?
             .min(mine);
+        if least >= SATURATED {
+            // Every member is busy: how busy says nothing more, and counts
+            // of tasks mislead (idle connections sent away from a busy
+            // worker earlier make it look emptiest). Go by backlog, the
+            // work each one has waiting, and keep the connection unless
+            // another member has clearly less.
+            let backlog = |i: usize| {
+                let (_, queued, incoming) = rt.counts_of(i);
+                queued + incoming
+            };
+            let n = group.mailboxes.len();
+            let target = (1..n)
+                .map(|k| (self.worker + k) % n)
+                .filter(|&i| member(i))
+                .min_by_key(|&i| backlog(i))?;
+            return (backlog(self.worker) > backlog(target) + 1).then_some(target);
+        }
         let limit = least.saturating_add(BAND);
         let target = rt.least_loaded_of(None, |i| member(i) && busy.expected(rt, i) <= limit)?;
         if mine > limit {

@@ -2,18 +2,18 @@ bench/placement.sh: 2 workers, 10 rounds of 4 s, medians of the rounds
 
 skew-closed
 mode           probe_rps        p50_us        p99_us       p999_us       hot_rps
-plain              20878            96           598           824          3086
-before             33575            67           498           656          3548
-balanced           28538            98           483           821          3742
+plain              20560            98           612          1032          3054
+before             33405            67           500           670          3512
+balanced           33105            68           494           648          3565
 
 skew-paced
 mode           probe_rps        p50_us        p99_us       p999_us       hot_rps
-plain              16000            92           574           981          3394
-before             16000            66           503           710          3734
-balanced           16000            55           172           588          4076
+plain              16000            93           580           922          3381
+before             16000            63           503           682          3754
+balanced           16000            57           170           606          4075
 
 mixed
 mode             hot_rps  light_p50_us  light_p99_us  light_max_us
-plain              17190           361           802          4318
-before             17196           274           742          3139
-balanced           17225           316           664          3632
+plain              17223           360           812          3472
+before             17234           357           736          3218
+balanced           17188           355           724          5280
