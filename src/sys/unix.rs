@@ -113,6 +113,9 @@ pub(crate) mod errno {
     pub(crate) const EINTR: i32 = libc::EINTR;
     pub(crate) const EIO: i32 = libc::EIO;
     pub(crate) const EOPNOTSUPP: i32 = libc::EOPNOTSUPP;
+    /// The same as `EOPNOTSUPP` on Linux; macOS's `F_PREALLOCATE` and
+    /// `F_FULLFSYNC` report this one.
+    pub(crate) const ENOTSUP: i32 = libc::ENOTSUP;
 }
 
 /// Maps `len` bytes of zero-filled, page-aligned memory for a buffer pool.

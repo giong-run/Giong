@@ -94,10 +94,9 @@ impl ResolverConfig {
             let mut words = line.split_whitespace();
             match words.next() {
                 Some("nameserver") => {
-                    // A zone index (`fe80::1%eth0`) is not supported; skip it.
-                    if let Some(ip) = words.next().and_then(|w| w.parse::<IpAddr>().ok()) {
+                    if let Some(server) = words.next().and_then(nameserver) {
                         if cfg.nameservers.len() < 3 {
-                            cfg.nameservers.push(SocketAddr::new(ip, 53));
+                            cfg.nameservers.push(server);
                         }
                     }
                 }
@@ -848,6 +847,33 @@ fn file_stamps() -> [Option<SystemTime>; 2] {
     ["/etc/resolv.conf", "/etc/hosts"].map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+/// A `nameserver` address on port 53. An IPv6 address may carry a zone
+/// (`fe80::1%en0` or `fe80::1%4`), as macOS writes for a router's
+/// link-local address: the interface it names, which must exist.
+fn nameserver(word: &str) -> Option<SocketAddr> {
+    let Some((ip, zone)) = word.split_once('%') else {
+        return word
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53));
+    };
+    let ip = ip.parse::<std::net::Ipv6Addr>().ok()?;
+    let scope = match zone.parse::<u32>() {
+        Ok(index) => index,
+        Err(_) => interface_index(zone)?,
+    };
+    Some(std::net::SocketAddrV6::new(ip, 53, 0, scope).into())
+}
+
+/// The index of the network interface `name`, if there is one.
+#[cfg(unix)]
+fn interface_index(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated string.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
+}
+
 /// The current thread's resolver for the system configuration, reloaded when
 /// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds).
 pub(crate) fn system_resolver() -> io::Result<Resolver> {
@@ -1103,13 +1129,43 @@ mod tests {
         assert!(tc.truncated);
     }
 
+    /// macOS writes a router's link-local address with its interface
+    /// (`fe80::1%en0`); the zone becomes the address's scope. One naming no
+    /// interface is skipped.
+    #[test]
+    fn a_nameserver_with_a_zone_gets_its_scope() {
+        let lo = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let cfg = ResolverConfig::parse(
+            &format!(
+                "nameserver fe80::1%nosuchif0\nnameserver fe80::2%{lo}\nnameserver fe80::3%7\n"
+            ),
+            "",
+        );
+        let scopes: Vec<_> = cfg
+            .nameservers
+            .iter()
+            .map(|a| match a {
+                SocketAddr::V6(a) => (a.ip().segments()[7], a.port(), a.scope_id()),
+                SocketAddr::V4(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(scopes.len(), 2, "{scopes:?}");
+        assert_eq!(scopes[0].0, 2);
+        assert!(scopes[0].2 > 0, "{scopes:?}");
+        assert_eq!(scopes[1], (3, 53, 7));
+    }
+
     #[test]
     fn resolv_conf_is_read_like_glibc_reads_it() {
         let cfg = ResolverConfig::parse(
             "# comment\n\
              nameserver 10.96.0.10\n\
              nameserver 2001:db8::53 ; trailing comment\n\
-             nameserver fe80::1%eth0\n\
+             nameserver fe80::1%nosuchif0\n\
              nameserver 10.0.0.3\nnameserver 10.0.0.4\n\
              domain ignored.example\n\
              search default.svc.cluster.local svc.cluster.local cluster.local.\n\

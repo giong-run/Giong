@@ -204,12 +204,20 @@ pub(crate) fn fd_mode(fd: RawFd) -> Option<u32> {
 pub(crate) fn fsync(fd: RawFd, _datasync: bool) -> isize {
     // SAFETY: plain fcntl on a descriptor.
     let res = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
-    if res < 0 {
-        // Filesystems without F_FULLFSYNC (some network ones): fall back.
+    if res < 0 && full_fsync_unsupported(io::Error::last_os_error().raw_os_error()) {
+        // A filesystem without F_FULLFSYNC (some network ones): plain fsync
+        // is the most it offers. Any other error (EIO above all: the flush
+        // failed) is the answer, as in std, which never falls back.
         // SAFETY: as above.
         return unsafe { libc::fsync(fd) } as isize;
     }
     res as isize
+}
+
+/// Whether an `F_FULLFSYNC` failure only says that the filesystem does not
+/// have it.
+fn full_fsync_unsupported(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ENOTSUP | libc::ENOTTY | libc::EINVAL))
 }
 
 /// Reserves space up to `offset + len` and extends the file to that size,
@@ -244,7 +252,9 @@ pub(crate) fn fallocate(fd: RawFd, offset: u64, len: u64) -> isize {
         return 0;
     }
     let mut store = libc::fstore_t {
-        fst_flags: libc::F_ALLOCATECONTIG,
+        // F_ALLOCATEALL: all of it or nothing; without it a partial
+        // reservation succeeds.
+        fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
         fst_posmode: libc::F_PEOFPOSMODE,
         fst_offset: 0,
         fst_length: (end - size) as libc::off_t,
@@ -541,6 +551,19 @@ pub(crate) unsafe fn sendmmsg(
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// `fsync` falls back from `F_FULLFSYNC` only where the filesystem does
+    /// not have it; a failed flush (`EIO`) is reported, as in std.
+    #[test]
+    fn only_a_missing_full_fsync_falls_back() {
+        for errno in [libc::ENOTSUP, libc::ENOTTY, libc::EINVAL] {
+            assert!(full_fsync_unsupported(Some(errno)), "{errno}");
+        }
+        for errno in [libc::EIO, libc::ENOSPC, libc::EBADF] {
+            assert!(!full_fsync_unsupported(Some(errno)), "{errno}");
+        }
+        assert!(!full_fsync_unsupported(None));
+    }
 
     /// A datagram, then an `ICMP` port unreachable: the batch returns the
     /// datagram and keeps the error, which `recvmsg` took off the socket,
