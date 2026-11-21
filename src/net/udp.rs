@@ -224,9 +224,12 @@ impl UdpSocket {
     /// share a port between processes on purpose, create the sockets
     /// yourself and pass them to [`from_std`](Self::from_std).
     ///
-    /// On macOS every worker can bind the address too, and the port is
-    /// checked the same way, but the kernel gives all its datagrams to one
-    /// of the sockets: one worker receives them. giong also raises the
+    /// On macOS every worker can bind the address too, and no other process
+    /// can: the sockets of one address in a process are duplicates of one
+    /// socket bound without `SO_REUSEPORT`, so each datagram goes to the
+    /// worker that reads first, and [`connect`](Self::connect) on one of
+    /// them connects them all (bind a port of its own for a connected
+    /// socket). giong also raises the
     /// socket's send buffer there to 65,535 bytes when it is smaller (the
     /// system's default refuses datagrams over 9,216 bytes), so a datagram
     /// of any length UDP allows can be sent, as on Linux.

@@ -29,22 +29,18 @@
 //! # macOS
 //!
 //! `SO_REUSEPORT` means something else there: every socket of a port needs
-//! it before it binds, and all TCP connections then go to one of the
-//! sockets (the last one bound), not to all of them. So on macOS:
-//!
-//! - **TCP**: the first listener of an address in this process binds
-//!   without `SO_REUSEPORT`, which refuses a port anything else holds and
-//!   keeps every other process out while it lives. The workers that bind
-//!   the same address afterwards get a duplicate of that one socket
-//!   ([`Socket::try_clone`]): one accept queue, taken from by every worker
-//!   that waits on it. The socket goes away when its last duplicate is
-//!   dropped.
-//! - **UDP**: every worker still binds its own socket with `SO_REUSEPORT`
-//!   (a duplicate would share [`connect`](crate::net::UdpSocket::connect)
-//!   between workers). The first one is preceded by a probe socket bound
-//!   without it, which fails when anything else holds the port, and is
-//!   closed again before the bind. The kernel hands all datagrams of the
-//!   port to one of the sockets, so one worker serves them.
+//! it before it binds, connections and datagrams then go to one of the
+//! sockets (the last one bound), not to all of them, and a socket bound to
+//! the wildcard address with it lets any user's socket that sets it too
+//! bind the port and take its traffic. So on macOS no socket gets it: the
+//! first socket of an address in this process binds without it, which
+//! refuses a port anything else holds and keeps every other process out
+//! while it lives. The workers that bind the same address afterwards get a
+//! duplicate of that one socket ([`Socket::try_clone`]): one queue of
+//! connections or datagrams, taken from by every worker that waits on it.
+//! The socket goes away when its last duplicate is dropped. For UDP this
+//! means that [`connect`](crate::net::UdpSocket::connect) on one of them
+//! connects them all.
 //!
 //! The Linux test build of the kqueue driver (`--cfg giong_libkqueue`) uses
 //! the same code, so that it runs without a Mac.
@@ -83,19 +79,19 @@ fn ports() -> MutexGuard<'static, BTreeMap<(Proto, u16), Port>> {
     PORTS.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The TCP listeners the workers share on macOS, by the address they were
-/// bound to: the map's own duplicate of the socket, which later binds of
-/// the address duplicate again. The `Arc` counts the listeners that use the
-/// socket (each holds one in its [`Held`]); the entry is removed with the
-/// last of them. Only touched with [`PORTS`] locked.
+/// The sockets the workers share on macOS, by transport and the address
+/// they were bound to: the map's own duplicate of the socket, which later binds of
+/// the address duplicate again. The `Arc` counts the sockets that use it
+/// (each holds one in its [`Held`]); the entry is removed with the last of
+/// them. Only touched with [`PORTS`] locked.
 #[cfg(any(target_os = "macos", giong_libkqueue))]
-static LISTENERS: Mutex<BTreeMap<SocketAddr, Arc<Socket>>> = Mutex::new(BTreeMap::new());
+static SHARED: Mutex<BTreeMap<(Proto, SocketAddr), Arc<Socket>>> = Mutex::new(BTreeMap::new());
 
 #[cfg(any(target_os = "macos", giong_libkqueue))]
-fn listeners() -> MutexGuard<'static, BTreeMap<SocketAddr, Arc<Socket>>> {
+fn shared_sockets() -> MutexGuard<'static, BTreeMap<(Proto, SocketAddr), Arc<Socket>>> {
     // An entry is inserted or removed in one step, so the map is whole even
     // after a panic.
-    LISTENERS.lock().unwrap_or_else(PoisonError::into_inner)
+    SHARED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// One socket's hold on a port, given up with [`release`](Self::release).
@@ -103,7 +99,7 @@ fn listeners() -> MutexGuard<'static, BTreeMap<SocketAddr, Arc<Socket>>> {
 pub(crate) struct Held {
     proto: Proto,
     port: u16,
-    /// The shared listener this socket is a duplicate of, and its address.
+    /// The shared socket this one is a duplicate of, and its address.
     #[cfg(any(target_os = "macos", giong_libkqueue))]
     shared: Option<(SocketAddr, Arc<Socket>)>,
 }
@@ -117,15 +113,17 @@ impl Held {
         let mut ports = ports();
         #[cfg(any(target_os = "macos", giong_libkqueue))]
         if let Some((addr, shared)) = self.shared {
-            let mut listeners = listeners();
-            // The map's own count and this one: the last listener of the
-            // address. The others keep accepting from the socket, so it is
-            // left as it is for them.
+            let mut map = shared_sockets();
+            // The map's own count and this one: the last socket of the
+            // address. The others keep using it, so it is left as it is for
+            // them.
             if Arc::strong_count(&shared) == 2 {
-                listeners.remove(&addr);
+                map.remove(&(self.proto, addr));
                 // Where a socket can stop listening (Linux), it does, as
                 // below; on macOS this fails and the close frees the port.
-                drop(sock.shutdown(Shutdown::Both));
+                if self.proto == Proto::Tcp {
+                    drop(sock.shutdown(Shutdown::Both));
+                }
             }
             let port = ports.entry((self.proto, self.port)).or_default();
             port.live = port.live.saturating_sub(1);
@@ -171,8 +169,8 @@ pub(crate) fn bind(
     new: impl FnOnce() -> io::Result<Socket>,
 ) -> io::Result<(Socket, Option<Held>)> {
     #[cfg(any(target_os = "macos", giong_libkqueue))]
-    if proto == Proto::Tcp && share {
-        return bind_shared_listener(addr, new);
+    if share {
+        return bind_shared(proto, addr, new);
     }
     let sock = new()?;
     // What every listener sets: connections left over from an earlier
@@ -197,16 +195,11 @@ pub(crate) fn bind(
         .copied()
         .unwrap_or_default();
     // The first bind without `SO_REUSEPORT` relies on Linux's rules: there
-    // the option can be set on a bound socket and later binds join it. On
-    // macOS every socket of a port needs it before it binds, so a probe
-    // socket makes the check there (see the module documentation).
+    // the option can be set on a bound socket and later binds join it.
     let first = addr.port() != 0 && known.live == 0;
-    if first && !PROBE {
+    if first {
         bind_first(proto, &sock, addr, known.released)?;
     } else {
-        if first {
-            probe(addr)?;
-        }
         sock.set_reuse_port(true)?;
         sock.bind(&addr.into())?;
         check_bound(&sock, addr)?;
@@ -230,30 +223,34 @@ pub(crate) fn bind(
     ))
 }
 
-/// The macOS way to share a TCP port between workers: the first listener of
+/// The macOS way to share a port between workers: the first socket of
 /// `addr` binds a socket made by `new`, without `SO_REUSEPORT` (so the bind
 /// fails with `EADDRINUSE` when anything else holds the address, and no
 /// other process can join it later); every later one gets a duplicate of
 /// that socket, and `new` is not called. A listener on port 0 is the first
 /// of the port the kernel gives it.
 #[cfg(any(target_os = "macos", giong_libkqueue))]
-fn bind_shared_listener(
+fn bind_shared(
+    proto: Proto,
     addr: SocketAddr,
     new: impl FnOnce() -> io::Result<Socket>,
 ) -> io::Result<(Socket, Option<Held>)> {
     // Held across the bind, as in `bind`.
     let mut ports = ports();
-    let mut listeners = listeners();
+    let mut map = shared_sockets();
     let mut addr = addr;
     let known = match addr.port() {
         0 => None,
-        _ => listeners.get(&addr),
+        _ => map.get(&(proto, addr)),
     };
     let (sock, shared) = match known {
         Some(shared) => (shared.try_clone()?, shared.clone()),
         None => {
             let sock = new()?;
-            sock.set_reuse_address(true)?;
+            // As in `bind`: listeners only.
+            if proto == Proto::Tcp {
+                sock.set_reuse_address(true)?;
+            }
             sock.bind(&addr.into())?;
             check_bound(&sock, addr)?;
             if addr.port() == 0 {
@@ -261,34 +258,19 @@ fn bind_shared_listener(
                 addr.set_port(port);
             }
             let shared = Arc::new(sock.try_clone()?);
-            listeners.insert(addr, shared.clone());
+            map.insert((proto, addr), shared.clone());
             (sock, shared)
         }
     };
-    ports.entry((Proto::Tcp, addr.port())).or_default().live += 1;
+    ports.entry((proto, addr.port())).or_default().live += 1;
     Ok((
         sock,
         Some(Held {
-            proto: Proto::Tcp,
+            proto,
             port: addr.port(),
             shared: Some((addr, shared)),
         }),
     ))
-}
-
-/// Whether the first UDP socket of a port is checked with a probe socket
-/// (macOS) instead of being bound without `SO_REUSEPORT` (Linux).
-const PROBE: bool = cfg!(any(target_os = "macos", giong_libkqueue));
-
-/// Fails with `EADDRINUSE` when any socket holds the UDP address `addr`:
-/// binds a socket to it without `SO_REUSEPORT`, which macOS refuses
-/// whatever the holder's options are, and closes it again. Only called
-/// while this process has no live socket on the port.
-fn probe(addr: SocketAddr) -> io::Result<()> {
-    use socket2::{Domain, Protocol, Type};
-    let probe = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-    probe.bind(&addr.into())?;
-    check_bound(&probe, addr)
 }
 
 /// Binds the first socket of a port in this process: without
@@ -364,6 +346,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", not(giong_libkqueue)))]
     #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn the_first_socket_of_a_port_refuses_another_holder_and_joins_the_workers() {
         let addr = free_port();
@@ -395,19 +378,17 @@ mod tests {
         };
         let (a, b) = (count(&first), count(&second));
         assert_eq!(a + b, 64);
-        // macOS gives them all to one socket.
-        if cfg!(target_os = "linux") {
-            assert!(
-                a > 0 && b > 0,
-                "one socket got all 64 datagrams: {a} and {b}"
-            );
-        }
+        assert!(
+            a > 0 && b > 0,
+            "one socket got all 64 datagrams: {a} and {b}"
+        );
 
         second_hold.unwrap().release(&second);
         hold.unwrap().release(&first);
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", not(giong_libkqueue)))]
     #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn a_released_port_is_counted_out_and_can_be_bound_again() {
         let addr = free_port();
@@ -430,10 +411,8 @@ mod tests {
 
         // Both sockets are still open, and marked: a new bind passes them.
         // It sets `SO_REUSEADDR` for the bind only, and joins the port's
-        // `SO_REUSEPORT` group once bound. Where a probe socket makes the
-        // check (macOS), nothing passes an open socket: there the readiness
-        // driver closes a dropped socket at once, so none is left open.
-        let open = (!PROBE).then_some((first, second));
+        // `SO_REUSEPORT` group once bound.
+        let open = (first, second);
         let (third, third_hold) = udp(addr).unwrap();
         assert_eq!(known(addr).live, 1);
         assert!(!third.reuse_address().unwrap());
@@ -443,6 +422,58 @@ mod tests {
         fourth_hold.unwrap().release(&fourth);
         third_hold.unwrap().release(&third);
         drop(open);
+    }
+
+    /// The macOS way for UDP: one socket without `SO_REUSEPORT`, duplicated
+    /// for each worker, so that no other process (of any user) can bind the
+    /// port and take its datagrams.
+    #[test]
+    #[cfg(any(target_os = "macos", giong_libkqueue))]
+    fn udp_sockets_of_one_address_share_one_socket_that_no_one_else_can_join() {
+        let addr = free_port();
+        // Another process's socket, as far as this module knows.
+        let other = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        other.set_reuse_port(true).unwrap();
+        other.bind(&addr.into()).unwrap();
+        assert_eq!(udp(addr).unwrap_err().kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(known(addr).live, 0);
+        drop(other);
+
+        let (first, hold) = udp(addr).unwrap();
+        assert!(!first.reuse_port().unwrap());
+        assert!(!first.reuse_address().unwrap());
+        // Nothing else can bind the address, with or without the options.
+        let other = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        other.set_reuse_address(true).unwrap();
+        other.set_reuse_port(true).unwrap();
+        assert_eq!(
+            other.bind(&addr.into()).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+
+        // A second socket is the same one: a datagram sent once is
+        // received by whichever reads first, here the second.
+        let (second, second_hold) = udp(addr).unwrap();
+        assert_eq!(known(addr).live, 2);
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender.send_to(b"x", addr).unwrap();
+        let mut buf = [std::mem::MaybeUninit::new(0u8); 8];
+        assert_eq!(second.recv(&mut buf).unwrap(), 1);
+
+        // Dropping one leaves the other receiving.
+        hold.unwrap().release(&first);
+        drop(first);
+        assert!(shared_sockets().contains_key(&(Proto::Udp, addr)));
+        sender.send_to(b"y", addr).unwrap();
+        assert_eq!(second.recv(&mut buf).unwrap(), 1);
+
+        // The last one gives the address up: it can be bound again at once.
+        second_hold.unwrap().release(&second);
+        drop(second);
+        assert!(!shared_sockets().contains_key(&(Proto::Udp, addr)));
+        assert_eq!(known(addr).live, 0);
+        let (third, third_hold) = udp(addr).unwrap();
+        third_hold.unwrap().release(&third);
     }
 
     /// The macOS way: one listening socket, duplicated for each worker.
@@ -473,7 +504,7 @@ mod tests {
         // A second listener is the same socket: a connection made once is
         // accepted by whichever asks first, here the second.
         let (second, second_hold) = tcp(addr).unwrap();
-        assert!(listeners().contains_key(&addr));
+        assert!(shared_sockets().contains_key(&(Proto::Tcp, addr)));
         let client = std::net::TcpStream::connect(addr).unwrap();
         let (_conn, from) = second.accept().unwrap();
         assert_eq!(from.as_socket(), client.local_addr().ok());
@@ -481,7 +512,7 @@ mod tests {
         // Dropping one leaves the other listening.
         hold.unwrap().release(&first);
         drop(first);
-        assert!(listeners().contains_key(&addr));
+        assert!(shared_sockets().contains_key(&(Proto::Tcp, addr)));
         let client = std::net::TcpStream::connect(addr).unwrap();
         let (_conn, from) = second.accept().unwrap();
         assert_eq!(from.as_socket(), client.local_addr().ok());
@@ -489,7 +520,7 @@ mod tests {
         // The last one gives the address up: it can be bound again at once.
         second_hold.unwrap().release(&second);
         drop(second);
-        assert!(!listeners().contains_key(&addr));
+        assert!(!shared_sockets().contains_key(&(Proto::Tcp, addr)));
         let (third, third_hold) = tcp(addr).unwrap();
         third_hold.unwrap().release(&third);
     }
