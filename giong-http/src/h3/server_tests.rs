@@ -549,6 +549,43 @@ fn a_request_dropped_mid_frame_is_cancelled_and_the_connection_lives_on() {
     });
 }
 
+/// `n` frames of a reserved (grease) type, which the server ignores.
+fn unknown_frames(n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        Header::write(&mut out, 0x21, 1);
+        out.push(0);
+    }
+    out
+}
+
+#[test]
+fn unknown_control_frames_are_bounded_per_second_not_for_the_connection_s_life() {
+    run(|| async {
+        // A long session that sends extension frames now and then keeps
+        // its connection, past any count over its whole life.
+        let mut client = connect().await;
+        for _ in 0..3 {
+            client
+                .control
+                .write_all(&unknown_frames(3000))
+                .await
+                .unwrap();
+            giong::time::sleep(std::time::Duration::from_millis(1100)).await;
+            assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+        }
+        // A flood within a second ends it: H3_EXCESSIVE_LOAD, 0x107 = 263.
+        let mut client = connect().await;
+        client
+            .control
+            .write_all(&unknown_frames(5000))
+            .await
+            .unwrap();
+        let why = closed_with(&client).await;
+        assert!(why.contains("263"), "{why}");
+    });
+}
+
 /// What a client sees of a connection the server closed with an error.
 async fn closed_with(client: &Client) -> String {
     // The next thing done on the connection reports its end.

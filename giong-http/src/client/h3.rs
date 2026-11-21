@@ -26,8 +26,9 @@ use crate::h3::qpack::{self, Encoder};
 /// The largest SETTINGS frame read. HTTP/3 defines three settings.
 const MAX_SETTINGS_FRAME: u64 = 4 * 1024;
 
-/// Frames of unknown types a server may send on its control stream.
-const MAX_UNKNOWN_FRAMES: usize = 1024;
+/// Frames of unknown types a server may send on its control stream, a
+/// second.
+const MAX_UNKNOWN_FRAMES: u32 = 1024;
 
 /// What the connection's streams and its task share.
 struct State {
@@ -785,7 +786,7 @@ async fn qpack_stream(
 /// no more requests.
 async fn control_stream(state: &State, r: &mut Reader) -> Result<(), Fail> {
     let mut first = true;
-    let mut unknown = 0;
+    let mut unknown = frame::Budget::new(MAX_UNKNOWN_FRAMES);
     loop {
         let Some(header) = r.header(On::Control).await? else {
             return Err(CLOSED_CRITICAL.into());
@@ -852,11 +853,12 @@ async fn control_stream(state: &State, r: &mut Reader) -> Result<(), Fail> {
                 .into());
             }
             _ => {
-                unknown += 1;
-                if unknown > MAX_UNKNOWN_FRAMES {
-                    return Err(
-                        frame::Error::new(Code::ExcessiveLoad, "too many unknown frames").into(),
-                    );
+                if !unknown.take() {
+                    return Err(frame::Error::new(
+                        Code::ExcessiveLoad,
+                        "too many unknown frames in a second",
+                    )
+                    .into());
                 }
                 r.skip(header.len).await?;
             }

@@ -344,3 +344,39 @@ pub(crate) fn write_goaway(out: &mut Vec<u8>, stream_id: u64) {
     Header::write(out, kind::GOAWAY, payload.len() as u64);
     out.extend_from_slice(&payload);
 }
+
+/// How many frames of a kind that does nothing (unknown types, RFC 9114
+/// section 9) a peer may send on a long-lived stream: so many a second.
+/// A cap over the stream's whole life would end a long browser session
+/// that sends extension frames now and then (PRIORITY_UPDATE, RFC 9218).
+pub(crate) struct Budget {
+    per_second: u32,
+    left: u32,
+    since: std::time::Instant,
+}
+
+impl Budget {
+    pub(crate) fn new(per_second: u32) -> Self {
+        Budget {
+            per_second,
+            left: per_second,
+            since: std::time::Instant::now(),
+        }
+    }
+
+    /// One more frame: false once the second's share is spent.
+    pub(crate) fn take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.since) >= std::time::Duration::from_secs(1) {
+            self.since = now;
+            self.left = self.per_second;
+        }
+        match self.left.checked_sub(1) {
+            Some(left) => {
+                self.left = left;
+                true
+            }
+            None => false,
+        }
+    }
+}

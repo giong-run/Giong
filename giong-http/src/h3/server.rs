@@ -466,7 +466,7 @@ async fn qpack_stream(
 /// say for the rest of the connection.
 async fn control_stream(conn: &Conn, r: &mut Reader) -> Result<(), Stop> {
     let mut first = true;
-    let mut unknown = 0;
+    let mut unknown = frame::Budget::new(4 * MAX_IDLE_FRAMES);
     loop {
         let header = match r.header(On::Control).await {
             Ok(Some(header)) => header,
@@ -522,9 +522,11 @@ async fn control_stream(conn: &Conn, r: &mut Reader) -> Result<(), Stop> {
                 }
             }
             _ => {
-                unknown += 1;
-                if unknown > 4 * MAX_IDLE_FRAMES {
-                    return Err(fatal(Code::ExcessiveLoad, "too many unknown frames"));
+                if !unknown.take() {
+                    return Err(fatal(
+                        Code::ExcessiveLoad,
+                        "too many unknown frames in a second",
+                    ));
                 }
                 match r.skip(header.len).await {
                     Err(Stop::Gone) => return Err(closed_critical()),
