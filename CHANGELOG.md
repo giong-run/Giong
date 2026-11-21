@@ -8,6 +8,169 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-21
+
+gRPC on giong: three new crates, giong-proto, giong-grpc-build and giong-grpc. Also HTTP
+trailers and streamed request bodies, a client that connects ahead of requests and pings
+idle HTTP/2 connections, batched PostgreSQL reads (off by default), faster large uploads,
+and a fix for an idle epoll worker spinning after a file operation. Nothing is removed or
+changed in meaning; upgrading from 1.0 needs no code changes.
+
+### Added
+
+- **giong-http: trailer fields.** `Trailers` holds the fields sent after a body. A streamed
+  response ends with them through `BodySender::send_trailers` (a last HEADERS frame over
+  HTTP/2, after the last chunk over HTTP/1.1), a handler reads a streamed request's with
+  `BodyStream::trailers`, and the client reads a response's with
+  `StreamingResponse::trailers`. Fields that mean nothing after a body (`content-length`,
+  `host`, `set-cookie` and the like) are refused when trailers are built (`GIONG-E1122`,
+  `HttpInvalidTrailer`) and dropped when they are received. Until now trailers were
+  checked and dropped, which a request body received whole still does; a streamed one's
+  trailers count against `max_head_size` over HTTP/2.
+- **giong-http client: request bodies written piece by piece.**
+  `RequestBuilder::streamed_body` returns a `RequestBody` to send the pieces through, with
+  backpressure, `abort` and `send_trailers`. Over HTTP/2 the response is read while the
+  request is still being written, so requests and responses can alternate on one stream;
+  over HTTP/1.1 the body is sent chunked and the response read after it. Redirects are not
+  followed for such a request, and it is sent again after a refusal only if no piece had
+  been taken.
+
+- **giong-http: `BodySender::closed`** waits until the client of a streamed response is
+  gone (it reset the stream or its connection closed), for a handler that produces a
+  response on its own and should stop when nobody reads it.
+- **giong-grpc** (new crate): gRPC servers and clients on giong-http's HTTP/2. The four
+  kinds of call (unary, server streaming, client streaming, bidirectional), deadlines sent
+  and enforced on both sides, cancellation that drops the server's handler, text and
+  binary metadata, statuses with details, gzip per message, message size limits (4 MiB by
+  default), TLS through ALPN. A streaming response's headers go out with its first message, or as
+  a Trailers-Only response when the handler ends without sending one, as grpc-go and tonic
+  do: metadata set before the first message still arrives first. `giong_grpc::Server` is a giong-http handler; a `Channel`
+  shares HTTP/2 connections between calls. The statuses it raises itself carry
+  `GIONG-E4101` to `GIONG-E4110` with the cause and the fix. Tested against grpc-go in
+  both directions with the cases of gRPC's interoperability specification, on io_uring and
+  epoll (`giong-grpc/interop/run.sh`, the `gRPC` workflow), and by hand against tonic
+  0.14.2's interop client and server (the eleven cases they implement). Measured against tonic 0.14
+  with `bench/grpc.sh` (4-core cloud VM, median of 10 rounds): a one-thread server does 30%
+  to 50% more 100-byte unary calls a second, 21% to 25% more 10,000-byte ones, 48% to 50%
+  more round trips on bidirectional streams and 3.8 to 4.0 times the messages of a server
+  stream, and holds 5.7 kB instead of 11.6 kB per open stream. A one-thread client is level
+  to 14% ahead (round trips against tonic's server, which that row measures: −1.7%). Tables and
+  what was not measured: `giong-grpc/README.md`; raw data: `bench/results/grpc/`.
+- **giong-grpc: health checking and server reflection.** `giong_grpc::health::Health`
+  serves `grpc.health.v1.Health` (Check, List, Watch) from statuses the program sets from
+  any thread, with `check` and `watch` for clients; `giong_grpc::reflection::Reflection`
+  serves `grpc.reflection.v1` and `v1alpha`, so `grpcurl` lists, describes and calls a
+  server's methods without its `.proto` files.
+- **giong-proto** (new crate): Protocol Buffers decoded as views over the receive buffer,
+  with no copy and no allocation for strings, bytes, repeated fields and maps, and message
+  structs whose fields borrow for encoding. Passes Google's protobuf conformance suite and
+  is fuzzed against prost. Codes `GIONG-E4001` to `GIONG-E4008`.
+- **giong-grpc-build** (new crate): generates the giong-proto messages and, for each
+  service, a trait to implement, a server that routes calls to it and a client, from
+  `.proto` files at build time. The files are parsed in Rust (protox): no `protoc` to
+  install. The generated file also carries the descriptors reflection serves.
+- **giong-http**: `Client::preconnect(url)` opens a connection to an origin before the first
+  request needs it (DNS, TCP, the proxy tunnel and the TLS handshake, with the client's
+  settings) and returns the version it speaks, without sending a request. Requests made
+  while it is being opened wait for it and share it once ALPN picks HTTP/2; when ALPN picks
+  HTTP/1.1 the connection goes among the idle ones and the waiting requests open their own;
+  when it fails or the call is dropped, the first request waiting opens one. No request is
+  sent twice. Bounded by the client's timeout; cancel safe. Asked for in
+  [#154](https://github.com/giong-run/Giong/issues/154) by a service that warms its client up
+  while requests arrive ([#184](https://github.com/giong-run/Giong/pull/184)).
+- **giong-http**: `Client::ping_idle_http2(url, deadline)` sends a PING on each idle HTTP/2
+  connection to an origin and waits up to `deadline` for the acknowledgements; it returns
+  how many answered. A connection that answers counts as used (its idle timeout starts
+  again). One that does not answer in time and still carries no request is closed at once
+  and takes no more requests (`GIONG-E1103`); one that carried a request during the probe
+  is left open. A probe in flight keeps the idle timeout from closing the connection, and
+  a GOAWAY read with the acknowledgement fails the call (`GIONG-E1106`). Only
+  acknowledgements of the client's own PINGs count. The client never pings unless asked.
+  ([#184](https://github.com/giong-run/Giong/pull/184))
+- **giong-postgres: batched reads** (`Config::batch_reads`, off by default). A pool sends
+  the `SELECT`s waiting for one shared connection under one `Sync`, at most 16, never
+  waiting for more, behind a prepared statement that makes their transaction read-only.
+  The server replies and wakes the client once per batch instead of once per statement: with
+  the database as the limit, 3.4 times the one-row lookups (198.3k against 58.7k a second
+  on one server core, p99 0.56 ms against 2.0 ms), 18% more on three cores, nothing for
+  100-row reads, and little on the full path of an HTTP request (`bench/db-path.sh`, new),
+  where the HTTP side is the limit. A `SELECT` that writes fails in the batch with `25006`
+  and is sent again alone; statements the server skipped after an error in their batch are
+  sent again one by one, as are the other statements of a batch that a failure or a failed
+  commit rolled back. A `SELECT` that calls `set_config` runs alone, so that a
+  transaction-local setting does not reach other tasks' statements; not for functions that
+  make such settings (row-level security set up per request), which a statement's text does
+  not show. A batch holds the locks its statements took until it ends, so a statement of a
+  batch gives up a lock wait within 50 ms, and one that fails in a batch with a lock
+  timeout, a deadlock or a serialization failure is sent again alone: a batch cannot
+  deadlock with a transaction that its statements one by one would not (a migration
+  locking two tables). MySQL's protocol has no equivalent.
+- `bench/db-path.sh`: an HTTP request that reads one row from PostgreSQL or MySQL, answered
+  as JSON, on giong against axum with deadpool-postgres and with SQLx, for throughput,
+  p50/p99 under load and the latency of one request at a time.
+
+### Changed
+
+- **giong-http client: HTTP/2 requests sent with `send_streaming` carry `te: trailers`**,
+  since their trailers can now be read; servers that only send them to a client that asks
+  (gRPC) do so. Requests sent with `send` are as before.
+- **giong-http client** (performance): a request costs 1.0% to 1.4% more instructions than
+  in 1.0.0-rc.1 (`bench/instr`: `http1-client` 30,512 to 30,939, `h2` 43,059 to 43,563,
+  `https` 42,596 to 43,175 on io_uring), the price of request bodies that can be streamed;
+  allocations and the memory of idle connections are unchanged. The baseline is updated.
+- **giong-http** (performance): the HTTP/2 server puts the small pieces a handler sends one
+  after the other through `BodySender::send` into one DATA frame (up to 16 KiB) when they
+  are ready in the same turn of the connection, and lets handlers that were woken while it
+  polled them go on for up to 32 rounds before it writes, instead of a frame and a write
+  for each piece. `send` waits for the connection to take each piece as before.
+- **giong-http** (performance): the HTTP/2 server sends the answers to a burst of short
+  requests in one write: answers whose bytes fit in one DATA frame fill the output up to
+  768 KiB, where it stopped at 64 KiB, and with one write in flight a connection waited a
+  turn of the worker for each further write. Streamed and file bodies still stop at 64 KiB.
+  The bytes in the output now count against the connection's budget for unsent responses
+  until they are written, so a connection holds no more than before. 10,000-byte gRPC unary
+  calls from tonic's client on one server thread (`bench/grpc.sh`, 4-core cloud VM,
+  io_uring): 62,597 to 89,862 calls a second with 16 in flight per connection.
+- **giong-http client** (performance): over HTTP/2, `StreamingResponse::chunk` hands over a
+  received DATA frame's buffer as it is (small frames still arrive joined) instead of
+  copying the frames that wait into one piece. Pieces stay within 64 KiB as documented.
+- **giong-http**: a request body of 64 KiB or more is received straight into the request
+  buffer, instead of being copied there out of the runtime's receive buffers. Uploads of
+  1 MiB are 2.2 to 2.3 times as fast and use 53 to 58% less CPU, on both drivers (3 MiB:
+  2.4 to 5.2 times), and small requests on the same connections are 1.2 to 1.4 times as
+  fast; memory per idle connection and small requests alone are unchanged
+  ([#194](https://github.com/giong-run/Giong/pull/194), `bench/results/upload-recv-into/`).
+
+- **giong-http** (memory): an idle server connection holds 8 bytes more over HTTP/1.1
+  (`bench/instr` idle heap: 1,979.9 to 1,988.2 bytes on io_uring, 2,158.1 to 2,166.1 on
+  epoll) and 24 bytes more over HTTP/2 (4,473.4 to 4,497.4 and 4,555.6 to 4,579.6), against
+  the 1.0 baseline; within the 1% that `bench/instr` allows. Which 1.1 change adds it is not
+  isolated yet.
+
+### Fixed
+
+- **giong**: an idle worker on the epoll driver no longer spins at full CPU after a file
+  operation. A blocking job that finished while its worker took the results rang the
+  worker's bell after the results were gone; the bell stayed readable with nothing to
+  take, and every later wait ended at once until the next file operation finished. The
+  wait that sees such a ring now resets it.
+- **giong-http**: on an HTTP/2 connection with more streamed request bodies open at once
+  than the body budget has full windows for (from the fourth, with the default budget of
+  1 MiB), the streams after the first few were never given flow-control window again once they had
+  used the window they started with, although their handlers had read everything: they
+  stalled until an older stream ended, and for good next to streams that never end
+  (bidirectional gRPC streams, long uploads read as they arrive). A stream whose handler
+  has taken what it sent now gets back the window it started with, which the budget keeps
+  for it while it is open; windows beyond that are still granted only within the budget.
+  A body received whole before its handler runs holds what it received, so it gets no
+  window past the budget. Found with 16 bidirectional gRPC streams on one connection, of
+  which three made progress.
+- **giong-http**: a timeout of `Duration::MAX` (or anything past what the clock can add)
+  given to `Server::idle_timeout`, `request_timeout`, `write_timeout`, `shutdown_linger`,
+  `ClientBuilder::timeout`, `connect_timeout`, `idle_timeout` or `RequestBuilder::timeout`
+  panicked when it was added to the clock, in the connection's task. Such a timeout now
+  counts as a century: no timeout.
+
 ## [1.0.1] - 2026-11-21
 
 One fix: on Linux 6.18, a worker with `spin_before_park` could spin at 100% CPU for good.
@@ -2484,7 +2647,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/giong-run/Giong/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/giong-run/Giong/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/giong-run/Giong/compare/v0.8.0...v1.0.0-rc.1
