@@ -318,12 +318,14 @@ impl Config {
     /// `SELECT`s that are waiting to be written to one connection when it
     /// writes, at most 16: a statement never waits for others to join it.
     ///
-    /// A `SELECT` whose text calls `set_config` runs alone, never in a
-    /// batch, because the statements of a batch share one transaction and a
+    /// A `SELECT` whose text contains `set_config` runs alone, never in a
+    /// batch: the statements of a batch share one transaction, and a
     /// transaction-local setting (`set_config(name, value, true)`, as
     /// row-level security set up per request uses) would apply to the
-    /// statements of other tasks after it. **Do not turn it on if functions
-    /// that statements call make such settings** (`set_config(.., true)` or
+    /// statements of other tasks after it. The text is matched in any case,
+    /// quoted strings and comments included; a false match only costs the
+    /// statement its batch. **Do not turn it on if functions that
+    /// statements call make such settings** (`set_config(.., true)` or
     /// `SET LOCAL` inside a function): those calls cannot be seen in the
     /// statement's text.
     ///

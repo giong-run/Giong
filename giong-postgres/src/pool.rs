@@ -974,11 +974,12 @@ impl Drop for Lent<'_> {
 }
 
 /// Whether `sql` starts with the word `SELECT`, the statements a batch may
-/// take ([`Config::batch_reads`]), and does not call `set_config`: a
+/// take ([`Config::batch_reads`]), and does not contain `set_config`: a
 /// transaction-local setting made that way (`set_config(..., true)`, as
-/// row-level security policies read) would reach the rest of its batch, so
-/// such a statement runs alone. A call hidden inside a function is not
-/// seen; [`Config::batch_reads`] says so.
+/// row-level security policies read) would reach the rest of its batch.
+/// Matched anywhere in the text, quoted or commented too, since a false
+/// match only runs a statement alone. A call hidden inside a function is
+/// not seen; [`Config::batch_reads`] says so.
 fn is_select(sql: &str) -> bool {
     let sql = sql.trim_start();
     sql.get(..6)
