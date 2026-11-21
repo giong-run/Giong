@@ -279,6 +279,14 @@ pub(crate) unsafe fn recvmmsg(
     libc::recvmmsg(fd, msgs, count as libc::c_uint, flags, std::ptr::null_mut()) as isize
 }
 
+/// The error a [`recvmmsg`] that returned some datagrams met after them,
+/// for the caller to report next. Linux keeps such an error on the socket
+/// itself (`sk_err`) and returns it from the next receive, so: none.
+#[inline(always)]
+pub(crate) fn take_recv_error() -> Option<i32> {
+    None
+}
+
 /// Reads at `offset` what the page cache holds, without waiting for the
 /// disk (`preadv2` with `RWF_NOWAIT`): the bytes read, or -1.
 ///

@@ -323,6 +323,10 @@ unsafe fn run_blocking(io: Io) -> i32 {
     }
 }
 
+/// A datagram of an earlier `recvmmsg` (pool buffer, length written), or
+/// the error it met after its datagrams.
+type Ahead = Result<(u16, u32), i32>;
+
 /// The readiness driver over poller `P`.
 pub(crate) struct Readiness<P: Poller> {
     poller: P,
@@ -334,9 +338,10 @@ pub(crate) struct Readiness<P: Poller> {
     ops: Slab<EOp>,
     /// By multishot operation: datagrams received in the same `recvmmsg` as
     /// one already handed out, as pool buffers and the length of what was
-    /// written into each. Apart from the operations, which every stream
-    /// has, so that they stay small.
-    ahead: HashMap<usize, VecDeque<(u16, u32)>>,
+    /// written into each, then the error (a negative `errno`) that the
+    /// receive met after them, if any (see `sys::take_recv_error`). Apart
+    /// from the operations, which every stream has, so that they stay small.
+    ahead: HashMap<usize, VecDeque<Ahead>>,
     /// Busy datagram sockets (descriptor, generation) to take out of the
     /// poller's set once no task waits on them (see [`QUIET_AFTER`]).
     quieting: Vec<(RawFd, u32)>,
@@ -872,10 +877,18 @@ impl<P: Poller> Readiness<P> {
         hdr: *const libc::msghdr,
         waker: &Waker,
     ) -> MultiPoll {
-        if let Some((bid, len)) = self.ahead.get_mut(&key).and_then(VecDeque::pop_front) {
+        match self.ahead.get_mut(&key).and_then(VecDeque::pop_front) {
             // Received earlier, in the same system call as another.
-            let pool = self.pool.clone();
-            return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
+            Some(Ok((bid, len))) => {
+                let pool = self.pool.clone();
+                return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
+            }
+            // What that system call met after them.
+            Some(Err(res)) => {
+                self.disarm(key);
+                return MultiPoll::Item(res);
+            }
+            None => {}
         }
         if !spend_budget() {
             waker.wake_by_ref();
@@ -981,7 +994,12 @@ impl<P: Poller> Readiness<P> {
             let name_space = unsafe { (*hdr).msg_namelen as usize };
             let out = self.recvmmsg_into_pool(key, fd, name_space, room);
             let got = match out {
-                Some(Ok(_)) => 1 + self.ahead.get(&key).map_or(0, VecDeque::len),
+                Some(Ok(_)) => {
+                    1 + self
+                        .ahead
+                        .get(&key)
+                        .map_or(0, |a| a.iter().filter(|d| d.is_ok()).count())
+                }
                 _ => 0,
             };
             self.set_batch(key, room, got);
@@ -1148,9 +1166,17 @@ impl<P: Poller> Readiness<P> {
             if i == 0 {
                 first = Some((total as i32, pooled_flags(bid)));
             } else if matches!(self.ops.get(key), Some(EOp::Multi { .. })) {
-                self.ahead.entry(key).or_default().push_back((bid, total));
+                self.ahead
+                    .entry(key)
+                    .or_default()
+                    .push_back(Ok((bid, total)));
             } else {
                 self.pool.release(bid);
+            }
+        }
+        if let Some(errno) = sys::take_recv_error() {
+            if matches!(self.ops.get(key), Some(EOp::Multi { .. })) {
+                self.ahead.entry(key).or_default().push_back(Err(-errno));
             }
         }
         first.map(Ok)
@@ -1220,7 +1246,7 @@ impl<P: Poller> Readiness<P> {
                 .then(|| self.ahead.remove(&key))
                 .flatten()
             {
-                for (bid, _) in ahead {
+                for (bid, _) in ahead.into_iter().flatten() {
                     self.pool.release(bid);
                 }
             }

@@ -421,8 +421,27 @@ pub(crate) struct MMsgHdr {
     pub(crate) msg_len: libc::c_uint,
 }
 
+std::thread_local! {
+    /// The error the last [`recvmmsg`] of this thread met after the
+    /// datagrams it returned, if any (see [`take_recv_error`]).
+    static RECV_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// A descriptor whose [`sendmmsg`] met an error after the datagrams it
+    /// sent, and that error, for its next call.
+    static SEND_ERROR: std::cell::Cell<(RawFd, i32)> = const { std::cell::Cell::new((-1, 0)) };
+}
+
+/// Whether `errno` only says that there was nothing (more) to do.
+fn would_block(errno: i32) -> bool {
+    errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
+}
+
 /// Receives up to `count` datagrams, one `recvmsg` each (macOS has no
 /// public `recvmmsg`): how many, or -1 with `errno` set if the first failed.
+///
+/// A `recvmsg` that fails after the first datagram has taken the error off
+/// the socket (a pending `ICMP` port unreachable, say), so nothing would
+/// report it again, and a receive waiting for it would wait forever. It is
+/// kept for [`take_recv_error`] instead, as Linux keeps it on the socket.
 ///
 /// # Safety
 ///
@@ -437,11 +456,28 @@ pub(crate) unsafe fn recvmmsg(
         let m = &mut *msgs.add(i);
         let n = libc::recvmsg(fd, &mut m.msg_hdr, flags);
         if n < 0 {
-            return if i == 0 { -1 } else { i as isize };
+            if i == 0 {
+                return -1;
+            }
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if !would_block(errno) {
+                RECV_ERROR.with(|e| e.set(errno));
+            }
+            return i as isize;
         }
         m.msg_len = n as libc::c_uint;
     }
     count as isize
+}
+
+/// The error (an `errno`) that the last [`recvmmsg`] of this thread met
+/// after the datagrams it returned, for the caller to report on the next
+/// receive; taken once.
+pub(crate) fn take_recv_error() -> Option<i32> {
+    match RECV_ERROR.with(|e| e.replace(0)) {
+        0 => None,
+        errno => Some(errno),
+    }
 }
 
 /// macOS cannot read only what the page cache holds: always -1, so every
@@ -461,6 +497,11 @@ pub(crate) const POLL_PEER_CLOSED: libc::c_short = libc::POLLHUP;
 /// Sends up to `count` datagrams, one `sendmsg` each (macOS has no public
 /// `sendmmsg`): how many, or -1 with `errno` set if the first failed.
 ///
+/// An error after the first datagram may have been taken off the socket
+/// (as in [`recvmmsg`]), so it is kept and returned by the next call on
+/// `fd`, which the caller makes at once for the datagrams that are left:
+/// the datagram that failed gets the error.
+///
 /// # Safety
 ///
 /// `msgs` must point at `count` headers whose pointers are valid.
@@ -470,13 +511,64 @@ pub(crate) unsafe fn sendmmsg(
     count: usize,
     flags: libc::c_int,
 ) -> isize {
+    let (held, errno) = SEND_ERROR.with(|e| e.get());
+    if held == fd && errno != 0 {
+        SEND_ERROR.with(|e| e.set((-1, 0)));
+        *libc::__error() = errno;
+        return -1;
+    }
     for i in 0..count {
         let m = &mut *msgs.add(i);
         let n = libc::sendmsg(fd, &m.msg_hdr, flags);
         if n < 0 {
-            return if i == 0 { -1 } else { i as isize };
+            if i == 0 {
+                return -1;
+            }
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if !would_block(errno) {
+                SEND_ERROR.with(|e| e.set((fd, errno)));
+            }
+            return i as isize;
         }
         m.msg_len = n as libc::c_uint;
     }
     count as isize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// A datagram, then an `ICMP` port unreachable: the batch returns the
+    /// datagram and keeps the error, which `recvmsg` took off the socket,
+    /// for the next receive (as Linux keeps it on the socket).
+    #[test]
+    fn a_receive_batch_keeps_the_error_it_met_after_a_datagram() {
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.connect(peer.local_addr().unwrap()).unwrap();
+        peer.send_to(b"x", a.local_addr().unwrap()).unwrap();
+        drop(peer);
+        a.send(b"y").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut bufs = [[0u8; 8]; 2];
+        // SAFETY: all-zero is valid for these plain C structs.
+        let mut iov: [libc::iovec; 2] = unsafe { mem::zeroed() };
+        // SAFETY: as above.
+        let mut msgs: [MMsgHdr; 2] = unsafe { mem::zeroed() };
+        for i in 0..2 {
+            iov[i].iov_base = bufs[i].as_mut_ptr().cast();
+            iov[i].iov_len = 8;
+            msgs[i].msg_hdr.msg_iov = &mut iov[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        // SAFETY: two headers pointing at the buffers above.
+        let n = unsafe { recvmmsg(a.as_raw_fd(), msgs.as_mut_ptr(), 2, libc::MSG_DONTWAIT) };
+        assert_eq!(n, 1);
+        assert_eq!(&bufs[0][..1], b"x");
+        assert_eq!(take_recv_error(), Some(libc::ECONNREFUSED));
+        assert_eq!(take_recv_error(), None);
+    }
 }
