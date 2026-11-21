@@ -341,7 +341,14 @@ fn attack_udp_unreachable_empty_and_oversized() {
         }
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         peer.send_to(b"", saddr).unwrap();
-        peer.send_to(&vec![7u8; 65507], saddr).unwrap();
+        // macOS caps a UDP send at net.inet.udp.maxdgram (9216 by default).
+        let big = match peer.send_to(&vec![7u8; 65507], saddr) {
+            Ok(n) => n,
+            Err(e) if e.raw_os_error() == Some(40) && cfg!(target_os = "macos") => {
+                peer.send_to(&vec![7u8; 9216], saddr).unwrap()
+            }
+            Err(e) => panic!("big send: {e}"),
+        };
         peer.send_to(b"after", saddr).unwrap();
         let mut seen = Vec::new();
         for _ in 0..3 {
@@ -354,7 +361,7 @@ fn attack_udp_unreachable_empty_and_oversized() {
         }
         eprintln!("udp: {seen:?}");
         assert_eq!(seen[0], (0, false));
-        assert!(seen[1].0 > 0 && (seen[1].0 == 65507 || seen[1].1));
+        assert!(seen[1].0 > 0 && (seen[1].0 == big || seen[1].1));
         assert_eq!(seen[2], (5, false));
         // And reads dropped mid-flight on a socket that gets ICMP errors.
         for i in 0..3000u64 {
