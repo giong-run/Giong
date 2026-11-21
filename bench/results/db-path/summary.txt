@@ -1,0 +1,16 @@
+load `many`: 50 connections; `one`: one connection, one request at a time; databases on CPUs 2,3
+subject        load  req/s median       min       max       p50       p99  non-2xx  srv%  wrk%   db%
+giong-pg       many         86937     75236     93163     528us    1480us        0    99    67    93
+giong-pg-batch many         82876     79204     95705     555us    1350us        0    99    66    84
+deadpool-pg    many         50038     48421     51929     940us    2050us        0    99    46   143
+sqlx-pg        many         20470     19472     20652    2330us    4280us        0    99    27   132
+giong-my       many         88738     77087     98679     511us    1620us        0    99    67   154
+sqlx-my        many         20188     18490     21148    2320us    6080us        0    98    28   146
+
+giong-pg       one           9918      9033     10430      88us     495us        0    37    21    35
+giong-pg-batch one          10258      9521     10891      88us     295us        0    39    21    36
+deadpool-pg    one           6616      5756      7286     129us     663us        0    29    15    45
+sqlx-pg        one           5555      4002      5659     156us     598us        0    43    13    47
+giong-my       one           7789      6701      9316     110us     635us        0    33    18    47
+sqlx-my        one           4119      3730      4807     207us     773us        0    35    13    56
+
