@@ -169,6 +169,11 @@ pub(crate) fn protocol(what: impl Into<String>) -> Status {
     )
 }
 
+/// A message longer than this that is still arriving is gathered piece by
+/// piece and put together once complete, rather than given room up front:
+/// its length is only what the sender announced.
+const STEP: usize = 16 * 1024;
+
 /// Takes the messages out of the pieces of a body as they arrive.
 pub(crate) struct Deframer {
     /// The piece being read, shared with the messages taken out of it.
@@ -183,6 +188,14 @@ pub(crate) struct Deframer {
     /// that message completed with the first bytes of the piece, and the
     /// piece goes on from here once it is taken.
     after: Option<(Vec<u8>, usize)>,
+    /// While a long message arrives: the pieces received after `buf`, and
+    /// how many bytes from `at` complete it. Five bytes announcing `max`
+    /// then hold nothing but those five bytes, where room for `max` would
+    /// be memory nobody charged (and a process with a limit on its address
+    /// space cannot get it, and aborts); each byte is still copied once.
+    parts: Vec<Vec<u8>>,
+    parts_len: usize,
+    gathering: usize,
 }
 
 impl Deframer {
@@ -193,11 +206,33 @@ impl Deframer {
             max,
             gzip,
             after: None,
+            parts: Vec::new(),
+            parts_len: 0,
+            gathering: 0,
         }
     }
 
     /// Adds a piece of the body.
     pub(crate) fn push(&mut self, piece: Vec<u8>) {
+        if self.gathering > 0 {
+            self.parts_len += piece.len();
+            self.parts.push(piece);
+            let rest = self.buf.len() - self.at;
+            if rest + self.parts_len >= self.gathering {
+                // Complete: the message, and what came after it, in one
+                // buffer of exactly that size.
+                let mut joined = Vec::with_capacity(rest + self.parts_len);
+                joined.extend_from_slice(&self.buf[self.at..]);
+                for part in self.parts.drain(..) {
+                    joined.extend_from_slice(&part);
+                }
+                self.buf = Rc::new(joined);
+                self.at = 0;
+                self.parts_len = 0;
+                self.gathering = 0;
+            }
+            return;
+        }
         if self.at == self.buf.len() {
             // Every message of the last piece is out: the buffer goes to
             // the last of them still held, or is used again.
@@ -285,9 +320,12 @@ impl Deframer {
         }
         let end = PREFIX + len;
         if rest.len() < end {
-            // Room for the rest, so that it arrives without regrowing.
             let missing = end - rest.len();
-            if let Some(buf) = Rc::get_mut(&mut self.buf) {
+            if missing > STEP {
+                // Gathered by `push` until complete.
+                self.gathering = end;
+            } else if let Some(buf) = Rc::get_mut(&mut self.buf) {
+                // Room for the rest, so that it arrives without regrowing.
                 buf.reserve(missing);
             }
             return Ok(None);
@@ -326,6 +364,7 @@ impl Deframer {
     /// The body ended: nothing may be left over.
     pub(crate) fn finish(&self) -> Result<(), Status> {
         let left = self.buf.len() - self.at
+            + self.parts_len
             + self
                 .after
                 .as_ref()
@@ -552,6 +591,37 @@ pub(crate) fn decode_message(value: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Five bytes announcing the largest message reserve no more than a
+    /// step: room grows with what arrives, not with what is announced.
+    #[test]
+    fn an_announced_length_reserves_only_what_has_arrived() {
+        let max = 4 << 20;
+        let mut d = Deframer::new(max, false);
+        let mut prefix = vec![0];
+        prefix.extend_from_slice(&(max as u32).to_be_bytes());
+        d.push(prefix);
+        assert!(d.next().unwrap().is_none());
+        assert!(d.buf.capacity() <= PREFIX + STEP, "{}", d.buf.capacity());
+        // The message still arrives whole, in pieces.
+        let mut sent = 0;
+        while sent < max {
+            let n = (max - sent).min(100_000);
+            d.push(vec![7; n]);
+            sent += n;
+            if sent < max {
+                // Nothing held but the pieces received.
+                assert!(d.buf.capacity() <= PREFIX + STEP);
+                assert!(d.next().unwrap().is_none());
+            } else {
+                // Put together once, in a buffer of exactly its size.
+                assert_eq!(d.buf.capacity(), PREFIX + max);
+            }
+        }
+        let message = d.next().unwrap().expect("the whole message");
+        assert_eq!(message.as_slice().len(), max);
+        d.finish().unwrap();
+    }
 
     #[test]
     fn grpc_content_types_are_told_from_grpc_web() {
