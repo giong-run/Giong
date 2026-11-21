@@ -34,10 +34,10 @@
 #         });
 #     }
 
-static: 256.8 ns per request
-static: 255.4 ns per request
-static: 267.8 ns per request
-shared: 277.3 ns per request
-shared: 215.6 ns per request
-shared: 271.2 ns per request
-Instant::now: 26.0 ns
+static: 276.6 ns per request
+static: 355.9 ns per request
+static: 357.1 ns per request
+shared: 315.9 ns per request
+shared: 295.3 ns per request
+shared: 291.6 ns per request
+Instant::now: 27.5 ns

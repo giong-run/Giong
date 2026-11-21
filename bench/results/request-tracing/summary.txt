@@ -1,6 +1,6 @@
-/json tracing off: 167365 req/s (min 156111, max 173728), p50 218 us, p99 712 us
-/json tracing on: 157379 req/s (min 142893, max 160149), p50 249 us, p99 790 us
-/json: tracing on changes requests per second by -6.0% (medians)
-/users/42 tracing off: 164554 req/s (min 154694, max 166968), p50 222 us, p99 728 us
-/users/42 tracing on: 148792 req/s (min 147825, max 155598), p50 273 us, p99 795 us
-/users/42: tracing on changes requests per second by -9.6% (medians)
+/json tracing off: 167428 req/s (min 157569, max 173459), p50 221 us, p99 688 us
+/json tracing on: 158288 req/s (min 147705, max 166190), p50 237 us, p99 715 us
+/json: tracing on changes requests per second by -5.5% (medians)
+/users/42 tracing off: 160747 req/s (min 156838, max 165561), p50 228 us, p99 711 us
+/users/42 tracing on: 149309 req/s (min 139434, max 152188), p50 275 us, p99 826 us
+/users/42: tracing on changes requests per second by -7.1% (medians)
