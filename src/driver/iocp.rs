@@ -50,8 +50,8 @@ use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NETNAME_DELETED, ERROR_NOT_SUPPORTED, ERROR_OPERATION_ABORTED, HANDLE,
+    CloseHandle, GetLastError, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING,
+    ERROR_MORE_DATA, ERROR_NETNAME_DELETED, ERROR_NOT_SUPPORTED, ERROR_OPERATION_ABORTED, HANDLE,
     INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
@@ -220,6 +220,9 @@ struct Record {
     /// A send on a socket: on a stream, it is not cancelled (see
     /// [`Iocp::cancel_op`]).
     sending: bool,
+    /// A read of a file or pipe: a pipe whose writer is gone ends it like
+    /// the end of a file.
+    reading: bool,
     /// A blocking job's flag, which a job that has not started yet checks.
     cancel: Option<Arc<super::blocking::Cancel>>,
     accepting: Option<Box<Accepting>>,
@@ -559,6 +562,7 @@ impl Iocp {
             after: After::Nothing,
             state,
             sending: false,
+            reading: false,
             cancel: None,
             accepting: None,
             datagram: None,
@@ -631,6 +635,7 @@ impl Iocp {
                 Io::Send { .. } | Io::SendMsg { .. } | Io::SendFile { .. } => {
                     (*record).sending = true;
                 }
+                Io::Read { .. } | Io::ReadReady { .. } => (*record).reading = true,
                 Io::RecvMsg { msg, .. } => {
                     let bufs =
                         std::slice::from_raw_parts((*msg).lpBuffers, (*msg).dwBufferCount as usize);
@@ -769,11 +774,17 @@ impl Iocp {
             Err(code) if ended_with_a_warning(code) => {
                 // SAFETY: the call has ended, so the kernel no longer
                 // writes to the record; its packet may still name it.
-                let after = unsafe {
+                let (after, count) = unsafe {
                     (*record).state = State::Lingering;
-                    (*record).after
+                    ((*record).after, (*record).overlapped.InternalHigh)
                 };
-                Start::Done(Self::cut(after, -code), 0)
+                let res = if socket {
+                    Self::cut(after, -code)
+                } else {
+                    // Part of a pipe message: what came, as a stream read.
+                    count.min(i32::MAX as usize) as i32
+                };
+                Start::Done(res, 0)
             }
             done => {
                 // Nothing is in flight: no completion will name the record.
@@ -785,7 +796,7 @@ impl Iocp {
                         0 => transferred as i32,
                         err => err,
                     },
-                    Err(code) if code == ERROR_HANDLE_EOF as i32 => 0,
+                    Err(code) if Self::is_end(&record, code) => 0,
                     Err(code) => Self::cut(record.after, -code),
                 };
                 Start::Done(res, 0)
@@ -863,6 +874,11 @@ impl Iocp {
 
     /// The result `res` of an operation, with a datagram that was cut to
     /// fit its buffer reported as the bytes that fit.
+    /// Whether a failed read (`code`) is the end of its file or pipe.
+    fn is_end(rec: &Record, code: i32) -> bool {
+        code == ERROR_HANDLE_EOF as i32 || (rec.reading && code == ERROR_BROKEN_PIPE as i32)
+    }
+
     fn cut(after: After, res: i32) -> i32 {
         match after {
             After::Received { room } if res == -WSAEMSGSIZE => room,
@@ -1529,8 +1545,11 @@ impl Iocp {
             };
             if ok != 0 {
                 bytes as i32
-            } else if err == ERROR_HANDLE_EOF as i32 {
+            } else if Self::is_end(rec, err) {
                 0
+            } else if !rec.socket && err == ERROR_MORE_DATA as i32 {
+                // Part of a pipe message: what came, as a stream read.
+                bytes as i32
             } else {
                 -err
             }

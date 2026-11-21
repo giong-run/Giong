@@ -508,7 +508,7 @@ impl StreamSocket {
             );
             return (Err(err), buf);
         }
-        let len = buf.capacity().min(u32::MAX as usize) as u32;
+        let len = buf.capacity().min(i32::MAX as usize) as u32;
         let io = Io::Recv {
             fd: self.sock.as_raw_fd(),
             buf: buf.as_mut_ptr(),
@@ -583,6 +583,23 @@ impl StreamSocket {
                 crate::sys::io_vec(unsafe { buf.as_ptr().add(skip) }, buf.len() - skip)
             })
             .collect();
+        // Windows reports a transfer's count as a signed 32-bit number: a
+        // send of more than that in one call is cut to it, a short write.
+        #[cfg(windows)]
+        {
+            let mut room = i32::MAX as usize;
+            let mut keep = 0;
+            for v in iov.iter_mut() {
+                if room == 0 {
+                    break;
+                }
+                let len = crate::sys::io_vec_parts(v).1.min(room);
+                v.len = len as u32;
+                room -= len;
+                keep += 1;
+            }
+            iov.truncate(keep);
+        }
         if iov.is_empty() {
             return (Ok(0), bufs);
         }
@@ -872,7 +889,7 @@ impl StreamSocket {
 
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
-        let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
+        let len = (buf.len() - offset).min(i32::MAX as usize) as u32;
         let hold = self.send_hold(&buf, len as usize);
         // SAFETY: `offset <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(offset) };

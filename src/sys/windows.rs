@@ -134,6 +134,15 @@ pub(crate) fn fsync(file: RawFile, _datasync: bool) -> isize {
     }
 }
 
+/// Whether `handle` is a character device, a console above all: those
+/// take no overlapped calls and cannot join a completion port, so their
+/// operations run on the blocking threads.
+pub(crate) fn is_char_device(handle: std::os::windows::io::RawHandle) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_CHAR};
+    // SAFETY: only reads the type of a handle the caller owns.
+    unsafe { GetFileType(handle) == FILE_TYPE_CHAR }
+}
+
 /// `CreateFileW` flag: the file is opened for overlapped I/O.
 pub(crate) const FILE_FLAG_OVERLAPPED: u32 =
     windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
@@ -321,7 +330,7 @@ pub(crate) const MSG_TRUNC: i32 = WinSock::MSG_TRUNC as i32;
 #[inline(always)]
 pub(crate) fn io_vec(base: *const u8, len: usize) -> IoVec {
     WSABUF {
-        len: len.min(u32::MAX as usize) as u32,
+        len: len.min(i32::MAX as usize) as u32,
         buf: base.cast_mut(),
     }
 }

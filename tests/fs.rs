@@ -1416,3 +1416,141 @@ fn cached_reads_return_the_right_bytes_and_end_of_file() {
         assert_eq!(fs::read(&path).await.unwrap(), data);
     });
 }
+
+/// A named pipe whose server, which wrote, is gone: the reader gets what
+/// was written and then the end, as from a file, not an error. (One name
+/// on every system, for the simulator's index; the body is Windows'.)
+#[test]
+fn a_pipe_whose_writer_has_gone_reads_to_its_end() {
+    #[cfg(windows)]
+    {
+        let (server, name) = named_pipe("eof", false);
+        giong::block_on(async move {
+            let file = File::open(&name).await.unwrap();
+            let mut server = connect_pipe(server);
+            std::io::Write::write_all(&mut server, b"hi").unwrap();
+            drop(server);
+            let (res, buf) = file.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 2);
+            assert_eq!(&buf[..], b"hi");
+            let (res, _) = file.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 0, "the end of the pipe is not an error");
+        });
+    }
+}
+
+/// A read of a message pipe with less room than the message returns what
+/// fits, and the rest comes with the next read, not an error.
+#[test]
+fn a_pipe_message_longer_than_the_buffer_is_read_in_parts() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_MESSAGE};
+        let (server, name) = named_pipe("message", true);
+        giong::block_on(async move {
+            let file = File::open(&name).await.unwrap();
+            let mode = PIPE_READMODE_MESSAGE;
+            // SAFETY: the client end, open; the mode is a local.
+            let ok = unsafe {
+                SetNamedPipeHandleState(
+                    file.as_raw_handle(),
+                    &mode,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+            let mut server = connect_pipe(server);
+            std::io::Write::write_all(&mut server, b"0123456789").unwrap();
+            let mut got = Vec::new();
+            while got.len() < 10 {
+                let (res, buf) = file.read_at(Vec::with_capacity(4), 0).await;
+                let n = res.unwrap();
+                assert!(n > 0 && n <= 4, "{n}");
+                got.extend_from_slice(&buf);
+            }
+            assert_eq!(got, b"0123456789");
+        });
+    }
+}
+
+/// The console opens and takes writes: it cannot join the completion
+/// port, so its calls run on the blocking threads.
+#[test]
+fn the_console_opens_and_takes_writes() {
+    #[cfg(windows)]
+    {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open("CONOUT$")
+            .is_err()
+        {
+            eprintln!("skipped: this process has no console");
+            return;
+        }
+        giong::block_on(async {
+            let console = OpenOptions::new()
+                .write(true)
+                .open("CONOUT$")
+                .await
+                .unwrap();
+            let (res, _) = console.write_at(b"\n".to_vec(), 0).await;
+            assert_eq!(res.unwrap(), 1);
+        });
+    }
+}
+
+/// A new named pipe's server end, byte or message type, and its name.
+#[cfg(windows)]
+fn named_pipe(name: &str, message: bool) -> (std::fs::File, String) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+    };
+    let name = format!(r"\\.\pipe\giong-fs-{}-{name}", std::process::id());
+    let wide: Vec<u16> = std::ffi::OsStr::new(&name)
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let kind = if message {
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+    } else {
+        0
+    };
+    // SAFETY: a NUL-terminated name; no security attributes.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            kind | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert_ne!(
+        handle,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: a new handle, owned from here on.
+    (unsafe { std::fs::File::from_raw_handle(handle) }, name)
+}
+
+/// The server end once its client has opened the pipe.
+#[cfg(windows)]
+fn connect_pipe(server: std::fs::File) -> std::fs::File {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+    // SAFETY: the server end, open. The client is already there, so this
+    // ends at once (`ERROR_PIPE_CONNECTED`, which is fine).
+    unsafe { ConnectNamedPipe(server.as_raw_handle(), std::ptr::null_mut()) };
+    server
+}

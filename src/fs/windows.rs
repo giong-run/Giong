@@ -268,7 +268,11 @@ impl OpenOptions {
         // A file the caller never receives is closed where it is dropped:
         // with the operation's resources.
         let file = blocking(move || options.open(path)).await?;
-        Ok(File::from_handle(file.into_raw_handle(), true))
+        let handle = file.into_raw_handle();
+        // A console (`CONIN$`, `CONOUT$`) ignores the overlapped flag and
+        // cannot join the completion port: its calls block, so they go to
+        // the blocking threads.
+        Ok(File::from_handle(handle, !sys::is_char_device(handle)))
     }
 }
 
@@ -397,7 +401,7 @@ impl File {
         if let Err(e) = check_offset(offset) {
             return (Err(e), buf);
         }
-        let len = buf.capacity().min(u32::MAX as usize) as u32;
+        let len = buf.capacity().min(i32::MAX as usize) as u32;
         let res = if self.overlapped {
             let io = Io::Read {
                 fd: self.handle,
@@ -481,7 +485,7 @@ impl File {
         if let Err(e) = check_offset(offset) {
             return (Err(e), buf);
         }
-        let len = (buf.len() - skip).min(u32::MAX as usize) as u32;
+        let len = (buf.len() - skip).min(i32::MAX as usize) as u32;
         // SAFETY: `skip <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(skip) };
         if self.overlapped {
