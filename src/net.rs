@@ -1516,9 +1516,10 @@ impl TcpStream {
     /// file ends before `offset + len`, after sending what it had.
     ///
     /// Not cancel safe: if the future is dropped, part of the file may have
-    /// been sent; on Windows the system then resets the connection, as the
-    /// peer could not tell where the data stops. After the first call, the
-    /// socket is non-blocking (on Unix).
+    /// been sent, and the peer cannot tell where it stops. (On Windows the
+    /// piece being sent when the future is dropped is sent to its end; the
+    /// rest is not.) After the first call, the socket is non-blocking (on
+    /// Unix).
     ///
     /// ```no_run
     /// # use giong::net::TcpStream;

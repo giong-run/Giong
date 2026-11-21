@@ -383,6 +383,9 @@ pub(crate) struct Iocp {
     /// Records whose future is gone and that the kernel or a blocking
     /// thread still holds; `shutdown` cancels them.
     orphans: HashSet<usize>,
+    /// Records of calls that ended at once with a warning, kept until the
+    /// packet that may still name them comes (see `State::Lingering`).
+    lingering: HashSet<usize>,
     accept_ex: LPFN_ACCEPTEX,
     connect_ex: LPFN_CONNECTEX,
     recv_msg: LPFN_WSARECVMSG,
@@ -433,6 +436,7 @@ impl Iocp {
             pool,
             graveyard: Vec::new(),
             orphans: HashSet::new(),
+            lingering: HashSet::new(),
             accept_ex: None,
             connect_ex: None,
             recv_msg: None,
@@ -778,6 +782,7 @@ impl Iocp {
                     (*record).state = State::Lingering;
                     ((*record).after, (*record).overlapped.InternalHigh)
                 };
+                self.lingering.insert(record as usize);
                 let res = if socket {
                     Self::cut(after, -code)
                 } else {
@@ -1288,6 +1293,7 @@ impl Iocp {
                     (*record).state = State::Lingering;
                     (*record).datagram.take().expect("a datagram receive")
                 };
+                self.lingering.insert(record as usize);
                 return match Self::datagram(&mut datagram, -code) {
                     Ok(data) => MultiPoll::Data(data),
                     Err(e) => {
@@ -1527,6 +1533,7 @@ impl Iocp {
             // Reported when its call returned; this is the packet that
             // the warning status still queued. It was never counted in
             // flight.
+            self.lingering.remove(&(record as usize));
             // SAFETY: reported, so neither the kernel nor the port holds
             // it any more.
             drop(unsafe { Box::from_raw(record) });
@@ -1696,6 +1703,12 @@ impl Drop for Iocp {
                 }
             }
         }
+        // Their calls ended long ago; only a packet nobody will read now
+        // names them.
+        for &record in &self.lingering {
+            // SAFETY: the kernel finished with it when its call returned.
+            drop(unsafe { Box::from_raw(record as *mut Record) });
+        }
     }
 }
 
@@ -1852,6 +1865,14 @@ mod tests {
             // Windows leaves it in flight. Either way a packet must come.
             let err = wsa_error();
             assert_eq!(rc, -1);
+            eprintln!(
+                "the receive {}",
+                if err == WSAEMSGSIZE {
+                    "ended inside the call, cut off"
+                } else {
+                    "was left in flight"
+                }
+            );
             assert!(
                 err == WSAEMSGSIZE || err == ERROR_IO_PENDING as i32,
                 "error {err}"
