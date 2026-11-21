@@ -325,7 +325,10 @@ fn mixed(port: u16, secs: u64, seed: u64) {
         percentile(&lat, 1.0),
     );
     // Where the connections ended up: hot/light on each worker.
-    let workers = placed.iter().rposition(|p| p != &[0, 0]).map_or(1, |i| i + 1);
+    let workers = placed
+        .iter()
+        .rposition(|p| p != &[0, 0])
+        .map_or(1, |i| i + 1);
     for (w, [hot, light]) in placed.iter().take(workers).enumerate() {
         println!("  worker {w}: {hot} hot, {light} light");
     }
