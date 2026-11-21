@@ -1023,23 +1023,42 @@ fn statements_before_a_failure_in_their_batch_run_again() {
 }
 
 #[test]
-fn transaction_local_settings_reach_the_rest_of_their_batch() {
+fn transaction_local_settings_stay_with_their_statement_unless_hidden() {
     run(|s| async move {
-        // What `Config::batch_reads` warns about, pinned: a setting made
-        // with `set_config(.., true)` lasts until the end of the batch.
+        // A setting made with `set_config(.., true)` lasts until the end of
+        // the transaction. A statement that calls it runs alone, so the
+        // setting reaches no other statement; a call inside a function is
+        // not seen and reaches the rest of its batch, as `Config::batch_reads`
+        // warns.
         const SET: &str = "SELECT set_config('giong.tenant', $1::int4::text, true)";
+        const HIDDEN: &str = "SELECT giong_set_tenant($1::int4)";
         const GET: &str =
             "SELECT coalesce(current_setting('giong.tenant', true), '') || $1::int4::text";
         for batch in [false, true] {
             let pool = Pool::new(s.local().batch_reads(batch), 1);
-            // Prepared, so that both may join a batch.
-            pool.query(SET, &[&0i32]).await.unwrap();
-            pool.query(GET, &[&0i32]).await.unwrap();
+            pool.get()
+                .await
+                .unwrap()
+                .batch_execute(
+                    "CREATE OR REPLACE FUNCTION giong_set_tenant(i int4) RETURNS text \
+                     LANGUAGE plpgsql AS $$ BEGIN \
+                     RETURN set_config('giong.tenant', i::text, true); END $$",
+                )
+                .await
+                .unwrap();
+            // Prepared, so that each may join a batch.
+            for sql in [SET, HIDDEN, GET] {
+                pool.query(sql, &[&0i32]).await.unwrap();
+            }
             for i in 1..=5 {
                 let [_, seen] = together(&pool, (SET, i), (GET, 0)).await;
                 let seen: String = seen.unwrap()[0].get::<&str>(0).unwrap().to_owned();
+                assert_eq!(seen, "0", "no setting from another statement");
+
+                let [_, seen] = together(&pool, (HIDDEN, i), (GET, 0)).await;
+                let seen: String = seen.unwrap()[0].get::<&str>(0).unwrap().to_owned();
                 if batch {
-                    assert_eq!(seen, format!("{i}0"), "the other task's setting");
+                    assert_eq!(seen, format!("{i}0"), "the hidden call's setting");
                 } else {
                     assert_eq!(seen, "0", "no setting from another statement");
                 }

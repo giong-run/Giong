@@ -20,9 +20,10 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   where the HTTP side is the limit. A `SELECT` that writes fails in the batch with `25006`
   and is sent again alone; statements the server skipped after an error in their batch are
   sent again one by one, as are the other statements of a batch that a failure or a failed
-  commit rolled back. Not for statements that set transaction-local settings (row-level
-  security set up per request): within a batch they reach other tasks' statements. MySQL's
-  protocol has no equivalent.
+  commit rolled back. A `SELECT` that calls `set_config` runs alone, so that a
+  transaction-local setting does not reach other tasks' statements; not for functions that
+  make such settings (row-level security set up per request), which a statement's text does
+  not show. MySQL's protocol has no equivalent.
 - `bench/db-path.sh`: an HTTP request that reads one row from PostgreSQL or MySQL, answered
   as JSON, on giong against axum with deadpool-postgres and with SQLx, for throughput,
   p50/p99 under load and the latency of one request at a time.

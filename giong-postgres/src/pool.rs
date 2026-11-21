@@ -974,12 +974,20 @@ impl Drop for Lent<'_> {
 }
 
 /// Whether `sql` starts with the word `SELECT`, the statements a batch may
-/// take ([`Config::batch_reads`]).
+/// take ([`Config::batch_reads`]), and does not call `set_config`: a
+/// transaction-local setting made that way (`set_config(..., true)`, as
+/// row-level security policies read) would reach the rest of its batch, so
+/// such a statement runs alone. A call hidden inside a function is not
+/// seen; [`Config::batch_reads`] says so.
 fn is_select(sql: &str) -> bool {
     let sql = sql.trim_start();
     sql.get(..6)
         .is_some_and(|w| w.eq_ignore_ascii_case("select"))
         && !sql[6..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+        && !sql
+            .as_bytes()
+            .windows(10)
+            .any(|w| w.eq_ignore_ascii_case(b"set_config"))
 }
 
 /// Refuses, before anything is sent, a statement that must not run on a
@@ -1410,6 +1418,8 @@ mod tests {
             "INSERT 1",
             "sel",
             "",
+            "SELECT set_config('app.user', $1, true)",
+            "select 1 from t where pg_catalog.SET_CONFIG('a', 'b', true) is not null",
         ] {
             assert!(!is_select(sql), "{sql}");
         }
