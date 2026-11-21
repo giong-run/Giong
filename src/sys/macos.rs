@@ -159,16 +159,20 @@ pub(crate) fn accept(fd: RawFd) -> isize {
 ///
 /// `buf` must be valid for `len` bytes of writes.
 pub(crate) unsafe fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> isize {
-    no_offsets_on_a_terminal(libc::pread(fd, buf.cast(), len, offset as libc::off_t))
+    no_offsets_on_a_terminal(fd, libc::pread(fd, buf.cast(), len, offset as libc::off_t))
 }
 
 /// macOS refuses `pread` and `pwrite` on a terminal with `ENXIO`, where a
 /// pipe (and everything without offsets on Linux) gets `ESPIPE`: reported
 /// as the latter, which the callers answer with a plain read or write.
-fn no_offsets_on_a_terminal(res: isize) -> isize {
-    // SAFETY: the calling thread's own `errno`.
+/// Only for a terminal: `ENXIO` from anything else (a raw disk read past
+/// its end, a device that went away) is a real error, and a plain read
+/// there would read the wrong place.
+fn no_offsets_on_a_terminal(fd: RawFd, res: isize) -> isize {
+    // SAFETY: the calling thread's own `errno`; `isatty` only on the
+    // failure path, and it leaves `errno` alone for a terminal.
     unsafe {
-        if res < 0 && *libc::__error() == libc::ENXIO {
+        if res < 0 && *libc::__error() == libc::ENXIO && libc::isatty(fd) == 1 {
             *libc::__error() = libc::ESPIPE;
         }
     }
@@ -187,7 +191,7 @@ pub(crate) unsafe fn pwrite(fd: RawFd, buf: *const u8, len: usize, offset: u64) 
     if libc::fcntl(fd, libc::F_GETFL) & libc::O_APPEND != 0 {
         return libc::write(fd, buf.cast(), len);
     }
-    no_offsets_on_a_terminal(libc::pwrite(fd, buf.cast(), len, offset as libc::off_t))
+    no_offsets_on_a_terminal(fd, libc::pwrite(fd, buf.cast(), len, offset as libc::off_t))
 }
 
 /// `st_mode` of an open descriptor, from `fstat`.
@@ -267,6 +271,17 @@ pub(crate) fn fallocate(fd: RawFd, offset: u64, len: u64) -> isize {
         if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) } < 0 {
             return -1;
         }
+    }
+    // macOS has no "grow if shorter" in one step: a write past `end` that
+    // landed since the first `fstat` would be cut off by the `ftruncate`.
+    // Looked at again right before it, which leaves only a write racing
+    // this last check (see `File::allocate`).
+    // SAFETY: as above.
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        return -1;
+    }
+    if st.st_size as u64 >= end {
+        return 0;
     }
     // SAFETY: plain syscall on a descriptor.
     unsafe { libc::ftruncate(fd, end as libc::off_t) as isize }

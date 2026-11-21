@@ -862,6 +862,10 @@ fn nameserver(word: &str) -> Option<SocketAddr> {
         Ok(index) => index,
         Err(_) => interface_index(zone)?,
     };
+    // A link-local address needs an interface to be sent to.
+    if scope == 0 && ip.segments()[0] & 0xffc0 == 0xfe80 {
+        return None;
+    }
     Some(std::net::SocketAddrV6::new(ip, 53, 0, scope).into())
 }
 
@@ -1131,7 +1135,7 @@ mod tests {
 
     /// macOS writes a router's link-local address with its interface
     /// (`fe80::1%en0`); the zone becomes the address's scope. One naming no
-    /// interface is skipped.
+    /// interface, or zone 0 on a link-local address, is skipped.
     #[test]
     fn a_nameserver_with_a_zone_gets_its_scope() {
         let lo = if cfg!(target_os = "linux") {
@@ -1141,7 +1145,7 @@ mod tests {
         };
         let cfg = ResolverConfig::parse(
             &format!(
-                "nameserver fe80::1%nosuchif0\nnameserver fe80::2%{lo}\nnameserver fe80::3%7\n"
+                "nameserver fe80::1%nosuchif0\nnameserver fe80::4%0\nnameserver fe80::2%{lo}\nnameserver fe80::3%7\n"
             ),
             "",
         );

@@ -459,8 +459,13 @@ impl File {
     /// Fails with `Unsupported` on a filesystem without `fallocate` (some
     /// network filesystems).
     ///
-    /// On macOS (`F_PREALLOCATE`) only space past the end of the file is
-    /// reserved: holes inside a sparse file stay holes.
+    /// # Platform
+    ///
+    /// On macOS (`F_PREALLOCATE`) only the part past the end of the file is
+    /// reserved: holes inside a sparse file stay holes, and writing into
+    /// them can still fail for lack of space. The file is grown in a
+    /// separate step, so a write past `offset + len` that runs at the same
+    /// time can be cut off: do not race the two there.
     ///
     /// Cancel safe: if the future is dropped, the space may or may not have
     /// been reserved, and calling again reserves it.
