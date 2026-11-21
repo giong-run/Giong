@@ -16,6 +16,9 @@ on:
       minutes:
         description: Minutes to run each workload
         default: "120"
+      clients:
+        description: Clients per worker (empty for 32 for runtime, 16 for TLS)
+        default: ""
 
 permissions:
   contents: read
@@ -31,13 +34,14 @@ jobs:
     timeout-minutes: 300
     env:
       GIONG_TEST_EXPECT_DRIVER: kqueue
-      # A quarter of the clients the soak runs on Linux (8 instead of 32 per
-      # worker for runtime, 4 instead of 16 for TLS), same scenarios and
-      # checks. At the full load the kernel refused 0.05-0.15% of sends and
-      # connects with ENOBUFS (no buffer); Linux makes the sender wait. At
-      # this load it still does in rare bursts (0.01% once, see
-      # portability.md section 7); giong 1.2.1 is to wait and retry.
-      GIONG_SOAK_CLIENTS: ${{ matrix.workload == 'runtime' && '8' || '4' }}
+      # The clients the soak runs on Linux (32 per worker for runtime, 16
+      # for TLS), same scenarios and checks. Sends and connects on these
+      # runners got ENOBUFS (no buffer) for 0.05-0.15% of connections at
+      # this load, and in rare bursts even at a quarter of it (0.01% once,
+      # see portability.md section 7), where Linux makes the sender wait. They now wait too
+      # (driver/readiness/nobufs.rs), so the full load must pass with no
+      # failed connection; `clients` sets a lighter one.
+      GIONG_SOAK_CLIENTS: ${{ inputs.clients || (matrix.workload == 'runtime' && '32' || '16') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

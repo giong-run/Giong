@@ -35,9 +35,8 @@ mod common;
 /// Client tasks per worker.
 const CLIENTS: usize = 32;
 
-/// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS`. The macOS
-/// runners take fewer: at the full load their kernel refuses some sends and
-/// connects with `ENOBUFS` (no buffer), where Linux makes the sender wait.
+/// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS` for a
+/// lighter run.
 fn clients() -> usize {
     std::env::var("GIONG_SOAK_CLIENTS")
         .ok()

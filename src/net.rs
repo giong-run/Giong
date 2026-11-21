@@ -62,6 +62,110 @@ pub(crate) fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
 }
 
+/// [`os_err`] for the result of a stream send or connect. On macOS,
+/// `ENOBUFS` there comes after the driver waited for network buffers (see
+/// `driver/readiness/nobufs.rs`), and gets its code.
+#[inline]
+pub(crate) fn send_err(res: i32) -> io::Error {
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    if res == -libc::ENOBUFS {
+        return nobufs::exhausted(os_err(res));
+    }
+    os_err(res)
+}
+
+/// The net layer's part in waiting out a shortage of network buffers on
+/// macOS: the connects the shortage broke after they began, and
+/// `sendfile(2)`. The driver retries the rest (see
+/// `driver/readiness/nobufs.rs`, whose steps these are). Datagram sends are
+/// left alone: their `ENOBUFS` is returned as the kernel's error, as on
+/// Linux, since a datagram may be dropped.
+#[cfg(any(target_os = "macos", giong_inject_enobufs))]
+pub(crate) mod nobufs {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use socket2::Socket;
+
+    use crate::error::{Code, Error};
+
+    const GIVE_UP: Duration = Duration::from_secs(2);
+    const FIRST: Duration = Duration::from_millis(1);
+    const MOST: Duration = Duration::from_millis(32);
+
+    /// `ENOBUFS` with its code, after giong waited for buffers.
+    #[cold]
+    pub(crate) fn exhausted(err: io::Error) -> io::Error {
+        Error::new(
+            Code::NetworkBuffersExhausted,
+            "the system ran out of network buffers (ENOBUFS), and still had none after 2 s",
+            "read from every connection promptly, cap how many connections can hold unread \
+             data at once, and lower SO_RCVBUF if the program raised it; netstat -m shows how \
+             many requests for network buffers macOS denied. If it keeps happening with \
+             little in use, treat the error as transient and try again later.",
+        )
+        .with_source(err)
+        .into()
+    }
+
+    pub(crate) fn is_exhausted(err: &io::Error) -> bool {
+        crate::error::code(err) == Some(Code::NetworkBuffersExhausted)
+    }
+
+    /// Waits between tries, as the driver does, within [`GIVE_UP`] from when
+    /// it was made.
+    pub(crate) struct Backoff {
+        since: Instant,
+        step: Duration,
+    }
+
+    impl Backoff {
+        pub(crate) fn new() -> Self {
+            Self {
+                since: Instant::now(),
+                step: Duration::ZERO,
+            }
+        }
+
+        /// Waits for the next try; `false`, at once, if it would end past
+        /// [`GIVE_UP`].
+        pub(crate) async fn wait(&mut self) -> bool {
+            self.step = if self.step.is_zero() {
+                FIRST
+            } else {
+                (self.step * 2).min(MOST)
+            };
+            if self.since.elapsed() + self.step > GIVE_UP {
+                return false;
+            }
+            crate::time::sleep(self.step).await;
+            true
+        }
+
+        /// What is left of [`GIVE_UP`].
+        pub(crate) fn left(&self) -> Duration {
+            GIVE_UP.saturating_sub(self.since.elapsed())
+        }
+    }
+
+    /// A socket from `make`. `socket(2)` fails with `ENOBUFS` when macOS
+    /// has no buffer for the new socket; that error comes back with its
+    /// code, for the caller to wait and try again.
+    pub(crate) fn socket(make: impl Fn() -> io::Result<Socket>) -> io::Result<Socket> {
+        #[cfg(giong_inject_enobufs)]
+        if crate::inject_enobufs::socket() {
+            return Err(exhausted(io::Error::from_raw_os_error(libc::ENOBUFS)));
+        }
+        make().map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOBUFS) {
+                exhausted(e)
+            } else {
+                e
+            }
+        })
+    }
+}
+
 /// A multishot operation slot owned by a socket: the driver key plus the uid
 /// of the worker whose driver it belongs to.
 pub(crate) struct MultiSlot {
@@ -416,6 +520,48 @@ impl StreamSocket {
         Some(copied.clone())
     }
 
+    /// Connects a socket made by `make` to `addr`. On macOS, a socket that
+    /// could not be made for want of network buffers is made again, and a
+    /// connect that the shortage broke after it began is made again on a new
+    /// socket. All of it stays within the 2 s the driver waits for buffers:
+    /// a connect on a new socket gets what is left of them, not 2 s of its
+    /// own.
+    pub(crate) async fn connect_new(
+        make: impl Fn() -> io::Result<Socket>,
+        addr: SockAddr,
+    ) -> io::Result<Self> {
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        {
+            let mut backoff = nobufs::Backoff::new();
+            let mut res = match nobufs::socket(&make) {
+                Ok(sock) => Self::connect(sock, addr.clone()).await,
+                Err(e) => Err(e),
+            };
+            loop {
+                match res {
+                    Err(e) if nobufs::is_exhausted(&e) && backoff.wait().await => {
+                        res = match nobufs::socket(&make) {
+                            Ok(sock) => {
+                                let connect = Self::connect(sock, addr.clone());
+                                match crate::time::timeout(backoff.left(), connect).await {
+                                    Ok(res) => res,
+                                    // Out of time while the driver waited for
+                                    // buffers (dropping the connect closed its
+                                    // socket).
+                                    Err(_) => Err(e),
+                                }
+                            }
+                            Err(again) => Err(again),
+                        };
+                    }
+                    res => return res,
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", giong_inject_enobufs)))]
+        Self::connect(make()?, addr).await
+    }
+
     /// Connects `sock` to `addr` through the driver.
     pub(crate) async fn connect(sock: Socket, addr: SockAddr) -> io::Result<Self> {
         // On the heap so the address the operation points at does not move
@@ -436,7 +582,7 @@ impl StreamSocket {
         // `KernelBox`.
         let (res, _, _addr) = unsafe { Op::new(io, addr) }.await;
         if res < 0 {
-            return Err(os_err(res));
+            return Err(send_err(res));
         }
         Ok(stream)
     }
@@ -701,7 +847,7 @@ impl StreamSocket {
         let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), bufs)
+            (Err(send_err(res)), bufs)
         } else {
             (Ok(res as usize), bufs)
         }
@@ -799,7 +945,7 @@ impl StreamSocket {
             unsafe { Op::new(io, (buf, control, iov, msg)) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), buf, control)
+            (Err(send_err(res)), buf, control)
         } else {
             (Ok(res as usize), buf, control)
         }
@@ -826,6 +972,8 @@ impl StreamSocket {
         let fd = self.sock.as_raw_fd();
         let (mut offset, mut left) = (offset, len);
         let mut since_yield = 0;
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        let mut backoff: Option<nobufs::Backoff> = None;
         while left > 0 {
             let count = left.min(SENDFILE_MAX) as usize;
             // The socket is non-blocking, so the call never waits; `offset`
@@ -834,6 +982,10 @@ impl StreamSocket {
             let n = crate::sys::sendfile(fd, file, &mut moved, count);
             match n {
                 n if n > 0 => {
+                    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                    {
+                        backoff = None;
+                    }
                     let n = n as u64;
                     offset += n;
                     left -= n;
@@ -862,6 +1014,18 @@ impl StreamSocket {
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
                         Some(crate::sys::errno::EINTR) => {}
+                        // The pool of network buffers is empty: wait for it
+                        // as stream sends do.
+                        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                        Some(libc::ENOBUFS) => {
+                            if !backoff
+                                .get_or_insert_with(nobufs::Backoff::new)
+                                .wait()
+                                .await
+                            {
+                                return Err(nobufs::exhausted(err));
+                            }
+                        }
                         Some(crate::sys::errno::EAGAIN) => {
                             // SAFETY: the operation has no pointers.
                             let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
@@ -898,7 +1062,7 @@ impl StreamSocket {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
             if let Some(res) = self.send_now(bytes) {
                 return if res < 0 {
-                    (Err(os_err(res)), buf)
+                    (Err(send_err(res)), buf)
                 } else {
                     (Ok(res as usize), buf)
                 };
@@ -922,7 +1086,7 @@ impl StreamSocket {
         let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), buf)
+            (Err(send_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }
@@ -1282,8 +1446,8 @@ impl TcpStream {
 
     /// Connects to exactly this address, without name resolution.
     pub(crate) async fn connect_addr(addr: SocketAddr) -> io::Result<Self> {
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        let inner = StreamSocket::connect(sock, addr.into()).await?;
+        let make = || Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP));
+        let inner = StreamSocket::connect_new(make, addr.into()).await?;
         Ok(Self { inner })
     }
 

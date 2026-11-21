@@ -51,6 +51,9 @@ use crate::buf::{BufPool, RecvBuf};
 use crate::slab::Slab;
 use crate::sys;
 
+#[cfg(any(target_os = "macos", giong_inject_enobufs))]
+mod nobufs;
+
 /// What the readiness driver needs from the kernel's event queue (epoll,
 /// kqueue). Tokens are 64 bits: [`WAKE`] and [`DONE`] for the two bells,
 /// otherwise a descriptor number in the lower half and a generation in the
@@ -367,6 +370,9 @@ pub(crate) struct Readiness<P: Poller> {
     /// descriptor is to be closed when the last one reports.
     busy: HashMap<RawFd, (u32, bool)>,
     graveyard: Vec<Box<dyn Any>>,
+    /// Sends and connects waiting out a shortage of network buffers.
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    retries: nobufs::Retries,
 }
 
 impl<P: Poller> Readiness<P> {
@@ -390,6 +396,8 @@ impl<P: Poller> Readiness<P> {
             ahead: HashMap::new(),
             quieting: Vec::new(),
             graveyard: Vec::new(),
+            #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+            retries: nobufs::Retries::default(),
         };
         driver.poller.watch(driver.completions.fd(), DONE)?;
         Ok(driver)
@@ -555,6 +563,10 @@ impl<P: Poller> Readiness<P> {
         if let Err(e) = self.register(fd) {
             return Attempt::Done(e);
         }
+        #[cfg(giong_inject_enobufs)]
+        if let Some(res) = nobufs::inject::refused(io, *connecting) {
+            return Attempt::Done(res);
+        }
         // SAFETY: for every call below, the pointers come from `Op`
         // resources, valid while the operation exists; the descriptor is
         // non-blocking.
@@ -562,12 +574,21 @@ impl<P: Poller> Readiness<P> {
             match *io {
                 Io::Connect { fd, addr, len } => {
                     if *connecting {
-                        return Attempt::Done(connect_result(fd)).or_wait(fd, Dir::Write);
+                        let res = connect_result(fd);
+                        #[cfg(giong_inject_enobufs)]
+                        let res = nobufs::inject::connected(res, connecting);
+                        return Attempt::Done(res).or_wait(fd, Dir::Write);
                     }
                     let res = match libc::connect(fd, addr, len) {
                         0 => 0,
                         _ => neg_errno(),
                     };
+                    // Tried again after `ENOBUFS`, the call may find the
+                    // first one under way after all.
+                    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                    let res = nobufs::connect_again(res);
+                    #[cfg(giong_inject_enobufs)]
+                    let res = nobufs::inject::connected(res, connecting);
                     if res == -libc::EINPROGRESS || res == -libc::EINTR {
                         // In progress: done when the socket becomes writable.
                         *connecting = true;
@@ -672,6 +693,16 @@ impl<P: Poller> Readiness<P> {
         }
         let mut connecting = false;
         match self.attempt(io, &mut connecting) {
+            #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+            Attempt::Done(res) if nobufs::retries(io, connecting, res) => {
+                let key = self.ops.insert(EOp::Ready {
+                    io: *io,
+                    connecting,
+                });
+                // The first step is always taken.
+                self.retries.schedule(key, waker);
+                Start::Submitted(key)
+            }
             Attempt::Done(res) => Start::Done(res, 0),
             Attempt::Wait(fd, dir) => {
                 let key = self.ops.insert(EOp::Ready {
@@ -766,12 +797,21 @@ impl<P: Poller> Readiness<P> {
             }
             _ => panic!("giong: operation polled in an invalid state"),
         };
+        // One comparison while no operation waits for network buffers.
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        if !self.retries.is_empty() && self.retries.waiting(key, waker) {
+            return Poll::Pending;
+        }
         if !spend_budget() {
             waker.wake_by_ref();
             return Poll::Pending;
         }
         match self.attempt(&io, &mut connecting) {
             Attempt::Done(res) => {
+                #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                if self.retry_later(key, &io, connecting, res, waker) {
+                    return Poll::Pending;
+                }
                 self.ops.remove(key);
                 Poll::Ready((res, 0))
             }
@@ -779,10 +819,32 @@ impl<P: Poller> Readiness<P> {
                 if let Some(EOp::Ready { connecting: c, .. }) = self.ops.get_mut(key) {
                     *c = connecting;
                 }
+                #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                self.retries.forget(key);
                 self.wait(fd, dir, waker);
                 Poll::Pending
             }
         }
+    }
+
+    /// `true` if operation `key`, whose attempt came to `res`, waits for
+    /// network buffers and is tried again later (see [`nobufs`]); otherwise
+    /// it no longer waits for them.
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    #[cold]
+    fn retry_later(
+        &mut self,
+        key: usize,
+        io: &Io,
+        connecting: bool,
+        res: i32,
+        waker: &Waker,
+    ) -> bool {
+        if nobufs::retries(io, connecting, res) && self.retries.schedule(key, waker) {
+            return true;
+        }
+        self.retries.forget(key);
+        false
     }
 
     pub(crate) fn cancel_op(
@@ -826,6 +888,8 @@ impl<P: Poller> Readiness<P> {
             Some(EOp::Ready { .. }) => {
                 // Nothing is using the resources any more.
                 self.ops.remove(key);
+                #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                self.retries.forget(key);
                 if let Some(data) = data {
                     self.graveyard.push(data);
                 }
@@ -1295,9 +1359,19 @@ impl<P: Poller> Readiness<P> {
                 Park::Poll => Some(Duration::ZERO),
                 Park::Wait(timeout) => timeout,
             };
+            #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+            let timeout = if self.retries.is_empty() {
+                timeout
+            } else {
+                self.retries.limit(timeout)
+            };
             self.wait_events(timeout)
         };
         self.dispatch(n);
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        if !self.retries.is_empty() {
+            self.retries.wake_due();
+        }
         if !self.quieting.is_empty() {
             self.leave_busy_sets();
         }

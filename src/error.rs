@@ -152,6 +152,17 @@ codes! {
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
 
+    // -------------------------------------------------------------- macOS
+    /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
+    /// longer than giong waits: sockets holding much unread data bring it
+    /// on, and some virtual machines get it in bursts. A stream send or
+    /// connect waits
+    /// for buffers and is tried again for up to 2 seconds before it fails
+    /// with this code (a datagram send keeps the kernel's error). The
+    /// kernel's error is the [`source`](std::error::Error::source), so
+    /// `raw_os_error` stays reachable.
+    NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
+
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
     InvalidAddress = 100, InvalidInput, "invalid address";
