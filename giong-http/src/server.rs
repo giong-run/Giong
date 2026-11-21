@@ -1693,6 +1693,7 @@ impl<T: Transport> Conn<T> {
                 body: BodyBytes::InBuffer(start..start),
                 peer: self.peer,
                 charge: Charge::none(),
+                early_data: false,
             };
             let stream_body =
                 catching(|| handler.stream_body(&req)).map_err(|()| End::Status(500))?;
@@ -1777,6 +1778,7 @@ impl<T: Transport> Conn<T> {
             body,
             peer: self.peer,
             charge,
+            early_data: false,
         };
         self.pos += total;
         self.scanned = 0;

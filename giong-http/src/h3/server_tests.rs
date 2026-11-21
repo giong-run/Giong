@@ -56,6 +56,7 @@ impl Handler for App {
                         String::from_utf8_lossy(req.header("host").unwrap()),
                     )
             }
+            "/early" => Response::text(req.is_early_data().to_string()),
             "/echo" => Response::new(200).body(req.body().to_vec()),
             "/big" => Response::new(200).body(pattern(1 << 20)),
             "/empty" => Response::new(204),
@@ -840,5 +841,72 @@ fn connections_answer_with_well_formed_responses_whatever_the_client_sends() {
             whole += played.unwrap_or_else(|_| panic!("round {round} hangs: {data:?}"));
         }
         assert!(whole > ROUNDS / 4, "only {whole} responses");
+    });
+}
+
+/// A server that takes 0-RTT data: requests that come in it are marked,
+/// and those of methods that are not safe are answered 425 Too Early
+/// without reaching the handler.
+#[test]
+fn requests_in_early_data_are_marked_and_unsafe_ones_wait() {
+    run(|| async {
+        let (server_tls, client_tls) = tls();
+        let endpoint = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerConfig::new(server_tls).unwrap().early_data(true),
+        )
+        .unwrap();
+        let addr: SocketAddr = endpoint.local_addr().unwrap();
+        drop(giong::spawn(async move {
+            Server::new().serve_h3(endpoint, App).await
+        }));
+        let quic = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let cfg = ClientConfig::new(client_tls).unwrap().early_data(true);
+        // Opens a request stream and sends `request` on it; the response
+        // is read later.
+        async fn send(conn: &Connection, request: Vec<u8>) -> giong_quic::RecvStream {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            send.write_all(&request).await.unwrap();
+            send.finish().unwrap();
+            recv
+        }
+        let mut control_frame = vec![0x00];
+        Settings::write_frame(&mut control_frame, 1 << 20);
+        let mut post_hi = post("/echo", &[("content-length", "2")]);
+        post_hi.extend_from_slice(&data(b"hi"));
+
+        // The first connection is not early, and leaves a ticket.
+        let first = quic.connect_early(addr, "localhost", &cfg).await.unwrap();
+        let mut control = first.open_uni().await.unwrap();
+        control.write_all(&control_frame).await.unwrap();
+        let mut recv = send(&first, get("/early")).await;
+        assert!(!recv.is_early());
+        let reply = parse(&recv.read_to_end(1 << 16).await.unwrap());
+        assert_eq!((reply.status(), &reply.body[..]), (200, &b"false"[..]));
+        first.close(0x100, b"");
+        drop((control, recv, first));
+
+        // The second sends its requests before its handshake ends.
+        let second = quic.connect_early(addr, "localhost", &cfg).await.unwrap();
+        let mut control = second.open_uni().await.unwrap();
+        control.write_all(&control_frame).await.unwrap();
+        let mut early_get = send(&second, get("/early")).await;
+        let mut early_post = send(&second, post_hi.clone()).await;
+        assert!(early_get.is_early() && early_post.is_early());
+        let reply = parse(&early_get.read_to_end(1 << 16).await.unwrap());
+        assert_eq!((reply.status(), &reply.body[..]), (200, &b"true"[..]));
+        let reply = parse(&early_post.read_to_end(1 << 16).await.unwrap());
+        assert_eq!(reply.status(), 425);
+        assert!(second.handshake().await.unwrap());
+
+        // After the handshake, nothing is early: the POST goes through.
+        let mut late = send(&second, get("/early")).await;
+        assert!(!late.is_early());
+        let reply = parse(&late.read_to_end(1 << 16).await.unwrap());
+        assert_eq!(&reply.body[..], b"false");
+        let mut late = send(&second, post_hi).await;
+        let reply = parse(&late.read_to_end(1 << 16).await.unwrap());
+        assert_eq!((reply.status(), &reply.body[..]), (200, &b"hi"[..]));
+        drop(control);
     });
 }

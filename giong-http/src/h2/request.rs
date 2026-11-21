@@ -362,6 +362,7 @@ impl Builder {
             body: BodyBytes::InBuffer(len..len),
             peer,
             charge: Charge::none(),
+            early_data: false,
         })
     }
 

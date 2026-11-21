@@ -75,6 +75,9 @@ pub struct Request {
     /// given back when it is dropped.
     #[allow(dead_code)] // Held for its `Drop`.
     pub(crate) charge: Charge,
+    /// Its head came in QUIC early data, which can be replayed.
+    #[cfg_attr(not(feature = "unstable-http3"), allow(dead_code))]
+    pub(crate) early_data: bool,
 }
 
 impl Request {
@@ -123,6 +126,7 @@ impl Request {
             body,
             peer: None,
             charge: Charge::none(),
+            early_data: false,
         })
     }
 
@@ -217,6 +221,21 @@ impl Request {
     /// worth believing when it comes from a proxy you run.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer
+    }
+
+    /// Whether the request came in 0-RTT early data (HTTP/3 to a server
+    /// whose QUIC configuration takes it), which anyone who recorded it can
+    /// send again (RFC 8470).
+    ///
+    /// The server answers early requests of methods other than `GET`,
+    /// `HEAD` and `OPTIONS` with `425 Too Early` itself, so a handler only
+    /// sees early requests of those three. A handler for which even such a
+    /// request has effects it must not repeat answers it with
+    /// `Response::new(425)`: the client sends it again once the handshake
+    /// is over, and it is no longer early.
+    #[cfg(feature = "unstable-http3")]
+    pub fn is_early_data(&self) -> bool {
+        self.early_data
     }
 
     /// The request body. Empty if the request has none, or if its body is

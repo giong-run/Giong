@@ -715,6 +715,15 @@ async fn exchange<H: Handler>(
         Err(_) => return respond(conn, send, Response::new(408), false).await,
     };
     let mut req = match built {
+        // Early data can be replayed (RFC 8470): only the methods meant
+        // to be safe get through, marked as early.
+        Built::Request(mut req) if r.recv.is_early() => {
+            if !matches!(req.method(), "GET" | "HEAD" | "OPTIONS") {
+                return respond(conn, send, Response::new(425), false).await;
+            }
+            req.early_data = true;
+            req
+        }
         Built::Request(req) => req,
         Built::Status(status) => {
             return respond(conn, send, Response::new(status), false).await;
