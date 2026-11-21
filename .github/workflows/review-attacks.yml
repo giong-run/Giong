@@ -39,7 +39,7 @@ jobs:
           cargo test -p giong $flag --test review_attacks diag -- --nocapture || true
           for i in $(seq 1 10); do
             echo "::group::run $i"
-            timeout 900 cargo test -p giong $flag --test review_attacks -- --nocapture --test-threads 2 --skip diag 2>&1 | tee run.log
+            perl -e 'alarm shift; exec @ARGV' 900 cargo test -p giong $flag --test review_attacks -- --nocapture --test-threads 2 --skip diag 2>&1 | tee run.log
             status=${PIPESTATUS[0]}
             echo "::endgroup::"
             if [ "$status" != 0 ]; then echo "::error::run $i failed ($status)"; exit 1; fi
