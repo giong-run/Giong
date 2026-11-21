@@ -21,9 +21,11 @@ request; everything else is automated and safe to re-run.
    request `chore(release): giong X.Y.Z` on the branch `release/X.Y.Z` that:
    - bumps `version` in every workspace crate, the path dependencies between them and
      `Cargo.lock`;
-   - turns `## [Unreleased]` in `CHANGELOG.md` into `## [X.Y.Z] - <date>` and updates
-     the compare links at the bottom; when `Unreleased` is empty it drafts the entries
-     from the conventional commit subjects, marked with a comment saying so;
+   - turns `## [Unreleased]` in `CHANGELOG.md`, with every entry in `changelog.d/`
+     merged into its section, into `## [X.Y.Z] - <date>`, deletes the `changelog.d/`
+     files and updates the compare links at the bottom (`python3 scripts/release.py
+     unreleased` shows the merged section beforehand); when both are empty it drafts the
+     entries from the conventional commit subjects, marked with a comment saying so;
    - updates install snippets such as `giong-http = "0.2"` in the crate READMEs, and
      lists any prose that still names the old minor version (for example
      "Status: 0.2.") for you to rewrite;
