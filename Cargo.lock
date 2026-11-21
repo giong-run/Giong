@@ -436,6 +436,7 @@ dependencies = [
  "quinn",
  "quinn-proto",
  "rcgen",
+ "ring",
  "rustls",
  "tokio",
 ]

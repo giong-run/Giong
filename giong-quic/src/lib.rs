@@ -66,7 +66,7 @@ impl Endpoint {
     pub fn server(addr: SocketAddr, config: ServerConfig) -> io::Result<Self> {
         let cfg = std::sync::Arc::new(config.to_proto()?);
         Ok(Self {
-            sh: proto::bind(addr, Some(cfg), config.early_data)?,
+            sh: proto::bind(addr, Some((cfg, config.reset_key)), config.early_data)?,
         })
     }
 

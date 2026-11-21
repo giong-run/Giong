@@ -728,9 +728,13 @@ fn deliver(
 
 pub(crate) fn bind(
     addr: SocketAddr,
-    server: Option<Arc<quinn_proto::ServerConfig>>,
+    server: Option<(Arc<quinn_proto::ServerConfig>, [u8; 32])>,
     early_data: bool,
 ) -> io::Result<Rc<Shared>> {
+    let (server, reset_key) = match server {
+        Some((config, key)) => (Some(config), Some(key)),
+        None => (None, None),
+    };
     let sock = UdpSocket::bind(addr)?;
     // GRO needs 64 KiB receive buffers; without them datagrams come one by
     // one, which is correct, only slower.
@@ -750,7 +754,13 @@ pub(crate) fn bind(
     // Connection IDs name this worker, so that another worker that gets
     // one of this endpoint's packets knows where it belongs.
     let worker = giong::worker_id() as u16;
-    let mut config = EndpointConfig::default();
+    let mut config = match reset_key {
+        Some(key) => EndpointConfig::new(Arc::new(ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA256,
+            &key,
+        ))),
+        None => EndpointConfig::default(),
+    };
     config.cid_generator(move || Box::new(route::WorkerCids { worker }));
     let route = match &server {
         Some(_) => Some(Member::join(sock.local_addr()?, worker)),

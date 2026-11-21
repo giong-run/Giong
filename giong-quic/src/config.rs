@@ -87,6 +87,7 @@ pub struct ServerConfig {
     pub(crate) tls: Arc<rustls::ServerConfig>,
     pub(crate) transport: TransportConfig,
     pub(crate) early_data: bool,
+    pub(crate) reset_key: [u8; 32],
 }
 
 impl ServerConfig {
@@ -101,10 +102,21 @@ impl ServerConfig {
                  vec![b\"h3\".to_vec()] for HTTP/3.",
             ));
         }
+        let mut reset_key = [0; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut reset_key).map_err(
+            |_| {
+                error::config(
+                    "the system's random number generator failed",
+                    "check that /dev/urandom and the getrandom system call work in this \
+                     environment.",
+                )
+            },
+        )?;
         let mut cfg = Self {
             tls: Arc::new(tls),
             transport: TransportConfig::default(),
             early_data: false,
+            reset_key,
         };
         cfg = cfg.early_data(false);
         cfg.to_proto()?;
@@ -135,6 +147,19 @@ impl ServerConfig {
         tls.max_early_data_size = if on { u32::MAX } else { 0 };
         self.tls = Arc::new(tls);
         self.early_data = on;
+        self
+    }
+
+    /// The secret that stateless resets are made with (RFC 9000, section
+    /// 10.3): a client whose connection a server no longer knows (after a
+    /// restart, or on another machine behind the same address) is told so
+    /// at once only if the token it holds was made with the same key;
+    /// otherwise it waits for its idle timeout. Random by default, shared
+    /// by every endpoint built from this configuration (one per worker).
+    /// Give the same key to the servers behind one address and across
+    /// restarts, and keep it secret: who has it can end connections.
+    pub fn stateless_reset_key(mut self, key: [u8; 32]) -> Self {
+        self.reset_key = key;
         self
     }
 

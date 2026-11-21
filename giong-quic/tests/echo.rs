@@ -878,3 +878,73 @@ fn streams_a_server_opens_are_never_early() {
         })
         .unwrap();
 }
+
+/// Two servers with the same stateless reset key, as after a restart: a
+/// client of the first, whose packets now reach the second, learns at once
+/// that its connection is gone (RFC 9000, section 10.3) instead of waiting
+/// for its idle timeout.
+#[test]
+fn a_server_with_the_same_reset_key_ends_connections_it_does_not_know() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let key = [7u8; 32];
+            let server = |tls: rustls::ServerConfig| {
+                let config = ServerConfig::new(tls).unwrap().stateless_reset_key(key);
+                let ep = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+                let addr = ep.local_addr().unwrap();
+                giong::spawn(serve(ep));
+                addr
+            };
+            let first = server(tls.clone());
+            let second = server(tls);
+            // A relay whose far side can be switched from one to the other.
+            let target = Arc::new(std::sync::Mutex::new(first));
+            let front = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+            let back = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+            let relay_addr = front.local_addr().unwrap();
+            let client_addr = Arc::new(std::sync::Mutex::new(None));
+            {
+                let (front, back, target, client_addr) = (
+                    front.clone(),
+                    back.clone(),
+                    target.clone(),
+                    client_addr.clone(),
+                );
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 65536];
+                    while let Ok((n, from)) = front.recv_from(&mut buf) {
+                        *client_addr.lock().unwrap() = Some(from);
+                        let to = *target.lock().unwrap();
+                        let _ = back.send_to(&buf[..n], to);
+                    }
+                });
+            }
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                while let Ok((n, _)) = back.recv_from(&mut buf) {
+                    if let Some(to) = *client_addr.lock().unwrap() {
+                        let _ = front.send_to(&buf[..n], to);
+                    }
+                }
+            });
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = client.connect(relay_addr, "localhost", &cfg).await.unwrap();
+            assert_eq!(echo_on(&conn, b"abc").await.unwrap(), b"cba");
+            // The first server is gone from the path; the second never
+            // saw this connection.
+            *target.lock().unwrap() = second;
+            let ended = giong::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if echo_on(&conn, b"abc").await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(ended.is_ok(), "the client waited for its idle timeout");
+        })
+        .unwrap();
+}
