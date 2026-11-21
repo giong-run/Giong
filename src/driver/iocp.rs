@@ -40,7 +40,7 @@
 //! error code, which `io::Error::from_raw_os_error(-res)` reads.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem;
@@ -62,6 +62,9 @@ use windows_sys::Win32::Networking::WinSock::{
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED, WSAECONNRESET,
     WSAEINVAL, WSAEMSGSIZE, WSAENOTCONN, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX,
     WSAID_CONNECTEX, WSAID_WSARECVMSG, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+};
+use windows_sys::Win32::Networking::WinSock::{
+    SO_PROTOCOL_INFOW, WSAPROTOCOL_INFOW, XP1_IFS_HANDLES,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, SetFileCompletionNotificationModes, WriteFile,
@@ -276,6 +279,26 @@ fn is_stream(socket: SOCKET) -> bool {
     rc == 0 && kind == SOCK_STREAM
 }
 
+/// Whether the provider behind `socket` hands out real file handles
+/// (`XP1_IFS_HANDLES`), which the I/O manager treats as files; a layered
+/// one that does not may report a call that succeeded at once anyway.
+fn ifs_handles(socket: SOCKET) -> bool {
+    // SAFETY: plain data, filled in by the call.
+    let mut info: WSAPROTOCOL_INFOW = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<WSAPROTOCOL_INFOW>() as i32;
+    // SAFETY: an open socket; `info` has room for `len` bytes.
+    let rc = unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_PROTOCOL_INFOW,
+            (&mut info as *mut WSAPROTOCOL_INFOW).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && info.dwServiceFlags1 & XP1_IFS_HANDLES != 0
+}
+
 /// Bytes of the header in front of every datagram of a multishot receive:
 /// name length, control length, payload length and flags, as `u32`s.
 const DATAGRAM_HEADER: usize = 16;
@@ -346,8 +369,9 @@ pub(crate) struct Iocp {
     events: Vec<OVERLAPPED_ENTRY>,
     /// Completions collected by `has_completions` and not processed yet.
     ready: usize,
-    /// Handles associated with the port.
-    registered: HashSet<usize>,
+    /// Handles associated with the port, each with whether the port skips
+    /// the completion of a call that succeeds at once (see `register`).
+    registered: HashMap<usize, bool>,
     pool: Rc<BufPool>,
     graveyard: Vec<Box<dyn Any>>,
     accept_ex: LPFN_ACCEPTEX,
@@ -396,7 +420,7 @@ impl Iocp {
             // SAFETY: OVERLAPPED_ENTRY is plain data; all-zero is valid.
             events: vec![unsafe { mem::zeroed() }; BATCH],
             ready: 0,
-            registered: HashSet::new(),
+            registered: HashMap::new(),
             pool,
             graveyard: Vec::new(),
             accept_ex: None,
@@ -418,8 +442,14 @@ impl Iocp {
     /// Associates a handle with the port, once. A socket is also put in
     /// non-blocking mode, for the reads the multishot receive tries first;
     /// overlapped calls are not affected by it.
+    ///
+    /// A call that succeeds at once is not reported through the port too
+    /// (`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`), except on a socket whose
+    /// provider does not hand out real file handles: a layered provider of
+    /// some antivirus or VPN software can still report it, so there every
+    /// call counts as in flight until its completion, as libuv does.
     fn register(&mut self, handle: HANDLE, socket: bool) -> Result<(), i32> {
-        if self.registered.contains(&(handle as usize)) {
+        if self.registered.contains_key(&(handle as usize)) {
             return Ok(());
         }
         // SAFETY: associates a handle the caller owns with our open port;
@@ -428,7 +458,12 @@ impl Iocp {
         if port.is_null() {
             return Err(-last_error());
         }
-        let modes = FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS;
+        let skips = !socket || ifs_handles(handle as SOCKET);
+        let modes = if skips {
+            FILE_SKIP_SET_EVENT_ON_HANDLE | FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
+        } else {
+            FILE_SKIP_SET_EVENT_ON_HANDLE
+        };
         // SAFETY: sets notification modes on a handle the caller owns.
         if unsafe { SetFileCompletionNotificationModes(handle, modes) } == 0 {
             return Err(-last_error());
@@ -440,8 +475,22 @@ impl Iocp {
                 return Err(-wsa_error());
             }
         }
-        self.registered.insert(handle as usize);
+        self.registered.insert(handle as usize, skips);
         Ok(())
+    }
+
+    /// Whether `result`, what an overlapped call on `handle` returned, means
+    /// that its completion will come through the port: in flight, or
+    /// finished at once on a handle whose port does not skip that.
+    fn reported_later(&self, handle: HANDLE, result: &Result<(), i32>) -> bool {
+        match result {
+            Err(code) => *code == ERROR_IO_PENDING as i32,
+            Ok(()) => !self
+                .registered
+                .get(&(handle as usize))
+                .copied()
+                .unwrap_or(true),
+        }
     }
 
     /// Closes a file handle the caller gives up. Operations in flight on
@@ -690,7 +739,7 @@ impl Iocp {
             }
         };
         match outcome {
-            Err(code) if code == ERROR_IO_PENDING as i32 => {
+            ref r if self.reported_later(handle, r) => {
                 self.inflight += 1;
                 Start::Submitted(self.ops.insert(Slot::Single(record)))
             }
@@ -1042,7 +1091,7 @@ impl Iocp {
                 )
             };
             match wsa(rc) {
-                Err(code) if code == ERROR_IO_PENDING as i32 => {
+                ref r if self.reported_later(socket as HANDLE, r) => {
                     self.inflight += 1;
                     let multi = self.multi(key);
                     multi.pending = record;
@@ -1160,7 +1209,7 @@ impl Iocp {
             )
         };
         let done = match wsa(rc) {
-            Err(code) if code == ERROR_IO_PENDING as i32 => {
+            ref r if self.reported_later(socket as HANDLE, r) => {
                 self.inflight += 1;
                 let multi = self.multi(key);
                 multi.pending = record;
@@ -1296,13 +1345,13 @@ impl Iocp {
                 record.cast(),
             )
         };
-        if ok == 0 {
-            let code = wsa_error();
-            if code == ERROR_IO_PENDING as i32 {
-                self.inflight += 1;
-                self.multi(key).pending = record;
-                return Ok(None);
-            }
+        let result = if ok == 0 { Err(wsa_error()) } else { Ok(()) };
+        if self.reported_later(listener as HANDLE, &result) {
+            self.inflight += 1;
+            self.multi(key).pending = record;
+            return Ok(None);
+        }
+        if let Err(code) = result {
             // SAFETY: nothing is in flight; dropping it closes the socket.
             drop(unsafe { Box::from_raw(record) });
             return Err(-code);
