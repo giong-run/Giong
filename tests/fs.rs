@@ -644,7 +644,8 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
     giong::block_on(async move {
         let file = File::from_std(master);
         let read = file.read_at(Vec::with_capacity(16), 0);
-        assert!(timeout(Duration::from_millis(100), read).await.is_err());
+        let early = timeout(Duration::from_millis(100), read).await;
+        assert!(early.is_err(), "the read did not wait: {:?}", early);
         if close {
             file.close().await.unwrap();
         } else {
@@ -1067,7 +1068,11 @@ fn directories_on_unix() {
             assert_eq!(meta.len(), std_meta.len());
         }
         // An entry outlives its listing, and clones share the directory.
-        let file = ours[2].clone();
+        let file = ours
+            .iter()
+            .find(|entry| entry.file_name() == "file")
+            .unwrap()
+            .clone();
         drop(ours);
         assert_eq!(file.path(), dir.path("file"));
         assert_eq!(file.metadata().await.unwrap().len(), 5);

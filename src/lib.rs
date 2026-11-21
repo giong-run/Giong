@@ -81,8 +81,11 @@
 // driver.
 #![cfg_attr(windows, allow(dead_code))]
 
-#[cfg(not(any(target_os = "linux", windows)))]
-compile_error!("giong supports Linux (io_uring, epoll) and Windows (completion ports)");
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!(
+    "giong supports Linux (io_uring and epoll), Windows (completion ports) and, as a development \
+     platform, macOS (kqueue)"
+);
 
 mod buf;
 mod driver;

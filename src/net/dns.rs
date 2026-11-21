@@ -68,6 +68,12 @@ impl ResolverConfig {
     /// Reads `/etc/resolv.conf` and `/etc/hosts`. A missing file counts as
     /// empty.
     ///
+    /// On macOS `/etc/resolv.conf` is written by the system from its network
+    /// configuration, and holds the servers and search domains of the
+    /// primary resolver (the first one `scutil --dns` lists), so this follows
+    /// the network the machine is on. Resolvers that macOS uses for some
+    /// domains only (files in `/etc/resolver`, a VPN's own domains) are not
+    /// in that file and are not consulted.
     /// On Windows, which has no `resolv.conf`, the name servers are those of
     /// the network adapters that are up (the first three, in the order
     /// Windows lists the adapters), the search domains are the machine's

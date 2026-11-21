@@ -7,9 +7,10 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 use super::Bell;
 
-/// macOS has no `MSG_NOSIGNAL`. Every socket giong makes is created by
-/// socket2, which sets `SO_NOSIGPIPE` on it (accepted sockets inherit it
-/// from their listener), so a send to a closed peer fails with `EPIPE`.
+/// macOS has no `MSG_NOSIGNAL`: the socket carries `SO_NOSIGPIPE` instead,
+/// so a send to a closed peer fails with `EPIPE`. socket2 sets it on every
+/// socket it creates, accepted sockets inherit it from their listener, and
+/// the `from_std` constructors and every listener set it themselves.
 pub(crate) const MSG_NOSIGNAL: i32 = 0;
 
 /// giong's own flag for "stat the descriptor itself" (macOS has no
@@ -66,13 +67,6 @@ impl Bell {
             set_nonblocking(fd)?;
         }
         Ok(Bell { read, write })
-    }
-
-    /// The worker's wake-up bell. A pipe, like every bell on macOS: the
-    /// kqueue driver could use an `EVFILT_USER` event instead, which needs
-    /// no descriptor and no read to reset (see the design document).
-    pub(crate) fn new_worker() -> io::Result<Self> {
-        Self::new()
     }
 }
 
@@ -163,7 +157,20 @@ pub(crate) fn accept(fd: RawFd) -> isize {
 ///
 /// `buf` must be valid for `len` bytes of writes.
 pub(crate) unsafe fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> isize {
-    libc::pread(fd, buf.cast(), len, offset as libc::off_t)
+    no_offsets_on_a_terminal(libc::pread(fd, buf.cast(), len, offset as libc::off_t))
+}
+
+/// macOS refuses `pread` and `pwrite` on a terminal with `ENXIO`, where a
+/// pipe (and everything without offsets on Linux) gets `ESPIPE`: reported
+/// as the latter, which the callers answer with a plain read or write.
+fn no_offsets_on_a_terminal(res: isize) -> isize {
+    // SAFETY: the calling thread's own `errno`.
+    unsafe {
+        if res < 0 && *libc::__error() == libc::ENXIO {
+            *libc::__error() = libc::ESPIPE;
+        }
+    }
+    res
 }
 
 /// `pwrite(2)`.
@@ -178,7 +185,7 @@ pub(crate) unsafe fn pwrite(fd: RawFd, buf: *const u8, len: usize, offset: u64) 
     if libc::fcntl(fd, libc::F_GETFL) & libc::O_APPEND != 0 {
         return libc::write(fd, buf.cast(), len);
     }
-    libc::pwrite(fd, buf.cast(), len, offset as libc::off_t)
+    no_offsets_on_a_terminal(libc::pwrite(fd, buf.cast(), len, offset as libc::off_t))
 }
 
 /// `st_mode` of an open descriptor, from `fstat`.
@@ -277,10 +284,18 @@ pub(crate) fn sendfile(sock: RawFd, file: RawFd, offset: &mut u64, count: usize)
         return len as isize;
     }
     if res == 0 {
-        0
-    } else {
-        -1
+        return 0;
     }
+    // A peer that closed makes macOS answer "not connected" where a send
+    // (and Linux's sendfile) says "broken pipe": reported as the latter, so
+    // one error means one thing on every system.
+    // SAFETY: the calling thread's own `errno`.
+    unsafe {
+        if *libc::__error() == libc::ENOTCONN {
+            *libc::__error() = libc::EPIPE;
+        }
+    }
+    -1
 }
 
 /// Reads a batch of directory entries into `buf` (whose capacity is the

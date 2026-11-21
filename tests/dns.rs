@@ -574,3 +574,38 @@ fn connect_reports_the_last_error_when_every_address_fails() {
         assert_eq!(code(&err), Some(Code::NoAddresses), "{err}");
     });
 }
+
+/// macOS writes the primary resolver of its network configuration to
+/// /etc/resolv.conf: the servers read from the file are the ones the system
+/// reports for it.
+#[test]
+#[cfg(target_os = "macos")]
+fn the_system_configuration_is_the_primary_resolver_of_macos() {
+    let out = std::process::Command::new("scutil")
+        .arg("--dns")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The first resolver listed is the primary one.
+    let primary: Vec<IpAddr> = text
+        .split("resolver #")
+        .nth(1)
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver["))
+        .filter_map(|rest| rest.split(": ").nth(1)?.trim().parse().ok())
+        .collect();
+    if primary.is_empty() {
+        // No network: nothing to compare.
+        return;
+    }
+    let cfg = ResolverConfig::system().unwrap();
+    let ours: Vec<IpAddr> = cfg.nameserver_addrs().iter().map(|a| a.ip()).collect();
+    assert!(!ours.is_empty());
+    for server in &ours {
+        assert!(
+            primary.contains(server),
+            "{server} is not a server of the primary resolver {primary:?}"
+        );
+    }
+}

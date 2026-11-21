@@ -696,6 +696,11 @@ fn a_dropped_open_closes_the_descriptor_it_produced() {
 #[cfg(unix)]
 #[test]
 fn a_dropped_close_still_closes_on_the_epoll_driver() {
+    // The system's readiness driver: kqueue on macOS works the same way.
+    #[cfg(target_os = "linux")]
+    const READINESS: giong::DriverKind = giong::DriverKind::Epoll;
+    #[cfg(target_os = "macos")]
+    const READINESS: giong::DriverKind = giong::DriverKind::Kqueue;
     // The epoll driver closes on a blocking thread. A close still waiting
     // for a thread when its future was dropped was skipped as cancelled,
     // and the descriptor stayed open with nobody owning it.
@@ -711,7 +716,7 @@ fn a_dropped_close_still_closes_on_the_epoll_driver() {
     // SAFETY: a valid C string.
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
     giong::Builder::new()
-        .driver(giong::DriverKind::Epoll)
+        .driver(READINESS)
         .block_on(async {
             let file = giong::fs::File::open(&path).await.unwrap();
             // More opens than the pool has threads (64): every thread

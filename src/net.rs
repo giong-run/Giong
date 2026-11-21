@@ -197,6 +197,12 @@ pub(crate) struct ListenSocket {
 
 impl ListenSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option, and the connections it accepts inherit it. socket2
+        // sets it on the sockets it creates; this covers a listener that
+        // came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
@@ -330,10 +336,19 @@ impl Drop for SendInFlight<'_> {
 
 impl StreamSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS waits in a send to a full socket even with `MSG_DONTWAIT`
+        // (the flag only keeps a receive from waiting there), so a stream is
+        // non-blocking from the start: a send made outside the driver, as
+        // giong-compat's direct sends are, must never hold the worker. The
+        // driver would set the mode at the first operation anyway.
+        #[cfg(target_os = "macos")]
+        let nonblocking = sock.set_nonblocking(true).is_ok();
+        #[cfg(not(target_os = "macos"))]
+        let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
-            nonblocking: Cell::new(false),
+            nonblocking: Cell::new(nonblocking),
             zero_copy: Cell::new(true),
             zero_copy_copied: OnceCell::new(),
             sends_in_flight: Cell::new(0),
@@ -1020,6 +1035,13 @@ impl TcpListener {
     /// before the old one has stopped), create the sockets yourself with
     /// `SO_REUSEPORT` set and pass them to [`from_std`](Self::from_std).
     ///
+    /// On macOS the workers share one listening socket instead (each
+    /// listener is a duplicate of the first one bound to the address), and
+    /// take connections from its one queue as they come: whichever worker
+    /// accepts first gets the next connection. The socket is bound without
+    /// `SO_REUSEPORT`, so no other process can bind the address while a
+    /// listener lives.
+    ///
     /// On Windows a port has one listening socket. The workers' listeners
     /// share it: from the second listener on, one thread accepts the
     /// connections and hands them to the listeners in turn.
@@ -1295,6 +1317,11 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> Self {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             inner: StreamSocket::new(sock),
         }
