@@ -34,6 +34,10 @@ mod common;
 
 /// Client tasks per worker.
 const CLIENTS: usize = 32;
+/// The least time between two connects of one client on Windows (see
+/// `client`): with 4 workers, about 85 connects a second.
+#[cfg(windows)]
+const WINDOWS_CONNECT_GAP: Duration = Duration::from_millis(1500);
 const RECV_BUFFERS: usize = 512;
 
 #[derive(Default)]
@@ -55,10 +59,8 @@ struct Counters {
     /// counter has the program). Counted and held to a small share, since a
     /// listener that went away would refuse thousands.
     connects_refused: AtomicU64,
-    /// Connects that found no free local port. Windows keeps a closed
-    /// connection's port in TIME_WAIT and has about 16,000 of them, which
-    /// this churn of short connections uses up; the clients then wait for
-    /// ports to come free. Counted, and connects must still go on.
+    /// Connects that found no free local port (Windows, where the clients
+    /// are paced so that this does not happen: must stay 0).
     ports_used_up: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
@@ -203,19 +205,25 @@ async fn within<T>(
 }
 
 async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Counters>) {
+    #[cfg(windows)]
+    let mut next_connect = Instant::now();
     while Instant::now() < deadline {
+        // Windows holds a closed connection's local port for TIME_WAIT and
+        // has about 16,000 of them: at full speed the clients use them all
+        // up, and connects that reuse a port then collide with connections
+        // still in TIME_WAIT. Each client connects at most once every
+        // WINDOWS_CONNECT_GAP, well under what the ports allow.
+        #[cfg(windows)]
+        {
+            let now = Instant::now();
+            if now < next_connect {
+                sleep(next_connect - now).await;
+            }
+            next_connect = Instant::now() + WINDOWS_CONNECT_GAP;
+        }
         let stream = match TcpStream::connect(addr).await {
             Ok(stream) => stream,
             Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
-                Counters::bump(&counters.connects_refused);
-                continue;
-            }
-            // Windows drops the connects that find the listener's backlog
-            // full rather than refusing them, and the connect times out
-            // after its retries. That happens when ports come free (see
-            // `ports_used_up`) and thousands of clients connect at once: it
-            // is the kernel's refusal, held to the same small share.
-            Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::TimedOut => {
                 Counters::bump(&counters.connects_refused);
                 continue;
             }
@@ -672,6 +680,11 @@ fn soak() {
     assert!(
         refused <= 1 + connections / 50_000_000,
         "{refused} of {connections} connects were refused while every listener was up"
+    );
+    assert_eq!(
+        c.ports_used_up.load(Ordering::Relaxed),
+        0,
+        "connects found no free local port: the clients' pace is too fast"
     );
     assert!(c.connections.load(Ordering::Relaxed) > 0);
     assert!(c.cancelled_recvs.load(Ordering::Relaxed) > 0);
