@@ -59,6 +59,16 @@
 //! for a thread: a server answers 503 rather than queue work it cannot do
 //! in time.
 //!
+//! ## Tenants
+//!
+//! Closures queued from a task of a [`Budget`](crate::budget::Budget), or
+//! with [`Budget::spawn_compute`](crate::budget::Budget::spawn_compute), wait
+//! in that budget's own queue on the compute lane. A free compute thread
+//! takes the next closure of the budget that has used the least compute time
+//! for its weight, so one tenant's long jobs do not make another tenant's
+//! short jobs wait behind them. Closures outside any budget share one queue,
+//! served the same way. See [`crate::budget`].
+//!
 //! ## What a lane does not do
 //!
 //! * A closure that has started runs to its end: [`BlockingHandle::abort`]

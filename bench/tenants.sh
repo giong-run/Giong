@@ -17,8 +17,10 @@
 #     Tenant A, in the `overload` runs, keeps A_CONNS requests in flight back
 #     to back: more than the box can do.
 #   * `shared` is the same service without budgets (one FIFO compute queue,
-#     no limits); `isolated` gives each tenant a Budget (TENANT_MEM_MIB of
-#     memory, TENANT_COMPUTE compute closures), with the waiting forms only.
+#     no limits); `global` gives both tenants one Budget with twice the
+#     limits (bounded, but not per tenant); `isolated` gives each tenant a
+#     Budget (TENANT_MEM_MIB of memory, TENANT_COMPUTE compute closures).
+#     All use the waiting forms only: nothing is refused.
 #   * Scenarios: `cpu` (WORK_US=2000, MEM_KIB=256, A_CONNS=64) and `memory`
 #     (WORK_US=500, MEM_KIB=2048, A_CONNS=128: A alone would hold 256 MiB).
 #   * Acceptance (2026-11-20): with `isolated`, on both drivers, B's
@@ -33,7 +35,7 @@ ROUNDS=${1:-3}
 SECS=${2:-20}
 OUT=${OUT:-results/tenants}
 DRIVERS=${DRIVERS:-"io_uring epoll"}
-MODES=${MODES:-"shared isolated"}
+MODES=${MODES:-"shared global isolated"}
 SCENARIOS=${SCENARIOS:-"cpu memory"}
 B_RATE=${B_RATE:-100}
 B_CONNS=${B_CONNS:-10}

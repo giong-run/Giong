@@ -60,12 +60,18 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn connect(addr: &str) -> TcpStream {
+/// Connects, trying for up to a second (the server may be gone: killed for
+/// running out of memory).
+fn connect(addr: &str) -> Option<TcpStream> {
+    let until = Instant::now() + Duration::from_secs(1);
     loop {
         if let Ok(s) = TcpStream::connect(addr) {
             s.set_nodelay(true).ok();
-            s.set_read_timeout(Some(Duration::from_secs(10))).ok();
-            return s;
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            return Some(s);
+        }
+        if Instant::now() > until {
+            return None;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -91,17 +97,23 @@ fn main() {
             let mut buf = Vec::new();
             let mut s = connect(&addr);
             while !stop.load(Ordering::Relaxed) {
-                match exchange(&mut s, &req, &mut buf) {
-                    Ok(200) => ok.fetch_add(1, Ordering::Relaxed),
-                    _ => {
-                        err.fetch_add(1, Ordering::Relaxed);
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        s = connect(&addr);
-                        0
-                    }
+                let Some(stream) = s.as_mut() else {
+                    thread::sleep(Duration::from_millis(100));
+                    s = connect(&addr);
+                    continue;
                 };
+                match exchange(stream, &req, &mut buf) {
+                    Ok(200) => {
+                        ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(_) => {
+                        err.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        err.fetch_add(1, Ordering::Relaxed);
+                        s = None;
+                    }
+                }
             }
         }));
     }
@@ -129,13 +141,19 @@ fn main() {
                 if at > now {
                     thread::sleep(at - now);
                 }
-                let r = exchange(&mut s, &req, &mut buf);
+                if s.is_none() {
+                    s = connect(&addr);
+                }
+                let r = match s.as_mut() {
+                    Some(stream) => exchange(stream, &req, &mut buf),
+                    None => Err(std::io::ErrorKind::ConnectionRefused.into()),
+                };
                 let took = at.elapsed();
                 match r {
                     Ok(status) => mine.push((status, took)),
                     Err(_) => {
                         mine.push((0, took));
-                        s = connect(&addr);
+                        s = None;
                     }
                 }
                 k += b_conns as u64;

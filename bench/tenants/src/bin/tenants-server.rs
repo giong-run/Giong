@@ -4,8 +4,10 @@
 //!     tenants-server <addr> <mode>
 //!
 //! `mode` is `shared` (no budgets: one FIFO compute queue and no limits,
-//! as a service without isolation runs) or `isolated` (one `Budget` per
-//! tenant, from the `x-tenant` header; waiting limits, no refusal).
+//! as a service without isolation runs), `global` (one `Budget` for both
+//! tenants with twice the limits: bounded, but not per tenant) or
+//! `isolated` (one `Budget` per tenant, from the `x-tenant` header). All
+//! use the waiting forms, no refusal.
 //! Settings from the environment: `WORK_US` (CPU time per request, default
 //! 2000), `MEM_KIB` (memory per request, touched, default 256),
 //! `TENANT_MEM_MIB` (memory limit per tenant, default 32), `TENANT_COMPUTE`
@@ -58,16 +60,18 @@ fn request_memory(bytes: usize) -> Vec<u8> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let addr = args.next().unwrap_or_else(|| "127.0.0.1:8080".into());
-    let isolated = match args.next().as_deref() {
-        Some("isolated") => true,
-        Some("shared") | None => false,
-        Some(other) => panic!("mode is shared or isolated, not {other}"),
+    let mode = args.next().unwrap_or_else(|| "shared".into());
+    let (budgeted, per_tenant) = match mode.as_str() {
+        "isolated" => (true, true),
+        "global" => (true, false),
+        "shared" => (false, false),
+        other => panic!("mode is shared, global or isolated, not {other}"),
     };
     let work_us = env("WORK_US", 2000) as u64;
     let mem = env("MEM_KIB", 256) << 10;
-    let limits = Limits::new()
-        .memory(env("TENANT_MEM_MIB", 32) << 20)
-        .compute(env("TENANT_COMPUTE", 8));
+    let (mem_mib, compute) = (env("TENANT_MEM_MIB", 32), env("TENANT_COMPUTE", 8));
+    let limits = Limits::new().memory(mem_mib << 20).compute(compute);
+    let global = Limits::new().memory(2 * mem_mib << 20).compute(2 * compute);
     let rt = giong::Builder::new()
         .workers(1)
         .shutdown_on_signals(true)
@@ -75,17 +79,25 @@ fn main() {
         .expect("runtime");
     eprintln!(
         "tenants-server {addr} {} work={work_us}us mem={}KiB",
-        if isolated { "isolated" } else { "shared" },
+        mode,
         mem >> 10
     );
     rt.run(move |_| {
         let addr = addr.clone();
         async move {
             eprintln!("driver: {}", giong::driver_kind());
+            let everyone = Budget::new("everyone", global);
             let budgets: Rc<HashMap<&'static str, Budget>> = Rc::new(
                 ["a", "b"]
                     .into_iter()
-                    .map(|t| (t, Budget::new(t, limits)))
+                    .map(|t| {
+                        let b = if per_tenant {
+                            Budget::new(t, limits)
+                        } else {
+                            everyone.clone()
+                        };
+                        (t, b)
+                    })
                     .collect(),
             );
             let listener = TcpListener::bind(addr.as_str()).expect("bind");
@@ -98,7 +110,7 @@ fn main() {
                             Some("b") => "b",
                             _ => return Response::new(400),
                         };
-                        if isolated {
+                        if budgeted {
                             let budget = &budgets[tenant];
                             let Ok(reservation) = budget.reserve(mem).await else {
                                 return Response::new(500);

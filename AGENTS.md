@@ -40,7 +40,8 @@ Where the code is:
 | `src/driver/uring.rs` | io_uring setup, submission and completion, the ring tiers |
 | `src/driver/epoll.rs` | the epoll driver: readiness, edge-triggered registration, the per-task budget |
 | `src/driver/blocking.rs` | the epoll driver's file-operation pool (an instance of `src/pool.rs`) and its completions |
-| `src/pool.rs`, `src/lane.rs` | the growable thread pool; the public blocking and compute lanes on it (`spawn_blocking`, `spawn_compute`) |
+| `src/pool.rs`, `src/lane.rs` | the growable thread pool (FIFO, or fair queues per budget for the compute lane); the public blocking and compute lanes on it (`spawn_blocking`, `spawn_compute`) |
+| `src/budget.rs` | `Budget`: per-tenant limits on tasks, memory, I/O in flight and compute closures; the thread-local current budget, inherited by `spawn` |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
@@ -254,6 +255,10 @@ is loaded.
   about 100 µs holds up every connection on its worker. Put it in `giong::spawn_blocking`
   (waiting) or `giong::spawn_compute` (computing), never `std::thread::spawn` per call.
   Closures there run on plain threads: giong's I/O and timers panic in them (`GIONG-E0011`).
+- **One tenant starving the others.** A server shared by tenants gives each a
+  `giong::budget::Budget` and runs its requests in it (`budget.spawn`, `budget.enter`, or
+  `budget.reserve` and `budget.spawn_compute` in the handler). The waiting forms are the
+  default; `try_` forms refuse with `GIONG-E0080`, which a server answers with 503.
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 

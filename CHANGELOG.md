@@ -27,6 +27,25 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   (`src/pool.rs`) but stays a separate pool, so application jobs cannot starve file
   operations.
 
+- **Budgets per tenant** (`giong::budget`): a `Budget` gives one tenant (a customer, an API
+  key, a class of traffic) limits of its own (`Limits::tasks`, `memory`, `io`, `compute`)
+  and charges each resource to the tenant while it holds it. `Budget::spawn`,
+  `Budget::reserve` and `Budget::spawn_compute` wait for room, in order; `try_spawn`,
+  `try_reserve` and `try_spawn_compute` refuse with the new code `GIONG-E0080`
+  (`Code::BudgetFull`), and a reservation larger than the whole budget fails with
+  `GIONG-E0081` (`Code::BudgetTooSmall`). `giong::spawn` and `giong::spawn_compute` inside a
+  task of a budget charge the same budget; `Budget::enter(fut)` runs a future in a budget
+  without a task of its own; `budget::current()` and `Budget::stats()` tell which budget
+  runs and what it holds; `Budget::set_limits` changes the limits at run time. An I/O
+  operation started in a budget holds one of its I/O slots until the kernel completes it:
+  when its future is dropped, the slot stays with the operation's buffers until the
+  cancellation completes. The compute lane keeps one queue per budget and serves the one
+  that has used the least compute time for its `Limits::compute_weight`, so a tenant with
+  long jobs cannot make another tenant's short jobs wait behind them. Code that uses no
+  budget pays one thread-local read per spawn and per operation. In a container of 1 CPU
+  and 128 MiB with tenant A sending far more than the box can serve, tenant B keeps its
+  in-deadline successes with budgets, and loses them all without (`bench/tenants.sh`,
+  numbers in `bench/results/tenants/`).
 ## [1.0.0-rc.1] - 2026-11-20
 
 ### Security
