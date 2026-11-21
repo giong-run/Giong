@@ -1436,7 +1436,7 @@ impl Runtime {
 /// Raises the soft `RLIMIT_NOFILE` to the hard one, once per process (see
 /// [`Builder::raise_open_files_limit`]). Failure changes nothing: the
 /// process keeps the limit it had.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(miri)))]
 fn raise_open_files_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -1469,8 +1469,8 @@ fn raise_open_files_limit() {
 }
 
 /// Other systems keep their limit: their hard limits and caps differ from
-/// Linux's, and each port decides for itself.
-#[cfg(not(target_os = "linux"))]
+/// Linux's, and each port decides for itself. Miri has no `getrlimit`.
+#[cfg(any(not(target_os = "linux"), miri))]
 fn raise_open_files_limit() {}
 
 // --------------------------------------------------------------------- signals
