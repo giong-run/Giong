@@ -161,6 +161,8 @@ fn receipt_errno(ev: &Kevent) -> i32 {
 }
 
 impl Poller for Kqueue {
+    const SKIP_EMPTY_POLL: bool = true;
+
     fn new() -> io::Result<Self> {
         // libkqueue 2.3.1 can deadlock in its one-time start-up when several
         // threads make their first queue at once, so the Linux test build
