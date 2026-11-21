@@ -200,3 +200,4 @@ when it is no longer raised.
 | [GIONG-E3602](E3602.md) | `QuicConnect` | cannot set up the QUIC connection |
 | [GIONG-E3603](E3603.md) | `QuicConnectionLost` | the QUIC connection was lost |
 | [GIONG-E3604](E3604.md) | `QuicStreamReset` | the QUIC stream was reset |
+| [GIONG-E3605](E3605.md) | `QuicEarlyDataRejected` | the server refused the 0-RTT data |

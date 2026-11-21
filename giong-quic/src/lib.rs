@@ -62,19 +62,20 @@ impl Endpoint {
     pub fn server(addr: SocketAddr, config: ServerConfig) -> io::Result<Self> {
         let cfg = std::sync::Arc::new(config.to_proto()?);
         Ok(Self {
-            sh: proto::bind(addr, Some(cfg))?,
+            sh: proto::bind(addr, Some(cfg), config.early_data)?,
         })
     }
 
     /// A client endpoint bound to `addr` (`0.0.0.0:0` for any port).
     pub fn client(addr: SocketAddr) -> io::Result<Self> {
         Ok(Self {
-            sh: proto::bind(addr, None)?,
+            sh: proto::bind(addr, None, false)?,
         })
     }
 
-    /// The next connection whose handshake has completed. `None` once the
-    /// endpoint is closed.
+    /// The next connection whose handshake has completed, or, when the
+    /// server takes early data ([`ServerConfig::early_data`]), whose first
+    /// flight is in. `None` once the endpoint is closed.
     ///
     /// Cancel safe: a connection is handed over only when the future
     /// completes; one that arrives after it was dropped waits for the next
@@ -98,7 +99,40 @@ impl Endpoint {
         server_name: &str,
         config: &ClientConfig,
     ) -> io::Result<Connection> {
-        let h = self.sh.connect(config.to_proto()?, to, server_name).await?;
+        let h = self
+            .sh
+            .connect(config.to_proto()?, to, server_name, false)
+            .await?;
+        Ok(Connection {
+            sh: self.sh.clone(),
+            h,
+        })
+    }
+
+    /// Connects as [`connect`](Self::connect) does, but returns at once
+    /// when `config` allows early data ([`ClientConfig::early_data`]) and
+    /// holds a session ticket for this server: streams opened before
+    /// [`Connection::handshake`] returns carry their first bytes in 0-RTT
+    /// data. Send only what is harmless to do twice in them, since early
+    /// data can be replayed. Without a ticket it waits for the handshake,
+    /// as `connect` does.
+    ///
+    /// If the server refuses the early data, those streams fail with
+    /// `GIONG-E3605` and nothing of them reached the server; the
+    /// connection carries on.
+    ///
+    /// Cancel safe: dropping the future closes the connection it was
+    /// making. The peer may have seen the handshake start.
+    pub async fn connect_early(
+        &self,
+        to: SocketAddr,
+        server_name: &str,
+        config: &ClientConfig,
+    ) -> io::Result<Connection> {
+        let h = self
+            .sh
+            .connect(config.to_proto()?, to, server_name, true)
+            .await?;
         Ok(Connection {
             sh: self.sh.clone(),
             h,
@@ -173,7 +207,7 @@ impl Connection {
         })
     }
 
-    fn pair(&self, id: quinn_proto::StreamId) -> (SendStream, RecvStream) {
+    fn pair(&self, id: proto::Sid) -> (SendStream, RecvStream) {
         (
             SendStream {
                 sh: self.sh.clone(),
@@ -188,6 +222,18 @@ impl Connection {
                 done: false,
             },
         )
+    }
+
+    /// Waits for the end of the handshake. On a client, `true` if the
+    /// server took the early data sent before it (see
+    /// [`Endpoint::connect_early`]); `false` if none was sent or the server
+    /// refused it, in which case the streams opened before fail with
+    /// `GIONG-E3605`. On a server, `true` if the client opened a stream in
+    /// early data.
+    ///
+    /// Cancel safe: it only waits.
+    pub async fn handshake(&self) -> io::Result<bool> {
+        self.sh.handshake(self.h).await
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -258,14 +304,14 @@ pub fn reset_code(error: &io::Error) -> Option<u64> {
 pub struct SendStream {
     sh: Rc<proto::Shared>,
     h: usize,
-    id: quinn_proto::StreamId,
+    id: proto::Sid,
     finished: bool,
 }
 
 impl SendStream {
     /// The stream's identifier (RFC 9000, section 2.1).
     pub fn id(&self) -> u64 {
-        quinn_proto::VarInt::from(self.id).into_inner()
+        quinn_proto::VarInt::from(self.id.id).into_inner()
     }
 
     /// Abandons the stream: what was written and not yet delivered may
@@ -304,14 +350,21 @@ impl Drop for SendStream {
 pub struct RecvStream {
     sh: Rc<proto::Shared>,
     h: usize,
-    id: quinn_proto::StreamId,
+    id: proto::Sid,
     done: bool,
 }
 
 impl RecvStream {
     /// The stream's identifier (RFC 9000, section 2.1).
     pub fn id(&self) -> u64 {
-        quinn_proto::VarInt::from(self.id).into_inner()
+        quinn_proto::VarInt::from(self.id.id).into_inner()
+    }
+
+    /// Whether the stream's first bytes may have come in 0-RTT data, which
+    /// can be replayed (server side; see [`ServerConfig::early_data`]). On
+    /// a client, whether they went out in it.
+    pub fn is_early(&self) -> bool {
+        self.id.early
     }
 
     /// Asks the peer to stop sending, with `code` (`STOP_SENDING`). What

@@ -60,6 +60,51 @@ struct Conn {
     dirty: bool,
     /// Server side: handed to `accept` once connected.
     incoming: bool,
+    /// Handed to `accept` already (a server endpoint with early data hands
+    /// a connection over before its handshake ends).
+    handed: bool,
+    /// Client: the connection started with 0-RTT keys. Server: the
+    /// endpoint accepts early data.
+    early: bool,
+    /// Bumped when the server rejects the client's early data: quinn-proto
+    /// forgets the streams opened in it and gives their numbers out again,
+    /// so handles from before must no longer touch them.
+    epoch: u32,
+    /// Server: bidirectional streams the peer opened before the handshake
+    /// ended, so in 0-RTT data, taken ahead of `accept_bi` to remember it.
+    early_bi: VecDeque<StreamId>,
+    /// Server: the peer opened a stream in 0-RTT data.
+    saw_early: bool,
+}
+
+/// A stream as a handle knows it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sid {
+    pub(crate) id: StreamId,
+    /// The connection's `epoch` when the stream was opened.
+    epoch: u32,
+    /// Its first bytes may have come in 0-RTT data (server), or went out
+    /// in it (client).
+    pub(crate) early: bool,
+}
+
+impl Conn {
+    /// A stream of the early data the server rejected.
+    fn stale(&self, s: Sid) -> bool {
+        s.epoch != self.epoch
+    }
+
+    /// Server: takes the bidirectional streams that the datagram just
+    /// handled opened, when it came before the end of the handshake.
+    fn take_early(&mut self, handshaking: bool) {
+        if self.incoming && self.early && handshaking {
+            while let Some(id) = self.c.streams().accept(Dir::Bi) {
+                self.early_bi.push_back(id);
+                self.saw_early = true;
+                wake_all(&mut self.waiters);
+            }
+        }
+    }
 }
 
 struct Send {
@@ -84,6 +129,8 @@ struct State {
     wake: bool,
     /// The `Endpoint` handle is gone: no new connections.
     closed: bool,
+    /// Server: the TLS configuration accepts early data.
+    early_data: bool,
     scratch: Vec<u8>,
     sends: Vec<Send>,
     segments: usize,
@@ -143,6 +190,7 @@ impl State {
         ch: ConnectionHandle,
         c: quinn_proto::Connection,
         incoming: bool,
+        early: bool,
     ) -> usize {
         let slot = self.free.pop().unwrap_or_else(|| {
             self.conns.push(None);
@@ -162,7 +210,16 @@ impl State {
             refs: usize::from(!incoming),
             dirty: false,
             incoming,
+            handed: false,
+            early,
+            epoch: 0,
+            early_bi: VecDeque::new(),
+            saw_early: false,
         });
+        if let Some(c) = &mut self.conns[slot] {
+            // The first datagram may hold 0-RTT packets after the Initial.
+            c.take_early(true);
+        }
         self.mark(slot);
         slot
     }
@@ -200,7 +257,8 @@ impl State {
                     self.scratch.clear();
                     match self.ep.accept(inc, now, &mut self.scratch, None) {
                         Ok((ch, c)) => {
-                            self.insert(ch, c, true);
+                            let early = self.early_data;
+                            self.insert(ch, c, true, early);
                         }
                         Err(e) => {
                             if let Some(t) = e.response {
@@ -215,7 +273,12 @@ impl State {
                     let slot = self.slots.get(ch.0).copied().unwrap_or(usize::MAX);
                     if let Some(Some(c)) = self.conns.get_mut(slot) {
                         if c.ch == ch {
+                            let handshaking = c.c.is_handshaking();
                             c.c.handle_event(ev);
+                            // A datagram that ends the handshake may also
+                            // hold 1-RTT packets: their streams count as
+                            // early too, which errs on the safe side.
+                            c.take_early(handshaking);
                             self.mark(slot);
                         }
                     }
@@ -269,14 +332,40 @@ impl State {
             }
             while let Some(ev) = conn.c.poll() {
                 match ev {
+                    Event::HandshakeDataReady if conn.incoming && conn.early => {
+                        // Early data on: the application gets the
+                        // connection now, to answer what came in 0-RTT.
+                        conn.handed = true;
+                        conn.refs += 1;
+                        self.accepted.push_back(i);
+                        if let Some(w) = self.accept_waker.take() {
+                            w.wake();
+                        }
+                    }
                     Event::Connected => {
                         conn.connected = true;
-                        if conn.incoming {
+                        if conn.incoming && !conn.handed {
+                            conn.handed = true;
                             conn.refs += 1;
                             self.accepted.push_back(i);
                             if let Some(w) = self.accept_waker.take() {
                                 w.wake();
                             }
+                        }
+                        if !conn.incoming && conn.early && !conn.c.accepted_0rtt() {
+                            // The server refused the early data: what was
+                            // sent in it is gone, and the stream numbers
+                            // start again.
+                            conn.epoch += 1;
+                            for w in conn.streams.values_mut() {
+                                if let Some(w) = w.read.take() {
+                                    w.wake();
+                                }
+                                if let Some(w) = w.write.take() {
+                                    w.wake();
+                                }
+                            }
+                            conn.streams.clear();
                         }
                         wake_all(&mut conn.waiters);
                     }
@@ -501,6 +590,7 @@ fn deliver(
 pub(crate) fn bind(
     addr: SocketAddr,
     server: Option<Arc<quinn_proto::ServerConfig>>,
+    early_data: bool,
 ) -> io::Result<Rc<Shared>> {
     let sock = UdpSocket::bind(addr)?;
     // GRO needs 64 KiB receive buffers; without them datagrams come one by
@@ -535,6 +625,7 @@ pub(crate) fn bind(
             driver_waker: None,
             wake: false,
             closed: false,
+            early_data,
             scratch: Vec::with_capacity(65_536),
             sends: Vec::new(),
             segments,
@@ -574,11 +665,14 @@ impl Shared {
         .await
     }
 
+    /// Connects; with `early`, returns at once when the client has 0-RTT
+    /// keys for the server (a ticket from an earlier connection).
     pub(crate) async fn connect(
         self: &Rc<Self>,
         cfg: quinn_proto::ClientConfig,
         to: SocketAddr,
         name: &str,
+        early: bool,
     ) -> io::Result<usize> {
         let h = {
             let mut st = self.st.borrow_mut();
@@ -586,7 +680,12 @@ impl Shared {
                 .ep
                 .connect(Instant::now(), cfg, to, name)
                 .map_err(error::connect)?;
-            st.insert(ch, c, false)
+            let early = early && c.has_0rtt();
+            let h = st.insert(ch, c, false, early);
+            if early {
+                return Ok(h);
+            }
+            h
         };
         // Releases the connection if the handshake fails or the caller
         // gives up on it (drops the future), so that it is closed and
@@ -643,30 +742,57 @@ impl Shared {
         }
     }
 
-    pub(crate) async fn stream(
-        self: &Rc<Self>,
-        h: usize,
-        open: bool,
-        dir: Dir,
-    ) -> io::Result<StreamId> {
+    /// Waits for the end of the handshake. `true` if the server took the
+    /// early data this client sent (client), or if the peer opened a
+    /// request stream in early data (server).
+    pub(crate) async fn handshake(self: &Rc<Self>, h: usize) -> io::Result<bool> {
+        poll_fn(|cx| {
+            let mut st = self.st.borrow_mut();
+            let c = st.conn(h);
+            if c.connected {
+                let took = if c.incoming {
+                    c.saw_early
+                } else {
+                    c.early && c.c.accepted_0rtt()
+                };
+                return Poll::Ready(Ok(took));
+            }
+            if let Some(e) = &c.lost {
+                return Poll::Ready(Err(error::lost(e)));
+            }
+            c.waiters.push(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+
+    pub(crate) async fn stream(self: &Rc<Self>, h: usize, open: bool, dir: Dir) -> io::Result<Sid> {
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             let c = st.conn(h);
             if let Some(e) = &c.lost {
                 return Poll::Ready(Err(error::lost(e)));
             }
-            let id = if open {
-                c.c.streams().open(dir)
+            let (id, early) = if open {
+                // Opened before the handshake ends: its bytes go in 0-RTT.
+                (c.c.streams().open(dir), c.early && !c.connected)
+            } else if dir == Dir::Bi && !c.early_bi.is_empty() {
+                (c.early_bi.pop_front(), true)
             } else {
-                c.c.streams().accept(dir)
+                (c.c.streams().accept(dir), false)
             };
             match id {
                 Some(id) => {
                     c.streams.insert(id, Wakers::default());
                     // One handle per half.
                     c.refs += if dir == Dir::Bi { 2 } else { 1 };
+                    let sid = Sid {
+                        id,
+                        epoch: c.epoch,
+                        early,
+                    };
                     st.mark(h);
-                    Poll::Ready(Ok(id))
+                    Poll::Ready(Ok(sid))
                 }
                 None => {
                     c.waiters.push(cx.waker().clone());
@@ -677,10 +803,14 @@ impl Shared {
         .await
     }
 
-    pub(crate) async fn read(self: &Rc<Self>, h: usize, id: StreamId) -> io::Result<Option<Bytes>> {
+    pub(crate) async fn read(self: &Rc<Self>, h: usize, s: Sid) -> io::Result<Option<Bytes>> {
+        let id = s.id;
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             let c = st.conn(h);
+            if c.stale(s) {
+                return Poll::Ready(Err(error::early_rejected()));
+            }
             let mut rs = c.c.recv_stream(id);
             let mut chunks = match rs.read(true) {
                 Ok(chunks) => chunks,
@@ -708,16 +838,15 @@ impl Shared {
         .await
     }
 
-    pub(crate) async fn write(
-        self: &Rc<Self>,
-        h: usize,
-        id: StreamId,
-        data: &[u8],
-    ) -> io::Result<()> {
+    pub(crate) async fn write(self: &Rc<Self>, h: usize, s: Sid, data: &[u8]) -> io::Result<()> {
+        let id = s.id;
         let mut off = 0;
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             let c = st.conn(h);
+            if c.stale(s) {
+                return Poll::Ready(Err(error::early_rejected()));
+            }
             let mut wrote = false;
             let out = loop {
                 if off == data.len() {
@@ -754,23 +883,32 @@ impl Shared {
         .await
     }
 
-    pub(crate) fn finish(&self, h: usize, id: StreamId) -> io::Result<()> {
+    pub(crate) fn finish(&self, h: usize, s: Sid) -> io::Result<()> {
         let mut st = self.st.borrow_mut();
         let c = st.conn(h);
-        let r = c.c.send_stream(id).finish();
+        if c.stale(s) {
+            return Err(error::early_rejected());
+        }
+        let r = c.c.send_stream(s.id).finish();
         st.mark(h);
         r.map_err(|_| error::lost(&ConnectionError::LocallyClosed))
     }
 
-    pub(crate) fn reset(&self, h: usize, id: StreamId, code: u32) {
+    pub(crate) fn reset(&self, h: usize, s: Sid, code: u32) {
         let mut st = self.st.borrow_mut();
-        let _ = st.conn(h).c.send_stream(id).reset(code.into());
+        let c = st.conn(h);
+        if !c.stale(s) {
+            let _ = c.c.send_stream(s.id).reset(code.into());
+        }
         st.mark(h);
     }
 
-    pub(crate) fn stop(&self, h: usize, id: StreamId, code: u32) {
+    pub(crate) fn stop(&self, h: usize, s: Sid, code: u32) {
         let mut st = self.st.borrow_mut();
-        let _ = st.conn(h).c.recv_stream(id).stop(code.into());
+        let c = st.conn(h);
+        if !c.stale(s) {
+            let _ = c.c.recv_stream(s.id).stop(code.into());
+        }
         st.mark(h);
     }
 
@@ -796,9 +934,11 @@ impl Shared {
         st.mark(h);
     }
 
-    pub(crate) fn forget_stream(&self, h: usize, id: StreamId) {
+    pub(crate) fn forget_stream(&self, h: usize, s: Sid) {
         if let Some(Some(c)) = self.st.borrow_mut().conns.get_mut(h) {
-            c.streams.remove(&id);
+            if !c.stale(s) {
+                c.streams.remove(&s.id);
+            }
         }
     }
 }

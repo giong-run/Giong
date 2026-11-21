@@ -390,3 +390,145 @@ fn closing_a_connection_ends_what_waits_on_it() {
         })
         .unwrap();
 }
+
+/// A server endpoint that answers every stream with its bytes reversed,
+/// and notes for each stream whether it came in early data.
+fn early_server(
+    tls: rustls::ServerConfig,
+    early: bool,
+) -> (SocketAddr, std::rc::Rc<std::cell::RefCell<Vec<bool>>>) {
+    let config = ServerConfig::new(tls).unwrap().early_data(early);
+    let server = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+    let addr = server.local_addr().unwrap();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let noted = seen.clone();
+    giong::spawn(async move {
+        while let Some(conn) = server.accept().await {
+            let noted = noted.clone();
+            giong::spawn(async move {
+                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                    noted.borrow_mut().push(recv.is_early());
+                    let Ok(mut req) = recv.read_to_end(1 << 20).await else {
+                        return;
+                    };
+                    req.reverse();
+                    let _ = send.write_all(&req).await;
+                    let _ = send.finish();
+                }
+            });
+        }
+    });
+    (addr, seen)
+}
+
+async fn echo_on(conn: &giong_quic::Connection, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(data).await?;
+    send.finish()?;
+    recv.read_to_end(1 << 20).await
+}
+
+#[test]
+fn a_resumed_client_sends_its_first_stream_in_early_data() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let (addr, seen) = early_server(tls, true);
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap().early_data(true);
+
+            // A first connection leaves a ticket behind.
+            let conn = client.connect_early(addr, "localhost", &cfg).await.unwrap();
+            assert_eq!(echo_on(&conn, b"one").await.unwrap(), b"eno");
+            assert!(!conn.handshake().await.unwrap());
+            conn.close(0, b"");
+            drop(conn);
+
+            // The second one sends before its handshake is over.
+            let conn = client.connect_early(addr, "localhost", &cfg).await.unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            assert!(recv.is_early());
+            send.write_all(b"early").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(64).await.unwrap(), b"ylrae");
+            assert!(conn.handshake().await.unwrap());
+            // After the handshake, streams are not early any more.
+            let (send, recv) = conn.open_bi().await.unwrap();
+            assert!(!recv.is_early());
+            drop((send, recv));
+            assert_eq!(echo_on(&conn, b"late").await.unwrap(), b"etal");
+            assert_eq!(*seen.borrow(), [false, true, false, false]);
+        })
+        .unwrap();
+}
+
+#[test]
+fn early_data_the_server_refuses_fails_its_streams_and_not_the_connection() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            // Two servers with the same certificate but their own session
+            // caches (a clone of a rustls configuration shares its cache):
+            // a ticket of the first means nothing to the second.
+            let mut other = tls.clone();
+            other.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+            let (first, _) = early_server(tls, true);
+            let (second, seen) = early_server(other, true);
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap().early_data(true);
+            let conn = client.connect(first, "localhost", &cfg).await.unwrap();
+            assert_eq!(echo_on(&conn, b"one").await.unwrap(), b"eno");
+            conn.close(0, b"");
+            drop(conn);
+
+            let conn = client
+                .connect_early(second, "localhost", &cfg)
+                .await
+                .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            assert!(recv.is_early());
+            let _ = send.write_all(b"early").await;
+            let _ = send.finish();
+            let read = giong::time::timeout(Duration::from_secs(5), recv.read_to_end(64))
+                .await
+                .expect("the refused stream never ends");
+            let error = read.unwrap_err();
+            assert_eq!(
+                giong::error::code(&error),
+                Some(giong::error::Code::QuicEarlyDataRejected),
+                "{error}"
+            );
+            assert!(send.write_all(b"more").await.is_err());
+            assert!(!conn.handshake().await.unwrap());
+            drop((send, recv));
+            // The connection works, with streams numbered from 0 again.
+            assert_eq!(echo_on(&conn, b"again").await.unwrap(), b"niaga");
+            assert_eq!(*seen.borrow(), [false]);
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_server_without_early_data_waits_for_the_handshake() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let (addr, seen) = early_server(tls, false);
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap().early_data(true);
+            for round in 0..2 {
+                let conn = client.connect_early(addr, "localhost", &cfg).await.unwrap();
+                let (send, recv) = conn.open_bi().await.unwrap();
+                // No ticket that allows early data: connect_early waited.
+                assert!(!recv.is_early(), "round {round}");
+                drop((send, recv));
+                assert_eq!(echo_on(&conn, b"x").await.unwrap(), b"x");
+                conn.close(0, b"");
+            }
+            assert_eq!(*seen.borrow(), [false; 4]);
+        })
+        .unwrap();
+}

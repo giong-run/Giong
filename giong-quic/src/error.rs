@@ -51,6 +51,18 @@ pub(crate) fn reset(code: u64) -> io::Error {
     )
 }
 
+pub(crate) fn early_rejected() -> io::Error {
+    raise(
+        Code::QuicEarlyDataRejected,
+        "the server refused the 0-RTT data this stream was opened in; nothing of it was \
+         processed"
+            .to_string(),
+        "send the request again on a new stream: the handshake has ended, so a stream opened \
+         now is not early data. Connection::handshake tells when that is."
+            .to_string(),
+    )
+}
+
 /// The application error code of a stream the peer reset or stopped
 /// (`GIONG-E3604`); `None` for any other error.
 pub(crate) fn reset_code(error: &io::Error) -> Option<u64> {

@@ -85,6 +85,7 @@ impl TransportConfig {
 pub struct ServerConfig {
     pub(crate) tls: Arc<rustls::ServerConfig>,
     pub(crate) transport: TransportConfig,
+    pub(crate) early_data: bool,
 }
 
 impl ServerConfig {
@@ -99,10 +100,12 @@ impl ServerConfig {
                  vec![b\"h3\".to_vec()] for HTTP/3.",
             ));
         }
-        let cfg = Self {
+        let mut cfg = Self {
             tls: Arc::new(tls),
             transport: TransportConfig::default(),
+            early_data: false,
         };
+        cfg = cfg.early_data(false);
         cfg.to_proto()?;
         Ok(cfg)
     }
@@ -110,6 +113,27 @@ impl ServerConfig {
     /// Replaces the transport settings.
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Takes 0-RTT data from clients that resume an earlier session
+    /// (default off). Their first requests then arrive without waiting
+    /// for the handshake, and [`Endpoint::accept`](crate::Endpoint::accept)
+    /// hands a connection over as soon as its first flight is in.
+    ///
+    /// Early data can be replayed: someone who recorded it can send it
+    /// again in a new connection, and the server cannot tell. What came in
+    /// it is marked ([`RecvStream::is_early`](crate::RecvStream::is_early));
+    /// act on it only if doing it twice is harmless (RFC 8470). rustls's
+    /// default session cache lets each ticket carry early data once, on
+    /// this server; servers behind one address that do not share it can
+    /// each take the same early data.
+    pub fn early_data(mut self, on: bool) -> Self {
+        let mut tls = (*self.tls).clone();
+        // QUIC allows no other values (RFC 9001, section 4.6.1).
+        tls.max_early_data_size = if on { u32::MAX } else { 0 };
+        self.tls = Arc::new(tls);
+        self.early_data = on;
         self
     }
 
@@ -160,6 +184,18 @@ impl ClientConfig {
     /// Replaces the transport settings.
     pub fn transport(mut self, transport: TransportConfig) -> Self {
         self.transport = transport;
+        self
+    }
+
+    /// Lets [`Endpoint::connect_early`](crate::Endpoint::connect_early)
+    /// send 0-RTT data to servers this configuration has a session ticket
+    /// for (default off). The tickets are kept in the rustls
+    /// configuration's session store, which clones of this configuration
+    /// share.
+    pub fn early_data(mut self, on: bool) -> Self {
+        let mut tls = (*self.tls).clone();
+        tls.enable_early_data = on;
+        self.tls = Arc::new(tls);
         self
     }
 

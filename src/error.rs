@@ -490,6 +490,10 @@ codes! {
     /// The peer reset a stream it was sending, or stopped one this side was
     /// sending, with an application error code.
     QuicStreamReset = 3604, ConnectionReset, "the QUIC stream was reset";
+    /// The server refused the 0-RTT data a stream was opened in: nothing of
+    /// that stream reached the application, and the request can be sent
+    /// again on a new stream.
+    QuicEarlyDataRejected = 3605, ConnectionRefused, "the server refused the 0-RTT data";
 }
 
 impl Code {
