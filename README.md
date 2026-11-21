@@ -1274,6 +1274,9 @@ giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub,
 giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
 giong-mcp/      the MCP server for agents: Streamable HTTP, tools over giong::observe
 giong-compat/   Compat: the Tokio and futures-io I/O traits for giong's streams
+giong-proto/    Protocol Buffers as views over the receive buffer (new in 1.1)
+giong-grpc-build/ code generation from .proto files at build time, no protoc (new in 1.1)
+giong-grpc/     gRPC servers and clients on giong-http's HTTP/2, health and reflection (new in 1.1)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs; rest-api/, a complete REST API (PostgreSQL, a Redis cache, HTTPS)
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, dns, channels, observe, soak, ...
 bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, rest-api.sh, compat.sh, the programs compared against, results/

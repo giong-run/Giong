@@ -8,6 +8,21 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-21
+
+One fix: on Linux 6.18, a worker with `spin_before_park` could spin at 100% CPU for good.
+Nothing else changes; upgrading from 1.0.0 needs no code changes.
+
+### Fixed
+
+- A worker with `spin_before_park` could stop blocking for good and burn its core: the
+  io_uring driver counted the kernel's deferred-work flag (`IORING_SQ_TASKRUN`) as
+  completions waiting, and Linux 6.18 (`DEFER_TASKRUN`) can leave that flag set after the
+  work has run. The spin loop then found "work" on every look, entered the kernel, found
+  nothing and looked again, at 100% CPU and without ever reaching its other checks. Seen
+  in about one of 70 runs of a benchmark streaming 10 million messages between two
+  processes. The driver now runs the deferred work and lets the completion queue decide.
+
 ## [1.0.0] - 2026-11-21
 
 The first stable release. The code is that of 1.0.0-rc.1, unchanged: the API is frozen
@@ -2469,7 +2484,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/giong-run/Giong/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/giong-run/Giong/compare/v0.8.0...v1.0.0-rc.1
 [0.8.0]: https://github.com/giong-run/Giong/compare/v0.7.0...v0.8.0
