@@ -40,7 +40,7 @@
 //! error code, which `io::Error::from_raw_os_error(-res)` reads.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io;
 use std::mem;
@@ -51,7 +51,8 @@ use std::task::{Poll, Waker};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA,
-    ERROR_NETNAME_DELETED, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    ERROR_NETNAME_DELETED, ERROR_NOT_SUPPORTED, ERROR_OPERATION_ABORTED, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockname, getsockopt, ioctlsocket, recv, recvfrom, setsockopt,
@@ -219,6 +220,8 @@ struct Record {
     /// A send on a socket: on a stream, it is not cancelled (see
     /// [`Iocp::cancel_op`]).
     sending: bool,
+    /// A blocking job's flag, which a job that has not started yet checks.
+    cancel: Option<Arc<super::blocking::Cancel>>,
     accepting: Option<Box<Accepting>>,
     datagram: Option<Box<Datagram>>,
 }
@@ -374,6 +377,9 @@ pub(crate) struct Iocp {
     registered: HashMap<usize, bool>,
     pool: Rc<BufPool>,
     graveyard: Vec<Box<dyn Any>>,
+    /// Records whose future is gone and that the kernel or a blocking
+    /// thread still holds; `shutdown` cancels them.
+    orphans: HashSet<usize>,
     accept_ex: LPFN_ACCEPTEX,
     connect_ex: LPFN_CONNECTEX,
     recv_msg: LPFN_WSARECVMSG,
@@ -423,6 +429,7 @@ impl Iocp {
             registered: HashMap::new(),
             pool,
             graveyard: Vec::new(),
+            orphans: HashSet::new(),
             accept_ex: None,
             connect_ex: None,
             recv_msg: None,
@@ -452,6 +459,15 @@ impl Iocp {
         if self.registered.contains_key(&(handle as usize)) {
             return Ok(());
         }
+        // First what can fail without leaving a trace: once the handle has
+        // joined the port it cannot join again, so it must be recorded then.
+        if socket {
+            let mut on = 1u32;
+            // SAFETY: a socket the caller owns; the argument is a local.
+            if unsafe { ioctlsocket(handle as SOCKET, FIONBIO, &mut on) } != 0 {
+                return Err(-wsa_error());
+            }
+        }
         // SAFETY: associates a handle the caller owns with our open port;
         // a handle that cannot be associated makes the call fail.
         let port = unsafe { CreateIoCompletionPort(handle, self.port.0, 0, 0) };
@@ -464,17 +480,10 @@ impl Iocp {
         } else {
             FILE_SKIP_SET_EVENT_ON_HANDLE
         };
-        // SAFETY: sets notification modes on a handle the caller owns.
-        if unsafe { SetFileCompletionNotificationModes(handle, modes) } == 0 {
-            return Err(-last_error());
-        }
-        if socket {
-            let mut on = 1u32;
-            // SAFETY: a socket the caller owns; the argument is a local.
-            if unsafe { ioctlsocket(handle as SOCKET, FIONBIO, &mut on) } != 0 {
-                return Err(-wsa_error());
-            }
-        }
+        // SAFETY: sets notification modes on a handle the caller owns. Where
+        // that fails (a layered provider may refuse it), every call waits
+        // for its packet, which is always safe.
+        let skips = skips && unsafe { SetFileCompletionNotificationModes(handle, modes) } != 0;
         self.registered.insert(handle as usize, skips);
         Ok(())
     }
@@ -550,6 +559,7 @@ impl Iocp {
             after: After::Nothing,
             state,
             sending: false,
+            cancel: None,
             accepting: None,
             datagram: None,
         }))
@@ -577,9 +587,22 @@ impl Iocp {
             }
             Io::Blocking { job } => {
                 let record = Self::record(ptr::null_mut(), false, State::Waiting(waker.clone()), 0);
+                let cancel = super::blocking::Cancel::new();
+                // SAFETY: the record was just made and is ours.
+                unsafe { (*record).cancel = Some(cancel.clone()) };
                 self.inflight += 1;
                 let (port, job, at) = (self.port.clone(), SendJob(job), record as usize);
-                super::blocking::spawn(Box::new(move || port.report(at, job.run())));
+                super::blocking::spawn(Box::new(move || {
+                    // A job whose future went before it started does not
+                    // run: a removal or a rename could otherwise act much
+                    // later, on a file made since.
+                    let res = if cancel.is_cancelled() {
+                        -(ERROR_OPERATION_ABORTED as i32)
+                    } else {
+                        job.run()
+                    };
+                    port.report(at, res);
+                }));
                 return Start::Submitted(self.ops.insert(Slot::Single(record)));
             }
             // The file API reaches these through `Io::Blocking`.
@@ -932,6 +955,7 @@ impl Iocp {
             return;
         }
         rec.state = State::Orphan(data);
+        self.orphans.insert(record as usize);
         // Windows aborts a connection whose send is cancelled part way, so
         // the stream would be unusable after a dropped write, where Unix
         // keeps it: a send on a stream runs to its end instead.
@@ -943,6 +967,11 @@ impl Iocp {
     /// Asks the kernel to cancel one operation. Its completion arrives
     /// either way: aborted, or with the result if it had finished already.
     fn cancel(rec: &Record) {
+        if let Some(cancel) = &rec.cancel {
+            // A blocking job: it reports either way.
+            cancel.cancel();
+            return;
+        }
         // SAFETY: names one operation by its OVERLAPPED, on the handle it
         // was started on. If the handle is closed the call fails and the
         // completion still comes.
@@ -1522,6 +1551,7 @@ impl Iocp {
                 // Nobody waits. The resources go now that the kernel is
                 // done with them, outside the driver (`park` returns them).
                 self.graveyard.extend(data);
+                self.orphans.remove(&(record as usize));
                 // SAFETY: reported, so the kernel no longer holds it. A
                 // socket accepted for nobody closes with it.
                 drop(unsafe { Box::from_raw(record) });
@@ -1587,6 +1617,12 @@ impl Iocp {
                 Self::cancel(rec);
             }
         }
+        // Orphans left to finish (a stream send, a job already running):
+        // they are not in `ops`.
+        for &record in &self.orphans {
+            // SAFETY: an orphan is alive until its completion.
+            Self::cancel(unsafe { &*(record as *const Record) });
+        }
         for _ in 0..100 {
             if self.inflight == 0 {
                 break;
@@ -1647,6 +1683,95 @@ mod tests {
             let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
             !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
         }
+    }
+
+    /// A registration that fails leaves the handle out of the port, so a
+    /// later registration still works: a handle joined to the port but not
+    /// recorded made every later operation on it fail with error 87.
+    #[test]
+    fn a_failed_registration_leaves_the_handle_free_to_register_again() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let mut iocp = Iocp::new(BufPool::new(4, 1024).unwrap()).unwrap();
+        let path = std::env::temp_dir().join(format!("giong-register-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED)
+            .open(&path)
+            .unwrap();
+        let handle = file.as_raw_handle() as HANDLE;
+        // A file is no socket: FIONBIO fails, before the port is joined.
+        assert!(iocp.register(handle, true).is_err());
+        assert!(!iocp.registered.contains_key(&(handle as usize)));
+        assert_eq!(iocp.register(handle, false), Ok(()));
+        assert!(iocp.registered.contains_key(&(handle as usize)));
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file operation whose future is dropped while it waits for a
+    /// blocking thread does not run later: a removal queued behind busy
+    /// threads would otherwise remove a file made since.
+    #[test]
+    fn a_queued_file_operation_whose_future_is_dropped_never_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let path = std::env::temp_dir().join(format!("giong-queued-{}", std::process::id()));
+        std::fs::write(&path, b"first").unwrap();
+        // Every blocking thread busy until `release`.
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let started = Arc::new(AtomicUsize::new(0));
+        struct Release(Arc<(Mutex<bool>, Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let release = Release(gate.clone());
+        for _ in 0..super::super::blocking::MAX_THREADS {
+            let (gate, started) = (gate.clone(), started.clone());
+            super::super::blocking::spawn(Box::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while started.load(Ordering::SeqCst) < super::super::blocking::MAX_THREADS {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the blocking threads did not all start"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let target = path.clone();
+        crate::Builder::new()
+            .block_on(async move {
+                let removal = crate::time::timeout(
+                    Duration::from_millis(50),
+                    crate::fs::remove_file(&target),
+                )
+                .await;
+                assert!(
+                    removal.is_err(),
+                    "the removal ran with every thread busy: {removal:?}"
+                );
+                std::fs::write(&target, b"second").unwrap();
+                drop(release);
+                // Time for the queued job to be taken, had it not been cancelled.
+                crate::time::sleep(Duration::from_millis(300)).await;
+            })
+            .unwrap();
+        let kept = std::fs::read(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(kept.unwrap(), b"second", "the dropped removal ran later");
     }
 
     /// What `State::Lingering` is for: a datagram receive that ends inside

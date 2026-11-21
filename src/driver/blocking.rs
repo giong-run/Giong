@@ -17,9 +17,7 @@ use std::collections::VecDeque;
 #[cfg(unix)]
 use std::io;
 
-#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
@@ -30,7 +28,7 @@ use crate::runtime::lock;
 /// The most blocking threads at once. Enough for disks that serve many
 /// requests in parallel (NVMe), and a bound on what a hung network
 /// filesystem can tie up.
-const MAX_THREADS: usize = 64;
+pub(super) const MAX_THREADS: usize = 64;
 
 /// How long a thread waits for work before it ends.
 const IDLE: Duration = Duration::from_secs(10);
@@ -170,10 +168,8 @@ impl Completions {
 }
 
 /// Lets a blocking job see that it was cancelled before it started.
-#[cfg(unix)]
 pub(super) struct Cancel(AtomicBool);
 
-#[cfg(unix)]
 impl Cancel {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self(AtomicBool::new(false)))
