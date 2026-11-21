@@ -42,10 +42,14 @@ jobs:
       # twice net.inet.tcp.msl) out of 16,384 ephemeral ports, so within
       # seconds the runner's own connections to GitHub found no free port
       # and the job was cancelled. Linux runners have a wider range and
-      # reuse such ports. A shorter TIME_WAIT and a wider range here.
+      # reuse such ports. A shorter TIME_WAIT and a wider range here. With
+      # 1 s (TIME_WAIT 2 s) the runtime soak's 15,000-27,000 connections a
+      # second still held up to 55,000 ports at once, the whole range, and
+      # connect failed now and then with EADDRNOTAVAIL or ENOBUFS; 250 ms
+      # keeps about a quarter of the range in TIME_WAIT.
       - name: Ports for connection churn
         run: |
-          sudo sysctl -w net.inet.tcp.msl=1000 net.inet.ip.portrange.first=10240 net.inet.ip.portrange.hifirst=10240
+          sudo sysctl -w net.inet.tcp.msl=250 net.inet.ip.portrange.first=10240 net.inet.ip.portrange.hifirst=10240
           sysctl net.inet.tcp.msl net.inet.ip.portrange.first net.inet.ip.portrange.last
       - name: Soak
         run: |
