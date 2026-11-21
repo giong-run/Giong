@@ -1,0 +1,11 @@
+# bench/results/containers/open-files.sh <defaults binary>
+# 2026-11-21, same machine as cpu-quota.txt (4 vCPU, Linux 6.18.44, Docker 29.10).
+# before: giong 1.0.1 (+ PR #201); after: this branch, where the runtime raises the soft
+# RLIMIT_NOFILE to the hard one when it is built.
+before: Max open files 1024 20000 files
+before: held 1100 connections, 1071 answered within 2 s each
+before: new client: b'HTTP/1.1 200 OK' 0.00s
+after:  Max open files 20000 20000 files
+after:  held 1100 connections, 1100 answered within 2 s each
+after:  new client: b'HTTP/1.1 200 OK' 0.00s
+after:  (second run) held 1100 connections, 1100 answered within 2 s each

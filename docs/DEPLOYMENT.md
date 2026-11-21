@@ -299,22 +299,16 @@ them. containerd from 1.8 on, and so Kubernetes on most nodes today, starts cont
 the systemd default of 1,024 soft and 524,288 hard. At the soft limit giong-http's accept loop
 waits 50 ms and tries again, serving the connections it has, while new clients wait in the
 listen queue: measured with the `defaults` example in a container limited to 1,024 files,
-1,071 of 1,100 keep-alive clients were answered and 29 were not. Raise the soft limit to the
-hard one when the process starts, as Go programs do by themselves:
+1,071 of 1,100 keep-alive clients were answered and 29 were not.
 
-```rust
-// Before Builder::build. A process may raise its own soft limit up to the hard one.
-let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-// SAFETY: getrlimit and setrlimit read and write the struct they are given.
-unsafe {
-    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
-        lim.rlim_cur = lim.rlim_max;
-        libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
-    }
-}
-```
-
-With Docker, `--ulimit nofile=65536:65536` (`ulimits` in Compose) does the same from outside.
+So on Linux giong raises the soft limit to the hard one when a runtime is built, as Go
+programs do: a process may do that without privileges, and with it all 1,100 clients are
+answered in the same container. A hard limit of `unlimited` is read as `fs.nr_open`. To
+keep the soft limit, for a program that starts children which still use `select(2)` and
+need descriptors below 1,024 (children inherit the limit), build with
+`Builder::raise_open_files_limit(false)`. A hard limit below what the service needs is
+raised from outside: `docker run --ulimit nofile=65536:65536`, `ulimits` in Compose,
+`LimitNOFILE` in systemd.
 
 ## Stopping: SIGTERM and process 1
 

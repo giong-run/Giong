@@ -56,9 +56,9 @@ Where the code is:
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
 A service built on giong for a container (Docker, Kubernetes, a sandbox): start from
-`examples/rest-api/Dockerfile`; set `Builder::shutdown_on_signals(true)`, raise the soft
-`RLIMIT_NOFILE` to the hard one at startup, and leave the worker count to giong unless the
-pod has a CPU request and no limit. [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) has the why and
+`examples/rest-api/Dockerfile`; set `Builder::shutdown_on_signals(true)`, and leave the
+worker count to giong unless the pod has a CPU request and no limit. giong raises the soft
+`RLIMIT_NOFILE` to the hard one itself (`Builder::raise_open_files_limit`). [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) has the why and
 the numbers.
 
 Which crate to use, in this repository and in a service built on giong: the giong crate

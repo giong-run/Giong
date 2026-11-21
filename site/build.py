@@ -1239,10 +1239,10 @@ Facts that are easy to get wrong:
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
 - In a container giong needs no setting: it falls back to epoll where io_uring is blocked,
   starts one worker per whole CPU of the CPU limit (1.5 CPUs: 1 worker), and giong-http
-  refuses connections before the memory limit is reached. Three things to do yourself:
-  `Builder::shutdown_on_signals(true)` so that `SIGTERM` stops process 1; raise the soft
-  `RLIMIT_NOFILE` to the hard one (containerd starts containers at 1,024 files); and in
-  Kubernetes without a CPU limit, set `Builder::workers` from the CPU request.
+  refuses connections before the memory limit is reached. It raises the soft
+  `RLIMIT_NOFILE` to the hard one (containerd starts containers at 1,024 files). Two things
+  to do yourself: `Builder::shutdown_on_signals(true)` so that `SIGTERM` stops process 1;
+  and in Kubernetes without a CPU limit, set `Builder::workers` from the CPU request.
   examples/rest-api has a Dockerfile and a compose.yaml.
 {pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
