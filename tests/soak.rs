@@ -1,7 +1,9 @@
 //! Soak test: hours of churn, then a check that nothing piled up.
 //!
 //! Every worker runs a TCP echo server and clients that connect to all of
-//! them, plus UDP, file and cross-worker traffic. Clients mix clean closes,
+//! them, plus UDP, file and cross-worker traffic. Even-numbered workers'
+//! listeners are balanced (`TcpListener::bind_balanced`), so connections
+//! are also handed from worker to worker, odd ones plain. Clients mix clean closes,
 //! aborts with unread data, half-closes and receives cancelled by a timeout.
 //! A thread outside the runtime samples the process's open descriptors and
 //! resident memory once a second.
@@ -454,7 +456,12 @@ fn soak() {
                 let udp_socket = udp_sockets.lock().unwrap()[worker].take().unwrap();
                 let udp_peers = udp_peers.clone();
                 async move {
-                    let listener = TcpListener::bind(addr).expect("bind");
+                    let listener = if worker % 2 == 0 {
+                        TcpListener::bind_balanced(addr)
+                    } else {
+                        TcpListener::bind(addr)
+                    }
+                    .expect("bind");
                     let acceptor = giong::spawn({
                         let counters = counters.clone();
                         async move {

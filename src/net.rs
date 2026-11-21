@@ -966,10 +966,28 @@ impl TcpListener {
     /// is: with few connections, or a few heavy ones, one worker can end up
     /// with several while another has none. A balanced listener checks, for
     /// each connection it accepts, whether another worker in its group looks
-    /// clearly less busy (by the hints described at
-    /// [`Handle::least_loaded_worker`](crate::Handle::least_loaded_worker)),
-    /// and if so hands the connection over; that worker's `accept` returns
-    /// it. Connections that are already being served never move.
+    /// clearly less busy, and if so hands the connection over; that worker's
+    /// `accept` returns it. Connections that are already being served never
+    /// move.
+    ///
+    /// "Less busy" is judged first by how busy each worker has been in the
+    /// last few milliseconds: the CPU time its thread used, less the time it
+    /// spent spinning for work (see
+    /// [`Builder::spin_before_park`](crate::Builder::spin_before_park)), as
+    /// a share of the time that passed, plus the average cost of a task for
+    /// each connection it took on since.
+    /// Workers within 5% of a core of the least busy one count as equally
+    /// busy, and among those the counts of tasks described at
+    /// [`Handle::least_loaded_worker`](crate::Handle::least_loaded_worker)
+    /// decide. So a worker kept busy by a few hot connections gets no new
+    /// ones while another worker has room, however many idle connections
+    /// that one holds; when the workers are about as busy, the connection
+    /// counts even out. When every worker is at least 80% busy, the work
+    /// each one has waiting decides instead: a connection moves only to a
+    /// worker with at least three fewer runnable tasks. Nothing is
+    /// added to the workers' loops: the listener that accepts a connection
+    /// reads each worker's CPU time from the kernel at most every 5 ms, and
+    /// never waits for another thread.
     ///
     /// Call it on every worker, inside [`Runtime::run`](crate::Runtime::run).
     /// A handed-over connection waits for the next `accept` on its new

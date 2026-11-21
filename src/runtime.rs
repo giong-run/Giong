@@ -98,6 +98,10 @@ pub(crate) struct WorkerShared {
     eventfd: OwnedFd,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
+    /// The clock of the worker thread's CPU time, for balanced listeners
+    /// telling how busy it has been (see `RuntimeShared::busy_ns_of`); set
+    /// when the worker starts.
+    cpu_clock: OnceLock<libc::clockid_t>,
 }
 
 impl WorkerShared {
@@ -124,6 +128,7 @@ impl WorkerShared {
             // SAFETY: a fresh descriptor we own.
             eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
             driver_choice: OnceLock::new(),
+            cpu_clock: OnceLock::new(),
         }))
     }
 
@@ -247,6 +252,41 @@ impl RuntimeShared {
             + w.load.queued.load(Ordering::Relaxed)
             + w.load.incoming.load(Ordering::Relaxed)
             + awake
+    }
+
+    /// What worker `i` published for choosing where to send work: its live
+    /// tasks, its runnable tasks, and the work sent to it that it has not
+    /// taken in yet.
+    pub(crate) fn counts_of(&self, i: usize) -> (usize, usize, usize) {
+        let load = &self.workers[i].load;
+        (
+            load.tasks.load(Ordering::Relaxed),
+            load.queued.load(Ordering::Relaxed),
+            load.incoming.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Nanoseconds of CPU time worker `i` has spent working so far: the
+    /// CPU time of its thread, less the time it spent spinning for work.
+    /// `None` before its thread has started, after it has ended, and under
+    /// Miri. One system call: the kernel keeps a thread's CPU time.
+    pub(crate) fn busy_ns_of(&self, i: usize) -> Option<u64> {
+        let w = &self.workers[i];
+        let clock = *w.cpu_clock.get()?;
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid place for the result. A clock of a thread
+        // that has ended gives an error, which is checked.
+        if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+            return None;
+        }
+        let cpu = u64::try_from(ts.tv_sec)
+            .ok()?
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::try_from(ts.tv_nsec).ok()?);
+        Some(cpu.saturating_sub(w.counters.spin_ns()))
     }
 
     /// Counts work about to be sent to `worker` from any thread, before it
@@ -502,6 +542,16 @@ impl Worker {
         shared.counters.set_driver(driver.kind());
         // A worker instance is built once, so the slot is always empty here.
         let _ = shared.driver_choice.set(choice);
+        // Miri has no CPU-time clocks; balanced listeners then go by counts.
+        #[cfg(not(miri))]
+        {
+            let mut clock: libc::clockid_t = 0;
+            // SAFETY: `pthread_self` names the calling thread, which is the
+            // worker's own; `clock` is a valid place for the result.
+            if unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock) } == 0 {
+                let _ = shared.cpu_clock.set(clock);
+            }
+        }
         Ok(Rc::new(Self {
             index,
             shared,
@@ -839,6 +889,11 @@ impl Worker {
             Some(timer) => timer.min(start + spin),
             None => start + spin,
         };
+        // Spinning uses the CPU but is not work: balanced listeners take it
+        // off the thread's CPU time when they tell how busy a worker is. It
+        // is counted at every clock read, so that a long spin shows while
+        // it lasts.
+        let mut counted = start;
         loop {
             // Reading the clock costs about as much as the checks, so look at
             // the ring many times per clock read.
@@ -847,11 +902,15 @@ impl Worker {
                     || self.rt.jobs_len.any()
                     || self.driver.borrow_mut().has_completions()
                 {
+                    self.shared.counters.spun(counted.elapsed());
                     return true;
                 }
                 std::hint::spin_loop();
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            self.shared.counters.spun(now - counted);
+            counted = now;
+            if now >= deadline {
                 // A due timer is work; an expired spin budget is not.
                 return self
                     .timers
