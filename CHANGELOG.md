@@ -32,8 +32,9 @@ was removed or renamed and how to migrate.
 ### Changed
 
 - No change to the code of the published crates since 1.0.0-rc.1 beyond their version
-  number and one lint attribute (`#![warn(missing_docs)]` in `giong`). What was checked on the release candidate before this release: four hours of soak per driver on
-  bare metal (about 320 million connections each, no leak, crash or stall;
+  number and one lint attribute (`#![warn(missing_docs)]` in `giong`). What was checked on
+  the release candidate before this release: four hours of soak per driver on bare metal
+  (about 320 million connections each, no leak, crash or stall;
   [#169](https://github.com/giong-run/Giong/pull/169)), the TLS soak above, the test suite
   under AddressSanitizer, and use in a service whose author reported no error.
 
