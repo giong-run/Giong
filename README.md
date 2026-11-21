@@ -17,7 +17,7 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 1.0.0-rc.1**, the first release candidate of 1.0: the API is frozen (see
+> **Status: 1.0.0**, the first stable release: the API is frozen (see
 > [STABILITY.md](docs/STABILITY.md)). Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server and client),
@@ -34,7 +34,8 @@ load arrives.
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser and
 > HTTP/2 on both sides are fuzzed, `h2spec` passes, and a soak test churns connections for two
-> hours every night. It has **not** run in production. See [Limitations](#limitations).
+> hours every night. One service uses it so far, its author's, with no error reported on
+> 1.0.0-rc.1. See [Limitations](#limitations).
 
 ## What giong is for
 
