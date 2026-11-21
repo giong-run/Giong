@@ -1411,13 +1411,26 @@ impl Uring {
 
     // ------------------------------------------------------------------ park
 
-    /// `true` if completions are waiting to be collected: either already in
-    /// the completion queue, or as deferred kernel work that the next
-    /// `io_uring_enter` will turn into completions. Makes no system call.
+    /// `true` if completions are waiting to be collected in the completion
+    /// queue. Makes no system call, except when the kernel flags deferred
+    /// work (`IORING_SQ_TASKRUN`).
+    ///
+    /// That work becomes completions only in an `io_uring_enter` that asks
+    /// for them, and the flag alone is not trusted: it can stay set after
+    /// the work has run (seen on Linux 6.18 with `DEFER_TASKRUN`, with an
+    /// empty work list and nothing in the completion queue). Reported as
+    /// work, it kept a spinning worker turning forever: 100% CPU, never
+    /// blocking, and never reaching anything checked after it. So the work
+    /// is run here and the completion queue decides.
     pub(crate) fn has_completions(&mut self) -> bool {
-        if self.ring.submission().taskrun() {
+        if !self.ring.completion().is_empty() {
             return true;
         }
+        if !self.ring.submission().taskrun() {
+            return false;
+        }
+        // Failures are those of `park`; the next `park` reports them.
+        let _ = self.enter(0, None);
         !self.ring.completion().is_empty()
     }
 
@@ -1937,6 +1950,84 @@ mod tests {
         match run {
             // Blocked (Docker's seccomp profile), missing or too old (5.15):
             // the cases in which the automatic choice falls back to epoll.
+            Err(e) if crate::driver::io_uring_unusable(&e) => {
+                eprintln!("skipped: {e}");
+            }
+            other => other.unwrap(),
+        }
+    }
+
+    /// Where the kernel puts the submission ring's flags word (the same in
+    /// every ring of a kernel): `io_uring_params.sq_off.flags`, from a
+    /// throwaway ring, since the `io-uring` crate keeps it private.
+    fn sq_flags_offset() -> usize {
+        // `struct io_uring_params`: 120 bytes; `sq_off` starts at byte 40,
+        // and `flags` is its fifth `u32`.
+        let mut params = [0u32; 30];
+        // SAFETY: a zeroed `io_uring_params` for the kernel to fill.
+        let fd = unsafe { libc::syscall(libc::SYS_io_uring_setup, 1u32, params.as_mut_ptr()) };
+        assert!(fd >= 0, "{}", io::Error::last_os_error());
+        // SAFETY: the ring just made, closed once.
+        unsafe { libc::close(fd as i32) };
+        params[14] as usize
+    }
+
+    /// A deferred-work flag the kernel left set with no work behind it is
+    /// not reported as completions. It was, and a worker that spins before
+    /// parking then turned forever at 100% CPU without blocking (seen on
+    /// Linux 6.18, in about one of 70 runs streaming 10 million messages
+    /// between two processes).
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot run io_uring")]
+    fn a_stale_taskrun_flag_is_not_work() {
+        use crate::driver::Driver;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let run = crate::runtime::Builder::new()
+            .driver(crate::DriverKind::IoUring)
+            .block_on(async {
+                if crate::runtime::driver_kind() != crate::DriverKind::IoUring {
+                    eprintln!("skipped: io_uring is not available");
+                    return;
+                }
+                crate::runtime::with_worker(|w| {
+                    let mut driver = w.driver.borrow_mut();
+                    let Driver::Uring(d) = &mut *driver else {
+                        unreachable!()
+                    };
+                    // The submission ring's flags word, through a second
+                    // mapping of the ring: the stale state, made on purpose.
+                    let off = sq_flags_offset();
+                    let len = off + 4;
+                    // SAFETY: maps the ring's own pages (shared, offset 0 is
+                    // IORING_OFF_SQ_RING); unmapped below.
+                    let base = unsafe {
+                        libc::mmap(
+                            std::ptr::null_mut(),
+                            len,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            d.ring.as_raw_fd(),
+                            0,
+                        )
+                    };
+                    assert_ne!(base, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+                    // SAFETY: the flags word, inside the mapping and aligned.
+                    let flags = unsafe { &*(base.cast::<u8>().add(off) as *const AtomicU32) };
+                    const TASKRUN: u32 = 1 << 2; // IORING_SQ_TASKRUN
+                    flags.fetch_or(TASKRUN, Ordering::SeqCst);
+                    assert!(d.ring.submission().taskrun());
+                    let reported = d.has_completions();
+                    flags.fetch_and(!TASKRUN, Ordering::SeqCst);
+                    // SAFETY: mapped above.
+                    unsafe { libc::munmap(base, len) };
+                    assert!(
+                        !reported,
+                        "a stale IORING_SQ_TASKRUN counted as completions"
+                    );
+                });
+            });
+        match run {
             Err(e) if crate::driver::io_uring_unusable(&e) => {
                 eprintln!("skipped: {e}");
             }
