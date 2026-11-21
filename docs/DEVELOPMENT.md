@@ -60,6 +60,13 @@ Each section below removes one of them.
    `scripts/preflight.sh --against <n>,<n>` merges the branch with each of them and names
    the files that conflict. Agree the order with their authors when two conflict, rather
    than letting the queue eject one.
+   **Enqueue by turning on auto-merge** for the pull request (`gh pr merge <n> --squash
+   --auto`, or the REST or MCP call that enables auto-merge): on a branch with a merge queue
+   it adds the pull request to the queue as soon as every required check has passed, and
+   the queue merges it only if every job passes again on `main`. It changes nothing in
+   what must pass; it only means nobody has to press the button. Never turn it on for a
+   release pull request (label `release`): merging one publishes to crates.io, which
+   needs a maintainer's explicit approval.
 9. **After the merge**, check that the branch was deleted, remove the item from the
    backlog, and take the next one.
 
@@ -145,8 +152,8 @@ look:
 
 ## What stays with the maintainers
 
-Agents working for the maintainers push branches and open, update and enqueue pull
-requests. These stay with a
+Agents working for the maintainers push branches, open and update pull requests, and
+enqueue them through auto-merge once they are ready. These stay with a
 maintainer: merging a release pull request (it publishes to crates.io, which cannot be
 undone), the first publish of a new crate, branch protection and repository settings,
 secrets, and paid machines.
