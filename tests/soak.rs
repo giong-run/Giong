@@ -46,6 +46,15 @@ struct Counters {
     cross_worker: AtomicU64,
     /// Messages the server got in more than one receive.
     split: AtomicU64,
+    /// Connects answered "connection refused" although every listener was
+    /// up. Linux does this on its own, rarely: a client that aborts a
+    /// connection the server already closed frees its port at once, and when
+    /// the next connect from that port reaches the server before the abort
+    /// does, the old connection's remains answer it with a reset. Plain
+    /// `std::net` sockets get the same (the pull request that added this
+    /// counter has the program). Counted and held to a small share, since a
+    /// listener that went away would refuse thousands.
+    connects_refused: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
 }
@@ -192,6 +201,10 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
     while Instant::now() < deadline {
         let stream = match TcpStream::connect(addr).await {
             Ok(stream) => stream,
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                Counters::bump(&counters.connects_refused);
+                continue;
+            }
             Err(err) => {
                 counters.unexpected("connect", err);
                 sleep(Duration::from_millis(10)).await;
@@ -355,14 +368,109 @@ async fn cross_worker(workers: usize, deadline: Instant, counters: Arc<Counters>
     }
 }
 
+#[cfg(unix)]
 fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
+    // macOS lists a process's own descriptors in /dev/fd.
+    let dir = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    std::fs::read_dir(dir).unwrap().count()
 }
 
+/// The process's open handles: sockets, files, events, threads and the rest.
+#[cfg(windows)]
+fn open_fds() -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut count = 0u32;
+    // SAFETY: the pseudo handle of this process, and a local to write to.
+    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    assert!(ok != 0, "GetProcessHandleCount failed");
+    count as usize
+}
+
+#[cfg(target_os = "linux")]
 fn rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// Resident memory from the kernel's task information (`proc_pidinfo`).
+#[cfg(target_os = "macos")]
+fn rss_kib() -> u64 {
+    // SAFETY: all-zero is a valid `proc_taskinfo`, which the call fills in;
+    // the size passed is its size.
+    unsafe {
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let n = libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        );
+        assert_eq!(n, size, "proc_pidinfo: {}", std::io::Error::last_os_error());
+        info.pti_resident_size / 1024
+    }
+}
+
+/// The process's working set, Windows' resident memory.
+#[cfg(windows)]
+fn rss_kib() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: all-zero is a valid value of this plain structure.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process, and a structure of the size
+    // given.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    assert!(ok != 0, "GetProcessMemoryInfo failed");
+    counters.WorkingSetSize as u64 / 1024
+}
+
+/// Opens, once, what Windows keeps open for the rest of the process after
+/// its first use: Winsock and its helper handles, the runtime's blocking
+/// threads, the file system's. The handle count before the soak is taken
+/// after this, so that it compares like with like.
+#[cfg(windows)]
+fn warm_up() {
+    let dir = std::env::temp_dir().join(format!("giong-soak-warm-{}", std::process::id()));
+    giong::Builder::new()
+        .workers(2)
+        .build()
+        .unwrap()
+        .run(move |worker| {
+            let dir = dir.clone();
+            async move {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let accept = giong::spawn(async move { listener.accept().await.map(drop) });
+                let connected = TcpStream::connect(addr).await.unwrap();
+                accept.await.unwrap().unwrap();
+                drop(connected);
+                let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+                udp.send_to(vec![1u8], udp.local_addr().unwrap())
+                    .await
+                    .0
+                    .unwrap();
+                drop(udp.recv_from().await.unwrap());
+                if worker == 0 {
+                    let path = dir.with_extension("tmp");
+                    let file = giong::fs::File::create(&path).await.unwrap();
+                    file.write_all_at(vec![0u8; 16], 0).await.0.unwrap();
+                    file.sync_all().await.unwrap();
+                    drop(file);
+                    giong::fs::remove_file(&path).await.unwrap();
+                }
+            }
+        })
+        .unwrap();
 }
 
 fn median(values: &mut [u64]) -> u64 {
@@ -378,6 +486,8 @@ fn soak() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    #[cfg(windows)]
+    warm_up();
     let fds_before = open_fds();
 
     // A free port for every worker's listener (SO_REUSEPORT), and one UDP
@@ -518,7 +628,7 @@ fn soak() {
     eprintln!(
         "soak: done after {secs}s on {workers} workers: {} connections, {} echoes, \
          {} cancelled receives, {} messages received in pieces, {} datagrams, {} files, \
-         {} cross-worker hops",
+         {} cross-worker hops, {} connects refused by the kernel",
         c.connections.load(Ordering::Relaxed),
         c.round_trips.load(Ordering::Relaxed),
         c.cancelled_recvs.load(Ordering::Relaxed),
@@ -526,10 +636,22 @@ fn soak() {
         c.datagrams.load(Ordering::Relaxed),
         c.files.load(Ordering::Relaxed),
         c.cross_worker.load(Ordering::Relaxed),
+        c.connects_refused.load(Ordering::Relaxed),
     );
 
     // 1. Every scenario behaved as designed.
     assert_eq!(c.unexpected.load(Ordering::Relaxed), 0, "unexpected errors");
+    // Refused connects are the kernel's (see `Counters::connects_refused`):
+    // one in 317 million was measured, so one in 50 million leaves room and
+    // still fails when a listener stops answering.
+    let (refused, connections) = (
+        c.connects_refused.load(Ordering::Relaxed),
+        c.connections.load(Ordering::Relaxed),
+    );
+    assert!(
+        refused <= 1 + connections / 50_000_000,
+        "{refused} of {connections} connects were refused while every listener was up"
+    );
     assert!(c.connections.load(Ordering::Relaxed) > 0);
     assert!(c.cancelled_recvs.load(Ordering::Relaxed) > 0);
 

@@ -7,15 +7,25 @@ publish = false
 [dependencies]
 giong = { path = "../.." }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net", "io-util"] }
-monoio = { version = "0.2", features = ["sync"] }
-local-sync = "0.1"
-glommio = "0.9"
-compio = { version = "0.19", features = ["runtime", "time", "io-uring", "net", "io"] }
 smol = "2"
 async-channel = "2"
 futures-channel = "0.3"
 futures-lite = "2"
+
+# getrusage.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The io_uring runtimes: Linux only. macOS and Windows run Gióng, Tokio and smol.
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = { version = "0.2", features = ["sync"] }
+local-sync = "0.1"
+glommio = "0.9"
+compio = { version = "0.19", features = ["runtime", "time", "io-uring", "net", "io"] }
+
+# The process's CPU time.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [profile.release]
 opt-level = 3

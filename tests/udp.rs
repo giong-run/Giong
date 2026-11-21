@@ -1,11 +1,16 @@
 //! UDP: send_to, recv_from (multishot + provided buffers), read_from.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+mod common;
 
 use giong::net::UdpSocket;
 use giong::time::{sleep, timeout};
@@ -18,6 +23,7 @@ fn socket() -> (UdpSocket, SocketAddr) {
 
 /// Lets this process open at least `needed` descriptors, by raising the soft
 /// limit (often 1024) towards the hard one.
+#[cfg(unix)]
 fn allow_open_files(needed: u64) {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -153,7 +159,7 @@ fn connected_sockets_send_and_filter() {
 
         // Without a peer, `send` has nowhere to go.
         let err = stranger.send("lost").await.0.unwrap_err();
-        assert_eq!(err.raw_os_error(), Some(libc::EDESTADDRREQ));
+        assert_eq!(err.raw_os_error(), Some(common::errno::NO_PEER));
     });
 }
 
@@ -256,6 +262,113 @@ fn long_datagrams_are_truncated_by_recv_from_and_whole_with_read_from() {
         // The two ways of receiving do not mix.
         let (res, _) = pooled.read_from(buf).await;
         assert_eq!(res.unwrap_err().kind(), ErrorKind::InvalidInput);
+    });
+}
+
+#[test]
+fn a_datagram_already_waiting_and_too_long_for_the_buffer_is_cut_safely() {
+    // The datagram is there before the receive starts, so the receive ends
+    // inside the call, cut off. On Windows that is a warning status, which
+    // still reports through the completion port: the receive's record must
+    // live until then, while the worker goes on with other I/O.
+    giong::block_on(async {
+        let (a, a_addr) = socket();
+        let (b, b_addr) = socket();
+        let data = payload(2000, 7);
+        let mut buf = Vec::with_capacity(512);
+        for round in 0..200 {
+            a.send_to(data.clone(), b_addr).await.0.unwrap();
+            // Let the datagram arrive first.
+            sleep(Duration::from_millis(1)).await;
+            let (res, got) = b.read_from(buf).await;
+            assert_eq!(res.unwrap(), (512, a_addr), "round {round}");
+            assert!(got == data[..512], "round {round}");
+            buf = got;
+            // Other I/O on the worker meanwhile, in both directions.
+            b.send_to(vec![round as u8; 64], a_addr).await.0.unwrap();
+            let (back, from) = a.recv_from().await.unwrap();
+            assert_eq!((back.len(), back[0], from), (64, round as u8, b_addr));
+        }
+    });
+}
+
+#[test]
+fn a_send_to_a_peer_that_has_gone_does_not_fail_later_receives() {
+    // The peer's port is closed, so the system answers the datagram with
+    // an ICMP "port unreachable". Unix reports that only on a connected
+    // socket; on Windows it would fail the next receive with a reset, and
+    // a server's receive loop would end there.
+    giong::block_on(async {
+        let (server, server_addr) = socket();
+        let (client, client_addr) = socket();
+        let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let gone_addr = gone.local_addr().unwrap();
+        drop(gone);
+        for _ in 0..3 {
+            server
+                .send_to(b"late reply".to_vec(), gone_addr)
+                .await
+                .0
+                .unwrap();
+        }
+        sleep(Duration::from_millis(50)).await;
+        client
+            .send_to(b"next".to_vec(), server_addr)
+            .await
+            .0
+            .unwrap();
+        let (got, from) = timeout(Duration::from_secs(5), server.recv_from())
+            .await
+            .expect("the datagram arrives")
+            .expect("the receive goes on");
+        assert_eq!((&*got, from), (&b"next"[..], client_addr));
+        // And with a buffer of one's own.
+        let (server, server_addr) = socket();
+        for _ in 0..3 {
+            server
+                .send_to(b"late reply".to_vec(), gone_addr)
+                .await
+                .0
+                .unwrap();
+        }
+        sleep(Duration::from_millis(50)).await;
+        client
+            .send_to(b"again".to_vec(), server_addr)
+            .await
+            .0
+            .unwrap();
+        let (res, buf) = server.read_from(Vec::with_capacity(64)).await;
+        assert_eq!(res.unwrap(), (5, client_addr));
+        assert_eq!(buf, b"again");
+    });
+}
+
+/// The sends that do not wait rely on the socket being non-blocking from
+/// the start, before the driver has seen it: on Windows, where no send has
+/// a flag that says so. (One name on every system, for the simulator's
+/// index; the body is Windows'.)
+#[test]
+fn a_new_socket_is_non_blocking_before_its_first_operation() {
+    #[cfg(windows)]
+    giong::block_on(async {
+        use std::os::windows::io::AsRawSocket;
+        let (sock, _) = socket();
+        let mut byte = [0u8; 1];
+        // A blocking socket would wait here for a datagram that never comes.
+        // SAFETY: an open socket and a local buffer of the size given.
+        let n = unsafe {
+            windows_sys::Win32::Networking::WinSock::recv(
+                sock.as_raw_socket() as _,
+                byte.as_mut_ptr(),
+                1,
+                0,
+            )
+        };
+        assert_eq!(n, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(10035), // WSAEWOULDBLOCK
+        );
     });
 }
 
@@ -448,8 +561,10 @@ fn every_worker_can_bind_the_same_port() {
     // hands out for port 0: a socket of a test running at the same time,
     // bound to port 0 of any address (0.0.0.0 included), cannot take it
     // before the workers bind it.
-    const ADDR: &str = "127.0.0.2";
-    let port = port_outside_ephemeral_range([127, 0, 0, 2]).port();
+    // macOS has 127.0.0.1 only, unless more are added to the interface.
+    const LAST: u8 = if cfg!(target_os = "macos") { 1 } else { 2 };
+    let ip = std::net::Ipv4Addr::new(127, 0, 0, LAST);
+    let port = port_outside_ephemeral_range(ip.octets()).port();
     let received = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
     let rt = giong::Builder::new().workers(3).build().unwrap();
@@ -459,7 +574,7 @@ fn every_worker_can_bind_the_same_port() {
         rt.run(move |_| {
             let (r, b) = (r.clone(), b.clone());
             async move {
-                let socket = UdpSocket::bind((ADDR, port)).unwrap();
+                let socket = UdpSocket::bind((ip, port)).unwrap();
                 b.fetch_add(1, Ordering::SeqCst);
                 while let Some(Ok((got, from))) = giong::until_shutdown(socket.recv_from()).await {
                     let reply = got.to_vec();
@@ -482,7 +597,7 @@ fn every_worker_can_bind_the_same_port() {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let message = format!("sender {i}");
-        client.send_to(message.as_bytes(), (ADDR, port)).unwrap();
+        client.send_to(message.as_bytes(), (ip, port)).unwrap();
         let mut buf = [0u8; 64];
         let (n, _) = client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], message.as_bytes());
@@ -492,6 +607,96 @@ fn every_worker_can_bind_the_same_port() {
     assert_eq!(received.load(Ordering::SeqCst), SENDERS);
 }
 
+#[test]
+fn a_shared_port_keeps_each_sender_on_one_socket() {
+    // The socket that binds first receives through `recv_from`.
+    shared_port_keeps_senders_apart([127, 0, 0, 3], 0);
+}
+
+#[test]
+fn a_shared_port_keeps_each_sender_on_one_socket_with_read_from() {
+    // The socket that binds first receives through `read_from`.
+    shared_port_keeps_senders_apart([127, 0, 0, 4], 1);
+}
+
+/// Each worker's socket answers with the order in which it was bound, half
+/// of them through `recv_from` and half through `read_from` (those whose
+/// order has the parity `read_from_parity`). Every datagram of one sender
+/// must reach the same socket, and the senders must not all reach one.
+/// Afterwards the port is free again.
+fn shared_port_keeps_senders_apart(ip: [u8; 4], read_from_parity: usize) {
+    // macOS answers only on 127.0.0.1 unless told otherwise, and keeps its
+    // port range elsewhere than /proc.
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    const WORKERS: usize = 4;
+    let addr = port_outside_ephemeral_range(ip);
+    let bound = Arc::new(AtomicUsize::new(0));
+    let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
+    let handle = rt.handle();
+    let b = bound.clone();
+    let server = std::thread::spawn(move || {
+        rt.run(move |_| {
+            let b = b.clone();
+            async move {
+                let socket = UdpSocket::bind(addr).unwrap();
+                let index = b.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    let from = if index % 2 != read_from_parity {
+                        match giong::until_shutdown(socket.recv_from()).await {
+                            Some(Ok((_, from))) => from,
+                            _ => break,
+                        }
+                    } else {
+                        let read = socket.read_from(Vec::with_capacity(64));
+                        match giong::until_shutdown(read).await {
+                            Some((Ok((_, from)), _)) => from,
+                            _ => break,
+                        }
+                    };
+                    let reply = vec![index as u8];
+                    socket.send_to(reply, from).await.0.unwrap();
+                }
+            }
+        })
+        .unwrap();
+    });
+    while bound.load(Ordering::SeqCst) < WORKERS {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    const SENDERS: usize = 40;
+    let mut reached = std::collections::HashSet::new();
+    for i in 0..SENDERS {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut seen = None;
+        for _ in 0..5 {
+            client.send_to(b"which", addr).unwrap();
+            let mut buf = [0u8; 8];
+            let (n, _) = client.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 1);
+            let socket = buf[0];
+            assert_eq!(
+                *seen.get_or_insert(socket),
+                socket,
+                "sender {i} reached two sockets"
+            );
+        }
+        reached.extend(seen);
+    }
+    assert!(
+        reached.len() > 1,
+        "{SENDERS} senders all reached one socket"
+    );
+    handle.shutdown();
+    server.join().unwrap();
+    std::net::UdpSocket::bind(addr).expect("the port is still held");
+}
+
+#[cfg(unix)]
 #[test]
 fn port_zero_gives_every_socket_a_port_of_its_own() {
     // With SO_REUSEPORT set before binding to port 0, Linux picks ports
@@ -871,6 +1076,7 @@ fn reply_after_cancelled_read_from(busy: bool) {
     peer.join().unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_new_socket_with_a_closed_sockets_number_is_left_alone() {
     // A receive that the runtime has queued but not yet handed to the kernel
@@ -944,6 +1150,7 @@ fn one_buffer_echoes_many_datagrams_between_tasks() {
 /// giong's sockets off that port: with `SO_REUSEPORT` the kernel would share
 /// its datagrams with them, and with `SO_REUSEADDR` on both sides (which
 /// giong no longer sets) any user could.
+#[cfg(unix)]
 #[test]
 fn a_port_held_by_another_process_is_refused() {
     giong::block_on(async {
@@ -975,7 +1182,19 @@ fn a_port_held_by_another_process_is_refused() {
 /// is the obvious pick for anything else on the machine doing the same.
 fn port_outside_ephemeral_range(ip: [u8; 4]) -> std::net::SocketAddr {
     use std::hash::{BuildHasher, Hasher};
+    #[cfg(target_os = "linux")]
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    #[cfg(target_os = "macos")]
+    let range = {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "net.inet.ip.portrange.first"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // Windows hands out ports from 49152 on unless told otherwise.
+    #[cfg(windows)]
+    let range = String::from("49152");
     let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
     assert!(
         low > 2048,
@@ -1053,6 +1272,7 @@ fn udp_holders(port: u16) -> Vec<(String, String)> {
 /// Which plain binds of `addr` the kernel refuses now: none of the options,
 /// `SO_REUSEADDR` only (giong's probe after a release) and `SO_REUSEPORT`
 /// only (giong's own sockets).
+#[cfg(unix)]
 fn refused_binds(addr: std::net::SocketAddr) -> String {
     let try_bind = |reuse_addr: bool, reuse_port: bool| {
         let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
@@ -1075,6 +1295,7 @@ fn refused_binds(addr: std::net::SocketAddr) -> String {
 /// lives only for a moment is gone before a single look, so this looks for
 /// half a second and reports every socket seen on the port, when it was
 /// first seen, and which binds the port refused at each change.
+#[cfg(unix)]
 fn bind_failure_report(addr: std::net::SocketAddr) -> String {
     let start = std::time::Instant::now();
     let mut seen: Vec<String> = Vec::new();
@@ -1111,6 +1332,7 @@ fn bind_failure_report(addr: std::net::SocketAddr) -> String {
 
 /// Workers of one process share a port; a dropped socket's port can be
 /// bound again at once.
+#[cfg(unix)]
 #[test]
 fn sockets_of_this_process_share_a_port_and_rebind_at_once() {
     giong::block_on(async {
@@ -1187,7 +1409,7 @@ fn datagrams_sent_in_one_turn_each_get_their_own_result() {
             let (i, len, res) = s.await.unwrap();
             if i == 3 {
                 let e = res.expect_err("a 70 000-byte datagram cannot be sent");
-                assert_eq!(e.raw_os_error(), Some(libc::EMSGSIZE));
+                assert_eq!(e.raw_os_error(), Some(common::errno::EMSGSIZE));
             } else {
                 assert_eq!(res.unwrap(), len);
             }

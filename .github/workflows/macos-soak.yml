@@ -1,0 +1,43 @@
+# The soak tests on macOS (the kqueue driver): connection churn, UDP, file
+# and cross-worker traffic (tests/soak.rs), and TLS handshakes, traffic and
+# interrupted operations (giong-tls/tests/soak.rs), each followed by checks
+# that no descriptor, memory or driver state was left behind. On macOS 15
+# and 26, side by side.
+#
+# Run it from the Actions tab, or by pushing a branch named soak/macos-*.
+
+name: macOS soak
+
+on:
+  push:
+    branches: ["soak/macos-*"]
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to run each workload
+        default: "120"
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        workload: [runtime, tls]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      GIONG_TEST_EXPECT_DRIVER: kqueue
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: sw_vers && sysctl -n hw.ncpu && ulimit -n
+      - name: Soak
+        run: |
+          ulimit -n 65536 || ulimit -n 10240
+          SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak ${{ matrix.workload }}

@@ -108,7 +108,7 @@ scripts/check.sh seccomp     # io_uring blocked as in Docker (scripts/no-io-urin
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh kani        # Kani proofs of the unsafe core (docs/kani.md; needs kani-verifier 0.68.0)
-scripts/check.sh soak        # minutes of connection churn, then checks for leaks
+scripts/check.sh soak        # minutes of connection churn, plain and then over TLS, then checks for leaks
 scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
@@ -172,7 +172,8 @@ is loaded.
 3. **`unsafe`** only with a `// SAFETY:` comment saying why it is sound, a test that would
    catch misuse, and clean `scripts/check.sh tsan` and `scripts/valgrind.sh` runs.
 4. **No new dependency** without a reason stated in the pull request. The runtime depends
-   on `io-uring`, `libc` and `socket2` only.
+   on `socket2`, plus `libc` on Unix, `io-uring` on Linux and `windows-sys` on Windows,
+   and nothing else.
 5. **Public items are documented.** Futures are not `Send` by design: tasks stay on their
    worker, and `Rc`/`RefCell` are fine. Buffers are passed by value and handed back, as in
    `write_all(buf)` returning `(io::Result<()>, buf)`.

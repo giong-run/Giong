@@ -13,7 +13,15 @@ cd "$(dirname "$0")/core"
 ROUNDS=${1:-5}
 OUT=${2:-../results/core/vm}
 CORES=${CORES:-1-2}
-RUNTIMES=${RUNTIMES:-"giong tokio-ct tokio-local tokio-mt monoio glommio compio smol"}
+# macOS and Windows have no taskset (and no io_uring runtimes): the runs
+# are not pinned there, and only Gióng, Tokio and smol run.
+if command -v taskset >/dev/null; then
+    PIN="taskset -c $CORES"
+    RUNTIMES=${RUNTIMES:-"giong tokio-ct tokio-local tokio-mt monoio glommio compio smol"}
+else
+    PIN=""
+    RUNTIMES=${RUNTIMES:-"giong tokio-ct tokio-local tokio-mt smol"}
+fi
 WORKLOADS=${WORKLOADS:-"spawn yield pingpong mpsc bounded oneshot chain timers timeout xthread tcp-rr connect lookup"}
 cargo build --release --quiet
 mkdir -p "$OUT"
@@ -25,7 +33,8 @@ for round in $(seq "$ROUNDS"); do
             if [ "$w" = lookup ]; then
                 case "$r" in monoio | glommio | compio) continue ;; esac
             fi
-            taskset -c "$CORES" target/release/bench-core "$r" "$w" >>"$OUT/raw.csv"
+            # tr: Windows ends each line with a carriage return too.
+            $PIN target/release/bench-core "$r" "$w" | tr -d '\r' >>"$OUT/raw.csv"
         done
     done
     echo "round $round done" >&2

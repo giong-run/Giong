@@ -1,0 +1,14 @@
+   1 test binaries
+cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead
+cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead
+cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead
+== no /dev/kvm: emulating, which is slow
+== Linux 6.18.63
+GIONG-EXPECT driver=io_uring workarounds=unchecked features=unchecked
+GIONG-KTLS tls module loaded
+GIONG-KERNEL 6.18.63-061863-generic
+GIONG-RUN soak-eb4d4ebd95bef12a
+GIONG-PASS soak-eb4d4ebd95bef12a
+GIONG-RUN soak-eb4d4ebd95bef12a for 60 s
+GIONG-PASS soak-eb4d4ebd95bef12a soak
+GIONG-DONE failed=0

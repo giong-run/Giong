@@ -17,7 +17,7 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 1.0.0-rc.1**, the first release candidate of 1.0: the API is frozen (see
+> **Status: 1.0.0**, the first stable release: the API is frozen (see
 > [STABILITY.md](docs/STABILITY.md)). Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server and client),
@@ -34,7 +34,8 @@ load arrives.
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser and
 > HTTP/2 on both sides are fuzzed, `h2spec` passes, and a soak test churns connections for two
-> hours every night. It has **not** run in production. See [Limitations](#limitations).
+> hours every night. One service uses it so far, its author's, with no error reported on
+> 1.0.0-rc.1. See [Limitations](#limitations).
 
 ## What giong is for
 
@@ -1131,9 +1132,17 @@ Also:
   close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
   traffic alongside; afterwards no descriptor, memory or driver state may be left over.
   30 minutes on four workers: 39.5 million connections, resident memory flat at 15.5–15.7
-  MB. CI runs it for two hours every night, on the runner's kernel and on Linux 6.18 in
-  QEMU, whose packed buffer rings cut stream receives wherever a shared buffer fills up;
-  the 6.12 and 6.18 kernel jobs soak for a minute on every change.
+  MB. A second soak (`giong-tls/tests/soak.rs`) does the same over TLS 1.3 and 1.2 with a
+  `TlsStream` at both ends, with kernel TLS on half the stream ends where the `tls` module
+  is loaded: clean closes, dropped connections, handshakes given up, receives cancelled and
+  taken up again, writes cancelled inside a record. 30 minutes on four workers of a 4-vCPU
+  virtual machine, without kernel TLS: 7.6 million connections on io_uring and 7.4 million
+  on epoll, about half of them full handshakes, no unexpected error, resident memory
+  between 62 and 89 MB on io_uring and between 56 and 85 MB on epoll with no growth
+  (`bench/results/tls-soak/4f9083b/`). CI
+  runs both for two hours every night, on the runner's kernel and on Linux 6.18 in QEMU,
+  whose packed buffer rings cut stream receives wherever a shared buffer fills up; the 6.12
+  and 6.18 kernel jobs soak for a minute on every change, 6.18 with kernel TLS.
 - **valgrind memcheck** over the single-threaded tests (`scripts/valgrind.sh`): no invalid
   access, no leak.
 - **Load** on the example HTTP server: over 250,000 connections opened and closed, 5,000

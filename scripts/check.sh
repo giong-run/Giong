@@ -26,7 +26,10 @@
 #                               of an io_uring operation (docs/kani.md)
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
-#                               driver state (tests/soak.rs)
+#                               driver state (tests/soak.rs); then the same over
+#                               TLS, with kernel TLS where the tls module is
+#                               loaded (giong-tls/tests/soak.rs). `soak runtime`
+#                               or `soak tls` runs one of the two
 #   scripts/check.sh miri       the unit tests and the tests Miri can run, on the
 #                               epoll driver, under Miri, which checks the unsafe
 #                               code against Rust's memory and aliasing rules
@@ -96,7 +99,10 @@ run_tsan() {
     # TSan queues an asynchronous signal until the receiving thread next calls
     # an intercepted libc function. giong's threads sit in raw io_uring_enter
     # and futex syscalls, so the SIGTERM handler would never run and the test
-    # would hang. It runs in every non-sanitizer job instead.
+    # would hang. It runs in every non-sanitizer job instead. The handler
+    # itself still runs under TSan in
+    # sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down, whose
+    # signal goes to a thread sleeping in nanosleep, which TSan intercepts.
     local skip=(--skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned)
     # `--cfg giong_tsan` makes giong close sockets with close(2) instead of
     # IORING_OP_CLOSE, which TSan cannot see (see Driver::close_fd).
@@ -119,8 +125,16 @@ run_loom() {
 }
 
 run_soak() {
-    echo "== soak for ${SOAK_SECS:-300} s"
-    GIONG_SOAK_SECS="${SOAK_SECS:-300}" cargo test --release --quiet --test soak -- --ignored --nocapture
+    # One after the other, each for SOAK_SECS: both use every core.
+    local which="$1"
+    if [ "$which" = all ] || [ "$which" = runtime ]; then
+        echo "== soak for ${SOAK_SECS:-300} s"
+        GIONG_SOAK_SECS="${SOAK_SECS:-300}" cargo test --release --quiet -p giong --test soak -- --ignored --nocapture
+    fi
+    if [ "$which" = all ] || [ "$which" = tls ]; then
+        echo "== TLS soak for ${SOAK_SECS:-300} s"
+        GIONG_SOAK_SECS="${SOAK_SECS:-300}" cargo test --release --quiet -p giong-tls --all-features --test soak -- --ignored --nocapture
+    fi
 }
 
 run_miri() {
@@ -220,12 +234,17 @@ case "${1:-all}" in
     seccomp) run_seccomp ;;
     tsan) run_tsan ;;
     loom) run_loom ;;
-    soak) run_soak ;;
+    soak)
+        case "${2:-all}" in
+            all | runtime | tls) run_soak "${2:-all}" ;;
+            *) echo "usage: $0 soak [runtime|tls]" >&2; exit 2 ;;
+        esac
+        ;;
     miri) run_miri ;;
     kani) run_kani ;;
     sim) run_sim ;;
     sim-long) run_sim_long ;;
     all) run_test; run_fallback all; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak|miri|kani|sim|sim-long|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak [runtime|tls]|miri|kani|sim|sim-long|all]" >&2; exit 2 ;;
 esac
 echo "ok"

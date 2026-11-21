@@ -174,6 +174,34 @@ async fn recv_exactly(tls: &TlsStream, n: usize) -> Vec<u8> {
     got
 }
 
+/// Runs a send together with the receive of what it sends: a megabyte does
+/// not fit in the buffers of a loopback connection on every system (macOS
+/// 26), and a send that waits for a reader that has not started never ends.
+async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+    use std::task::Poll;
+    let (mut a, mut b) = (std::pin::pin!(a), std::pin::pin!(b));
+    let (mut a_out, mut b_out) = (None, None);
+    std::future::poll_fn(|cx| {
+        if a_out.is_none() {
+            if let Poll::Ready(out) = a.as_mut().poll(cx) {
+                a_out = Some(out);
+            }
+        }
+        if b_out.is_none() {
+            if let Poll::Ready(out) = b.as_mut().poll(cx) {
+                b_out = Some(out);
+            }
+        }
+        if a_out.is_some() && b_out.is_some() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+    (a_out.unwrap(), b_out.unwrap())
+}
+
 /// Messages of awkward sizes around the 16 KiB record size, then a few
 /// megabytes, from `a` to `b` and back; then a header, a body and a trailer
 /// in one vectored write each way.
@@ -181,32 +209,38 @@ async fn exchange(a: &TlsStream, b: &TlsStream) {
     let sizes = [1, 2, 100, 16383, 16384, 16385, 32768, 65537, 1_000_000];
     for (i, &n) in sizes.iter().enumerate() {
         let data: Vec<u8> = (0..n).map(|j| (j * 7 + i) as u8).collect();
-        let (res, data) = a.write_all(data).await;
+        let ((res, data), got) = both(a.write_all(data), recv_exactly(b, n)).await;
         res.unwrap();
-        assert!(recv_exactly(b, n).await == data, "{n} bytes a to b");
-        let (res, data) = b.write_all(data).await;
+        assert!(got == data, "{n} bytes a to b");
+        let ((res, data), got) = both(b.write_all(data), recv_exactly(a, n)).await;
         res.unwrap();
-        assert!(recv_exactly(a, n).await == data, "{n} bytes b to a");
+        assert!(got == data, "{n} bytes b to a");
     }
     let body: Vec<u8> = (0..150_000u32).map(|j| (j % 251) as u8).collect();
     let pieces = vec![b"head ".to_vec(), body, Vec::new(), b" tail".to_vec()];
     let whole = pieces.concat();
     for (from, to) in [(a, b), (b, a)] {
-        let (res, back) = from.write_all_vectored(pieces.clone()).await;
+        let ((res, back), got) = both(
+            from.write_all_vectored(pieces.clone()),
+            recv_exactly(to, whole.len()),
+        )
+        .await;
         res.unwrap();
         assert!(back == pieces, "the pieces are handed back");
-        assert!(
-            recv_exactly(to, whole.len()).await == whole,
-            "vectored write"
-        );
+        assert!(got == whole, "vectored write");
     }
     // A file: whole, a range across record boundaries, and past its end.
     let file_data: Vec<u8> = (0..1_000_003u32).map(|j| (j % 253) as u8).collect();
     let file = TempFile::new(&file_data);
     let f = giong::fs::File::open(&file.0).await.unwrap();
     for (from, to) in [(a, b), (b, a)] {
-        from.send_file(&f, 0, file_data.len() as u64).await.unwrap();
-        assert!(recv_exactly(to, file_data.len()).await == file_data, "file");
+        let (res, got) = both(
+            from.send_file(&f, 0, file_data.len() as u64),
+            recv_exactly(to, file_data.len()),
+        )
+        .await;
+        res.unwrap();
+        assert!(got == file_data, "file");
         from.send_file(&f, 16_000, 50_000).await.unwrap();
         assert!(
             recv_exactly(to, 50_000).await == file_data[16_000..66_000],

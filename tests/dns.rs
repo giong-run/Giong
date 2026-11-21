@@ -42,16 +42,17 @@ impl FakeDns {
             .map(|((name, t), reply)| ((name.to_string(), t), reply))
             .collect();
         let table = Arc::new(table);
-        // A UDP port whose TCP twin is free too (another test may hold it).
-        // Linux 6.0.16 to 6.0.19 answer a TCP bind to a busy address with
-        // success and leave the socket unbound, and `listen` then picks
-        // another port: check where the listener really is.
+        // A TCP port whose UDP twin is free too (another test may hold it).
+        // The TCP port is chosen first: a TCP port can be busy with closed
+        // connections in TIME_WAIT, which UDP ports never are, and Windows
+        // hands out ports in sequence, so the twin of a fresh UDP port was
+        // often one that this suite's own connections had just closed.
         let (udp, tcp, addr) = (0..100)
             .find_map(|_| {
-                let udp = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-                let addr = udp.local_addr().unwrap();
-                let tcp = StdTcpListener::bind(addr).ok()?;
-                (tcp.local_addr().ok()? == addr).then_some((udp, tcp, addr))
+                let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = tcp.local_addr().unwrap();
+                let udp = StdUdpSocket::bind(addr).ok()?;
+                Some((udp, tcp, addr))
             })
             .expect("no free UDP and TCP port pair");
         let queries = Arc::new(Mutex::new(Vec::new()));
@@ -320,7 +321,13 @@ fn a_server_nobody_listens_on_is_a_coded_error() {
         let os = source
             .downcast_ref::<std::io::Error>()
             .expect("an io::Error");
-        assert_eq!(os.kind(), ErrorKind::ConnectionRefused);
+        // Windows reports a refused datagram as a reset.
+        let refused = if cfg!(windows) {
+            ErrorKind::ConnectionReset
+        } else {
+            ErrorKind::ConnectionRefused
+        };
+        assert_eq!(os.kind(), refused);
     });
 }
 
@@ -567,4 +574,39 @@ fn connect_reports_the_last_error_when_every_address_fails() {
         assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
         assert_eq!(code(&err), Some(Code::NoAddresses), "{err}");
     });
+}
+
+/// macOS writes the primary resolver of its network configuration to
+/// /etc/resolv.conf: the servers read from the file are the ones the system
+/// reports for it.
+#[test]
+#[cfg(target_os = "macos")]
+fn the_system_configuration_is_the_primary_resolver_of_macos() {
+    let out = std::process::Command::new("scutil")
+        .arg("--dns")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The first resolver listed is the primary one.
+    let primary: Vec<IpAddr> = text
+        .split("resolver #")
+        .nth(1)
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("nameserver["))
+        .filter_map(|rest| rest.split(": ").nth(1)?.trim().parse().ok())
+        .collect();
+    if primary.is_empty() {
+        // No network: nothing to compare.
+        return;
+    }
+    let cfg = ResolverConfig::system().unwrap();
+    let ours: Vec<IpAddr> = cfg.nameserver_addrs().iter().map(|a| a.ip()).collect();
+    assert!(!ours.is_empty());
+    for server in &ours {
+        assert!(
+            primary.contains(server),
+            "{server} is not a server of the primary resolver {primary:?}"
+        );
+    }
 }
