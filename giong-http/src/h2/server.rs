@@ -93,9 +93,10 @@ const OUT_HIGH: usize = 64 * 1024;
 /// Short answers, whose bytes held in memory fit in one DATA frame (and the
 /// ends of streams), are added until the output holds this much: with one
 /// write in flight, the answers to a burst of short requests cut at
-/// `OUT_HIGH` each waited a turn of the worker for the next write. Below
-/// `OUT_PAUSE`, and the output's capacity stays within 256 KiB.
-const OUT_SHORT_HIGH: usize = 192 * 1024;
+/// `OUT_HIGH` each waited a turn of the worker for the next write. The bytes
+/// in the output count against the connection's budget for responses until
+/// they are written, so the connection holds no more than before.
+const OUT_SHORT_HIGH: usize = 768 * 1024;
 /// How many times in a row the connection polls the handlers that were
 /// woken while it polled them, before it lets the rest of the worker run.
 const ROUNDS_PER_TURN: usize = 32;
@@ -406,8 +407,11 @@ pub(crate) struct Session {
     /// on start with `initial_window` instead of the protocol's default.
     settings_acked: bool,
     /// Response bytes the streams hold, not sent yet, and how many they may
-    /// before handlers wait.
+    /// before handlers wait. Bytes copied into the output count until the
+    /// write that sends them is done.
     unsent: u64,
+    /// Of `unsent`, the bytes in `out`.
+    out_unsent: u64,
     unsent_budget: u64,
     /// Requests whose handlers are due to start, in order.
     starts: VecDeque<(usize, Request)>,
@@ -475,6 +479,7 @@ impl Session {
             initial_window: initial_window(&cfg),
             settings_acked: false,
             unsent: 0,
+            out_unsent: 0,
             unsent_budget: budget(&cfg),
             starts: VecDeque::new(),
             grant_due: false,
@@ -612,6 +617,18 @@ impl Session {
     /// Too much output waits: stop reading.
     pub(crate) fn paused(&self) -> bool {
         self.out.len() >= OUT_PAUSE
+    }
+
+    /// Takes the output to write, and the bytes of it that count against
+    /// the budget for responses until [`wrote`](Self::wrote) is called.
+    pub(crate) fn take_out(&mut self) -> (Vec<u8>, u64) {
+        let out = mem::replace(&mut self.out, take_buffer());
+        (out, mem::take(&mut self.out_unsent))
+    }
+
+    /// A write taken with [`take_out`](Self::take_out) is done.
+    pub(crate) fn wrote(&mut self, counted: u64) {
+        self.unsent -= counted;
     }
 
     pub(crate) fn open_streams(&self) -> usize {
@@ -2009,7 +2026,7 @@ impl Session {
                         ..
                     }
                 ) {
-                    self.unsent -= sent as u64;
+                    self.out_unsent += sent as u64;
                 }
             }
             if end {
@@ -2318,6 +2335,9 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
     let mut recv = pin!(Some(io.recv()));
     let mut write = pin!(None);
     let mut write_deadline: Option<Instant> = None;
+    // The bytes of the write in flight that count against the budget for
+    // responses (`Session::take_out`).
+    let mut writing = 0;
     let mut timer = pin!(sleep_until(Instant::now() + cfg.idle_timeout));
     let mut shutdown = pin!(giong::until_shutdown(std::future::pending::<()>()));
     let mut shutting_down = false;
@@ -2386,7 +2406,8 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         stop_handlers(&mut s, &mut tasks);
 
         if write.is_none() && !s.out.is_empty() {
-            let out = mem::replace(&mut s.out, take_buffer());
+            let (out, counted) = s.take_out();
+            writing = counted;
             write.set(Some(io.write_all(out)));
             write_deadline = Some(Instant::now() + cfg.write_timeout);
         }
@@ -2450,6 +2471,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         match woke {
             Wake::Wrote((Ok(()), mut buf)) => {
                 write.set(None);
+                s.wrote(mem::take(&mut writing));
                 write_deadline = None;
                 buf.clear();
                 if s.out.is_empty() {
