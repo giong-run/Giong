@@ -1178,6 +1178,33 @@ impl Client {
             let opening = H3Opening { pool, origin, gate };
             // Boxed for the reason `checkout` boxes `Conn::open`.
             let opened = Box::pin(self.h3_open(quic, origin, port, connect_timeout)).await;
+            // With a ticket, a connection opens without a packet from the
+            // server (0-RTT). An origin's advertised alternative is used
+            // only once the server has answered, so that a network that
+            // blocks UDP sends the requests over TCP at once rather than
+            // after their timeout. With prior knowledge there is no TCP to
+            // go to, and 0-RTT is kept.
+            let prior_knowledge = self
+                .shared
+                .config
+                .http3
+                .as_ref()
+                .is_some_and(|http3| http3.prior_knowledge);
+            let opened = match opened {
+                Ok(conn) if !prior_knowledge => {
+                    match giong::time::timeout(connect_timeout, conn.handshake()).await {
+                        Ok(()) if conn.is_open() => Ok(conn),
+                        _ => Err(Error::new(
+                            ErrorKind::Timeout,
+                            format!(
+                                "no answer from {origin} over HTTP/3 (UDP port {port}) within \
+                                 {connect_timeout:?}; the request goes over TCP"
+                            ),
+                        )),
+                    }
+                }
+                other => other,
+            };
             let conn = match opened {
                 Ok(conn) => conn,
                 Err(e) => {

@@ -823,6 +823,7 @@ fn a_client_that_is_dropped_closes_its_connections() {
 mod alt_svc {
     use super::*;
     use giong_tls::{Certificates, TlsAcceptor, TlsConnector};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// An HTTPS server over TCP whose responses carry `alt_svc(port)` as
     /// their `Alt-Svc`, with `Server::serve_h3` behind `port`; and a client
@@ -983,6 +984,116 @@ mod alt_svc {
             }
             let waited = started.elapsed();
             assert!(waited < Duration::from_millis(1500), "{waited:?}");
+        });
+    }
+
+    /// A UDP relay to `server` that drops everything once `cut` is set.
+    fn relay(server: std::net::SocketAddr, cut: Arc<AtomicBool>) -> u16 {
+        use std::net::UdpSocket;
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let back = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let port = front.local_addr().unwrap().port();
+        let client = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (front, back, client, cut) =
+                (front.clone(), back.clone(), client.clone(), cut.clone());
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 65536];
+                while let Ok((n, from)) = front.recv_from(&mut buf) {
+                    *client.lock().unwrap() = Some(from);
+                    if !cut.load(Ordering::Relaxed) {
+                        let _ = back.send_to(&buf[..n], server);
+                    }
+                }
+            });
+        }
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while let Ok((n, _)) = back.recv_from(&mut buf) {
+                let to = *client.lock().unwrap();
+                if let (Some(to), false) = (to, cut.load(Ordering::Relaxed)) {
+                    let _ = front.send_to(&buf[..n], to);
+                }
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_ticket_does_not_commit_requests_to_an_alternative_that_no_longer_answers() {
+        run(|| async {
+            let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+            let (pem, key_pem) = (cert.cert.pem(), cert.key_pair.serialize_pem());
+            let der = cert.cert.der().clone();
+            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+            let mut server_tls = rustls::ServerConfig::builder_with_provider(provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![der.clone()], key.into())
+                .unwrap();
+            server_tls.alpn_protocols = vec![b"h3".to_vec()];
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(der).unwrap();
+            let mut client_tls = rustls::ClientConfig::builder_with_provider(provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+            let endpoint = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(server_tls).unwrap().early_data(true),
+            )
+            .unwrap();
+            let cut = Arc::new(AtomicBool::new(false));
+            let port = relay(endpoint.local_addr().unwrap(), cut.clone());
+            drop(giong::spawn(async move {
+                Server::new().serve_h3(endpoint, App).await
+            }));
+            let acceptor = TlsAcceptor::with_certificates(
+                &Certificates::from_pem(pem.as_bytes(), key_pem.as_bytes()).unwrap(),
+            )
+            .unwrap();
+            let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("https://{}", listener.local_addr().unwrap());
+            let value = format!("h3=\":{port}\"; ma=60");
+            drop(giong::spawn(async move {
+                let handler = move |_: Request| {
+                    let value = value.clone();
+                    async move { Response::text("over TCP").header("alt-svc", value) }
+                };
+                Server::new().serve_tls(listener, acceptor, handler).await
+            }));
+            // Clients that share their tickets.
+            let quic = ClientConfig::new(client_tls).unwrap().early_data(true);
+            let client = || {
+                Client::builder()
+                    .tls(TlsConnector::with_root_pem(pem.as_bytes()).unwrap())
+                    .http3(quic.clone())
+                    .connect_timeout(Duration::from_millis(400))
+                    .timeout(Duration::from_secs(20))
+                    .build()
+            };
+            // The first leaves a ticket behind.
+            let first = client();
+            for version in [Version::Http2, Version::Http3, Version::Http3] {
+                let res = first.get(&format!("{url}/")).send().await.unwrap();
+                assert_eq!(res.version(), version);
+            }
+            // UDP goes dark. The next client has a ticket, so it could
+            // send at once in 0-RTT; it waits for an answer instead, and
+            // goes over TCP when none comes.
+            cut.store(true, Ordering::Relaxed);
+            let second = client();
+            let res = second.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            let started = std::time::Instant::now();
+            let res = second.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.version(), Version::Http2);
+            let waited = started.elapsed();
+            assert!(waited < Duration::from_secs(3), "{waited:?}");
         });
     }
 
