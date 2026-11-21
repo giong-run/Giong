@@ -369,13 +369,40 @@ async fn cross_worker(workers: usize, deadline: Instant, counters: Arc<Counters>
 }
 
 fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
+    // macOS lists a process's own descriptors in /dev/fd.
+    let dir = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    std::fs::read_dir(dir).unwrap().count()
 }
 
+#[cfg(target_os = "linux")]
 fn rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// Resident memory from the kernel's task information (`proc_pidinfo`).
+#[cfg(target_os = "macos")]
+fn rss_kib() -> u64 {
+    // SAFETY: all-zero is a valid `proc_taskinfo`, which the call fills in;
+    // the size passed is its size.
+    unsafe {
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let n = libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        );
+        assert_eq!(n, size, "proc_pidinfo: {}", std::io::Error::last_os_error());
+        info.pti_resident_size / 1024
+    }
 }
 
 fn median(values: &mut [u64]) -> u64 {
