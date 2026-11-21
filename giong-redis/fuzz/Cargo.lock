@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "0.2.1"
+version = "1.1.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -71,7 +71,7 @@ dependencies = [
 
 [[package]]
 name = "giong-redis"
-version = "0.2.1"
+version = "1.1.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -88,10 +88,13 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "0.2.1"
+version = "1.1.0"
 dependencies = [
  "giong",
+ "libc",
  "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
 ]
 
 [[package]]

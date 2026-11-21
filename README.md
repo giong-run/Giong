@@ -1059,9 +1059,10 @@ cost 1% more instructions, or an idle connection 1% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,114 tests across the nine crates and the example API (`cargo test --workspace
+1,114 tests across the nine crates of 1.0 and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
-driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
+driver without a failure (giong-proto, giong-grpc-build and giong-grpc, new in 1.1, add
+9, 4 and 65 more), plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and
 TLS's main suites are below; the database clients, giong-web, giong-mcp, giong-compat and
 the example API describe theirs in their READMEs.

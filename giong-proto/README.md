@@ -6,8 +6,7 @@ the input, so decoding copies nothing and makes no heap allocation; encoding wri
 message structs whose fields borrow too. Code is generated from `.proto` files by
 [giong-grpc-build](../giong-grpc-build), which parses them in Rust: no `protoc` to install.
 
-> **New in giong 1.1.** Not published before giong 1.0.0 is released. It is the message
-> layer of [giong-grpc](../giong-grpc), gRPC on giong's HTTP/2.
+> **New in giong 1.1.** It is the message layer of [giong-grpc](../giong-grpc), gRPC on giong's HTTP/2.
 
 ## Use
 
