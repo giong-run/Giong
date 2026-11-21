@@ -314,6 +314,15 @@ impl SendStream {
         quinn_proto::VarInt::from(self.id.id).into_inner()
     }
 
+    /// On a client, whether the stream was opened before the handshake
+    /// ended, so that what is written on it before
+    /// [`Connection::handshake`] returns goes out in 0-RTT data (see
+    /// [`Endpoint::connect_early`]). On a server, whether the peer opened
+    /// it in early data.
+    pub fn is_early(&self) -> bool {
+        self.id.early
+    }
+
     /// Abandons the stream: what was written and not yet delivered may
     /// never arrive, and the peer is told `code` (`RESET_STREAM`).
     pub fn reset(&mut self, code: u32) {

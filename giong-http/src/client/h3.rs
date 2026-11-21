@@ -38,6 +38,9 @@ struct State {
     /// Which of the server's critical streams exist: control (1), QPACK
     /// encoder (2), QPACK decoder (4).
     critical: Cell<u8>,
+    /// The client's control stream stays open for as long as the
+    /// connection: closing it is a connection error (section 6.2.1).
+    control: RefCell<Option<SendStream>>,
 }
 
 impl State {
@@ -63,9 +66,6 @@ struct Shared {
     quic: Rc<giong_quic::Connection>,
     state: Rc<State>,
     max_head_size: usize,
-    /// The client's control stream stays open for as long as the
-    /// connection: closing it is a connection error (section 6.2.1).
-    _control: SendStream,
 }
 
 impl Drop for Shared {
@@ -91,24 +91,38 @@ impl Connection {
         max_head_size: usize,
     ) -> io::Result<Self> {
         let quic = Rc::new(quic);
-        let mut control = quic.open_uni().await?;
-        let mut out = vec![StreamType::CONTROL as u8];
-        Settings::write_frame(&mut out, max_head_size as u64);
-        control.write_all(&out).await?;
+        let control = open_control(&quic, max_head_size).await?;
+        let early = control.is_early();
         let state = Rc::new(State {
             closed: RefCell::new(None),
             goaway: Cell::new(None),
             critical: Cell::new(0),
+            control: RefCell::new(Some(control)),
         });
         drop(giong::spawn(server_streams(quic.clone(), state.clone())));
+        if early {
+            drop(giong::spawn(settle(
+                quic.clone(),
+                state.clone(),
+                max_head_size,
+            )));
+        }
         Ok(Self {
             shared: Rc::new(Shared {
                 quic,
                 state,
                 max_head_size,
-                _control: control,
             }),
         })
+    }
+
+    /// Waits for the end of the QUIC handshake, after which nothing more
+    /// goes out in 0-RTT data. Cancel safe: it only waits.
+    pub(crate) async fn handshake(&self) {
+        let shared = &self.shared;
+        if let Err(e) = shared.quic.handshake().await {
+            shared.state.lost(&e);
+        }
     }
 
     /// Whether a new request may go on this connection.
@@ -138,6 +152,15 @@ impl Connection {
                 "the server is going away (GOAWAY)".into(),
             ));
         }
+        // Early data can be replayed (RFC 8470), so only a request that is
+        // harmless to repeat goes out in it; others wait for the handshake.
+        let early = send.is_early();
+        if early && !(req.body.is_none() && matches!(req.method, "GET" | "HEAD" | "OPTIONS")) {
+            if let Err(e) = shared.quic.handshake().await {
+                state.lost(&e);
+                return Err(StreamError::Refused(e.to_string()));
+            }
+        }
         let mut stream = Stream {
             conn: self.clone(),
             id: send.id(),
@@ -149,6 +172,7 @@ impl Connection {
             received_any: false,
             trailers: false,
             done: false,
+            early,
         };
         let body = req.body.unwrap_or_default();
         let mut out = Vec::with_capacity(128 + req.path.len());
@@ -171,6 +195,33 @@ impl Connection {
             }
         }
         Ok(stream)
+    }
+}
+
+/// Opens the client's control stream and sends its settings.
+async fn open_control(
+    quic: &giong_quic::Connection,
+    max_head_size: usize,
+) -> io::Result<SendStream> {
+    let mut control = quic.open_uni().await?;
+    let mut out = vec![StreamType::CONTROL as u8];
+    Settings::write_frame(&mut out, max_head_size as u64);
+    control.write_all(&out).await?;
+    Ok(control)
+}
+
+/// For a control stream opened in 0-RTT data: once the handshake is over,
+/// opens it again if the server refused that data, since it then never
+/// saw the client's settings.
+async fn settle(quic: Rc<giong_quic::Connection>, state: Rc<State>, max_head_size: usize) {
+    let reopened = match quic.handshake().await {
+        Ok(true) => return,
+        Ok(false) => open_control(&quic, max_head_size).await,
+        Err(e) => Err(e),
+    };
+    match reopened {
+        Ok(control) => *state.control.borrow_mut() = Some(control),
+        Err(e) => state.lost(&e),
     }
 }
 
@@ -330,6 +381,9 @@ pub(crate) struct Stream {
     trailers: bool,
     /// The response ended and was read, or failed.
     done: bool,
+    /// The stream was opened before the handshake ended, so the request
+    /// may have gone out in 0-RTT data.
+    early: bool,
 }
 
 impl Stream {
@@ -337,6 +391,11 @@ impl Stream {
     fn failed(&mut self, e: io::Error) -> StreamError {
         self.done = true;
         let state = &self.conn.shared.state;
+        if giong::error::code(&e) == Some(giong::error::Code::QuicEarlyDataRejected) {
+            return StreamError::Refused(
+                "the server refused the 0-RTT data the request went out in".into(),
+            );
+        }
         match giong_quic::reset_code(&e) {
             Some(code) if code == Code::RequestRejected as u64 => StreamError::Refused(
                 "the server rejected the request unprocessed (H3_REQUEST_REJECTED)".into(),
@@ -570,6 +629,11 @@ impl Stream {
     }
 
     /// Whether the body has been read to its end (or failed).
+    /// Whether the request may have gone out in 0-RTT data.
+    pub(crate) fn was_early(&self) -> bool {
+        self.early
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.done
     }

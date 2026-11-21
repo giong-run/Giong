@@ -91,6 +91,7 @@ impl Handler for App {
             "/echo" => Response::new(200).body(req.body().to_vec()),
             "/big" => Response::new(200).body(pattern(3 << 20)),
             "/empty" => Response::new(204),
+            "/early" => Response::text(req.is_early_data().to_string()),
             "/clear" => Response::text("cleared").header("alt-svc", "clear"),
             "/slow" => {
                 giong::time::sleep(Duration::from_millis(30)).await;
@@ -157,6 +158,67 @@ fn requests_and_responses_go_over_http3() {
 
         // All of it on one connection.
         assert_eq!(PEERS.with(|p| p.borrow().len()), 1);
+    });
+}
+
+/// Serves `App` with early data on, at the address returned.
+fn early_server(tls: rustls::ServerConfig) -> String {
+    let config = ServerConfig::new(tls).unwrap().early_data(true);
+    let endpoint = Endpoint::server("127.0.0.1:0".parse().unwrap(), config).unwrap();
+    let url = format!("https://{}", endpoint.local_addr().unwrap());
+    drop(giong::spawn(async move {
+        Server::new().serve_h3(endpoint, App).await
+    }));
+    url
+}
+
+#[test]
+fn a_resumed_client_sends_safe_requests_in_early_data_and_waits_with_the_others() {
+    run(|| async {
+        let (server_tls, client_tls) = tls();
+        // A second server with the same certificate and a session cache of
+        // its own, so that it cannot take the first one's tickets.
+        let mut other_tls = server_tls.clone();
+        other_tls.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
+        let url = early_server(server_tls);
+        let other = early_server(other_tls);
+        let quic = ClientConfig::new(client_tls).unwrap().early_data(true);
+        let client = || {
+            Client::builder()
+                .http3_prior_knowledge(quic.clone())
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(10))
+                .build()
+        };
+        let early = |client: &Client, post: bool| {
+            let url = format!("{url}/early");
+            let req = if post {
+                client.post(&url).body("x")
+            } else {
+                client.get(&url)
+            };
+            async move { req.send().await.unwrap().text().unwrap().to_owned() }
+        };
+
+        // The first connection gets a session ticket and sends nothing early.
+        let first = client();
+        assert_eq!(early(&first, false).await, "false");
+        drop(first);
+
+        // A new connection resumes: the GET goes out in early data, the
+        // POST, sent at the same time, waits for the handshake.
+        let second = client();
+        let get = giong::spawn(early(&second, false));
+        let post = giong::spawn(early(&second, true));
+        assert_eq!(get.await.unwrap(), "true");
+        assert_eq!(post.await.unwrap(), "false");
+        drop(second);
+
+        // A server that refuses the early data gets the request again
+        // after the handshake.
+        let third = client();
+        let res = third.get(&format!("{other}/early")).send().await.unwrap();
+        assert_eq!((res.status(), res.text().unwrap()), (200, "false"));
     });
 }
 

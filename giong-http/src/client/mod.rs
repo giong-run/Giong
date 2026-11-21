@@ -453,6 +453,14 @@ impl ClientBuilder {
     /// connection, and its stream limits and windows bound what a server
     /// can make the client hold. [`tls`](Self::tls) is not used for these
     /// requests; [`connect_timeout`](Self::connect_timeout) is.
+    ///
+    /// With early data on in `quic` (`giong_quic::ClientConfig::early_data`),
+    /// a new connection to a server the client holds a session ticket for
+    /// sends its first requests in 0-RTT data, a round trip sooner. Since
+    /// early data can be replayed, only GET, HEAD and OPTIONS requests
+    /// without a body go in it; the others wait for the handshake. A
+    /// request the server refuses to take early (its 0-RTT data refused, or
+    /// `425 Too Early`) is sent again once the handshake is over.
     #[cfg(feature = "unstable-http3")]
     pub fn http3_prior_knowledge(mut self, quic: giong_quic::ClientConfig) -> Self {
         self.http3 = Some(Http3 {
@@ -1073,6 +1081,7 @@ impl Client {
         };
         let mut refused = 0;
         let mut again = false;
+        let mut too_early = false;
         loop {
             let (conn, reused) = self
                 .h3_connection(&http3.quic, &origin, port, connect_timeout)
@@ -1083,6 +1092,13 @@ impl Client {
                 Ok(stream)
             };
             match response.await {
+                // 425 Too Early: the server will take the request once the
+                // handshake is over (RFC 8470, section 5.2).
+                Ok(stream) if stream.head().status == 425 && stream.was_early() && !too_early => {
+                    too_early = true;
+                    drop(stream);
+                    conn.handshake().await;
+                }
                 Ok(stream) => {
                     let head = h2_head(stream.head());
                     self.note_alt_svc(url, &head, &stream.head().bytes);
@@ -1226,7 +1242,7 @@ impl Client {
                     }
                 };
                 let made = async {
-                    let conn = endpoint.connect(addr, &origin.host, quic).await?;
+                    let conn = endpoint.connect_early(addr, &origin.host, quic).await?;
                     h3::Connection::start(conn, config.max_head_size).await
                 };
                 match giong::time::timeout(share, made).await {
