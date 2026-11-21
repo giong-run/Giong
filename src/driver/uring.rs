@@ -285,8 +285,9 @@ fn build_ring(entries: u32) -> io::Result<IoUring> {
 
 /// `io_uring_setup` fails with `EPERM` when a seccomp profile blocks it (as
 /// Docker's default profile does) or the `kernel.io_uring_disabled` sysctl
-/// forbids it, and with `ENOSYS` where the kernel or a sandbox such as gVisor
-/// does not provide it. The bare errno says none of that, so say it here.
+/// forbids it, with `ENOSYS` where the kernel or a sandbox such as gVisor
+/// does not provide it, and with `EINVAL` where a sandbox provides only part
+/// of it. The bare errno says none of that, so say it here.
 fn explain_setup_error(e: io::Error) -> io::Error {
     match e.raw_os_error() {
         // The kernel's kind (PermissionDenied or Unsupported) is kept.
@@ -300,6 +301,23 @@ fn explain_setup_error(e: io::Error) -> io::Error {
                  profile blocks io_uring, sandboxes such as gVisor do not have it, and the \
                  kernel.io_uring_disabled sysctl turns it off; docs/DEPLOYMENT.md shows how to \
                  allow it in Docker and Kubernetes.",
+            )
+            .with_source(e),
+        ),
+        // Linux takes the flags and sizes of the last attempt from 5.6 on, so
+        // `EINVAL` comes from an io_uring that only imitates Linux's, such as
+        // gVisor's (`runsc --iouring`), which takes no setup flags at all.
+        Some(libc::EINVAL) => io::Error::new(
+            e.kind(),
+            Error::new(
+                Code::IoUringUnavailable,
+                format!(
+                    "giong needs io_uring, and the io_uring here refused to set up a ring \
+                     ({e}): it is not Linux's, or only part of it, as in gVisor"
+                ),
+                "let giong use its epoll driver by not asking for io_uring (Builder::driver, \
+                 GIONG_DRIVER), or run on Linux 6.0 or newer outside such a sandbox; \
+                 docs/DEPLOYMENT.md lists the places without a full io_uring.",
             )
             .with_source(e),
         ),
@@ -380,7 +398,7 @@ fn locked_memory_error(e: io::Error, what: &str, limit: u64) -> io::Error {
              against it, summed over all processes of the same user: a giong worker locks \
              about 150 KiB with the default settings, more with a larger \
              Builder::ring_entries or Builder::recv_buffers. Without \
-             .driver(crate::DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
+             .driver(DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
              on its epoll driver instead; docs/DEPLOYMENT.md shows how to raise the limit.",
         )
         .with_source(e),
@@ -2038,7 +2056,7 @@ mod tests {
     /// A blocked or missing io_uring is explained; other errors pass through.
     #[test]
     fn setup_errors_say_why_io_uring_is_missing() {
-        for errno in [libc::EPERM, libc::ENOSYS] {
+        for errno in [libc::EPERM, libc::ENOSYS, libc::EINVAL] {
             let original = io::Error::from_raw_os_error(errno);
             let kind = original.kind();
             let e = explain_setup_error(original);

@@ -266,6 +266,10 @@ is loaded.
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
   cannot fix that (see `giong-compat/README.md`).
+- **gVisor is not Linux.** Its network stack records `SO_REUSEPORT` when a socket binds
+  (Linux reads it when the next socket binds), its `somaxconn` is 1024, and it has no
+  `SO_COOKIE` and no io_uring giong can use. Socket code that relies on when Linux reads
+  an option needs a run of `scripts/gvisor.sh` (CI's `gvisor` job).
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 
