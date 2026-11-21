@@ -207,8 +207,10 @@ docs: explain how to run under WSL2
 1. Branch from `main`. Name the branch `<type>/<short-description>`, for example
    `fix/recv-pause-on-drop`.
 2. Keep the pull request focused; several small ones are reviewed faster than one large one.
-3. Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for anything a user
-   would notice.
+3. For anything a user would notice, add a changelog entry as a new file in
+   [changelog.d/](changelog.d/README.md) rather than editing `CHANGELOG.md`, so that pull
+   requests in flight do not conflict. `scripts/preflight.sh` runs the checks your change
+   needs before you push.
 4. Fill in the pull request template. Say how you tested the change.
 5. All checks must be green. A maintainer reviews the pull request and adds it to the
    merge queue, which runs every check once more on `main` with the pull request merged,
@@ -224,9 +226,8 @@ published together, to crates.io and as a GitHub Release whose notes come from
 `CHANGELOG.md` and thank everyone who contributed. The whole process, including adding a
 new crate, is in [docs/RELEASING.md](docs/RELEASING.md).
 
-What that asks of a contributor is in the list above: a `CHANGELOG.md` line under
-`Unreleased` and a pull request title in the commit convention, since both feed the
-release notes.
+What that asks of a contributor is in the list above: a changelog entry in `changelog.d/`
+and a pull request title in the commit convention, since both feed the release notes.
 
 ## Security
 
