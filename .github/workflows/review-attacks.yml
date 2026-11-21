@@ -1,7 +1,7 @@
 name: Review attacks
 
 # Review harness only (not for merging): hostile and racy use of the
-# drivers on real Windows, many runs in a row.
+# drivers on real macOS, many runs in a row.
 on:
   pull_request:
     paths:
@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
+        os: [macos-14, macos-15]
         profile: [debug, release]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -37,7 +37,6 @@ jobs:
           flag=""; [ "${{ matrix.profile }}" = release ] && flag=--release
           cargo test -p giong $flag --test review_attacks --no-run
           cargo test -p giong $flag --test review_attacks diag -- --nocapture || true
-          cargo test -p giong $flag --test net send_file -- --nocapture
           for i in $(seq 1 10); do
             echo "::group::run $i"
             timeout 900 cargo test -p giong $flag --test review_attacks -- --nocapture --test-threads 2 --skip diag 2>&1 | tee run.log

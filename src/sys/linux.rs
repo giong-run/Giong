@@ -164,7 +164,7 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> bool {
 }
 
 /// Accepts a connection as a close-on-exec, non-blocking descriptor;
-/// `-errno` on failure (`EINTR` included).
+/// -1 with `errno` set on failure (`EINTR` included).
 pub(crate) fn accept(fd: RawFd) -> isize {
     let flags = libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     // SAFETY: null address pointers ask for no peer address.
@@ -277,6 +277,14 @@ pub(crate) unsafe fn recvmmsg(
     flags: libc::c_int,
 ) -> isize {
     libc::recvmmsg(fd, msgs, count as libc::c_uint, flags, std::ptr::null_mut()) as isize
+}
+
+/// The error a [`recvmmsg`] that returned some datagrams met after them,
+/// for the caller to report next. Linux keeps such an error on the socket
+/// itself (`sk_err`) and returns it from the next receive, so: none.
+#[inline(always)]
+pub(crate) fn take_recv_error() -> Option<i32> {
+    None
 }
 
 /// Reads at `offset` what the page cache holds, without waiting for the

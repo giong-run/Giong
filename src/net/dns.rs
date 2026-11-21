@@ -74,39 +74,10 @@ impl ResolverConfig {
     /// the network the machine is on. Resolvers that macOS uses for some
     /// domains only (files in `/etc/resolver`, a VPN's own domains) are not
     /// in that file and are not consulted.
-    /// On Windows, which has no `resolv.conf`, the name servers are those of
-    /// the network adapters that are up (the first three, in the order
-    /// Windows lists the adapters), the search domains are the machine's
-    /// primary DNS suffix and each adapter's own suffix, and the hosts file
-    /// is `%SystemRoot%\System32\drivers\etc\hosts`. IPv6 servers that are
-    /// site-local (`fec0::/10`, listed on adapters with no IPv6 server) or
-    /// link-local are left out. The other settings are the defaults.
     pub fn system() -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            let resolv = read_optional("/etc/resolv.conf")?;
-            let hosts = read_optional("/etc/hosts")?;
-            Ok(Self::parse(&resolv, &hosts))
-        }
-        #[cfg(windows)]
-        {
-            let (servers, search) = crate::sys::dns_config()?;
-            let hosts = read_optional(crate::sys::hosts_path())?;
-            Ok(Self::from_adapters(&servers, &search, &hosts))
-        }
-    }
-
-    /// What the adapters report, with the hosts file. With no DNS server
-    /// there is none: Windows runs no server at `127.0.0.1:53`, the
-    /// default a `resolv.conf` without one gets, so a lookup there would
-    /// only time out; it fails with `GIONG-E0104` instead.
-    #[cfg(windows)]
-    fn from_adapters(servers: &[IpAddr], search: &[String], hosts: &str) -> Self {
-        let mut cfg = Self::parse(&adapters_as_resolv_conf(servers, search), hosts);
-        if servers.is_empty() {
-            cfg.nameservers.clear();
-        }
-        cfg
+        let resolv = read_optional("/etc/resolv.conf")?;
+        let hosts = read_optional("/etc/hosts")?;
+        Ok(Self::parse(&resolv, &hosts))
     }
 
     /// Builds a configuration from the text of a `resolv.conf` and a `hosts`
@@ -123,10 +94,9 @@ impl ResolverConfig {
             let mut words = line.split_whitespace();
             match words.next() {
                 Some("nameserver") => {
-                    // A zone index (`fe80::1%eth0`) is not supported; skip it.
-                    if let Some(ip) = words.next().and_then(|w| w.parse::<IpAddr>().ok()) {
+                    if let Some(server) = words.next().and_then(nameserver) {
                         if cfg.nameservers.len() < 3 {
-                            cfg.nameservers.push(SocketAddr::new(ip, 53));
+                            cfg.nameservers.push(server);
                         }
                     }
                 }
@@ -252,63 +222,7 @@ fn is_loopback(ip: &IpAddr) -> bool {
     }
 }
 
-/// What Windows reports, written as a `resolv.conf`, so that it is read by
-/// the same rules.
-#[cfg(windows)]
-fn adapters_as_resolv_conf(servers: &[IpAddr], search: &[String]) -> String {
-    let mut text = String::new();
-    for server in servers {
-        text.push_str(&format!("nameserver {server}\n"));
-    }
-    if !search.is_empty() {
-        text.push_str(&format!("search {}\n", search.join(" ")));
-    }
-    text
-}
-
-/// Where the system's DNS servers are set, for the fixes of errors.
-#[cfg(unix)]
-macro_rules! servers_where {
-    () => {
-        "/etc/resolv.conf"
-    };
-}
-#[cfg(windows)]
-macro_rules! servers_where {
-    () => {
-        "the settings of the network adapter (`ipconfig /all` lists them)"
-    };
-}
-
-/// Where the system's hosts file is, for the fixes of errors.
-#[cfg(unix)]
-macro_rules! hosts_where {
-    () => {
-        "/etc/hosts"
-    };
-}
-#[cfg(windows)]
-macro_rules! hosts_where {
-    () => {
-        "the hosts file (%SystemRoot%\\System32\\drivers\\etc\\hosts)"
-    };
-}
-
-/// How to give a slow DNS server longer, for the fixes of errors.
-#[cfg(unix)]
-macro_rules! longer_where {
-    () => {
-        "options timeout:N and attempts:N there give it longer"
-    };
-}
-#[cfg(windows)]
-macro_rules! longer_where {
-    () => {
-        "ResolverConfig::timeout and ResolverConfig::attempts give it longer"
-    };
-}
-
-fn read_optional(path: impl AsRef<std::path::Path>) -> io::Result<String> {
+fn read_optional(path: &str) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
@@ -432,13 +346,8 @@ impl Resolver {
             raise(
                 Code::HostNotFound,
                 format!("no address found for {host}"),
-                concat!(
-                    "check the spelling of the name, ",
-                    hosts_where!(),
-                    ", and the DNS servers in ",
-                    servers_where!(),
-                    " (in a container, the network it is attached to)."
-                ),
+                "check the spelling of the name, /etc/hosts, and the DNS servers in \
+                 /etc/resolv.conf (in a container, the network it is attached to).",
             )
         }))
     }
@@ -476,21 +385,12 @@ impl Resolver {
         let cfg = &self.inner.cfg;
         let servers = &cfg.nameservers;
         if servers.is_empty() {
-            #[cfg(windows)]
-            let (what, fix) = (
-                "no DNS server is configured: ResolverConfig::nameservers was given none, or no \
-                 network adapter reports one",
-                "give a network adapter a DNS server (`ipconfig /all` lists them), pass at least \
-                 one server to ResolverConfig::nameservers, or use an address or a name from the \
-                 hosts file.",
-            );
-            #[cfg(unix)]
-            let (what, fix) = (
+            return Err(raise(
+                Code::NoDnsServer,
                 "no DNS server is configured: ResolverConfig::nameservers was given none",
                 "pass at least one server to ResolverConfig::nameservers, or use an address or a \
                  name from /etc/hosts.",
-            );
-            return Err(raise(Code::NoDnsServer, what, fix));
+            ));
         }
         let start = if cfg.rotate {
             let n = self.inner.next_server.get();
@@ -532,13 +432,8 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
             Err(_) => Err(raise(
                 Code::DnsTimeout,
                 format!("DNS server {server} did not answer for {name} within {wait:?}"),
-                concat!(
-                    "check that the server in ",
-                    servers_where!(),
-                    " is reachable (firewall, VPN, container network); ",
-                    longer_where!(),
-                    "."
-                ),
+                "check that the server in /etc/resolv.conf is reachable (firewall, VPN, \
+                 container network); options timeout:N and attempts:N there give it longer.",
             )),
         }
     };
@@ -565,12 +460,9 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
                     crate::error::Error::new(
                         Code::DnsServerUnreachable,
                         format!("cannot reach DNS server {server} to look up {name}: {e}"),
-                        concat!(
-                            "check that a DNS server runs at the address in ",
-                            servers_where!(),
-                            " (in a container, the network it is attached to) and that a \
-                             firewall lets UDP and TCP port 53 through."
-                        ),
+                        "check that a DNS server runs at the address in /etc/resolv.conf (in a \
+                         container, the network it is attached to) and that a firewall lets \
+                         UDP and TCP port 53 through.",
                     )
                     .with_source(e)
                     .into(),
@@ -774,11 +666,8 @@ fn malformed() -> io::Error {
     raise(
         Code::DnsBadResponse,
         "malformed DNS response",
-        concat!(
-            "check the DNS server in ",
-            servers_where!(),
-            "; something between giong and it may be changing the packets."
-        ),
+        "check the DNS server in /etc/resolv.conf; something between giong and it may be \
+         changing the packets.",
     )
 }
 
@@ -905,12 +794,8 @@ fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Ans
                 format!(
                     "the DNS answer for {name} has a chain of more than {MAX_CNAMES} CNAME records"
                 ),
-                concat!(
-                    "check the DNS server in ",
-                    servers_where!(),
-                    " and the records of the name; resolvers stop following aliases long \
-                     before this."
-                ),
+                "check the DNS server in /etc/resolv.conf and the records of the name; \
+                 resolvers stop following aliases long before this.",
             ));
         }
         min_ttl = min_ttl.min(*ttl);
@@ -955,77 +840,62 @@ thread_local! {
 struct SystemResolver {
     resolver: Resolver,
     checked: Instant,
-    stamps: Stamps,
+    stamps: [Option<SystemTime>; 2],
 }
 
-/// What the system configuration was read from, to tell when it changed.
-#[cfg(unix)]
-type Stamps = [Option<SystemTime>; 2];
-/// The hosts file's time, and what the adapters report: Windows keeps the
-/// rest in no file.
-#[cfg(windows)]
-type Stamps = (Option<SystemTime>, Option<(Vec<IpAddr>, Vec<String>)>);
-
-#[cfg(unix)]
-fn file_stamps() -> Stamps {
+fn file_stamps() -> [Option<SystemTime>; 2] {
     ["/etc/resolv.conf", "/etc/hosts"].map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
-#[cfg(windows)]
-fn file_stamps() -> Stamps {
-    let hosts = std::fs::metadata(crate::sys::hosts_path())
-        .and_then(|m| m.modified())
-        .ok();
-    (hosts, crate::sys::dns_config().ok())
-}
-
-/// The system configuration, read again.
-#[cfg(unix)]
-fn system_config(_stamps: &Stamps) -> io::Result<ResolverConfig> {
-    ResolverConfig::system()
-}
-
-/// The system configuration, with what the adapters reported for `stamps`.
-#[cfg(windows)]
-fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
-    match &stamps.1 {
-        Some((servers, search)) => {
-            let hosts = read_optional(crate::sys::hosts_path())?;
-            Ok(ResolverConfig::from_adapters(servers, search, &hosts))
-        }
-        // Asked again, for the error.
-        None => ResolverConfig::system(),
+/// A `nameserver` address on port 53. An IPv6 address may carry a zone
+/// (`fe80::1%en0` or `fe80::1%4`), as macOS writes for a router's
+/// link-local address: the interface it names, which must exist.
+fn nameserver(word: &str) -> Option<SocketAddr> {
+    let Some((ip, zone)) = word.split_once('%') else {
+        return word
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53));
+    };
+    let ip = ip.parse::<std::net::Ipv6Addr>().ok()?;
+    let scope = match zone.parse::<u32>() {
+        Ok(index) => index,
+        Err(_) => interface_index(zone)?,
+    };
+    // A link-local address needs an interface to be sent to.
+    if scope == 0 && ip.segments()[0] & 0xffc0 == 0xfe80 {
+        return None;
     }
+    Some(std::net::SocketAddrV6::new(ip, 53, 0, scope).into())
+}
+
+/// The index of the network interface `name`, if there is one.
+#[cfg(unix)]
+fn interface_index(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated string.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
 }
 
 /// The current thread's resolver for the system configuration, reloaded when
-/// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds; on
-/// Windows, the hosts file and what the adapters report).
+/// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds).
 pub(crate) fn system_resolver() -> io::Result<Resolver> {
     SYSTEM.with(|slot| {
         let mut slot = slot.borrow_mut();
         let now = Instant::now();
-        if let Some(sys) = slot.as_ref() {
+        if let Some(sys) = slot.as_mut() {
             if now.duration_since(sys.checked) < RELOAD_CHECK {
                 return Ok(sys.resolver.clone());
             }
-        }
-        // Read once per check: on Windows, asking the adapters is not
-        // cheap, and the stamps hold what they said.
-        let stamps = file_stamps();
-        if let Some(sys) = slot.as_mut() {
             sys.checked = now;
+            let stamps = file_stamps();
             if stamps == sys.stamps {
                 return Ok(sys.resolver.clone());
             }
-            // The adapters could not be asked this time: what they said
-            // last still holds, and they are asked again at the next check.
-            #[cfg(windows)]
-            if stamps.1.is_none() {
-                return Ok(sys.resolver.clone());
-            }
         }
-        let resolver = Resolver::new(system_config(&stamps)?);
+        let stamps = file_stamps();
+        let resolver = Resolver::new(ResolverConfig::system()?);
         *slot = Some(SystemResolver {
             resolver: resolver.clone(),
             checked: now,
@@ -1263,41 +1133,34 @@ mod tests {
         assert!(tc.truncated);
     }
 
+    /// macOS writes a router's link-local address with its interface
+    /// (`fe80::1%en0`); the zone becomes the address's scope. One naming no
+    /// interface, or zone 0 on a link-local address, is skipped.
     #[test]
-    fn windows_takes_the_name_servers_of_its_adapters() {
-        // One test on every platform (the simulation's index is built from
-        // test names), with nothing to check off Windows.
-        #[cfg(windows)]
-        {
-            let (servers, search) = crate::sys::dns_config().unwrap();
-            assert!(!servers.is_empty(), "no adapter reports a DNS server");
-            let cfg = ResolverConfig::parse(&adapters_as_resolv_conf(&servers, &search), "");
-            let expected: Vec<SocketAddr> = servers
-                .iter()
-                .take(3)
-                .map(|&ip| SocketAddr::new(ip, 53))
-                .collect();
-            assert_eq!(cfg.nameservers, expected);
-            assert_eq!(cfg.search, search);
-            ResolverConfig::system().unwrap();
-        }
-    }
-
-    #[test]
-    fn windows_with_no_adapter_dns_server_fails_with_a_coded_error() {
-        // One name on every platform, for the simulation's index; the body
-        // is Windows'.
-        #[cfg(windows)]
-        {
-            let cfg = ResolverConfig::from_adapters(&[], &["corp.example".into()], "");
-            assert!(cfg.nameservers.is_empty());
-            let resolver = Resolver::new(cfg);
-            let err = crate::block_on(resolver.lookup_ip("db.corp.example")).unwrap_err();
-            assert_eq!(
-                crate::error::code(&err),
-                Some(crate::error::Code::NoDnsServer)
-            );
-        }
+    fn a_nameserver_with_a_zone_gets_its_scope() {
+        let lo = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let cfg = ResolverConfig::parse(
+            &format!(
+                "nameserver fe80::1%nosuchif0\nnameserver fe80::4%0\nnameserver fe80::2%{lo}\nnameserver fe80::3%7\n"
+            ),
+            "",
+        );
+        let scopes: Vec<_> = cfg
+            .nameservers
+            .iter()
+            .map(|a| match a {
+                SocketAddr::V6(a) => (a.ip().segments()[7], a.port(), a.scope_id()),
+                SocketAddr::V4(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(scopes.len(), 2, "{scopes:?}");
+        assert_eq!(scopes[0].0, 2);
+        assert!(scopes[0].2 > 0, "{scopes:?}");
+        assert_eq!(scopes[1], (3, 53, 7));
     }
 
     #[test]
@@ -1306,7 +1169,7 @@ mod tests {
             "# comment\n\
              nameserver 10.96.0.10\n\
              nameserver 2001:db8::53 ; trailing comment\n\
-             nameserver fe80::1%eth0\n\
+             nameserver fe80::1%nosuchif0\n\
              nameserver 10.0.0.3\nnameserver 10.0.0.4\n\
              domain ignored.example\n\
              search default.svc.cluster.local svc.cluster.local cluster.local.\n\

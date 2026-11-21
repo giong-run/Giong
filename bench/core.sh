@@ -13,8 +13,8 @@ cd "$(dirname "$0")/core"
 ROUNDS=${1:-5}
 OUT=${2:-../results/core/vm}
 CORES=${CORES:-1-2}
-# macOS and Windows have no taskset (and no io_uring runtimes): the runs
-# are not pinned there, and only Gióng, Tokio and smol run.
+# macOS has no taskset (and no io_uring runtimes): the runs are not pinned
+# there, and only Gióng, Tokio and smol run.
 if command -v taskset >/dev/null; then
     PIN="taskset -c $CORES"
     RUNTIMES=${RUNTIMES:-"giong tokio-ct tokio-local tokio-mt monoio glommio compio smol"}
@@ -33,8 +33,10 @@ for round in $(seq "$ROUNDS"); do
             if [ "$w" = lookup ]; then
                 case "$r" in monoio | glommio | compio) continue ;; esac
             fi
-            # tr: Windows ends each line with a carriage return too.
-            $PIN target/release/bench-core "$r" "$w" | tr -d '\r' >>"$OUT/raw.csv"
+            $PIN target/release/bench-core "$r" "$w" >>"$OUT/raw.csv"
+            # macOS: let the connections' ports leave TIME_WAIT (30 s), so
+            # the next run does not run out of them (see CONNECTS).
+            if [ "$w" = connect ] && [ "$(uname)" = Darwin ]; then sleep 31; fi
         done
     done
     echo "round $round done" >&2

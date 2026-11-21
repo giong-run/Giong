@@ -82,6 +82,13 @@ mod certs;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod ktls;
+
+/// The flag that makes a send to a closed peer fail with `EPIPE` instead of
+/// raising `SIGPIPE`. macOS has none: giong's sockets carry `SO_NOSIGPIPE`.
+#[cfg(target_os = "linux")]
+const NO_SIGNAL: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(target_os = "macos")]
+const NO_SIGNAL: libc::c_int = 0;
 mod received;
 
 pub use certs::Certificates;
@@ -1515,7 +1522,7 @@ impl TlsStream {
                     std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
                     unsent.as_ptr().cast(),
                     len,
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    libc::MSG_DONTWAIT | NO_SIGNAL,
                 )
             };
             if n >= 0 {

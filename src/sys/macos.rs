@@ -53,7 +53,9 @@ pub(crate) unsafe fn stat_at(
 }
 
 impl Bell {
-    /// A non-blocking, close-on-exec pipe.
+    /// A non-blocking, close-on-exec pipe. macOS has no `pipe2`, so the
+    /// flags are set after the `pipe`: a `fork` and `exec` on another thread
+    /// in between would see the two descriptors (as with `accept` below).
     pub(crate) fn new() -> io::Result<Self> {
         let mut fds = [0; 2];
         // SAFETY: `fds` has room for the two descriptors.
@@ -157,16 +159,20 @@ pub(crate) fn accept(fd: RawFd) -> isize {
 ///
 /// `buf` must be valid for `len` bytes of writes.
 pub(crate) unsafe fn pread(fd: RawFd, buf: *mut u8, len: usize, offset: u64) -> isize {
-    no_offsets_on_a_terminal(libc::pread(fd, buf.cast(), len, offset as libc::off_t))
+    no_offsets_on_a_terminal(fd, libc::pread(fd, buf.cast(), len, offset as libc::off_t))
 }
 
 /// macOS refuses `pread` and `pwrite` on a terminal with `ENXIO`, where a
 /// pipe (and everything without offsets on Linux) gets `ESPIPE`: reported
 /// as the latter, which the callers answer with a plain read or write.
-fn no_offsets_on_a_terminal(res: isize) -> isize {
-    // SAFETY: the calling thread's own `errno`.
+/// Only for a terminal: `ENXIO` from anything else (a raw disk read past
+/// its end, a device that went away) is a real error, and a plain read
+/// there would read the wrong place.
+fn no_offsets_on_a_terminal(fd: RawFd, res: isize) -> isize {
+    // SAFETY: the calling thread's own `errno`; `isatty` only on the
+    // failure path, and it leaves `errno` alone for a terminal.
     unsafe {
-        if res < 0 && *libc::__error() == libc::ENXIO {
+        if res < 0 && *libc::__error() == libc::ENXIO && libc::isatty(fd) == 1 {
             *libc::__error() = libc::ESPIPE;
         }
     }
@@ -185,7 +191,7 @@ pub(crate) unsafe fn pwrite(fd: RawFd, buf: *const u8, len: usize, offset: u64) 
     if libc::fcntl(fd, libc::F_GETFL) & libc::O_APPEND != 0 {
         return libc::write(fd, buf.cast(), len);
     }
-    no_offsets_on_a_terminal(libc::pwrite(fd, buf.cast(), len, offset as libc::off_t))
+    no_offsets_on_a_terminal(fd, libc::pwrite(fd, buf.cast(), len, offset as libc::off_t))
 }
 
 /// `st_mode` of an open descriptor, from `fstat`.
@@ -202,12 +208,20 @@ pub(crate) fn fd_mode(fd: RawFd) -> Option<u32> {
 pub(crate) fn fsync(fd: RawFd, _datasync: bool) -> isize {
     // SAFETY: plain fcntl on a descriptor.
     let res = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
-    if res < 0 {
-        // Filesystems without F_FULLFSYNC (some network ones): fall back.
+    if res < 0 && full_fsync_unsupported(io::Error::last_os_error().raw_os_error()) {
+        // A filesystem without F_FULLFSYNC (some network ones): plain fsync
+        // is the most it offers. Any other error (EIO above all: the flush
+        // failed) is the answer, as in std, which never falls back.
         // SAFETY: as above.
         return unsafe { libc::fsync(fd) } as isize;
     }
     res as isize
+}
+
+/// Whether an `F_FULLFSYNC` failure only says that the filesystem does not
+/// have it.
+fn full_fsync_unsupported(errno: Option<i32>) -> bool {
+    matches!(errno, Some(libc::ENOTSUP | libc::ENOTTY | libc::EINVAL))
 }
 
 /// Reserves space up to `offset + len` and extends the file to that size,
@@ -242,7 +256,9 @@ pub(crate) fn fallocate(fd: RawFd, offset: u64, len: u64) -> isize {
         return 0;
     }
     let mut store = libc::fstore_t {
-        fst_flags: libc::F_ALLOCATECONTIG,
+        // F_ALLOCATEALL: all of it or nothing; without it a partial
+        // reservation succeeds.
+        fst_flags: libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL,
         fst_posmode: libc::F_PEOFPOSMODE,
         fst_offset: 0,
         fst_length: (end - size) as libc::off_t,
@@ -255,6 +271,17 @@ pub(crate) fn fallocate(fd: RawFd, offset: u64, len: u64) -> isize {
         if unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) } < 0 {
             return -1;
         }
+    }
+    // macOS has no "grow if shorter" in one step: a write past `end` that
+    // landed since the first `fstat` would be cut off by the `ftruncate`.
+    // Looked at again right before it, which leaves only a write racing
+    // this last check (see `File::allocate`).
+    // SAFETY: as above.
+    if unsafe { libc::fstat(fd, &mut st) } < 0 {
+        return -1;
+    }
+    if st.st_size as u64 >= end {
+        return 0;
     }
     // SAFETY: plain syscall on a descriptor.
     unsafe { libc::ftruncate(fd, end as libc::off_t) as isize }
@@ -311,6 +338,9 @@ pub(crate) fn read_dir_batch(
 ) -> io::Result<usize> {
     buf.clear();
     let cap = buf.capacity();
+    if let Some(errno) = state.failed.take() {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
     if state.dir.is_null() {
         // SAFETY: plain syscalls; `fdopendir` owns the duplicate on success.
         unsafe {
@@ -339,10 +369,15 @@ pub(crate) fn read_dir_batch(
                 };
                 if ent.is_null() {
                     let errno = io::Error::last_os_error();
-                    if errno.raw_os_error().unwrap_or(0) != 0 {
-                        return Err(errno);
+                    match errno.raw_os_error().unwrap_or(0) {
+                        0 => return Ok(buf.len()),
+                        // The entries read so far first, then the error.
+                        e if !buf.is_empty() => {
+                            state.failed = Some(e);
+                            return Ok(buf.len());
+                        }
+                        _ => return Err(errno),
                     }
-                    return Ok(buf.len());
                 }
                 // SAFETY: readdir returned a valid entry, valid until the
                 // next call; the name is copied out at once.
@@ -380,6 +415,9 @@ pub(crate) fn read_dir_batch(
 pub(crate) struct DirState {
     dir: *mut libc::DIR,
     pending: Option<(u64, u8, Vec<u8>)>,
+    /// An error `readdir` gave after entries of the same batch, for the
+    /// next call.
+    failed: Option<i32>,
 }
 
 impl Default for DirState {
@@ -387,6 +425,7 @@ impl Default for DirState {
         Self {
             dir: std::ptr::null_mut(),
             pending: None,
+            failed: None,
         }
     }
 }
@@ -421,8 +460,28 @@ pub(crate) struct MMsgHdr {
     pub(crate) msg_len: libc::c_uint,
 }
 
+std::thread_local! {
+    /// The error the last [`recvmmsg`] of this thread met after the
+    /// datagrams it returned, if any (see [`take_recv_error`]).
+    static RECV_ERROR: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    /// A descriptor whose [`sendmmsg`] met an error after the datagrams it
+    /// sent, and that error, for its next call.
+    static SEND_ERROR: std::cell::Cell<(RawFd, i32)> = const { std::cell::Cell::new((-1, 0)) };
+}
+
+/// Whether `errno` says nothing about the socket: there was nothing (more)
+/// to do, or a signal came. A batch stops there and keeps no error.
+fn would_block(errno: i32) -> bool {
+    errno == libc::EAGAIN || errno == libc::EWOULDBLOCK || errno == libc::EINTR
+}
+
 /// Receives up to `count` datagrams, one `recvmsg` each (macOS has no
 /// public `recvmmsg`): how many, or -1 with `errno` set if the first failed.
+///
+/// A `recvmsg` that fails after the first datagram has taken the error off
+/// the socket (a pending `ICMP` port unreachable, say), so nothing would
+/// report it again, and a receive waiting for it would wait forever. It is
+/// kept for [`take_recv_error`] instead, as Linux keeps it on the socket.
 ///
 /// # Safety
 ///
@@ -437,11 +496,28 @@ pub(crate) unsafe fn recvmmsg(
         let m = &mut *msgs.add(i);
         let n = libc::recvmsg(fd, &mut m.msg_hdr, flags);
         if n < 0 {
-            return if i == 0 { -1 } else { i as isize };
+            if i == 0 {
+                return -1;
+            }
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if !would_block(errno) {
+                RECV_ERROR.with(|e| e.set(errno));
+            }
+            return i as isize;
         }
         m.msg_len = n as libc::c_uint;
     }
     count as isize
+}
+
+/// The error (an `errno`) that the last [`recvmmsg`] of this thread met
+/// after the datagrams it returned, for the caller to report on the next
+/// receive; taken once.
+pub(crate) fn take_recv_error() -> Option<i32> {
+    match RECV_ERROR.with(|e| e.replace(0)) {
+        0 => None,
+        errno => Some(errno),
+    }
 }
 
 /// macOS cannot read only what the page cache holds: always -1, so every
@@ -461,6 +537,11 @@ pub(crate) const POLL_PEER_CLOSED: libc::c_short = libc::POLLHUP;
 /// Sends up to `count` datagrams, one `sendmsg` each (macOS has no public
 /// `sendmmsg`): how many, or -1 with `errno` set if the first failed.
 ///
+/// An error after the first datagram may have been taken off the socket
+/// (as in [`recvmmsg`]), so it is kept and returned by the next call on
+/// `fd`, which the caller makes at once for the datagrams that are left:
+/// the datagram that failed gets the error.
+///
 /// # Safety
 ///
 /// `msgs` must point at `count` headers whose pointers are valid.
@@ -470,13 +551,77 @@ pub(crate) unsafe fn sendmmsg(
     count: usize,
     flags: libc::c_int,
 ) -> isize {
+    let (held, errno) = SEND_ERROR.with(|e| e.get());
+    if held == fd && errno != 0 {
+        SEND_ERROR.with(|e| e.set((-1, 0)));
+        *libc::__error() = errno;
+        return -1;
+    }
     for i in 0..count {
         let m = &mut *msgs.add(i);
         let n = libc::sendmsg(fd, &m.msg_hdr, flags);
         if n < 0 {
-            return if i == 0 { -1 } else { i as isize };
+            if i == 0 {
+                return -1;
+            }
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if !would_block(errno) {
+                SEND_ERROR.with(|e| e.set((fd, errno)));
+            }
+            return i as isize;
         }
         m.msg_len = n as libc::c_uint;
     }
     count as isize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    /// `fsync` falls back from `F_FULLFSYNC` only where the filesystem does
+    /// not have it; a failed flush (`EIO`) is reported, as in std.
+    #[test]
+    fn only_a_missing_full_fsync_falls_back() {
+        for errno in [libc::ENOTSUP, libc::ENOTTY, libc::EINVAL] {
+            assert!(full_fsync_unsupported(Some(errno)), "{errno}");
+        }
+        for errno in [libc::EIO, libc::ENOSPC, libc::EBADF] {
+            assert!(!full_fsync_unsupported(Some(errno)), "{errno}");
+        }
+        assert!(!full_fsync_unsupported(None));
+    }
+
+    /// A datagram, then an `ICMP` port unreachable: the batch returns the
+    /// datagram and keeps the error, which `recvmsg` took off the socket,
+    /// for the next receive (as Linux keeps it on the socket).
+    #[test]
+    fn a_receive_batch_keeps_the_error_it_met_after_a_datagram() {
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.connect(peer.local_addr().unwrap()).unwrap();
+        peer.send_to(b"x", a.local_addr().unwrap()).unwrap();
+        drop(peer);
+        a.send(b"y").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut bufs = [[0u8; 8]; 2];
+        // SAFETY: all-zero is valid for these plain C structs.
+        let mut iov: [libc::iovec; 2] = unsafe { mem::zeroed() };
+        // SAFETY: as above.
+        let mut msgs: [MMsgHdr; 2] = unsafe { mem::zeroed() };
+        for i in 0..2 {
+            iov[i].iov_base = bufs[i].as_mut_ptr().cast();
+            iov[i].iov_len = 8;
+            msgs[i].msg_hdr.msg_iov = &mut iov[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+        // SAFETY: two headers pointing at the buffers above.
+        let n = unsafe { recvmmsg(a.as_raw_fd(), msgs.as_mut_ptr(), 2, libc::MSG_DONTWAIT) };
+        assert_eq!(n, 1);
+        assert_eq!(&bufs[0][..1], b"x");
+        assert_eq!(take_recv_error(), Some(libc::ECONNREFUSED));
+        assert_eq!(take_recv_error(), None);
+    }
 }

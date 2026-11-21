@@ -18,7 +18,7 @@
 
 use std::future::poll_fn;
 use std::io;
-#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::ptr;
 use std::task::{Poll, Waker};
 
@@ -26,16 +26,9 @@ use socket2::SockAddr;
 
 use crate::runtime;
 use crate::slab::Slab;
-use crate::sys::RawSock as RawFd;
 
 /// Datagrams handed to the kernel per `sendmmsg` (Linux takes up to 1024).
 const CHUNK: usize = 64;
-
-/// No socket: what a datagram that went away is grouped under.
-#[cfg(unix)]
-const NO_SOCKET: RawFd = -1;
-#[cfg(windows)]
-const NO_SOCKET: RawFd = RawFd::MAX;
 
 /// What became of a queued datagram.
 enum State {
@@ -98,11 +91,11 @@ impl SendQueue {
         let mut wakers = Vec::with_capacity(order.len());
         let mut i = 0;
         while i < order.len() {
-            let fd = self.entries.get(order[i]).map_or(NO_SOCKET, |e| e.fd);
+            let fd = self.entries.get(order[i]).map_or(-1, |e| e.fd);
             let mut j = i;
             while j < order.len()
                 && j - i < CHUNK
-                && self.entries.get(order[j]).map_or(NO_SOCKET, |e| e.fd) == fd
+                && self.entries.get(order[j]).map_or(-1, |e| e.fd) == fd
             {
                 j += 1;
             }
@@ -117,11 +110,10 @@ impl SendQueue {
     }
 
     /// One `sendmmsg` (more after an error) for `keys`, all on one socket.
-    #[cfg(unix)]
     fn send_run(&mut self, keys: &[usize], wakers: &mut Vec<Waker>) {
         let mut iov: Vec<libc::iovec> = Vec::with_capacity(keys.len());
         let mut msgs: Vec<crate::sys::MMsgHdr> = Vec::with_capacity(keys.len());
-        let fd = self.entries.get(keys[0]).map_or(NO_SOCKET, |e| e.fd);
+        let fd = self.entries.get(keys[0]).map_or(-1, |e| e.fd);
         for &k in keys {
             let e = self.entries.get(k).expect("queued datagram");
             iov.push(libc::iovec {
@@ -152,7 +144,7 @@ impl SendQueue {
                     fd,
                     msgs.as_mut_ptr().add(at),
                     left as usize,
-                    crate::sys::MSG_NOSIGNAL | crate::sys::MSG_DONTWAIT,
+                    crate::sys::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
                 )
             };
             if res > 0 {
@@ -181,49 +173,6 @@ impl SendQueue {
                     at += 1;
                 }
             }
-        }
-    }
-
-    /// One non-blocking send for each of `keys`: Windows has no call that
-    /// takes several datagrams. A socket without room ends the run, and the
-    /// rest wait for room on their own.
-    #[cfg(windows)]
-    fn send_run(&mut self, keys: &[usize], wakers: &mut Vec<Waker>) {
-        for (at, &k) in keys.iter().enumerate() {
-            let e = self.entries.get(k).expect("queued datagram");
-            let res = loop {
-                // SAFETY: the queued buffer and address stay put until
-                // their sender is woken; non-blocking.
-                let res = unsafe {
-                    match &e.addr {
-                        Some(a) => crate::sys::send_to_nowait(
-                            e.fd,
-                            e.buf,
-                            e.len,
-                            a.as_ptr().cast(),
-                            a.len(),
-                        ),
-                        None => crate::sys::send_nowait(e.fd, e.buf, e.len),
-                    }
-                };
-                if res >= 0 {
-                    break res;
-                }
-                match io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(crate::sys::errno::EIO)
-                {
-                    crate::sys::errno::EINTR => {}
-                    crate::sys::errno::EAGAIN => {
-                        for &k in &keys[at..] {
-                            self.finish(k, State::Full, wakers);
-                        }
-                        return;
-                    }
-                    e => break -(e as isize),
-                }
-            };
-            self.finish(k, State::Done(res), wakers);
         }
     }
 

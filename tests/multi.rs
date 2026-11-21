@@ -1,8 +1,5 @@
 //! The thread-per-core runtime: workers, cross-thread wake-ups, shutdown.
 
-// Some tests and their helpers are Unix-only for now.
-#![cfg_attr(windows, allow(dead_code, unused_imports))]
-
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
@@ -420,7 +417,6 @@ fn a_panicking_worker_stops_the_runtime_and_propagates() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_triggers_a_graceful_shutdown() {
@@ -469,7 +465,6 @@ fn sigterm_triggers_a_graceful_shutdown() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_still_works_after_worker_0_returned() {

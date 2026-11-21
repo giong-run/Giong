@@ -139,6 +139,44 @@ fn an_unknown_giong_driver_is_an_error() {
     let _ = Code::InvalidConfig;
 }
 
+/// A driver this system does not have is refused by `build`, before any
+/// worker starts: io_uring with `GIONG-E0001` (not available), the others
+/// with `GIONG-E0004` (a wrong setting). Named through `GIONG_DRIVER`, the
+/// same.
+#[test]
+#[cfg_attr(giong_libkqueue, ignore = "the libkqueue build has every driver")]
+fn a_driver_this_system_does_not_have_is_refused_by_build() {
+    #[cfg(target_os = "linux")]
+    let missing = [(DriverKind::Kqueue, Code::InvalidConfig, "kqueue")];
+    #[cfg(target_os = "macos")]
+    let missing = [
+        (DriverKind::IoUring, Code::IoUringUnavailable, "io_uring"),
+        (DriverKind::Epoll, Code::InvalidConfig, "epoll"),
+    ];
+    if std::env::var_os(CHILD).is_some() {
+        let err = giong::Builder::new()
+            .build()
+            .err()
+            .expect("build must fail");
+        println!("code: {:?}", error::code(&err));
+        return;
+    }
+    for (kind, code, name) in missing {
+        let err = giong::Builder::new()
+            .driver(kind)
+            .build()
+            .err()
+            .expect("build must fail");
+        assert_eq!(error::code(&err), Some(code), "{err}");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        let out = child_with_env(
+            "a_driver_this_system_does_not_have_is_refused_by_build",
+            name,
+        );
+        assert!(out.contains(&format!("code: Some({code:?})")), "{out}");
+    }
+}
+
 /// I/O that always finishes at once (on epoll, a UDP send never waits)
 /// must still let the other tasks on the worker run.
 #[test]

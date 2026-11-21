@@ -42,7 +42,6 @@ pub fn refusing_addr() -> (Socket, SocketAddr) {
 /// `SO_REUSEPORT`, which a holder would keep from binding: there the port is
 /// given back at once (the returned socket holds nothing), and the short
 /// race with another bind is accepted.
-#[cfg(unix)]
 pub fn shared_port() -> (Socket, u16) {
     let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
     socket.set_reuse_address(true).unwrap();
@@ -57,20 +56,6 @@ pub fn shared_port() -> (Socket, u16) {
         Socket::new(Domain::IPV4, Type::STREAM, None).unwrap()
     };
     (socket, port)
-}
-
-/// A port on 127.0.0.1 for the listeners of a test to share. Windows has
-/// no `SO_REUSEPORT` to hold it with: the port is one that was free a
-/// moment ago, and the short race with another bind is accepted.
-#[cfg(windows)]
-pub fn shared_port() -> (Socket, u16) {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    socket
-        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .unwrap();
-    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
-    drop(socket);
-    (Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(), port)
 }
 
 /// An address on 127.0.0.1 where a UDP datagram is refused (the kernel
@@ -89,32 +74,5 @@ pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
         .connect(&SocketAddr::from(([127, 0, 0, 1], 9)).into())
         .unwrap();
     let addr = socket.local_addr().unwrap().as_socket().unwrap();
-    // Windows drops a datagram that a connected socket does not take
-    // without telling the sender, so there the port is given back: a
-    // closed port answers, and the short race with another bind is
-    // accepted.
-    #[cfg(windows)]
-    let socket = {
-        drop(socket);
-        Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap()
-    };
     (socket, addr)
-}
-
-/// Error numbers the tests compare against, as each system spells them.
-pub mod errno {
-    /// A datagram too long to send.
-    #[cfg(unix)]
-    pub const EMSGSIZE: i32 = libc::EMSGSIZE;
-    /// A datagram too long to send (`WSAEMSGSIZE`).
-    #[cfg(windows)]
-    pub const EMSGSIZE: i32 = 10040;
-
-    /// A send without an address on a socket that has no peer.
-    #[cfg(unix)]
-    pub const NO_PEER: i32 = libc::EDESTADDRREQ;
-    /// A send without an address on a socket that has no peer
-    /// (`WSAENOTCONN`).
-    #[cfg(windows)]
-    pub const NO_PEER: i32 = 10057;
 }

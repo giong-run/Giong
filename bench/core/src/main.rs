@@ -8,37 +8,12 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 fn cpu_ns() -> u64 {
     // SAFETY: getrusage only writes into the struct we pass.
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
     let t = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1000;
     t(u.ru_utime) + t(u.ru_stime)
-}
-
-#[cfg(windows)]
-fn cpu_ns() -> u64 {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
-    let zero = FILETIME {
-        dwLowDateTime: 0,
-        dwHighDateTime: 0,
-    };
-    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-    // SAFETY: the pseudo handle of this process, and four locals to fill.
-    unsafe {
-        GetProcessTimes(
-            GetCurrentProcess(),
-            &mut created,
-            &mut exited,
-            &mut kernel,
-            &mut user,
-        )
-    };
-    // In units of 100 ns.
-    let t = |f: FILETIME| ((u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)) * 100;
-    t(kernel) + t(user)
 }
 
 /// A yield that every runtime handles the same way: wake, then pending.
@@ -69,7 +44,14 @@ const XMSGS: u64 = 4_000_000;
 const CHAIN: u64 = 1_000;
 const CHAIN_ROUNDS: u64 = 400;
 const RR: u64 = 100_000;
+/// macOS keeps a closed loopback connection's port in TIME_WAIT for 30 s
+/// and has 16,384 ephemeral ports: 10,000 per run would run out of them by
+/// the second runtime (connect fails with `ETIMEDOUT`). `bench/core.sh`
+/// also waits out TIME_WAIT after each `connect` run there.
+#[cfg(target_os = "linux")]
 const CONNECTS: u64 = 10_000;
+#[cfg(not(target_os = "linux"))]
+const CONNECTS: u64 = 2_000;
 const LOOKUPS: u64 = 200_000;
 
 /// The workloads, written once and expanded inside each runtime's module,

@@ -120,7 +120,7 @@ pub(crate) fn auto_reserve() -> u64 {
     *AUTO.get_or_init(|| {
         let total = match cgroup() {
             Some(cgroup) => Some(cgroup.limit),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             None => fs::read_to_string("/proc/meminfo")
                 .ok()
                 .and_then(|text| field(&text, "MemTotal:").map(|kib| kib * 1024)),
@@ -144,7 +144,7 @@ struct Watch {
     /// The files, kept open.
     usage: Option<File>,
     stat: Option<File>,
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     meminfo: Option<File>,
     buf: Vec<u8>,
 }
@@ -210,7 +210,7 @@ impl Watch {
             low: false,
             usage,
             stat,
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(target_os = "linux")]
             meminfo: File::open("/proc/meminfo").ok(),
             buf: Vec::with_capacity(8 * 1024),
         }
@@ -255,7 +255,7 @@ impl Watch {
         mac::available()
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     fn machine_free(&mut self) -> Option<u64> {
         let text = read_all(self.meminfo.as_ref()?, &mut self.buf).ok()?;
         field(std::str::from_utf8(text).ok()?, "MemAvailable:").map(|kib| kib * 1024)
@@ -288,7 +288,10 @@ mod mac {
             new: *mut c_void,
             new_len: usize,
         ) -> c_int;
-        fn getpagesize() -> c_int;
+        /// The kernel's page size, which `host_statistics64` counts in. It
+        /// can differ from the process's (`getpagesize`): 16 KiB against
+        /// 4 KiB for an x86_64 process under Rosetta on Apple silicon.
+        static vm_kernel_page_size: usize;
     }
 
     /// The memory installed (`hw.memsize`).
@@ -325,8 +328,8 @@ mod mac {
             return None;
         }
         let pages = u64::from(stats.0[0]) + u64::from(stats.0[2]);
-        // SAFETY: no arguments.
-        let page = u64::try_from(unsafe { getpagesize() }).ok()?;
+        // SAFETY: a constant the system sets before the process starts.
+        let page = u64::try_from(unsafe { vm_kernel_page_size }).ok()?;
         Some(pages * page)
     }
 }

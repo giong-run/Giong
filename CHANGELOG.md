@@ -8,24 +8,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
-### Added
+### Fixed
 
-- macOS support: a kqueue driver for the readiness loop (`DriverKind::Kqueue`, chosen by
-  default on macOS), with each worker woken through an `EVFILT_USER` event of its own
-  queue. The workers of a TCP port share one listening socket, bound without
-  `SO_REUSEPORT`, so no other process can take the port; UDP checks the port before the
-  first bind. Every socket has `SO_NOSIGPIPE`; streams are non-blocking from the start
-  (macOS waits in a send to a full socket even with `MSG_DONTWAIT`); UDP sockets that giong
-  binds take datagrams of every length UDP allows. `TlsConnector::with_system_roots` reads
-  the keychain's trust settings, `ResolverConfig::system` the resolver macOS writes to
-  `/etc/resolv.conf`, `Server::min_free_memory` the kernel's free and inactive pages, and
-  giong-mcp's process figures come from `proc_pidinfo`. The whole test suite passes on
-  macOS 15 and macOS 26 (Apple Silicon), as do ThreadSanitizer and the soak tests. What
-  still differs from Linux is listed in `docs/design/portability.md`
-  ([#173](https://github.com/giong-run/Giong/pull/173)).
-- The portability layer under the drivers (`src/sys/`, one `Poller` trait for epoll and
-  kqueue, a wake-up per driver), on which the macOS and Windows drivers are built; no
-  change on Linux ([#173](https://github.com/giong-run/Giong/pull/173)).
+- A worker with `spin_before_park` could stop blocking for good and burn its core: the
+  io_uring driver counted the kernel's deferred-work flag (`IORING_SQ_TASKRUN`) as
+  completions waiting, and Linux 6.18 (`DEFER_TASKRUN`) can leave that flag set after the
+  work has run. The spin loop then found "work" on every look, entered the kernel, found
+  nothing and looked again, at 100% CPU and without ever reaching its other checks. Seen
+  in about one of 70 runs of a benchmark streaming 10 million messages between two
+  processes. The driver now runs the deferred work and lets the completion queue decide.
 
 ## [1.0.0] - 2026-11-21
 

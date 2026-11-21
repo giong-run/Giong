@@ -3,7 +3,9 @@
 Instructions for AI coding agents working in this repository. People should read
 [CONTRIBUTING.md](CONTRIBUTING.md); this file says the same things in the order an agent
 needs them, adds the traps that cost time, and is kept short on purpose. Where the two
-disagree, CONTRIBUTING.md wins: report the difference.
+disagree, CONTRIBUTING.md wins: report the difference. How a change goes from an item to a
+merge, with several agents working at once (preflight, changelog entries, conflicts between
+pull requests, handoff), is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## What this is
 
@@ -92,6 +94,11 @@ Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README
 Run these from the repository root. All tests use loopback; none needs the internet.
 
 ```bash
+scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
+scripts/preflight.sh --quick  # the fast part, while iterating
+scripts/preflight.sh --against 172,173   # also merge with those open pull requests
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
+
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
 cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
@@ -172,8 +179,7 @@ is loaded.
 3. **`unsafe`** only with a `// SAFETY:` comment saying why it is sound, a test that would
    catch misuse, and clean `scripts/check.sh tsan` and `scripts/valgrind.sh` runs.
 4. **No new dependency** without a reason stated in the pull request. The runtime depends
-   on `socket2`, plus `libc` on Unix, `io-uring` on Linux and `windows-sys` on Windows,
-   and nothing else.
+   on `io-uring`, `libc` and `socket2` only.
 5. **Public items are documented.** Futures are not `Send` by design: tasks stay on their
    worker, and `Rc`/`RefCell` are fine. Buffers are passed by value and handed back, as in
    `write_all(buf)` returning `(io::Result<()>, buf)`.
@@ -198,7 +204,9 @@ is loaded.
 ## Changes, commits and pull requests
 
 - Branch from `main` as `<type>/<short-description>`. Never push to `main`; it is
-  protected.
+  protected. Leave nothing behind: a superseded pull request is closed with a comment
+  naming what replaces it and its branch deleted; a branch never stays without a pull
+  request (docs/DEVELOPMENT.md, *Leave nothing behind*).
 - Commits follow Conventional Commits: `<type>(<scope>): <imperative summary, lower case,
   no full stop>`. Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`,
   `ci`, `chore`. Scopes: the runtime's parts (`runtime`, `executor`, `driver`, `net`,
@@ -211,8 +219,11 @@ is loaded.
   whose message is the one `main` should get; for several commits it is the title and the
   list of their messages. Either way the title must be a valid commit summary. Fill in
   `.github/PULL_REQUEST_TEMPLATE.md`, including how the change was tested.
-- Anything a user would notice gets a line under `## [Unreleased]` in `CHANGELOG.md`
-  ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)), grouped by crate.
+- Anything a user would notice gets an entry in a new file in `changelog.d/`
+  ([changelog.d/README.md](changelog.d/README.md)), never an edit to `CHANGELOG.md`: pull
+  requests in flight then do not conflict, and the release pull request merges the files
+  into `CHANGELOG.md` ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/) sections,
+  entries grouped by crate).
 - Documentation is in English only: the READMEs, the docs and the comments. Each crate has
   one `README.md`. `scripts/release.py check` verifies the images and install snippets in
   them, not the test counts or benchmark numbers: update those by hand when a change moves
@@ -228,6 +239,11 @@ is loaded.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps
+
+- **Pull requests in flight conflict in the merge queue.** One that merges first can put
+  another out of date while the queue is testing it, and the queue ejects it. Before
+  enqueueing, `scripts/preflight.sh --against <open pull requests>` names the files that
+  conflict; the usual ones are README test counts and shared platform files.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that

@@ -13,8 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use giong_postgres::{Client, Config, Pool, Row};
 
-const LIST: &str =
-    "SELECT id, name, email, created_at FROM bench_users WHERE id > $1 ORDER BY id LIMIT 100";
+const LIST: &str = "SELECT id, name, email, created_at FROM bench_users WHERE id > $1 ORDER BY id LIMIT 100";
 const POINT: &str = "SELECT id, name, email, created_at FROM bench_users WHERE id = $1";
 
 enum Target {
@@ -34,12 +33,7 @@ impl Target {
 /// CPU time this process has used, in clock ticks (user + system).
 fn cpu_ticks() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    let fields: Vec<&str> = stat
-        .rsplit(')')
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .collect();
+    let fields: Vec<&str> = stat.rsplit(')').next().unwrap().split_whitespace().collect();
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
 
@@ -57,9 +51,7 @@ fn decode(rows: &[Row]) -> usize {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let config = Config::from_url(&args[1])
-        .unwrap()
-        .statement_cache_capacity(16);
+    let config = Config::from_url(&args[1]).unwrap().statement_cache_capacity(16);
     let sql = if args[2] == "list" { LIST } else { POINT };
     let mode = args[3].clone();
     let tasks: usize = args[4].parse().unwrap();
@@ -67,13 +59,7 @@ fn main() {
 
     giong::block_on(async move {
         let target = Rc::new(match mode.as_str() {
-            "pool" | "batch" => {
-                let config = config.batch_reads(mode == "batch");
-                Target::Pool(Pool::new(
-                    config,
-                    std::env::var("POOL_SIZE").map_or(4, |v| v.parse().unwrap()),
-                ))
-            }
+            "pool" => Target::Pool(Pool::new(config, std::env::var("POOL_SIZE").map_or(4, |v| v.parse().unwrap()))),
             _ => Target::Client(Rc::new(Client::connect(&config).await.unwrap())),
         });
         let measuring = Rc::new(Cell::new(false));
@@ -82,13 +68,8 @@ fn main() {
         let sink = Rc::new(Cell::new(0usize));
         let handles: Vec<_> = (0..tasks)
             .map(|t| {
-                let (target, measuring, stop, samples, sink) = (
-                    target.clone(),
-                    measuring.clone(),
-                    stop.clone(),
-                    samples.clone(),
-                    sink.clone(),
-                );
+                let (target, measuring, stop, samples, sink) =
+                    (target.clone(), measuring.clone(), stop.clone(), samples.clone(), sink.clone());
                 giong::spawn(async move {
                     let mut id = (t as i64 * 7919) % 10_000;
                     while !stop.get() {
@@ -97,9 +78,7 @@ fn main() {
                         let rows = target.query(sql, id).await;
                         sink.set(sink.get() + decode(&rows));
                         if measuring.get() {
-                            samples
-                                .borrow_mut()
-                                .push(start.elapsed().as_micros() as u32);
+                            samples.borrow_mut().push(start.elapsed().as_micros() as u32);
                         }
                     }
                 })
@@ -112,10 +91,7 @@ fn main() {
         giong::time::sleep(Duration::from_secs(secs)).await;
         measuring.set(false);
         let elapsed = begin.elapsed().as_secs_f64();
-        let hz: f64 = std::env::var("CLK_TCK")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(100.0);
+        let hz: f64 = std::env::var("CLK_TCK").ok().and_then(|v| v.parse().ok()).unwrap_or(100.0);
         let cpu = (cpu_ticks() - ticks) as f64 * 100.0 / (hz * elapsed);
         stop.set(true);
         for h in handles {

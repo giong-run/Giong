@@ -18,6 +18,7 @@ use std::task::{Context, Poll, Waker};
 
 use socket2::Socket;
 
+use super::ListenSocket;
 use crate::runtime::{self, lock, RuntimeShared};
 
 /// How much busier than the least busy member a worker must look before it
@@ -112,7 +113,7 @@ impl Member {
     pub(crate) fn poll_accept(
         &self,
         cx: &mut Context<'_>,
-        mut next: impl FnMut(&mut Context<'_>) -> Poll<io::Result<Socket>>,
+        listener: &ListenSocket,
     ) -> Poll<io::Result<Socket>> {
         let group = &*self.group;
         {
@@ -127,7 +128,7 @@ impl Member {
             }
         }
         loop {
-            let sock = match next(cx) {
+            let sock = match listener.poll_accept(cx) {
                 Poll::Ready(Ok(sock)) => sock,
                 other => return other,
             };
