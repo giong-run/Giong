@@ -10,6 +10,7 @@ from the root one. The API reference is on [docs.rs](https://docs.rs/giong).
 | [errors/](errors/README.md) | Every `GIONG-Exxxx` code: what went wrong and how to fix it. An error message names its page. |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Running a giong service: checking a machine, the locked-memory limit, kernel quirks, restarting on the same port, sizing memory, io_uring in Docker, Kubernetes and sandboxes. |
 | [kani.md](kani.md) | The Kani proofs of the `unsafe` core and how to run them. |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | How a change goes from an item to a merge with several agents at once: preflight checks, changelog entries, avoiding conflicts in the merge queue, handoff. |
 | [RELEASING.md](RELEASING.md) | How a release is cut and published (maintainers). |
 | [reviews/](reviews/) | Written reviews: the 1.0 API freeze, API portability, giong-tls's security review, the gaps a general runtime still has. |
 
