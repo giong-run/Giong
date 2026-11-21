@@ -182,13 +182,26 @@ impl<T: 'static> Drop for Op<T> {
             } else {
                 None
             };
+            let charged = charge.is_some();
             let data = data
                 .take()
                 .map(|(d, hold)| Box::new((d, hold, charge)) as Box<dyn Any>);
             match w.driver.try_borrow_mut() {
-                Ok(mut driver) => driver.cancel_op(key as usize, data, result_is_fd, finish),
+                Ok(mut driver) => {
+                    driver.cancel_op(key as usize, data, result_is_fd, finish);
+                    if charged {
+                        // Resources the kernel is done with already: drop
+                        // them now, outside the driver, so that the slot
+                        // goes back (and wakes a task waiting for one)
+                        // before the worker next sleeps.
+                        let graveyard = driver.take_graveyard();
+                        drop(driver);
+                        drop(graveyard);
+                    }
+                }
                 // Dropped by code the driver runs (a waker's `wake` or
-                // `drop`): cancelled at the next turn, still on this worker.
+                // `drop`): cancelled at the next turn, still on this worker
+                // (which drops what that frees before it sleeps).
                 Err(_) => w.defer_cancel(key as usize, data, result_is_fd, finish),
             }
             true

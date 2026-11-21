@@ -91,11 +91,11 @@
 //!
 //! ## Cost
 //!
-//! Next to nothing for code that uses no budget: a spawn and the start of an
-//! operation test one pointer the worker keeps (whether the task polled now
-//! runs in a budget), and everything else is out of line. Measured with
-//! `scripts/instr.py`, that is under 1% more instructions on every hot path
-//! (0.6% on a spawn, 0.4% on a TCP echo).
+//! Next to nothing for code that uses no budget: the start of an operation
+//! and a spawn (once the task is allocated) test one pointer the worker keeps
+//! (whether the task polled now runs in a budget), and everything else is out
+//! of line. Measured with `scripts/instr.py`: 0 to 0.3% more instructions per
+//! operation, and a spawn takes fewer than before this module.
 //! Inside a budget, each charge is one atomic add on the budget's counter;
 //! a budget is shared by every worker its tenant runs on.
 
@@ -830,9 +830,23 @@ pub(crate) struct TaskCharge {
 impl TaskCharge {
     /// Charges a task of `F` to `budget`, whose task slot is taken.
     fn new<F>(budget: Arc<Inner>) -> Self {
-        let bytes = std::mem::size_of::<F>() + TASK_OVERHEAD;
+        Self::with_size(budget, std::mem::size_of::<F>())
+    }
+
+    fn with_size(budget: Arc<Inner>, size: usize) -> Self {
+        let bytes = size + TASK_OVERHEAD;
         budget.memory.force(bytes);
         Self { budget, bytes }
+    }
+
+    /// Charges a task of `size` bytes, spawned without waiting inside a
+    /// task of the budget at `ptr` (the worker's current one).
+    pub(crate) fn inherit(ptr: *const Inner, size: usize) -> Self {
+        // SAFETY: read from the worker on this thread during this poll (see
+        // `arc_of`).
+        let budget = Arc::clone(&unsafe { arc_of(ptr) }.expect("not null"));
+        budget.tasks.force(1);
+        Self::with_size(budget, size)
     }
 
     /// Runs `poll` (one poll of the task) in the budget.
@@ -975,26 +989,6 @@ where
 {
     let charge = TaskCharge::new::<F>(budget);
     runtime::with_worker(|w| w.spawn_charged(fut, location, charge))
-}
-
-/// [`spawn`](crate::spawn) inside a task of the budget at `ptr` (the
-/// worker's current one): the new task is charged to it, without waiting.
-/// Out of line, so that a spawn outside budgets pays one test.
-#[cold]
-#[inline(never)]
-pub(crate) fn spawn_inherited<F>(
-    w: &Worker,
-    ptr: *const Inner,
-    fut: F,
-    location: &'static std::panic::Location<'static>,
-) -> JoinHandle<F::Output>
-where
-    F: Future + 'static,
-{
-    // SAFETY: read from the worker on this thread just now (see `arc_of`).
-    let budget = Arc::clone(&unsafe { arc_of(ptr) }.expect("not null"));
-    budget.tasks.force(1);
-    w.spawn_charged(fut, location, TaskCharge::new::<F>(budget))
 }
 
 /// A future running in a budget: what it spawns, starts and queues is

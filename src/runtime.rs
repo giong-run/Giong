@@ -830,6 +830,12 @@ impl Worker {
         for fd in deferred.closes {
             driver.close_fd(fd);
         }
+        // What the cancellations freed (a budget's I/O slot may be among
+        // it, and wake a task): dropped outside the driver, before the
+        // worker sleeps.
+        let graveyard = driver.take_graveyard();
+        drop(driver);
+        drop(graveyard);
     }
 
     /// Publishes how busy this worker is (see [`Load`]): two relaxed stores

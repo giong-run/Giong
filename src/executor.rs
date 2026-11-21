@@ -587,12 +587,36 @@ impl Runnable for Charged {
     }
 }
 
+/// `task` (of `size` bytes) as a task of the budget at `budget`, the
+/// budget of the task that spawns it.
+#[cold]
+#[inline(never)]
+fn inherit(
+    budget: *const crate::budget::Inner,
+    task: Rc<dyn Runnable>,
+    size: usize,
+) -> Rc<dyn Runnable> {
+    let charge = crate::budget::TaskCharge::inherit(budget, size);
+    Rc::new(Charged { task, charge })
+}
+
 impl Worker {
     pub(crate) fn spawn_local<F>(&self, fut: F, location: Location) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
     {
-        self.spawn_wrapped(fut, location, |task| task)
+        // Inside a budgeted task the new task is charged to the same
+        // budget. Tested once the future is in its allocation, and handled
+        // out of line without the future's type, so that a spawn outside
+        // budgets pays one test and no copy.
+        self.spawn_wrapped(fut, location, |task| {
+            let budget = self.budget.get();
+            if budget.is_null() {
+                task
+            } else {
+                inherit(budget, task, std::mem::size_of::<F>())
+            }
+        })
     }
 
     /// [`spawn_local`](Self::spawn_local) for a task of a budget. The
@@ -809,15 +833,7 @@ where
     F: Future + 'static,
 {
     let location = std::panic::Location::caller();
-    runtime::with_worker(|w| {
-        let budget = w.budget.get();
-        if budget.is_null() {
-            w.spawn_local(fut, location)
-        } else {
-            // Inside a budgeted task the new task is charged to the same budget.
-            crate::budget::spawn_inherited(w, budget, fut, location)
-        }
-    })
+    runtime::with_worker(|w| w.spawn_local(fut, location))
 }
 
 /// Yields to the executor, letting other tasks and pending I/O make progress.

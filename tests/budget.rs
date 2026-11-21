@@ -397,10 +397,10 @@ fn compute_weight_shares_the_lane() {
                 jobs.push(
                     budget
                         .spawn_compute(move || {
-                            let start = Instant::now();
-                            while start.elapsed() < Duration::from_millis(2) {
-                                std::hint::spin_loop();
-                            }
+                            // Sleeps rather than spins: the lane charges wall
+                            // time, which a busy machine would stretch for
+                            // spinning jobs unevenly.
+                            std::thread::sleep(Duration::from_millis(2));
                             done.lock().unwrap().push((name, i));
                         })
                         .await,

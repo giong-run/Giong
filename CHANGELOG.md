@@ -42,10 +42,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   cancellation completes. The compute lane keeps one queue per budget and serves the one
   that has used the least compute time for its `Limits::compute_weight`, so a tenant with
   long jobs cannot make another tenant's short jobs wait behind them. Code that uses no
-  budget pays one thread-local read per spawn and per operation. In a container of 1 CPU
+  budget pays one test per operation start: 0 to 0.3% more instructions per operation
+  (`scripts/instr.py`), and a spawn takes 1.5-1.9% fewer than before. In a container of 1 CPU
   and 128 MiB with tenant A sending far more than the box can serve, tenant B keeps its
   in-deadline successes with budgets, and loses them all without (`bench/tenants.sh`,
   numbers in `bench/results/tenants/`).
+
 ## [1.0.0-rc.1] - 2026-11-20
 
 ### Security
