@@ -1,0 +1,21 @@
+# The protobuf conformance testee for giong-proto, and its differential
+# tests against prost. A separate workspace: it is a test harness, not part
+# of the published crates.
+[package]
+name = "giong-proto-conformance"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+giong-proto = { path = ".." }
+prost = "0.13"
+prost-types = "0.13"
+protox = "0.8"
+
+[build-dependencies]
+giong-grpc-build = { path = "../../giong-grpc-build" }
+protox = "0.8"
+prost-build = "0.13"
