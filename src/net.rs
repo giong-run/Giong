@@ -263,6 +263,22 @@ impl ListenSocket {
             Poll::Pending
         }
     }
+
+    /// The connection an accept of this listener completed with and nobody
+    /// collected, for a listener that goes away while others share its
+    /// address: closed with the listener, it would be lost to them.
+    pub(crate) fn take_accepted(&self) -> Option<Socket> {
+        runtime::try_with_worker(|w| {
+            if !self.accept.is_active(w) {
+                return None;
+            }
+            let key = self.accept.key(w);
+            let socket = w.driver.try_borrow_mut().ok()?.take_accepted(key)?;
+            // SAFETY: a socket the driver accepted and hands over.
+            Some(unsafe { Socket::from_raw_fd(socket as crate::sys::RawSock) })
+        })
+        .flatten()
+    }
 }
 
 impl Drop for ListenSocket {
@@ -1231,6 +1247,16 @@ impl Drop for TcpListener {
         // Before the socket is closed, which happens when `inner` is dropped.
         if let Some(held) = self.held.take() {
             held.release(self.inner.socket());
+        }
+        // A connection this listener's own accept took goes to the others
+        // that share the address, with those still waiting for it.
+        #[cfg(windows)]
+        if let Some(member) = &self.spread {
+            if member.shared() {
+                if let Some(sock) = self.inner.take_accepted() {
+                    member.give_back(sock);
+                }
+            }
         }
     }
 }

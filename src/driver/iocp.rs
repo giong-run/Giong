@@ -1036,6 +1036,18 @@ impl Iocp {
         self.multi(key).last = true;
     }
 
+    /// The socket of an accept that completed and was not collected yet,
+    /// for a listener that goes away while others share its address; no
+    /// further accept is started.
+    pub(crate) fn take_accepted(&mut self, key: usize) -> Option<i32> {
+        let multi = self.multi(key);
+        multi.last = true;
+        match multi.accepted {
+            Some(socket) if socket >= 0 => multi.accepted.take(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn poll_multi(&mut self, key: usize, waker: &Waker) -> MultiPoll {
         let multi = self.multi(key);
         if let Some(res) = multi.accepted.take() {

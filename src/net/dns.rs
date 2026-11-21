@@ -1002,6 +1002,12 @@ pub(crate) fn system_resolver() -> io::Result<Resolver> {
             if stamps == sys.stamps {
                 return Ok(sys.resolver.clone());
             }
+            // The adapters could not be asked this time: what they said
+            // last still holds, and they are asked again at the next check.
+            #[cfg(windows)]
+            if stamps.1.is_none() {
+                return Ok(sys.resolver.clone());
+            }
         }
         let resolver = Resolver::new(system_config(&stamps)?);
         *slot = Some(SystemResolver {

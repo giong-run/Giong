@@ -190,6 +190,20 @@ impl Member {
     }
 }
 
+impl Member {
+    /// Whether other listeners share the address (the thread hands out the
+    /// connections).
+    pub(crate) fn shared(&self) -> bool {
+        self.spread.dispatching.load(Ordering::Acquire)
+    }
+
+    /// Puts `sock` with the connections waiting for this listener, which
+    /// go to the others when it is dropped.
+    pub(crate) fn give_back(&self, sock: Socket) {
+        lock(&self.inbox.slot).sockets.push_back(sock);
+    }
+}
+
 impl Spread {
     /// The thread: takes connections off the socket and hands them out,
     /// until it is told to stop.

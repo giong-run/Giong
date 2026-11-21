@@ -155,6 +155,67 @@ fn no_other_socket_can_bind_over_a_live_listener_or_udp_socket() {
     });
 }
 
+/// Connections a shared address hands round are not inherited by child
+/// processes, like every other socket: a child holding a copy would keep
+/// the connection open after this process closed it. (One name on every
+/// system, for the simulator's index; the body is Windows', where a thread
+/// accepts for listeners that share an address.)
+#[test]
+fn connections_handed_round_a_shared_address_are_not_inherited() {
+    #[cfg(windows)]
+    giong::block_on(async {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = first.local_addr().unwrap();
+        let second = TcpListener::bind(addr).unwrap();
+        let _clients: Vec<_> = (0..2)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        for listener in [&first, &second] {
+            let stream = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("no connection handed over")
+                .unwrap();
+            let mut flags = 0u32;
+            // SAFETY: reads the flags of an open socket into a local.
+            let ok = unsafe { GetHandleInformation(stream.as_raw_socket() as _, &mut flags) };
+            assert_ne!(ok, 0);
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "an inheritable connection");
+        }
+    });
+}
+
+/// A listener dropped after its own accept took a connection, while
+/// another listener shares the address, gives that connection to the other
+/// one instead of closing it. (One name on every system, for the
+/// simulator's index; the body is Windows', where the first listener of an
+/// address accepts through its own driver.)
+#[test]
+fn a_dropped_listener_hands_its_accepted_connection_to_another_sharing_the_address() {
+    #[cfg(windows)]
+    giong::block_on(async {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = first.local_addr().unwrap();
+        // An accept of the first listener left waiting in the driver.
+        assert!(timeout(Duration::from_millis(20), first.accept())
+            .await
+            .is_err());
+        let second = TcpListener::bind(addr).unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.write_all(b"x").unwrap();
+        // Time for the first listener's accept to complete.
+        sleep(Duration::from_millis(100)).await;
+        drop(first);
+        let stream = timeout(Duration::from_secs(5), second.accept())
+            .await
+            .expect("the connection was lost with the first listener")
+            .unwrap();
+        let data = stream.recv().await.unwrap();
+        assert_eq!(&data[..], b"x");
+    });
+}
+
 #[test]
 fn echo_roundtrip() {
     giong::block_on(async {

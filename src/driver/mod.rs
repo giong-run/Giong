@@ -1017,6 +1017,13 @@ impl Driver {
         each!(self, d => d.finish_multi(key))
     }
 
+    /// Takes a connection an accept has completed with and nobody has
+    /// collected yet (see `Iocp::take_accepted`).
+    #[cfg(windows)]
+    pub(crate) fn take_accepted(&mut self, key: usize) -> Option<i32> {
+        each!(self, d => d.take_accepted(key))
+    }
+
     /// Stops a multishot receive that is waiting in the kernel, so that the
     /// reader's next poll starts it again (io_uring; the epoll driver reads
     /// when the socket is readable and misses nothing).

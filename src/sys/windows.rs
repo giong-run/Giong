@@ -709,6 +709,7 @@ impl AcceptEvents {
             if wake == WinSock::INVALID_SOCKET {
                 return Err(std::io::Error::last_os_error());
             }
+            no_inherit(wake);
             let events = AcceptEvents {
                 listener,
                 wake,
@@ -783,6 +784,14 @@ impl AcceptEvents {
                 std::ptr::null_mut(),
                 &limit,
             );
+            if ready < 0 {
+                // The call failed (no buffers, a closed listener): the
+                // wait is not cut short, or the caller would spin.
+                std::thread::sleep(std::time::Duration::from_millis(u64::from(
+                    timeout.min(100),
+                )));
+                return AcceptWake::Timeout;
+            }
             let set = &read.fd_array[..(read.fd_count as usize).min(2)];
             if ready > 0 && set.contains(&self.wake) {
                 AcceptWake::Stop
@@ -825,8 +834,19 @@ pub(crate) fn accept_nowait(listener: RawSock) -> std::io::Result<Option<RawSock
                 _ => Err(err),
             };
         }
+        no_inherit(sock);
         Ok(Some(sock))
     }
+}
+
+/// Keeps a child process from inheriting `sock`, as the standard library
+/// does for every socket it makes: a child holding a copy keeps the
+/// connection open after this process closes it.
+fn no_inherit(sock: RawSock) {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+    // SAFETY: changes a flag of a socket the caller owns. On failure the
+    // socket is only inheritable, which is how `socket` made it.
+    unsafe { SetHandleInformation(sock as HANDLE, HANDLE_FLAG_INHERIT, 0) };
 }
 
 /// The DNS servers and search domains Windows uses: the servers of the
