@@ -4,7 +4,7 @@ gRPC for the [giong](../README.md) runtime: servers and clients over [giong-http
 
 It interoperates with grpc-go in both directions on the test cases of [gRPC's interoperability specification](https://github.com/grpc/grpc/blob/master/doc/interop-test-descriptions.md), on io_uring and on epoll, in CI ([`interop/run.sh`](interop/run.sh)).
 
-> **New in giong 1.1.** Not published before giong 1.0.0 is released.
+> **New in giong 1.1.**
 
 ```toml
 [dependencies]
