@@ -338,8 +338,11 @@ impl State {
                         }
                     } else {
                         let closing = Arc::new(AtomicBool::new(false));
+                        // Only the answer to send is kept of a refusal.
                         let accepted = Closable::building_for(&closing, || {
-                            self.ep.accept(inc, now, &mut self.scratch, None)
+                            self.ep
+                                .accept(inc, now, &mut self.scratch, None)
+                                .map_err(|e| e.response)
                         });
                         match accepted {
                             Ok((ch, c)) => {
@@ -347,7 +350,7 @@ impl State {
                                 self.insert(ch, c, true, early, closing);
                                 None
                             }
-                            Err(e) => e.response,
+                            Err(response) => response,
                         }
                     };
                     if let Some(t) = answer {
