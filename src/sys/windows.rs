@@ -177,7 +177,9 @@ unsafe fn transfer_at(
     offset: u64,
     start: impl FnOnce(*mut u32, *mut OVERLAPPED) -> i32,
 ) -> io::Result<usize> {
-    use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING};
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, ERROR_IO_PENDING, ERROR_MORE_DATA,
+    };
     // SAFETY: OVERLAPPED is plain data; all-zero is its initial state.
     let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
     overlapped.Anonymous.Anonymous.Offset = offset as u32;
@@ -200,6 +202,9 @@ unsafe fn transfer_at(
     match err.raw_os_error().map(|code| code as u32) {
         // The end of a file, or of a pipe whose writer is gone.
         Some(ERROR_HANDLE_EOF | ERROR_BROKEN_PIPE) => Ok(0),
+        // Part of a pipe message: what came, as a stream read.
+        // The count is in the OVERLAPPED where the call left `done` unset.
+        Some(ERROR_MORE_DATA) => Ok((done as usize).max(overlapped.InternalHigh)),
         _ => Err(err),
     }
 }
@@ -324,8 +329,9 @@ pub(crate) const AF_INET6: i32 = WinSock::AF_INET6 as i32;
 /// The flag a received message carries when its end was cut off.
 pub(crate) const MSG_TRUNC: i32 = WinSock::MSG_TRUNC as i32;
 
-/// The piece of `len` bytes at `base`. A Winsock piece holds less than
-/// 4 GiB: a longer one is cut there, and the send or receive reports the
+/// The piece of `len` bytes at `base`. Windows reports counts as signed
+/// 32-bit numbers, so a piece holds at most `i32::MAX` bytes (2 GiB): a
+/// longer one is cut there, and the send or receive reports the
 /// shorter count like any partial transfer.
 #[inline(always)]
 pub(crate) fn io_vec(base: *const u8, len: usize) -> IoVec {

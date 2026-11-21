@@ -877,13 +877,13 @@ impl Iocp {
         self.recv_msg.ok_or(WSAEOPNOTSUPP)
     }
 
-    /// The result `res` of an operation, with a datagram that was cut to
-    /// fit its buffer reported as the bytes that fit.
     /// Whether a failed read (`code`) is the end of its file or pipe.
     fn is_end(rec: &Record, code: i32) -> bool {
         code == ERROR_HANDLE_EOF as i32 || (rec.reading && code == ERROR_BROKEN_PIPE as i32)
     }
 
+    /// The result `res` of an operation, with a datagram that was cut to
+    /// fit its buffer reported as the bytes that fit.
     fn cut(after: After, res: i32) -> i32 {
         match after {
             After::Received { room } if res == -WSAEMSGSIZE => room,
