@@ -40,6 +40,11 @@ const RECV_BATCH: usize = 64;
 /// that stopped accepting (`max_connections` reached), cannot make the
 /// endpoint hold connections without bound.
 const MAX_UNACCEPTED: usize = 1024;
+/// Past this many connections not yet accepted, a client whose address is
+/// not validated gets a Retry (RFC 9000, section 8.1.2) before it costs a
+/// connection: a flood of Initials from forged addresses, which never see
+/// the Retry, then holds at most this many of the `MAX_UNACCEPTED`.
+const RETRY_ABOVE: usize = 64;
 
 pub(crate) struct Shared {
     sock: UdpSocket,
@@ -297,31 +302,35 @@ impl State {
                         self.ep.ignore(inc);
                         return;
                     }
-                    if self.unaccepted >= MAX_UNACCEPTED {
-                        self.scratch.clear();
-                        let t = self.ep.refuse(inc, &mut self.scratch);
+                    self.scratch.clear();
+                    let answer = if self.unaccepted >= MAX_UNACCEPTED {
+                        Some(self.ep.refuse(inc, &mut self.scratch))
+                    } else if self.unaccepted >= RETRY_ABOVE && !inc.remote_address_validated() {
+                        match self.ep.retry(inc, &mut self.scratch) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                self.ep.ignore(e.into_incoming());
+                                None
+                            }
+                        }
+                    } else {
+                        let closing = Arc::new(AtomicBool::new(false));
+                        let accepted = Closable::building_for(&closing, || {
+                            self.ep.accept(inc, now, &mut self.scratch, None)
+                        });
+                        match accepted {
+                            Ok((ch, c)) => {
+                                let early = self.early_data;
+                                self.insert(ch, c, true, early, closing);
+                                None
+                            }
+                            Err(e) => e.response,
+                        }
+                    };
+                    if let Some(t) = answer {
                         let d = std::mem::take(&mut self.scratch);
                         self.out(t.destination, &d[..t.size], 0, 0);
                         self.scratch = d;
-                        return;
-                    }
-                    self.scratch.clear();
-                    let closing = Arc::new(AtomicBool::new(false));
-                    let accepted = Closable::building_for(&closing, || {
-                        self.ep.accept(inc, now, &mut self.scratch, None)
-                    });
-                    match accepted {
-                        Ok((ch, c)) => {
-                            let early = self.early_data;
-                            self.insert(ch, c, true, early, closing);
-                        }
-                        Err(e) => {
-                            if let Some(t) = e.response {
-                                let d = std::mem::take(&mut self.scratch);
-                                self.out(t.destination, &d[..t.size], 0, 0);
-                                self.scratch = d;
-                            }
-                        }
                     }
                 }
                 Some(DatagramEvent::ConnectionEvent(ch, ev)) => {
@@ -387,9 +396,13 @@ impl State {
             }
             while let Some(ev) = conn.c.poll() {
                 match ev {
-                    Event::HandshakeDataReady if conn.incoming && conn.early => {
-                        // Early data on: the application gets the
-                        // connection now, to answer what came in 0-RTT.
+                    Event::HandshakeDataReady
+                        if conn.incoming && conn.early && conn.c.has_0rtt() =>
+                    {
+                        // Early data on and taken: the application gets
+                        // the connection now, to answer what came in 0-RTT.
+                        // Without 0-RTT keys it waits for the handshake,
+                        // so that a forged Initial never reaches it.
                         conn.handed = true;
                         conn.refs += 1;
                         self.accepted.push_back(i);

@@ -674,3 +674,62 @@ fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
         })
         .unwrap();
 }
+
+/// The first Initial datagram of a QUIC client that will never answer: what
+/// a client with a forged source address sends.
+fn forged_initial(ca: &rustls::pki_types::CertificateDer<'static>, to: SocketAddr) -> Vec<u8> {
+    let tls = Arc::new(client_tls(ca.clone()));
+    let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let cfg = quinn_proto::ClientConfig::new(Arc::new(crypto));
+    let mut ep = quinn_proto::Endpoint::new(Default::default(), None, true, None);
+    let now = std::time::Instant::now();
+    let (_, mut conn) = ep.connect(now, cfg, to, "localhost").unwrap();
+    let mut buf = Vec::new();
+    let t = conn.poll_transmit(now, 1, &mut buf).unwrap();
+    buf.truncate(t.size);
+    buf
+}
+
+#[test]
+fn a_flood_of_forged_initials_does_not_lock_real_clients_out() {
+    giong::Builder::new()
+        .workers(1)
+        .recv_buffers(512, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            giong::spawn(serve(server));
+            // More forged handshakes than the endpoint holds, each from an
+            // address of its own that never reads what comes back.
+            let forged: Vec<_> = (0..1200).map(|_| forged_initial(&ca, addr)).collect();
+            let mut sockets = Vec::new();
+            for (i, datagram) in forged.iter().enumerate() {
+                let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                sock.send_to(datagram, addr).unwrap();
+                sockets.push(sock);
+                if i % 50 == 0 {
+                    giong::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+            giong::time::sleep(Duration::from_millis(100)).await;
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = giong::time::timeout(
+                Duration::from_secs(5),
+                client.connect(addr, "localhost", &cfg),
+            )
+            .await
+            .expect("the real client got no answer")
+            .expect("the real client was locked out");
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"abc").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(10).await.unwrap(), b"cba");
+        })
+        .unwrap();
+}
