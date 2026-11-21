@@ -1,0 +1,253 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 31K of event 'cpu/cycles/P'
+# Event count (approx.): 41801962146
+#
+# Overhead  Command  Shared Object      Symbol                                                                                                                                                                                                       
+# ........  .......  .................  .............................................................................................................................................................................................................
+#
+     2.84%  giong-0  bench-udp-echo     [.] bench_udp_echo::giong_echo::{closure#0}
+     2.40%  giong-0  [kernel.kallsyms]  [k] process_backlog
+            |          
+             --2.26%--_raw_spin_lock_irq
+                       process_backlog
+                       __napi_poll
+                       net_rx_action
+                       handle_softirqs
+                       __do_softirq
+                       do_softirq.part.0
+                       __local_bh_enable_ip
+                       __dev_queue_xmit
+                       neigh_hh_output
+                       ip_finish_output2
+                       __ip_finish_output
+                       ip_finish_output
+                       ip_output
+                       ip_send_skb
+                       udp_send_skb
+                       udp_sendmsg
+                       inet_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+                       giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                       <giong::driver::Driver>::try_send_to (inlined)
+                       <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     2.27%  giong-0  [kernel.kallsyms]  [k] nft_immediate_eval
+     2.24%  giong-0  [kernel.kallsyms]  [k] udp_sendmsg
+            |          
+             --1.07%--fib_table_lookup
+                       ip_route_output_key_hash_rcu
+                       ip_route_output_flow
+                       udp_sendmsg
+                       inet_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+                       giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                       <giong::driver::Driver>::try_send_to (inlined)
+                       <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     2.19%  giong-0  [kernel.kallsyms]  [k] nft_counter_eval
+     1.97%  giong-0  [kernel.kallsyms]  [k] nft_do_chain
+     1.74%  giong-0  [kernel.kallsyms]  [k] _find_next_bit
+            |          
+             --1.07%--fput
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+                       giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                       <giong::driver::Driver>::try_send_to (inlined)
+                       <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.70%  giong-0  [kernel.kallsyms]  [k] entry_SYSCALL_64
+            |          
+             --1.64%--fdget
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+                       giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                       <giong::driver::Driver>::try_send_to (inlined)
+                       <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.65%  giong-0  [kernel.kallsyms]  [k] io_poll_wake
+     1.49%  giong-0  [kernel.kallsyms]  [k] _copy_from_iter
+            |          
+             --1.45%--__ip_select_ident
+                       |          
+                        --1.45%--__ip_make_skb
+                                  ip_make_skb
+                                  udp_sendmsg
+                                  inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+                                  giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                                  <giong::driver::Driver>::try_send_to (inlined)
+                                  <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.48%  giong-0  [kernel.kallsyms]  [k] __sys_sendto
+            |          
+             --1.00%--fdget
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+                       giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                       <giong::driver::Driver>::try_send_to (inlined)
+                       <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.47%  giong-0  [kernel.kallsyms]  [k] net_rx_action
+     1.42%  giong-0  [kernel.kallsyms]  [k] __rcu_read_lock
+     1.40%  giong-0  [kernel.kallsyms]  [k] nft_do_chain_ipv4
+     1.34%  giong-0  [kernel.kallsyms]  [k] receiver_wake_function
+            |
+            ---__raw_spin_lock_irqsave
+               _raw_spin_lock_irqsave
+               try_to_wake_up
+               default_wake_function
+               autoremove_wake_function
+               receiver_wake_function
+               __wake_up_common
+               __wake_up_sync_key
+               sock_def_readable
+               __udp_enqueue_schedule_skb
+               udp_queue_rcv_one_skb
+               udp_queue_rcv_skb
+               udp_unicast_rcv_skb
+               __udp4_lib_rcv
+               udp_rcv
+               ip_protocol_deliver_rcu
+               ip_local_deliver_finish
+               ip_local_deliver
+               ip_rcv
+               __netif_receive_skb_one_core
+               __netif_receive_skb
+               process_backlog
+               __napi_poll
+               net_rx_action
+               handle_softirqs
+               __do_softirq
+               do_softirq.part.0
+               __local_bh_enable_ip
+               __dev_queue_xmit
+               neigh_hh_output
+               ip_finish_output2
+               __ip_finish_output
+               ip_finish_output
+               ip_output
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               inet_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __libc_sendto
+               giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+               <giong::driver::Driver>::try_send_to (inlined)
+               <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.32%  giong-0  [kernel.kallsyms]  [k] _copy_to_user
+     1.32%  giong-0  [kernel.kallsyms]  [k] fib_table_lookup
+            |          
+             --1.17%--__mkroute_output
+                       |          
+                        --1.16%--ip_route_output_key_hash_rcu
+                                  ip_route_output_flow
+                                  udp_sendmsg
+                                  inet_sendmsg
+                                  __sys_sendto
+                                  __x64_sys_sendto
+                                  x64_sys_call
+                                  do_syscall_64
+                                  entry_SYSCALL_64_after_hwframe
+                                  __libc_sendto
+                                  giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                                  <giong::driver::Driver>::try_send_to (inlined)
+                                  <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.32%  giong-0  [kernel.kallsyms]  [k] select_task_rq_fair
+     1.21%  giong-0  [kernel.kallsyms]  [k] __rcu_read_unlock
+     1.15%  giong-0  [kernel.kallsyms]  [k] __ip_append_data
+     1.14%  giong-0  [kernel.kallsyms]  [k] __siphash_unaligned
+            |
+            ---__nf_conntrack_find_get
+               resolve_normal_ct
+               nf_conntrack_in
+               ipv4_conntrack_local
+               nf_hook_slow
+               __ip_local_out
+               ip_send_skb
+               udp_send_skb
+               udp_sendmsg
+               inet_sendmsg
+               __sys_sendto
+               __x64_sys_sendto
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               __libc_sendto
+               giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+               <giong::driver::Driver>::try_send_to (inlined)
+               <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.10%  giong-0  [kernel.kallsyms]  [k] read_tsc
+            |          
+             --1.08%--_raw_spin_lock
+                       enqueue_to_backlog
+                       netif_rx_internal
+                       __netif_rx
+                       veth_xmit
+                       xmit_one.constprop.0
+                       dev_hard_start_xmit
+                       __dev_queue_xmit
+                       neigh_hh_output
+                       ip_finish_output2
+                       __ip_finish_output
+                       ip_finish_output
+                       ip_output
+                       ip_send_skb
+                       udp_send_skb
+                       udp_sendmsg
+                       inet_sendmsg
+                       __sys_sendto
+                       __x64_sys_sendto
+                       x64_sys_call
+                       do_syscall_64
+                       entry_SYSCALL_64_after_hwframe
+                       __libc_sendto
+                       giong::driver::send_now::<<giong::driver::Driver>::try_send_to::{closure#0}> (inlined)
+                       <giong::driver::Driver>::try_send_to (inlined)
+                       <giong::net::udp::UdpSocket>::send_to::<alloc::vec::Vec<u8>>::{closure#0}::{closure#0}
+
+     1.08%  giong-0  libc.so.6          [.] __libc_sendto
+     1.06%  giong-0  [kernel.kallsyms]  [k] udp4_csum_init
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

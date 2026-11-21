@@ -3,12 +3,17 @@
 Instructions for AI coding agents working in this repository. People should read
 [CONTRIBUTING.md](CONTRIBUTING.md); this file says the same things in the order an agent
 needs them, adds the traps that cost time, and is kept short on purpose. Where the two
-disagree, CONTRIBUTING.md wins: report the difference.
+disagree, CONTRIBUTING.md wins: report the difference. How a change goes from an item to a
+merge, with several agents working at once (preflight, changelog entries, conflicts between
+pull requests, handoff), is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## What this is
 
 giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
-driver where io_uring is blocked or the kernel is too old. One Cargo
+driver where io_uring is blocked or the kernel is too old. It aims to be the best Rust
+async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
+is built for code that agents write: strict types, coded errors with the cause and the
+fix, and an API that stays on major version 1 for many years. One Cargo
 workspace, nine crates and an example service:
 
 | Path | Crate | What it is |
@@ -56,6 +61,18 @@ crate that needs the Tokio runtime on a worker. The table with each giong crate,
 replaces and how it measured against it is under
 [Choosing crates](README.md#choosing-crates) in the README.
 
+## Looking inside a running service
+
+To find out why a giong service is slow, stuck or leaking, ask it rather than guess:
+`giong-mcp` serves the runtime's own state over MCP. The service keeps
+`let _mcp = giong_mcp::start_from_env(&handle);` alive; run it with
+`GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` (16 characters or more), and connect with
+`claude mcp add --transport http giong http://127.0.0.1:7777/mcp --header "Authorization: Bearer $GIONG_MCP_TOKEN"`.
+Tools: `overview` (memory, threads, open descriptors, workers, warnings such as a blocked
+worker), `workers`, `tasks` (live tasks by the line that spawned them), `sources` (database
+pools) and `profile` (where the workers spent a time window). It listens on loopback or a
+Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
+
 ## The machine you need
 
 - **Linux 6.0 or newer with io_uring allowed**, to test both drivers. giong does not
@@ -80,6 +97,11 @@ replaces and how it measured against it is under
 Run these from the repository root. All tests use loopback; none needs the internet.
 
 ```bash
+scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
+scripts/preflight.sh --quick  # the fast part, while iterating
+scripts/preflight.sh --against 172,173   # also merge with those open pull requests
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
+
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
 cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
@@ -95,7 +117,8 @@ scripts/check.sh epoll       # the tests on the epoll driver only
 scripts/check.sh seccomp     # io_uring blocked as in Docker (scripts/no-io-uring.py): giong picks epoll
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
-scripts/check.sh soak        # minutes of connection churn, then checks for leaks
+scripts/check.sh kani        # Kani proofs of the unsafe core (docs/kani.md; needs kani-verifier 0.68.0)
+scripts/check.sh soak        # minutes of connection churn, plain and then over TLS, then checks for leaks
 scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
@@ -118,10 +141,13 @@ The release test binaries are built once per run (the `build` job, with
 the `tsan (…)` jobs do for ThreadSanitizer's rounds; `fallback` and `tsan` pass when all
 of theirs did.
 CI also runs `semver` (`scripts/semver.sh`: `cargo-semver-checks` against the last
-release, so no breaking change lands between releases), `instr` (`scripts/instr.py`:
+release, so no breaking change lands between releases; what the 1.x promise covers, and the
+rules for growing the API without breaking it, are in `docs/STABILITY.md`), `instr` (`scripts/instr.py`:
 instructions per operation on the hot paths, counted by callgrind, and heap per idle
-connection, within 1% and 2% of `bench/instr/baseline.csv`; a change meant to move them
-commits the new baseline the job prints, see `bench/instr/README.md`), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+connection, both within 1% of `bench/instr/baseline.csv`; a change meant to move them
+commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
+in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
+operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
 against other server versions (`servers`) on every pull request, and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
@@ -173,11 +199,17 @@ is loaded.
    `fuzz/`, commands in CONTRIBUTING.md).
 8. **Performance claims need numbers**: before and after, the median of several runs with
    the spread, the machine and kernel. Never write a number you did not measure.
+9. **The API rules.** Every public addition follows four rules: one way to do each thing;
+   misuse fails at compile time, or at run time with a coded error; every behaviour code
+   relies on is documented; a release only adds, and never changes what existing code
+   means. Prefer a new item to a new meaning for an old one.
 
 ## Changes, commits and pull requests
 
 - Branch from `main` as `<type>/<short-description>`. Never push to `main`; it is
-  protected.
+  protected. Leave nothing behind: a superseded pull request is closed with a comment
+  naming what replaces it and its branch deleted; a branch never stays without a pull
+  request (docs/DEVELOPMENT.md, *Leave nothing behind*).
 - Commits follow Conventional Commits: `<type>(<scope>): <imperative summary, lower case,
   no full stop>`. Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`,
   `ci`, `chore`. Scopes: the runtime's parts (`runtime`, `executor`, `driver`, `net`,
@@ -190,8 +222,11 @@ is loaded.
   whose message is the one `main` should get; for several commits it is the title and the
   list of their messages. Either way the title must be a valid commit summary. Fill in
   `.github/PULL_REQUEST_TEMPLATE.md`, including how the change was tested.
-- Anything a user would notice gets a line under `## [Unreleased]` in `CHANGELOG.md`
-  ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)), grouped by crate.
+- Anything a user would notice gets an entry in a new file in `changelog.d/`
+  ([changelog.d/README.md](changelog.d/README.md)), never an edit to `CHANGELOG.md`: pull
+  requests in flight then do not conflict, and the release pull request merges the files
+  into `CHANGELOG.md` ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/) sections,
+  entries grouped by crate).
 - Documentation is in English only: the READMEs, the docs and the comments. Each crate has
   one `README.md`. `scripts/release.py check` verifies the images and install snippets in
   them, not the test counts or benchmark numbers: update those by hand when a change moves
@@ -207,6 +242,11 @@ is loaded.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps
+
+- **Pull requests in flight conflict in the merge queue.** One that merges first can put
+  another out of date while the queue is testing it, and the queue ejects it. Before
+  enqueueing, `scripts/preflight.sh --against <open pull requests>` names the files that
+  conflict; the usual ones are README test counts and shared platform files.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that

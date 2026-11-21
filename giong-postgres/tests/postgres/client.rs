@@ -160,7 +160,7 @@ fn conversion_errors_name_the_parameter_or_column() {
             .query("SELECT $1::uuid", &[&"not-a-uuid"])
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some("22P02"), "{e}");
+        assert_eq!(e.server_code(), Some("22P02"), "{e}");
 
         let e = client.query("SELECT 1\0", &[]).await.unwrap_err();
         assert!(e.to_string().contains("NUL"), "{e}");
@@ -184,7 +184,7 @@ fn server_errors_carry_their_fields_and_leave_the_connection_usable() {
         let client = connect(s).await;
         let e = client.query("SELEKT 1", &[]).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Db);
-        assert_eq!(e.code(), Some("42601"));
+        assert_eq!(e.server_code(), Some("42601"));
         assert_eq!(e.db().unwrap().position(), Some(1));
 
         table(&client, "errs", "id int PRIMARY KEY").await;
@@ -196,7 +196,7 @@ fn server_errors_carry_their_fields_and_leave_the_connection_usable() {
             .execute("INSERT INTO errs VALUES (1)", &[])
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some("23505"));
+        assert_eq!(e.server_code(), Some("23505"));
         assert_eq!(e.db().unwrap().constraint(), Some("errs_pkey"));
         assert_eq!(e.db().unwrap().table(), Some("errs"));
         assert!(e.to_string().contains("duplicate key"), "{e}");
@@ -277,7 +277,7 @@ fn batch_execute_runs_several_statements_atomically() {
             .batch_execute("INSERT INTO batch VALUES (3); SELECT 1/0;")
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some("22012"));
+        assert_eq!(e.server_code(), Some("22012"));
         let n: i64 = client
             .query_one("SELECT count(*) FROM batch", &[])
             .await
@@ -352,7 +352,7 @@ fn a_failing_statement_in_a_pipeline_affects_only_itself() {
             }
         });
         assert_eq!(a.await.unwrap().unwrap(), 1);
-        assert_eq!(b.await.unwrap().unwrap_err().code(), Some("22012"));
+        assert_eq!(b.await.unwrap().unwrap_err().server_code(), Some("22012"));
         assert_eq!(c2.await.unwrap().unwrap(), 3);
     });
 }
@@ -422,7 +422,7 @@ fn a_schema_change_inside_a_transaction_fails_once_and_is_not_retried() {
         // stale statement is gone from the cache.
         let tx = client.transaction().await.unwrap();
         let e = tx.query(sql, &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some("0A000"), "{e}");
+        assert_eq!(e.server_code(), Some("0A000"), "{e}");
         assert_eq!(
             e.db().unwrap().routine(),
             Some("RevalidateCachedQuery"),
@@ -542,7 +542,7 @@ fn the_statement_timeout_is_enforced_by_the_server() {
             .await
             .unwrap();
         let e = client.query("SELECT pg_sleep(2)", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some("57014"));
+        assert_eq!(e.server_code(), Some("57014"));
         assert!(e.to_string().contains("Config::statement_timeout"), "{e}");
         assert_eq!(
             client
@@ -572,7 +572,7 @@ fn a_cancel_request_stops_the_running_statement() {
             .unwrap()
             .unwrap()
             .unwrap_err();
-        assert_eq!(e.code(), Some("57014"), "{e}");
+        assert_eq!(e.server_code(), Some("57014"), "{e}");
         assert!(e.to_string().contains("user request"), "{e}");
     });
 }
@@ -629,7 +629,7 @@ fn a_connection_the_server_ends_reports_why() {
         assert!(client.is_closed(), "the client noticed without being used");
         let e = client.query("SELECT 1", &[]).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Closed);
-        assert_eq!(e.code(), Some("57P01"), "{e}");
+        assert_eq!(e.server_code(), Some("57P01"), "{e}");
         assert!(e.to_string().contains("administrator command"), "{e}");
     });
 }
@@ -708,7 +708,7 @@ fn transactions_commit_roll_back_and_roll_back_when_dropped() {
         );
         // Code that branches on the SQLSTATE sees one.
         assert_eq!(e.kind(), ErrorKind::Db);
-        assert_eq!(e.code(), Some("25P02"));
+        assert_eq!(e.server_code(), Some("25P02"));
         assert!(e.db().is_none());
 
         // A transaction() future dropped while BEGIN is in flight.
@@ -717,10 +717,62 @@ fn transactions_commit_roll_back_and_roll_back_when_dropped() {
         drop(r);
         let e = client.batch_execute("SAVEPOINT s").await.unwrap_err();
         assert_eq!(
-            e.code(),
+            e.server_code(),
             Some("25P01"),
             "not in a transaction any more: {e}"
         );
+    });
+}
+
+#[test]
+fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
+    run(|s| async move {
+        let mut client = connect(s).await;
+        let other = connect(s).await;
+        table(&client, "given_up", "id int").await;
+        let tx = client.transaction().await.unwrap();
+        tx.execute("INSERT INTO given_up VALUES (1)", &[])
+            .await
+            .unwrap();
+        // Sent, then given up while the server still runs it.
+        let late = timeout(
+            Duration::from_millis(20),
+            tx.execute("INSERT INTO given_up SELECT 2 FROM pg_sleep(0.3)", &[]),
+        )
+        .await;
+        assert!(late.is_err());
+        // Nothing more is sent in it.
+        let e = tx
+            .execute("INSERT INTO given_up VALUES (3)", &[])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("given up"), "{e}");
+        let e = tx.commit().await.unwrap_err();
+        assert!(e.to_string().contains("given up"), "{e}");
+        assert_eq!(e.kind(), ErrorKind::Db);
+        assert_eq!(e.giong_code(), ErrorKind::Db.giong_code());
+        // Once the late statement has run and the rollback after it, another
+        // connection sees none of the transaction.
+        client.batch_execute("SELECT 1").await.unwrap();
+        assert_eq!(count(&other, "given_up").await, 0, "rolled back");
+        // The connection is fine for the next transaction.
+        let tx = client.transaction().await.unwrap();
+        let insert = "INSERT INTO given_up VALUES ($1)";
+        tx.execute(insert, &[&4i32]).await.unwrap();
+        // Answered before its future was dropped: its outcome is known, so it
+        // does not stop the commit. (The statement is cached, so the first
+        // poll sends it.)
+        let mut answered = Box::pin(tx.execute(insert, &[&5i32]));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(answered.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        tx.batch_execute("SELECT 1").await.unwrap();
+        drop(answered);
+        tx.commit().await.unwrap();
+        assert_eq!(count(&other, "given_up").await, 2);
     });
 }
 

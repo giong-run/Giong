@@ -74,6 +74,7 @@ mod pool;
 mod protocol;
 mod row;
 mod session;
+mod text;
 mod tls;
 pub mod types;
 

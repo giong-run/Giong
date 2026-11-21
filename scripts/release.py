@@ -2,15 +2,21 @@
 """Release tooling for the giong workspace. Python 3.8+, standard library only.
 
     python3 scripts/release.py check
-        Repository invariants that CI enforces on every pull request: the three
+        Repository invariants that CI enforces on every pull request: the
         crates share one version, README images use absolute URLs that exist,
-        CHANGELOG.md is well formed, and site/build.py builds the site with no
-        broken link.
+        CHANGELOG.md and the entries in changelog.d/ are well formed, and
+        site/build.py builds the site with no broken link.
+
+    python3 scripts/release.py unreleased
+        Print the "Unreleased" section as the next release will get it: the
+        entries under "Unreleased" in CHANGELOG.md with every changelog.d/
+        entry merged in, section by section.
 
     python3 scripts/release.py prepare [auto|patch|minor|major|X.Y.Z] [--pr] [--dispatch-ci]
         Turn the working tree into the release commit for the next version:
-        bump the crates and Cargo.lock, move "Unreleased" in CHANGELOG.md into a
-        dated section (drafting it from the commit messages if it is empty),
+        bump the crates and Cargo.lock, move "Unreleased" in CHANGELOG.md and the
+        entries in changelog.d/ into a dated section (drafting it from the commit
+        messages if both are empty) and delete the changelog.d/ entries,
         update the compare links and README install snippets, and rebuild the
         site. With --pr it also commits on release/X.Y.Z, pushes and opens the
         release pull request; --dispatch-ci then starts CI on that branch, which
@@ -47,6 +53,10 @@ REPO_URL = "https://github.com/" + REPO
 # The published crates are found from the workspace (see workspace_crates), so a
 # new member crate is released with the others without a change here.
 CHANGELOG = "CHANGELOG.md"
+# One file per change, so that pull requests in flight never edit the same lines of
+# CHANGELOG.md (changelog.d/README.md says how to write one). `prepare` folds them in.
+FRAGMENTS = "changelog.d"
+FRAGMENT_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]*\.md$")
 SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$")
 
 # Keep a Changelog sections, in the order they are written.
@@ -121,6 +131,7 @@ def workspace_crates():
         name = re.search(r'^name\s*=\s*"([^"]+)"', pkg, re.M)[1]
         crates[name] = d
         deps[name] = set(re.findall(r"^([A-Za-z0-9_-]+)\s*=\s*\{[^}]*\bpath\s*=", text, re.M))
+        deps[name].discard(name)  # a dev-dependency on itself, to turn on a feature for its tests
     order = []
 
     def visit(name, stack=()):
@@ -244,6 +255,69 @@ def check_changelog():
     return problems
 
 
+def fragment_files():
+    """The changelog.d/ entries, in the order they are merged: by file name."""
+    d = ROOT / FRAGMENTS
+    if not d.is_dir():
+        return []
+    return sorted((p for p in d.iterdir() if p.is_file() and p.name not in ("README.md", ".gitkeep")),
+                  key=lambda p: p.name)
+
+
+def split_sections(body):
+    """(preface, [(section, block)]) of a changelog body: the text before the first
+    '### ' heading, then each '### Name' heading with the text under it, stripped."""
+    parts = re.split(r"^### ([^\n]*?)[ \t]*\r?$", body, flags=re.M)
+    preface, rest = parts[0].strip(), parts[1:]
+    return preface, [(rest[i].strip(), rest[i + 1].strip()) for i in range(0, len(rest), 2)]
+
+
+def check_fragment(path):
+    rel = path.relative_to(ROOT).as_posix()
+    if not FRAGMENT_NAME.match(path.name):
+        return [f"{rel}: name it like 'windows-iocp-driver.md': lower case letters, digits, '.', '-' or '_', ending in .md"]
+    text = path.read_text(encoding="utf-8")
+    problems = []
+    if re.search(r"^#{1,2} ", text, re.M):
+        problems.append(f"{rel}: only '### <section>' headings belong in an entry; the release adds the version heading")
+    preface, sections = split_sections(re.sub(r"<!--.*?-->", "", text, flags=re.S))
+    if preface:
+        problems.append(f"{rel}: text before the first '### <section>' heading")
+    if not sections:
+        problems.append(f"{rel}: no '### <section>' heading; use one of {', '.join(SECTIONS)}")
+    for name, block in sections:
+        if name not in SECTIONS:
+            problems.append(f"{rel}: '### {name}' is not one of {', '.join(SECTIONS)}")
+        if not block.startswith("- "):
+            problems.append(f"{rel}: '### {name}' has no '- ' list item under it")
+    return problems
+
+
+def check_fragments():
+    return [p for f in fragment_files() for p in check_fragment(f)]
+
+
+def merge_unreleased(body, fragments):
+    """The Unreleased body with each fragment's entries appended to their section, the
+    sections in Keep a Changelog order."""
+    preface, sections = split_sections(body)
+    blocks = {}
+    for name, block in sections:
+        blocks.setdefault(name, []).append(block)
+    for path in fragments:
+        for name, block in split_sections(re.sub(r"<!--.*?-->", "", path.read_text(encoding="utf-8"), flags=re.S))[1]:
+            blocks.setdefault(name, []).append(block)
+    order = SECTIONS + [n for n in blocks if n not in SECTIONS]
+    out = [preface] if preface else []
+    out += [f"### {n}\n\n" + "\n".join(b for b in blocks[n] if b) for n in order if n in blocks]
+    return "\n\n".join(out)
+
+
+def unreleased_body(text):
+    m = re.search(r"^## \[Unreleased\][ \t]*\r?\n(.*?)(?=^## \[)", text, re.M | re.S)
+    return m
+
+
 def check_site():
     """The site builds from the repository as it is, with no broken link. Its pages are
     generated when it deploys (site.yml), so there is nothing committed to compare."""
@@ -259,12 +333,13 @@ def check_site():
 
 
 def cmd_check(_args):
-    problems = check_versions() + check_readmes() + check_changelog() + check_site()
+    problems = check_versions() + check_readmes() + check_changelog() + check_fragments() + check_site()
     for p in problems:
         print(("::error::" if _in_actions() else "") + p)
     if problems:
         sys.exit(1)
-    print(f"ok: giong {workspace_version()}, READMEs, CHANGELOG.md and the site are consistent")
+    print(f"ok: giong {workspace_version()}, READMEs, CHANGELOG.md, {len(fragment_files())} changelog.d/ "
+          "entries and the site are consistent")
 
 
 def _in_actions():
@@ -343,12 +418,16 @@ def bump_files(old, new, date, commits):
     write("Cargo.lock", lock)
     changed.append("Cargo.lock")
 
-    # CHANGELOG.md: Unreleased becomes the new section.
+    # CHANGELOG.md: Unreleased, with the changelog.d/ entries merged in, becomes the
+    # new section, and the entries are deleted.
     text = read(CHANGELOG)
-    m = re.search(r"^## \[Unreleased\][ \t]*\r?\n(.*?)(?=^## \[)", text, re.M | re.S)
+    m = unreleased_body(text)
     if not m:
         fail(f"{CHANGELOG} has no '## [Unreleased]' section followed by a release")
-    body = m[1].strip()
+    if problems := check_fragments():
+        fail("\n".join(problems))
+    fragments = fragment_files()
+    body = merge_unreleased(m[1].strip(), fragments).strip()
     drafted = not body
     if drafted:
         body = draft_entries(commits) or "### Changed\n\n- Maintenance release."
@@ -360,6 +439,9 @@ def bump_files(old, new, date, commits):
                   text, count=1, flags=re.M)
     write(CHANGELOG, text)
     changed.append(CHANGELOG)
+    for path in fragments:
+        path.unlink()
+        changed.append(path.relative_to(ROOT).as_posix() + " (merged into CHANGELOG.md, deleted)")
 
     # README install snippets: `giong = "0.2"` / `giong-http = { version = "0.2", ... }`.
     o, n = parse(old), parse(new)
@@ -551,6 +633,18 @@ def cmd_notes(args):
     print("\n\n".join(parts))
 
 
+def cmd_unreleased(_args):
+    if problems := check_fragments():
+        fail("\n".join(problems))
+    m = unreleased_body(read(CHANGELOG))
+    if not m:
+        fail(f"{CHANGELOG} has no '## [Unreleased]' section followed by a release")
+    print("## [Unreleased]\n")
+    body = merge_unreleased(m[1].strip(), fragment_files())
+    if body:
+        print(body)
+
+
 def cmd_version(_args):
     print(workspace_version())
 
@@ -564,6 +658,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check").set_defaults(fn=cmd_check)
+    sub.add_parser("unreleased").set_defaults(fn=cmd_unreleased)
     sub.add_parser("version").set_defaults(fn=cmd_version)
     sub.add_parser("crates").set_defaults(fn=cmd_crates)
     pp = sub.add_parser("prepare")

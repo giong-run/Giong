@@ -278,7 +278,9 @@ impl<S: 'static> Router<S> {
     ///   the outermost router for every other path.
     ///
     /// Middleware run in the order they were added: the first one added
-    /// sees the request first.
+    /// sees the request first. That is the reverse of axum's
+    /// `Router::layer`, where the last layer added is the outermost: code
+    /// ported from axum lists its layers the other way round here.
     pub fn layer<M: Middleware<S>>(mut self, middleware: M) -> Self {
         self.middleware.push(Rc::new(middleware));
         self
@@ -494,6 +496,9 @@ impl<S: 'static> App<S> {
     /// assert_eq!(resp.status(), 200);
     /// assert_eq!(resp.body_bytes(), b"hello ada");
     /// ```
+    ///
+    /// Cancel safe as far as the handlers are, like
+    /// [`Next::run`](crate::Next::run).
     pub async fn handle(&self, http: Request) -> Response {
         let method = Method::parse(http.method());
         let mut caps = Captures::new();

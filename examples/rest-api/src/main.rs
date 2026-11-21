@@ -19,7 +19,7 @@ use std::time::Duration;
 use giong::net::TcpListener;
 use giong_postgres::Config as DbConfig;
 use giong_redis::Config as CacheConfig;
-use giong_tls::TlsAcceptor;
+use giong_tls::{Certificates, TlsAcceptor};
 use giong_web::Server;
 use rest_api::{app, AccessLog, State, SCHEMA};
 
@@ -57,7 +57,8 @@ fn settings() -> Result<Settings, String> {
     let tls = match (var("TLS_CERT"), var("TLS_KEY")) {
         (Some(cert), Some(key)) => {
             let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
-            let acceptor = TlsAcceptor::from_pem(&read(&cert)?, &read(&key)?)
+            let acceptor = Certificates::from_pem(&read(&cert)?, &read(&key)?)
+                .and_then(|certs| TlsAcceptor::with_certificates(&certs))
                 .map_err(|e| format!("TLS_CERT/TLS_KEY: {e}"))?;
             Some(acceptor)
         }

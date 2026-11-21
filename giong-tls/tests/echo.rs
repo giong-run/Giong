@@ -1,28 +1,34 @@
 //! A TLS echo server on giong, driven by a blocking rustls client.
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{mpsc, Arc};
+use std::task::Poll;
 use std::time::Duration;
 
 use giong::net::TcpListener;
 use giong::time::timeout;
 use giong_tls::rustls::pki_types::{CertificateDer, ServerName};
 use giong_tls::rustls::{self, ClientConfig, ClientConnection, RootCertStore, StreamOwned};
-use giong_tls::{TlsAcceptor, TlsStream};
+use giong_tls::{Certificates, TlsAcceptor, TlsStream};
 
 type Client = StreamOwned<ClientConnection, TcpStream>;
 
 struct Certs {
     acceptor: TlsAcceptor,
     client: Arc<ClientConfig>,
+    roots: RootCertStore,
 }
 
 fn certs(versions: &[&'static rustls::SupportedProtocolVersion]) -> Certs {
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let cert_pem = key.cert.pem();
     let key_pem = key.key_pair.serialize_pem();
-    let acceptor = TlsAcceptor::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
+    let acceptor = TlsAcceptor::with_certificates(
+        &Certificates::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
 
     let mut roots = RootCertStore::empty();
     roots
@@ -32,11 +38,12 @@ fn certs(versions: &[&'static rustls::SupportedProtocolVersion]) -> Certs {
     let client = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)
         .unwrap()
-        .with_root_certificates(roots)
+        .with_root_certificates(roots.clone())
         .with_no_client_auth();
     Certs {
         acceptor,
         client: Arc::new(client),
+        roots,
     }
 }
 
@@ -129,6 +136,127 @@ fn roundtrip(versions: &[&'static rustls::SupportedProtocolVersion]) {
         client.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty());
     });
+}
+
+/// A client configuration like `certs`' that offers only `versions` and
+/// lists the cipher suites in the order of `suites`.
+fn client_listing(
+    c: &Certs,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    suites: &[rustls::CipherSuite],
+) -> Arc<ClientConfig> {
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+        .cipher_suites
+        .retain(|s| suites.contains(&s.suite()));
+    provider
+        .cipher_suites
+        .sort_by_key(|s| suites.iter().position(|x| *x == s.suite()));
+    let config = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(versions)
+        .unwrap()
+        .with_root_certificates(c.roots.clone())
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
+/// The cipher suite a client listing `suites` in that order ends up with.
+fn negotiated(
+    acceptor: TlsAcceptor,
+    c: &Certs,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    suites: &[rustls::CipherSuite],
+) -> rustls::CipherSuite {
+    let config = client_listing(c, versions, suites);
+    let (tx, rx) = mpsc::channel();
+    with_server(acceptor, echo, move |addr| {
+        let mut client = connect(addr, &config);
+        client.write_all(b"x").unwrap();
+        let mut buf = [0u8; 1];
+        client.read_exact(&mut buf).unwrap();
+        tx.send(client.conn.negotiated_cipher_suite().unwrap().suite())
+            .unwrap();
+    });
+    rx.recv().unwrap()
+}
+
+#[test]
+fn from_pem_prefers_aes_128_gcm_unless_the_client_lists_chacha20_first() {
+    use rustls::CipherSuite as S;
+    let tls13 = &[&rustls::version::TLS13][..];
+    let tls12 = &[&rustls::version::TLS12][..];
+    let c = certs(tls13);
+    // OpenSSL's order: AES-256-GCM, ChaCha20, AES-128-GCM.
+    let openssl13 = [
+        S::TLS13_AES_256_GCM_SHA384,
+        S::TLS13_CHACHA20_POLY1305_SHA256,
+        S::TLS13_AES_128_GCM_SHA256,
+    ];
+    let openssl12 = [
+        S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+    ];
+    // A client without AES instructions.
+    let chacha13 = [
+        S::TLS13_CHACHA20_POLY1305_SHA256,
+        S::TLS13_AES_128_GCM_SHA256,
+        S::TLS13_AES_256_GCM_SHA384,
+    ];
+    let chacha12 = [
+        S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        S::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    ];
+    let cases: [(_, &[S], _); 5] = [
+        (tls13, &openssl13, S::TLS13_AES_128_GCM_SHA256),
+        (tls13, &chacha13, S::TLS13_CHACHA20_POLY1305_SHA256),
+        (
+            tls13,
+            &[S::TLS13_AES_256_GCM_SHA384],
+            S::TLS13_AES_256_GCM_SHA384,
+        ),
+        (
+            tls12,
+            &openssl12,
+            S::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        ),
+        (
+            tls12,
+            &chacha12,
+            S::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        ),
+    ];
+    for (versions, suites, want) in cases {
+        let got = negotiated(c.acceptor.clone(), &c, versions, suites);
+        assert_eq!(got, want, "client listing {suites:?}");
+    }
+    // An acceptor made with `new` follows its configuration: rustls' own
+    // default, the client's order.
+    let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(tls13)
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![CertificateDer::from(key.cert.der().to_vec())],
+        rustls::pki_types::PrivateKeyDer::try_from(key.key_pair.serialize_der()).unwrap(),
+    )
+    .unwrap();
+    let mut c2 = certs(tls13);
+    c2.roots = RootCertStore::empty();
+    c2.roots
+        .add(CertificateDer::from(key.cert.der().to_vec()))
+        .unwrap();
+    let got = negotiated(
+        TlsAcceptor::from_rustls(Arc::new(config)),
+        &c2,
+        tls13,
+        &openssl13,
+    );
+    assert_eq!(got, S::TLS13_AES_256_GCM_SHA384);
 }
 
 #[test]
@@ -295,6 +423,38 @@ fn recv_is_cancel_safe() {
         client.read_exact(&mut got).unwrap();
         assert_eq!(got, expected);
     });
+}
+
+#[test]
+fn a_recv_dropped_at_its_first_poll_can_still_send() {
+    // After a TLS 1.3 handshake the server still owes its session tickets,
+    // and a receive with nothing to read sends them. Each receive here is
+    // dropped right after the poll that does so: on io_uring that poll used
+    // to leave the send with the kernel, dropping it cut the record stream,
+    // and every later write failed with GIONG-E2008.
+    async fn serve(tls: TlsStream) {
+        for _ in 0..3 {
+            let mut recv = std::pin::pin!(tls.recv());
+            let ready =
+                std::future::poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_ready())).await;
+            assert!(!ready, "the client sends nothing");
+        }
+        tls.write_all(&b"still here"[..]).await.0.unwrap();
+        tls.shutdown().await.unwrap();
+    }
+    for versions in [
+        &[&rustls::version::TLS13][..],
+        &[&rustls::version::TLS12][..],
+    ] {
+        let c = certs(versions);
+        let config = c.client.clone();
+        with_server(c.acceptor, serve, move |addr| {
+            let mut client = connect(addr, &config);
+            let mut got = Vec::new();
+            client.read_to_end(&mut got).unwrap();
+            assert_eq!(got, b"still here");
+        });
+    }
 }
 
 #[test]

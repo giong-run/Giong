@@ -293,7 +293,7 @@ fn wait<F: std::future::Future>(fut: F) -> F::Output {
 #[test]
 fn channel_delivers_across_workers_and_from_plain_threads() {
     const PER_SENDER: usize = 10_000;
-    let (tx, rx) = mpsc::channel::<usize>();
+    let (tx, rx) = mpsc::unbounded::<usize>();
     let rx = Arc::new(Mutex::new(Some(rx)));
     // One sender for each of workers 1 and 2, handed out by index.
     let senders = Arc::new(Mutex::new(vec![None, Some(tx.clone()), Some(tx.clone())]));
@@ -533,13 +533,106 @@ fn sigterm_still_works_after_worker_0_returned() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
+fn sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down() {
+    // The kernel hands a process-wide signal to any thread that does not
+    // block it, often one the runtime knows nothing about. Its handler must
+    // still find the runtime's eventfd, and (under ThreadSanitizer) do so
+    // without a data race with the runtime that created it.
+    if std::env::var_os("GIONG_SIGNAL_CHILD_OTHER").is_some() {
+        use std::sync::atomic::AtomicBool;
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        // Started before the runtime, so nothing orders it after the
+        // runtime's set-up but the handler's own load.
+        let bystander = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            while !DONE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let tid = tid_rx.recv().unwrap();
+        giong::Builder::new()
+            .workers(2)
+            .shutdown_on_signals(true)
+            .build()
+            .unwrap()
+            .run(move |index| async move {
+                if index == 0 {
+                    println!("ready {tid}");
+                }
+                giong::shutdown_signal().await;
+            })
+            .unwrap();
+        DONE.store(true, Ordering::SeqCst);
+        bystander.join().unwrap();
+        println!("clean exit");
+        return;
+    }
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(exe)
+        .args([
+            "--exact",
+            "sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("GIONG_SIGNAL_CHILD_OTHER", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let tid: libc::pid_t = lines
+        .by_ref()
+        .find_map(|l| {
+            // libtest may print the test's name on the same line first.
+            let l = l.unwrap();
+            l.split_once("ready ")
+                .map(|(_, t)| t.trim().parse().unwrap())
+        })
+        .expect("child never became ready");
+    // SAFETY: tgkill with the child's pid and one of its thread ids.
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_tgkill,
+            child.id() as libc::pid_t,
+            tid,
+            libc::SIGTERM,
+        )
+    };
+    assert_eq!(sent, 0, "tgkill: {}", std::io::Error::last_os_error());
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
+    assert!(status.is_some(), "SIGTERM was ignored: {rest:?}");
+    assert!(status.unwrap().success(), "child output: {rest:?}");
+    assert!(
+        rest.iter().any(|l| l.contains("clean exit")),
+        "child output: {rest:?}"
+    );
+}
+
+#[test]
 #[cfg_attr(
     miri,
     ignore = "timing: measures wake-up latency, which Miri slows down"
 )]
 fn a_sleeping_worker_is_woken_promptly_by_another_thread() {
     // Latency of the eventfd wake-up path.
-    let (tx, mut rx) = mpsc::channel::<Instant>();
+    let (tx, mut rx) = mpsc::unbounded::<Instant>();
     let sender = std::thread::spawn(move || {
         for _ in 0..200 {
             std::thread::sleep(Duration::from_millis(1));

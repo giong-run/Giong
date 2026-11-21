@@ -1,0 +1,24 @@
+Throughput: h2load, json and users with 48 connections x 10 streams,
+json-mux with 3 connections x 100 streams; one server core.
+
+endpoint  server           req/s median       min       max  mean ms  cpu%  failed
+json      giong-http-tls        1421176   1406822   1428866     0.30    99       0
+json      axum-tls               351812    349900    352793     1.36   100       0
+json      giong-http            1343448   1327507   1350632     0.34   100       0
+json      axum                   363076    362733    364617     1.32   100       0
+
+users     giong-http-tls         112246    112224    112306     4.24   100       0
+users     axum-tls                47534     47504     47593    10.07   100       0
+users     giong-http             128036    127838    128194     3.74   100       0
+users     axum                    48147     48095     48332     9.95   100       0
+
+json-mux  giong-http-tls        1923380   1921860   1925680     0.14   100       0
+json-mux  axum-tls               348126    347829    352189     0.85   100       0
+json-mux  giong-http            1871357   1831043   1873199     0.15   100       0
+json-mux  axum                   355931    355167    356753     0.84   100       0
+
+Memory: 5000 connections over HTTP/2 with prior knowledge, one worker thread.
+
+server            h2-idle  h2-pending  per stream   KiB
+giong-http           6.78        7.10        1.58
+axum                23.79       23.03        1.95

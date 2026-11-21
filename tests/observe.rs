@@ -1,7 +1,7 @@
 //! `giong::observe`: pulses read from other threads, snapshots, profiles,
 //! sources, and tasks named by where they were spawned.
 
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -247,7 +247,13 @@ fn idle_time_only_goes_up_while_a_worker_sleeps_and_wakes() {
     .unwrap();
     watcher.join().unwrap();
     let end = handle.pulse(0);
-    assert!(end.parks >= 200, "{end:?}");
+    // Each sleep parks the worker once, unless its millisecond has passed
+    // before the worker gets to park: then the timer fires without a sleep
+    // in the kernel. Under ThreadSanitizer on epoll that happened once in
+    // 200 (CI, #146). That skip needs a slow worker, so it stays rare; a
+    // worker that stopped parking, or a park counter that missed parks,
+    // would still fall far below this bound.
+    assert!(end.parks >= 180, "{end:?}");
     assert!(end.idle >= Duration::from_millis(100), "{end:?}");
     assert!(end.idle <= built.elapsed(), "{end:?}");
 }
@@ -323,7 +329,8 @@ fn sources_report_until_they_are_dropped() {
         let pool = Rc::new(Pool {
             open: std::cell::Cell::new(3),
         });
-        assert!(observe::register_rc(&pool));
+        let source: Weak<dyn observe::Source> = Rc::downgrade(&pool) as _;
+        assert!(observe::register(source));
         let snap = observe::snapshot();
         assert_eq!(snap.sources.len(), 1);
         assert_eq!(snap.sources[0].kind, "test pool");
@@ -338,7 +345,8 @@ fn sources_report_until_they_are_dropped() {
     let pool = Rc::new(Pool {
         open: std::cell::Cell::new(0),
     });
-    assert!(!observe::register_rc(&pool));
+    let source: Weak<dyn observe::Source> = Rc::downgrade(&pool) as _;
+    assert!(!observe::register(source));
 }
 
 #[test]

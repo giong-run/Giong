@@ -235,10 +235,12 @@ fn a_failed_send_is_reported_once_as_is_then_with_a_code() {
         settle().await;
         let mut c = Compat::new(c);
         let chunk = vec![7u8; 64 * 1024];
+        // A write as large as the buffer goes straight to the socket, so
+        // its own error can come back from the write rather than the flush.
         let first = loop {
-            c.write_all(&chunk)
-                .await
-                .unwrap_or_else(|e| panic!("write: {e}"));
+            if let Err(e) = c.write_all(&chunk).await {
+                break e;
+            }
             if let Err(e) = c.flush().await {
                 break e;
             }
@@ -325,11 +327,15 @@ fn vectored_writes_are_copied_in_order() {
             std::io::IoSlice::new(b"defghij"),
             std::io::IoSlice::new(b"klm"),
         ];
-        // Up to the limit, in order.
-        assert_eq!(c.write_vectored(&parts).await.unwrap(), 10);
-        c.write_all(b"klm").await.unwrap();
+        // With nothing buffered, a write at least as large as the limit goes
+        // straight to the socket, every slice in order.
+        assert_eq!(c.write_vectored(&parts).await.unwrap(), 13);
+        // Behind buffered bytes: copied up to the limit, in order.
+        c.write_all(b"-").await.unwrap();
+        assert_eq!(c.write_vectored(&parts).await.unwrap(), 9);
+        c.write_all(b"jklm").await.unwrap();
         c.shutdown().await.unwrap();
-        assert_eq!(native_read_all(&s).await, b"abcdefghijklm");
+        assert_eq!(native_read_all(&s).await, b"abcdefghijklm-abcdefghijklm");
     });
 }
 

@@ -1,0 +1,88 @@
+Low-memory refusal (Server::min_free_memory, GIONG-E1121) and the idle HTTP/2
+memory regression of 0.8.0. Measured 2026-11-16 on the 4-vCPU Xeon VM
+(Linux 6.18.44, 15 GiB, cgroup v1), giong 0.8.0 (b6d9b4b) against this change.
+
+1. Idle HTTPS connections in a memory-limited cgroup
+   Server: bench/giong-http with TLS (rustls, ECDSA P-256), 1 worker,
+   max_connections raised to 15,000 and idle timeout to an hour (as
+   bench/small-box.sh does), in a cgroup v1 with memory.limit_in_bytes 96 MiB.
+   Client: bench/small-box/tlshold.py (branch bench/bare-metal-0.9), batches of
+   1,000 handshakes plus one keep-alive GET each, then idle; reads
+   memory.usage_in_bytes and memory.oom_control. cgroup v1 leaves the kernel's
+   socket memory out, so connections are cheaper here than under cgroup v2.
+   The fd hard limit of the VM (20,000) rules out the bare-metal 36k runs.
+
+     0.8.0  held 7,903, then OOM-killed            idle-https-96m-0.8.0.csv
+     fix    held 6,521, then refused (GIONG-E1121), alive, new connections
+            served again once the idle ones closed  idle-https-96m-fix.csv
+
+   (oom_kills in the fix's file is 1 from the 0.8.0 run before it: v1
+   keeps the count per cgroup.)
+
+   Plain HTTP/1.1, the `defaults` example (every default, including
+   max_connections 10,000 per worker), scripts/idle-connections.sh in Docker
+   with 32 MiB (MEMORY=32m NOFILE=20000 RUNS="1:epoll 4:epoll"):
+     0.8.0  1 worker: 9,091 held, then OOM-killed; 4 workers: 8,493, OOM-killed
+     fix    1 worker: 6,609 held, 20 refused, held ones served, peak 24 MiB
+            4 workers: 6,162 held, 20 refused, held ones served, peak 24 MiB
+
+2. Resident memory per HTTP/2 connection (h2-memory.csv)
+   bench/giong-http without TLS (HTTP/2 with prior knowledge), 1 worker;
+   bench/hold opens 5,000 connections; the KiB are the growth of the server's
+   VmRSS divided by 5,000, read 2 s after the client is ready, as bench/h2.sh
+   does. idle: one request answered on each connection; pending: one request
+   in progress (GET /wait?ms=600000); pending10: ten in progress. Three
+   rounds, builds interleaved; every round gave the same numbers.
+
+               idle    pending   pending10
+     0.5.0     4.56     6.68      19.09
+     0.8.0     7.09     7.42      21.65
+     fix       4.54     5.88      19.09
+
+   Causes, by bisecting with this measurement: idle from #122 (05e1350),
+   which kept the memory for a connection's streams for a second after each
+   request; 5,000 connections opening together all held it at once, and
+   glibc kept the pages after they were freed (heap counters see nothing).
+   pending from #76 (d516c08), whose queue of handlers to start reserved
+   four requests (672 bytes) on first use; the stream slots likewise four
+   streams (1,408 bytes).
+
+3. bench/instr idle-h2, now with one request per connection
+   (scripts/instr.py measure --cases idle-h2, 2,000 connections, bytes per
+   connection, io_uring / epoll):
+     0.8.0's giong-http/src/h2/server.rs   heap 6,852 / 6,917  rss 7,371 / 7,367
+     fix                                   heap 4,427 / 4,492  rss 4,801 / 4,796
+   The other cases of scripts/instr.py check stay within their limits; the
+   h2 case's instructions moved +0.56% (epoll), allocations unchanged.
+
+4. HTTP/2 throughput after #125 (h2-instructions.csv, h2-throughput.csv)
+   Bare metal on #125 (003d9e5) served 4.6% fewer HTTP/2 requests per second
+   than 0.8.0 (bench/h2.sh json, 48 connections x 10 streams: 1.519M against
+   1.593M). Cause: next_start() gave the queue of handlers to start back each
+   time it emptied after growing past four, so with many streams in flight
+   every burst allocated it again. Now it is given back after the first burst
+   only (ten long requests opened at once do not keep it) and kept from the
+   second on, until the connection is idle.
+
+   Instructions per request, server only, callgrind (bench/instructions.sh
+   json-h2 with STREAMS and CONNS), medians of the runs in the file:
+
+     streams x conns     0.8.0    #125            this change
+     1 x 10              14,478   14,648 (+1.2%)  14,534 (+0.4%)
+     10 x 10             11,243   11,475 (+2.1%)  11,278 (+0.3%)
+     100 x 10            10,889   11,377 (+4.5%)  11,008 (+1.1%)
+     100 x 3             10,817   11,239 (+3.9%)  10,852 (+0.3%)
+
+   Keeping the queue from the first burst on (fixed-keep-always) costs the
+   same as this change, 10,852: the one give-back is not measurable.
+   Wall-clock rates on this VM move by up to 10% between rounds of one build
+   and cannot settle the difference (h2-throughput.csv); bare metal does.
+
+   Memory per connection with this change (bench/hold, as in 2): idle 4.53,
+   pending 5.88, pending10 19.09 KiB, three rounds, the same as #125. Keeping
+   the queue from the first burst on would have made pending10 21.68 KiB.
+
+   bench/instr gains a case, h2-streams: ten requests at once on one HTTP/2
+   connection, client and server. #125 costs 4 more allocations (500 against
+   496) and 0.7% more instructions per operation there; this change and 0.8.0
+   cost the same. Its limit is 0.5% on both (counts repeat within 0.1%).

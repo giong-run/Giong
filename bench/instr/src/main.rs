@@ -16,63 +16,23 @@
 //! otherwise), and the fake database servers are a few dozen instructions
 //! per request.
 //!
+//! A run's memory comes from the size classes of `alloc.rs`, not from
+//! glibc's malloc, whose cost depends on the state of the heap.
+//!
 //! Outside valgrind the client requests do nothing, so `run` also works as a
 //! quick functional check (it prints the allocation counts either way).
 
+mod alloc;
 mod cases;
 mod db;
 mod vg;
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
-/// Counts heap allocations and live bytes. Relaxed atomics: everything that
-/// is measured runs on one thread, and the counts are read on that thread.
-struct Counting;
-
-static ALLOCS: AtomicU64 = AtomicU64::new(0);
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-// SAFETY: every method forwards to `System` with the same arguments; the
-// counters do not touch the memory.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        LIVE.fetch_add(layout.size(), Relaxed);
-        // SAFETY: forwarded as received.
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        LIVE.fetch_add(layout.size(), Relaxed);
-        // SAFETY: forwarded as received.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Relaxed);
-        // SAFETY: forwarded as received.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        LIVE.fetch_sub(layout.size(), Relaxed);
-        LIVE.fetch_add(new_size, Relaxed);
-        // SAFETY: forwarded as received.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+pub use alloc::{allocations, live_bytes};
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
-
-pub fn allocations() -> u64 {
-    ALLOCS.load(Relaxed)
-}
-
-pub fn live_bytes() -> usize {
-    LIVE.load(Relaxed)
-}
+static GLOBAL: alloc::Counting = alloc::Counting::new();
 
 /// The resident set of this process, in bytes.
 pub fn rss() -> usize {
@@ -175,6 +135,9 @@ fn main() {
             };
             let iterations = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(2000);
             let warmup = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(500);
+            // What an allocation costs must not depend on the heap's
+            // state (see `alloc.rs`).
+            GLOBAL.fixed_cost();
             let meter = Meter {
                 name: case.name,
                 iterations,

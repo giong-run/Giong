@@ -9,10 +9,19 @@ mod bounded;
 pub mod oneshot;
 
 pub mod mpsc {
-    //! Multi-producer, single-consumer channels: [`channel`] is unbounded,
-    //! [`bounded`] holds a fixed number of values and makes senders wait.
+    //! Multi-producer, single-consumer channels: [`unbounded`] takes every
+    //! value it is sent, [`bounded`] holds a fixed number of values and makes
+    //! senders wait.
+    //!
+    //! Tokio's `mpsc::channel(n)` is [`bounded`]`(n)` here, and its
+    //! `unbounded_channel()` is [`unbounded`]`()`.
+    //!
+    //! The halves of the bounded channel are [`Sender`] and [`Receiver`], as in
+    //! Tokio, so the short name is the channel that holds its memory to a
+    //! bound; the unbounded ones are [`UnboundedSender`] and
+    //! [`UnboundedReceiver`].
 
-    pub use super::bounded::{bounded, BoundedReceiver, BoundedSender, TrySendError};
+    pub use super::bounded::{bounded, Receiver, Sender, TrySendError};
 
     use std::collections::VecDeque;
     use std::fmt;
@@ -35,8 +44,10 @@ pub mod mpsc {
         }
     }
 
-    /// Creates an unbounded channel.
-    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+    /// Creates an unbounded channel: [`UnboundedSender::send`] never waits, and
+    /// values queue up until the receiver takes them. Use [`bounded`] when
+    /// the senders can outrun the receiver.
+    pub fn unbounded<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
         let shared = Arc::new(Shared(Mutex::new(State {
             queue: VecDeque::new(),
             rx_waker: None,
@@ -44,24 +55,34 @@ pub mod mpsc {
             rx_alive: true,
         })));
         (
-            Sender {
+            UnboundedSender {
                 shared: shared.clone(),
             },
-            Receiver { shared },
+            UnboundedReceiver {
+                shared,
+                taken: Mutex::new(VecDeque::new()),
+            },
         )
     }
 
     /// The sending half. Cheap to clone; `Send` when `T` is.
-    pub struct Sender<T> {
+    pub struct UnboundedSender<T> {
         shared: Arc<Shared<T>>,
     }
 
     /// The receiving half.
-    pub struct Receiver<T> {
+    pub struct UnboundedReceiver<T> {
         shared: Arc<Shared<T>>,
+        /// Values already taken from the shared queue, oldest first. The
+        /// receiver empties the shared queue in one go when this runs dry,
+        /// so it takes the lock once per batch rather than once per value,
+        /// and senders on other threads rarely find the lock held. A
+        /// `Mutex` only for its auto traits: it is reached through
+        /// `&mut self` with `get_mut`, which never locks.
+        taken: Mutex<VecDeque<T>>,
     }
 
-    /// Returned by [`Sender::send`] and [`BoundedSender::send`] when the receiver
+    /// Returned by [`UnboundedSender::send`] and [`Sender::send`] when the receiver
     /// is gone; holds the value.
     pub struct SendError<T>(pub T);
 
@@ -79,7 +100,7 @@ pub mod mpsc {
 
     impl<T> std::error::Error for SendError<T> {}
 
-    /// Why [`Receiver::try_recv`] or [`BoundedReceiver::try_recv`] returned
+    /// Why [`UnboundedReceiver::try_recv`] or [`Receiver::try_recv`] returned
     /// no value.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum TryRecvError {
@@ -101,7 +122,7 @@ pub mod mpsc {
 
     impl std::error::Error for TryRecvError {}
 
-    impl<T> Sender<T> {
+    impl<T> UnboundedSender<T> {
         /// Sends a value without blocking. Fails if the receiver was dropped.
         pub fn send(&self, value: T) -> Result<(), SendError<T>> {
             let waker = {
@@ -120,7 +141,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Clone for Sender<T> {
+    impl<T> Clone for UnboundedSender<T> {
         fn clone(&self) -> Self {
             self.shared.lock().senders += 1;
             Self {
@@ -129,7 +150,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Drop for Sender<T> {
+    impl<T> Drop for UnboundedSender<T> {
         fn drop(&mut self) {
             let waker = {
                 let mut state = self.shared.lock();
@@ -146,14 +167,23 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Receiver<T> {
+    impl<T> UnboundedReceiver<T> {
         /// Receives the next value, or `None` once every sender is gone and
         /// the channel is empty.
+        ///
+        /// Cancel safe: if the future is dropped, no value is lost; the next
+        /// call returns it.
         pub async fn recv(&mut self) -> Option<T> {
             poll_fn(|cx| {
-                let mut state = self.shared.lock();
-                if let Some(value) = state.queue.pop_front() {
+                let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
+                if let Some(value) = taken.pop_front() {
                     return Poll::Ready(Some(value));
+                }
+                let mut state = self.shared.lock();
+                if !state.queue.is_empty() {
+                    std::mem::swap(&mut state.queue, taken);
+                    drop(state);
+                    return Poll::Ready(taken.pop_front());
                 }
                 if state.senders == 0 {
                     return Poll::Ready(None);
@@ -172,8 +202,13 @@ pub mod mpsc {
         /// [`TryRecvError::Closed`] once every sender is gone and the channel
         /// is empty, when [`recv`](Self::recv) would return `None`.
         pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
+            let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
+            if let Some(value) = taken.pop_front() {
+                return Ok(value);
+            }
             let mut state = self.shared.lock();
-            match state.queue.pop_front() {
+            std::mem::swap(&mut state.queue, taken);
+            match taken.pop_front() {
                 Some(value) => Ok(value),
                 None if state.senders == 0 => Err(TryRecvError::Closed),
                 None => Err(TryRecvError::Empty),
@@ -181,7 +216,7 @@ pub mod mpsc {
         }
     }
 
-    impl<T> Drop for Receiver<T> {
+    impl<T> Drop for UnboundedReceiver<T> {
         fn drop(&mut self) {
             let leftover = {
                 let mut state = self.shared.lock();

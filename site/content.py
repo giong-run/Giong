@@ -34,7 +34,7 @@ CRATES = {
                "`spawn_on`, `spawn_balanced` and `bind_balanced` to spread new work"],
         fact="3 dependencies: `io-uring`, `libc`, `socket2`"),
     "giong-http": dict(
-        layer="protocols", tests=206,
+        layer="protocols", tests=215,
         short="A strict HTTP/1.1 and HTTP/2 server, HTTPS behind a feature, and a pooled client.",
         lede="A small, strict HTTP/1.1 and HTTP/2 server with one async handler, and a client that speaks both.",
         items=["HTTP/2 through ALPN or with prior knowledge, for the same handlers",
@@ -49,14 +49,14 @@ CRATES = {
         layer="protocols", tests=76,
         short="TLS 1.2 and 1.3 for servers and clients on rustls. No OpenSSL.",
         lede="TLS 1.2 and 1.3 for servers and clients on rustls with `ring`. No OpenSSL.",
-        items=["`TlsAcceptor::from_pem(cert, key)`; `TlsConnector` with the system's or built-in roots",
+        items=["`TlsAcceptor::with_certificates(&certs)`; `TlsConnector` with the system's or built-in roots",
                "`recv()` is cancel safe",
                "A cancelled write poisons the sending side instead of corrupting the record stream",
                "ALPN, client certificates and a handshake timeout",
                "Kernel TLS after the handshake (`Ktls::Auto`), and files sent with `sendfile`"],
-        fact="TLS costs 4% on `/json`"),
+        fact="TLS costs 2% on `/json` (main, after 0.8.0)"),
     "giong-postgres": dict(
-        layer="clients", tests=105,
+        layer="clients", tests=107,
         short="PostgreSQL client and pool; statements of every task pipeline together.",
         lede="A PostgreSQL client and pool. The statements of every task pipeline over a few connections.",
         items=["`Client::connect`, `query`, `execute`, `transaction`, `cancel_token`",
@@ -64,9 +64,9 @@ CRATES = {
                "Every statement prepared once per connection and cached",
                "TLS verified by default for remote hosts; SCRAM-SHA-256; `require_auth`",
                "A connection taken with `get()` comes back to the pool with its session reset"],
-        fact="2.6× deadpool's statements per core"),
+        fact="3.3× deadpool's statements per core (main, after 0.8.0)"),
     "giong-mysql": dict(
-        layer="clients", tests=118,
+        layer="clients", tests=120,
         short="MySQL and MariaDB client and pool, built the same way as giong-postgres.",
         lede="A client and pool for MySQL 8 and MariaDB 10.6 or newer, built the same way as giong-postgres.",
         items=["`Client::connect`, `query`, `execute`, `transaction`",
@@ -74,7 +74,7 @@ CRATES = {
                "Prepared statements on the binary protocol, cached per connection",
                "TLS; `caching_sha2_password` and `mysql_native_password`",
                "A connection taken with `get()` comes back to the pool with its session reset"],
-        fact="4.7× SQLx's statements per core"),
+        fact="5.1× SQLx's statements per core (main, after 0.8.0)"),
     "giong-redis": dict(
         layer="clients", tests=86,
         short="Redis client on RESP3: pipelining across tasks, Pub/Sub, a pool.",
@@ -83,9 +83,9 @@ CRATES = {
                "Transactions with `watch`; Pub/Sub",
                "A `Pool` per worker; `take()` for a connection of your own",
                "TLS; Redis 6 or newer (RESP3)"],
-        fact="1.4× redis-rs's `GET`s per core"),
+        fact="1.3× redis-rs's `GET`s at half the CPU (main, after 0.8.0)"),
     "giong-web": dict(
-        layer="framework", tests=107,
+        layer="framework", tests=110,
         short="Router, middleware and JSON on giong-http; errors as coded problem+json.",
         lede="A router, middleware and JSON on giong-http. Handlers are plain `async fn`s; every "
              "error is a coded problem+json answer.",
@@ -96,7 +96,7 @@ CRATES = {
                "without a socket"],
         fact="1.3× axum's `/json` on one core"),
     "giong-mcp": dict(
-        layer="tooling", tests=33,
+        layer="tooling", tests=34,
         short="A read-only MCP server: an agent sees what each worker, task and pool is doing.",
         lede="A read-only MCP server that lets an AI agent look inside a running service: which "
              "task blocks a worker, which line spawned the tasks that leak, how full the pools are.",
@@ -133,11 +133,12 @@ LAYERS = [  # top to bottom, as drawn
 
 # ---------------------------------------------------------------- home
 HERO = dict(
-    h1="One syscall per tick, <em>not per operation.</em>",
-    lede=("giong is an async runtime for Rust services on Linux, built on io_uring with one "
-          "thread per core, and an epoll driver wherever io_uring is blocked. It brings its own HTTP server and client, TLS, PostgreSQL, MySQL "
-          "and Redis clients and a web framework, so a whole service runs on it with no Tokio "
-          "underneath."),
+    h1="The Rust runtime <em>built for the agent era.</em>",
+    lede=("An async runtime for Rust services on Linux. A strict API meant to stay on version 1 "
+          "for years, errors that say how to fix them, and an MCP server that lets your agent "
+          "look inside the running service. Underneath: io_uring with one thread per core. On "
+          "top: its own HTTP, TLS, PostgreSQL, MySQL and Redis crates, so a whole service runs "
+          "with no Tokio."),
 )
 
 PILLARS = [
@@ -165,27 +166,58 @@ PILLARS = [
 
 AGENTS = dict(
     h2="Made for the agents that write your code",
-    lede=("More code is written by AI coding agents every month. giong is built so they get it "
-          "right on the first try, and can fix it alone when they do not."),
+    lede=("giong is a late entrant, built for a time when more code is written by AI agents "
+          "every month. Its API does not have to be short to type; it has to be strict, always "
+          "correct, and able to grow for years. So agents get it right on the first try, and can "
+          "fix it alone when they do not."),
     points=[
         ("Errors that say how to fix them",
          "Every error giong raises has a stable code, the cause and the fix, and a page of its "
          "own. `giong::error::code(&err)` matches on the code, never on the message."),
         ("One obvious way",
-         "No macros that hide control flow. Strict types, so a mistake is a compile error. Every "
-         "timeout and size limit is finite and documented."),
+         "One way to do each thing, and no macros that hide control flow. Misuse fails at compile "
+         "time, or at run time with a coded error. Every timeout and size limit is finite and "
+         "documented."),
+        ("Version 1 for years",
+         "After 1.0, giong grows through 1.x releases rather than a 2.0. Every behaviour code "
+         "relies on is documented, and a release only adds: it never changes what existing code "
+         "means. `cargo-semver-checks` runs on every change."),
         ("Verification is the law",
          "Tests, ThreadSanitizer, loom, fuzzing and soak tests run in CI and block merging. "
          "Machines check the work, not only reviewers."),
         ("Docs a machine can read",
-         "`AGENTS.md` in the repository and `llms.txt` on this site. `giong-mcp` lets an "
-         "agent look inside a running service."),
+         "`AGENTS.md` in the repository and `llms.txt` on this site: the facts a model gets "
+         "wrong, which crate to use for each job, and every page in one file."),
     ],
     # `{version}` becomes the release's version: messages link to the pages of
     # the release that raised them.
     error=("GIONG-E0102: no address found for db.internal. Fix: check the spelling of the name, "
            "/etc/hosts, and the DNS servers in /etc/resolv.conf (in a container, the network it is "
            "attached to). See https://github.com/giong-run/Giong/blob/v{version}/docs/errors/E0102.md"),
+)
+
+# The giong-mcp section on the home page. Every claim is from giong-mcp/README.md.
+MCP = dict(
+    h2="Your agent can ask the running service",
+    lede=("`giong-mcp` is an MCP server inside your service. Connect Claude Code, or any client "
+          "that speaks MCP over HTTP, and the agent reads what each worker is doing, which tasks "
+          "are alive and which line of your code spawned them, and what the pools hold, instead "
+          "of guessing from logs."),
+    setup=[("Start it next to the runtime", "let _mcp = giong_mcp::start_from_env(&rt.handle());"),
+           ("Run with an address and a token", "GIONG_MCP=127.0.0.1:7777 GIONG_MCP_TOKEN=$(openssl rand -hex 16) cargo run"),
+           ("Connect the agent", "claude mcp add --transport http giong http://127.0.0.1:7777/mcp \\\n"
+                                 "    --header \"Authorization: Bearer $GIONG_MCP_TOKEN\"")],
+    warning=("worker 1 has been inside one poll of the task spawned at src/routes/report.rs:88:13 "
+             "for 2.3 s: that task blocks the thread (a blocking call, a long computation or a "
+             "loop without .await), and every other task on worker 1 waits"),
+    tools=[("overview", "Memory, threads, open descriptors against the limit, each worker's state, and warnings such as a blocked worker."),
+           ("workers", "Each worker's counters, timers, I/O in flight, and the task a blocked worker is stuck in."),
+           ("tasks", "Live tasks grouped by the line that spawned them. A count that keeps growing is a leak."),
+           ("sources", "The PostgreSQL, MySQL and Redis pools: open, taken, waiting, connect errors, timeouts."),
+           ("profile", "Times every poll for a window and lists where the workers spent it.")],
+    foot=("Read-only apart from `profile` turning poll timing on for its window. Loopback or a Unix "
+          "socket only, a token required on TCP, and its own thread, so it answers even when every "
+          "worker is stuck."),
 )
 
 CHECKED = [
@@ -199,6 +231,9 @@ CHECKED = [
 ]
 NOT_YET = [
     "giong has **not run in production**",
+    "Not ahead everywhere: small responses at 50 connections are a tie with tuned Monoio and raw "
+    "Tokio, and over one shared PostgreSQL connection giong-postgres is behind tokio-postgres "
+    "(7–9% on main)",
     "Bare metal measured on one pair of 8-core machines only; nothing larger yet",
     "No independent audit: every crate has been reviewed, but by the project's AI agents",
 ]
@@ -361,18 +396,21 @@ CHARTS = [
     dict(
         id="tls", home=True,
         title="HTTPS on one core",
-        sub="requests per second, TLS 1.3, the same rustls on both sides · higher is better",
+        sub="requests per second, TLS 1.3, the same rustls on both sides · main after 0.8.0 (76d55bd) · higher is better",
         max=160,
         rows=["`/json`, kept-alive",
-              ("httptls", 144.8, "144.8k", 142.3, 152.9), ("axumtls", 81.0, "81.0k", 80.2, 82.8),
+              ("httptls", 146.6, "146.6k", 135.6, 155.4), ("axumtls", 81.2, "81.2k", 80.1, 85.1),
               "`/users`, 8 KB, kept-alive",
-              ("httptls", 47.8, "47.8k", 43.4, 48.8), ("axumtls", 19.2, "19.2k", 18.7, 19.8),
+              ("httptls", 48.7, "48.7k", 47.4, 50.0), ("axumtls", 18.5, "18.5k", 17.4, 19.5),
               "a new handshake per request",
-              ("httptls", 7.1, "7.1k", 6.7, 7.5), ("axumtls", 7.3, "7.3k", 6.9, 7.6)],
-        short="Handshakes are level: they are almost all cryptography, from the same library.",
-        note=("TLS costs giong 4% on `/json` and 14% on 8 KB responses. Handshakes are level: a "
-              "handshake is almost all cryptography, and both sides use the same library for it. "
-              "Most of the `/users` factor is there without TLS."),
+              ("httptls", 8.4, "8.4k", 7.9, 9.1), ("axumtls", 7.1, "7.1k", 6.3, 7.6)],
+        short="18% more new connections than Axum, mostly from the cipher suite; set up the same "
+              "way, Axum matches it.",
+        note=("TLS costs giong 2% on `/json` and 12% on 8 KB responses. New connections: 18% more "
+              "per second than Axum + rustls at 15% less CPU each, mostly because giong-tls prefers "
+              "AES-128-GCM. Axum set to the same suite matches giong's rate (8.4k), with a higher "
+              "p99 (6.2 ms against 4.2): a handshake is almost all cryptography, from the same "
+              "library. Most of the `/users` factor is there without TLS."),
         src=["bench/tls.sh"],
     ),
     dict(
@@ -526,7 +564,9 @@ ELSEWHERE = [
     "**Monoio** is the mature choice and runs in production at ByteDance. If you need a runtime "
     "proven in production today, or macOS, use it.",
     "**Glommio** is built for storage engines: Direct I/O and priority scheduling are its strengths.",
-    "**Tokio** is the general-purpose runtime. giong is not trying to replace it for every workload.",
+    "**Tokio** is the default general-purpose runtime, with the largest ecosystem and years in "
+    "production. giong aims to beat it on technical merit and replaces its crates with its own, "
+    "but it has not run in production yet: measure your own workload before you switch.",
 ]
 
 FAQ = [

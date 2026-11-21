@@ -5,7 +5,7 @@ use std::io::Write;
 
 use giong::net::TcpListener;
 use giong_http::{Request, Response, Server};
-use giong_tls::{Ktls, TlsAcceptor};
+use giong_tls::{Certificates, Ktls, TlsAcceptor};
 
 fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }
 
@@ -119,6 +119,9 @@ async fn handler(req: Request) -> Response {
         "/static" => Response::new(200)
             .header("content-type", "application/octet-stream")
             .body(giong_http::Body::Static(bytes(req.query().unwrap_or("")))),
+        // `POST /upload`: the server has received the whole body by now
+        // (bench/small-box.sh floods it with slow uploads).
+        "/upload" => Response::new(200),
         _ => Response::new(404),
     }
 }
@@ -153,7 +156,8 @@ fn main() -> std::io::Result<()> {
     // handshake (kernel TLS); off by default.
     let tls = match (std::env::var("TLS_CERT"), std::env::var("TLS_KEY")) {
         (Ok(cert), Ok(key)) => {
-            let acceptor = TlsAcceptor::from_pem(&std::fs::read(cert)?, &std::fs::read(key)?)?;
+            let certs = Certificates::from_pem(&std::fs::read(cert)?, &std::fs::read(key)?)?;
+            let acceptor = TlsAcceptor::with_certificates(&certs)?;
             let mode = match std::env::var("GIONG_KTLS").as_deref() {
                 Ok("auto") => Ktls::Auto,
                 Ok("required") => Ktls::Required,
@@ -199,14 +203,26 @@ fn main() -> std::io::Result<()> {
                 } else {
                     TcpListener::bind
                 };
+                // GIONG_MAX_CONNS=N: connections each worker serves at once
+                // instead of the default 10,000 (bench/small-box.sh measures
+                // how many idle connections fit in a memory limit).
+                let mut server = Server::new();
+                if let Some(n) = std::env::var("GIONG_MAX_CONNS").ok().and_then(|v| v.parse().ok()) {
+                    server = server.max_connections(n);
+                }
+                // GIONG_IDLE_TIMEOUT_SECS=N: how long a keep-alive connection
+                // may stay idle instead of the default 60 s (likewise).
+                if let Some(n) = std::env::var("GIONG_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()) {
+                    server = server.idle_timeout(std::time::Duration::from_secs(n));
+                }
                 match tls {
                     Some(acceptor) => {
                         let listener = bind(bench_addr(3010)).expect("bind");
-                        Server::new().serve_tls(listener, acceptor, handler).await;
+                        server.serve_tls(listener, acceptor, handler).await;
                     }
                     None => {
                         let listener = bind(bench_addr(3009)).expect("bind");
-                        Server::new().serve(listener, handler).await;
+                        server.serve(listener, handler).await;
                     }
                 }
             }

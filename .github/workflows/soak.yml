@@ -1,11 +1,17 @@
 name: Soak
 
 # Two hours of connection churn, UDP, file and cross-worker traffic every night
-# (tests/soak.rs), then checks that no descriptor, memory or driver state was
-# left behind. Run it by hand with another duration from the Actions tab.
-# Twice: on the runner's kernel, and on Linux 6.18 booted in QEMU, where
+# (tests/soak.rs), and two hours of TLS handshakes, traffic and interrupted
+# operations, in the process and with kernel TLS (giong-tls/tests/soak.rs),
+# each followed by checks that no descriptor, memory or driver state was left
+# behind. Run it by hand with another duration from the Actions tab.
+# Each twice: on the runner's kernel, and on Linux 6.18 booted in QEMU, where
 # streams receive through packed buffer rings (6.12 and newer), which cut a
-# receive wherever a shared buffer fills up.
+# receive wherever a shared buffer fills up, and where kernel TLS takes new
+# keys on a live connection (6.14 and newer).
+# Then years of simulated uptime under hostile faults (sim/README.md), on new
+# seeds every night: rare fault combinations show up only after thousands of
+# seeds, more than the per-PR run can afford.
 
 on:
   schedule:
@@ -15,6 +21,9 @@ on:
       minutes:
         description: Minutes to run
         default: "120"
+      sim_from:
+        description: First seed of the simulated long runs (default changes every night)
+        default: ""
 
 permissions:
   contents: read
@@ -23,18 +32,34 @@ jobs:
   soak:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        workload: [runtime, tls]
+    env:
+      # The TLS soak must reach the kernel: the module is loaded below.
+      GIONG_KTLS_REQUIRED: 1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
       - run: uname -r && nproc
+      - name: Load the kernel's tls module, so the TLS soak covers kernel TLS
+        if: matrix.workload == 'tls'
+        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - name: Soak
-        run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak
+        run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak ${{ matrix.workload }}
 
   soak-packed-buffers:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { workload: runtime, package: giong, ktls: "0" }
+          - { workload: tls, package: giong-tls, ktls: "1" }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -53,18 +78,39 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/kernels/linux-6.18.63
-          key: kernel-6.18.63
+          key: kernel-6.18.63${{ matrix.ktls == '1' && '-ktls' || '' }}
       - name: Soak on Linux 6.18
         run: |
           secs=$(( ${{ inputs.minutes || '120' }} * 60 ))
-          bin=$(cargo test --release --test soak --no-run --message-format=json |
+          bin=$(cargo test --release -p ${{ matrix.package }} --all-features --test soak --no-run --message-format=json |
             jq -r 'select(.reason == "compiler-artifact" and .target.name == "soak") | .executable')
-          TEST_BINARIES="$bin" SOAK_SECS=$secs TIMEOUT=$(( secs + 1800 )) scripts/kernels.sh 6.18.63
+          TEST_BINARIES="$bin" KTLS=${{ matrix.ktls }} SOAK_SECS=$secs TIMEOUT=$(( secs + 1800 )) scripts/kernels.sh 6.18.63
       - name: Check that receives were cut, so packed buffer rings were in use
+        if: matrix.workload == 'runtime'
         run: grep -E ', [1-9][0-9]* messages received in pieces' target/kernels/linux-6.18.63.log
+      - name: Check that the kernel encrypted connections
+        if: matrix.workload == 'tls'
+        run: grep -E '\([0-9]+ resumed sessions, [1-9][0-9]* stream ends encrypted by the kernel\)' target/kernels/linux-6.18.63.log
       - name: Keep the guest's log
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: soak-linux-6.18.63-log
+          name: soak-${{ matrix.workload }}-linux-6.18.63-log
           path: target/kernels/linux-6.18.63.log
+
+  sim-long-runs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      # 1200 seeds of 521 simulated days each (about 1,700 simulated years),
+      # starting where the previous night stopped. A failure prints its seed;
+      # replay it with GIONG_SIM_SEED=<seed> GIONG_SIM_SOAK_DAYS=3650.
+      - name: Hostile soak in simulated time
+        env:
+          SIM_FROM: ${{ inputs.sim_from }}
+          RUN: ${{ github.run_number }}
+        run: SIM_LONG_FROM="${SIM_FROM:-$(( RUN * 1200 ))}" scripts/check.sh sim-long

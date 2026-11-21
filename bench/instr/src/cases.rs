@@ -84,6 +84,11 @@ pub const CASES: &[Case] = &[
         h2
     ),
     case!(
+        "h2-streams",
+        "giong-http client to giong-http server, ten HTTP/2 GET /json at once on one connection",
+        h2_streams
+    ),
+    case!(
         "https",
         "giong-http client to giong-http server over TLS (rustls), HTTP/1.1 GET /json",
         https
@@ -122,14 +127,26 @@ pub const IDLE: &[IdleCase] = &[
     IdleCase {
         name: "idle-http1",
         what: "heap and RSS per idle HTTP/1.1 connection of giong-http's server",
-        run: |name, n| Box::pin(idle(name, n, false)),
+        run: |name, n| Box::pin(idle(name, n, Proto::Http1)),
     },
     IdleCase {
         name: "idle-h2",
-        what: "heap and RSS per idle HTTP/2 connection (after the preface and SETTINGS)",
-        run: |name, n| Box::pin(idle(name, n, true)),
+        what: "heap and RSS per idle HTTP/2 connection, after one request",
+        run: |name, n| Box::pin(idle(name, n, Proto::Http2)),
+    },
+    IdleCase {
+        name: "idle-https",
+        what: "heap and RSS per idle HTTPS (HTTP/1.1 over rustls) connection, after one request",
+        run: |name, n| Box::pin(idle(name, n, Proto::Https)),
     },
 ];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Proto {
+    Http1,
+    Http2,
+    Https,
+}
 
 async fn spawn(m: &Meter) {
     for i in m.iter() {
@@ -378,15 +395,55 @@ async fn h2(m: &Meter) {
     client_loop(m, client, &url).await;
 }
 
+/// Requests in flight together in `h2-streams`.
+const STREAMS: usize = 10;
+
+/// One operation is `STREAMS` requests sent together over one HTTP/2
+/// connection, as from a client with many streams in flight. Requests that
+/// arrive in one read queue up for their handlers, which `h2` (one request
+/// at a time) never does: 0.8.0's fix for idle memory gave the queue back
+/// each time it emptied, which cost 2% more instructions per request with
+/// ten streams and 4.5% with a hundred, unseen here until this case.
+async fn h2_streams(m: &Meter) {
+    let (listener, addr) = listen();
+    let _server = giong::spawn(async move { Server::new().serve(listener, json).await });
+    let client = giong_http::client::Client::builder()
+        .http2_prior_knowledge(true)
+        .build();
+    let url = std::rc::Rc::<str>::from(format!("http://{addr}/json"));
+    let first = client.get(&url).send().await.expect("a response");
+    assert_eq!(
+        first.version(),
+        giong_http::Version::Http2,
+        "HTTP/2 was used"
+    );
+    let mut tasks = Vec::with_capacity(STREAMS);
+    for _ in m.iter() {
+        for _ in 0..STREAMS {
+            let (client, url) = (client.clone(), url.clone());
+            tasks.push(giong::spawn(async move {
+                let resp = client.get(&url).send().await.expect("a response");
+                assert_eq!(resp.status(), 200);
+                resp.body().len()
+            }));
+        }
+        for task in tasks.drain(..) {
+            std::hint::black_box(task.await.expect("the request task"));
+        }
+    }
+}
+
 async fn https(m: &Meter) {
     let (listener, addr) = listen();
     // A fresh P-256 certificate: the handshake is not counted, and the
     // records' cost does not depend on the key.
     let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key");
     let cert = key.cert.pem();
-    let acceptor =
-        giong_tls::TlsAcceptor::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+    let certs =
+        giong_tls::Certificates::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
             .expect("the test certificate");
+    let acceptor =
+        giong_tls::TlsAcceptor::with_certificates(&certs).expect("the test certificate");
     let _server =
         giong::spawn(async move { Server::new().serve_tls(listener, acceptor, json).await });
     let connector = giong_tls::TlsConnector::with_root_pem(cert.as_bytes()).expect("the test root");
@@ -432,16 +489,59 @@ async fn web(m: &Meter) {
 /// Opens `n` idle connections to a giong-http server in this process from
 /// another thread (blocking std sockets, which own no heap memory) and
 /// prints the server's heap and RSS growth per connection.
-async fn idle(name: &'static str, n: usize, h2: bool) {
-    use std::io::{Read, Write};
+///
+/// For HTTPS the other thread does each handshake and one keep-alive
+/// request with rustls, then drops the client's TLS state and keeps only
+/// the socket (the server cannot tell, nothing is sent), so the heap that
+/// stays is the server's. The allocation count covers both ends.
+async fn idle(name: &'static str, n: usize, proto: Proto) {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     let (listener, addr) = listen();
-    let _server = giong::spawn(async move { Server::new().serve(listener, json).await });
-    // One request first, so whatever the server sets up once is not counted.
-    let warm = RawClient::connect(addr, b"GET /json HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
-    drop(warm);
+    let mut tls_client = None;
+    if proto == Proto::Https {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key");
+        let cert = key.cert.pem();
+        let certs = giong_tls::Certificates::from_pem(
+            cert.as_bytes(),
+            key.key_pair.serialize_pem().as_bytes(),
+        )
+        .expect("the test certificate");
+        let acceptor =
+            giong_tls::TlsAcceptor::with_certificates(&certs).expect("the test certificate");
+        let _server =
+            giong::spawn(async move { Server::new().serve_tls(listener, acceptor, json).await });
+        // One request first, so whatever the server sets up once is not
+        // counted.
+        let connector =
+            giong_tls::TlsConnector::with_root_pem(cert.as_bytes()).expect("the test root");
+        let client = giong_http::client::Client::builder()
+            .tls(connector)
+            .http2(false)
+            .build();
+        let url = format!("https://localhost:{}/json", addr.port());
+        let resp = client.get(&url).send().await.expect("a response");
+        assert_eq!(resp.status(), 200);
+        drop((resp, client));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(key.cert.der().clone()).expect("the test root");
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        // No session cache: it would keep tickets on the client's heap.
+        config.resumption = rustls::client::Resumption::disabled();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tls_client = Some(Arc::new(config));
+    } else {
+        let _server = giong::spawn(async move { Server::new().serve(listener, json).await });
+        let warm = RawClient::connect(addr, b"GET /json HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        drop(warm);
+    }
     let go = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -455,17 +555,13 @@ async fn idle(name: &'static str, n: usize, h2: bool) {
             }
             for _ in 0..n {
                 let mut s = std::net::TcpStream::connect(addr).expect("connect");
-                if h2 {
-                    s.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0")
-                        .expect("write the preface");
-                    // The server's SETTINGS proves that it has taken the
-                    // preface. Waiting for it before the next connection
-                    // keeps the server from falling behind: with thousands
-                    // of prefaces queued, the receive buffer pool runs low
-                    // and the driver copies data to the heap, by timing.
-                    let mut buf = [0u8; 256];
-                    let got = s.read(&mut buf).expect("read the server's SETTINGS");
-                    assert!(got >= 9 && buf[3] == 4, "the server answers with SETTINGS");
+                match proto {
+                    Proto::Http1 => {}
+                    Proto::Http2 => h2_request(&mut s),
+                    Proto::Https => {
+                        let config = tls_client.clone().expect("the client config");
+                        tls_request(config, &mut s);
+                    }
                 }
                 conns.push(s);
                 ready.fetch_add(1, Ordering::Release);
@@ -498,4 +594,91 @@ async fn idle(name: &'static str, n: usize, h2: bool) {
     );
     stop.store(true, Ordering::Release);
     opener.join().expect("the opener thread");
+}
+
+/// The HTTP/2 preface, SETTINGS and one `GET /` over `sock` (prior
+/// knowledge), read to the end of the response, as `bench/h2.sh`'s `h2-idle`
+/// does: a connection that has made a request holds what a request leaves
+/// behind (an HTTP/2 connection kept the memory for its streams for a second
+/// after each request in 0.8.0, which only shows when the connection has
+/// had one). Waiting for the answer before the next connection also keeps
+/// the server from falling behind: with thousands of prefaces queued, the
+/// receive buffer pool runs low and the driver copies data to the heap, by
+/// timing.
+fn h2_request(sock: &mut std::net::TcpStream) {
+    use std::io::{Read, Write};
+    // HEADERS on stream 1, END_STREAM and END_HEADERS: :method GET,
+    // :scheme http, :path / (static table entries 2, 6 and 4) and
+    // :authority localhost (literal, not indexed, name from entry 1).
+    const HEADERS: &[u8] = b"\0\0\x0e\x01\x05\0\0\0\x01\x82\x86\x84\x01\x09localhost";
+    let mut out = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0".to_vec();
+    out.extend_from_slice(HEADERS);
+    sock.write_all(&out)
+        .expect("write the preface and the request");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        // Every complete frame so far.
+        let mut at = 0;
+        while got.len() >= at + 9 {
+            let len = usize::from(got[at]) << 16
+                | usize::from(got[at + 1]) << 8
+                | usize::from(got[at + 2]);
+            if got.len() < at + 9 + len {
+                break;
+            }
+            let (kind, flags) = (got[at + 3], got[at + 4]);
+            let stream = u32::from_be_bytes([got[at + 5], got[at + 6], got[at + 7], got[at + 8]]);
+            if kind == 4 && flags & 1 == 0 {
+                sock.write_all(b"\0\0\0\x04\x01\0\0\0\0")
+                    .expect("acknowledge SETTINGS");
+            }
+            if (kind == 0 || kind == 1) && stream == 1 && flags & 1 == 1 {
+                return;
+            }
+            assert!(kind != 7, "the server sent GOAWAY");
+            at += 9 + len;
+        }
+        got.drain(..at);
+        let k = sock.read(&mut buf).expect("read the response");
+        assert!(k > 0, "the server closed");
+        got.extend_from_slice(&buf[..k]);
+    }
+}
+
+/// A TLS handshake and one keep-alive `GET /json` over `sock`, read to the
+/// end of the response; the client's TLS state is then dropped.
+fn tls_request(config: std::sync::Arc<rustls::ClientConfig>, sock: &mut std::net::TcpStream) {
+    use std::io::{Read, Write};
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+    let mut conn = rustls::ClientConnection::new(config, name).expect("a TLS client");
+    let mut tls = rustls::Stream::new(&mut conn, sock);
+    tls.write_all(b"GET /json HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .expect("write the request");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let k = tls.read(&mut buf).expect("read the response");
+        assert!(k > 0, "the server closed");
+        got.extend_from_slice(&buf[..k]);
+        let Some(end) = find(&got, b"\r\n\r\n") else {
+            continue;
+        };
+        let head = std::str::from_utf8(&got[..end]).expect("an ASCII head");
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "unexpected response: {head}"
+        );
+        let body: usize = head
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case("content-length")
+                    .then(|| v.trim().parse().ok())?
+            })
+            .expect("a Content-Length");
+        if got.len() >= end + 4 + body {
+            return;
+        }
+    }
 }

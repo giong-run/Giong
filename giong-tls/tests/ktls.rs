@@ -10,6 +10,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{mpsc, Arc};
+use std::task::Poll;
 use std::time::Duration;
 
 use giong::error::Code;
@@ -96,13 +97,13 @@ impl Pki {
     }
 
     fn acceptor(&self, suite: Option<SupportedCipherSuite>, mode: Ktls) -> TlsAcceptor {
-        TlsAcceptor::new(Arc::new(self.server(suite)))
+        TlsAcceptor::from_rustls(Arc::new(self.server(suite)))
             .ktls(mode)
             .unwrap()
     }
 
     fn connector(&self, suite: Option<SupportedCipherSuite>, mode: Ktls) -> TlsConnector {
-        TlsConnector::new(Arc::new(self.client(suite)))
+        TlsConnector::from_rustls(Arc::new(self.client(suite)))
             .ktls(mode)
             .unwrap()
     }
@@ -298,13 +299,13 @@ fn required_fails_up_front_and_says_why_when_the_kernel_cannot() {
         return;
     }
     let pki = pki();
-    let err = TlsAcceptor::new(Arc::new(pki.server(None)))
+    let err = TlsAcceptor::from_rustls(Arc::new(pki.server(None)))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert_eq!(code(&err), Some(Code::KtlsUnavailable), "{err}");
     let why = ktls_support().unavailable_reason().unwrap();
     assert!(err.to_string().contains(why), "{err}");
-    let err = TlsConnector::new(Arc::new(pki.client(None)))
+    let err = TlsConnector::from_rustls(Arc::new(pki.client(None)))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert_eq!(code(&err), Some(Code::KtlsUnavailable), "{err}");
@@ -315,19 +316,19 @@ fn configurations_with_0rtt_data_cannot_use_kernel_tls() {
     let pki = pki();
     let mut server = pki.server(None);
     server.max_early_data_size = 16384;
-    let acceptor = TlsAcceptor::new(Arc::new(server.clone()))
+    let acceptor = TlsAcceptor::from_rustls(Arc::new(server.clone()))
         .ktls(Ktls::Auto)
         .unwrap();
     let why = acceptor.ktls_unavailable().expect("a reason");
     assert!(why.contains("0-RTT"), "{why}");
-    let err = TlsAcceptor::new(Arc::new(server))
+    let err = TlsAcceptor::from_rustls(Arc::new(server))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert_eq!(code(&err), Some(Code::KtlsUnavailable), "{err}");
 
     let mut client = pki.client(None);
     client.enable_early_data = true;
-    let err = TlsConnector::new(Arc::new(client))
+    let err = TlsConnector::from_rustls(Arc::new(client))
         .ktls(Ktls::Required)
         .unwrap_err();
     assert!(err.to_string().contains("0-RTT"), "{err}");
@@ -336,8 +337,8 @@ fn configurations_with_0rtt_data_cannot_use_kernel_tls() {
 #[test]
 fn off_is_the_default_and_keeps_connections_in_the_process() {
     let pki = pki();
-    let acceptor = TlsAcceptor::new(Arc::new(pki.server(None)));
-    let connector = TlsConnector::new(Arc::new(pki.client(None)));
+    let acceptor = TlsAcceptor::from_rustls(Arc::new(pki.server(None)));
+    let connector = TlsConnector::from_rustls(Arc::new(pki.client(None)));
     assert_eq!(acceptor.ktls_unavailable(), None);
     run(async move {
         let (server, client) = tls_pair(acceptor, connector).await;
@@ -423,7 +424,7 @@ fn what_the_handshake_settled_survives_the_handoff() {
     ] {
         let mut server = pki.server(Some(suite));
         server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let acceptor = TlsAcceptor::new(Arc::new(server))
+        let acceptor = TlsAcceptor::from_rustls(Arc::new(server))
             .ktls(Ktls::Required)
             .unwrap();
         let connector = pki
@@ -474,13 +475,16 @@ fn a_peer_that_cuts_its_records_small_still_hands_over_cleanly() {
             let mut client = pki.client(Some(suite));
             let (acceptor, connector) = if kernel_side == "client" {
                 server.max_fragment_size = Some(32);
-                let acceptor = TlsAcceptor::new(Arc::new(server));
-                let connector = TlsConnector::new(Arc::new(client)).ktls(Ktls::Required);
+                let acceptor = TlsAcceptor::from_rustls(Arc::new(server));
+                let connector = TlsConnector::from_rustls(Arc::new(client)).ktls(Ktls::Required);
                 (acceptor, connector.unwrap())
             } else {
                 client.max_fragment_size = Some(32);
-                let acceptor = TlsAcceptor::new(Arc::new(server)).ktls(Ktls::Required);
-                (acceptor.unwrap(), TlsConnector::new(Arc::new(client)))
+                let acceptor = TlsAcceptor::from_rustls(Arc::new(server)).ktls(Ktls::Required);
+                (
+                    acceptor.unwrap(),
+                    TlsConnector::from_rustls(Arc::new(client)),
+                )
             };
             let label = format!("{:?}, kernel on the {kernel_side}", suite.suite());
             run(async move {
@@ -550,6 +554,69 @@ fn data_sent_with_the_last_handshake_flight_is_not_lost() {
         });
         server.join().unwrap();
     }
+}
+
+#[test]
+fn a_key_update_sent_with_the_last_handshake_flight_is_answered() {
+    if !kernel_tls() || !kernel_key_updates() {
+        return;
+    }
+    // The client's Finished, data, a KeyUpdate that asks for the server's
+    // and more data, all in one write: the server's handshake finds them in
+    // the socket together. It must leave everything after the Finished to
+    // the kernel. If rustls took the KeyUpdate, it would change the sending
+    // key and keep the answer for a write it never makes, and the client
+    // could not decrypt what the kernel sends.
+    let pki = pki();
+    let suite = suites::TLS13_AES_128_GCM_SHA256;
+    let acceptor = pki.acceptor(Some(suite), Ktls::Required);
+    let config = Arc::new(pki.client(Some(suite)));
+    let updates = ktls_stats().key_updates;
+    with_server(acceptor, echo, move |addr| {
+        for round in 0..10u8 {
+            let mut sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let mut conn = ClientConnection::new(config.clone(), name).unwrap();
+            while conn.is_handshaking() {
+                while conn.wants_write() {
+                    retry(|| conn.write_tls(&mut sock)).unwrap();
+                }
+                assert!(
+                    retry(|| conn.read_tls(&mut sock)).unwrap() > 0,
+                    "closed in the handshake"
+                );
+                conn.process_new_packets().unwrap();
+            }
+            // The Finished is queued, not sent yet.
+            assert!(conn.wants_write());
+            conn.writer().write_all(&[round; 1000]).unwrap();
+            conn.refresh_traffic_keys().unwrap();
+            conn.writer().write_all(&[round + 100; 1000]).unwrap();
+            let mut flight = Vec::new();
+            while conn.wants_write() {
+                conn.write_tls(&mut flight).unwrap();
+            }
+            sock.write_all(&flight).unwrap();
+
+            let mut back = Vec::new();
+            while back.len() < 2000 {
+                assert!(
+                    retry(|| conn.read_tls(&mut sock)).unwrap() > 0,
+                    "closed before the echo"
+                );
+                let state = conn.process_new_packets().unwrap();
+                let at = back.len();
+                back.resize(at + state.plaintext_bytes_to_read(), 0);
+                conn.reader().read_exact(&mut back[at..]).unwrap();
+            }
+            assert_eq!(back[..1000], [round; 1000]);
+            assert_eq!(back[1000..], [round + 100; 1000]);
+        }
+    });
+    // Each round: the client's key, and the server's in answer.
+    assert!(ktls_stats().key_updates >= updates + 20);
 }
 
 /// Drives a blocking rustls connection that queues `data` before the
@@ -1179,6 +1246,59 @@ fn kernel_recv_is_cancel_safe() {
         sleep(Duration::from_millis(50)).await;
         let stats = giong::observe::worker_stats();
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
+fn a_kernel_recv_dropped_as_it_answers_a_key_update_can_still_send() {
+    if !kernel_tls() || !kernel_key_updates() {
+        return;
+    }
+    let pki = pki();
+    let suite = suites::TLS13_AES_128_GCM_SHA256;
+    let acceptor = pki.acceptor(Some(suite), Ktls::Required);
+    let client = Arc::new(pki.client(Some(suite)));
+    let (tx, rx) = mpsc::channel();
+    // Every receive is dropped after one poll, the one that reads the
+    // peer's KeyUpdate and answers it included. That answer used to be a
+    // send the poll left with the kernel: dropping it ended the stream's
+    // sending (GIONG-E2008).
+    let serve = move |tls: TlsStream| {
+        let tx = tx.clone();
+        async move {
+            let mut got = Vec::new();
+            while got.len() < 2000 {
+                let mut recv = std::pin::pin!(tls.recv());
+                match std::future::poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx))).await {
+                    Poll::Ready(data) => {
+                        let data = data.unwrap();
+                        assert!(!data.is_empty(), "closed after {} bytes", got.len());
+                        got.extend_from_slice(&data);
+                    }
+                    Poll::Pending => sleep(Duration::from_millis(1)).await,
+                }
+            }
+            let (res, _) = tls.write_all(got).await;
+            let _ = tx.send(res);
+            let _ = tls.shutdown().await;
+        }
+    };
+    let updates = ktls_stats().key_updates;
+    with_server(acceptor, serve, move |addr| {
+        let mut c = blocking_client(addr, &client);
+        c.write_all(&[1; 1000]).unwrap();
+        c.conn.refresh_traffic_keys().unwrap();
+        c.write_all(&[2; 1000]).unwrap();
+        // The answer comes under the server's next key, which the client
+        // moves to only when it has read the server's KeyUpdate.
+        let mut back = [0; 2000];
+        c.read_exact(&mut back).unwrap();
+        assert_eq!(back[..1000], [1; 1000]);
+        assert_eq!(back[1000..], [2; 1000]);
+        let sent = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(sent.is_ok(), "{sent:?}");
+        // The peer's key, and ours in answer.
+        assert!(ktls_stats().key_updates >= updates + 2);
     });
 }
 

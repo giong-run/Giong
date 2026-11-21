@@ -76,7 +76,7 @@ fn a_taken_connection_is_exclusive_and_comes_back_clean() {
         }
         let e = pool.batch_execute("SAVEPOINT s").await.unwrap_err();
         assert_eq!(
-            e.code(),
+            e.server_code(),
             Some("25P01"),
             "the shared connection is not in a transaction: {e}"
         );
@@ -132,9 +132,9 @@ fn broken_connections_are_replaced() {
 #[test]
 fn connect_errors_are_reported_and_counted() {
     run(|s| async move {
-        let pool = Pool::new(s.local().dbname("missing_db"), 2);
+        let pool = Pool::new(s.local().database("missing_db"), 2);
         let e = pool.query("SELECT 1", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some("3D000"), "{e}");
+        assert_eq!(e.server_code(), Some("3D000"), "{e}");
         assert_eq!(pool.stats().connect_errors, 1);
         assert_eq!(pool.stats().connections, 0);
     });
@@ -185,7 +185,7 @@ fn a_slow_statement_does_not_hold_up_the_ones_behind_it() {
             "the quick statements waited behind the slow one: {took:?}"
         );
         let e = slow.await.unwrap().unwrap_err();
-        assert_eq!(e.code(), Some("57014"), "{e}");
+        assert_eq!(e.server_code(), Some("57014"), "{e}");
     });
 }
 
@@ -555,7 +555,7 @@ fn a_cancel_token_stops_working_when_its_connection_goes_back() {
             });
             let slow = conn.query("SELECT pg_sleep(5)", &[]).await;
             cancel.await.unwrap().unwrap();
-            assert_eq!(slow.unwrap_err().code(), Some("57014"));
+            assert_eq!(slow.unwrap_err().server_code(), Some("57014"));
             token
         };
         // Back in the pool, where another task runs a statement on it.
@@ -671,5 +671,18 @@ fn a_connection_carries_at_most_1024_statements_at_a_time() {
             t.await.unwrap().unwrap();
         }
         assert_eq!(pool.stats().timeouts, 0);
+    });
+}
+
+#[test]
+fn timeouts_too_long_for_the_clock_mean_no_limit() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1)
+            .idle_timeout(Duration::MAX)
+            .max_lifetime(Duration::MAX);
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        drop(pool.get().await.unwrap());
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        assert_eq!(pool.stats().opened, 1);
     });
 }

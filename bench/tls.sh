@@ -15,8 +15,11 @@
 #   * `json` and `users` use keep-alive connections: the handshake happens once
 #     and the numbers show the cost of encrypting records.
 #   * `handshake` (TLS servers only) sends `Connection: close`, so every
-#     request needs a new connection and a full handshake (ECDSA P-256
-#     certificate, no session resumption by wrk).
+#     request needs a new connection and a handshake. wrk offers each new
+#     connection the session of the one before, so after the first these are
+#     resumed TLS 1.3 handshakes (a key exchange with X25519 and the key
+#     schedule; no certificate and no signature), the common case for
+#     clients that reconnect.
 #     It is not measured without TLS: on loopback that case is limited by the
 #     client. When the client's FIN goes out before the server's, the client
 #     side ends up in TIME_WAIT and wrk runs out of ports that may be reused
@@ -32,6 +35,12 @@
 #     cache; read and encrypted in pieces by rustls otherwise.
 #     `file64k-open` opens the file for every request, as a static file
 #     server without a cache of open files does.
+#   * `axum-tls-aes128` is axum-tls with its rustls configuration set to
+#     pick AES-128-GCM first whatever order the client lists, as giong-tls'
+#     `TlsAcceptor::with_certificates` does. wrk (OpenSSL) lists AES-256-GCM first,
+#     which the other rustls servers follow; its suite hashes with SHA-384,
+#     which costs a resumed handshake about a sixth of its CPU time. The row
+#     shows how much of giong's handshake rate is that choice.
 #   * `cpu%` is how busy the server's core was during the measurement. Well
 #     below 100 means that the load generator was the limit, not the server.
 #     `us/req` is the server's CPU time (user + system) per request: kernel
@@ -63,12 +72,13 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -addext "subjectAltName=DNS:localhost" 2>/dev/null
 export TLS_CERT="$TMP/cert.pem" TLS_KEY="$TMP/key.pem"
 
-read -r -a NAMES <<<"${SERVERS:-axum giong-http axum-tls giong-http-tls giong-http-ktls}"
+read -r -a NAMES <<<"${SERVERS:-axum giong-http axum-tls axum-tls-aes128 giong-http-tls giong-http-ktls}"
 read -r -a EPS <<<"${ENDPOINTS:-json users handshake bytes64k bytes1m file64k file1m}"
 declare -A CMD=(
   [axum]="axum/target/release/bench-axum"
   [giong-http]="env -u TLS_CERT giong-http/target/release/bench-giong-http"
   [axum-tls]="axum-tls/target/release/bench-axum-tls"
+  [axum-tls-aes128]="env PREFER_AES128=1 axum-tls/target/release/bench-axum-tls"
   [giong-http-tls]="env GIONG_KTLS=off giong-http/target/release/bench-giong-http"
   [giong-http-ktls]="env GIONG_KTLS=required giong-http/target/release/bench-giong-http"
 )
@@ -76,6 +86,7 @@ declare -A URL=(
   [axum]="http://127.0.0.1:3003"
   [giong-http]="http://127.0.0.1:3009"
   [axum-tls]="https://127.0.0.1:3011"
+  [axum-tls-aes128]="https://127.0.0.1:3011"
   [giong-http-tls]="https://127.0.0.1:3010"
   [giong-http-ktls]="https://127.0.0.1:3010"
 )

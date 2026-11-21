@@ -46,6 +46,15 @@ struct Counters {
     cross_worker: AtomicU64,
     /// Messages the server got in more than one receive.
     split: AtomicU64,
+    /// Connects answered "connection refused" although every listener was
+    /// up. Linux does this on its own, rarely: a client that aborts a
+    /// connection the server already closed frees its port at once, and when
+    /// the next connect from that port reaches the server before the abort
+    /// does, the old connection's remains answer it with a reset. Plain
+    /// `std::net` sockets get the same (the pull request that added this
+    /// counter has the program). Counted and held to a small share, since a
+    /// listener that went away would refuse thousands.
+    connects_refused: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
 }
@@ -192,6 +201,10 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
     while Instant::now() < deadline {
         let stream = match TcpStream::connect(addr).await {
             Ok(stream) => stream,
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                Counters::bump(&counters.connects_refused);
+                continue;
+            }
             Err(err) => {
                 counters.unexpected("connect", err);
                 sleep(Duration::from_millis(10)).await;
@@ -338,7 +351,7 @@ async fn cross_worker(workers: usize, deadline: Instant, counters: Arc<Counters>
     let handle = giong::handle();
     while Instant::now() < deadline {
         let target = (giong::worker_id() + 1) % workers;
-        let (tx, mut rx) = giong::sync::mpsc::channel::<usize>();
+        let (tx, mut rx) = giong::sync::mpsc::unbounded::<usize>();
         let task = handle.spawn_on(target, move || async move {
             let _ = tx.send(giong::worker_id());
             giong::worker_id()
@@ -518,7 +531,7 @@ fn soak() {
     eprintln!(
         "soak: done after {secs}s on {workers} workers: {} connections, {} echoes, \
          {} cancelled receives, {} messages received in pieces, {} datagrams, {} files, \
-         {} cross-worker hops",
+         {} cross-worker hops, {} connects refused by the kernel",
         c.connections.load(Ordering::Relaxed),
         c.round_trips.load(Ordering::Relaxed),
         c.cancelled_recvs.load(Ordering::Relaxed),
@@ -526,10 +539,22 @@ fn soak() {
         c.datagrams.load(Ordering::Relaxed),
         c.files.load(Ordering::Relaxed),
         c.cross_worker.load(Ordering::Relaxed),
+        c.connects_refused.load(Ordering::Relaxed),
     );
 
     // 1. Every scenario behaved as designed.
     assert_eq!(c.unexpected.load(Ordering::Relaxed), 0, "unexpected errors");
+    // Refused connects are the kernel's (see `Counters::connects_refused`):
+    // one in 317 million was measured, so one in 50 million leaves room and
+    // still fails when a listener stops answering.
+    let (refused, connections) = (
+        c.connects_refused.load(Ordering::Relaxed),
+        c.connections.load(Ordering::Relaxed),
+    );
+    assert!(
+        refused <= 1 + connections / 50_000_000,
+        "{refused} of {connections} connects were refused while every listener was up"
+    );
     assert!(c.connections.load(Ordering::Relaxed) > 0);
     assert!(c.cancelled_recvs.load(Ordering::Relaxed) > 0);
 

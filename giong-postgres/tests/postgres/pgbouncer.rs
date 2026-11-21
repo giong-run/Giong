@@ -37,7 +37,7 @@ impl Bouncer {
             .host("127.0.0.1")
             .port(self.port)
             .user("postgres")
-            .dbname("postgres")
+            .database("postgres")
     }
 }
 
@@ -66,6 +66,35 @@ fn start(s: &Server, settings: &str, users: &[(&str, &str)]) -> Option<Bouncer> 
         eprintln!("skipping: pgbouncer not found (set GIONG_PGBOUNCER_BIN)");
         return None;
     };
+    let mut attempt = 1;
+    loop {
+        match launch(&bin, s, settings, users) {
+            Ok(bouncer) => return Some(bouncer),
+            Err(log) if log.contains("Address already in use") && attempt < START_ATTEMPTS => {
+                eprintln!("pgbouncer: its port was taken before it could listen; trying another");
+                attempt += 1;
+            }
+            Err(log) => panic!("pgbouncer did not start: {log}"),
+        }
+    }
+}
+
+/// How many ports `start` tries before it gives up.
+const START_ATTEMPTS: usize = 5;
+
+/// Starts PgBouncer on a port free a moment ago and waits until it says it
+/// listens there; or, if it exits first, gives its log.
+///
+/// The port can be taken in that moment by a server another test starts, and
+/// PgBouncer then exits. A probe that connects to the port would reach that
+/// server instead and pass, and the test would find nothing there once the
+/// other server stops, so readiness is PgBouncer's own word in its log.
+fn launch(
+    bin: &std::path::Path,
+    s: &Server,
+    settings: &str,
+    users: &[(&str, &str)],
+) -> Result<Bouncer, String> {
     let port = free_port();
     let dir = std::env::temp_dir().join(format!("giong-pgbouncer-{}-{port}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -74,6 +103,7 @@ fn start(s: &Server, settings: &str, users: &[(&str, &str)]) -> Option<Bouncer> 
         auth += &format!("\"{user}\" \"{password}\"\n");
     }
     std::fs::write(dir.join("users.txt"), auth).unwrap();
+    let log_path = dir.join("pgbouncer.log");
     std::fs::write(
         dir.join("pgbouncer.ini"),
         format!(
@@ -102,17 +132,25 @@ fn start(s: &Server, settings: &str, users: &[(&str, &str)]) -> Option<Bouncer> 
         .stderr(Stdio::null())
         .spawn()
         .expect("start pgbouncer");
-    let bouncer = Bouncer { port, child, dir };
+    let mut bouncer = Bouncer { port, child, dir };
+    let listening = format!("listening on 127.0.0.1:{port}");
     let started = std::time::Instant::now();
-    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log.contains(&listening) {
+            return Ok(bouncer);
+        }
+        if bouncer.child.try_wait().unwrap().is_some() {
+            // Dropping `bouncer` removes its directory: read the log first.
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            return Err(log);
+        }
         assert!(
             started.elapsed() < Duration::from_secs(10),
-            "pgbouncer did not start: {}",
-            std::fs::read_to_string(bouncer.dir.join("pgbouncer.log")).unwrap_or_default()
+            "pgbouncer did not start: {log}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    Some(bouncer)
 }
 
 /// 8 tasks, each with statements and transactions (into `table`) through
@@ -170,7 +208,7 @@ fn through_pgbouncer_the_statement_timeout_must_not_be_sent() {
         // PgBouncer refuses startup parameters it does not track.
         let e = Client::connect(&bouncer.config()).await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
-        assert_eq!(e.code(), Some("08P01"), "{e}");
+        assert_eq!(e.server_code(), Some("08P01"), "{e}");
         let shown = e.to_string();
         assert!(shown.contains("statement_timeout(None)"), "{shown}");
         assert!(shown.contains("ALTER ROLE"), "{shown}");
@@ -226,7 +264,7 @@ fn through_pgbouncer_the_statement_timeout_comes_from_the_role() {
             assert_eq!(row.get::<&str>(0).unwrap(), "300ms");
         }
         let e = pool.query("SELECT pg_sleep(5)", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some("57014"), "{e}");
+        assert_eq!(e.server_code(), Some("57014"), "{e}");
         let errors = workload(&pool, "bouncer_role_log").await;
         assert!(errors.is_empty(), "{errors:?}");
         sleep(Duration::from_millis(1)).await;

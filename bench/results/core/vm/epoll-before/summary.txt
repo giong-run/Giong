@@ -1,0 +1,28 @@
+5 rounds; ns per operation, median [min-max]
+workload   runtime          wall      min      max      cpu
+spawn      giong           165.5    162.1    171.7    165.4
+
+yield      giong            28.4     26.0     38.4     28.4
+
+pingpong   giong           530.7    520.3    644.7    529.2
+
+mpsc       giong            41.0     37.9     49.7     39.9
+
+bounded    giong            47.0     46.6     53.5     46.7
+
+oneshot    giong           636.7    620.4    666.8    634.2
+
+chain      giong           285.9    279.7    360.9    284.2
+
+timers     giong           849.5    714.3    967.6    848.9
+
+timeout    giong            28.4     28.0     33.7     28.2
+
+xthread    giong           216.2    187.0    223.3    418.7
+
+tcp-rr     giong          5740.9   5251.3   6742.7   5585.3
+
+connect    giong         17485.1  16468.9  19972.1  16883.8
+
+lookup     giong           174.3    168.6    238.0    174.2
+

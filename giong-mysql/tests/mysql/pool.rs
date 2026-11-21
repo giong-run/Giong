@@ -1,5 +1,7 @@
 //! The per-worker pool.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use giong::time::{sleep, timeout, Instant};
@@ -134,7 +136,7 @@ fn connect_errors_are_reported_and_counted() {
     run(|s| async move {
         let pool = Pool::new(s.local().database("missing_db"), 2);
         let e = pool.query("SELECT 1", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some(1049), "{e}");
+        assert_eq!(e.server_code(), Some(1049), "{e}");
         assert_eq!(pool.stats().connect_errors, 1);
         assert_eq!(pool.stats().connections, 0);
     });
@@ -695,5 +697,105 @@ fn without_a_database_a_connection_that_changed_it_is_closed() {
         let row = pool.query_one("SELECT DATABASE()", &[]).await.unwrap();
         assert_eq!(row.get::<Option<String>>(0).unwrap(), None);
         assert_eq!(pool.stats().opened, 2);
+    });
+}
+
+#[test]
+fn idle_connections_are_closed() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 3).idle_timeout(Duration::from_millis(200));
+        // A burst opens all three.
+        let held: Vec<_> = (0..3).map(|_| pool.get()).collect();
+        let mut conns = Vec::new();
+        for get in held {
+            conns.push(get.await.unwrap());
+        }
+        for conn in &conns {
+            conn.query_one("SELECT 1", &[]).await.unwrap();
+        }
+        drop(conns);
+        assert_eq!(pool.stats().connections, 3);
+        let started = Instant::now();
+        while pool.stats().connections > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                pool.stats()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        let stats = pool.stats();
+        assert_eq!(stats.recycled, stats.opened);
+        // And opened again when needed.
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        assert_eq!(pool.stats().connections, 1);
+    });
+}
+
+#[test]
+fn old_connections_are_replaced_even_under_load() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 2).max_lifetime(Duration::from_millis(200));
+        let stop = Rc::new(Cell::new(false));
+        let done = Rc::new(Cell::new(0u64));
+        for _ in 0..16 {
+            let (pool, stop, done) = (pool.clone(), stop.clone(), done.clone());
+            giong::spawn(async move {
+                while !stop.get() {
+                    pool.query_one("SELECT 1", &[]).await.unwrap();
+                    done.set(done.get() + 1);
+                }
+            });
+        }
+        let id = |pool: Pool| async move {
+            let row = pool.query_one("SELECT CONNECTION_ID()", &[]).await.unwrap();
+            row.get::<u64>(0).unwrap()
+        };
+        let first = id(pool.clone()).await;
+        sleep(Duration::from_millis(600)).await;
+        let stats = pool.stats();
+        assert!(stats.recycled >= 2, "{stats:?}");
+        assert!(stats.connections <= 2, "{stats:?}");
+        let before = done.get();
+        sleep(Duration::from_millis(50)).await;
+        assert!(done.get() > before, "statements go on");
+        let mut later = Vec::new();
+        for _ in 0..10 {
+            later.push(id(pool.clone()).await);
+        }
+        assert!(!later.contains(&first), "{first} still in use: {later:?}");
+        stop.set(true);
+        assert_eq!(pool.stats().timeouts, 0);
+    });
+}
+
+#[test]
+fn a_taken_connection_past_its_lifetime_is_closed_when_it_comes_back() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1).max_lifetime(Duration::from_millis(100));
+        let conn = pool.get().await.unwrap();
+        let first = conn.query_one("SELECT CONNECTION_ID()", &[]).await.unwrap();
+        let first: u64 = first.get(0).unwrap();
+        sleep(Duration::from_millis(150)).await;
+        // Still usable while taken: the lifetime never cuts a task off.
+        conn.query_one("SELECT 1", &[]).await.unwrap();
+        drop(conn);
+        let stats = pool.stats();
+        assert_eq!((stats.connections, stats.recycled), (0, 1), "{stats:?}");
+        let row = pool.query_one("SELECT CONNECTION_ID()", &[]).await.unwrap();
+        assert_ne!(row.get::<u64>(0).unwrap(), first);
+    });
+}
+
+#[test]
+fn timeouts_too_long_for_the_clock_mean_no_limit() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1)
+            .idle_timeout(Duration::MAX)
+            .max_lifetime(Duration::MAX);
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        drop(pool.get().await.unwrap());
+        pool.query_one("SELECT 1", &[]).await.unwrap();
+        assert_eq!(pool.stats().opened, 1);
     });
 }

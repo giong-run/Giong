@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use giong::net::TcpListener;
 use giong::time::sleep;
 use giong_http::{Request, Response, Server};
-use giong_tls::TlsAcceptor;
+use giong_tls::{Certificates, TlsAcceptor};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
@@ -55,9 +55,12 @@ impl TestServer {
         Fut: Future<Output = Response> + 'static,
     {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let acceptor = TlsAcceptor::from_pem(
-            key.cert.pem().as_bytes(),
-            key.key_pair.serialize_pem().as_bytes(),
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(
+                key.cert.pem().as_bytes(),
+                key.key_pair.serialize_pem().as_bytes(),
+            )
+            .unwrap(),
         )
         .unwrap()
         .handshake_timeout(handshake_timeout);
@@ -262,6 +265,21 @@ fn answers_requests_on_a_kept_alive_tls_connection() {
     let r = c.reply();
     assert_eq!(r.header("connection"), Some("close"));
     c.expect_closed();
+}
+
+/// Below `min_free_memory`, a new TLS connection is closed before its
+/// handshake, which is what would take the memory.
+#[test]
+fn new_tls_connections_are_closed_while_memory_is_low() {
+    let server = TestServer::start(Server::new().min_free_memory(usize::MAX), echo);
+    let mut c = server.client();
+    let err = c
+        .stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        .and_then(|()| c.stream.flush())
+        .and_then(|()| c.stream.read(&mut [0u8; 64]).map(|_| ()));
+    assert!(err.is_err(), "the server answered");
+    assert!(c.stream.conn.is_handshaking(), "the handshake completed");
 }
 
 #[test]

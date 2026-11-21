@@ -420,6 +420,35 @@ jobs:
                 "$t" -q
               done'
 
+  # giong-http with its defaults, in a container limited to 128 MiB, under
+  # hundreds of uploads that stop one byte short: it must not be OOM-killed,
+  # and a well-behaved client mixed in must keep getting answers. One and four
+  # workers, on epoll and on io_uring (scripts/slow-uploads.sh). Then in 48 MiB
+  # under idle connections until it refuses them for low memory: it must not
+  # be OOM-killed, and must keep serving the ones it holds
+  # (scripts/idle-connections.sh).
+  slow-uploads:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Fetch the release build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      # Built with the test binaries already (`cargo test` builds examples),
+      # with the same features, so this finds it up to date.
+      - run: cargo build --release --workspace --all-features --example defaults
+      - run: scripts/slow-uploads.sh target/release/examples/defaults
+      - run: scripts/idle-connections.sh target/release/examples/defaults
+
   # ThreadSanitizer over every test: twice on io_uring and once on the epoll
   # driver, which hands file operations to threads of its own. Three jobs side
   # by side, each with its own build (the standard library included).
@@ -492,6 +521,20 @@ jobs:
         with:
           toolchain: stable
       - run: scripts/check.sh loom
+
+  # The deterministic simulation (sim/README.md): the epoll driver on a
+  # simulated kernel, with faults chosen by a seed; scenarios for HTTP, TLS,
+  # HTTP/2, Redis, PostgreSQL and files, months of simulated uptime, and the
+  # core crate's tests with and without faults. A failure prints its seed.
+  sim:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: scripts/check.sh sim
 
   # The core crate's tests with each of its direct dependencies at the lowest
   # version its Cargo.toml allows, so that the floors there are checked, not
@@ -631,12 +674,32 @@ jobs:
           retention-days: 14
           overwrite: true
 
+  # Proofs with the Kani model checker for the unsafe core: the slab, the
+  # receive buffer pool against a model of the kernel's buffer rings,
+  # KernelBox, and the lifetime of an io_uring operation across cancel and
+  # completion (docs/kani.md says what each proves and within which bounds).
+  # Kani's version is pinned: it brings its own nightly compiler and CBMC.
+  kani:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version 0.68.0
+          cargo kani setup
+      # Two proofs at a time where they fit the runner's 16 GB (check.sh runs
+      # the largest alone).
+      - run: KANI_JOBS=2 scripts/check.sh kani
+
   # Every job of this workflow passed. One name to require on main, so that
-  # the jobs that are not required by themselves (Miri, the kernels, Docker,
-  # the other server versions, loom, h2spec, the lowest dependency versions)
-  # hold a merge back as well.
+  # the jobs that are not required by themselves (Miri, Kani, the kernels,
+  # Docker, the other server versions, loom, h2spec, the lowest dependency
+  # versions, the simulation) hold a merge back as well.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, tsan, miri, loom, minimal-versions, kernels, semver, instr]
+    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim]
     if: always()
     runs-on: ubuntu-24.04
     steps:

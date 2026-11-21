@@ -1,0 +1,53 @@
+# h2load -D 5 -t3: json is 48 connections x 10 streams, json-mux is 3 x 100; one worker on CPU 3,
+# h2load on CPUs 0-2; 4-vCPU VM. Too noisy to settle a few percent: json moves by up to 10% between
+# rounds of one build. Batch 1 ran old, merged, fixed in each round; batch 2 the other way round.
+# old = 0.8.0 (b6d9b4b), merged = #125 (003d9e5), fixed = this change. See h2-instructions.csv.
+batch,round,build,endpoint,rps
+1,1,old,json,712612.00
+1,1,old,json-mux,865292.00
+1,1,merged,json,721248.40
+1,1,merged,json-mux,804905.20
+1,1,fixed,json,685625.20
+1,1,fixed,json-mux,790425.20
+1,2,old,json,700320.60
+1,2,old,json-mux,820998.60
+1,2,merged,json,698391.00
+1,2,merged,json-mux,801175.40
+1,2,fixed,json,642193.00
+1,2,fixed,json-mux,817426.80
+1,3,old,json,701447.20
+1,3,old,json-mux,820432.80
+1,3,merged,json,727430.20
+1,3,merged,json-mux,810573.00
+1,3,fixed,json,691387.60
+1,3,fixed,json-mux,793080.80
+1,4,old,json,740735.40
+1,4,old,json-mux,878759.20
+1,4,merged,json,739964.60
+1,4,merged,json-mux,831650.40
+1,4,fixed,json,702442.20
+1,4,fixed,json-mux,795066.80
+2,1,fixed,json,695547.60
+2,1,fixed,json-mux,820087.60
+2,1,merged,json,708313.60
+2,1,merged,json-mux,817518.20
+2,1,old,json,677259.00
+2,1,old,json-mux,839342.40
+2,2,fixed,json,651703.40
+2,2,fixed,json-mux,812563.00
+2,2,merged,json,772221.60
+2,2,merged,json-mux,826606.60
+2,2,old,json,675232.20
+2,2,old,json-mux,850182.40
+2,3,fixed,json,705077.60
+2,3,fixed,json-mux,755416.20
+2,3,merged,json,705003.40
+2,3,merged,json-mux,823776.40
+2,3,old,json,758288.60
+2,3,old,json-mux,842915.00
+2,4,fixed,json,718308.80
+2,4,fixed,json-mux,821934.60
+2,4,merged,json,721264.80
+2,4,merged,json-mux,825630.00
+2,4,old,json,732575.60
+2,4,old,json-mux,875247.00

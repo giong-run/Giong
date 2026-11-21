@@ -138,7 +138,7 @@ fn the_server_wide_limit_on_prepared_statements_is_handled() {
         }
         let client = Client::connect(&odd.tcp(SHA2_USER)).await.unwrap();
         let e = client.query("SELECT 'one more'", &[]).await.unwrap_err();
-        assert_eq!(e.code(), Some(1461), "{e}");
+        assert_eq!(e.server_code(), Some(1461), "{e}");
         assert!(e.to_string().contains("max_prepared_stmt_count"), "{e}");
         assert!(e.to_string().contains("statement_cache_capacity"), "{e}");
         drop(hog);
@@ -274,7 +274,7 @@ fn a_lock_wait_timeout_that_rolls_the_transaction_back_ends_it() {
             .execute("UPDATE odd_rot SET id = 2 WHERE id = 1", &[])
             .await
             .unwrap_err();
-        assert_eq!(e.code(), Some(1205), "{e}");
+        assert_eq!(e.server_code(), Some(1205), "{e}");
         // Not run outside the transaction, where it would commit at once.
         let e = tx_b
             .execute("INSERT INTO odd_rot VALUES (11)", &[])

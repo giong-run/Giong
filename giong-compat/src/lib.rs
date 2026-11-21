@@ -28,7 +28,7 @@
 //! HTTP/2, server and client), giong-web, giong-tls, giong-postgres,
 //! giong-mysql and giong-redis are built on giong's owned buffers and
 //! batched system calls; measured against the Tokio crates they replace on
-//! Tokio, they serve 1.2 to 4.7 times the requests or statements per core
+//! Tokio, they serve 1.1 to 5.1 times the requests or statements per core
 //! on the workloads measured (the "Choosing crates" table in giong's
 //! README). A Tokio crate run through `Compat` keeps its own design and
 //! adds a copy per byte written, and per byte read through `AsyncRead`
@@ -273,8 +273,10 @@ impl<S: Transport> Compat<S> {
     /// Sends everything written so far, then hands back the stream and the
     /// bytes received but not yet read, to carry on with giong's own API.
     ///
-    /// A shutdown that has started is abandoned. Not cancel safe: if the
-    /// future is dropped, the `Compat` is dropped with it.
+    /// A shutdown that has started is abandoned.
+    ///
+    /// Not cancel safe: if the future is dropped, the `Compat` is dropped
+    /// with it.
     pub async fn into_inner(mut self) -> io::Result<(S, Vec<u8>)> {
         poll_fn(|cx| self.poll_flush_buffered(cx)).await?;
         let unread = self.read.unread.bytes().to_vec();
@@ -461,6 +463,20 @@ impl<S: Transport> Compat<S> {
         }
         // A finished send hands back its buffer (or its error) first.
         let _ = self.poll_send(cx);
+        if self.write.buf.is_empty() && self.write.sending.is_none() && len >= self.write.limit {
+            // Nothing to keep in order before it, and too large to gather
+            // with others: straight to the socket, as `BufWriter` does,
+            // if the socket takes it now.
+            match S::send_now(&self.stream, bufs) {
+                Some(Ok(n)) => return Poll::Ready(Ok(n)),
+                Some(Err(e)) => {
+                    let text = e.to_string();
+                    self.write.state = WriteStatus::Failed(None, text);
+                    return Poll::Ready(Err(e));
+                }
+                None => {}
+            }
+        }
         if self.write.buf.len() >= self.write.limit {
             // Full: wait for the send before it. `Pending` here comes from
             // that send, which holds the waker. (Polling a send can finish

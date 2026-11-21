@@ -1,16 +1,21 @@
+builds: old = main 8606db1 (giong-compat 0.8.0), new = perf/core-faster (#145) on #142, with #146; 9 interleaved runs
 
-recv: MiB/s and CPU ns/KiB, median [min-max] of 9 runs
-  giong                3137 [2631-3241]      150.20 [141.60-165.20]
-  compat               3307 [2886-3774]      173.90 [156.70-194.60]
-  compat-bufread       3127 [2947-3402]      156.80 [146.00-171.00]
-  tokio                3119 [2861-3343]      130.20 [124.40-137.10]
+recv: MiB/s and CPU ns/KiB, median [min-max]
+  new  giong                3124 [2876-3506]        138.90 [128.50-153.40]
+  old  compat               3503 [2703-4034]        169.60 [148.40-199.40]
+  new  compat               3197 [2946-3677]        146.80 [134.30-155.20]
+  old  compat-bufread       3263 [2988-3874]        143.70 [134.30-163.00]
+  new  compat-bufread       3280 [3045-3493]        141.30 [121.50-150.60]
+  new  tokio                3041 [2479-3695]        123.60 [118.00-126.50]
 
-send: MiB/s and CPU ns/KiB, median [min-max] of 9 runs
-  giong                2294 [1952-2764]      423.90 [347.80-485.20]
-  compat               2195 [2110-2298]      443.40 [421.20-453.60]
-  tokio                2225 [1871-2952]      431.40 [329.50-513.40]
+send: MiB/s and CPU ns/KiB, median [min-max]
+  new  giong                2737 [2069-3196]        351.10 [303.50-467.30]
+  old  compat               2381 [2201-2553]        407.00 [379.20-423.70]
+  new  compat               2535 [2255-4642]        378.60 [209.70-425.40]
+  new  tokio                2404 [2266-3100]        404.00 [314.30-428.40]
 
-rr: round trips/s and CPU us/round trip, median [min-max] of 9 runs
-  giong               31531 [29459-34382]       15.11 [14.24-18.62]
-  compat              31746 [29621-33600]       15.39 [14.68-16.05]
-  tokio               32268 [28751-34046]       15.19 [14.25-16.96]
+rr: round trips/s and CPU us/round trip, median [min-max]
+  new  giong               33815 [30808-35058]         13.76 [13.07-15.09]
+  old  compat              33159 [31855-34394]         14.79 [14.34-15.67]
+  new  compat              34331 [31586-35290]         13.67 [13.24-14.61]
+  new  tokio               34194 [32267-35948]         14.00 [13.07-14.75]

@@ -18,7 +18,7 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// |---|---|
 /// | `ts` | when the request reached the logger: RFC 3339, UTC, microseconds |
 /// | `level` | `error` for a `5xx` status, `info` otherwise |
-/// | `event` | always `request` |
+/// | `event` | `request`, or `request cancelled` (see below) |
 /// | `method`, `path` | as sent; the path still percent-encoded, and cut to 4 KiB when longer (ending `...(+N bytes)`) |
 /// | `query` | the query string, only with [`include_query`](Self::include_query); cut like the path |
 /// | `route` | the pattern that matched, or `null` |
@@ -29,6 +29,12 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// | `peer` | the client's address, or `null` over a Unix socket |
 /// | `worker` | the giong worker that served the request |
 /// | `error` | for a response made from an [`Error`]: `code`, `detail` and, when there is one, `cause` |
+///
+/// When the request is dropped before its response is ready (the client
+/// reset its HTTP/2 stream, or a [`Timeout`](super::Timeout) layered
+/// outside the logger gave up), the line is written at the drop instead,
+/// with `"event":"request cancelled"`, `"status":null`, `"bytes":null` and
+/// the time until then in `duration_us`; nginx logs the same case as `499`.
 ///
 /// The cause of a `5xx` error is in the line and nowhere else: the client
 /// only gets the code and a generic detail. Lines go through the background
@@ -55,36 +61,29 @@ impl Logger {
 
 impl<S: 'static> Middleware<S> for Logger {
     async fn call(&self, req: Req<S>, next: Next<'_, S>) -> Result<Response, Error> {
-        let start = Instant::now();
-        let ts = SystemTime::now();
-        let method = req.method().to_owned();
-        let path = clip(req.path()).into_owned();
-        let query = if self.query {
-            req.query_string().map(|q| clip(q).into_owned())
-        } else {
-            None
+        let mut pending = Pending {
+            sink: &self.sink,
+            start: Instant::now(),
+            ts: SystemTime::now(),
+            method: req.method().to_owned(),
+            path: clip(req.path()).into_owned(),
+            query: if self.query {
+                req.query_string().map(|q| clip(q).into_owned())
+            } else {
+                None
+            },
+            route: req.route().map(str::to_owned),
+            peer: req.peer_addr(),
+            id: req.request_id().map(str::to_owned),
+            done: false,
         };
-        let route = req.route().map(str::to_owned);
-        let peer: Option<SocketAddr> = req.peer_addr();
-        let id = req.request_id().map(str::to_owned);
 
         let resp = next.run(req).await;
-        let elapsed = start.elapsed();
+        pending.done = true;
+        let elapsed = pending.start.elapsed();
 
         let status = resp.status();
-        let mut line = JsonWriter::with_capacity(256 + path.len());
-        line.str("ts", &timestamp(ts));
-        line.str("level", if status >= 500 { "error" } else { "info" });
-        line.str("event", "request");
-        line.str("method", &method);
-        line.str("path", &path);
-        if let Some(q) = &query {
-            line.str("query", q);
-        }
-        match &route {
-            Some(r) => line.str("route", r),
-            None => line.null("route"),
-        }
+        let mut line = pending.head(if status >= 500 { "error" } else { "info" }, "request");
         line.u64("status", u64::from(status));
         line.u64("duration_us", elapsed.as_micros() as u64);
         if resp.is_streaming() {
@@ -94,27 +93,85 @@ impl<S: 'static> Middleware<S> for Logger {
             line.u64("bytes", resp.body_len() as u64);
         }
         let rendered = resp.extension::<Rendered>();
-        let id = id.or_else(|| {
+        let id = pending.id.take().or_else(|| {
             rendered
                 .and_then(|r| r.request_id.as_ref())
                 .map(|i| i.as_str().to_owned())
         });
-        match &id {
-            Some(id) => line.str("request_id", id),
-            None => line.null("request_id"),
-        }
-        match peer {
-            Some(addr) => line.str("peer", &addr.to_string()),
-            None => line.null("peer"),
-        }
-        if let Some(n) = worker() {
-            line.u64("worker", n as u64);
-        }
+        pending.tail(&mut line, id.as_deref());
         if let Some(r) = rendered {
             error_fields(&mut line, &r.error);
             r.logged.set(true);
         }
         self.sink.write(&line.finish_line());
         Ok(resp)
+    }
+}
+
+/// What the line needs from the request, kept until the response is ready
+/// and written by `Drop` if it never is.
+struct Pending<'a> {
+    sink: &'a Sink,
+    start: Instant,
+    ts: SystemTime,
+    method: String,
+    path: String,
+    query: Option<String>,
+    route: Option<String>,
+    peer: Option<SocketAddr>,
+    id: Option<String>,
+    done: bool,
+}
+
+impl Pending<'_> {
+    /// The fields before `status`.
+    fn head(&self, level: &str, event: &str) -> JsonWriter {
+        let mut line = JsonWriter::with_capacity(256 + self.path.len());
+        line.str("ts", &timestamp(self.ts));
+        line.str("level", level);
+        line.str("event", event);
+        line.str("method", &self.method);
+        line.str("path", &self.path);
+        if let Some(q) = &self.query {
+            line.str("query", q);
+        }
+        match &self.route {
+            Some(r) => line.str("route", r),
+            None => line.null("route"),
+        }
+        line
+    }
+
+    /// The fields after `bytes`.
+    fn tail(&self, line: &mut JsonWriter, id: Option<&str>) {
+        match id {
+            Some(id) => line.str("request_id", id),
+            None => line.null("request_id"),
+        }
+        match self.peer {
+            Some(addr) => line.str("peer", &addr.to_string()),
+            None => line.null("peer"),
+        }
+        if let Some(n) = worker() {
+            line.u64("worker", n as u64);
+        }
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        // A panic is caught further in and answered as a `500`; one that
+        // gets here comes from the logger's own sink.
+        if self.done || std::thread::panicking() {
+            return;
+        }
+        // The request was dropped before its response was ready: say so,
+        // or it would leave no trace at all.
+        let mut line = self.head("info", "request cancelled");
+        line.null("status");
+        line.u64("duration_us", self.start.elapsed().as_micros() as u64);
+        line.null("bytes");
+        self.tail(&mut line, self.id.as_deref());
+        self.sink.write(&line.finish_line());
     }
 }

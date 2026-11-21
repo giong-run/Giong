@@ -1,0 +1,25 @@
+# 2026-11-16T08:38:42Z 7.0.0-43-generic, 16 CPUs: AMD EPYC 4345P 8-Core Processor
+# server cgroup: CPUQuota=100% AllowedCPUs=2 MemoryMax=512M MemorySwapMax=0
+# load: root@10.40.96.3 7.0.0-43-generic 16, wrk wrk debian/4.1.0-4build2 [epoll] Copyright (C) 2012 Will Glozer, h2load nghttp2/1.59.0
+# rustc 1.100.0 (0ef1bc386 2026-11-09); go version go1.22.2 linux/amd64; nginx version: nginx/1.24.0 (Ubuntu); OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)
+# giong commit d4f5605aea2723c17e0ea98cbb860d6ae720aba0
+
+requests per second, median of rounds (min-max); p99 ms (wrk only); server CPU %; errors
+server           test                             req/s   p99 ms   cpu%  thr ms  errors
+giong-http       json         464,024 (463,624-464,687)     0.39    101       1       0
+giong-http-tls   json-tls     373,581 (371,722-375,765)     0.50    101       0       0
+giong-http-tls   json-h2   1,519,045 (1,488,368-1,533,515)      nan    100       0       0
+giong-http-ktls  json-tls     327,188 (323,348-328,376)     0.51    100       0       0
+giong-http-ktls  json-h2   1,229,427 (1,210,056-1,253,025)      nan    100       3       0
+
+idle HTTPS connections: most held, why it stopped, KiB per connection at 20,000 (or at the
+last count before the server stopped): cgroup memory.current, which includes the kernel's
+socket and TLS memory; resident memory; the kernel part
+giong-http-ktls-r1       held  62,225 (refused    ) at 20,000: cgroup   7.61  rss   3.72  kernel   3.87  sock   0.00
+giong-http-tls-r1        held  32,734 (refused    ) at 20,000: cgroup  14.39  rss  10.51  kernel   3.89  sock   0.00
+
+slow-upload flood (1 MB bodies one byte short): uploads sent, held (if killed: the last count
+before the kill), refused, outcome,
+peak cgroup memory (page cache included), peak of the server's own (anon) memory,
+well-behaved /json requests answered / not
+giong-http   sent  3000  held     0  refused  3000  max         peak  101 MiB  anon   80 MiB  ok 1234 bad 0

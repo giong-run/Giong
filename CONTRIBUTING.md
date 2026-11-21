@@ -70,7 +70,7 @@ threads, also run:
 ```bash
 scripts/check.sh tsan        # ThreadSanitizer; needs nightly with the rust-src component
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
-scripts/check.sh soak        # 5 minutes of churn, then checks for leaks (SOAK_SECS=…)
+scripts/check.sh soak        # 5 minutes of churn, plain and then over TLS, then checks for leaks (SOAK_SECS=…)
 scripts/check.sh seccomp     # io_uring blocked as Docker blocks it: giong must pick epoll
 scripts/kernels.sh           # the suite on real 5.15, 6.0 and 6.1 kernels in QEMU; needs
                              # qemu-system-x86, busybox-static, cpio (slow without KVM)
@@ -92,12 +92,14 @@ cargo +nightly fuzz run inflate        # gzip and deflate bodies
 cargo +nightly fuzz run hpack          # HTTP/2 header compression
 cargo +nightly fuzz run h2             # a whole HTTP/2 connection, the server's side
 cargo +nightly fuzz run h2_client      # the client's side of HTTP/2
-cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, url
-cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, url
+cargo +nightly fuzz run response_body  # the client's response body framing
+cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, session, url
+cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, session, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: connection, url
 cd ../giong-web && cargo +nightly fuzz run request         # also: routes
 cd ../giong-tls && cargo +nightly fuzz run ktls_records    # record framing and handshake messages around kernel TLS
 cd ../giong-mcp && cargo +nightly fuzz run request         # the MCP server's checks and dispatch
+cd .. && cargo +nightly fuzz run dns_response              # also: resolv_conf (the core crate's resolver)
 ```
 
 Starting inputs are in each `fuzz/seeds/`; what the targets check is in each crate's
@@ -155,7 +157,10 @@ epoll driver, a file operation running on a blocking thread does the same.
   `miniz_oxide` for gzip, and `tls` or `client` giong-tls).
 - Public items need documentation. The API was settled for 1.0 in 0.7.0
   ([docs/reviews/2026-11-api-freeze.md](docs/reviews/2026-11-api-freeze.md)): add rather
-  than break. A breaking change needs an issue first and an entry in the changelog that
+  than break. giong means to stay on major version 1 for many years, so every addition
+  follows four rules: one way to do each thing; misuse fails at compile time, or at run
+  time with a coded error; every behaviour code relies on is documented; a release only
+  adds, and never changes what existing code means. A breaking change needs an issue first and an entry in the changelog that
   says how to migrate.
 - The Rust samples in the READMEs, `docs/DEPLOYMENT.md` and `docs/errors/README.md` are
   compiled by `cargo test -p rest-api --doc`, and run unless marked `no_run`; a change to
@@ -199,8 +204,10 @@ docs: explain how to run under WSL2
 1. Branch from `main`. Name the branch `<type>/<short-description>`, for example
    `fix/recv-pause-on-drop`.
 2. Keep the pull request focused; several small ones are reviewed faster than one large one.
-3. Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for anything a user
-   would notice.
+3. For anything a user would notice, add a changelog entry as a new file in
+   [changelog.d/](changelog.d/README.md) rather than editing `CHANGELOG.md`, so that pull
+   requests in flight do not conflict. `scripts/preflight.sh` runs the checks your change
+   needs before you push.
 4. Fill in the pull request template. Say how you tested the change.
 5. All checks must be green. A maintainer reviews the pull request and adds it to the
    merge queue, which runs every check once more on `main` with the pull request merged,
@@ -216,9 +223,8 @@ published together, to crates.io and as a GitHub Release whose notes come from
 `CHANGELOG.md` and thank everyone who contributed. The whole process, including adding a
 new crate, is in [docs/RELEASING.md](docs/RELEASING.md).
 
-What that asks of a contributor is in the list above: a `CHANGELOG.md` line under
-`Unreleased` and a pull request title in the commit convention, since both feed the
-release notes.
+What that asks of a contributor is in the list above: a changelog entry in `changelog.d/`
+and a pull request title in the commit convention, since both feed the release notes.
 
 ## Security
 

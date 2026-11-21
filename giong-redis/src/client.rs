@@ -200,6 +200,9 @@ impl Client {
     /// # Panics
     ///
     /// Panics when called outside of a giong runtime.
+    ///
+    /// Cancel safe: if the future is dropped, the connection being opened is
+    /// closed.
     pub async fn connect(config: &Config) -> Result<Client, Error> {
         let startup = connect::connect(config).await?;
         Ok(Self::start(startup, config.clone()))
@@ -248,6 +251,9 @@ impl Client {
     /// An error reply is returned as an [`ErrorKind::Server`] error with the
     /// server's code ([`Error::server_code`]). The reply must arrive within
     /// [`Config::response_timeout`].
+    ///
+    /// Not cancel safe: if the future is dropped, the command may still run on the
+    /// server; the connection stays usable.
     pub async fn query<T: FromValue>(&self, cmd: &Cmd) -> Result<T, Error> {
         cmd.check(false, false)?;
         let value = self
@@ -293,6 +299,10 @@ impl Client {
     /// If this is dropped before the reply comes, the command keeps the
     /// connection blocked until the server answers; a pooled connection is
     /// then closed rather than given back.
+    ///
+    /// Not cancel safe: if the future is dropped, the command may still run, so
+    /// a blocking pop may take an element whose reply is then thrown away, and
+    /// the element is lost.
     pub async fn query_blocking<T: FromValue>(&mut self, cmd: &Cmd) -> Result<T, Error> {
         cmd.check(true, false)?;
         let value = self
@@ -320,6 +330,8 @@ impl Client {
     /// ```
     ///
     /// An [atomic](Pipeline::atomic) pipeline is a transaction: see there.
+    ///
+    /// Not cancel safe, like [`query`](Self::query).
     pub async fn pipeline<T: FromValue>(&self, pipe: &Pipeline) -> Result<T, Error> {
         let atomic = pipe.is_atomic();
         pipe.check(atomic)?;
@@ -373,6 +385,9 @@ impl Client {
     /// It takes `&mut self`, since `WATCH` holds for the whole connection:
     /// use a connection the task has to itself. Dropping the `Watch` without
     /// `exec` sends `UNWATCH`.
+    ///
+    /// Cancel safe: if the future is dropped, a `WATCH` it sent is undone with
+    /// `UNWATCH`.
     pub async fn watch<K: ToArg>(&mut self, keys: &[K]) -> Result<Watch<'_>, Error> {
         if keys.is_empty() {
             return Err(Error::command("WATCH needs at least one key"));
@@ -848,7 +863,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
             break e;
         }
         let received = {
-            let mut recv = pin!(conn.stream.recv());
+            let mut recv = pin!(conn.stream.read_into(&mut buf));
             poll_fn(|cx| {
                 if let Poll::Ready(r) = recv.as_mut().poll(cx) {
                     return Poll::Ready(r);
@@ -859,7 +874,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
             .await
         };
         match received {
-            Ok(chunk) if chunk.is_empty() => {
+            Ok(0) => {
                 let closing = conn.state.borrow().closing;
                 break Error::closed(if closing {
                     "the connection was closed".to_owned()
@@ -870,7 +885,7 @@ async fn read_loop(conn: Rc<Conn>, mut buf: ReadBuf) {
                     )
                 });
             }
-            Ok(chunk) => buf.extend(&chunk),
+            Ok(_) => {}
             Err(e) => {
                 break Error::io(
                     ErrorKind::Closed,
@@ -953,6 +968,8 @@ pub struct Watch<'a> {
 
 impl Watch<'_> {
     /// Sends a command on the watching connection; see [`Client::query`].
+    ///
+    /// Not cancel safe, like [`Client::query`].
     pub async fn query<T: FromValue>(&self, cmd: &Cmd) -> Result<T, Error> {
         self.client.query(cmd).await
     }
@@ -961,6 +978,9 @@ impl Watch<'_> {
     /// not it was made [atomic](Pipeline::atomic)) if no watched key
     /// changed since [`Client::watch`]: `Some` with `EXEC`'s array, or
     /// `None` when a key changed and nothing ran.
+    ///
+    /// Not cancel safe: if the future is dropped, the transaction may have run
+    /// without the caller learning it.
     pub async fn exec<T: FromValue>(mut self, pipe: &Pipeline) -> Result<Option<T>, Error> {
         pipe.check(true)?;
         // EXEC ends the watch whatever happens next.

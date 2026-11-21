@@ -53,6 +53,11 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// detail. Such an error then counts as logged, and is not written to
 /// stderr as an unlogged one.
 ///
+/// When the request is dropped before its response is ready (the client
+/// reset its HTTP/2 stream, or a [`Timeout`](super::Timeout) layered
+/// outside gave up), the span ends with `request cancelled` at `INFO`
+/// instead, with `duration_us` until then and no status.
+///
 /// With no subscriber, or one that leaves the target out, the span is
 /// disabled and the middleware only passes the request on.
 /// [`Logger`](super::Logger) and `Trace` can run side by side.
@@ -84,10 +89,15 @@ impl<S: 'static> Middleware<S> for Trace {
         if span.is_disabled() {
             return Ok(next.run(req).await);
         }
-        let start = Instant::now();
+        let mut pending = Pending {
+            span: &span,
+            start: Instant::now(),
+            done: false,
+        };
         let resp = next.run(req).instrument(span.clone()).await;
+        pending.done = true;
         let status = resp.status();
-        let duration_us = start.elapsed().as_micros() as u64;
+        let duration_us = pending.start.elapsed().as_micros() as u64;
         span.record("http.response.status_code", status);
         match resp.extension::<Rendered>() {
             Some(r) if status >= 500 => {
@@ -125,5 +135,27 @@ impl<S: 'static> Middleware<S> for Trace {
             ),
         }
         Ok(resp)
+    }
+}
+
+/// Ends the span with `request cancelled` if the request is dropped before
+/// its response is ready.
+struct Pending<'a> {
+    span: &'a tracing::Span,
+    start: Instant,
+    done: bool,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if !self.done && !std::thread::panicking() {
+            tracing::event!(
+                target: "giong_web",
+                parent: self.span,
+                Level::INFO,
+                duration_us = self.start.elapsed().as_micros() as u64,
+                "request cancelled"
+            );
+        }
     }
 }

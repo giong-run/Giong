@@ -13,6 +13,7 @@ use std::task::{Context, Poll};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use super::addr::{resolved, ToSocketAddrs};
+use super::sendq::{self, Sent};
 use super::{
     close_socket, inet_addr, no_addresses, os_err, share, unexpected, wait_for_pool, MultiSlot,
 };
@@ -172,8 +173,18 @@ impl std::fmt::Debug for Datagram {
 /// A UDP socket.
 ///
 /// All methods take `&self`, so a socket can be shared (e.g. in an `Rc`)
-/// between tasks; any number of them may send at the same time, one at a time
-/// may receive.
+/// between tasks; any number of them may send and receive at the same time.
+/// Each datagram goes to one of the tasks waiting in
+/// [`recv_from`](Self::recv_from), woken for it alone.
+///
+/// A send returns once the kernel has taken the datagram, with the result
+/// `sendto(2)` gives. When other tasks of the worker are waiting to run, the
+/// datagram waits for the end of that turn of the event loop and goes to the
+/// kernel with the others sent in it, in one `sendmmsg(2)`; a task that is
+/// the only one with work sends at once. Datagrams of one socket leave in
+/// the order they were sent. Receives stay queued in the kernel's ring on
+/// io_uring and come up to 16 per `recvmmsg(2)` on epoll, so a busy server
+/// makes a fraction of a system call per datagram.
 pub struct UdpSocket {
     sock: ManuallyDrop<Socket>,
     recv: MultiSlot,
@@ -181,6 +192,15 @@ pub struct UdpSocket {
     /// made on a port of the caller's choice (see `share`).
     held: Option<share::Held>,
     _not_send: PhantomData<*const ()>,
+}
+
+/// A send's answer (bytes, or a negative errno) as an `io::Result`.
+fn sent_result(res: isize) -> io::Result<usize> {
+    if res < 0 {
+        Err(io::Error::from_raw_os_error(-res as i32))
+    } else {
+        Ok(res as usize)
+    }
 }
 
 impl UdpSocket {
@@ -223,16 +243,7 @@ impl UdpSocket {
         // between them by a hash of the sender's address.
         let share = addr.port() != 0;
         let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
-            let sock = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-            if share {
-                // `SO_REUSEPORT` only. With `SO_REUSEADDR` as well, any
-                // user's socket that sets `SO_REUSEADDR` could bind the
-                // port and receive its datagrams; `SO_REUSEPORT` is for
-                // sockets of the same user.
-                sock.set_reuse_port(true)?;
-            }
-            sock.bind(&addr.into())?;
-            Ok(sock)
+            Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         })?;
         let mut socket = Self::from_socket(sock);
         socket.held = held;
@@ -278,7 +289,7 @@ impl UdpSocket {
     ///
     /// The datagram borrows a buffer from the worker's pool, so the longest
     /// payload that fits is the pool's buffer size
-    /// ([`Builder::recv_buffers`](crate::Builder::recv_buffers), 8 KiB by
+    /// ([`Builder::recv_buffers`](crate::Builder::recv_buffers), 16 KiB by
     /// default) minus 44 bytes. Longer datagrams are cut off and marked
     /// [`is_truncated`](Datagram::is_truncated); use
     /// [`read_from`](Self::read_from) with a buffer of your own for those.
@@ -288,10 +299,18 @@ impl UdpSocket {
     /// in the meantime is returned by the next call. As always with UDP, the
     /// kernel drops datagrams when the socket is not read fast enough.
     pub async fn recv_from(&self) -> io::Result<(Datagram, SocketAddr)> {
-        poll_fn(|cx| self.poll_recv_from(cx)).await
+        let mut waiting = super::Waiting::new(&self.recv);
+        poll_fn(|cx| {
+            let poll = self.poll_recv_from(cx);
+            waiting.polled(&poll, cx);
+            poll
+        })
+        .await
     }
 
     /// Like [`recv_from`](Self::recv_from), without the sender's address.
+    ///
+    /// Cancel safe, like [`recv_from`](Self::recv_from).
     pub async fn recv(&self) -> io::Result<Datagram> {
         Ok(self.recv_from().await?.0)
     }
@@ -330,11 +349,12 @@ impl UdpSocket {
     /// returning the buffer with its length set to the bytes received, and the
     /// sender's address. A datagram longer than the buffer is cut off.
     ///
-    /// For datagrams that do not fit a pool buffer. Unlike
-    /// [`recv_from`](Self::recv_from) this is **not** cancel safe (a datagram
-    /// that arrives while the future is being dropped is lost), and the two
-    /// must not be mixed on one socket: once `recv_from` has been used,
-    /// `read_from` fails with `InvalidInput`.
+    /// For datagrams that do not fit a pool buffer. It must not be mixed
+    /// with [`recv_from`](Self::recv_from) on one socket: once `recv_from`
+    /// has been used, `read_from` fails with `InvalidInput`.
+    ///
+    /// Not cancel safe, unlike `recv_from`: a datagram that arrives while the
+    /// future is being dropped is lost.
     ///
     /// A buffer with no capacity (such as `Vec::new()`) is refused with
     /// `GIONG-E0109`: the kernel would take the datagram and keep none of it.
@@ -395,7 +415,9 @@ impl UdpSocket {
 
     /// Like [`read_from`](Self::read_from), without the sender's address: for
     /// a socket that has been [`connect`](Self::connect)ed. The same limits
-    /// apply (not cancel safe, not after `recv` or `recv_from`).
+    /// apply (not after `recv` or `recv_from`).
+    ///
+    /// Not cancel safe, like `read_from`.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         let (res, buf) = self.read_from(buf).await;
         (res.map(|(len, _from)| len), buf)
@@ -403,20 +425,72 @@ impl UdpSocket {
 
     /// Sends `buf` as one datagram to `addr`, returning the number of bytes
     /// sent. The buffer is handed back so it can be reused.
+    ///
+    /// Not cancel safe: if the future is dropped, the datagram may have been
+    /// sent.
     pub async fn send_to<B: IoBuf>(&self, buf: B, addr: SocketAddr) -> (io::Result<usize>, B) {
         let addr = SockAddr::from(addr);
-        let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&addr));
-        let io = Io::SendMsg {
-            fd: self.sock.as_raw_fd(),
-            // SAFETY: `msg` owns a live `Message`; the field pointer is taken
-            // without making a reference.
-            msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
-            flags: libc::MSG_NOSIGNAL as u32,
-            zero_copy: false,
+        let fd = self.sock.as_raw_fd();
+        // At once where the socket has room (see `Driver::try_send_to`),
+        // unless other tasks may send in this turn too: then with their
+        // datagrams (see `sendq`).
+        let try_now = |w: &runtime::Worker| {
+            let mut driver = w.driver.borrow_mut();
+            // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+            (driver.try_send_to(fd, bytes, &addr), driver.sends_to())
         };
-        // SAFETY: the header is in a `KernelBox` and points at its own fields
-        // and at `buf`'s bytes; an `IoBuf`'s bytes stay put when it moves.
-        let (res, _, (_msg, buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
+        let mut now = runtime::with_worker(|w| (!sendq::wanted(w)).then(|| try_now(w)));
+        if now.is_none() {
+            let queued = {
+                // SAFETY: an `IoBuf`'s bytes stay put, and `buf` is held
+                // until the future is done.
+                unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), Some(&addr)) }
+            };
+            if let Sent::Done(res) = queued.await {
+                return (sent_result(res), buf);
+            }
+            now = Some(runtime::with_worker(try_now));
+        }
+        let (sent, sends_to) = now.expect("tried");
+        if let Some(res) = sent {
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
+        }
+        let (res, buf) = if sends_to {
+            let addr = KernelBox::new(addr);
+            let io = Io::SendTo {
+                fd,
+                buf: buf.as_ptr(),
+                len: buf.len().min(u32::MAX as usize) as u32,
+                // SAFETY: `addr` owns a live `SockAddr`; the pointer is taken
+                // through the box, so it stays valid when `addr` moves.
+                addr: unsafe { (*addr.as_ptr()).as_ptr().cast() },
+                addr_len: addr.get().len(),
+            };
+            // SAFETY: the address is in a `KernelBox`; an `IoBuf`'s bytes
+            // stay put when it moves.
+            let (res, _, (_addr, buf)) = unsafe { Op::new(io, (addr, buf)) }.await;
+            (res, buf)
+        } else {
+            let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&addr));
+            let io = Io::SendMsg {
+                fd,
+                // SAFETY: `msg` owns a live `Message`; the field pointer is
+                // taken without making a reference.
+                msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
+                flags: libc::MSG_NOSIGNAL as u32,
+                zero_copy: false,
+            };
+            // SAFETY: the header is in a `KernelBox` and points at its own
+            // fields and at `buf`'s bytes; an `IoBuf`'s bytes stay put when
+            // it moves.
+            let (res, _, (_msg, buf)) = unsafe { Op::new(io, (msg, buf)) }.await;
+            (res, buf)
+        };
         if res < 0 {
             (Err(os_err(res)), buf)
         } else {
@@ -426,7 +500,36 @@ impl UdpSocket {
 
     /// Sends `buf` as one datagram to the peer set with
     /// [`connect`](Self::connect).
+    ///
+    /// Not cancel safe: if the future is dropped, the datagram may have been
+    /// sent.
     pub async fn send<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
+        let fd = self.sock.as_raw_fd();
+        let try_now = |w: &runtime::Worker| {
+            // SAFETY: an `IoBuf` has `len()` initialised bytes at `as_ptr()`.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), buf.len()) };
+            w.driver.borrow_mut().try_send(fd, bytes)
+        };
+        // As in `send_to`.
+        let mut now = runtime::with_worker(|w| (!sendq::wanted(w)).then(|| try_now(w)));
+        if now.is_none() {
+            let queued = {
+                // SAFETY: as in `send_to`.
+                unsafe { sendq::send(fd, buf.as_ptr(), buf.len(), None) }
+            };
+            if let Sent::Done(res) = queued.await {
+                return (sent_result(res), buf);
+            }
+            now = Some(runtime::with_worker(try_now));
+        }
+        let sent = now.expect("tried");
+        if let Some(res) = sent {
+            return if res < 0 {
+                (Err(os_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            };
+        }
         let len = buf.len().min(u32::MAX as usize) as u32;
         let io = Io::Send {
             fd: self.sock.as_raw_fd(),

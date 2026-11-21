@@ -62,7 +62,7 @@ fn wake_all(wakers: Vec<Waker>) {
 }
 
 /// Creates a channel that holds at most `capacity` values. When it is full,
-/// [`BoundedSender::send`] waits for room, so a fast producer is slowed down
+/// [`Sender::send`] waits for room, so a fast producer is slowed down
 /// to the pace of the consumer instead of filling memory.
 ///
 /// Waiting senders get room in the order they started waiting. Senders and
@@ -90,7 +90,7 @@ fn wake_all(wakers: Vec<Waker>) {
 ///     assert_eq!(sum, 45);
 /// });
 /// ```
-pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
+pub fn bounded<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     assert!(
         capacity > 0,
         "a bounded channel needs a capacity of at least 1"
@@ -107,25 +107,25 @@ pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
         next_id: 0,
     })));
     (
-        BoundedSender {
+        Sender {
             shared: shared.clone(),
         },
-        BoundedReceiver { shared },
+        Receiver { shared },
     )
 }
 
 /// The sending half of a [`bounded`] channel. Cheap to clone; `Send` and
 /// `Sync` when `T` is `Send`.
-pub struct BoundedSender<T> {
+pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
 /// The receiving half of a [`bounded`] channel.
-pub struct BoundedReceiver<T> {
+pub struct Receiver<T> {
     shared: Arc<Shared<T>>,
 }
 
-/// Why [`BoundedSender::try_send`] did not send; holds the value.
+/// Why [`Sender::try_send`] did not send; holds the value.
 pub enum TrySendError<T> {
     /// The channel is full, or other senders are already waiting for room.
     Full(T),
@@ -190,7 +190,7 @@ impl<T> Drop for Waiting<'_, T> {
     }
 }
 
-impl<T> BoundedSender<T> {
+impl<T> Sender<T> {
     /// Sends `value`, waiting while the channel is full. Fails, handing the
     /// value back, if the receiver is gone.
     ///
@@ -279,7 +279,7 @@ impl<T> BoundedSender<T> {
     }
 }
 
-impl<T> Clone for BoundedSender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         self.shared.lock().senders += 1;
         Self {
@@ -288,7 +288,7 @@ impl<T> Clone for BoundedSender<T> {
     }
 }
 
-impl<T> Drop for BoundedSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let waker = {
             let mut state = self.shared.lock();
@@ -305,9 +305,12 @@ impl<T> Drop for BoundedSender<T> {
     }
 }
 
-impl<T> BoundedReceiver<T> {
+impl<T> Receiver<T> {
     /// Receives the next value, or `None` once every sender is gone and the
-    /// channel is empty. Cancel safe.
+    /// channel is empty.
+    ///
+    /// Cancel safe: if the future is dropped, no value is lost; the next call
+    /// returns it.
     pub async fn recv(&mut self) -> Option<T> {
         let mut wake = Vec::new();
         let value = poll_fn(|cx| {
@@ -362,7 +365,7 @@ impl<T> BoundedReceiver<T> {
     }
 }
 
-impl<T> Drop for BoundedReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let (leftover, wake) = {
             let mut state = self.shared.lock();
@@ -379,17 +382,17 @@ impl<T> Drop for BoundedReceiver<T> {
     }
 }
 
-impl<T> fmt::Debug for BoundedSender<T> {
+impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoundedSender")
+        f.debug_struct("Sender")
             .field("capacity", &self.capacity())
             .finish()
     }
 }
 
-impl<T> fmt::Debug for BoundedReceiver<T> {
+impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BoundedReceiver")
+        f.debug_struct("Receiver")
             .field("len", &self.len())
             .finish()
     }

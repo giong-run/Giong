@@ -126,12 +126,15 @@ pub struct UnixStream {
 impl UnixStream {
     fn wrap(inner: StreamSocket) -> Self {
         Self {
-            inner: inner.without_zero_copy(),
+            inner: inner.unix(),
             passes_fds: Cell::new(false),
         }
     }
 
     /// Connects to the socket at `path`.
+    ///
+    /// Cancel safe: if the future is dropped, the socket is closed and no
+    /// connection is left behind.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let addr = SockAddr::unix(path)?;
         let inner = StreamSocket::connect(new_socket()?, addr).await?;
@@ -283,12 +286,18 @@ impl UnixStream {
 
     /// Writes some bytes of `bufs` with one system call; see
     /// [`TcpStream::write_vectored`](super::TcpStream::write_vectored).
+    ///
+    /// Not cancel safe: if the future is dropped, some bytes may have been sent
+    /// without the caller learning how many.
     pub async fn write_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<usize>, Vec<B>) {
         self.inner.write_vectored(bufs).await
     }
 
     /// Writes all of `bufs` without copying them into one buffer; see
     /// [`TcpStream::write_all_vectored`](super::TcpStream::write_all_vectored).
+    ///
+    /// Not cancel safe: if the future is dropped, part of the data may have
+    /// been sent.
     pub async fn write_all_vectored<B: IoBuf>(&self, bufs: Vec<B>) -> (io::Result<()>, Vec<B>) {
         self.inner.write_all_vectored(bufs).await
     }

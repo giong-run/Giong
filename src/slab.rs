@@ -127,3 +127,126 @@ mod tests {
         assert_eq!(s.insert("h"), 0);
     }
 }
+
+/// Kani proofs (`scripts/check.sh kani`).
+///
+/// The proofs are inductive: each starts from *any* slab of up to `SLOTS`
+/// slots that satisfies [`Slab::well_formed`], applies one operation with
+/// any argument, and checks the result and that the slab is still well
+/// formed. An empty slab is well formed, so together they cover every
+/// sequence of operations, of any length, that never needs more than
+/// `SLOTS` slots at once (the free list's walk is bounded by `SLOTS`).
+#[cfg(kani)]
+mod proofs {
+    use super::{Entry, Slab};
+
+    const SLOTS: usize = 5;
+
+    impl<T> Slab<T> {
+        /// The free list starts at `next`, visits only vacant slots, each
+        /// once, and ends at `entries.len()`; every vacant slot is on it;
+        /// `len` counts the occupied ones.
+        fn well_formed(&self) -> bool {
+            let n = self.entries.len();
+            let occupied = self
+                .entries
+                .iter()
+                .filter(|e| matches!(e, Entry::Occupied(_)))
+                .count();
+            if occupied != self.len {
+                return false;
+            }
+            let mut at = self.next;
+            let mut walked = 0;
+            while at != n {
+                match self.entries.get(at) {
+                    Some(Entry::Vacant(next)) => at = *next,
+                    _ => return false,
+                }
+                walked += 1;
+                if walked > n {
+                    return false; // a cycle
+                }
+            }
+            // `walked` distinct vacant slots (a repeat would be a cycle).
+            walked == n - occupied
+        }
+    }
+
+    /// Any well-formed slab of up to `SLOTS` slots, with room for one more
+    /// so that no operation reallocates (the standard library's code: a
+    /// reallocation of symbolic size makes CBMC run out of memory).
+    fn any_slab() -> Slab<u8> {
+        let n: usize = kani::any();
+        kani::assume(n <= SLOTS);
+        let mut entries = Vec::with_capacity(SLOTS + 1);
+        for _ in 0..n {
+            entries.push(if kani::any() {
+                Entry::Occupied(kani::any())
+            } else {
+                Entry::Vacant(kani::any())
+            });
+        }
+        let slab = Slab {
+            entries,
+            next: kani::any(),
+            len: kani::any(),
+        };
+        kani::assume(slab.well_formed());
+        slab
+    }
+
+    fn any_key() -> usize {
+        let key: usize = kani::any();
+        kani::assume(key <= SLOTS + 1);
+        key
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn insert_takes_a_free_slot_and_keeps_the_rest() {
+        let mut slab = any_slab();
+        let n = slab.entries.len();
+        let other = any_key();
+        let before = slab.get(other).copied();
+        let val: u8 = kani::any();
+        // Never hits the `unreachable!`: the free list's head is vacant.
+        let key = slab.insert(val);
+        assert!(key <= n, "insert skipped a free slot");
+        assert_eq!(slab.get(key), Some(&val));
+        if other != key {
+            assert_eq!(slab.get(other).copied(), before);
+        } else {
+            assert!(before.is_none(), "insert reused an occupied key");
+        }
+        assert!(slab.well_formed());
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn remove_frees_exactly_its_slot() {
+        let mut slab = any_slab();
+        let key = any_key();
+        let other = any_key();
+        let had = slab.get(key).copied();
+        let before = slab.get(other).copied();
+        let len = slab.len();
+        assert_eq!(slab.remove(key), had);
+        assert_eq!(slab.get(key), None);
+        if other != key {
+            assert_eq!(slab.get(other).copied(), before);
+        }
+        assert_eq!(slab.len(), len - usize::from(had.is_some()));
+        assert!(slab.well_formed());
+    }
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn take_all_returns_every_value_and_empties() {
+        let mut slab = any_slab();
+        let len = slab.len();
+        assert_eq!(slab.take_all().len(), len);
+        assert!(slab.well_formed());
+        assert_eq!(slab.insert(0), 0);
+    }
+}

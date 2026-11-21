@@ -321,12 +321,40 @@ extern "C" fn stop_servers() {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+/// A TCP port free now on every one of `addrs`, from below the kernel's
+/// ephemeral range, for a server this test starts.
+///
+/// The server cannot be told to pick a port itself and say which, so the
+/// test picks one and the server binds it a moment later. A port from the
+/// ephemeral range (what binding port 0 gives) can be taken in that moment
+/// by any socket of the tests or of anything else on the machine: a
+/// connect's source port, or another port-0 bind. The kernel hands out
+/// ports below the range only on request. The same rule as giong-redis's
+/// test server (#128).
+fn server_port(addrs: &[&str]) -> u16 {
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|r| r.split_whitespace().next()?.parse::<u16>().ok())
+        .unwrap_or(32768);
+    let (from, to) = (10_000u16, low.max(11_000));
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+        .subsec_nanos()
+        ^ std::process::id().wrapping_mul(2_654_435_761);
+    loop {
+        // xorshift: any spread will do.
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let port = from + (seed % u32::from(to - from)) as u16;
+        if addrs
+            .iter()
+            .all(|addr| std::net::TcpListener::bind((*addr, port)).is_ok())
+        {
+            return port;
+        }
+    }
 }
 
 /// For a server that listens on one address only: a port free on 127.0.0.1
@@ -335,7 +363,7 @@ fn free_port() -> u16 {
 fn free_port_with_second_address() -> u16 {
     let (port, listener) = (0..100)
         .find_map(|_| {
-            let port = free_port();
+            let port = server_port(&["127.0.0.1", "127.0.0.2"]);
             let listener = std::net::TcpListener::bind(("127.0.0.2", port)).ok()?;
             Some((port, listener))
         })
@@ -358,6 +386,38 @@ fn free_port_with_second_address() -> u16 {
         }
     });
     port
+}
+
+/// How many ports `start` tries before it gives up.
+const START_ATTEMPTS: usize = 5;
+
+/// Waits until the server answers on its Unix socket; or, if it exits first,
+/// gives what it logged from `log_from` on.
+fn wait_until_ready(server: &Server, gone: &AtomicBool, log_from: usize) -> Result<(), String> {
+    let started = Instant::now();
+    while !server.socket.exists() || !server.try_sql("SELECT 1") {
+        if gone.load(Ordering::Acquire) {
+            return Err(server.log().get(log_from..).unwrap_or_default().to_owned());
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            // Say which side failed: the server, or the client that sets it
+            // up (which cannot run when a shared library is missing, say).
+            let client = Command::new(&server.bins.mysql)
+                .args(["--no-defaults", "-uroot", "-N", "-B", "-S"])
+                .arg(&server.socket)
+                .args(["-e", "SELECT 1"])
+                .output()
+                .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
+                .unwrap_or_else(|e| e.to_string());
+            panic!(
+                "The server did not answer {} within 60 s.\nThe client says: {client}\nThe server's log:\n{}",
+                server.bins.mysql.display(),
+                server.log()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
 }
 
 fn mysqld(bins: &Bins) -> Command {
@@ -465,137 +525,127 @@ fn start(bins: Bins, role: Role) -> Server {
     std::fs::write(dir.join("server-cert.pem"), server_cert.pem()).unwrap();
     std::fs::write(dir.join("server-key.pem"), server_key.serialize_pem()).unwrap();
 
-    let port = if bins.one_address {
-        free_port_with_second_address()
-    } else {
-        free_port()
-    };
-    let socket = dir.join("mysqld.sock");
-
-    // The server is started from a thread that never ends, with SIGKILL as
-    // its parent-death signal: if this process dies without running its exit
-    // handlers, the server goes too.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let gone = Arc::new(AtomicBool::new(false));
-    let mut cmd = mysqld(&bins);
-    cmd.arg(format!("--datadir={}", data.display()))
-        .arg(format!("--port={port}"))
-        .arg(if bins.one_address {
-            "--bind-address=127.0.0.1"
+    // The port is free a moment before the server binds it. A server another
+    // test starts can take it in that moment, and mysqld then exits; a port
+    // it could not bind is tried again with another.
+    let mut attempt = 1;
+    let mut server = loop {
+        let port = if bins.one_address {
+            free_port_with_second_address()
         } else {
-            "--bind-address=127.0.0.1,127.0.0.2"
-        })
-        .arg(format!("--socket={}", socket.display()))
-        .arg(format!("--pid-file={}", dir.join("mysqld.pid").display()))
-        .arg(format!("--log-error={}", dir.join("server.log").display()))
-        .args([
-            "--skip-name-resolve",
-            "--innodb-flush-log-at-trx-commit=0",
-            "--innodb-doublewrite=0",
-            "--max-connections=300",
-            "--max-allowed-packet=64M",
-            // MySQL 8.4 has the plugin off by default; 8.0 does not know the
-            // option, which `loose` lets it ignore.
-            "--loose-mysql-native-password=ON",
-        ]);
-    if mariadb {
-        // Off by default on MariaDB; the tests look at sessions there.
-        cmd.args(mariadb_dirs(&bins)).arg("--performance-schema=ON");
-    } else {
-        cmd.args(["--mysqlx=OFF", "--secure-file-priv=NULL", "--skip-log-bin"]);
-    }
-    // MySQL makes certificates of its own when given none, as most
-    // installations use them: with no name in them, for the server's own
-    // authority. MariaDB 10 makes none.
-    let auto_certificates = role == Role::Odd && !mariadb;
-    if !auto_certificates {
-        cmd.arg(format!("--ssl-ca={}", dir.join("ca.pem").display()))
-            .arg(format!(
-                "--ssl-cert={}",
-                dir.join("server-cert.pem").display()
-            ))
-            .arg(format!(
-                "--ssl-key={}",
-                dir.join("server-key.pem").display()
-            ));
-    }
-    if role == Role::Odd {
-        cmd.args([
-            "--init-connect=SET NAMES latin1",
-            "--innodb-rollback-on-timeout=ON",
-        ]);
-    }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let server_gone = gone.clone();
-    std::thread::spawn(move || {
-        // SAFETY: prctl is async-signal-safe and touches only this process.
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().expect("start mysqld");
-        tx.send(child.id()).unwrap();
-        // Blocks until the server is gone, keeping this thread (its parent)
-        // alive until then.
-        let _ = child.wait();
-        server_gone.store(true, Ordering::Release);
-    });
-    let pid = rx.recv().unwrap();
-    STARTED
-        .lock()
-        .unwrap()
-        .iter_mut()
-        .find(|(_, d)| *d == dir)
-        .unwrap()
-        .0 = pid as i32;
+            // It listens on both addresses itself.
+            server_port(&["127.0.0.1", "127.0.0.2"])
+        };
+        let socket = dir.join("mysqld.sock");
+        let log_from = std::fs::metadata(dir.join("server.log")).map_or(0, |m| m.len() as usize);
 
-    let mut server = Server {
-        port,
-        socket,
-        ca_pem: ca.pem().into_bytes(),
-        ca_file: dir.join("ca.pem"),
-        auto_certificates,
-        public_key_pem: Vec::new(),
-        has_native: false,
-        has_sha256: false,
-        has_caching_sha2: !mariadb,
-        mariadb,
-        version: String::new(),
-        dir,
-        bins,
+        // The server is started from a thread that never ends, with SIGKILL as
+        // its parent-death signal: if this process dies without running its exit
+        // handlers, the server goes too.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let gone = Arc::new(AtomicBool::new(false));
+        let mut cmd = mysqld(&bins);
+        cmd.arg(format!("--datadir={}", data.display()))
+            .arg(format!("--port={port}"))
+            .arg(if bins.one_address {
+                "--bind-address=127.0.0.1"
+            } else {
+                "--bind-address=127.0.0.1,127.0.0.2"
+            })
+            .arg(format!("--socket={}", socket.display()))
+            .arg(format!("--pid-file={}", dir.join("mysqld.pid").display()))
+            .arg(format!("--log-error={}", dir.join("server.log").display()))
+            .args([
+                "--skip-name-resolve",
+                "--innodb-flush-log-at-trx-commit=0",
+                "--innodb-doublewrite=0",
+                "--max-connections=300",
+                "--max-allowed-packet=64M",
+                // MySQL 8.4 has the plugin off by default; 8.0 does not know the
+                // option, which `loose` lets it ignore.
+                "--loose-mysql-native-password=ON",
+            ]);
+        if mariadb {
+            // Off by default on MariaDB; the tests look at sessions there.
+            cmd.args(mariadb_dirs(&bins)).arg("--performance-schema=ON");
+        } else {
+            cmd.args(["--mysqlx=OFF", "--secure-file-priv=NULL", "--skip-log-bin"]);
+        }
+        // MySQL makes certificates of its own when given none, as most
+        // installations use them: with no name in them, for the server's own
+        // authority. MariaDB 10 makes none.
+        let auto_certificates = role == Role::Odd && !mariadb;
+        if !auto_certificates {
+            cmd.arg(format!("--ssl-ca={}", dir.join("ca.pem").display()))
+                .arg(format!(
+                    "--ssl-cert={}",
+                    dir.join("server-cert.pem").display()
+                ))
+                .arg(format!(
+                    "--ssl-key={}",
+                    dir.join("server-key.pem").display()
+                ));
+        }
+        if role == Role::Odd {
+            cmd.args([
+                "--init-connect=SET NAMES latin1",
+                "--innodb-rollback-on-timeout=ON",
+            ]);
+        }
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let server_gone = gone.clone();
+        std::thread::spawn(move || {
+            // SAFETY: prctl is async-signal-safe and touches only this process.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().expect("start mysqld");
+            tx.send(child.id()).unwrap();
+            // Blocks until the server is gone, keeping this thread (its parent)
+            // alive until then.
+            let _ = child.wait();
+            server_gone.store(true, Ordering::Release);
+        });
+        let pid = rx.recv().unwrap();
+        STARTED
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|(_, d)| *d == dir)
+            .unwrap()
+            .0 = pid as i32;
+
+        let server = Server {
+            port,
+            socket,
+            ca_pem: ca.pem().into_bytes(),
+            ca_file: dir.join("ca.pem"),
+            auto_certificates,
+            public_key_pem: Vec::new(),
+            has_native: false,
+            has_sha256: false,
+            has_caching_sha2: !mariadb,
+            mariadb,
+            version: String::new(),
+            dir: dir.clone(),
+            bins: bins.clone(),
+        };
+        match wait_until_ready(&server, &gone, log_from) {
+            Ok(()) => break server,
+            Err(log) if log.contains("Address already in use") && attempt < START_ATTEMPTS => {
+                eprintln!("mysqld: port {port} was taken before it could listen; trying another");
+                attempt += 1;
+            }
+            Err(log) => panic!("The server stopped while it was starting. Its log:\n{log}"),
+        }
     };
-    let started = Instant::now();
-    while !server.socket.exists() || !server.try_sql("SELECT 1") {
-        if gone.load(Ordering::Acquire) {
-            panic!(
-                "The server stopped while it was starting. Its log:\n{}",
-                server.log()
-            );
-        }
-        if started.elapsed() > Duration::from_secs(60) {
-            // Say which side failed: the server, or the client that sets it
-            // up (which cannot run when a shared library is missing, say).
-            let client = Command::new(&server.bins.mysql)
-                .args(["--no-defaults", "-uroot", "-N", "-B", "-S"])
-                .arg(&server.socket)
-                .args(["-e", "SELECT 1"])
-                .output()
-                .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
-                .unwrap_or_else(|e| e.to_string());
-            panic!(
-                "The server did not answer {} within 60 s.\nThe client says: {client}\nThe server's log:\n{}",
-                server.bins.mysql.display(),
-                server.log()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
     server.version = server.sql("SELECT VERSION()").trim().to_owned();
-    if auto_certificates {
+    if server.auto_certificates {
         server.ca_file = data.join("ca.pem");
         server.ca_pem = std::fs::read(&server.ca_file).expect("MySQL made its certificates");
     }
@@ -641,8 +691,8 @@ fn start(bins: Bins, role: Role) -> Server {
         SHA256_USER.0, SHA256_USER.1
     ));
     eprintln!(
-        "{} on port {port} (mysql_native_password: {}, sha256_password: {})",
-        server.version, server.has_native, server.has_sha256
+        "{} on port {} (mysql_native_password: {}, sha256_password: {})",
+        server.version, server.port, server.has_native, server.has_sha256
     );
     server
 }

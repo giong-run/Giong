@@ -1,0 +1,5 @@
+kTLS available: TLS 1.2 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, TLS 1.3 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, key updates yes (mode Required)
+kTLS available: TLS 1.2 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, TLS 1.3 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, key updates yes (mode Required)
+kTLS available: TLS 1.2 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, TLS 1.3 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, key updates yes (mode Required)
+kTLS available: TLS 1.2 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, TLS 1.3 AES-128-GCM AES-256-GCM ChaCha20-Poly1305, key updates yes (mode Required)
+giong-http: GIONG-E1121 refused 1 connection(s) on this worker: less than 51 MiB of memory is left to the process, its min_free_memory; see docs/errors/E1121.md

@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>A thread-per-core async runtime for Linux, built on io_uring, with an epoll driver wherever io_uring is blocked.</b></p>
+<p align="center"><b>An async runtime for Rust services on Linux, built for code that AI agents write: a strict API meant to stay correct for years, errors that say how to fix them, and io_uring with one thread per core underneath.</b></p>
 
 <p align="center">
   <a href="https://github.com/giong-run/Giong/actions/workflows/main.yml"><img alt="CI" src="https://github.com/giong-run/Giong/actions/workflows/main.yml/badge.svg"></a>
@@ -17,7 +17,8 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 0.7.** Complete enough to write real servers: TCP, UDP, Unix sockets, files,
+> **Status: 1.0.0**, the first stable release: the API is frozen (see
+> [STABILITY.md](docs/STABILITY.md)). Complete enough to write real servers: TCP, UDP, Unix sockets, files,
 > timers, multi-core, graceful shutdown, and eight companion crates:
 > [`giong-http`](giong-http/README.md) (a strict HTTP/1.1 and HTTP/2 server and client),
 > [`giong-web`](giong-web/README.md) (a router, middleware and JSON on it),
@@ -33,7 +34,90 @@ load arrives.
 > seccomp profile and on real 5.15, 6.0 and 6.1 kernels; ThreadSanitizer
 > and valgrind are clean, loom model-checks the cross-thread wake-ups, the HTTP parser and
 > HTTP/2 on both sides are fuzzed, `h2spec` passes, and a soak test churns connections for two
-> hours every night. It has **not** run in production. See [Limitations](#limitations).
+> hours every night. One service uses it so far, its author's, with no error reported on
+> 1.0.0-rc.1. See [Limitations](#limitations).
+
+## What giong is for
+
+giong is a late entrant: Tokio has been Rust's default runtime for years, and giong does not
+try to be a smaller copy of it. It is built for the way services are written now, with more
+and more of the code coming from AI agents. So the API is designed to be used correctly on
+the first try, and to tell the one who got it wrong how to fix it, rather than to be short
+to type.
+
+- **The goal: the best async runtime for Rust, on technical merit.** A complete,
+  general-purpose runtime for any workload a service has, faster and leaner than Tokio. Every
+  claim comes from a benchmark in this repository, and where giong is not ahead the README
+  says so (see below).
+- **A whole service with no Tokio underneath.** HTTP/1.1 and HTTP/2 (server and client),
+  TLS, PostgreSQL, MySQL, Redis, DNS, routing and middleware are giong crates, written for
+  its buffer pool and its batched system calls, not adapters. [Choosing crates](#choosing-crates)
+  measures each one against the Tokio crate it replaces.
+- **Agent-first.** Every error giong raises carries a stable code, the cause and the fix,
+  and has a page of its own ([docs/errors](docs/errors/README.md)). [AGENTS.md](AGENTS.md)
+  and [giong.run/llms.txt](https://giong.run/llms.txt) tell a model how to work with it;
+  giong-web writes JSON-line logs and `tracing` spans; [`giong-mcp`](giong-mcp/README.md)
+  lets an agent look inside a running service ([below](#let-your-agent-look-inside-the-running-service)).
+- **One major version for a long time.** After 1.0, giong grows through 1.x minor releases
+  for years rather than moving to a 2.0, so the API follows four rules:
+  1. One way to do each thing.
+  2. Misuse fails at compile time, or at run time with a coded error.
+  3. Every behaviour code relies on is documented.
+  4. Releases only add; they never change what existing code means.
+
+  The API was settled in 0.7 ([review](docs/reviews/2026-11-api-freeze.md)), and
+  `cargo-semver-checks` runs on every pull request.
+- **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
+  io_uring is blocked. macOS (for development) and Windows come after 1.0
+  ([ROADMAP.md](ROADMAP.md)).
+
+## Let your agent look inside the running service
+
+[`giong-mcp`](giong-mcp/README.md) is an MCP server built into your service. Connect your
+coding agent (Claude Code, or any client that speaks MCP's Streamable HTTP) and it can see
+what each worker is doing, which tasks are alive and which line of your code spawned them,
+what the database pools hold and where the time goes, instead of guessing from logs. The
+answer no other tool gives: **which task blocks a worker**, named by the line that spawned
+it.
+
+1. Add `giong-mcp` and start it next to the runtime. It starts only when `GIONG_MCP` is
+   set, and never stops the service from starting:
+
+   ```rust,no_run
+   fn main() -> std::io::Result<()> {
+       let rt = giong::Builder::new().shutdown_on_signals(true).build()?;
+       let _mcp = giong_mcp::start_from_env(&rt.handle()); // keep it: dropping it stops the server
+       rt.run(|_worker| async {
+           // ... the service ...
+           giong::shutdown_signal().await;
+       })
+   }
+   ```
+
+2. Run the service with an address and a token (16 characters or more):
+
+   ```sh
+   export GIONG_MCP=127.0.0.1:7777 GIONG_MCP_TOKEN=$(openssl rand -hex 16)
+   cargo run --release
+   ```
+
+3. Connect the agent, with the same token:
+
+   ```sh
+   claude mcp add --transport http giong http://127.0.0.1:7777/mcp \
+       --header "Authorization: Bearer $GIONG_MCP_TOKEN"
+   ```
+
+The agent then has five tools: `overview` (memory, threads, open descriptors against the
+limit, each worker's state, warnings such as a blocked worker), `workers` (each worker's
+counters, timers, I/O in flight and the task it is stuck in), `tasks` (live tasks grouped by
+the line that spawned them: a count that keeps growing is a leak), `sources` (the
+PostgreSQL, MySQL and Redis pools: open, taken, waiting, timeouts) and `profile` (times every
+poll for a window and lists where the workers spent it). Every tool only reads, apart from
+`profile` turning on poll timing for its window. The server listens on a loopback address
+or a Unix socket only, needs the token on TCP, and runs on a thread of its own, so it answers
+even when every worker is stuck. To reach a service on another machine, forward the port
+(`ssh -L`, `kubectl port-forward`).
 
 ## Why giong
 
@@ -49,8 +133,8 @@ load arrives.
   CPU per request (11% below the next runtime) and has the lowest p99. At 1,000 it is level
   with a hand-written epoll server and ahead of the rest.
 - **HTTP and HTTPS in the box.** [`giong-http`](giong-http/README.md) and
-  [`giong-tls`](giong-tls/README.md) serve HTTPS at **144.8k requests/s on one core,
-  against 81.0k for Axum** on the same rustls.
+  [`giong-tls`](giong-tls/README.md) serve HTTPS at **146.6k requests/s on one core,
+  against 81.2k for Axum** on the same rustls.
 - **Cancellation-safe by construction.** Dropping an I/O future never frees memory the
   kernel may still write to, and wrapping `recv`, `recv_from` or `accept` in a timeout
   loses neither data nor connections.
@@ -58,13 +142,16 @@ load arrives.
   under gVisor or on a kernel older than 6.0, a worker switches to an epoll driver by
   itself: same API, same tests, and as fast as raw Tokio there. See
   [Two drivers](#two-drivers-io_uring-and-epoll).
-- **Small enough to read.** About 11,300 lines of code for the runtime, both drivers
+- **Small enough to read.** About 12,100 lines of code for the runtime, both drivers
   included, three dependencies, and a comment on every `unsafe` block.
 
-What it is **not**: faster than everything at everything. On the classic 50-connection
-benchmark giong, a tuned Monoio and raw Tokio are within noise of each other, because the
-kernel's TCP stack, not the runtime, is most of the cost. The numbers below say where the
-design pays off and where it does not.
+What it is **not**, today: faster than everything at everything. On the classic
+50-connection benchmark giong, a tuned Monoio and raw Tokio are within noise of each other,
+because the kernel's TCP stack, not the runtime, is most of the cost. Over one PostgreSQL
+connection shared by every task, giong-postgres is 7–9% behind tokio-postgres; a blocking
+`std` read of a cached file beats every async one, giong's included; and a TLS handshake
+costs the same as Axum's once both prefer the same cipher suite. The numbers below say
+where the design pays off and where it does not.
 
 ## Results at a glance
 
@@ -94,7 +181,8 @@ connection, the same as the others.
   containerd's default ones), under gVisor, or with the `kernel.io_uring_disabled` sysctl.
   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) shows how to allow io_uring in Docker, Docker
   Compose and Kubernetes.
-- Rust 1.80 or newer.
+- Rust 1.80 or newer. How this minimum, the kernel minimums and the API move during 1.x:
+  [docs/STABILITY.md](docs/STABILITY.md).
 - giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
   `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
   are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
@@ -221,7 +309,7 @@ fn main() -> std::io::Result<()> {
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
 | Shutdown | `shutdown_signal()`, `until_shutdown(fut)`, `is_shutting_down()`, `Handle::shutdown()` |
-| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::channel()` (unbounded), `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
+| Across threads | `Handle::spawn_on(worker, \|\| async { .. }) -> RemoteJoinHandle<T>` (await or abort it from any thread), `Handle::spawn_balanced(\|\| async { .. })` (the first idle worker starts it), `Handle::least_loaded_worker()`, `sync::mpsc::unbounded()`, `sync::mpsc::bounded(n)` (senders wait when full), `sync::oneshot::channel()` (one value) |
 | Errors | Every error giong raises starts with a code (`GIONG-E0102: no address found for …`) and links to its page in [docs/errors](docs/errors/README.md); `error::code(&err)` returns it as a `Code` to match on |
 | HTTP | [`giong-http`](giong-http/README.md): `Server::serve` / `serve_unix` / `serve_tls`, `Request`, `Response`; with the `client` feature, `client::Client` (`get`, `post`, ... `send`), `client::Response` |
 | TLS | [`giong-tls`](giong-tls/README.md): `TlsAcceptor`, `TlsConnector`, `TlsStream` |
@@ -242,7 +330,7 @@ Five things to remember:
    a pipe) are not: one that is dropped mid-flight can still take data that arrives before
    the kernel has processed the cancellation.
 3. A datagram received with `recv_from()` lives in a pool buffer, so its longest payload is
-   the buffer size minus 44 bytes (8 KiB − 44 by default). Longer ones are cut off and
+   the buffer size minus 44 bytes (16 KiB − 44 by default). Longer ones are cut off and
    `is_truncated()` says so; raise `.recv_buffers(count, size)` or use `read_from()` with a
    buffer of your own. Do not mix the two kinds on one socket.
 4. A `File` has no cursor: every read and write names its offset. Opened with
@@ -277,24 +365,30 @@ For each job a service has, try these in order and take the first that fits:
 | An HTTP/2 server | `giong-http` (on by default) | hyper, axum | 3.8 to 4.4 times axum on small answers, 2.5 to 3.0 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
 | Routing, JSON, middleware | [`giong-web`](giong-web/README.md) | axum, tower-http | 1.3 times axum on `/json` and 1.8 times on 8 KB answers; with request ids, gzip and a timeout, 1.9 and 2.3 times ([Routing](#routing-json-and-middleware)) |
 | An HTTP client | `giong-http`, feature `client` | reqwest, hyper's client | 1.6 to 1.8 times reqwest over HTTP/1.1; over HTTP/2 2.0 to 2.2 times on small answers, 1.2 to 1.3 times on 8.5 KiB ones ([giong-http](giong-http/README.md)) |
-| TLS | [`giong-tls`](giong-tls/README.md) | tokio-rustls | The same rustls underneath, so handshakes are level. Measured with `giong-http`: 1.8 times axum + rustls on `/json`, 2.5 times on 8 KB answers ([HTTPS](#https)) |
-| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 2.6 times tokio-postgres + deadpool at its best on one row by key ([PostgreSQL](#postgresql)) |
-| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 4.7 times SQLx at its best on one row by key, 3.4 times on 100 rows ([MySQL](#mysql)) |
-| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.3 to 1.9 times redis-rs, at half its CPU per command or less ([Redis](#redis)) |
-| Files | `giong::fs` | `tokio::fs` | 5.5 to 8 times Tokio on reads at an offset, 1.5 to 2.5 times on whole small files ([File I/O](#file-io)) |
-| Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | Not measured |
-| Timers, channels | `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::time`, `tokio::sync::mpsc` | Not measured on their own |
+| TLS | [`giong-tls`](giong-tls/README.md) | tokio-rustls | The same rustls underneath. Measured with `giong-http`: 1.8 times axum + rustls on `/json`, 2.6 times on 8 KB answers, 1.18 times the new connections per second (level with axum set to prefer AES-128-GCM as giong does) ([HTTPS](#https)) |
+| PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 3.3 times tokio-postgres + deadpool at its best on one row by key, 2.5 times on 100 rows; 7–9% behind tokio-postgres on one shared connection ([PostgreSQL](#postgresql)) |
+| MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 5.1 times SQLx at its best on one row by key, 3.7 times on 100 rows ([MySQL](#mysql)) |
+| Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.1 to 1.8 times redis-rs on small commands, 1.25 to 2.5 times on 8 KiB values, at half its CPU per command or less ([Redis](#redis)) |
+| Files | `giong::fs` | `tokio::fs` | 8 times Tokio on reads at an offset, 3.2 to 4.1 times on whole small files ([File I/O](#file-io)) |
+| Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | `localhost` from `/etc/hosts`: 171 ns against Tokio's 28.6 µs ([Core primitives](#core-primitives)); DNS over the network not measured |
+| Tasks, timers, channels | `giong::spawn`, `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::spawn`, `tokio::time`, `tokio::sync` | 1.3 to 2.6 times Tokio; Monoio and Glommio are ahead on spawning and channels within one thread ([Core primitives](#core-primitives)) |
 | Runtime state for an AI agent | [`giong-mcp`](giong-mcp/README.md) | | |
 
 Where a giong crate is not ahead, the sections linked above say so: over one shared
-connection giong-postgres is 8–11% below tokio-postgres at the median, a blocking `std`
-read of a cached file beats every async one, and TLS handshakes cost the same on both.
+connection giong-postgres is 7–9% below tokio-postgres at the median, a blocking `std`
+read of a whole small cached file beats every async one, Monoio and Glommio spawn tasks and
+pass values within one thread faster, and TLS handshakes cost the same on both once axum's
+rustls is set to the cipher suite giong-tls prefers.
 
 What `Compat` adds is measured on its own, on one TCP stream with no protocol on top
-([giong-compat](giong-compat/README.md#what-it-costs)): against giong's own `write_all`,
-up to 20% less throughput and up to 25% more CPU per byte sent, for the copy into its
-write buffer; against giong's own `recv`, 6–16% more CPU per byte read with `read`, and no
-measurable difference through `AsyncBufRead`; 1–5% more CPU per small request and reply.
+([giong-compat](giong-compat/README.md#what-it-costs)): large writes go straight from the
+caller's memory to the socket, from 9% above to 6% below Tokio's CPU per byte sent over the
+last two sessions (until 0.8.0 they were copied first: 25% above Tokio in a session the same
+day); against giong's own `recv`, 6–16% more CPU per byte read with `read`, and no measurable
+difference through `AsyncBufRead`; up to 5% more CPU per small request and reply, and level
+with Tokio there. Receiving costs more CPU per byte than Tokio's own (14% through
+`AsyncBufRead`, 19% with `read`, in the latest session, with 16 KiB receive buffers; 17% and
+30% with 8 KiB), most of it in giong's own receive (12% above Tokio).
 A protocol crate over `Compat` brings its own design on top of that, and none has been
 measured against the giong crate for the same protocol. The reason to prefer the giong
 crate is its design (step 1) and the gaps in the table, measured against these Tokio
@@ -552,7 +646,7 @@ others are from 0.4's run on the same kind of VM.
   1 MiB (it rose by 40 MiB when every worker lent all 512 buffers at once).
 - **Small reads share a buffer.** On Linux 6.12 and newer the kernel fills a receive
   buffer piece by piece (`IOU_PBUF_RING_INC`), so a hundred connections that each send a
-  short request use one or two 8 KiB buffers rather than a hundred. Before, each receive
+  short request use one or two buffers rather than a hundred. Before, each receive
   took a whole buffer, and under load a worker cycled through all it had lent: with 20
   workers and 5,000 busy connections giong-http peaked 50 MiB above idle, now 23 MiB
   (epoll 15 MiB, raw Tokio 64 MiB, Axum 124 MiB, Go 184 MiB; `WORKERS=20
@@ -727,24 +821,38 @@ shows the one-worker numbers (giong 218.9k, Monoio 214.2k, giong-http 186.1k, Gl
 ### HTTPS
 
 `bench/tls.sh`: `giong-http` + `giong-tls` against Axum + `axum-server`, both on rustls with
-`ring`, so the TLS library and the cryptography are the same and only the runtime and the
-HTTP layer differ. The server gets one core and `wrk` three (the load generator has to
-encrypt too); 50 connections, TLS 1.3 with AES-256-GCM, an ECDSA P-256 certificate, five
-rounds. The server's core was 98–101% busy in every row, so the server was the limit.
+`ring`, so the TLS library and the cryptography are the same and only the runtime, the
+HTTP layer and the TLS settings differ. The server gets one core and `wrk` three (the load
+generator has to encrypt too); 50 connections, TLS 1.3, an ECDSA P-256 certificate, seven
+interleaved rounds on a 4-vCPU VM (2026-11-17, [`bench/results/tls/`](bench/results/tls/README.md)).
+The server's core was 97–100% busy in every row, so the server was the limit. The plain
+HTTP rows are from the earlier session of five rounds (`bench/results/tls/2026-11-12/`).
 
-| Server | `/json` | `/users` (8 KB) | New handshake per request |
-|---|---|---|---|
-| Axum, plain HTTP | 94.0k (86–97k) | 19.5k | |
-| giong-http, plain HTTP | 150.3k (140–158k) | 55.3k (54–59k) | |
-| Axum + rustls | 81.0k (80–83k) | 19.2k | 7.3k (6.9–7.6k) |
-| **giong-http + giong-tls** | **144.8k (142–153k)** | **47.8k (43–49k)** | 7.1k (6.7–7.5k) |
+| Server | `/json` | `/users` (8 KB) | New connection per request | CPU per new connection |
+|---|---|---|---|---|
+| Axum, plain HTTP | 94.0k (86–97k) | 19.5k | | |
+| giong-http, plain HTTP | 150.3k (140–158k) | 55.3k (54–59k) | | |
+| Axum + rustls | 81.2k (80–85k) | 18.5k (17–19k) | 7.1k (6.3–7.6k) | 136 µs |
+| Axum + rustls, set to pick AES-128-GCM first | 80.5k (78–83k) | 19.4k (19–20k) | 8.4k (7.7–8.6k) | 116 µs |
+| giong-http + giong-tls 0.8.0 | 145.1k (129–150k) | 47.7k (46–50k) | 6.8k (6.3–7.1k) | 142 µs |
+| **giong-http + giong-tls** | **146.6k (136–155k)** | **48.7k (47–50k)** | **8.4k (7.9–9.1k)** | **116 µs** |
 
-- **On kept-alive connections giong's HTTPS is 1.8 times Axum + rustls on `/json` and 2.5
+- **On kept-alive connections giong's HTTPS is 1.8 times Axum + rustls on `/json` and 2.6
   times on `/users`.** Most of the `/users` factor is there without TLS (see above).
-- **TLS costs giong 4% on `/json` and 14% on `/users`**, where there are more bytes to
+- **TLS costs giong 2% on `/json` and 12% on `/users`**, where there are more bytes to
   encrypt.
-- **Handshakes are level** (7.1k against 7.3k per second): a handshake is almost all
-  cryptography, and both use the same library for it.
+- **New connections: 18% more per second than Axum + rustls, at 15% less CPU each, and
+  lower latency (p99 4.2 ms against 7.1).** wrk resumes sessions, so these are resumed TLS
+  1.3 handshakes. Two changes since 0.8.0 (which was 5% behind Axum here): giong-tls sends
+  its session tickets with the first response and its `close_notify` with the FIN (14.4
+  TCP segments per connection, both directions, against 16.5 before and Axum's 14.0), and
+  `TlsAcceptor::with_certificates` picks AES-128-GCM first, as Go's and BoringSSL's servers do,
+  where wrk (OpenSSL) lists AES-256-GCM first and its suite hashes with SHA-384. **The
+  suite is most of the gain: Axum set up the same way matches giong's rate** (8.4k), with
+  higher latency (p99 6.2 ms against 4.2). A handshake is almost all cryptography, and
+  both use the same library for it.
+- With 64 KiB responses giong-http + giong-tls serves 31.9k req/s against 26.3k for 0.8.0
+  (+21%), from AES-128-GCM.
 - Axum is lower here than in the first table (94k against 161k) because `wrk` runs three
   threads: requests arrive less bunched and Tokio gets less work out of each `epoll_wait`.
   giong hardly depends on the shape of the load.
@@ -770,14 +878,14 @@ per second:
 
 | Client, connections | One row by key | p99 | 100 rows | p99 |
 |---|---|---|---|---|
-| **giong-postgres, 3** | **240.7k** | **0.52 ms** | **54.8k** | **2.0 ms** |
+| **giong-postgres, 3** | **311.4k** | **0.43 ms** | **71.3k** | **2.0 ms** |
 | tokio-postgres + deadpool, 4 | 53.1k | 1.9 ms | 21.7k | 4.4 ms |
 | tokio-postgres + deadpool, 64 (its best) | 93.8k | 1.5 ms | 28.6k | 4.1 ms |
 
 Statements from every task share the pool's connections and are pipelined, so one client
-core does 2.6 times the work of deadpool at its best. Over one shared connection both
-libraries pipeline and the server's single backend is the limit; there the two are within
-the spread of the rounds, giong-postgres 8–11% lower at the median. The crate's README has the full table, including what happens with more
+core does 3.3 and 2.5 times the work of deadpool at its best. Over one shared connection
+both libraries pipeline and the server's single backend is the limit; there giong-postgres
+is 7–9% behind tokio-postgres at the median (47.7k against 51.4k by key). The crate's README has the full table, including what happens with more
 connections than the server has cores.
 
 ### MySQL
@@ -788,12 +896,12 @@ other three, 64 tasks issuing statements back to back. Medians, statements per s
 
 | Client, connections | One row by key | p99 | 100 rows | p99 |
 |---|---|---|---|---|
-| **giong-mysql, 3** | **138.7k** | **0.91 ms** | **35.1k** | **3.2 ms** |
+| **giong-mysql, 3** | **150.7k** | **0.81 ms** | **38.9k** | **3.4 ms** |
 | SQLx, 64 (its best) | 29.3k | 3.9 ms | 10.4k | 9.1 ms |
 | mysql_async, 4 (its best) | 19.0k | 5.5 ms | 8.9k | 10.6 ms |
 
 Statements from every task share the pool's connections and are pipelined, so one client
-core does 4.7 and 3.4 times the work of SQLx at its best, and the server becomes the limit.
+core does 5.1 and 3.7 times the work of SQLx at its best, and the server becomes the limit.
 One connection shared by every task does about what SQLx does with 64. The crate's README
 has the full table, including mysql_async's default pool settings and more connections
 than the server has cores.
@@ -807,15 +915,15 @@ per second, and the client core's time per command:
 
 | Client, connections | `GET` 64 B | µs/op | `SET` 64 B | µs/op | `MGET` of 10 | µs/op |
 |---|---|---|---|---|---|---|
-| **giong-redis, 1** | **618k** | **0.78** | **557k** | **0.77** | **219k** | **2.29** |
-| redis-rs, 1 | 448k | 1.76 | 442k | 1.67 | 140k | 4.84 |
-| fred, 1 | 314k | 2.42 | 287k | 2.58 | 110k | 6.91 |
-| **giong-redis, 4** | **881k** | **0.98** | **779k** | **0.99** | **313k** | **2.30** |
-| redis-rs, 4 | 475k | 2.04 | 491k | 1.97 | 198k | 4.96 |
+| **giong-redis, 1** | **640k** | **0.80** | **565k** | **0.83** | **268k** | **1.75** |
+| redis-rs, 1 | 492k | 1.59 | 493k | 1.52 | 166k | 4.16 |
+| fred, 1 | 351k | 2.22 | 316k | 2.37 | 117k | 6.17 |
+| **giong-redis, 4** | **848k** | **1.06** | **842k** | **1.03** | **375k** | **2.03** |
+| redis-rs, 4 | 483k | 2.01 | 516k | 1.88 | 209k | 4.68 |
 
-1.3 to 1.9 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
-where about half of every client's core is time in the kernel, giong-redis does twice
-redis-rs on one connection and the same on four. The crate's README has the full tables
+1.1 to 1.8 times redis-rs, at half its CPU time per command or less. With 8 KiB values,
+where about half of every client's core is time in the kernel, giong-redis does 2.5 times
+redis-rs on one connection and 1.25 times on four. The crate's README has the full tables
 and how many connections to use.
 
 ### Routing, JSON and middleware
@@ -836,27 +944,102 @@ on giong-web (22.9 against 18.5 ms).
 ### File I/O
 
 `bench/fs.sh`: 200,000 operations per measurement, five rounds, all data in the page cache,
-so this measures what one operation costs, not the disk. giong and `std` use one thread.
-Tokio hands every file operation to its blocking thread pool, so it is measured pinned to
-one core and free to use all four.
+so this measures what one operation costs, not the disk. giong, Monoio, compio and `std` use
+one thread. Tokio hands every file operation to its blocking thread pool, so it is measured
+pinned to one core and free to use all four. Raw data: [bench/results/fs](bench/results/fs/summary.txt).
 
 | Operations per second | Whole 4 KiB file, 1 task | 64 tasks | 4 KiB at a random offset, 1 task | 64 tasks |
 |---|---|---|---|---|
-| `std` (blocking) | 556k | | 1.40M | |
-| **giong** | **227k** (201–243k) | **292k** | **1.01M** (0.87–1.15M) | **1.26M** |
-| Tokio, one core | 147k | 116k | 184k | 156k |
-| Tokio, 4 cores | 29k | 81k | 33k | 74k |
+| `std` (blocking) | 567k | | 1.31M | |
+| **giong** | **437k** (395–445k) | **517k** | **1.33M** (1.28–1.35M) | **1.30M** |
+| Monoio 0.2 | 375k | 338k | 968k | 1.23M |
+| compio 0.19 | 141k | 130k | 892k | 1.10M |
+| Tokio, one core | 135k | 125k | 163k | 157k |
+| Tokio, 4 cores | 33k | 98k | 38k | 96k |
 
-- **Reads at an offset: 5.5 times Tokio with one task and 8 times with 64.** On Tokio every
-  read is a hand-off to another thread and back; on giong it is one entry in a batch.
-- **Whole small files (open, statx, read, close): 1.5 to 2.5 times Tokio.**
-- **A blocking `std` call is faster for cached data** (28% for reads at an offset, 2.4
-  times for whole files). What giong buys is a worker that never waits when the data is
-  not cached, which this benchmark does not measure.
+- **Reads at an offset: 8 times Tokio, level with a blocking `std` call.** giong first copies
+  from the page cache with `preadv2(RWF_NOWAIT)`, one system call that never waits for the
+  disk, and goes through the ring only when the data is not cached. On Tokio every read is a
+  hand-off to another thread and back.
+- **Whole small files (open, fstat, read, close): 3.2 to 4.1 times Tokio, 1.2 to 1.5 times
+  Monoio.**
+- **A blocking `std` call is still faster for whole small files** (567k against 437k): opening
+  and closing go through the ring. What giong buys is a worker that never waits when the data
+  is not cached, which this benchmark does not measure.
 
-The HTTPS and file numbers were measured on 2026-11-11, on the same machine, with the
-code as it was just before the busy-poll mode was merged in; the merge did not touch the
-TLS, HTTP or file code. Everything above them was measured again on the merged code.
+Measured on 2026-11-17 on the same machine; the run before the page-cache path is in
+[bench/results/fs/before-core-pr](bench/results/fs/before-core-pr/summary.txt).
+
+### Core primitives
+
+`bench/core.sh 5`: tasks, channels, timers and loopback TCP against Tokio (current thread,
+`LocalSet`, multi-thread), Monoio, Glommio, compio and smol, each on its own scheduler and
+channels, pinned to two cores. Median nanoseconds per operation over five rounds, lower is
+better; giong on io_uring (epoll in parentheses). Method, every runtime and the raw data:
+[bench/results/core/vm](bench/results/core/vm/README.md).
+
+| ns per operation | giong | Tokio (best) | Monoio | Glommio | compio | smol |
+|---|---|---|---|---|---|---|
+| spawn and join a task | **91.5** (93.3) | 174 | 59.1 | 91.5 | 89.9 | 272 |
+| yield | **23.7** (28.7) | 62.3 | 49.5 | 45.0 | 30.5 | 138 |
+| unbounded channel, one producer | **30.9** (24.3) | 57.9 | 13.8 | 23.4 | 118 | 109 |
+| oneshot answered by a new task | **293** (276) | 527 | 218 | 208 | 415 | 1,793 |
+| 1,000 tasks pass a token | **220** (224) | 289 | 91.8 | 343 | 585 | 484 |
+| 100,000 sleeping tasks, per task | **688** (736) | 886 | 1,497 | 1,328 | 951 | 1,231 |
+| a plain thread feeds a task | **64.0** (68.9) | 155 | 185 | 170 | 223 | 211 |
+| one byte back and forth over TCP | **4,652** (5,304) | 5,231 | 5,181 | 13,517 | 5,257 | 8,851 |
+| resolve `localhost` | **171** (186) | 28,564 | | | | 28,643 |
+
+- **giong is ahead of every Tokio flavour in every row**, except TCP round trips on epoll,
+  where both make the same system calls and are level within noise.
+- **Monoio and Glommio are ahead on spawning, channels and oneshots.** Their tasks and channels
+  only work within one thread, with no atomic operations; giong's carry values between threads
+  and workers as well (the "plain thread" row, where giong is 2.4 to 3.5 times faster than every
+  other runtime).
+- `localhost` is answered from giong's cache of `/etc/hosts`; Tokio and smol call
+  `getaddrinfo` on a blocking thread every time. Monoio, Glommio and compio have no resolver.
+
+### UDP
+
+`bench/udp-echo.sh`: a UDP echo server on one core, 64-byte datagrams, the client in
+another network namespace over veth keeping 256 datagrams in flight, five rounds of 8 s
+(`bench/results/udp-echo/`). "Kernel × 32" is a server with no runtime that calls
+`recvmmsg` and `sendmmsg` 32 datagrams at a time: the ceiling for kernel sockets.
+
+| Echoes per second | 16 tasks on one socket | 1 task |
+|---|---:|---:|
+| giong, epoll | **335,535** | **351,241** |
+| giong, io_uring | **319,380** | **346,643** |
+| Tokio | 270,672 | 307,195 |
+| Kernel × 32 | 389,686 | 366,291 |
+
+Server CPU per echo with 16 tasks: 4.08 µs on epoll and 4.37 µs on io_uring against
+Tokio's 5.33 (kernel × 32: 3.55); with one task 3.89 and 4.10 against 4.68 (3.81). Datagrams
+that tasks send in one turn of the event loop go to the kernel in one `sendmmsg(2)`, and on
+epoll a busy datagram socket leaves the epoll set, so it pays no wake-ups for the datagrams
+it sends and receives (`bench/results/udp-echo/vm/epoll-deep/`). This VM varies by about 15%
+between rounds: giong on either driver is ahead of Tokio in every round with one task and in
+four of five with 16 (in the other, Tokio's 324,148 beat both, also on CPU per echo).
+
+On bare metal (AMD EPYC 4345P, Linux 7.0, the same benchmark over veth, server on one core;
+`bench/results/bare-metal-epyc-4345p/linux-7.0/post-soak/udp-udp-epoll-*`), the server core
+is saturated near a million echoes a second and the margins are much smaller:
+
+| Echoes per second (median of 5, range) | 16 tasks on one socket | 1 task |
+|---|---:|---:|
+| giong, epoll | **920,836** (904,872–926,239) | **892,565** (881,529–906,552) |
+| giong, io_uring | **902,459** (895,390–914,320) | 875,632 (863,835–927,756) |
+| Tokio | 870,488 (855,699–877,000) | 863,001 (851,625–897,835) |
+| Kernel × 32 | 1,009,532 | 1,028,443 |
+
+With 16 tasks giong wins clearly: 5.8% (epoll) and 3.7% (io_uring) ahead of Tokio in the
+median, ahead in every round, at 1.09 and 1.11 µs of server process CPU per echo against
+Tokio's 1.15 (kernel × 32: 0.99). With one task it only ties: ahead in the median (3.4% and
+1.5%) but behind Tokio in one round of five on epoll and two on io_uring. Every runtime moves
+between two levels from round to round (about 870k and 930k), so differences under about 5%
+are within noise. Most of an echo's cost here is the kernel's UDP and veth path: with 16 tasks
+giong makes about 0.12 system calls per echo, where Tokio makes a `sendto` for each one
+(`post-soak/udp-perf/`).
 
 ### What has not been measured
 
@@ -869,19 +1052,20 @@ TLS, HTTP or file code. Everything above them was measured again on the merged c
   (August and March 2024); their main branches may differ.
 
 Reproduce with `bench/run.sh`, `bench/scale.sh`, `bench/workers.sh`, `bench/syscalls.sh`,
-`bench/tls.sh`, `bench/fs.sh`, `bench/postgres.sh`, `bench/mysql.sh`, `bench/redis.sh`,
-`bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh` and `bench/compat.sh`; two cores with
+`bench/tls.sh`, `bench/fs.sh`, `bench/core.sh`, `bench/postgres.sh`, `bench/mysql.sh`,
+`bench/redis.sh`, `bench/http-client.sh`, `bench/web.sh`, `bench/memory.sh`, `bench/compat.sh`
+and `bench/udp-echo.sh`; two cores with
 `SERVER_CPU=2,3 LOAD_CPU=0,1 WRK_THREADS=2 CONNS=100 OUT=results/2core bench/run.sh 3`.
 Recorded output is in `bench/results/`. A change of a percent or two per request is below
 the noise of these runs; `bench/instructions.sh` counts the server's instructions per
 request with callgrind instead, which repeats within 0.1%. CI holds the hot paths to
 their counts: `scripts/instr.py check` fails a change that makes any of 16 operations
 (spawning a task, a TCP round trip, an HTTP/1.1, HTTP/2 or TLS request, a database query)
-cost 1% more instructions, or an idle connection 2% more heap ([bench/instr](bench/instr/README.md)).
+cost 1% more instructions, or an idle connection 1% more heap ([bench/instr](bench/instr/README.md)).
 
 ## Testing and safety
 
-1,062 tests across the nine crates and the example API (`cargo test --workspace
+1,114 tests across the nine crates and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
 driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and
@@ -896,7 +1080,7 @@ the example API describe theirs in their READMEs.
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/unix_fds.rs` (12) | Unix datagrams keep their boundaries and senders, abstract names, peer credentials; a pipe and a TCP listener passed to another socket keep working, 253 descriptors in one message, mistakes refused with `GIONG-E0017`; **a dropped receive never leaks a descriptor**, and a dropped send keeps its own copies |
 | `tests/process.rs` (15), `tests/signal.rs` (8), `tests/activation.rs` (3) | output and exit codes, 1 MiB through `cat` both ways at once, kill and signals through the pidfd, **a dropped wait loses nothing and a dropped child is reaped**, pipes, the process's own stdin and stdout (also from a regular file); every listener sees a signal, deliveries coalesce, `SIGCHLD`, a `SIGTERM` listener together with `shutdown_on_signals`; sockets inherited as systemd passes them |
-| `tests/udp.rs` (22) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
+| `tests/udp.rs` (25) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, many tasks receiving on one socket each woken for a datagram of its own, a receiver that gave up not taking the next datagram, a task that only sends letting the others run, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
 | `tests/fs.rs` (25) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll), one stuck operation not holding up the others, offsets above `i64::MAX` and open options that cannot work refused with their codes, a pipe on standard input left blocking |
 | `tests/cancel.rs` (17) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; a dropped `send_file` leaves nothing behind; **a dropped open closes the descriptor it produced**; a stream or operation dropped by code the driver runs is still closed and cancelled; connections accepted for a listener that outlives its runtime are closed; teardown with everything in flight |
 | `tests/multi.rs` (16) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM (also after worker 0 returned), work sent to a stopped runtime cancelled, a panicking worker |
@@ -904,8 +1088,8 @@ the example API describe theirs in their READMEs.
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
 | `tests/driver.rs` (9), `tests/blocked.rs` (4) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; with the locked-memory limit used up, the same with GIONG-E0010; the optional io_uring features found are the kernel's; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
 | `tests/observe.rs` (10) | tasks named by the line that spawned them (`spawn`, `spawn_on`, `spawn_balanced`); **a pulse read from another thread names the task a blocked worker is stuck in**; counters and idle time, which counts a sleep in progress and never goes down; poll profiles by spawn location; sources reported until dropped |
-| `giong-http` (206) | HTTP/1.1: 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 24 end-to-end server tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit); 14 of bodies streamed both ways; 12 over HTTPS with a rustls client. HTTP/2: 41 unit tests of the server's streams, flow control, memory budgets, HPACK and frames; 15 client tests against the server and against servers that misbehave on purpose (refused and reset streams, overdrawn windows, malformed responses, over kernel TLS). 8 fuzz-style tests: 500,000 random inputs for the parser and the chunked decoder, HPACK header blocks, HTTP/2 connections from each side, compressed bodies, response heads and 100,000 responses read by the client in random pieces; 55 other unit tests; 15 documentation examples |
-| `giong-tls` (76) | 15 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two and three tasks sending on one connection with every write arriving whole, **a TLS 1.2 write past the record limit failing instead of vanishing**, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 31 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, a peer that cuts its records to 32 bytes, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
+| `giong-http` (215) | HTTP/1.1: 22 client tests on real sockets (keep-alive, HTTPS, redirects, timeouts, truncated bodies, gzip, streamed bodies, proxies); 27 end-to-end server tests on real sockets (pipelining, large bodies, file bodies, a request one byte at a time, 408/413/431, malformed requests, a panicking handler, graceful shutdown, a Unix socket, the client address, the connection limit, the memory budget for requests being received); 14 of bodies streamed both ways; 12 over HTTPS with a rustls client. HTTP/2: 41 unit tests of the server's streams, flow control, memory budgets, HPACK and frames; 15 client tests against the server and against servers that misbehave on purpose (refused and reset streams, overdrawn windows, malformed responses, over kernel TLS). 8 fuzz-style tests: 500,000 random inputs for the parser and the chunked decoder, HPACK header blocks, HTTP/2 connections from each side, compressed bodies, response heads and 100,000 responses read by the client in random pieces; 61 other unit tests; 15 documentation examples |
+| `giong-tls` (96) | certificates chosen by SNI and replaced while serving, client certificates required or requested on the server; 15 client tests (system and built-in roots, client certificates, name and IP checks); TLS 1.2 and 1.3 with 4 MB each way, ALPN, a `recv` cancelled over and over, two and three tasks sending on one connection with every write arriving whole, **a TLS 1.2 write past the record limit failing instead of vanishing**, a write cancelled half way (the client sees a cut-off stream, never a corrupt record), a file read and encrypted, broken or stalled handshakes; 32 kernel TLS tests (every cipher suite through the kernel in both roles, files sent with `sendfile`, key updates both ways and with the last handshake flight, **the TLS 1.2 nonces read off the wire**, tampered and unexpected records, a peer that cuts its records to 32 bytes, cancellation), run on Linux 5.15, 6.1, Ubuntu's 6.8 and 6.18 with the `tls` module |
 | Other | DNS, channels, slab, the io_uring setup tiers, error pages, documentation examples |
 
 Also:
@@ -945,13 +1129,28 @@ Also:
   tasks, channels, timers, `observe`, several workers), on the epoll driver, in CI on
   every change. It found memory the kernel writes into being reached through a pointer
   taken before its `Box` moved, in the file and UDP paths (nothing miscompiled); fixed.
+- **Kani proofs** (`scripts/check.sh kani`, [docs/kani.md](docs/kani.md)): the model
+  checker proves, for every input within stated bounds, that the slab's free list stays
+  sound, that no receive buffer is ever both lent to the kernel and read by user space or
+  lent twice (from any pool state of two buffers, so for sequences of any length), that a
+  dropped operation's memory and slab entry outlive the kernel's last completion in every
+  order of events, and that `KernelBox` pointers survive moves; in CI on every change. No
+  bug found; each proof caught a planted one.
 - **Soak** (`scripts/check.sh soak`, `tests/soak.rs`): TCP clients on every worker that
   close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
   traffic alongside; afterwards no descriptor, memory or driver state may be left over.
   30 minutes on four workers: 39.5 million connections, resident memory flat at 15.5–15.7
-  MB. CI runs it for two hours every night, on the runner's kernel and on Linux 6.18 in
-  QEMU, whose packed buffer rings cut stream receives wherever a shared buffer fills up;
-  the 6.12 and 6.18 kernel jobs soak for a minute on every change.
+  MB. A second soak (`giong-tls/tests/soak.rs`) does the same over TLS 1.3 and 1.2 with a
+  `TlsStream` at both ends, with kernel TLS on half the stream ends where the `tls` module
+  is loaded: clean closes, dropped connections, handshakes given up, receives cancelled and
+  taken up again, writes cancelled inside a record. 30 minutes on four workers of a 4-vCPU
+  virtual machine, without kernel TLS: 7.6 million connections on io_uring and 7.4 million
+  on epoll, about half of them full handshakes, no unexpected error, resident memory
+  between 62 and 89 MB on io_uring and between 56 and 85 MB on epoll with no growth
+  (`bench/results/tls-soak/4f9083b/`). CI
+  runs both for two hours every night, on the runner's kernel and on Linux 6.18 in QEMU,
+  whose packed buffer rings cut stream receives wherever a shared buffer fills up; the 6.12
+  and 6.18 kernel jobs soak for a minute on every change, 6.18 with kernel TLS.
 - **valgrind memcheck** over the single-threaded tests (`scripts/valgrind.sh`): no invalid
   access, no leak.
 - **Load** on the example HTTP server: over 250,000 connections opened and closed, 5,000
@@ -961,7 +1160,7 @@ Also:
   period 156 of 200 requests were answered; with one, 400 of 400.
 - **CI** runs formatting, clippy, the documentation build, a build with Rust 1.80, the
   repeated tests, the fallback setups and the epoll driver, the tests inside Docker,
-  ThreadSanitizer, Miri, the loom models, the real 5.15, 6.0 and 6.1 kernels and the core
+  ThreadSanitizer, Miri, the Kani proofs, the loom models, the real 5.15, 6.0 and 6.1 kernels and the core
   crate with its direct dependencies at the lowest versions it allows on every change, and
   fuzzing and the soak test every night.
 
@@ -982,7 +1181,7 @@ Not verified, and you should know it:
 
 ## Compared with Monoio and Glommio
 
-| | giong 0.7 | Monoio 0.2.4 | Glommio 0.9.0 |
+| | giong 1.0 | Monoio 0.2.4 | Glommio 0.9.0 |
 |---|---|---|---|
 | Platforms | Linux: io_uring on ≥ 6.0, an epoll driver elsewhere | Linux ≥ 5.6, with an epoll/kqueue fallback (runs on macOS) | Linux ≥ 5.8, needs a raised memlock limit |
 | Receiving | multishot, kernel-provided buffers | one submission per read, caller's buffer | direct `recv`, io_uring to wait |
@@ -995,13 +1194,15 @@ Not verified, and you should know it:
 | Scheduling | FIFO | FIFO | weighted queues with latency classes |
 | I/O | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, files | TCP, UDP, Unix sockets, Direct I/O files |
 | Ecosystem | its own HTTP/1.1 and HTTP/2 server and client, TLS for both sides, DNS, PostgreSQL, MySQL and Redis clients | TLS, HTTP, codecs, Tokio compatibility layer | channels, semaphores, rate control |
-| Size | ~16,400 lines, plus ~23,000 for HTTP and TLS and ~22,900 for the database clients | ~25,000 lines | ~40,500 lines |
+| Size | ~17,400 lines, plus ~23,800 for HTTP and TLS and ~23,000 for the database clients | ~25,000 lines | ~40,500 lines |
 
 Monoio is the mature choice and runs in production at ByteDance; if you need
 Tokio-compatible crates today, use it. Glommio is built for storage engines: Direct I/O and
-priority scheduling are its strengths, not HTTP. giong's case is narrower: the receive
-path (multishot with provided buffers, cancel safe without a second API), good defaults,
-the latency dial, a strict HTTP server on top, and code small enough to audit.
+priority scheduling are its strengths, not HTTP. giong's case: the receive path
+(multishot with provided buffers, cancel safe without a second API), good defaults, the
+latency dial, its own crates for a whole service instead of a compatibility layer, an API
+held to the four rules [above](#what-giong-is-for), and code small enough to audit. It is
+younger than both and has not run in production.
 
 ## Limitations
 

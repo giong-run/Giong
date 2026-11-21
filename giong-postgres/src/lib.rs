@@ -65,6 +65,7 @@ pub mod fuzzing;
 mod pool;
 mod protocol;
 mod row;
+mod text;
 pub mod types;
 
 pub use client::{CancelToken, Client, Transaction};

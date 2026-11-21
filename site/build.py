@@ -607,8 +607,8 @@ def home():
     stats = [
         (sys_rows["giong"][2], f"system calls per request on `/json`; raw Tokio makes {sys_rows['tokio'][2]}"),
         (str(len(CRATES)), "crates on one version: the runtime and what a service needs on top"),
+        (str(ERROR_COUNT), "error codes, each with the cause, the fix and a page of its own"),
         (f"{TOTAL_TESTS:,}", "tests, run on three io_uring setups, on epoll and on real 5.15, 6.0 and 6.1 kernels"),
-        (str(len(DEPS)), "dependencies in the runtime: " + ", ".join(f"`{d}`" for d in DEPS)),
     ]
     stats_html = "".join(f'<div class="stat"><b>{v}</b><span>{ilm(d)}</span></div>' for v, d in stats)
     drawn = {"One syscall per tick": art.syscalls, "Idle connections hold no buffer": art.buffers,
@@ -623,6 +623,12 @@ def home():
     charts = "".join(chart(c, home=True) for c in C.CHARTS if c.get("home"))
     a = C.AGENTS
     points = "".join(f'<li><h3>{h}</h3><p>{ilm(p)}</p></li>' for h, p in a["points"])
+    m = C.MCP
+    mcp_steps = "\n".join(f'<span class="c"># {i}. {html.escape(h)}</span>\n'
+                          + ("" if cmd.startswith("let ") else '<span class="p">$</span> ')
+                          + html.escape(cmd) + "\n"
+                          for i, (h, cmd) in enumerate(m["setup"], 1))
+    mcp_tools = "".join(f'<li><h3><code>{h}</code></h3><p>{ilm(p)}</p></li>' for h, p in m["tools"])
     checked = "".join(f"<li>{ilm(x)}</li>" for x in C.CHECKED)
     not_yet = "".join(f"<li>{ilm(x)}</li>" for x in C.NOT_YET)
     body = f'''<section class="hero">
@@ -658,6 +664,44 @@ def home():
 
 <section class="stats-band" aria-label="giong in numbers">
   <div class="wrap stats">{stats_html}</div>
+</section>
+
+<section class="band" id="agents">
+  <div class="wrap agents">
+    {head_block("agent-first", a["h2"], a["lede"])}
+    <div class="agents-side">
+      <figure class="term">
+        <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>cargo run</span></div>
+        <pre><code><span class="p">$</span> cargo run
+<span class="c">   Running `target/debug/shop`</span>
+Error: <span class="e">{html.escape(a["error"].replace("{version}", VERSION))}</span></code></pre>
+      </figure>
+      <div class="files">
+        <a href="{BLOB}AGENTS.md"><b>AGENTS.md</b><span>how to build, test and change giong</span></a>
+        <a href="{asset("llms.txt")}"><b>llms.txt</b><span>where a model finds the docs</span></a>
+        <a href="{link("docs", "errors")}"><b>{ERROR_COUNT} error codes</b><span>each with a page: cause and fix</span></a>
+      </div>
+    </div>
+    <ol class="points points-5">{points}</ol>
+  </div>
+</section>
+
+<section class="band band-alt" id="mcp">
+  <div class="wrap agents">
+    {head_block("giong-mcp", m["h2"], m["lede"], (f"{BLOB}giong-mcp/README.md", "giong-mcp README"))}
+    <div class="agents-side">
+      <figure class="term">
+        <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>three steps</span></div>
+        <pre><code>{mcp_steps}</code></pre>
+      </figure>
+      <figure class="term">
+        <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>overview → warnings</span></div>
+        <pre><code><span class="e">{html.escape(m["warning"])}</span></code></pre>
+      </figure>
+    </div>
+    <ol class="points points-5">{mcp_tools}</ol>
+    <p class="head-lede mcp-foot">{ilm(m["foot"])}</p>
+  </div>
 </section>
 
 <section class="band" id="why">
@@ -696,26 +740,6 @@ def home():
   </div>
 </section>
 
-<section class="band" id="agents">
-  <div class="wrap agents">
-    {head_block("agent-first", a["h2"], a["lede"])}
-    <div class="agents-side">
-      <figure class="term">
-        <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>cargo run</span></div>
-        <pre><code><span class="p">$</span> cargo run
-<span class="c">   Running `target/debug/shop`</span>
-Error: <span class="e">{html.escape(a["error"].replace("{version}", VERSION))}</span></code></pre>
-      </figure>
-      <div class="files">
-        <a href="{BLOB}AGENTS.md"><b>AGENTS.md</b><span>how to build, test and change giong</span></a>
-        <a href="{asset("llms.txt")}"><b>llms.txt</b><span>where a model finds the docs</span></a>
-        <a href="{link("docs", "errors")}"><b>{ERROR_COUNT} error codes</b><span>each with a page: cause and fix</span></a>
-      </div>
-    </div>
-    <ol class="points">{points}</ol>
-  </div>
-</section>
-
 <section class="band band-alt" id="status">
   <div class="wrap">
     {head_block("status", "Where giong stands",
@@ -746,7 +770,7 @@ Error: <span class="e">{html.escape(a["error"].replace("{version}", VERSION))}</
     every core the moment load arrives.</p>
   </div>
 </section>'''
-    return frame("home", "giong: a thread-per-core async runtime for Rust on io_uring",
+    return frame("home", "giong: the Rust async runtime built for the agent era",
                  C.HERO["lede"], body)
 
 
@@ -960,6 +984,9 @@ def roadmap():
         return found[-1] if found else None
 
     def label(m):
+        # A track that spans several 1.x releases ("... (track R, after 1.0)") is not a crate.
+        if not m["ver"] and m["title"].endswith("after 1.0)"):
+            return "1.x"
         return m["ver"] or "crates"
 
     def name(m):
@@ -1154,10 +1181,13 @@ def llms():
              ) if "giong-postgres" in names else ""
     return f"""# giong
 
-> A thread-per-core async runtime for Rust on Linux, built directly on io_uring. Every
-> worker owns its ring, tasks and buffers; tasks never move between threads, so futures
-> need not be `Send`. Version {VERSION}; every link below is to the documentation of that
-> release, which is what `cargo add` installs.
+> An async runtime for Rust services on Linux, built for code that AI agents write: a
+> strict API meant to stay on major version 1 for many years, errors with a stable code,
+> the cause and the fix, and its own crates for a whole service (HTTP, TLS, PostgreSQL,
+> MySQL, Redis, DNS) with no Tokio underneath. Thread per core on io_uring: every worker
+> owns its ring, tasks and buffers; tasks never move between threads, so futures need not
+> be `Send`. Version {VERSION}; every link below is to the documentation of that release,
+> which is what `cargo add` installs.
 
 Facts that are easy to get wrong:
 
@@ -1197,8 +1227,9 @@ Facts that are easy to get wrong:
   `giong-postgres`, not sqlx or tokio-postgres; MySQL: `giong-mysql`; Redis: `giong-redis`,
   not redis-rs; files: `giong::fs`; names: `giong::net::lookup_host`; timers: `giong::time`.
   Measured against those Tokio crates on Tokio, one core each, they serve 1.2 to 4.7 times
-  the requests or statements, and file reads at an offset 5.5 to 8 times (the README's
-  Benchmarks section has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
+  the requests, statements or commands, and file reads at an offset 5.5 to 8 times; over one
+  PostgreSQL connection shared by every task giong-postgres is behind tokio-postgres,
+  so use a `Pool` (the README's Benchmarks section has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
   they are. Only for a protocol giong has no crate for (WebSocket, for one), a crate generic
   over a Tokio or futures-io stream (tokio-tungstenite, h2, tokio-rustls, hyper's `conn`)
   runs through `giong_compat::Compat::new(stream)`, which adds a copy per byte written and

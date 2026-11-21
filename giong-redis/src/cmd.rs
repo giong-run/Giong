@@ -101,8 +101,7 @@ pub fn cmd(name: &str) -> Cmd {
 }
 
 impl Cmd {
-    /// Starts a command; the same as [`cmd`].
-    pub fn new(name: &str) -> Self {
+    fn new(name: &str) -> Self {
         let mut c = Self {
             body: Vec::with_capacity(64),
             count: 0,

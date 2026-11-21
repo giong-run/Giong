@@ -170,7 +170,11 @@ pub trait ToSql {
 }
 
 fn wrong_param(rust: &str, ty: Type, instead: &str) -> Error {
-    Error::conversion(format!("a {rust} cannot be a {ty}{instead}"))
+    Error::conversion(format!(
+        "{} cannot be {}{instead}",
+        crate::text::a(rust),
+        crate::text::a(&ty.to_string())
+    ))
 }
 
 /// What to pass instead for a parameter of type `ty`.
@@ -190,7 +194,8 @@ fn suggestion(ty: Type) -> &'static str {
 fn put_int(v: i64, rust: &str, ty: Type, out: &mut Vec<u8>) -> Result<Encoded, Error> {
     let range = |name: &str| {
         Error::conversion(format!(
-            "{v} does not fit in a {name}; change the column type or pass a smaller value"
+            "{v} does not fit in {}; change the column type or pass a smaller value",
+            crate::text::a(name)
         ))
     };
     match ty {
@@ -433,7 +438,7 @@ pub trait FromSql<'a>: Sized {
         let _ = ty;
         Err(Error::conversion(format!(
             "the value is NULL; read it as Option<{}>",
-            std::any::type_name::<Self>()
+            crate::text::rust_name::<Self>()
         )))
     }
 }
@@ -454,8 +459,9 @@ fn read_as(ty: Type) -> &'static str {
 
 fn wrong_column<T>(ty: Type) -> Error {
     Error::conversion(format!(
-        "a {ty} cannot be read as {}{}",
-        std::any::type_name::<T>(),
+        "{} cannot be read as {}{}",
+        crate::text::a(&ty.to_string()),
+        crate::text::rust_name::<T>(),
         read_as(ty)
     ))
 }
@@ -463,8 +469,9 @@ fn wrong_column<T>(ty: Type) -> Error {
 fn fixed<const N: usize>(raw: &[u8], ty: Type) -> Result<[u8; N], Error> {
     raw.try_into().map_err(|_| {
         Error::conversion(format!(
-            "the server sent {} bytes for a {ty}, which has {N}",
-            raw.len()
+            "the server sent {} bytes for {}, which has {N}",
+            raw.len(),
+            crate::text::a(&ty.to_string())
         ))
     })
 }
@@ -625,11 +632,7 @@ mod tests {
             (Encoded::Text, b"7".to_vec())
         );
         let e = enc(&3_000_000_000i64, Type::INT4).unwrap_err();
-        assert!(
-            e.to_string().contains("does not fit in a integer")
-                || e.to_string().contains("does not fit in a"),
-            "{e}"
-        );
+        assert!(e.to_string().contains("does not fit in an integer"), "{e}");
         let e = enc(&1i32, Type::TEXT).unwrap_err();
         assert!(e.to_string().contains("pass a &str"), "{e}");
 

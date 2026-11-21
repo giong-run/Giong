@@ -36,7 +36,7 @@ use std::time::Duration;
 use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 
-pub(crate) use epoll::refill_budget;
+pub(crate) use epoll::{refill_budget, spend_budget};
 
 /// Which I/O driver a worker uses: io_uring, the default, or epoll where
 /// io_uring is not available (see [`Builder::driver`](crate::Builder::driver)).
@@ -373,6 +373,18 @@ pub(crate) enum Io {
         flags: u32,
         zero_copy: bool,
     },
+    /// `sendto(2)`: one datagram to `addr` from a socket that need not be
+    /// connected. The io_uring driver submits it only where
+    /// [`Driver::sends_to`] says the kernel takes it (`IORING_OP_SEND` with
+    /// a destination address, Linux 6.1). Sent with `MSG_NOSIGNAL`; no
+    /// other flags, so that every operation stays as small as before.
+    SendTo {
+        fd: RawFd,
+        buf: *const u8,
+        len: u32,
+        addr: *const libc::sockaddr,
+        addr_len: libc::socklen_t,
+    },
     /// A one-off `recvmsg(2)` with `flags` (such as `MSG_CMSG_CLOEXEC`).
     RecvMsg {
         fd: RawFd,
@@ -450,11 +462,19 @@ impl Io {
         matches!(self, Io::OpenAt { .. })
     }
 
+    /// `true` for operations that run to the end once submitted, even when
+    /// their future is dropped: a close the caller gave up on must still
+    /// close, or the descriptor stays open with nobody owning it.
+    pub(crate) fn finishes_when_dropped(&self) -> bool {
+        matches!(self, Io::Close { .. })
+    }
+
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
             Io::Send { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
             Io::SendMsg { flags, .. } => flags & libc::MSG_DONTWAIT as u32 == 0,
+            Io::SendTo { .. } => true,
             _ => false,
         }
     }
@@ -542,6 +562,61 @@ pub(crate) enum MultiIo {
 pub(crate) enum Driver {
     Uring(uring::Uring),
     Epoll(epoll::Epoll),
+}
+
+/// Runs a non-blocking send for [`Driver::try_send_to`]: its result, or
+/// `None` when the socket is full or the task's budget is spent.
+fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
+    if !epoll::spend_budget() {
+        return None;
+    }
+    loop {
+        let res = send();
+        if res >= 0 {
+            return Some(res.min(i32::MAX as isize) as i32);
+        }
+        match io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
+        {
+            libc::EINTR => {}
+            libc::EAGAIN => {
+                // Full: the operation the caller submits instead waits for
+                // room, and takes its own unit of the budget.
+                epoll::give_back_budget();
+                return None;
+            }
+            e => return Some(-e),
+        }
+    }
+}
+
+/// Reads from a regular file at once when the bytes are in the page cache:
+/// `preadv2` with `RWF_NOWAIT`, which copies what is cached and returns
+/// `EAGAIN` instead of waiting for the disk. A cached read then costs one
+/// system call, as with blocking I/O, instead of a trip through io_uring (or
+/// epoll's blocking threads). `None` when the caller must use the driver:
+/// nothing is cached, the file system cannot do it, the call failed in any
+/// other way (the driver's operation then reports the error as before), or
+/// the task's budget is spent, so a loop over cached reads still yields.
+pub(crate) fn read_cached(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Option<i32> {
+    // Miri cannot run `preadv2`: every read goes through the driver there.
+    if cfg!(miri) || len == 0 || offset > i64::MAX as u64 || !epoll::spend_budget() {
+        return None;
+    }
+    let iov = libc::iovec {
+        iov_base: buf.cast(),
+        iov_len: len as usize,
+    };
+    // SAFETY: the caller hands a buffer valid for `len` bytes; the call does
+    // not block (RWF_NOWAIT).
+    let res = unsafe { libc::preadv2(fd, &iov, 1, offset as libc::off_t, libc::RWF_NOWAIT) };
+    if res >= 0 {
+        return Some(res as i32);
+    }
+    // The driver's operation takes its own unit of the budget.
+    epoll::give_back_budget();
+    None
 }
 
 /// `GIONG_DRIVER` when the builder did not choose: `None` if unset or
@@ -675,11 +750,19 @@ impl Driver {
     /// The future of a single-shot operation was dropped before its result
     /// was collected. `data` are the resources the kernel may still use;
     /// `result_is_fd` says the result will be a descriptor nobody owns (see
-    /// [`Io::result_is_fd`]), which the driver then closes.
-    pub(crate) fn cancel_op(&mut self, key: usize, data: Option<Box<dyn Any>>, result_is_fd: bool) {
+    /// [`Io::result_is_fd`]), which the driver then closes. With `finish`
+    /// (see [`Io::finishes_when_dropped`]) the operation is not cancelled:
+    /// it runs to the end and its result is thrown away.
+    pub(crate) fn cancel_op(
+        &mut self,
+        key: usize,
+        data: Option<Box<dyn Any>>,
+        result_is_fd: bool,
+        finish: bool,
+    ) {
         match self {
-            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd),
-            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd),
+            Driver::Uring(d) => d.cancel_op(key, data, result_is_fd, finish),
+            Driver::Epoll(d) => d.cancel_op(key, data, result_is_fd, finish),
         }
     }
 
@@ -687,6 +770,75 @@ impl Driver {
         match self {
             Driver::Uring(d) => d.new_multi(kind),
             Driver::Epoll(d) => d.new_multi(kind),
+        }
+    }
+
+    /// Sends one datagram to `addr` at once with `sendto(2)`, without
+    /// blocking: the result, or `None` if the caller is to send it as an
+    /// operation instead, because the socket buffer is full or the task has
+    /// used its budget (see [`refill_budget`]).
+    ///
+    /// Both drivers send datagrams this way first. A UDP send never waits for
+    /// the peer, so the kernel finishes it within the call. With io_uring it
+    /// is cheaper than an SQE: the datagram leaves at once instead of at the
+    /// next `io_uring_enter`, and the task carries on without waiting for a
+    /// completion, which with one task per socket meant a turn of the event
+    /// loop per datagram. Receives stay multishot, so an echo costs one
+    /// system call, where a readiness runtime makes two.
+    ///
+    /// Not while SQEs wait for the next `io_uring_enter`: the datagram would
+    /// reach the kernel before them. One of them may cancel a receive on this
+    /// socket, and on kernels that run completions before taking new
+    /// submissions (Linux 6.0) the answer to this datagram would go to the
+    /// receive being cancelled and be lost. The operation the caller submits
+    /// instead goes in behind them.
+    #[inline(always)]
+    pub(crate) fn try_send_to(
+        &mut self,
+        fd: RawFd,
+        buf: &[u8],
+        addr: &socket2::SockAddr,
+    ) -> Option<i32> {
+        if self.has_queued_submissions() {
+            return None;
+        }
+        // SAFETY: `buf` and `addr` are valid for the call; non-blocking.
+        send_now(|| unsafe {
+            libc::sendto(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                addr.as_ptr().cast(),
+                addr.len(),
+            )
+        })
+    }
+
+    /// [`try_send_to`](Self::try_send_to) for a connected socket: `send(2)`.
+    #[inline(always)]
+    pub(crate) fn try_send(&mut self, fd: RawFd, buf: &[u8]) -> Option<i32> {
+        if self.has_queued_submissions() {
+            return None;
+        }
+        // SAFETY: `buf` is valid for the call; non-blocking.
+        send_now(|| unsafe {
+            libc::send(
+                fd,
+                buf.as_ptr().cast(),
+                buf.len(),
+                libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+            )
+        })
+    }
+
+    /// `true` if [`Io::SendTo`] can be submitted: always with epoll, from
+    /// Linux 6.1 on with io_uring. Without it, a datagram to an address goes
+    /// as an [`Io::SendMsg`].
+    pub(crate) fn sends_to(&self) -> bool {
+        match self {
+            Driver::Uring(d) => d.sends_to(),
+            Driver::Epoll(_) => true,
         }
     }
 
@@ -701,6 +853,25 @@ impl Driver {
         match self {
             Driver::Uring(d) => d.poll_multi(key, waker),
             Driver::Epoll(d) => d.poll_multi(key, waker),
+        }
+    }
+
+    /// Stops a multishot receive that is waiting in the kernel, so that the
+    /// reader's next poll starts it again (io_uring; the epoll driver reads
+    /// when the socket is readable and misses nothing).
+    pub(crate) fn restart_multi(&mut self, key: usize) {
+        if let Driver::Uring(d) = self {
+            d.restart_multi(key);
+        }
+    }
+
+    /// A future that waited on multishot operation `key` with `waker` was
+    /// dropped (see `net::Waiting`).
+    pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {
+        match self {
+            Driver::Uring(d) => d.leave_multi(key, waker),
+            // A readiness edge wakes every waiting task.
+            Driver::Epoll(_) => {}
         }
     }
 
@@ -749,8 +920,17 @@ impl Driver {
         }
     }
 
+    /// `true` if operations wait to be handed to the kernel (io_uring's
+    /// submission queue); never with epoll, which has no queue.
+    #[inline(always)]
+    pub(crate) fn has_queued_submissions(&mut self) -> bool {
+        match self {
+            Driver::Uring(d) => d.has_queued_submissions(),
+            Driver::Epoll(_) => false,
+        }
+    }
+
     /// Hands queued SQEs to the kernel now (see `Uring::submit_queued`).
-    #[cfg(giong_tsan)]
     pub(crate) fn submit_queued(&mut self) {
         match self {
             Driver::Uring(d) => d.submit_queued(),

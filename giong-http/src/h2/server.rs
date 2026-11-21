@@ -65,6 +65,7 @@ use super::hpack::{Decoder, Encoder, Index, TABLE_SIZE};
 use super::request::{Builder, Built, Trailers};
 use super::wake::Wakers;
 use crate::body::{Failure, Next, Pipe, StreamBody};
+use crate::budget::{self, Charge};
 use crate::heap::HeapFuture;
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, FileBody, Response};
@@ -103,6 +104,15 @@ const WINDOW_UPDATES_PER_DATA: u32 = 10;
 /// After an error, how long the connection keeps reading (and discarding)
 /// so that the client sees the GOAWAY rather than a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
+/// How long an idle connection keeps the memory for its streams (slots,
+/// wakers, queues, the header buffer) after its last stream closed, so that
+/// requests following one another allocate none of it again. Only once
+/// requests have been seen to follow one another within this time (see
+/// `Session::warm`): a connection that makes one request and then sits idle,
+/// as thousands of them do when they open together, gives the memory back at
+/// once, or it would be held for all of them at the same time and stay in
+/// the process's resident memory after it was freed.
+const KEEP_STREAMS: Duration = Duration::from_secs(1);
 
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
 /// request bodies, and of responses not sent yet.
@@ -261,6 +271,9 @@ struct Stream {
     /// Body bytes held for this stream: the buffered body (until the
     /// stream ends) or what its handler has not taken yet.
     held: u64,
+    /// A body received in full before the handler runs, against the
+    /// worker's budget for requests (`max_buffered_request_bytes`).
+    charge: Charge,
     recv: Recv,
     send_window: i64,
     send: Send,
@@ -397,7 +410,20 @@ pub(crate) struct Session {
     pub(crate) wakers: Wakers,
     /// Since when no stream has been open.
     idle_since: Instant,
-    /// Lowercased header names, reused.
+    /// Requests have followed one another within `KEEP_STREAMS`: the memory
+    /// for streams is kept between them, and given back once the connection
+    /// has been idle for that long.
+    warm: bool,
+    /// The memory for streams has been given back at least once.
+    released: bool,
+    /// The queue of handlers to start (`starts`) has been given back once
+    /// after a burst of streams, since the memory for streams last was.
+    starts_shrunk: bool,
+    /// It grew past four again after that: bursts keep coming, and it is
+    /// kept until the memory for streams is given back.
+    keep_starts: bool,
+    /// A buffer reused for lowercased response header names, and for the
+    /// fields of a request header block while it is decoded.
     name: Vec<u8>,
 }
 
@@ -439,6 +465,10 @@ impl Session {
             events: Vec::new(),
             wakers: Wakers::default(),
             idle_since: Instant::now(),
+            warm: false,
+            released: false,
+            starts_shrunk: false,
+            keep_starts: false,
             name: Vec::new(),
         }
     }
@@ -471,8 +501,9 @@ impl Session {
         }
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<Event> {
-        mem::take(&mut self.events)
+    /// The next handler to drop, in no particular order.
+    pub(crate) fn pop_event(&mut self) -> Option<Event> {
+        self.events.pop()
     }
 
     /// Handlers wait: the connection holds as many response bytes as it
@@ -487,11 +518,41 @@ impl Session {
     }
 
     /// The next request whose handler may start, unless handlers wait.
+    /// Queues the handler of the stream in `slot` to start. The queue's
+    /// first allocation holds one request: Rust's would hold four (672
+    /// bytes), kept with the stream memory while the connection is warm, and
+    /// most connections have one request at a time. A queue grown past four
+    /// is given back the first time it is empty, and kept from the second
+    /// on (see `next_start`).
+    fn push_start(&mut self, slot: usize, req: Request) {
+        if self.starts.capacity() == 0 {
+            self.starts.reserve_exact(1);
+        }
+        self.starts.push_back((slot, req));
+    }
+
     pub(crate) fn next_start(&mut self) -> Option<(usize, Request)> {
         if self.handlers_wait() {
             return None;
         }
-        self.starts.pop_front()
+        let next = self.starts.pop_front();
+        if next.is_none() && self.starts.capacity() > 4 && !self.keep_starts {
+            // A burst of streams opened together grew the queue. Its
+            // requests are large (168 bytes each): after one burst, as when a
+            // client opens several long requests at once, the memory would
+            // stay with the connection for as long as they last, so it is
+            // given back. When bursts keep coming, as from a client with many
+            // streams in flight, giving it back each time cost up to 4.5%
+            // more instructions per request: from the second burst on it is
+            // kept, until the connection is idle (`release_streams`).
+            if self.starts_shrunk {
+                self.keep_starts = true;
+            } else {
+                self.starts = VecDeque::new();
+                self.starts_shrunk = true;
+            }
+        }
+        next
     }
 
     /// The handler of the stream in `slot` panicked: the stream is
@@ -708,6 +769,7 @@ impl Session {
             return Ok(());
         };
         let limit = self.cfg.max_body_size as u64;
+        let buffered_limit = self.cfg.buffered_limit();
         let Some(st) = self.stream(slot) else {
             return Ok(());
         };
@@ -752,6 +814,15 @@ impl Session {
         }
         match &mut st.recv {
             Recv::Buffer(req) => {
+                let charged = st.charge.bytes() + data.len() as u64;
+                if !st.charge.grow_to(charged, buffered_limit) {
+                    // The worker holds as many request bytes as it may.
+                    st.recv = Recv::Done;
+                    st.unacked += data.len() as u32;
+                    budget::note_refused(buffered_limit);
+                    self.refuse(slot);
+                    return Ok(());
+                }
                 if let Some(buf) = Rc::get_mut(&mut req.buf) {
                     buf.extend_from_slice(data);
                 }
@@ -788,7 +859,7 @@ impl Session {
             Recv::Buffer(mut req) => {
                 let start = req.head.len;
                 req.body = BodyBytes::InBuffer(start..req.buf.len());
-                self.starts.push_back((slot, req));
+                self.push_start(slot, req);
             }
             pipe @ Recv::Pipe { .. } => {
                 st.recv = pipe;
@@ -955,10 +1026,12 @@ impl Session {
                 self.remote_end(slot)
             }
             Purpose::Open { refuse } => {
-                let mut builder = Builder::new(self.cfg.max_head_size);
-                self.decoder
-                    .decode(fragment, |n, v| builder.field(n, v))
-                    .map_err(compression)?;
+                let mut builder =
+                    Builder::with_scratch(self.cfg.max_head_size, mem::take(&mut self.name));
+                let decoded = self.decoder.decode(fragment, |n, v| builder.field(n, v));
+                let built = builder.finish(self.peer);
+                self.name = builder.into_scratch();
+                decoded.map_err(compression)?;
                 if refuse {
                     return self.reset_closed(id, Reason::Protocol);
                 }
@@ -969,7 +1042,7 @@ impl Session {
                     // Not processed: the client sends it again later.
                     return self.reset_closed(id, Reason::RefusedStream);
                 }
-                match builder.finish(self.peer) {
+                match built {
                     Built::Malformed(_) => self.reset_closed(id, Reason::Protocol),
                     Built::Status(status) => {
                         let slot = self.open(id, end_stream, None, false);
@@ -1027,6 +1100,7 @@ impl Session {
             content_length,
             received: 0,
             held: 0,
+            charge: Charge::none(),
             recv: Recv::Done,
             send_window: self.peer_window,
             send: Send::Waiting,
@@ -1037,12 +1111,27 @@ impl Session {
             deadline: None,
             blocked_since: None,
         };
+        if self.streams.capacity() == 0
+            && self.released
+            && Instant::now() < self.idle_since + KEEP_STREAMS
+        {
+            // The memory for streams was given back, and a request follows
+            // soon after: keep it from now on.
+            self.warm = true;
+        }
         let slot = match self.free.pop() {
             Some(slot) => {
                 self.streams[slot] = Some(stream);
                 slot
             }
             None => {
+                // Room for one stream at first (352 bytes), not the four
+                // Rust's first allocation would make room for: most
+                // connections have one request at a time, and an idle one
+                // keeps this while it is warm.
+                if self.streams.capacity() == 0 {
+                    self.streams.reserve_exact(1);
+                }
                 self.streams.push(Some(stream));
                 self.streams.len() - 1
             }
@@ -1070,7 +1159,7 @@ impl Session {
                 let _ = self.reset(slot, Reason::Protocol);
                 return;
             }
-            self.starts.push_back((slot, req));
+            self.push_start(slot, req);
             return;
         }
         let Ok(stream_body) = catching(|| handler.stream_body(&req)) else {
@@ -1093,11 +1182,24 @@ impl Session {
                     taken: 0,
                 };
                 st.expect_continue = expect_continue;
-                self.starts.push_back((slot, req));
+                self.push_start(slot, req);
             }
             None => {
                 if content_length.is_some_and(|cl| cl > max_body) {
                     let _ = self.answer_status(slot, 413);
+                    return;
+                }
+                // Refused before its body is read if the worker's budget for
+                // requests cannot take it (at least one byte of it, when no
+                // length is announced).
+                let buffered_limit = self.cfg.buffered_limit();
+                if content_length.is_some_and(|cl| cl > buffered_limit) {
+                    let _ = self.answer_status(slot, 413);
+                    return;
+                }
+                if !budget::fits(content_length.unwrap_or(1), buffered_limit) {
+                    budget::note_refused(buffered_limit);
+                    self.refuse(slot);
                     return;
                 }
                 let st = self.stream(slot).expect("just opened");
@@ -1347,6 +1449,20 @@ impl Session {
         self.reset_budget()
     }
 
+    /// Refuses the stream in `slot`, whose handler has not run, with
+    /// `REFUSED_STREAM`: the worker holds as many request bytes as it may.
+    /// The client may send the request again. Not counted against the
+    /// client's budget for resets: the refusal is the server's doing.
+    fn refuse(&mut self, slot: usize) {
+        let Some(st) = self.stream(slot) else {
+            return;
+        };
+        let id = st.id;
+        self.reserve_out();
+        frame::write_rst(&mut self.out, id, Reason::RefusedStream);
+        self.remove(slot, Failure::Abandoned, true);
+    }
+
     /// Resets a stream that has no slot (refused, or closed already).
     fn reset_closed(&mut self, id: u32, reason: Reason) -> Result<(), ConnError> {
         self.reserve_out();
@@ -1420,6 +1536,7 @@ impl Session {
     /// The body bytes of the stream in `slot` are no longer held.
     fn drop_held(&mut self, slot: usize) {
         if let Some(st) = self.stream(slot) {
+            st.charge.shrink_to(0);
             let held = mem::take(&mut st.held);
             self.held -= held;
             self.grant_due |= held > 0;
@@ -1495,10 +1612,10 @@ impl Session {
         self.encoder
             .field(b"date", &crate::date::now(), Index::Yes, &mut block);
         if !bodiless && !streaming {
-            let mut digits = itoa(body.len());
+            let mut digits = [0; 20];
+            let digits = itoa(body.len(), &mut digits);
             self.encoder
-                .field(b"content-length", digits.as_bytes(), Index::No, &mut block);
-            digits.clear();
+                .field(b"content-length", digits, Index::No, &mut block);
         }
         let mut name = mem::take(&mut self.name);
         for (n, v) in resp.headers() {
@@ -1837,8 +1954,13 @@ impl Session {
         if let Some(block) = &self.block {
             at(block.deadline);
         }
-        if self.ids.is_empty() && self.goaway.is_none() {
-            at(self.idle_since + self.cfg.idle_timeout);
+        if self.ids.is_empty() {
+            if self.goaway.is_none() {
+                at(self.idle_since + self.cfg.idle_timeout);
+            }
+            if self.keeps_streams() {
+                at(self.idle_since + KEEP_STREAMS);
+            }
         }
         for &(_, slot) in &self.ids {
             if let Some(st) = &self.streams[slot] {
@@ -1860,6 +1982,9 @@ impl Session {
                 "a header block was not finished within the request timeout",
             ));
             return;
+        }
+        if self.ids.is_empty() && self.keeps_streams() && self.idle_since + KEEP_STREAMS <= now {
+            self.release_streams();
         }
         if self.ids.is_empty()
             && self.goaway.is_none()
@@ -1913,13 +2038,33 @@ impl Session {
     }
 
     /// With no stream open: gives back the output buffer if it is empty,
-    /// and the memory kept for streams, so that an idle connection holds
-    /// little more than its HPACK tables.
+    /// and the memory for streams unless requests have been following one
+    /// another (then the timer does, after `KEEP_STREAMS`).
     pub(crate) fn release(&mut self) {
         if self.out.is_empty() && self.out.capacity() > 0 {
             give_buffer(mem::take(&mut self.out));
         }
+        if !self.warm {
+            self.release_streams();
+        }
+    }
+
+    /// Memory for streams is kept: the connection has had streams, and has
+    /// not given it back yet.
+    pub(crate) fn keeps_streams(&self) -> bool {
+        self.streams.capacity() > 0
+    }
+
+    /// With no stream open: gives back the memory kept for streams, so that
+    /// an idle connection holds little more than its HPACK tables. Kept
+    /// while requests follow one another, which then allocate nothing for
+    /// it; given back once the connection has been idle for `KEEP_STREAMS`.
+    fn release_streams(&mut self) {
         if self.ids.is_empty() && self.events.is_empty() && self.streams.capacity() > 0 {
+            self.warm = false;
+            self.released = true;
+            self.starts_shrunk = false;
+            self.keep_starts = false;
             self.streams = Vec::new();
             self.free = Vec::new();
             self.ids = Vec::new();
@@ -1988,13 +2133,22 @@ fn poll_file(
     }
 }
 
-fn itoa(n: usize) -> String {
-    n.to_string()
+/// The decimal digits of `n`, written at the end of `buf`.
+fn itoa(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return &buf[at..];
+        }
+    }
 }
 
 /// Drops the handlers of the streams that are gone.
 fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
-    for event in s.take_events() {
+    while let Some(event) = s.pop_event() {
         let Event::Stop(slot) = event;
         if let Some(task) = tasks.get_mut(slot) {
             drop_quietly(task.take());
@@ -2138,9 +2292,10 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             break;
         }
         if write.is_none() && s.open_streams() == 0 {
-            // Idle: hand the buffers back.
+            // Idle: hand the buffers back, and the memory for streams once
+            // the session has (see `release_streams`).
             s.release();
-            if tasks.capacity() > 0 {
+            if !s.keeps_streams() && tasks.capacity() > 0 {
                 tasks = Vec::new();
             }
         }
@@ -2257,6 +2412,92 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         match giong::time::timeout(left, io.recv()).await {
             Ok(Ok(chunk)) if !chunk.is_empty() => {}
             _ => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_memory_is_kept_while_requests_follow_and_released_when_idle() {
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        // One request, then idle: given back at once.
+        let slot = s.open(1, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
+        assert!(!s.keeps_streams());
+        assert_eq!(s.next_deadline(), Some(s.idle_since + s.cfg.idle_timeout));
+        // Another soon after: from now on the memory is kept.
+        let slot = s.open(3, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
+        let idle = s.idle_since;
+        // The next request reuses the slot: nothing is allocated for it.
+        assert!(s.keeps_streams());
+        assert_eq!(s.next_deadline(), Some(idle + KEEP_STREAMS));
+        let streams = s.streams.as_ptr();
+        let slot = s.open(5, true, None, false);
+        assert_eq!(s.streams.as_ptr(), streams);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        let idle = s.idle_since;
+        s.on_timer(idle + KEEP_STREAMS / 2);
+        assert!(s.keeps_streams());
+        // Idle long enough: given back, and no wake-up is due for it.
+        s.on_timer(idle + KEEP_STREAMS);
+        assert!(!s.keeps_streams());
+        assert_eq!(s.streams.capacity(), 0);
+        assert_eq!(s.next_deadline(), Some(idle + s.cfg.idle_timeout));
+        // A request after a long pause is a first request again.
+        s.idle_since -= KEEP_STREAMS;
+        let slot = s.open(7, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
+        assert!(!s.keeps_streams());
+    }
+
+    #[test]
+    fn the_handler_queue_is_given_back_after_one_burst_and_kept_while_bursts_follow() {
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        let req = || Request::from_bytes(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").expect("a request");
+        let burst = |s: &mut Session| {
+            for slot in 0..8 {
+                s.push_start(slot, req());
+            }
+            assert!(s.starts.capacity() > 4);
+            while s.next_start().is_some() {}
+        };
+        // One burst, as from a client opening several long requests at
+        // once: the queue is given back as soon as it is empty.
+        burst(&mut s);
+        assert_eq!(s.starts.capacity(), 0);
+        // Bursts keep coming: kept, so the next one allocates nothing.
+        burst(&mut s);
+        let kept = s.starts.capacity();
+        assert!(kept > 4);
+        burst(&mut s);
+        assert_eq!(s.starts.capacity(), kept);
+        // Given back with the memory for streams, and the next burst is a
+        // first one again.
+        let slot = s.open(1, true, None, false);
+        s.remove(slot, Failure::Abandoned, false);
+        while s.pop_event().is_some() {}
+        s.release();
+        assert_eq!(s.starts.capacity(), 0);
+        burst(&mut s);
+        assert_eq!(s.starts.capacity(), 0);
+    }
+
+    #[test]
+    fn content_lengths_are_written_in_decimal() {
+        let mut buf = [0; 20];
+        for n in [0, 7, 10, 1234, 4096, usize::MAX] {
+            assert_eq!(itoa(n, &mut buf), n.to_string().as_bytes());
         }
     }
 }

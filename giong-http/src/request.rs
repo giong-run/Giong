@@ -6,6 +6,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::body::{BodyStream, Pipe};
+use crate::budget::Charge;
 use crate::chunked::{Decoder, Progress};
 use crate::parse::{find_head_end, header_lines, parse_head, Head};
 
@@ -66,6 +67,11 @@ pub struct Request {
     pub(crate) head: Head,
     pub(crate) body: BodyBytes,
     pub(crate) peer: Option<SocketAddr>,
+    /// The bytes the request holds against the worker's budget for
+    /// requests received in full (see `Server::max_buffered_request_bytes`),
+    /// given back when it is dropped.
+    #[allow(dead_code)] // Held for its `Drop`.
+    pub(crate) charge: Charge,
 }
 
 impl Request {
@@ -113,6 +119,7 @@ impl Request {
             head,
             body,
             peer: None,
+            charge: Charge::none(),
         })
     }
 

@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io::{self, Write as _};
 use std::mem;
@@ -17,6 +18,7 @@ use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use giong::time::{sleep, timeout};
 
 use crate::body::{Failure, Next, Pipe, StreamBody};
+use crate::budget::{self, Charge, FREE};
 use crate::chunked::{Decoder, Progress};
 use crate::h2::PREFACE;
 use crate::heap::HeapFuture;
@@ -393,6 +395,49 @@ pub(crate) struct Config {
     /// responses not sent yet, instead of the larger of `max_body_size`
     /// and 1 MiB: for the fuzz harness, which needs a small one.
     pub(crate) http2_budget: Option<u64>,
+    pub(crate) max_buffered_request_bytes: BufferedLimit,
+}
+
+impl Config {
+    /// The worker's budget for requests received in full (see
+    /// `Server::max_buffered_request_bytes`). Worked out on the worker, the
+    /// first time it is needed.
+    pub(crate) fn buffered_limit(&self) -> u64 {
+        match self.max_buffered_request_bytes {
+            BufferedLimit::AUTO => {
+                let single = (self.max_body_size as u64).saturating_add(self.max_head_size as u64);
+                crate::budget::auto_limit(single)
+            }
+            BufferedLimit(limit) => limit,
+        }
+    }
+}
+
+/// `Server::max_buffered_request_bytes`: a number of bytes, or
+/// [`AUTO`](Self::AUTO) for the default, which depends on the worker count
+/// and the cgroup the process runs in and so is worked out on the worker.
+/// Not an `Option`, which would take 8 bytes more in every connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BufferedLimit(pub(crate) u64);
+
+impl BufferedLimit {
+    pub(crate) const AUTO: Self = Self(u64::MAX);
+
+    fn bytes(bytes: usize) -> Self {
+        // `u64::MAX` bytes is no limit anyway.
+        Self((bytes as u64).min(u64::MAX - 1))
+    }
+}
+
+impl fmt::Debug for BufferedLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::AUTO => {
+                f.write_str("auto (64 MiB, or the cgroup memory limit / 4 / workers if less)")
+            }
+            Self(bytes) => write!(f, "{bytes}"),
+        }
+    }
 }
 
 /// An HTTP/1.1 and HTTP/2 server. Configure it, then call
@@ -424,6 +469,10 @@ pub(crate) struct Config {
 #[derive(Clone, Debug)]
 pub struct Server {
     pub(crate) cfg: Config,
+    /// `min_free_memory`, or `u64::MAX` for the default. Kept out of
+    /// `Config`, which every connection carries: only the accept loop needs
+    /// it.
+    min_free_memory: u64,
 }
 
 impl Default for Server {
@@ -448,7 +497,9 @@ impl Server {
                 http2_prior_knowledge: true,
                 max_concurrent_streams: 100,
                 http2_budget: None,
+                max_buffered_request_bytes: BufferedLimit::AUTO,
             },
+            min_free_memory: u64::MAX,
         }
     }
 
@@ -489,6 +540,51 @@ impl Server {
         self
     }
 
+    /// Most bytes of requests one worker holds while receiving them
+    /// (default: 64 MiB, or less in a container: see below).
+    ///
+    /// [`max_head_size`](Self::max_head_size) and
+    /// [`max_body_size`](Self::max_body_size) bound one request, and
+    /// [`max_connections`](Self::max_connections) the number of
+    /// connections, but not the sum: 10,000 clients each sending a 1 MiB
+    /// body slowly would make one worker hold about 11 GiB. This bounds the
+    /// sum. It counts what the server receives in full before calling the
+    /// handler, over HTTP/1.1 and HTTP/2, on every connection of the worker
+    /// (every `Server` serving on it shares the count, each against its own
+    /// limit), from the moment the bytes arrive until the request is
+    /// dropped. Over HTTP/1.1 the first 4 KiB of each request are not
+    /// counted, so that ordinary requests keep being served while uploads
+    /// fill the budget. A body read as a stream (see
+    /// [`Handler::stream_body`]) is not counted: it holds one piece at a
+    /// time.
+    ///
+    /// A request that would take the count past the limit is refused
+    /// without calling the handler, with `503 Service Unavailable`,
+    /// `Retry-After: 1` and `Connection: close` over HTTP/1.1 (before its
+    /// body is read, if its `Content-Length` does not fit; otherwise as
+    /// soon as the next bytes would not), and with `REFUSED_STREAM` over
+    /// HTTP/2, which clients retry. The body of the `503` names
+    /// `GIONG-E1120`, and each worker says on stderr, at most once a
+    /// minute, how many requests it refused. A request larger than the
+    /// limit itself gets `413 Content Too Large`.
+    ///
+    /// The default is 64 MiB per worker, or, when the process has a cgroup
+    /// memory limit (a container's memory limit, systemd's `MemoryMax`), a
+    /// quarter of that limit divided among the workers if that is less; but
+    /// never less than one request of `max_head_size` plus `max_body_size`.
+    /// With one worker in 128 MiB that is 32 MiB. `Debug` shows `auto` for
+    /// it, since the worker count is only known on the worker.
+    ///
+    /// What a worker holds is then about this limit plus what its
+    /// connections cost on their own (about 2 KiB each while idle over
+    /// HTTP/1.1, 4.5 KiB over HTTP/2 and 12.5 KiB over HTTPS, and up to the
+    /// 4 KiB above while a request arrives); see `docs/DEPLOYMENT.md` for
+    /// sizing a container.
+    pub fn max_buffered_request_bytes(mut self, bytes: usize) -> Self {
+        self.cfg.max_buffered_request_bytes = BufferedLimit::bytes(bytes);
+        self
+    }
+
     /// After a shutdown is requested, how long the server keeps picking up
     /// connections and requests that were already on their way (default:
     /// 100 ms). Requests in progress are not affected by this: they get the
@@ -502,19 +598,64 @@ impl Server {
     /// (default: 10,000). Normally every worker makes its own call, so the
     /// limit applies per worker.
     ///
-    /// The default keeps a worker's memory bounded: an idle connection costs
-    /// a few KiB, and the most a client can make one hold is about 1.2 MiB
-    /// over HTTP/1.1 and 1.7 MiB over HTTP/2 with the default sizes. Raise
-    /// it for many long-lived connections per worker (event streams), lower
-    /// it to bound memory more tightly.
+    /// An idle connection costs a few KiB (about 2 KiB over HTTP/1.1, 4.5
+    /// KiB over HTTP/2, 12.5 KiB over HTTPS, plus the kernel's socket
+    /// buffers), so the default holds a worker's idle connections to tens
+    /// of MiB. The requests the connections are receiving have a bound of
+    /// their own, shared by all of them:
+    /// [`max_buffered_request_bytes`](Self::max_buffered_request_bytes).
+    /// Raise this limit for many long-lived connections per worker (event
+    /// streams), lower it to bound memory more tightly, as in a small
+    /// container.
     ///
     /// At the limit the server stops accepting until a connection closes.
     /// New clients wait in the kernel's listen queue meanwhile instead of
-    /// being refused, and the server never runs out of file descriptors or
-    /// memory because of the number of clients. Connections handed to
+    /// being refused, so the server does not run out of file descriptors
+    /// because of the number of clients. Connections handed to
     /// [`serve_connection`](Self::serve_connection) are not counted.
+    ///
+    /// Below the limit, new connections are refused while the process is
+    /// low on memory: see [`min_free_memory`](Self::min_free_memory).
     pub fn max_connections(mut self, max: usize) -> Self {
         self.cfg.max_connections = max.max(1);
+        self
+    }
+
+    /// Memory to keep free: while less than this is left to the process,
+    /// new connections are refused (default: a tenth of the memory limit,
+    /// between 16 and 256 MiB; see below). `0` turns the check off.
+    ///
+    /// The other limits bound what each connection and each request may
+    /// hold, but not what the process holds in all: a worker's
+    /// [`max_connections`](Self::max_connections) idle HTTPS connections
+    /// take about 170 MiB with the kernel's socket memory, and more workers
+    /// or a higher limit take more. Past the memory the process may use,
+    /// the kernel's out-of-memory killer ends it, with every connection it
+    /// holds. Instead, the accept loop checks what is left before it takes
+    /// on a connection, and while less than this is left, it accepts and
+    /// closes new connections at once: plain HTTP/1.1 clients get `503
+    /// Service Unavailable` with `Retry-After: 1` and `GIONG-E1121` in the
+    /// body, TLS clients a closed connection. The connections the server
+    /// has keep being served, and new ones are taken on again as soon as
+    /// memory is freed. Each worker says on stderr, at most once a minute,
+    /// how many connections it refused.
+    ///
+    /// What is left is the smaller of what the process's cgroup allows (a
+    /// container's memory limit or systemd's `MemoryMax`: `memory.max`, or
+    /// `memory.high` if lower, less what the cgroup uses apart from the
+    /// page cache the kernel can reclaim) and what the machine has
+    /// (`MemAvailable` in `/proc/meminfo`). A worker reads it at most every
+    /// 50 ms while far from the limit and on every accept close to it.
+    ///
+    /// The default is a tenth of the cgroup's memory limit, or of the
+    /// machine's memory without one, but at least 16 MiB, at most 256 MiB,
+    /// and never more than a quarter of the memory: 51 MiB in a container
+    /// of 512 MiB. Raise it if the program allocates large amounts outside
+    /// of its connections (caches, a database client's buffers), so that
+    /// those allocations still find room when connections have filled the
+    /// rest.
+    pub fn min_free_memory(mut self, bytes: usize) -> Self {
+        self.min_free_memory = (bytes as u64).min(u64::MAX - 1);
         self
     }
 
@@ -596,16 +737,23 @@ impl Server {
     /// ends, and the other requests on the connection go on. A handler
     /// whose answer had begun when it panicked (a streamed body's producer
     /// runs elsewhere, so this is rare) has its stream reset instead.
+    ///
+    /// Cancel safe: if the future is dropped, the listener is closed;
+    /// connections already accepted go on as their own tasks.
     pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
-        self.accept_loop(accept, |stream: TcpStream, slot| {
-            let _ = stream.set_nodelay(true);
-            drop(giong::spawn(
-                Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
-            ));
-        })
+        self.accept_loop(
+            accept,
+            |stream: TcpStream, slot| {
+                let _ = stream.set_nodelay(true);
+                drop(giong::spawn(
+                    Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
+                ));
+            },
+            refuse,
+        )
         .await;
     }
 
@@ -622,15 +770,21 @@ impl Server {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Cancel safe, like [`serve`](Self::serve).
     pub async fn serve_unix<H: Handler>(&self, listener: UnixListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
         let accept = || listener.accept();
-        self.accept_loop(accept, |stream: UnixStream, slot| {
-            drop(giong::spawn(
-                Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
-            ));
-        })
+        self.accept_loop(
+            accept,
+            |stream: UnixStream, slot| {
+                drop(giong::spawn(
+                    Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
+                ));
+            },
+            refuse,
+        )
         .await;
     }
 
@@ -642,15 +796,17 @@ impl Server {
     /// # use giong_http::{Request, Response, Server};
     /// # async fn handler(_: Request) -> Response { Response::new(200) }
     /// # async fn demo() -> std::io::Result<()> {
-    /// let acceptor = giong_tls::TlsAcceptor::from_pem(
+    /// let acceptor = giong_tls::TlsAcceptor::with_certificates(&giong_tls::Certificates::from_pem(
     ///     &std::fs::read("cert.pem")?,
     ///     &std::fs::read("key.pem")?,
-    /// )?;
+    /// )?)?;
     /// let listener = TcpListener::bind("0.0.0.0:8443")?;
     /// Server::new().serve_tls(listener, acceptor, handler).await;
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// Cancel safe, like [`serve`](Self::serve).
     #[cfg(feature = "tls")]
     pub async fn serve_tls<H: Handler>(
         &self,
@@ -668,35 +824,73 @@ impl Server {
             acceptor.alpn(&[b"http/1.1"])
         };
         let accept = || listener.accept();
-        self.accept_loop(accept, |stream: TcpStream, slot| {
-            let _ = stream.set_nodelay(true);
-            let (acceptor, handler) = (acceptor.clone(), handler.clone());
-            drop(giong::spawn(async move {
-                // A failed handshake (a port scan, a plain-HTTP client, an
-                // unknown protocol version) just ends the connection.
-                let Ok(tls) = acceptor.accept(stream).await else {
-                    return;
-                };
-                if tls.alpn_protocol().as_deref() == Some(b"h2") {
-                    let _slot = slot;
+        self.accept_loop(
+            accept,
+            |stream: TcpStream, slot| {
+                let _ = stream.set_nodelay(true);
+                let acceptor = acceptor.clone();
+                let handler = handler.clone();
+                // The handshake, on the heap for its length only, holding what
+                // the connection needs (the acceptor and TCP stream for the
+                // handshake, then the rest), and reading the connection's address
+                // and protocol. The connection's task then holds the TLS stream
+                // once, inside the HTTP state, and nothing else: an input the
+                // task captures, or a local of it that is borrowed, keeps its
+                // bytes in the task for as long as the connection lasts.
+                let handshake = HeapFuture::new(async move {
+                    let tls = acceptor.accept(stream).await?;
+                    let h2 = tls.alpn_protocol().as_deref() == Some(b"h2");
                     let peer = Transport::peer_addr(&tls);
-                    // On the heap, so that HTTP/1.1 connections do not
-                    // carry the larger HTTP/2 state.
-                    HeapFuture::new(serve_h2(tls, cfg, peer, handler)).await;
-                } else {
-                    Conn::new(tls, cfg, Some(slot)).serve(handler).await;
-                }
-            }));
-        })
+                    io::Result::Ok((tls, h2, peer, cfg, slot, handler))
+                });
+                drop(giong::spawn(async move {
+                    // A failed handshake (a port scan, a plain-HTTP client, an
+                    // unknown protocol version) just ends the connection.
+                    let Ok((tls, h2, peer, cfg, slot, handler)) = handshake.await else {
+                        return;
+                    };
+                    if h2 {
+                        let _slot = slot;
+                        // On the heap, so that HTTP/1.1 connections do not
+                        // carry the larger HTTP/2 state.
+                        HeapFuture::new(serve_h2(tls, cfg, peer, handler)).await;
+                    } else {
+                        Conn::new(tls, cfg, Some(slot)).serve(handler).await;
+                    }
+                }));
+            },
+            // Nothing can be said before the handshake, which is what
+            // costs memory: just close.
+            drop,
+        )
         .await;
     }
 
     /// Accepts until a shutdown is requested, then for a moment longer.
-    /// Waits for a free slot under `max_connections` before each accept.
-    async fn accept_loop<S, A>(&self, accept: impl Fn() -> A, spawn: impl Fn(S, Slot))
-    where
+    /// Waits for a free slot under `max_connections` before each accept, and
+    /// hands a connection to `refuse` instead of `spawn` while memory is low
+    /// (`min_free_memory`).
+    async fn accept_loop<S, A>(
+        &self,
+        accept: impl Fn() -> A,
+        spawn: impl Fn(S, Slot),
+        refuse: impl Fn(S),
+    ) where
         A: Future<Output = io::Result<S>>,
     {
+        let reserve = match self.min_free_memory {
+            u64::MAX => crate::memory::auto_reserve(),
+            bytes => bytes,
+        };
+        let spawn = |stream: S, slot: Slot| {
+            if crate::memory::low(reserve) {
+                drop(slot);
+                refuse(stream);
+                note_refused_connection(reserve);
+            } else {
+                spawn(stream, slot);
+            }
+        };
         let slots = Rc::new(Slots::new(self.cfg.max_connections));
         // Cancel safe: a slot taken by a dropped future is given back, and
         // `accept` itself loses no connection.
@@ -778,6 +972,88 @@ impl Drop for Slot {
     }
 }
 
+/// Refused connections a worker may still be answering at once; past this
+/// they are closed without an answer, so that refusing costs no memory.
+const MAX_REFUSING: usize = 64;
+
+thread_local! {
+    /// Refused connections being answered on this worker.
+    static REFUSING: Cell<usize> = const { Cell::new(0) };
+    /// Connections refused since the worker last said so, and when it did.
+    static REFUSED: Cell<(u64, Option<Instant>)> = const { Cell::new((0, None)) };
+}
+
+/// The answer to a connection refused because memory is low.
+const LOW_MEMORY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
+    retry-after: 1\r\n\
+    connection: close\r\n\
+    content-type: text/plain; charset=utf-8\r\n\
+    content-length: 102\r\n\
+    \r\n\
+    GIONG-E1121: the server is low on memory and takes no new connections \
+    (min_free_memory). Retry later.\n";
+
+/// Refuses a connection without TLS while memory is low: answers `503`,
+/// then closes, in a small task of its own that holds no read buffer until
+/// the answer is out.
+fn refuse<T: Transport>(stream: T) {
+    let busy = REFUSING.with(|n| {
+        if n.get() >= MAX_REFUSING {
+            return true;
+        }
+        n.set(n.get() + 1);
+        false
+    });
+    if busy {
+        return;
+    }
+    drop(giong::spawn(async move {
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = REFUSING.try_with(|n| n.set(n.get() - 1));
+            }
+        }
+        let _done = Done;
+        let answer = async {
+            let (res, _) = stream.write_all(LOW_MEMORY.to_vec()).await;
+            if res.is_err() {
+                return;
+            }
+            // Close the sending side and read what the client sends until it
+            // closes too, so that the client reads the answer instead of a
+            // reset for unread data.
+            stream.close_write().await;
+            while let Ok(chunk) = stream.recv().await {
+                if chunk.is_empty() {
+                    break;
+                }
+            }
+        };
+        let _ = timeout(ERROR_LINGER, answer).await;
+    }));
+}
+
+/// Notes a connection refused for low memory; at most once a minute per
+/// worker, says so on stderr, with the code and how many were refused.
+fn note_refused_connection(reserve: u64) {
+    let _ = REFUSED.try_with(|refused| {
+        let (count, last) = refused.get();
+        let now = Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(60)) {
+            refused.set((count + 1, last));
+            return;
+        }
+        refused.set((0, Some(now)));
+        eprintln!(
+            "giong-http: GIONG-E1121 refused {} connection(s) on this worker: less than {} MiB \
+             of memory is left to the process, its min_free_memory; see docs/errors/E1121.md",
+            count + 1,
+            reserve >> 20
+        );
+    });
+}
+
 /// An HTTP/2 connection chosen through ALPN: its own task body.
 #[cfg(feature = "tls")]
 async fn serve_h2<T: Transport, H: Handler>(
@@ -797,6 +1073,21 @@ enum End {
     Status(u16),
     /// The connection starts with the HTTP/2 preface: hand it over.
     Http2,
+    /// The worker holds as many request bytes as it may
+    /// (`max_buffered_request_bytes`): answer `503`, then close.
+    Busy,
+}
+
+/// The answer to a request refused because the worker holds as many
+/// request bytes as it may.
+fn busy() -> Response {
+    Response::new(503)
+        .header("retry-after", "1")
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(
+            &b"GIONG-E1120: the server is receiving as many requests as its memory budget \
+               allows (max_buffered_request_bytes). Retry later.\n"[..],
+        )
 }
 
 /// A request body read as it arrives (see `Handler::stream_body`).
@@ -890,6 +1181,9 @@ struct Conn<T> {
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
+    /// What the unparsed data and the body being decoded hold against the
+    /// worker's budget for requests (see `budget`).
+    charge: Charge,
     /// The connection's place under `max_connections`, given back when the
     /// connection is dropped. Declared last, so that the stream is closed
     /// first.
@@ -910,6 +1204,7 @@ impl<T: Transport> Conn<T> {
             closing: false,
             deadline: None,
             first: true,
+            charge: Charge::none(),
             _slot: slot,
         }
     }
@@ -935,13 +1230,13 @@ impl<T: Transport> Conn<T> {
                 Err(End::Http2) => {
                     let input = self.buf[self.pos..].to_vec();
                     self.release_read_buffer_all();
+                    self.charge.shrink_to(0);
                     let h2 = crate::h2::serve(&self.stream, self.cfg, self.peer, handler, input);
                     HeapFuture::new(h2).await;
                     return;
                 }
-                Err(End::Status(status)) => {
-                    self.reserve_out();
-                    Response::new(status).write_to(&mut self.out, 1, false, false);
+                Err(end @ (End::Status(_) | End::Busy)) => {
+                    self.write_refusal(end);
                     if self.flush().await.is_ok() {
                         self.lingering_close().await;
                     }
@@ -1068,6 +1363,22 @@ impl<T: Transport> Conn<T> {
                 self.close_write().await;
             }
         }
+    }
+
+    /// Writes the answer to a request that is refused without its handler
+    /// (an error status, or `503` for a full budget). Not inline in `run`:
+    /// a `Response` there would be kept in every connection's future.
+    fn write_refusal(&mut self, end: End) {
+        // Nothing more of the request is read: what it holds goes back now
+        // rather than after the answer.
+        self.release_read_buffer_all();
+        self.charge.shrink_to(0);
+        self.reserve_out();
+        let resp = match end {
+            End::Status(status) => Response::new(status),
+            _ => busy(),
+        };
+        resp.write_to(&mut self.out, 1, false, false);
     }
 
     /// Runs the handler of a request whose body it reads as a stream, while
@@ -1318,6 +1629,7 @@ impl<T: Transport> Conn<T> {
                 head,
                 body: BodyBytes::InBuffer(start..start),
                 peer: self.peer,
+                charge: Charge::none(),
             };
             let stream_body =
                 catching(|| handler.stream_body(&req)).map_err(|()| End::Status(500))?;
@@ -1340,6 +1652,7 @@ impl<T: Transport> Conn<T> {
                     self.pos += req.head.len;
                     self.scanned = 0;
                     self.deadline = None;
+                    self.settle();
                     return Ok((req, Some(streamed)));
                 }
                 None => head = req.head,
@@ -1351,14 +1664,17 @@ impl<T: Transport> Conn<T> {
             let mut decoder = Decoder::new(self.cfg.max_body_size);
             loop {
                 let data = &self.buf[self.pos + head.len..];
+                // The decoded body is held as well as the bytes it came from.
                 match decoder.feed(data).map_err(End::Status)? {
                     Progress::Done(used) => {
+                        self.account(decoder.body.len())?;
                         break (
                             BodyBytes::Decoded(mem::take(&mut decoder.body)),
                             head.len + used,
-                        )
+                        );
                     }
                     Progress::NeedMore => {
+                        self.account(decoder.body.len())?;
                         self.send_continue(&head, &mut interim_sent);
                         self.read_more(false).await?;
                     }
@@ -1370,6 +1686,9 @@ impl<T: Transport> Conn<T> {
                 return Err(End::Status(413));
             }
             let len = len as usize;
+            // Refused before the body is read (and before `100 Continue`)
+            // if it cannot fit in the worker's budget.
+            self.admit(head.len + len)?;
             while self.buf.len() - self.pos - head.len < len {
                 self.send_continue(&head, &mut interim_sent);
                 self.read_more(false).await?;
@@ -1378,12 +1697,23 @@ impl<T: Transport> Conn<T> {
             (BodyBytes::InBuffer(start..start + len), head.len + len)
         };
 
+        // What the request holds goes with it, and is given back when the
+        // handler drops it; the connection keeps the share of whatever
+        // follows it in the buffer.
+        let charge = if self.charge.bytes() == 0 {
+            // A request within `FREE`: the usual case, and nothing to work out.
+            Charge::none()
+        } else {
+            let rest = self.buf.len() - self.pos - total;
+            self.charge.split_off(rest.saturating_sub(FREE) as u64)
+        };
         let req = Request {
             buf: self.buf.clone(),
             start: self.pos,
             head,
             body,
             peer: self.peer,
+            charge,
         };
         self.pos += total;
         self.scanned = 0;
@@ -1439,7 +1769,8 @@ impl<T: Transport> Conn<T> {
         match received {
             Ok(Ok(chunk)) if !chunk.is_empty() => {
                 self.append(&chunk);
-                Ok(())
+                drop(chunk);
+                self.account(0)
             }
             // Idle for too long, an I/O error, or closed by the peer.
             _ => Err(End::Close),
@@ -1470,6 +1801,57 @@ impl<T: Transport> Conn<T> {
         }
     }
 
+    /// Charges the unparsed data, less the first `FREE` bytes, and `extra`
+    /// (a body being decoded) against the worker's budget. `Busy` if that
+    /// would take the worker past its limit.
+    fn account(&mut self, extra: usize) -> Result<(), End> {
+        let unparsed = self.buf.len() - self.pos;
+        if unparsed <= FREE && extra == 0 {
+            return Ok(());
+        }
+        let held = (unparsed.saturating_sub(FREE) + extra) as u64;
+        if held <= self.charge.bytes() {
+            return Ok(());
+        }
+        let limit = self.cfg.buffered_limit();
+        if self.charge.grow_to(held, limit) {
+            Ok(())
+        } else {
+            budget::note_refused(limit);
+            Err(End::Busy)
+        }
+    }
+
+    /// Whether a request taking `total` bytes from `pos` can be received:
+    /// `413` if it is larger than the worker's whole budget, `Busy` if the
+    /// budget cannot take it now. Nothing is charged: bytes are, as they
+    /// arrive.
+    fn admit(&mut self, total: usize) -> Result<(), End> {
+        let held = (total.saturating_sub(FREE)) as u64;
+        let Some(more) = held
+            .checked_sub(self.charge.bytes())
+            .filter(|&more| more > 0)
+        else {
+            return Ok(());
+        };
+        let limit = self.cfg.buffered_limit();
+        if held > limit {
+            return Err(End::Status(413));
+        }
+        if budget::fits(more, limit) {
+            Ok(())
+        } else {
+            budget::note_refused(limit);
+            Err(End::Busy)
+        }
+    }
+
+    /// Gives back what is charged beyond the unparsed data's share.
+    fn settle(&mut self) {
+        let held = (self.buf.len() - self.pos).saturating_sub(FREE);
+        self.charge.shrink_to(held as u64);
+    }
+
     fn reserve_out(&mut self) {
         if self.out.capacity() == 0 {
             self.out = take_buffer();
@@ -1491,6 +1873,7 @@ impl<T: Transport> Conn<T> {
                 None => self.buf = Rc::new(Vec::new()),
             }
             self.pos = 0;
+            self.charge.shrink_to(0);
         }
     }
 
@@ -1569,6 +1952,19 @@ mod tests {
         assert_eq!(other.stream_body(&req), Some(5));
         let status = giong::block_on(async { shared.call(req).await.status() });
         assert_eq!(status, 204);
+    }
+
+    /// The fixed refusal for low memory announces its own length.
+    #[test]
+    fn the_low_memory_answer_announces_its_length() {
+        let text = std::str::from_utf8(LOW_MEMORY).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .unwrap();
+        assert_eq!(length.parse::<usize>().unwrap(), body.len());
+        assert!(body.starts_with("GIONG-E1121"));
     }
 
     /// What an idle connection costs is mostly its task, the connection's

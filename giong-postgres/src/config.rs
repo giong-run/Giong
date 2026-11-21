@@ -89,7 +89,7 @@ pub(crate) enum Host {
 ///     .host("db.internal")
 ///     .user("app")
 ///     .password("secret")
-///     .dbname("shop")
+///     .database("shop")
 ///     .statement_timeout(Duration::from_secs(5));
 /// # Ok::<_, giong_postgres::Error>(())
 /// ```
@@ -203,8 +203,9 @@ impl Config {
     }
 
     /// The database; the server uses the user's name when it is not set.
-    pub fn dbname(mut self, dbname: &str) -> Self {
-        self.dbname = Some(dbname.to_owned());
+    /// In a URL it is the path, or the `dbname` parameter.
+    pub fn database(mut self, database: &str) -> Self {
+        self.dbname = Some(database.to_owned());
         self
     }
 

@@ -216,6 +216,7 @@ struct Mapping {
     len: usize,
 }
 
+#[cfg(not(kani))]
 impl Mapping {
     fn new(len: usize) -> io::Result<Self> {
         // SAFETY: a fresh anonymous mapping; the result is checked.
@@ -239,16 +240,55 @@ impl Mapping {
     }
 }
 
+/// Under Kani: heap memory instead of a mapping, which Kani cannot model
+/// (`mmap` is a foreign function). Zero-filled as a fresh mapping is.
+#[cfg(kani)]
+impl Mapping {
+    const ALIGN: usize = 8;
+
+    fn new(len: usize) -> io::Result<Self> {
+        Ok(Self::heap(len))
+    }
+
+    fn heap(len: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(len, Self::ALIGN).unwrap();
+        // SAFETY: `len` is never 0 (the pool checks its sizes).
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        Self {
+            ptr: NonNull::new(ptr).expect("allocation failed"),
+            len,
+        }
+    }
+}
+
+#[cfg(not(kani))]
 fn page_size() -> usize {
     // SAFETY: plain libc call without pointers.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(size).unwrap_or(4096)
 }
 
+/// Under Kani: a small stand-in, only the size of the padding `Ring::new`
+/// adds for Linux 6.0 (`sysconf` is a foreign function).
+#[cfg(kani)]
+fn page_size() -> usize {
+    16
+}
+
+#[cfg(not(kani))]
 impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: exactly the region mapped in `new`.
         unsafe { libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len) };
+    }
+}
+
+#[cfg(kani)]
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(self.len, Self::ALIGN).unwrap();
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
     }
 }
 
@@ -307,15 +347,22 @@ impl Ring {
         // and fails with EFAULT unless that page happens to be mapped.
         // Fixed in 6.1 ("io_uring: fix size calculation when registering buf
         // ring"); found by running the tests on a real 6.0 kernel.
-        let len = count as usize * std::mem::size_of::<BufRingEntry>() + page_size();
-        Ok(Self {
-            map: Mapping::new(len)?,
+        Ok(Self::with_map(Mapping::new(Self::size(count))?))
+    }
+
+    fn size(count: u16) -> usize {
+        count as usize * std::mem::size_of::<BufRingEntry>() + page_size()
+    }
+
+    fn with_map(map: Mapping) -> Self {
+        Self {
+            map,
             tail: Cell::new(0),
             published: Cell::new(0),
             target: Cell::new(0),
             ran_dry: Cell::new(false),
             registered: Cell::new(false),
-        })
+        }
     }
 
     fn entries(&self) -> *mut BufRingEntry {
@@ -430,6 +477,12 @@ impl BufPool {
             )
         })?;
         let mem = Mapping::new(mem_size)?;
+        let rings = [Ring::new(count)?, Ring::new(count)?];
+        Ok(Rc::new(Self::with_memory(count, buf_len, mem, rings)))
+    }
+
+    /// A pool of `count` buffers of `buf_len` bytes in `mem`, sizes checked.
+    fn with_memory(count: u16, buf_len: usize, mem: Mapping, rings: [Ring; 2]) -> Self {
         let slots = (0..count)
             .map(|_| Slot {
                 filled: Cell::new(0),
@@ -439,17 +492,16 @@ impl BufPool {
             })
             .collect();
 
-        let pool = Self {
+        Self {
             mem,
             count,
             buf_len,
-            rings: [Ring::new(count)?, Ring::new(count)?],
+            rings,
             slots,
             // Buffer 0 on top: the lowest addresses are used first.
             spare: RefCell::new((0..count).rev().collect()),
             waiters: RefCell::new(Vec::new()),
-        };
-        Ok(Rc::new(pool))
+        }
     }
 
     fn ring(&self, id: RingId) -> &Ring {
@@ -1016,5 +1068,435 @@ mod tests {
         pool.release(bid);
         assert_eq!(pool.free(), 2);
         assert_eq!(pool.next_free().unwrap().0, bid, "most recently used first");
+    }
+}
+
+/// Kani proofs (`scripts/check.sh kani`, docs/kani.md) for the receive
+/// buffer pool.
+///
+/// Each harness starts from any pool state that [`BufPool::check`] accepts
+/// ([`Sim::any`]) and applies one event, chosen freely from what the
+/// drivers and the kernel can do: a model of the kernel takes a buffer from
+/// a ring as io_uring does (the whole ring one buffer per receive; the
+/// packed ring piece by piece, keeping a buffer at the head while room is
+/// left), user space reads a piece it holds and perhaps releases it, the
+/// io_uring driver refills or arms a receive, or the epoll driver takes a
+/// spare buffer itself. The kernel model reads buffer ids from the ring
+/// memory the pool wrote, through raw pointers, as the kernel does. A new
+/// pool passes the check too, so the harnesses cover every sequence of
+/// events, of any length.
+///
+/// After the event, for every buffer, the check proves:
+///
+/// * it is in exactly one place: a ring's published window, the spare
+///   list, or held by user space; or, only as the packed ring's head
+///   buffer, both in that ring and held (the kernel then writes only past
+///   the pieces handed out, which the offset checks show);
+/// * so the kernel can never take a buffer user space still reads, nor the
+///   same buffer twice;
+/// * no buffer is lost, and the pool's counts (`published`, `lent_to`,
+///   `pieces`) agree with what the rings and user space really hold;
+/// * a ring never holds more entries than it has slots (the kernel would
+///   read an overwritten entry), and every entry names the buffer's real
+///   address and length; the published tail is the pool's.
+///
+/// Kani also checks every raw pointer access on the way (ring entries, the
+/// tail, buffer slices) for bounds and liveness.
+///
+/// Bounds: `COUNT` buffers of `BUF_LEN` bytes, one harness per driver
+/// setup (epoll; io_uring with the whole ring; io_uring with both rings).
+/// Not covered: more buffers; the driver code around the pool (which
+/// completions reach `received`, the backpressure policy); kernel
+/// behaviour beyond this model; concurrency with the kernel (each kernel
+/// step is atomic between driver steps).
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    const COUNT: u16 = 2;
+    const BUF_LEN: usize = 2;
+    /// Most pieces user space can hold at once: each buffer is held by at
+    /// most `BUF_LEN` one-byte pieces.
+    const MAX_PIECES: usize = COUNT as usize * BUF_LEN;
+
+    /// Every entry of ring `id` as the kernel reads them. Read at constant
+    /// offsets and then picked by index: a read of ring memory at a
+    /// symbolic offset costs Kani a term over the whole allocation, and a
+    /// few of those exhaust its memory.
+    fn entries(pool: &BufPool, id: RingId) -> [(u64, u32, u16); COUNT as usize] {
+        let mut all = [(0, 0, 0); COUNT as usize];
+        for (i, out) in all.iter_mut().enumerate() {
+            // SAFETY: `i < count`, inside the ring allocation; the kernel
+            // reads the entry fields like this.
+            unsafe {
+                let e = pool.ring(id).entries().add(i).cast::<RawEntry>();
+                *out = (
+                    ptr::addr_of!((*e).addr).read(),
+                    ptr::addr_of!((*e).len).read(),
+                    ptr::addr_of!((*e).bid).read(),
+                );
+            }
+        }
+        all
+    }
+
+    /// The entry the kernel finds at ring position `idx`.
+    fn entry(pool: &BufPool, id: RingId, idx: u16) -> (u64, u32, u16) {
+        entries(pool, id)[(idx & (pool.count - 1)) as usize]
+    }
+
+    /// The tail as the kernel reads it: the published copy.
+    fn published_tail(pool: &BufPool, id: RingId) -> u16 {
+        // SAFETY: the tail lives inside the ring allocation.
+        unsafe {
+            let tail = BufRingEntry::tail(pool.ring(id).entries()) as *mut u16;
+            AtomicU16::from_ptr(tail).load(Ordering::Acquire)
+        }
+    }
+
+    struct Sim {
+        /// On the stack, not in an `Rc`: Kani tracks the fields of a
+        /// local precisely, but merges a heap object's fields across
+        /// paths, and then every pointer read from it can point anywhere.
+        pool: BufPool,
+        uring: bool,
+        packed: bool,
+        /// Next entry the kernel takes, per ring.
+        head: [u16; 2],
+        /// Bytes the kernel has put into the packed ring's head buffer.
+        filled: u32,
+        /// Pieces user space holds: (buffer, offset, length).
+        pieces: [Option<(u16, u32, u32)>; MAX_PIECES],
+    }
+
+    impl Sim {
+        fn new(uring: bool, packed: bool) -> Self {
+            // `BufPool::new` after its size checks, which build coded
+            // errors: Kani would follow the code of every `dyn Error`.
+            let ring = || Ring::with_map(Mapping::heap(Ring::size(COUNT)));
+            let mem = Mapping::heap(COUNT as usize * BUF_LEN);
+            let pool = BufPool::with_memory(COUNT, BUF_LEN, mem, [ring(), ring()]);
+            if uring {
+                pool.set_registered(RingId::Whole);
+            }
+            if packed {
+                pool.set_registered(RingId::Packed);
+            }
+            let sim = Self {
+                pool,
+                uring,
+                packed,
+                head: [0; 2],
+                filled: 0,
+                pieces: [None; MAX_PIECES],
+            };
+            sim.check();
+            sim
+        }
+
+        /// Any pool state [`check`](Self::check) accepts: every buffer
+        /// spare, in a ring (in either order), or held in pieces; the
+        /// packed ring's head buffer part-filled and perhaps held; any
+        /// kernel head, targets and `ran_dry`. Built with the pool's own
+        /// `push` and `publish_tail`, so the ring memory is what the pool
+        /// writes.
+        fn any(uring: bool, packed: bool) -> Self {
+            let mut sim = Self::new(uring, packed);
+            let pool = &sim.pool;
+            pool.spare.borrow_mut().clear();
+            for (r, id) in [RingId::Whole, RingId::Packed].into_iter().enumerate() {
+                let head: u16 = kani::any();
+                sim.head[r] = head;
+                let ring = pool.ring(id);
+                ring.tail.set(head);
+                let registered = ring.registered.get();
+                let target: usize = kani::any();
+                kani::assume(target <= COUNT as usize && (registered || target == 0));
+                ring.target.set(target);
+                ring.ran_dry.set(registered && kani::any());
+            }
+            let first: u16 = if kani::any() { 1 } else { 0 };
+            let mut held_only = [0u32; COUNT as usize];
+            for n in 0..COUNT {
+                let bid = (first + n) % COUNT;
+                let home = if packed && kani::any() {
+                    RingId::Packed
+                } else {
+                    RingId::Whole
+                };
+                pool.slots[bid as usize].home.set(home);
+                match kani::any::<u8>() {
+                    0 => pool.spare.borrow_mut().push(bid),
+                    1 if uring => pool.push(RingId::Whole, bid),
+                    2 if packed => pool.push(RingId::Packed, bid),
+                    _ => {
+                        let pieces: u32 = kani::any();
+                        kani::assume(pieces >= 1 && pieces as usize <= BUF_LEN);
+                        held_only[bid as usize] = pieces;
+                    }
+                }
+            }
+            pool.publish_tail(RingId::Whole);
+            pool.publish_tail(RingId::Packed);
+            // Pieces of buffers no ring holds: one byte each, or one
+            // piece of any length.
+            for bid in 0..COUNT {
+                let pieces = held_only[bid as usize];
+                sim.pool.slots[bid as usize].pieces.set(pieces);
+                if pieces == 1 {
+                    let len: u32 = kani::any();
+                    kani::assume(len >= 1 && len as usize <= BUF_LEN);
+                    sim.hold((bid, 0, len));
+                } else {
+                    for off in 0..pieces {
+                        sim.hold((bid, off, 1));
+                    }
+                }
+            }
+            // The packed ring's head buffer: part-filled, and the filled
+            // bytes perhaps held in one-byte pieces.
+            if packed && sim.pool.ring(RingId::Packed).published.get() > 0 {
+                let bid = entry(&sim.pool, RingId::Packed, sim.head[1]).2;
+                let filled: u32 = kani::any();
+                kani::assume((filled as usize) < BUF_LEN);
+                let pieces: u32 = kani::any();
+                kani::assume(pieces <= filled);
+                let slot = &sim.pool.slots[bid as usize];
+                slot.filled.set(filled);
+                slot.pieces.set(pieces);
+                sim.filled = filled;
+                for off in 0..pieces {
+                    sim.hold((bid, off, 1));
+                }
+            }
+            sim.check();
+            sim
+        }
+
+        fn hold(&mut self, piece: (u16, u32, u32)) {
+            let free = self.pieces.iter_mut().find(|p| p.is_none());
+            *free.expect("more pieces than bytes") = Some(piece);
+        }
+
+        /// The kernel completes a receive through ring `id`.
+        fn kernel_receives(&mut self, id: RingId) {
+            let pool = &self.pool;
+            let head = self.head[id as usize];
+            if head == published_tail(pool, id) {
+                pool.ran_dry(id); // ENOBUFS
+                return;
+            }
+            let bid = entry(pool, id, head).2;
+            let room = match id {
+                RingId::Whole => BUF_LEN as u32,
+                RingId::Packed => BUF_LEN as u32 - self.filled,
+            };
+            let res: i32 = kani::any();
+            kani::assume(res >= -1 && res <= room as i32);
+            // The packed ring keeps a buffer while room is left in it.
+            let more = id == RingId::Packed && res > 0 && (res as u32) < room;
+            if id == RingId::Whole {
+                self.head[0] = head.wrapping_add(1);
+            }
+            match pool.received(id, bid, res, more) {
+                Received::Data { bid: b, off, len } => {
+                    assert!(res > 0 && b == bid && len == res as u32);
+                    if id == RingId::Packed {
+                        assert!(off == self.filled, "a piece overlaps another");
+                        self.filled += len;
+                        if !more {
+                            self.head[1] = head.wrapping_add(1);
+                            self.filled = 0;
+                        }
+                    } else {
+                        assert!(off == 0);
+                    }
+                    self.hold((b, off, len));
+                }
+                Received::Nothing => assert!(res <= 0),
+            }
+        }
+
+        /// The epoll driver receives into a spare buffer.
+        fn epoll_receives(&mut self) {
+            if let Some((bid, ptr, len)) = self.pool.next_free() {
+                assert!(len == BUF_LEN);
+                // SAFETY: `next_free` lends `len` bytes at `ptr`.
+                let _ = ptr; //XX
+                self.pool.take_next();
+                let n: u32 = kani::any();
+                kani::assume(n >= 1 && n as usize <= BUF_LEN);
+                self.hold((bid, 0, n));
+            }
+        }
+
+        /// User space reads a piece it holds, then perhaps drops it.
+        fn user_reads(&mut self) {
+            let i: usize = kani::any();
+            kani::assume(i < MAX_PIECES);
+            if let Some((bid, off, len)) = self.pieces[i] {
+                // What `copy_out` and `RecvBuf` read (a copy would add an
+                // allocation of symbolic size).
+                let bytes = self.pool.slice(bid, off, len);
+                assert!(bytes.len() == len as usize);
+                let _ = bytes[bytes.len() - 1];
+                if kani::any() {
+                    self.pool.release(bid);
+                    self.pieces[i] = None;
+                }
+            }
+        }
+
+        fn step(&mut self) {
+            match kani::any::<u8>() {
+                // The io_uring driver arms a receive through a ring.
+                0 if self.uring => {
+                    let packed = self.packed && kani::any::<bool>();
+                    let id = if packed {
+                        RingId::Packed
+                    } else {
+                        RingId::Whole
+                    };
+                    self.pool.ensure_published(Some(id));
+                }
+                // The io_uring driver after a batch of completions.
+                1 if self.uring => self.pool.refill(),
+                2 if self.uring => self.kernel_receives(RingId::Whole),
+                3 if self.packed => self.kernel_receives(RingId::Packed),
+                4 if !self.uring => self.epoll_receives(),
+                _ => self.user_reads(),
+            }
+            self.check();
+        }
+
+        fn check(&self) {
+            self.pool.check(self.head, self.filled, &self.pieces);
+        }
+    }
+
+    impl BufPool {
+        fn check(&self, heads: [u16; 2], filled: u32, pieces: &[Option<(u16, u32, u32)>]) {
+            // Plain loops: iterator adapters cost Kani far more code.
+            let spare = self.spare.borrow();
+            let mut windows = [0u16; 2];
+            for r in 0..2 {
+                let id = if r == 0 {
+                    RingId::Whole
+                } else {
+                    RingId::Packed
+                };
+                let ring = self.ring(id);
+                assert!(published_tail(self, id) == ring.tail.get());
+                let window = ring.tail.get().wrapping_sub(heads[r]);
+                assert!(window <= self.count, "a ring holds more entries than slots");
+                assert!(window as usize == ring.published.get());
+                windows[r] = window;
+            }
+            let mut in_spare = [0usize; COUNT as usize];
+            let mut i = 0;
+            while i < spare.len() {
+                in_spare[spare[i] as usize] += 1;
+                i += 1;
+            }
+            let mut in_ring = [[0usize; 2]; COUNT as usize];
+            let base = self.mem.ptr.as_ptr() as u64;
+            let mut packed_head = None;
+            for r in 0..2 {
+                let id = if r == 0 {
+                    RingId::Whole
+                } else {
+                    RingId::Packed
+                };
+                let all = entries(self, id);
+                let mut i = 0;
+                while i < COUNT as usize {
+                    // Position `i` holds a published entry if it is fewer
+                    // than `window` places after the kernel's head.
+                    let k = (i as u16).wrapping_sub(heads[r]) & (self.count - 1);
+                    if k < windows[r] {
+                        let (addr, len, b) = all[i];
+                        assert!(b < self.count, "a ring entry names no buffer");
+                        in_ring[b as usize][r] += 1;
+                        assert!(addr == base + (b as usize * self.buf_len) as u64);
+                        assert!(len as usize == self.buf_len);
+                        if r == 1 && k == 0 {
+                            packed_head = Some(b as usize);
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            let mut held = [0usize; COUNT as usize];
+            let mut i = 0;
+            while i < pieces.len() {
+                if let Some((b, _, _)) = pieces[i] {
+                    held[b as usize] += 1;
+                }
+                i += 1;
+            }
+            let mut bid = 0;
+            while bid < COUNT as usize {
+                let slot = &self.slots[bid];
+                let rings = in_ring[bid][0] + in_ring[bid][1];
+                assert!(rings <= 1, "a buffer is in the rings twice");
+                assert!(
+                    in_spare[bid] + rings <= 1,
+                    "a buffer is spare twice or also in a ring"
+                );
+                match slot.lent_to.get() {
+                    None => assert!(rings == 0, "lent_to misses a ring"),
+                    Some(id) => {
+                        assert!(in_ring[bid][id as usize] == 1, "lent_to names a wrong ring")
+                    }
+                }
+                assert!(
+                    slot.pieces.get() as usize == held[bid],
+                    "the pool miscounts pieces"
+                );
+                if held[bid] > 0 {
+                    assert!(in_spare[bid] == 0, "a held buffer is spare");
+                    if rings > 0 {
+                        // Only the packed ring's head buffer: the kernel
+                        // writes into it past `filled`, never over a piece.
+                        assert!(in_ring[bid][1] == 1);
+                        assert!(packed_head == Some(bid));
+                        assert!(slot.filled.get() == filled);
+                    }
+                }
+                assert!(in_spare[bid] + rings + held[bid] > 0, "a buffer was lost");
+                bid += 1;
+            }
+            assert!(self.free() == spare.len() + windows[0] as usize + windows[1] as usize);
+        }
+    }
+
+    /// One event from any valid state: with [`Sim::new`] valid too, this
+    /// covers every sequence of events, of any length.
+    fn one_event(uring: bool, packed: bool) {
+        let mut sim = Sim::any(uring, packed);
+        sim.step();
+        // The harness's bookkeeping; dropping the pool only adds drop code.
+        std::mem::forget(sim);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn epoll_buffers_are_never_shared_or_lost() {
+        Sim::new(false, false);
+        one_event(false, false);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn whole_ring_buffers_are_never_shared_or_lost() {
+        Sim::new(true, false);
+        one_event(true, false);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn packed_ring_buffers_are_never_shared_or_lost() {
+        Sim::new(true, true);
+        one_event(true, true);
     }
 }

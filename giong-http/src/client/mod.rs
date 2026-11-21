@@ -622,6 +622,7 @@ impl Client {
             config.idle_timeout,
             fresh,
             prior_knowledge,
+            config.http2 && route.origin.https,
         )
         .await;
         match taken {
@@ -1306,7 +1307,12 @@ impl RequestBuilder {
     /// the headers that frame the message (`Content-Length`,
     /// `Transfer-Encoding`, `Connection`...) are the client's to set, and
     /// setting one is an error.
-    pub fn header(mut self, name: &str, value: &str) -> Self {
+    ///
+    /// The value is anything that reads as text, as for the server's
+    /// [`Response::header`](crate::Response::header): a `&str`, a `String`,
+    /// or `format!(..)` without `&`.
+    pub fn header(mut self, name: &str, value: impl AsRef<str>) -> Self {
+        let value = value.as_ref();
         if self.error.is_some() {
             return self;
         }
@@ -1363,6 +1369,10 @@ impl RequestBuilder {
     /// Any status is a response, 404 and 500 included: see
     /// [`Response::error_for_status`]. Dropping the future closes the
     /// connection it was using.
+    ///
+    /// Not cancel safe: if the future is dropped, the request may already have
+    /// reached the server, which may act on it, and the connection it used is
+    /// closed.
     pub async fn send(self) -> Result<Response, Error> {
         if let Some(e) = self.error {
             return Err(e);
@@ -1392,6 +1402,8 @@ impl RequestBuilder {
     /// it is the longest wait for each piece of the body, so a body that
     /// keeps arriving can take as long as it needs, and one that stops is
     /// noticed.
+    ///
+    /// Not cancel safe, like [`send`](Self::send).
     pub async fn send_streaming(self) -> Result<StreamingResponse, Error> {
         if let Some(e) = self.error {
             return Err(e);
@@ -1647,6 +1659,9 @@ impl StreamingResponse {
     /// most 64 KiB), or `None` at its end. Waits at most the request's
     /// timeout for it. After an error, the connection is closed and every
     /// further call returns `None`.
+    ///
+    /// Not cancel safe: if the future is dropped, part of the body may be lost,
+    /// so drop the response then.
     pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, Error> {
         let pending = &mut self.pending;
         if pending.finished() {
