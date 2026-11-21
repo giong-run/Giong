@@ -549,6 +549,28 @@ fn a_request_dropped_mid_frame_is_cancelled_and_the_connection_lives_on() {
     });
 }
 
+#[test]
+fn a_header_section_announced_too_large_gets_its_431_at_once() {
+    run(|| async {
+        let client = connect().await;
+        // A HEADERS frame that says it is a gigabyte, with little of it
+        // sent: the answer does not wait for the rest.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        let mut out = Vec::new();
+        Header::write(&mut out, kind::HEADERS, 1 << 30);
+        out.extend_from_slice(&[0; 100]);
+        send.write_all(&out).await.unwrap();
+        let reply =
+            giong::time::timeout(std::time::Duration::from_secs(3), recv.read_to_end(1 << 20))
+                .await
+                .expect("the 431 waited for the rest of the frame")
+                .unwrap();
+        assert_eq!(parse(&reply).status(), 431);
+        drop(send);
+        assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+    });
+}
+
 /// `n` frames of a reserved (grease) type, which the server ignores.
 fn unknown_frames(n: usize) -> Vec<u8> {
     let mut out = Vec::new();

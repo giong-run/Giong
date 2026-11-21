@@ -679,9 +679,10 @@ async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
         }
     };
     // An encoded section this large cannot decode to a list under the
-    // limit that was announced.
+    // limit that was announced. Answered at once: the rest of the stream,
+    // which a client may announce as a gigabyte, is not read (the stream
+    // is stopped once the answer is out).
     if header.len > max_head as u64 {
-        r.skip(header.len).await?;
         return Ok(Built::Status(431));
     }
     let block = r.exact(header.len as usize).await?;
