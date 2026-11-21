@@ -805,3 +805,36 @@ fn a_writer_waiting_for_credit_is_woken_after_its_reading_half_is_dropped() {
         })
         .unwrap();
 }
+
+#[test]
+fn a_wildcard_server_answers_from_the_address_it_was_sent_to() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "0.0.0.0:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let port = server.local_addr().unwrap().port();
+            giong::spawn(serve(server));
+            let client = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            // 127.0.0.2 is this machine too, but the route to the client
+            // would answer from 127.0.0.1, which the client drops.
+            let addr: SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+            let conn = giong::time::timeout(
+                Duration::from_secs(5),
+                client.connect(addr, "localhost", &cfg),
+            )
+            .await
+            .expect("no answer from the address connected to")
+            .unwrap();
+            let (mut send, mut recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"abc").await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(64).await.unwrap(), b"cba");
+        })
+        .unwrap();
+}

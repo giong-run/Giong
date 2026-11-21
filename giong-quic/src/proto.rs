@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +21,7 @@ use std::task::{Poll, Waker};
 use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
-use giong::net::UdpSocket;
+use giong::net::{SendOptions, UdpSocket};
 use quinn_proto::{
     ConnectionError, ConnectionHandle, DatagramEvent, Dir, EcnCodepoint, EndpointConfig, Event,
     ReadError, StreamEvent, StreamId, WriteError,
@@ -133,6 +133,9 @@ struct Send {
     to: SocketAddr,
     segment: usize,
     ecn: u8,
+    /// The local address to send from: the one the peer sent to, on a
+    /// wildcard bind (quinn-proto's `Transmit::src_ip`).
+    src: Option<IpAddr>,
 }
 
 struct State {
@@ -274,14 +277,15 @@ impl State {
         slot
     }
 
-    fn out(&mut self, to: SocketAddr, data: &[u8], segment: usize, ecn: u8) {
+    fn out(&mut self, t: &quinn_proto::Transmit, data: &[u8]) {
         let mut v = self.spare.pop().unwrap_or_default();
         v.extend_from_slice(data);
         self.sends.push(Send {
             data: v,
-            to,
-            segment,
-            ecn,
+            to: t.destination,
+            segment: 0,
+            ecn: 0,
+            src: t.src_ip,
         });
     }
 
@@ -289,6 +293,7 @@ impl State {
         &mut self,
         now: Instant,
         from: SocketAddr,
+        local: Option<IpAddr>,
         ecn: u8,
         mut data: BytesMut,
         seg: Option<usize>,
@@ -306,9 +311,9 @@ impl State {
             } else {
                 None
             };
-            self.handle_one(now, from, ecn, one);
+            self.handle_one(now, from, local, ecn, one);
             if let Some(rest) = rest {
-                self.handle_one(now, from, ecn, rest);
+                self.handle_one(now, from, local, ecn, rest);
             }
         }
     }
@@ -317,12 +322,16 @@ impl State {
         &mut self,
         now: Instant,
         from: SocketAddr,
+        local: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
         one: BytesMut,
     ) {
         {
             self.scratch.clear();
-            match self.ep.handle(now, from, None, ecn, one, &mut self.scratch) {
+            match self
+                .ep
+                .handle(now, from, local, ecn, one, &mut self.scratch)
+            {
                 Some(DatagramEvent::NewConnection(inc)) => {
                     if self.closed {
                         self.ep.ignore(inc);
@@ -358,7 +367,7 @@ impl State {
                     };
                     if let Some(t) = answer {
                         let d = std::mem::take(&mut self.scratch);
-                        self.out(t.destination, &d[..t.size], 0, 0);
+                        self.out(&t, &d[..t.size]);
                         self.scratch = d;
                     }
                 }
@@ -376,7 +385,7 @@ impl State {
                 }
                 Some(DatagramEvent::Response(t)) => {
                     let d = std::mem::take(&mut self.scratch);
-                    self.out(t.destination, &d[..t.size], 0, 0);
+                    self.out(&t, &d[..t.size]);
                     self.scratch = d;
                 }
                 None => {}
@@ -502,6 +511,7 @@ impl State {
                             to: t.destination,
                             segment: t.segment_size.unwrap_or(0),
                             ecn: t.ecn.map_or(0, |e| e as u8),
+                            src: t.src_ip,
                         });
                     }
                     None => break,
@@ -547,17 +557,19 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
         for s in sends {
             let sh = sh.clone();
             giong::spawn(async move {
-                let (sent, mut v) = sh
-                    .sock
-                    .send_segments_to(s.data, s.to, s.segment, s.ecn)
-                    .await;
+                let mut options = SendOptions::new().segment_size(s.segment).ecn(s.ecn);
+                if let Some(src) = s.src {
+                    options = options.source(src);
+                }
+                let (sent, mut v) = sh.sock.send_to_with(s.data, s.to, &options).await;
                 if s.segment > 0 && s.segment < v.len() && gso_refused(&sent) {
                     // The route refuses segmentation offload (no checksum
                     // offload on a tun, VPN or veth device): one datagram
                     // per send from now on, and this batch again so.
                     sh.st.borrow_mut().segments = 1;
+                    let options = options.segment_size(0);
                     for one in v.chunks(s.segment) {
-                        let _ = sh.sock.send_segments_to(one.to_vec(), s.to, 0, s.ecn).await;
+                        let _ = sh.sock.send_to_with(one.to_vec(), s.to, &options).await;
                     }
                 }
                 // Other send errors are losses, which QUIC recovers from.
@@ -613,7 +625,7 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
                     let data = BytesMut::from(&d.data[..]);
                     sh.st
                         .borrow_mut()
-                        .handle(now, d.from, d.ecn, data, d.segment);
+                        .handle(now, d.from, d.local, d.ecn, data, d.segment);
                     n += 1;
                     next = match inbox.as_mut() {
                         Some(inbox) if n < RECV_BATCH => inbox.try_recv().ok(),
@@ -628,15 +640,15 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
         let mut n = 0;
         while let Some(r) = next {
             if let Ok((dg, from)) = r {
-                let (seg, ecn) = (dg.segment_size(), dg.ecn());
+                let (seg, ecn, local) = (dg.segment_size(), dg.ecn(), dg.local_ip());
                 match member.as_mut() {
                     Some(member) => {
-                        deliver(&sh, member, now, from, ecn, dg.as_slice(), seg);
+                        deliver(&sh, member, now, (from, local), ecn, dg.as_slice(), seg);
                     }
                     None => {
                         let data = BytesMut::from(dg.as_slice());
                         drop(dg);
-                        sh.st.borrow_mut().handle(now, from, ecn, data, seg);
+                        sh.st.borrow_mut().handle(now, from, local, ecn, data, seg);
                     }
                 }
             }
@@ -661,7 +673,7 @@ fn deliver(
     sh: &Shared,
     member: &mut Member,
     now: Instant,
-    from: SocketAddr,
+    (from, local): (SocketAddr, Option<IpAddr>),
     ecn: u8,
     data: &[u8],
     seg: Option<usize>,
@@ -673,7 +685,7 @@ fn deliver(
     let (step, seg) = match route::owner_of_all(data, whole, me) {
         Ok(None) => {
             let data = BytesMut::from(data);
-            sh.st.borrow_mut().handle(now, from, ecn, data, seg);
+            sh.st.borrow_mut().handle(now, from, local, ecn, data, seg);
             return;
         }
         Ok(Some(_)) => (data.len().max(1), seg),
@@ -687,6 +699,7 @@ fn deliver(
                 from,
                 ecn,
                 segment: seg,
+                local,
             };
             // Given back when no endpoint of that worker is there: the
             // packet is then answered as any that is not known.
@@ -696,7 +709,7 @@ fn deliver(
         }
         if let Some(part) = here {
             let data = BytesMut::from(part);
-            sh.st.borrow_mut().handle(now, from, ecn, data, seg);
+            sh.st.borrow_mut().handle(now, from, local, ecn, data, seg);
         }
     }
 }
@@ -711,6 +724,12 @@ pub(crate) fn bind(
     // one, which is correct, only slower.
     let _ = sock.set_gro(true);
     sock.set_recv_ecn(true)?;
+    // On a wildcard bind, each datagram's local address, so that the answer
+    // leaves from the address the peer sent to: on a machine with several
+    // addresses the route may pick another, which the peer drops.
+    if addr.ip().is_unspecified() {
+        sock.set_recv_local_addr(true)?;
+    }
     let segments = if sock.gso_supported() {
         GSO_SEGMENTS
     } else {

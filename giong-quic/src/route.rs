@@ -33,6 +33,8 @@ pub(crate) struct Forwarded {
     pub(crate) from: SocketAddr,
     pub(crate) ecn: u8,
     pub(crate) segment: Option<usize>,
+    /// The local address it was sent to, on a wildcard bind.
+    pub(crate) local: Option<std::net::IpAddr>,
 }
 
 /// The owner of every datagram of a receive that holds several (`segment`
@@ -202,6 +204,7 @@ mod tests {
             from: "127.0.0.1:1".parse().unwrap(),
             ecn: 0,
             segment: None,
+            local: None,
         }
     }
 
@@ -276,6 +279,7 @@ mod tests {
             from: addr,
             ecn: 0,
             segment: None,
+            local: None,
         };
         let (mut a, _a_in) = Member::join(addr, 0);
         // No one there yet: it comes back.
