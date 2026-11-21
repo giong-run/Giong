@@ -25,6 +25,7 @@ use crate::heap::HeapFuture;
 use crate::parse::{find_head_end, parse_head};
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, Response};
+use crate::trailers::Trailers;
 
 /// Responses to pipelined requests are sent together, up to this many bytes.
 const FLUSH_AT: usize = 64 * 1024;
@@ -506,7 +507,7 @@ impl Server {
     /// How long a keep-alive connection may sit between requests before it is
     /// closed (default: 60 s).
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.idle_timeout = timeout;
+        self.cfg.idle_timeout = crate::bounded(timeout);
         self
     }
 
@@ -514,14 +515,14 @@ impl Server {
     /// the moment the server first has to wait for more of it (default: 30 s).
     /// Slower clients get `408 Request Timeout`.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.request_timeout = timeout;
+        self.cfg.request_timeout = crate::bounded(timeout);
         self
     }
 
     /// How long a client may take to accept a batch of responses before the
     /// connection is dropped (default: 30 s).
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.write_timeout = timeout;
+        self.cfg.write_timeout = crate::bounded(timeout);
         self
     }
 
@@ -590,7 +591,7 @@ impl Server {
     /// 100 ms). Requests in progress are not affected by this: they get the
     /// runtime's [`shutdown_grace`](giong::Builder::shutdown_grace).
     pub fn shutdown_linger(mut self, linger: Duration) -> Self {
-        self.cfg.shutdown_linger = linger;
+        self.cfg.shutdown_linger = crate::bounded(linger);
         self
     }
 
@@ -1427,7 +1428,13 @@ impl<T: Transport> Conn<T> {
     async fn pump(&mut self, body: &Streamed) -> Result<(), Failure> {
         body.pipe.asked().await;
         let result = if body.chunked {
-            self.pump_chunked(body).await
+            match self.pump_chunked(body).await {
+                Ok(trailers) => {
+                    body.pipe.finish_with(Ok(()), Some(trailers));
+                    return Ok(());
+                }
+                Err(failure) => Err(failure),
+            }
         } else {
             self.pump_length(body).await
         };
@@ -1463,7 +1470,7 @@ impl<T: Transport> Conn<T> {
         Ok(())
     }
 
-    async fn pump_chunked(&mut self, body: &Streamed) -> Result<(), Failure> {
+    async fn pump_chunked(&mut self, body: &Streamed) -> Result<Trailers, Failure> {
         let mut decoder = Decoder::new(usize::try_from(body.limit).unwrap_or(usize::MAX));
         // What arrived with the head, then what follows, less what the
         // decoder has read.
@@ -1482,7 +1489,7 @@ impl<T: Transport> Conn<T> {
                         // The start of the next request.
                         self.append(&input[used..]);
                     }
-                    return Ok(());
+                    return Ok(decoder.trailers.take().map(|t| *t).unwrap_or_default());
                 }
                 Ok(Progress::NeedMore) => {
                     input.drain(..decoder.consume());
@@ -1562,9 +1569,13 @@ impl<T: Transport> Conn<T> {
                         }
                     }
                 }
-                Next::End => {
+                Next::End(trailers) => {
                     if chunked {
-                        self.out.extend_from_slice(b"0\r\n\r\n");
+                        self.out.extend_from_slice(b"0\r\n");
+                        if let Some(trailers) = trailers {
+                            trailers.write_lines(&mut self.out);
+                        }
+                        self.out.extend_from_slice(b"\r\n");
                     }
                     return Ok(());
                 }

@@ -752,6 +752,34 @@ fn trailers_continue_streamed_answers_and_large_header_blocks() {
 }
 
 #[test]
+fn trailers_past_the_head_limit_matter_only_where_they_are_kept() {
+    let server = TestServer::start(Server::new().max_head_size(1024));
+    let mut c = server.client();
+    let big = "v".repeat(2000);
+    let with_trailers = |c: &mut Client, path: &str| {
+        let id = c.open("POST", path, &[("te", "trailers")], false);
+        c.send_body(id, b"abc", false);
+        let block = c.encode(&[("x-big", big.as_str())]);
+        c.send(
+            frame::HEADERS,
+            frame::END_HEADERS | frame::END_STREAM,
+            id,
+            &block,
+        );
+        c.reply(id)
+    };
+    // A body received whole drops its trailers, whatever their size.
+    assert_eq!(with_trailers(&mut c, "/echo").unwrap().text(), "abc");
+    // A body read as a stream keeps them for its handler, within the limit.
+    assert_eq!(
+        with_trailers(&mut c, "/pipe").unwrap_err(),
+        Ended::Reset(Reason::Protocol as u32)
+    );
+    // The connection goes on.
+    assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
+}
+
+#[test]
 fn responses_follow_the_clients_flow_control() {
     let server = TestServer::start(Server::new());
     let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 1000)]);
@@ -944,6 +972,81 @@ fn a_streamed_body_gets_window_only_as_the_handler_reads() {
     server.state.released.store(true, Ordering::SeqCst);
     c.send_body(id, &body[sent..], true);
     assert_eq!(c.reply(id).unwrap().text(), format!("read {}", body.len()));
+}
+
+#[test]
+fn every_streamed_body_that_is_read_gets_window() {
+    // Long-lived streams whose handlers read as the data arrives, as with
+    // gRPC: the first ones take the budget with their full windows, and the
+    // others still get back the share they started with.
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let ids: Vec<u32> = (0..16)
+        .map(|_| c.open("POST", "/pipe", &[], false))
+        .collect();
+    c.frames_within(Duration::from_millis(100));
+    let body = pattern(100_000);
+    for &id in ids.iter().rev() {
+        c.send_body(id, &body, false);
+    }
+    // Still within the budget, and the oldest stream's top-up.
+    c.frames_within(Duration::from_millis(100));
+    let granted: i64 = ids.iter().map(|id| c.send_windows[id].max(0)).sum();
+    assert!(
+        granted <= (1 << 20) + 256 * 1024,
+        "{granted} bytes of window granted"
+    );
+    for &id in &ids {
+        c.send_body(id, &body, true);
+        assert_eq!(c.reply(id).unwrap().text(), "read 200000");
+    }
+}
+
+#[test]
+fn bodies_buffered_whole_stay_within_the_budget() {
+    // Bodies the server buffers before their handlers run hold what they
+    // received until the handler takes it, so they get no window beyond
+    // the budget, unlike streamed bodies whose handlers read as they go.
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let ids: Vec<u32> = (0..16)
+        .map(|_| c.open("POST", "/echo", &[], false))
+        .collect();
+    c.frames_within(Duration::from_millis(100));
+    let body = pattern(100_000);
+    let mut sent: HashMap<u32, usize> = ids.iter().map(|&id| (id, 0)).collect();
+    // Each stream sends what its window allows, again and again, so that
+    // any window given back is used too, until no window is left.
+    for _ in 0..100 {
+        let before: usize = sent.values().sum();
+        for &id in ids.iter().rev() {
+            let window = c.send_conn.min(c.send_windows[&id]).max(0) as usize;
+            let n = window.min(body.len() - sent[&id]);
+            if n > 0 {
+                c.send_body(id, &body[sent[&id]..sent[&id] + n], false);
+                *sent.get_mut(&id).unwrap() += n;
+            }
+        }
+        c.frames_within(Duration::from_millis(20));
+        if sent.values().sum::<usize>() == before {
+            break;
+        }
+    }
+    // Received and still open to send: within the budget, and the oldest
+    // stream's top-up.
+    let held: i64 = ids
+        .iter()
+        .map(|id| sent[id] as i64 + c.send_windows[id].max(0))
+        .sum();
+    assert!(
+        held <= (1 << 20) + 256 * 1024,
+        "{held} bytes held or granted"
+    );
+    // Sent in turn as the windows allow, every body gets through.
+    for &id in &ids {
+        c.send_body(id, &body[sent[&id]..], true);
+        assert_eq!(c.reply(id).unwrap().body, body);
+    }
 }
 
 #[test]

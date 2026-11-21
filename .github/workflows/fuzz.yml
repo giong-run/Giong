@@ -3,7 +3,8 @@ name: Fuzz
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
 # bytes from the network: giong's DNS answers (and resolv.conf and hosts),
 # giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and client, giong-web's
-# router and request handling, giong-mcp's request handling, the PostgreSQL,
+# router and request handling, giong-mcp's request handling, giong-grpc's
+# message framing, gzip, timeouts, status messages, metadata and descriptors, the PostgreSQL,
 # MySQL and Redis protocol readers, and what giong-tls reads of the peer's
 # records around kernel TLS. Every night each target runs for 10 minutes and
 # its corpus is kept in the Actions cache, so the corpus keeps growing. A pull
@@ -26,6 +27,7 @@ on:
       - "giong-web/**"
       - "giong-tls/**"
       - "giong-mcp/**"
+      - "giong-grpc/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -38,6 +40,7 @@ on:
       - "giong-web/**"
       - "giong-tls/**"
       - "giong-mcp/**"
+      - "giong-grpc/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -64,7 +67,7 @@ jobs:
     steps:
       # A pull request is checked out as its merge commit, whose first parent
       # is the base branch: the diff between the two is what the PR changes.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
       - id: plan
@@ -104,6 +107,13 @@ jobs:
           { "crate": "giong-web", "target": "request" }
           { "crate": "giong-tls", "target": "ktls_records" }
           { "crate": "giong-mcp", "target": "request" }
+          { "crate": "giong-proto", "target": "differential" }
+          { "crate": "giong-grpc", "target": "framing" }
+          { "crate": "giong-grpc", "target": "gzip" }
+          { "crate": "giong-grpc", "target": "timeout" }
+          { "crate": "giong-grpc", "target": "status_message" }
+          { "crate": "giong-grpc", "target": "metadata" }
+          { "crate": "giong-grpc", "target": "descriptors" }
           EOF
           )
           if [ "$EVENT" = pull_request ]; then
@@ -134,18 +144,18 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: fuzz (${{ matrix.crate }} ${{ matrix.target }})
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
       # The prebuilt cargo-fuzz is a musl binary and builds for its own target by
       # default, where the sanitizers cannot link: every cargo fuzz command
       # below names the glibc target.
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-fuzz
       - name: Restore the corpus
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ matrix.dir || matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
@@ -166,13 +176,13 @@ jobs:
           cargo fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }} fuzz/corpus/${{ matrix.target }}
       - name: Save the corpus
         if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ matrix.dir || matrix.crate }}/fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.crate }}-${{ matrix.target }}-${{ github.run_id }}
       - name: Upload the crashing input
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.crate }}-${{ matrix.target }}
           path: ${{ matrix.dir || matrix.crate }}/fuzz/artifacts/${{ matrix.target }}

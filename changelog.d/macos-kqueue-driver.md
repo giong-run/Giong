@@ -30,7 +30,3 @@
   `nameserver` with a zone, such as `fe80::1%en0`, as a scoped IPv6 address; it was skipped,
   which could leave only the `127.0.0.1` fallback
   ([#173](https://github.com/giong-run/Giong/pull/173)).
-- **giong**: a worker on the epoll (or kqueue) driver no longer spins at full CPU while
-  idle when a file operation on the blocking threads finished just as the worker collected
-  the results; the stale wake-up is now reset
-  ([#173](https://github.com/giong-run/Giong/pull/173)).
