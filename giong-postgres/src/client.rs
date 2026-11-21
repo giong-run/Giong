@@ -200,11 +200,10 @@ const SYNC_LEN: usize = 5;
 /// It also caps how long a statement of the batch waits for a lock, at 50 ms
 /// (a constant: computed from the session's `lock_timeout`, the guard cost
 /// the batch 10% of its speed): a batch holds the locks its statements took
-/// until it ends, so a statement that waits behind
-/// another transaction while earlier ones hold their locks could close a
-/// cycle that the statements one by one never would (a migration that locks
-/// two tables, say), and the server would roll back one side after its
-/// `deadlock_timeout`. Given up within 50 ms instead, the wait fails the
+/// until it ends, so a statement that waits behind another transaction while
+/// earlier ones hold their locks could close a cycle that the statements one
+/// by one never would (a migration that locks two tables, say), and the
+/// server would roll back one side after its `deadlock_timeout`. Given up within 50 ms instead, the wait fails the
 /// batch, whose statements run again on their own and wait as they would
 /// without batches.
 const READ_ONLY: &str =

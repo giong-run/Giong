@@ -344,7 +344,11 @@ impl Config {
     ///   whether it had run (what it did was rolled back) or the server had
     ///   skipped it. What a transaction's rollback does not undo happens
     ///   twice then: a sequence advanced by `nextval` (allowed on temporary
-    ///   sequences) is advanced again.
+    ///   sequences) is advanced again, and a session-level advisory lock
+    ///   (`pg_advisory_lock`, `pg_try_advisory_lock`) is taken twice, so one
+    ///   unlock leaves it held. One statement that fails on its input (a bad
+    ///   `$1::int4`, say) also makes up to 15 statements before it run
+    ///   again: bounded, but more work for a database that is the limit.
     /// * Its answer arrives when the batch ends, once its commit is known:
     ///   a statement waits for up to 15 others that were written after it.
     ///   They run one after another on the server either way, so this is
