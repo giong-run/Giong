@@ -311,3 +311,30 @@ fn a_connect_that_keeps_breaking_fails_with_the_code() {
         drop(listener);
     });
 }
+
+#[test]
+#[cfg_attr(
+    giong_libkqueue,
+    ignore = "libkqueue loses events of a reused descriptor"
+)]
+fn a_connect_waits_two_seconds_in_all() {
+    let _h = hooked();
+    run(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Broken after it began, then refused on every new socket: the
+        // driver's wait on the new socket gets what is left of the 2 s, not
+        // 2 s of its own.
+        hook::fail_connects_late(1);
+        hook::fail_connects(u32::MAX);
+        let start = Instant::now();
+        let err = TcpStream::connect(addr).await.map(drop).unwrap_err();
+        let waited = start.elapsed();
+        assert_exhausted(&err);
+        assert!(
+            waited >= Duration::from_millis(1900) && waited < Duration::from_millis(2500),
+            "{waited:?}"
+        );
+        drop(listener);
+    });
+}

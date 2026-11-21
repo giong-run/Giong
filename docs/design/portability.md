@@ -366,10 +366,12 @@ stays pending, so the worker runs its other tasks meanwhile, and a
 `time::timeout` or a dropped future ends the wait as it ends a readiness
 wait; `ENOBUFS` is all or nothing on a call, so nothing was sent. A
 connect the shortage broke after it began has a dead socket and starts
-over on a new one within the same 2 s (`StreamSocket::connect_new`). After
-2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`, kind
-`OutOfMemory`, the kernel's error as its source). A datagram send fails
-with E0028 at once. Rust's standard library, mio and Tokio return the
+over on a new one within the same 2 s (`StreamSocket::connect_new`).
+giong-tls sends its queued records without waiting in two places, and
+leaves them queued on `ENOBUFS` as on `EAGAIN`, for the next send, which
+waits. After 2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`,
+kind `OutOfMemory`, the kernel's error as its source). A datagram send
+keeps the kernel's `ENOBUFS`, as on Linux. Rust's standard library, mio and Tokio return the
 kernel's `ENOBUFS` as it is. None of this is built on Linux; on macOS it
 costs one comparison per poll of an operation while nothing waits. Tests
 make the failures with a hook built only with `--cfg giong_inject_enobufs`

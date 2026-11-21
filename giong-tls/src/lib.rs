@@ -313,6 +313,15 @@ fn broken() -> io::Error {
     )
 }
 
+/// `true` for `ENOBUFS` on macOS, where every socket's buffers come from one
+/// pool for the whole machine: a send it refuses sent nothing, and giong's
+/// own sends wait for buffers (GIONG-E0028), so the sends here made without
+/// waiting treat it as a full socket. Linux makes a TCP sender wait instead.
+#[inline]
+fn no_buffers(e: &io::Error) -> bool {
+    cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::ENOBUFS)
+}
+
 /// Every certificate in `pem`, or an error if there is none.
 pub(crate) fn pem_certs(pem: &[u8]) -> io::Result<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_slice_iter(pem)
@@ -1539,6 +1548,9 @@ impl TlsStream {
             match e.kind() {
                 io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock => return Ok(()),
+                // macOS out of network buffers: like a full socket, what was
+                // not sent waits for the next send, which waits for them.
+                _ if no_buffers(&e) => return Ok(()),
                 _ => {
                     self.broken.set(true);
                     *unsent = Vec::new();
@@ -1953,10 +1965,13 @@ impl TlsStream {
             wire.drain(..n as usize);
         } else {
             let e = io::Error::last_os_error();
+            // Out of network buffers (macOS): `send_wire` below waits for
+            // them, as for room in the socket.
             if !matches!(
                 e.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
+            ) && !no_buffers(&e)
+            {
                 self.broken.set(true);
                 wire.clear();
                 return Err(e);

@@ -15,8 +15,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use super::addr::{resolved, ToSocketAddrs};
 use super::sendq::{self, Sent};
 use super::{
-    close_socket, datagram_err, inet_addr, no_addresses, os_err, share, unexpected, wait_for_pool,
-    MultiSlot,
+    close_socket, inet_addr, no_addresses, os_err, share, unexpected, wait_for_pool, MultiSlot,
 };
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
 use crate::driver::{Io, MultiIo, MultiKind, MultiPoll};
@@ -203,7 +202,7 @@ pub struct UdpSocket {
 /// A send's answer (bytes, or a negative errno) as an `io::Result`.
 fn sent_result(res: isize) -> io::Result<usize> {
     if res < 0 {
-        Err(datagram_err(res as i32))
+        Err(io::Error::from_raw_os_error(-res as i32))
     } else {
         Ok(res as usize)
     }
@@ -486,7 +485,7 @@ impl UdpSocket {
         let (sent, sends_to) = now.expect("tried");
         if let Some(res) = sent {
             return if res < 0 {
-                (Err(datagram_err(res)), buf)
+                (Err(os_err(res)), buf)
             } else {
                 (Ok(res as usize), buf)
             };
@@ -523,7 +522,7 @@ impl UdpSocket {
             (res, buf)
         };
         if res < 0 {
-            (Err(datagram_err(res)), buf)
+            (Err(os_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }
@@ -556,7 +555,7 @@ impl UdpSocket {
         let sent = now.expect("tried");
         if let Some(res) = sent {
             return if res < 0 {
-                (Err(datagram_err(res)), buf)
+                (Err(os_err(res)), buf)
             } else {
                 (Ok(res as usize), buf)
             };
@@ -572,7 +571,7 @@ impl UdpSocket {
         // SAFETY: an `IoBuf`'s bytes stay put when it moves.
         let (res, _, buf) = unsafe { Op::new(io, buf) }.await;
         if res < 0 {
-            (Err(datagram_err(res)), buf)
+            (Err(os_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }

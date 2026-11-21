@@ -157,9 +157,9 @@ codes! {
     /// every socket on the machine draws from is empty, usually because
     /// sockets hold data that nobody reads. A stream send or connect waits
     /// for buffers and is tried again for up to 2 seconds before it fails
-    /// with this code; a datagram send fails at once. The kernel's error is
-    /// the [`source`](std::error::Error::source), so `raw_os_error` stays
-    /// reachable.
+    /// with this code (a datagram send keeps the kernel's error). The
+    /// kernel's error is the [`source`](std::error::Error::source), so
+    /// `raw_os_error` stays reachable.
     NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
 
     // ------------------------------------------------- network and names

@@ -69,18 +69,7 @@ pub(crate) fn os_err(res: i32) -> io::Error {
 pub(crate) fn send_err(res: i32) -> io::Error {
     #[cfg(any(target_os = "macos", giong_inject_enobufs))]
     if res == -libc::ENOBUFS {
-        return nobufs::exhausted(os_err(res), true);
-    }
-    os_err(res)
-}
-
-/// [`os_err`] for the result of a datagram send: `ENOBUFS` gets its code at
-/// once on macOS, since a datagram may be dropped.
-#[inline]
-pub(crate) fn datagram_err(res: i32) -> io::Error {
-    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
-    if res == -libc::ENOBUFS {
-        return nobufs::exhausted(os_err(res), false);
+        return nobufs::exhausted(os_err(res));
     }
     os_err(res)
 }
@@ -88,7 +77,9 @@ pub(crate) fn datagram_err(res: i32) -> io::Error {
 /// The net layer's part in waiting out a shortage of network buffers on
 /// macOS: the connects the shortage broke after they began, and
 /// `sendfile(2)`. The driver retries the rest (see
-/// `driver/readiness/nobufs.rs`, whose steps these are).
+/// `driver/readiness/nobufs.rs`, whose steps these are). Datagram sends are
+/// left alone: their `ENOBUFS` is returned as the kernel's error, as on
+/// Linux, since a datagram may be dropped.
 #[cfg(any(target_os = "macos", giong_inject_enobufs))]
 pub(crate) mod nobufs {
     use std::io;
@@ -100,17 +91,12 @@ pub(crate) mod nobufs {
     const FIRST: Duration = Duration::from_millis(1);
     const MOST: Duration = Duration::from_millis(32);
 
-    /// `ENOBUFS` with its code; `waited` if giong waited for buffers first.
+    /// `ENOBUFS` with its code, after giong waited for buffers.
     #[cold]
-    pub(crate) fn exhausted(err: io::Error, waited: bool) -> io::Error {
-        let message = if waited {
-            "the system ran out of network buffers (ENOBUFS), and still had none after 2 s"
-        } else {
-            "the datagram was not sent: the system ran out of network buffers (ENOBUFS)"
-        };
+    pub(crate) fn exhausted(err: io::Error) -> io::Error {
         Error::new(
             Code::NetworkBuffersExhausted,
-            message,
+            "the system ran out of network buffers (ENOBUFS), and still had none after 2 s",
             "read from every connection promptly, cap how many connections can hold unread \
              data at once, and lower SO_RCVBUF if the program raised it: macOS takes every \
              socket's buffers from one pool for the whole machine (netstat -m shows it).",
@@ -123,8 +109,8 @@ pub(crate) mod nobufs {
         crate::error::code(err) == Some(Code::NetworkBuffersExhausted)
     }
 
-    /// Waits between tries, as the driver does, within [`GIVE_UP`] from the
-    /// first failure.
+    /// Waits between tries, as the driver does, within [`GIVE_UP`] from when
+    /// it was made.
     pub(crate) struct Backoff {
         since: Instant,
         step: Duration,
@@ -151,6 +137,11 @@ pub(crate) mod nobufs {
             }
             crate::time::sleep(self.step).await;
             true
+        }
+
+        /// What is left of [`GIVE_UP`].
+        pub(crate) fn left(&self) -> Duration {
+            GIVE_UP.saturating_sub(self.since.elapsed())
         }
     }
 }
@@ -511,7 +502,9 @@ impl StreamSocket {
 
     /// Connects a socket made by `make` to `addr`. On macOS, a connect
     /// that a shortage of network buffers broke after it began is made again
-    /// on a new socket, within the 2 s the driver waits for buffers.
+    /// on a new socket. All of it stays within the 2 s the driver waits for
+    /// buffers: a connect on a new socket gets what is left of them, not 2 s
+    /// of its own.
     pub(crate) async fn connect_new(
         make: impl Fn() -> io::Result<Socket>,
         addr: SockAddr,
@@ -519,9 +512,18 @@ impl StreamSocket {
         #[cfg(any(target_os = "macos", giong_inject_enobufs))]
         {
             let mut backoff = nobufs::Backoff::new();
+            let mut res = Self::connect(make()?, addr.clone()).await;
             loop {
-                match Self::connect(make()?, addr.clone()).await {
-                    Err(e) if nobufs::is_exhausted(&e) && backoff.wait().await => {}
+                match res {
+                    Err(e) if nobufs::is_exhausted(&e) && backoff.wait().await => {
+                        let connect = Self::connect(make()?, addr.clone());
+                        res = match crate::time::timeout(backoff.left(), connect).await {
+                            Ok(res) => res,
+                            // Out of time while the driver waited for buffers
+                            // (dropping the connect closed its socket).
+                            Err(_) => Err(e),
+                        };
+                    }
                     res => return res,
                 }
             }
@@ -991,7 +993,7 @@ impl StreamSocket {
                                 .wait()
                                 .await
                             {
-                                return Err(nobufs::exhausted(err, true));
+                                return Err(nobufs::exhausted(err));
                             }
                         }
                         Some(crate::sys::errno::EAGAIN) => {
