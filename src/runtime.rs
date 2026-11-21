@@ -1028,9 +1028,13 @@ impl Builder {
     /// [`DriverKind::Epoll`] it never uses io_uring.
     ///
     /// When no driver is named here, the `GIONG_DRIVER` environment variable
-    /// can name one (`io_uring` or `epoll`), so that a deployment can choose
-    /// without a rebuild. Any other value makes [`build`](Self::build) fail
-    /// with `GIONG-E0004`.
+    /// can name one (`io_uring` or `epoll` on Linux, `kqueue` on macOS), so
+    /// that a deployment can choose without a rebuild. Any other value makes
+    /// [`build`](Self::build) fail with `GIONG-E0004`.
+    ///
+    /// A driver this operating system does not have, named either way, makes
+    /// `build` fail too: io_uring with `GIONG-E0001`, the others with
+    /// `GIONG-E0004`.
     ///
     /// ```no_run
     /// let rt = giong::Builder::new().driver(giong::DriverKind::Epoll).build()?;
@@ -1162,6 +1166,9 @@ impl Builder {
                 None => (None, ChosenBy::Automatic),
             },
         };
+        if let Some(kind) = driver {
+            crate::driver::check_exists(kind)?;
+        }
         Ok(Config {
             driver,
             chosen_by,

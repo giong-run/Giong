@@ -723,10 +723,37 @@ fn report_fallback(e: &io::Error) {
     }
 }
 
-/// The error for a driver this operating system does not have.
+/// Whether this build has the driver `kind`.
+fn exists(kind: DriverKind) -> bool {
+    match kind {
+        DriverKind::IoUring | DriverKind::Epoll => cfg!(target_os = "linux"),
+        DriverKind::Kqueue => cfg!(any(target_os = "macos", giong_libkqueue)),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Fails, as [`Driver::new`] would, for a driver that this operating system
+/// does not have: so that `Builder::build` refuses it, before any worker
+/// starts.
+pub(crate) fn check_exists(kind: DriverKind) -> io::Result<()> {
+    if exists(kind) {
+        Ok(())
+    } else {
+        Err(unsupported(kind))
+    }
+}
+
+/// The error for a driver this operating system does not have: io_uring is
+/// not available (`GIONG-E0001`, as `Builder::driver` promises), and the
+/// others are a wrong setting (`GIONG-E0004`).
 fn unsupported(kind: DriverKind) -> io::Error {
+    let code = match kind {
+        DriverKind::IoUring => Code::IoUringUnavailable,
+        _ => Code::InvalidConfig,
+    };
     crate::error::raise(
-        Code::InvalidConfig,
+        code,
         format!("the {kind} driver does not exist on this operating system"),
         "name io_uring or epoll on Linux and kqueue on macOS (Builder::driver or \
          GIONG_DRIVER), or name none to let giong choose.",
