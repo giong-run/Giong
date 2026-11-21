@@ -347,18 +347,20 @@ impl UdpSocket {
     /// peer of all of them. Connect a socket with a port of its own (port
     /// 0, or an address no other worker binds).
     ///
-    /// Where Unix fails the next receive on a connected socket with
-    /// `ConnectionRefused` when the peer's port is closed (an ICMP "port
-    /// unreachable" came back), Windows reports nothing: giong turns those
-    /// reports off there, since Windows would otherwise give them to
-    /// unconnected sockets too and end a server's receive loop. Datagrams
-    /// to a closed port are lost silently, as UDP allows.
+    /// As on Unix, a receive on a connected socket fails when the peer's
+    /// port is closed (an ICMP "port unreachable" came back); on Windows
+    /// the error is `ConnectionReset`. An unconnected socket never reports
+    /// it, on any system.
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let mut last_err = None;
         for addr in resolved(&addr, "UdpSocket::connect")? {
             // Connecting a UDP socket only records the address: it never blocks.
             match self.sock.connect(&addr.into()) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(windows)]
+                    crate::sys::udp_reports_refusals(&self.sock, true);
+                    return Ok(());
+                }
                 Err(e) => last_err = Some(e),
             }
         }

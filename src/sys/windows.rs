@@ -580,15 +580,29 @@ pub(crate) fn set_exclusive_address(sock: &socket2::Socket) -> io::Result<()> {
 /// - Without `SIO_UDP_CONNRESET` and `SIO_UDP_NETRESET`: otherwise an ICMP
 ///   "port unreachable" for an earlier send to a peer that has gone fails
 ///   the next receive with `WSAECONNRESET`, and a server's receive loop
-///   ends. Unix reports these only on a connected socket.
+///   ends. Unix reports these only on a connected socket, and
+///   [`udp_reports_refusals`] turns them back on when it connects.
 ///
 /// A failure leaves the socket as it was.
 pub(crate) fn ready_udp(sock: &socket2::Socket) {
-    use std::os::windows::io::AsRawSocket;
-    use windows_sys::Win32::Networking::WinSock::{WSAIoctl, SIO_UDP_CONNRESET, SIO_UDP_NETRESET};
+    use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SIO_UDP_NETRESET};
     drop(sock.set_nonblocking(true));
-    for code in [SIO_UDP_CONNRESET, SIO_UDP_NETRESET] {
-        let off: BOOL = 0;
+    set_udp_resets(sock, &[SIO_UDP_CONNRESET, SIO_UDP_NETRESET], false);
+}
+
+/// Whether a UDP socket's receives fail when its peer's port is closed:
+/// on for a connected socket, as on Unix, where the refusal comes from the
+/// one peer the socket talks to. A failure leaves the socket as it was.
+pub(crate) fn udp_reports_refusals(sock: &socket2::Socket, on: bool) {
+    use windows_sys::Win32::Networking::WinSock::SIO_UDP_CONNRESET;
+    set_udp_resets(sock, &[SIO_UDP_CONNRESET], on);
+}
+
+fn set_udp_resets(sock: &socket2::Socket, codes: &[u32], on: bool) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::WSAIoctl;
+    for &code in codes {
+        let value = BOOL::from(on);
         let mut returned = 0u32;
         // SAFETY: an open socket; the input is a local of the size given,
         // and there is no output.
@@ -596,7 +610,7 @@ pub(crate) fn ready_udp(sock: &socket2::Socket) {
             WSAIoctl(
                 sock.as_raw_socket() as RawSock,
                 code,
-                (&off as *const BOOL).cast(),
+                (&value as *const BOOL).cast(),
                 mem::size_of::<BOOL>() as u32,
                 std::ptr::null_mut(),
                 0,

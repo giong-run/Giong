@@ -1673,6 +1673,9 @@ mod tests {
                 SetFileCompletionNotificationModes(socket as HANDLE, modes),
                 0
             );
+            // Non-blocking, as the driver's sockets are.
+            let mut on = 1u32;
+            assert_eq!(ioctlsocket(socket, FIONBIO, &mut on), 0);
             let mut buf = [0u8; 512];
             let wsabuf = WSABUF {
                 len: 512,
@@ -1689,17 +1692,20 @@ mod tests {
                 &mut *overlapped,
                 None,
             );
-            assert_eq!(
-                (rc, wsa_error()),
-                (-1, WSAEMSGSIZE),
-                "cut off inside the call"
+            // With the datagram there, the call ends inside, cut off; or
+            // Windows leaves it in flight. Either way a packet must come.
+            let err = wsa_error();
+            assert_eq!(rc, -1);
+            assert!(
+                err == WSAEMSGSIZE || err == ERROR_IO_PENDING as i32,
+                "error {err}"
             );
             let (mut bytes, mut key, mut got) = (0u32, 0usize, ptr::null_mut());
             let ok = GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut got, 2000);
             let reported = !got.is_null();
             assert!(
                 ok != 0 || reported,
-                "no packet came for the cut-off receive (error {})",
+                "no packet came for the receive that ended with {err} (error {})",
                 last_error()
             );
             assert_eq!(got, &mut *overlapped as *mut OVERLAPPED);
