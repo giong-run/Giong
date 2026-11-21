@@ -54,14 +54,14 @@ use windows_sys::Win32::Foundation::{
     ERROR_NETNAME_DELETED, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    bind, closesocket, getsockname, ioctlsocket, recv, recvfrom, setsockopt, TransmitFile,
-    WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend, WSASendMsg,
-    WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX,
-    LPFN_WSARECVMSG, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-    SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED, WSAECONNRESET, WSAEINVAL, WSAEMSGSIZE,
-    WSAENOTCONN, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG,
-    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    bind, closesocket, getsockname, getsockopt, ioctlsocket, recv, recvfrom, setsockopt,
+    TransmitFile, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend,
+    WSASendMsg, WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX,
+    LPFN_CONNECTEX, LPFN_WSARECVMSG, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_TYPE,
+    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED, WSAECONNRESET,
+    WSAEINVAL, WSAEMSGSIZE, WSAENOTCONN, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX,
+    WSAID_CONNECTEX, WSAID_WSARECVMSG, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     ReadFile, SetFileCompletionNotificationModes, WriteFile,
@@ -211,6 +211,9 @@ struct Record {
     socket: bool,
     after: After,
     state: State,
+    /// A send on a socket: on a stream, it is not cancelled (see
+    /// [`Iocp::cancel_op`]).
+    sending: bool,
     accepting: Option<Box<Accepting>>,
     datagram: Option<Box<Datagram>>,
 }
@@ -252,6 +255,23 @@ fn connection_gone(res: i32) -> bool {
         WSAENOTCONN,
     ]
     .contains(&-res)
+}
+
+/// Whether `socket` is a stream socket.
+fn is_stream(socket: SOCKET) -> bool {
+    let mut kind = 0i32;
+    let mut len = mem::size_of::<i32>() as i32;
+    // SAFETY: an open socket; the value is a local of the size given.
+    let rc = unsafe {
+        getsockopt(
+            socket,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&mut kind as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && kind == SOCK_STREAM
 }
 
 /// Bytes of the header in front of every datagram of a multishot receive:
@@ -478,6 +498,7 @@ impl Iocp {
             socket,
             after: After::Nothing,
             state,
+            sending: false,
             accepting: None,
             datagram: None,
         }))
@@ -532,6 +553,9 @@ impl Iocp {
                     (*record).after = After::Received {
                         room: len.min(i32::MAX as u32) as i32,
                     }
+                }
+                Io::Send { .. } | Io::SendMsg { .. } | Io::SendFile { .. } => {
+                    (*record).sending = true;
                 }
                 Io::RecvMsg { msg, .. } => {
                     let bufs =
@@ -857,7 +881,10 @@ impl Iocp {
             return;
         }
         rec.state = State::Orphan(data);
-        if !finish {
+        // Windows aborts a connection whose send is cancelled part way, so
+        // the stream would be unusable after a dropped write, where Unix
+        // keeps it: a send on a stream runs to its end instead.
+        if !finish && !(rec.sending && is_stream(rec.handle as SOCKET)) {
             Self::cancel(rec);
         }
     }
