@@ -1323,7 +1323,10 @@ impl<P: Poller> Readiness<P> {
             let (token, readable, writable) = self.poller.event(i);
             match token {
                 WAKE => self.wake.seen(),
-                DONE => {} // collected below
+                // Collected below; a ring left over from results that
+                // were already taken is reset, or every wait would end
+                // at once.
+                DONE => self.completions.quiet(),
                 token => {
                     let fd = token as u32 as usize;
                     let gen = (token >> 32) as u32;
@@ -1505,4 +1508,38 @@ pub(super) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    type Platform = super::super::epoll::Epoll;
+    #[cfg(all(not(target_os = "linux"), any(target_os = "macos", giong_libkqueue)))]
+    type Platform = super::super::kqueue::Kqueue;
+
+    /// A blocking job that finishes while its worker takes the results
+    /// rings the bell after the results are gone. The next wait sees the
+    /// ring and resets it: the one after waits again.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call epoll_wait or kevent")]
+    fn a_late_ring_of_the_blocking_threads_does_not_end_every_wait() {
+        let mut driver = Readiness::<Platform>::new(BufPool::new(2, 64).unwrap()).unwrap();
+        driver.completions.push(usize::MAX, 0);
+        let mut taken = Vec::new();
+        driver.completions.take(&mut taken);
+        assert_eq!(taken.len(), 1);
+        // The ring of a job whose result was already taken.
+        driver.completions.ring();
+        driver.park(Park::Wait(Some(Duration::from_millis(1))));
+        let wait = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        driver.park(Park::Wait(Some(wait)));
+        assert!(
+            start.elapsed() >= wait - Duration::from_millis(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
 }
