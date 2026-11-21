@@ -56,7 +56,7 @@
 //!   is still being written (full duplex). The trailer fields of a response
 //!   are read with [`StreamingResponse::trailers`]; an HTTP/2 or HTTP/3
 //!   request sent with [`RequestBuilder::send_streaming`] says
-//!   `te: trailers`. A client with HTTP/3 sends a streamed body over TCP.
+//!   `te: trailers`. A streamed body goes over HTTP/1.1 or HTTP/2.
 //! * Every request has a timeout (30 s by default) that covers waiting for
 //!   a connection, connecting, sending, and reading the whole response,
 //!   redirects included; connecting has its own (10 s).
@@ -455,7 +455,10 @@ impl ClientBuilder {
     /// such as giong-http's own `Server::serve_h3`. Every request to an
     /// `https` origin then goes over QUIC, on one connection for each
     /// origin; nothing falls back to TCP. Not through a proxy, where
-    /// requests stay on HTTP/1.1 and HTTP/2.
+    /// requests stay on HTTP/1.1 and HTTP/2. A request with a streamed body
+    /// ([`RequestBuilder::streamed_body`]) is refused with
+    /// [`ErrorKind::Request`], since HTTP/3 requests carry bodies held in
+    /// memory.
     ///
     /// `quic` carries the TLS settings, which must offer the ALPN protocol
     /// `h3`, and the transport's: its idle timeout is what closes an unused
@@ -917,6 +920,20 @@ impl Client {
             && !headers
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case("accept-encoding"));
+        // A server spoken to by prior knowledge may have no TCP: refused
+        // rather than sent there.
+        #[cfg(feature = "unstable-http3")]
+        if let (Some(http3), true, None, true) = (&config.http3, url.https, &route.proxy, streamed)
+        {
+            if http3.prior_knowledge {
+                return Err(Error::request(format!(
+                    "{what}: a streamed request body cannot go over HTTP/3 yet, and this client \
+                     speaks HTTP/3 to https origins by prior knowledge; send the body from \
+                     memory (RequestBuilder::body), or use a client without \
+                     http3_prior_knowledge"
+                )));
+            }
+        }
         #[cfg(feature = "unstable-http3")]
         // A streamed request body goes over HTTP/1.1 or HTTP/2: the HTTP/3
         // client sends bodies it has whole.
@@ -2162,9 +2179,11 @@ impl RequestBuilder {
     /// written (full duplex): `send_streaming` returns when the head of the
     /// response does, whether or not the body has ended. Over HTTP/1.1 the
     /// body goes out with `Transfer-Encoding: chunked` and the response is
-    /// read once the body has ended. A client with HTTP/3 sends the request
-    /// over HTTP/1.1 or HTTP/2 instead: its HTTP/3 requests carry bodies held
-    /// in memory.
+    /// read once the body has ended. HTTP/3 requests carry bodies held in
+    /// memory: a client that learned of HTTP/3 from `Alt-Svc` sends this
+    /// request over HTTP/1.1 or HTTP/2, and one with
+    /// `ClientBuilder::http3_prior_knowledge` refuses it
+    /// ([`ErrorKind::Request`]).
     ///
     /// What differs from a body held in memory, because it cannot be sent
     /// twice: redirects are not followed (the 3xx response is returned),

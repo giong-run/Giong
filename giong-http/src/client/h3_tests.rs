@@ -364,21 +364,22 @@ fn the_trailers_of_a_streamed_response_are_read_over_http3() {
 }
 
 #[test]
-fn a_streamed_request_body_is_not_sent_over_http3() {
+fn a_streamed_request_body_is_refused_with_prior_knowledge() {
     run(|| async {
         let (url, client) = served();
-        // The HTTP/3 client sends bodies it has whole: this one goes over
-        // TCP, where nothing listens here.
+        // The HTTP/3 client sends bodies it has whole, and a server known to
+        // speak HTTP/3 may have no TCP: refused, with nothing sent.
         let (request, body) = client.post(&format!("{url}/echo")).streamed_body();
         body.send("piece").await.unwrap();
         drop(body);
         let err = request.send().await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Connect, "{err}");
+        assert_eq!(err.kind(), ErrorKind::Request, "{err}");
+        assert!(err.to_string().contains("streamed request body"), "{err}");
         assert!(
             PEERS.with(|p| p.borrow().is_empty()),
-            "nothing reached the HTTP/3 server"
+            "nothing reached the server"
         );
-        // Whole bodies still go over HTTP/3.
+        // Whole bodies go over HTTP/3.
         let res = client
             .post(&format!("{url}/echo"))
             .body("whole")
