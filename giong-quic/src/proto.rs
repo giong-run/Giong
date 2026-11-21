@@ -1094,7 +1094,13 @@ impl Shared {
         }
         let r = c.c.send_stream(s.id).finish();
         st.mark(h);
-        r.map_err(|_| error::lost(&ConnectionError::LocallyClosed))
+        r.map_err(|e| match e {
+            // The peer asked to stop sending: its code, as `write` gives it.
+            quinn_proto::FinishError::Stopped(code) => error::reset(code.into_inner()),
+            quinn_proto::FinishError::ClosedStream => {
+                error::lost(&ConnectionError::LocallyClosed)
+            }
+        })
     }
 
     pub(crate) fn reset(&self, h: usize, s: Sid, code: u32) {

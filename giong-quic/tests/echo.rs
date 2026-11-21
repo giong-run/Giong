@@ -1076,3 +1076,36 @@ fn a_closed_endpoint_still_draining_refuses_new_clients_at_once() {
         })
         .unwrap();
 }
+
+#[test]
+fn finishing_a_stream_the_peer_stopped_gives_its_code() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            giong::spawn(async move {
+                let conn = server.accept().await.unwrap();
+                let (_send, mut recv) = conn.accept_bi().await.unwrap();
+                // "I have my answer": stop sending, code 7.
+                recv.stop(7);
+                giong::time::sleep(Duration::from_secs(2)).await;
+            });
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
+            let (mut send, _recv) = conn.open_bi().await.unwrap();
+            send.write_all(b"abc").await.unwrap();
+            // Something else is awaited before finishing; STOP_SENDING
+            // arrives meanwhile.
+            giong::time::sleep(Duration::from_millis(200)).await;
+            let e = send.finish().expect_err("the peer stopped the stream");
+            assert_eq!(giong_quic::reset_code(&e), Some(7), "{e}");
+        })
+        .unwrap();
+}
