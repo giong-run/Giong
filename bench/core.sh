@@ -6,6 +6,7 @@
 #
 # Every run is pinned to two cores (CORES, default 1-2): one for the runtime
 # and one for the feeding thread of `xthread` (and Tokio's extra workers).
+# Where there is no taskset (Windows), runs are not pinned.
 # Prints and writes raw.csv (one line per run) and summary.txt (median,
 # min and max ns per operation, wall clock and CPU).
 set -euo pipefail
@@ -25,7 +26,12 @@ for round in $(seq "$ROUNDS"); do
             if [ "$w" = lookup ]; then
                 case "$r" in monoio | glommio | compio) continue ;; esac
             fi
-            taskset -c "$CORES" target/release/bench-core "$r" "$w" >>"$OUT/raw.csv"
+            if command -v taskset >/dev/null; then
+                taskset -c "$CORES" target/release/bench-core "$r" "$w" >>"$OUT/raw.csv"
+            else
+                # Windows: no pinning.
+                target/release/bench-core "$r" "$w" | tr -d '\r' >>"$OUT/raw.csv"
+            fi
         done
     done
     echo "round $round done" >&2
