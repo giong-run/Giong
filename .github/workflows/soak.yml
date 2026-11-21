@@ -3,9 +3,9 @@ name: Soak
 # Two hours of connection churn, UDP, file and cross-worker traffic every night
 # (tests/soak.rs), then checks that no descriptor, memory or driver state was
 # left behind. Run it by hand with another duration from the Actions tab.
-# Twice: on the runner's kernel, and on Linux 6.18 booted in QEMU, where
-# streams receive through packed buffer rings (6.12 and newer), which cut a
-# receive wherever a shared buffer fills up.
+# On Windows, and twice on Linux: on the runner's kernel, and on Linux 6.18
+# booted in QEMU, where streams receive through packed buffer rings (6.12
+# and newer), which cut a receive wherever a shared buffer fills up.
 # Then years of simulated uptime under hostile faults (sim/README.md), on new
 # seeds every night: rare fault combinations show up only after thousands of
 # seeds, more than the per-PR run can afford.
@@ -37,6 +37,23 @@ jobs:
       - run: uname -r && nproc
       - name: Soak
         run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak
+
+  # The same churn on Windows, through the completion port driver: the
+  # handle count and working set stand in for descriptors and resident
+  # memory.
+  soak-windows:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Soak
+        shell: bash
+        run: |
+          GIONG_SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) \
+            cargo test -p giong --release --locked --test soak -- --ignored --nocapture
 
   soak-packed-buffers:
     runs-on: ubuntu-24.04

@@ -355,14 +355,83 @@ async fn cross_worker(workers: usize, deadline: Instant, counters: Arc<Counters>
     }
 }
 
+#[cfg(unix)]
 fn open_fds() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
 }
 
+/// The process's open handles: sockets, files, events, threads and the rest.
+#[cfg(windows)]
+fn open_fds() -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut count = 0u32;
+    // SAFETY: the pseudo handle of this process, and a local to write to.
+    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    assert!(ok != 0, "GetProcessHandleCount failed");
+    count as usize
+}
+
+#[cfg(unix)]
 fn rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// The process's working set, Windows' resident memory.
+#[cfg(windows)]
+fn rss_kib() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: all-zero is a valid value of this plain structure.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process, and a structure of the size
+    // given.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    assert!(ok != 0, "GetProcessMemoryInfo failed");
+    counters.WorkingSetSize as u64 / 1024
+}
+
+/// Opens, once, what Windows keeps open for the rest of the process after
+/// its first use: Winsock and its helper handles, the runtime's blocking
+/// threads, the file system's. The handle count before the soak is taken
+/// after this, so that it compares like with like.
+#[cfg(windows)]
+fn warm_up() {
+    let dir = std::env::temp_dir().join(format!("giong-soak-warm-{}", std::process::id()));
+    giong::Builder::new()
+        .workers(2)
+        .build()
+        .unwrap()
+        .run(move |worker| {
+            let dir = dir.clone();
+            async move {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let accept = giong::spawn(async move { listener.accept().await.map(drop) });
+                let connected = TcpStream::connect(addr).await.unwrap();
+                accept.await.unwrap().unwrap();
+                drop(connected);
+                let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+                udp.send_to(vec![1u8], udp.local_addr().unwrap())
+                    .await
+                    .0
+                    .unwrap();
+                drop(udp.recv_from().await.unwrap());
+                if worker == 0 {
+                    let path = dir.with_extension("tmp");
+                    let file = giong::fs::File::create(&path).await.unwrap();
+                    file.write_all_at(vec![0u8; 16], 0).await.0.unwrap();
+                    file.sync_all().await.unwrap();
+                    drop(file);
+                    giong::fs::remove_file(&path).await.unwrap();
+                }
+            }
+        })
+        .unwrap();
 }
 
 fn median(values: &mut [u64]) -> u64 {
@@ -378,6 +447,8 @@ fn soak() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
     let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
+    #[cfg(windows)]
+    warm_up();
     let fds_before = open_fds();
 
     // A free port for every worker's listener (SO_REUSEPORT), and one UDP
