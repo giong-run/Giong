@@ -76,6 +76,8 @@
 )]
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
+// Every public item is documented, as in giong's other crates.
+#![warn(missing_docs)]
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("giong only supports Linux: it is built on io_uring and epoll");
