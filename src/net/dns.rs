@@ -67,10 +67,30 @@ impl Default for ResolverConfig {
 impl ResolverConfig {
     /// Reads `/etc/resolv.conf` and `/etc/hosts`. A missing file counts as
     /// empty.
+    ///
+    /// On Windows, which has no `resolv.conf`, the name servers are those of
+    /// the network adapters that are up (the first three, in the order
+    /// Windows lists the adapters), the search domains are the machine's
+    /// primary DNS suffix and each adapter's own suffix, and the hosts file
+    /// is `%SystemRoot%\System32\drivers\etc\hosts`. IPv6 servers that are
+    /// site-local (`fec0::/10`, listed on adapters with no IPv6 server) or
+    /// link-local are left out. The other settings are the defaults.
     pub fn system() -> io::Result<Self> {
-        let resolv = read_optional("/etc/resolv.conf")?;
-        let hosts = read_optional("/etc/hosts")?;
-        Ok(Self::parse(&resolv, &hosts))
+        #[cfg(unix)]
+        {
+            let resolv = read_optional("/etc/resolv.conf")?;
+            let hosts = read_optional("/etc/hosts")?;
+            Ok(Self::parse(&resolv, &hosts))
+        }
+        #[cfg(windows)]
+        {
+            let (servers, search) = crate::sys::dns_config()?;
+            let hosts = read_optional(crate::sys::hosts_path())?;
+            Ok(Self::parse(
+                &adapters_as_resolv_conf(&servers, &search),
+                &hosts,
+            ))
+        }
     }
 
     /// Builds a configuration from the text of a `resolv.conf` and a `hosts`
@@ -216,7 +236,21 @@ fn is_loopback(ip: &IpAddr) -> bool {
     }
 }
 
-fn read_optional(path: &str) -> io::Result<String> {
+/// What Windows reports, written as a `resolv.conf`, so that it is read by
+/// the same rules.
+#[cfg(windows)]
+fn adapters_as_resolv_conf(servers: &[IpAddr], search: &[String]) -> String {
+    let mut text = String::new();
+    for server in servers {
+        text.push_str(&format!("nameserver {server}\n"));
+    }
+    if !search.is_empty() {
+        text.push_str(&format!("search {}\n", search.join(" ")));
+    }
+    text
+}
+
+fn read_optional(path: impl AsRef<std::path::Path>) -> io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
@@ -834,15 +868,33 @@ thread_local! {
 struct SystemResolver {
     resolver: Resolver,
     checked: Instant,
-    stamps: [Option<SystemTime>; 2],
+    stamps: Stamps,
 }
 
-fn file_stamps() -> [Option<SystemTime>; 2] {
+/// What the system configuration was read from, to tell when it changed.
+#[cfg(unix)]
+type Stamps = [Option<SystemTime>; 2];
+/// The hosts file's time, and what the adapters report: Windows keeps the
+/// rest in no file.
+#[cfg(windows)]
+type Stamps = (Option<SystemTime>, Option<(Vec<IpAddr>, Vec<String>)>);
+
+#[cfg(unix)]
+fn file_stamps() -> Stamps {
     ["/etc/resolv.conf", "/etc/hosts"].map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
 }
 
+#[cfg(windows)]
+fn file_stamps() -> Stamps {
+    let hosts = std::fs::metadata(crate::sys::hosts_path())
+        .and_then(|m| m.modified())
+        .ok();
+    (hosts, crate::sys::dns_config().ok())
+}
+
 /// The current thread's resolver for the system configuration, reloaded when
-/// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds).
+/// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds; on
+/// Windows, the hosts file and what the adapters report).
 pub(crate) fn system_resolver() -> io::Result<Resolver> {
     SYSTEM.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -1094,6 +1146,26 @@ mod tests {
         assert_eq!((nx.rcode, nx.addrs.len()), (RCODE_NXDOMAIN, 0));
         let tc = parse_response(&response(&q, 0, true, &[]), 3, "gone.example", TYPE_A).unwrap();
         assert!(tc.truncated);
+    }
+
+    #[test]
+    fn windows_takes_the_name_servers_of_its_adapters() {
+        // One test on every platform (the simulation's index is built from
+        // test names), with nothing to check off Windows.
+        #[cfg(windows)]
+        {
+            let (servers, search) = crate::sys::dns_config().unwrap();
+            assert!(!servers.is_empty(), "no adapter reports a DNS server");
+            let cfg = ResolverConfig::parse(&adapters_as_resolv_conf(&servers, &search), "");
+            let expected: Vec<SocketAddr> = servers
+                .iter()
+                .take(3)
+                .map(|&ip| SocketAddr::new(ip, 53))
+                .collect();
+            assert_eq!(cfg.nameservers, expected);
+            assert_eq!(cfg.search, search);
+            ResolverConfig::system().unwrap();
+        }
     }
 
     #[test]

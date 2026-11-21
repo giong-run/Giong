@@ -688,3 +688,134 @@ pub(crate) fn accept_nowait(listener: RawSock) -> std::io::Result<Option<RawSock
         Ok(Some(sock))
     }
 }
+
+/// The DNS servers and search domains Windows uses: the servers of the
+/// network adapters that are up, in the order Windows lists the adapters,
+/// and the primary DNS suffix followed by each adapter's own suffix.
+///
+/// Site-local servers (`fec0::/10`, which Windows lists on adapters with no
+/// IPv6 DNS server) and link-local ones (`fe80::/10`, which need a zone
+/// index) are left out.
+pub(crate) fn dns_config() -> std::io::Result<(Vec<std::net::IpAddr>, Vec<String>)> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GetNetworkParams, FIXED_INFO_W2KSP1, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_FRIENDLY_NAME, GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST,
+        IF_TYPE_SOFTWARE_LOOPBACK, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+
+    let mut search = Vec::new();
+    let mut add_suffix = |suffix: String| {
+        let suffix = suffix.trim_end_matches('.').to_string();
+        if !suffix.is_empty() && !search.contains(&suffix) {
+            search.push(suffix);
+        }
+    };
+
+    // The primary DNS suffix of the machine.
+    let mut len = 0u32;
+    // SAFETY: a null buffer asks for the size it needs.
+    if unsafe { GetNetworkParams(std::ptr::null_mut(), &mut len) } == ERROR_BUFFER_OVERFLOW {
+        // `u64` units keep the buffer aligned for the structure.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        let info = buf.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>();
+        // SAFETY: `buf` holds `len` bytes, aligned for `FIXED_INFO_W2KSP1`.
+        if unsafe { GetNetworkParams(info, &mut len) } == NO_ERROR {
+            // SAFETY: the call filled the structure; `DomainName` ends in a
+            // NUL within its array.
+            let name = unsafe { &(*info).DomainName };
+            let bytes: Vec<u8> = name
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            add_suffix(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+
+    // The adapters. The list can grow between the two calls, so the size
+    // is asked again until it fits.
+    let flags = GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_FRIENDLY_NAME;
+    let mut len = 16 * 1024u32;
+    let mut buf: Vec<u64>;
+    loop {
+        buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: `buf` holds `len` bytes, aligned for the structures.
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                WinSock::AF_UNSPEC as u32,
+                flags,
+                std::ptr::null(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        match rc {
+            NO_ERROR => break,
+            ERROR_BUFFER_OVERFLOW => continue,
+            ERROR_NO_DATA => return Ok((Vec::new(), search)),
+            e => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+    let mut servers = Vec::new();
+    let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    // SAFETY: the call filled `buf` with a list of adapters whose pointers
+    // stay within it, and `buf` lives until the end of the walk.
+    unsafe {
+        while !adapter.is_null() {
+            let a = &*adapter;
+            adapter = a.Next;
+            if a.OperStatus != IfOperStatusUp || a.IfType == IF_TYPE_SOFTWARE_LOOPBACK {
+                continue;
+            }
+            let mut dns = a.FirstDnsServerAddress;
+            while !dns.is_null() {
+                let address = (*dns).Address;
+                dns = (*dns).Next;
+                let sa = address.lpSockaddr;
+                if sa.is_null() {
+                    continue;
+                }
+                let ip = match (*sa).sa_family {
+                    WinSock::AF_INET => {
+                        let sin = &*sa.cast::<WinSock::SOCKADDR_IN>();
+                        IpAddr::V4(Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes()))
+                    }
+                    WinSock::AF_INET6 => {
+                        let sin6 = &*sa.cast::<WinSock::SOCKADDR_IN6>();
+                        let ip = Ipv6Addr::from(sin6.sin6_addr.u.Byte);
+                        let first = ip.segments()[0];
+                        if first & 0xffc0 == 0xfec0 || first & 0xffc0 == 0xfe80 {
+                            continue;
+                        }
+                        IpAddr::V6(ip)
+                    }
+                    _ => continue,
+                };
+                if !servers.contains(&ip) {
+                    servers.push(ip);
+                }
+            }
+            if !a.DnsSuffix.is_null() {
+                let mut end = 0;
+                while *a.DnsSuffix.add(end) != 0 {
+                    end += 1;
+                }
+                let suffix = std::slice::from_raw_parts(a.DnsSuffix, end);
+                add_suffix(String::from_utf16_lossy(suffix));
+            }
+        }
+    }
+    Ok((servers, search))
+}
+
+/// The hosts file of Windows.
+pub(crate) fn hosts_path() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    std::path::Path::new(&root).join("System32\\drivers\\etc\\hosts")
+}
