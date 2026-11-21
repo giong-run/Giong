@@ -1,57 +1,82 @@
-# 2026-11-21T06:21:36Z 6.18.44-fc-v726 4 CPUs: Intel(R) Xeon(R) Processor @ 2.10GHz; server CPU 0, 1 worker; spin 200 us; 10 s per case
+Spin governor behind spin_before_park (feat/spin-governor), measured with bench/spin.sh.
 
-All cases, raw.csv (3 rounds x 10 s), medians:
- conns   req/s  mode          runs  CPU %  p50 us  p99 us p99.9 us
-     1       0  none             3    0.0       0       0        0
-     1       0  fixed            3    0.0       0       0        0
-     1       0  adaptive         3    0.0       0       0        0
-     1     100  none             3    0.6     181     428     3256
-     1     100  fixed            3    2.6     188     407     2994
-     1     100  adaptive         3    0.7     201     351     1719
-     1    1000  none             3    3.6     100     304     3222
-     1    1000  fixed            3   22.7      90     291     2939
-     1    1000  adaptive         3    4.1     118     334     2829
-     1    2000  none             3    5.3      75     261     2110
-     1    2000  fixed            3   44.0      78     308     2314
-     1    2000  adaptive         3    5.7      83     238     2128
-     1    5000  none             3    8.4      34     196     6743
-     1    5000  fixed            3   96.0      22     385     2342
-     1    5000  adaptive         3   96.7      22     136     2447
-     1   20000  none             3   30.3      32    1728     5064
-     1   20000  fixed            3   96.9      22     885     4310
-     1   20000  adaptive         3   96.7      20     745     5333
-    50   20000  none             3   28.6      33     221     7741
-    50   20000  fixed            3   97.3      23     107     1763
-    50   20000  adaptive         3   96.9      23     233     5241
-    50   50000  none             3   63.6      54     488     5051
-    50   50000  fixed            3   97.3      37    1013    13700
-    50   50000  adaptive         3   97.7      36     230     2394
+fixed = bench/giong built from origin/main (5a4cdb3): spin_before_park(200 us) spins
+        200 us every time.
+tuned = this branch: the same knob, the spin per worker doubles after an idle time
+        <= 200 us and halves after one > 400 us.
+none  = no spin.
 
-Low rates, raw.csv and raw-lowrate.csv pooled, medians over every round:
- conns   req/s  mode          runs  CPU %  p50 us  p99 us p99.9 us
-     1     100  none             3    0.6     181     428     3256
-     1     100  fixed            7    2.6     195     407     2562
-     1     100  adaptive         7    0.7     193     374     1719
-     1    1000  none            13    3.6     106     316     2973
-     1    1000  fixed           32   22.4      90     269     2368
-     1    1000  adaptive        32    3.6     100     289     2810
-     1    2000  none            13    5.6      80     261     2517
-     1    2000  fixed           17   44.3      75     241     2876
-     1    2000  adaptive        17    5.8      82     287     2657
+Machine: Firecracker guest, Linux 6.18.44, 4 vCPUs Xeon 2.10 GHz, no cpuidle driver.
+Server on CPU 0, 1 worker; load (bench/spin/src/bin/spin-load.rs, constant interval,
+open loop) on the other CPUs. 5 rounds x 10 s per case; raw-busy.csv and
+raw-blocking.csv hold every round, the tables below are medians over rounds.
 
-CPU cap, raw-cap.csv (4 rounds x 5 s); adaptive 50% is adaptive_spin(200 us, 50):
- conns   req/s  mode          runs  CPU %  p50 us  p99 us p99.9 us
-     1    5000  fixed            4   94.8      20     144     1598
-     1    5000  adaptive         4   94.3      22     309     8884
-     1    5000  adaptive 50%     4   55.6      31     544     2784
-     1   20000  fixed            4   94.9      20    1074     8018
-     1   20000  adaptive         4   95.1      20     344     5756
-     1   20000  adaptive 50%     4   75.9      28    7098    14112
-    50   20000  fixed            4   95.0      22     254     3166
-    50   20000  adaptive         4   95.4      22     116     1756
-    50   20000  adaptive 50%     4   74.9      28     126     2508
-    50   50000  fixed            4   95.6      34     230    14860
-    50   50000  adaptive         4   95.0      35    1933     9170
-    50   50000  adaptive 50%     4   95.3      32     220     3157
+busy client (the load tool busy-polls its socket; its own wake-up is out of the picture)
+ conns   req/s  mode     CPU %  p50 us  p99 us p99.9 us
+     1     100  none       0.6     158     314     1698
+     1     100  fixed      2.5     139     333     2575
+     1     100  tuned      0.5     146     308     2209
+     1    1000  none       2.9      83     209     2459
+     1    1000  fixed     22.2      77     198     1126
+     1    1000  tuned      2.9      79     223     2980
+     1    2000  none       3.8      58     209     1815
+     1    2000  fixed     42.3      52     173     2931
+     1    2000  tuned      3.9      55     228     8761
+     1    5000  none       4.7      24      75      726
+     1    5000  fixed     96.5      10      64     1817
+     1    5000  tuned     96.7      10      71     1329
+     1   20000  none      15.0      20     211     3160
+     1   20000  fixed     97.3       9      90     2237
+     1   20000  tuned     97.0      10     157     7075
+    50   20000  none      16.4      22      61      471
+    50   20000  fixed     97.3      10      39      433
+    50   20000  tuned     97.5      10      34      560
+    50   50000  none      37.9      21     140     6085
+    50   50000  fixed     97.3      10      53     2134
+    50   50000  tuned     97.4      10      48      949
 
-CPU = the server's user + kernel time as a share of one core. Latency per request from its sending (or its scheduled time when its connection was busy). The run-to-run spread of p99 on this VM is large (fixed at 1:1000 ranges 247-600 us over 32 rounds), so compare medians over many rounds.
+blocking client (the load tool blocks in read())
+ conns   req/s  mode     CPU %  p50 us  p99 us p99.9 us
+     1     100  none       0.6     188     376     1792
+     1     100  fixed      2.5     179     392     1222
+     1     100  tuned      0.6     188     419     2748
+     1    1000  none       3.7     101     262     2369
+     1    1000  fixed     22.9      93     259     2038
+     1    1000  tuned      3.5     100     293     2335
+     1    2000  none       5.8      83     227     1795
+     1    2000  fixed     44.0      72     235     2585
+     1    2000  tuned      5.8      83     228     1491
+     1    5000  none       7.6      33     138     1880
+     1    5000  fixed     97.0      21      82     2126
+     1    5000  tuned     96.7      21     160     2072
+     1   20000  none      31.0      33    1885    11445
+     1   20000  fixed     96.7      20     947     8553
+     1   20000  tuned     96.7      21     511     3235
+    50   20000  none      29.8      34     105     1758
+    50   20000  fixed     97.3      23      87     1177
+    50   20000  tuned     97.4      23      75     1897
+    50   50000  none      66.0      56     353     3324
+    50   50000  fixed     97.3      38     358     4575
+    50   50000  tuned     97.4      36     352   12936
+
+What it shows
+- CPU: up to 2,000 requests/s on one connection the governor costs what no spin costs
+  (2.9-5.8% of a core against 22-44% for the fixed spin). From 5,000 requests/s it
+  spins like the fixed one.
+- p99, where it saves CPU: it has the latency of no spin, because it does not spin.
+  With the busy client that is 13% (1,000/s) and 32% (2,000/s) above the fixed spin;
+  with the blocking client it is +13% and -3%. At 2,000/s the requests come 500 us
+  apart, so the fixed 200 us spin never catches one: what it buys is a shorter sleep
+  afterwards (about 250 us instead of 450 us), and in this guest a shorter sleep wakes
+  faster. That gain only comes with the CPU it burns, so no governor that saves the
+  CPU can keep it here.
+- p99, where it spins: equal or better with 50 connections, but worse at 5,000/s on
+  one connection with the blocking client (160 against 82 us, same CPU) and at
+  20,000/s with the busy client (157 against 90 us). Every round-to-round spread is
+  wide (fixed alone: 61-280 us at 5,000/s), and an earlier 8-round run had the
+  governor within 5% of the fixed spin at 1,000-2,000/s; this run does not.
+
+Verdict: it does not meet "cut idle CPU without raising p99" against the fixed spin on
+this machine. Not shipped; PR #186 closed with this data. A bare-metal run (no
+hypervisor halt-polling) is what would show whether the low-rate p99 gap is the
+guest's wake-up or the governor.

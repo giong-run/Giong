@@ -8,16 +8,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
-### Added
+### Changed
 
-- **Adaptive spinning** (`Builder::adaptive_spin(max, cpu_percent)`): like
-  `spin_before_park(max)`, but each worker spins only while spinning has recently been
-  catching new work. After each sleep, idle no longer than `max` doubles its spin (up to
-  `max`), idle more than twice `max` halves it (down to none), and spinning never takes more
-  than `cpu_percent` of the worker's time. On one connection at 1,000 and 2,000 requests/s
-  it costs 3.6 and 5.8% of a core where `spin_before_park(200 µs)` costs 22 and 44%, at the
-  latency of a worker that does not spin (p99 289 and 287 µs against 269 and 241 µs with
-  the fixed spin); from 5,000 requests/s it spins like the fixed one (`bench/spin.sh`,
+- `spin_before_park(max)` tunes each worker's spin to what spinning catches: after each
+  sleep, idle no longer than `max` doubles the spin (up to `max`), idle more than twice
+  `max` halves it (down to none). On one connection at 1,000 and 2,000 requests/s a worker
+  costs 2.9 and 3.9% of a core where the fixed 200 µs spin costs 22 and 42%, at the p99 of
+  a worker that does not spin (223 and 228 µs against 198 and 173 µs with the fixed spin,
+  busy-polling client); from 5,000 requests/s it spins like the fixed one (`bench/spin.sh`,
   numbers in `bench/results/spin/`).
 
 ## [1.0.0] - 2026-11-21

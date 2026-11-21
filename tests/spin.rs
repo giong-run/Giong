@@ -7,31 +7,12 @@ use giong::net::{TcpListener, TcpStream};
 use giong::sync::mpsc;
 use giong::time::{sleep, timeout};
 
-/// Each test runs twice: with a fixed spin (`spin_before_park`) and with an
-/// adaptive one (`adaptive_spin`), as `spinning(duration)` in its body.
-macro_rules! both_modes {
-    ($name:ident, |$spinning:ident| $body:block) => {
-        mod $name {
-            use super::*;
-
-            #[test]
-            fn fixed() {
-                #[allow(unused_variables)]
-                let $spinning = |spin: Duration| giong::Builder::new().spin_before_park(spin);
-                $body
-            }
-
-            #[test]
-            fn adaptive() {
-                #[allow(unused_variables)]
-                let $spinning = |spin: Duration| giong::Builder::new().adaptive_spin(spin, 100);
-                $body
-            }
-        }
-    };
+fn spinning(spin: Duration) -> giong::Builder {
+    giong::Builder::new().spin_before_park(spin)
 }
 
-both_modes!(io_works_while_spinning, |spinning| {
+#[test]
+fn io_works_while_spinning() {
     spinning(Duration::from_millis(5))
         .block_on(async {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -62,9 +43,10 @@ both_modes!(io_works_while_spinning, |spinning| {
             server.await.unwrap();
         })
         .unwrap();
-});
+}
 
-both_modes!(timers_fire_on_time_while_spinning, |spinning| {
+#[test]
+fn timers_fire_on_time_while_spinning() {
     // The spin budget is longer than the timers: a due timer must end the spin.
     spinning(Duration::from_millis(500))
         .block_on(async {
@@ -88,9 +70,10 @@ both_modes!(timers_fire_on_time_while_spinning, |spinning| {
             );
         })
         .unwrap();
-});
+}
 
-both_modes!(the_worker_still_sleeps_after_the_spin_budget, |spinning| {
+#[test]
+fn the_worker_still_sleeps_after_the_spin_budget() {
     // A short spin followed by a long wait: the timer must still fire.
     spinning(Duration::from_micros(100))
         .block_on(async {
@@ -101,45 +84,44 @@ both_modes!(the_worker_still_sleeps_after_the_spin_budget, |spinning| {
             assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
         })
         .unwrap();
-});
+}
 
-both_modes!(
-    cross_thread_wakeups_reach_a_spinning_worker_and_a_sleeping_one,
-    |spinning| {
-        let (tx, mut rx) = mpsc::unbounded::<(u32, Instant)>();
-        let sender = std::thread::spawn(move || {
-            for i in 0..40u32 {
-                // Gaps shorter and longer than the 2 ms spin budget, so the message
-                // arrives both while the worker spins and after it went to sleep.
-                std::thread::sleep(Duration::from_micros(if i % 2 == 0 { 300 } else { 6_000 }));
-                tx.send((i, Instant::now())).unwrap();
+#[test]
+fn cross_thread_wakeups_reach_a_spinning_worker_and_a_sleeping_one() {
+    let (tx, mut rx) = mpsc::unbounded::<(u32, Instant)>();
+    let sender = std::thread::spawn(move || {
+        for i in 0..40u32 {
+            // Gaps shorter and longer than the 2 ms spin budget, so the message
+            // arrives both while the worker spins and after it went to sleep.
+            std::thread::sleep(Duration::from_micros(if i % 2 == 0 { 300 } else { 6_000 }));
+            tx.send((i, Instant::now())).unwrap();
+        }
+    });
+    let (count, worst) = spinning(Duration::from_millis(2))
+        .block_on(async move {
+            let mut count = 0;
+            let mut worst = Duration::ZERO;
+            while let Some((i, sent)) = timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("lost wake-up")
+            {
+                assert_eq!(i, count);
+                count += 1;
+                worst = worst.max(sent.elapsed());
             }
-        });
-        let (count, worst) = spinning(Duration::from_millis(2))
-            .block_on(async move {
-                let mut count = 0;
-                let mut worst = Duration::ZERO;
-                while let Some((i, sent)) = timeout(Duration::from_secs(10), rx.recv())
-                    .await
-                    .expect("lost wake-up")
-                {
-                    assert_eq!(i, count);
-                    count += 1;
-                    worst = worst.max(sent.elapsed());
-                }
-                (count, worst)
-            })
-            .unwrap();
-        sender.join().unwrap();
-        assert_eq!(count, 40);
-        assert!(
-            worst < Duration::from_millis(100),
-            "slow wake-up: {worst:?}"
-        );
-    }
-);
+            (count, worst)
+        })
+        .unwrap();
+    sender.join().unwrap();
+    assert_eq!(count, 40);
+    assert!(
+        worst < Duration::from_millis(100),
+        "slow wake-up: {worst:?}"
+    );
+}
 
-both_modes!(spinning_workers_shut_down_cleanly, |spinning| {
+#[test]
+fn spinning_workers_shut_down_cleanly() {
     let rt = spinning(Duration::from_millis(1))
         .workers(2)
         .build()
@@ -154,12 +136,13 @@ both_modes!(spinning_workers_shut_down_cleanly, |spinning| {
     })
     .unwrap();
     stopper.join().unwrap();
-});
+}
 
-both_modes!(a_zero_spin_duration_turns_the_mode_off, |spinning| {
+#[test]
+fn a_zero_spin_duration_turns_the_mode_off() {
     spinning(Duration::ZERO)
         .block_on(async {
             sleep(Duration::from_millis(2)).await;
         })
         .unwrap();
-});
+}

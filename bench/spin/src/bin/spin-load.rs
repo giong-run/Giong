@@ -25,7 +25,7 @@ fn exchange(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
     buf.clear();
     let mut chunk = [0u8; 4096];
     loop {
-        let n = stream.read(&mut chunk)?;
+        let n = read(stream, &mut chunk)?;
         if n == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -41,7 +41,7 @@ fn exchange(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
                 })
                 .unwrap_or(0);
             while buf.len() < end + 4 + len {
-                let n = stream.read(&mut chunk)?;
+                let n = read(stream, &mut chunk)?;
                 if n == 0 {
                     return Err(std::io::ErrorKind::UnexpectedEof.into());
                 }
@@ -50,6 +50,22 @@ fn exchange(stream: &mut TcpStream, buf: &mut Vec<u8>) -> std::io::Result<()> {
             return Ok(());
         }
     }
+}
+
+/// A read that, with `SPIN_LOAD_BUSY=1`, busy-polls a non-blocking socket
+/// instead of sleeping in the kernel: the client's own wake-up then costs
+/// nothing, so what is left is the server's.
+fn read(stream: &mut TcpStream, chunk: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match stream.read(chunk) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::hint::spin_loop(),
+            other => return other,
+        }
+    }
+}
+
+fn busy() -> bool {
+    std::env::var("SPIN_LOAD_BUSY").is_ok_and(|v| v == "1")
 }
 
 fn main() {
@@ -76,6 +92,7 @@ fn main() {
             unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1, 0, 0, 0) };
             let mut stream = TcpStream::connect(&addr).expect("connect");
             stream.set_nodelay(true).ok();
+            stream.set_nonblocking(busy()).ok();
             stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
             let mut buf = Vec::new();
             let mut lat = Vec::new();
@@ -98,6 +115,7 @@ fn main() {
                             Ok(s) => {
                                 s.set_nodelay(true).ok();
                                 s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                                s.set_nonblocking(busy()).ok();
                                 stream = s;
                             }
                             Err(_) => thread::sleep(Duration::from_millis(10)),
