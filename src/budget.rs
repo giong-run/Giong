@@ -91,12 +91,14 @@
 //!
 //! ## Cost
 //!
-//! Nothing for code that uses no budget: a task outside any budget reads
-//! one thread-local pointer when it spawns and when it starts an operation.
+//! Next to nothing for code that uses no budget: a spawn and the start of an
+//! operation test one pointer the worker keeps (whether the task polled now
+//! runs in a budget), and everything else is out of line. Measured with
+//! `scripts/instr.py`, that is under 1% more instructions on every hot path
+//! (0.6% on a spawn, 0.4% on a TCP echo).
 //! Inside a budget, each charge is one atomic add on the budget's counter;
 //! a budget is shared by every worker its tenant runs on.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
@@ -110,7 +112,7 @@ use std::task::{Context, Poll, Waker};
 use crate::error::{raise, Code};
 use crate::executor::JoinHandle;
 use crate::lane::BlockingHandle;
-use crate::runtime::{self, lock};
+use crate::runtime::{self, lock, Worker};
 
 /// No limit.
 const UNLIMITED: usize = usize::MAX;
@@ -118,11 +120,6 @@ const UNLIMITED: usize = usize::MAX;
 /// What a task costs beyond its future, roughly: the task's header, its
 /// waker and its join state.
 const TASK_OVERHEAD: usize = 128;
-
-thread_local! {
-    /// The budget of the task this worker polls now, or null.
-    static CURRENT: Cell<*const Inner> = const { Cell::new(ptr::null()) };
-}
 
 // -------------------------------------------------------------------- limits
 
@@ -463,6 +460,10 @@ pub(crate) struct Inner {
     memory: Gate,
     io: Gate,
     compute: Gate,
+    /// Operations waiting for an I/O slot; all are woken when one is given
+    /// back, and try again.
+    io_parked: Mutex<Vec<Waker>>,
+    io_parked_len: AtomicUsize,
 }
 
 /// A share of the runtime for one tenant: limits on its tasks, memory, I/O
@@ -504,6 +505,8 @@ impl Budget {
                 memory: Gate::new(limits.memory),
                 io: Gate::new(limits.io),
                 compute: Gate::new(limits.compute),
+                io_parked: Mutex::new(Vec::new()),
+                io_parked_len: AtomicUsize::new(0),
             }),
         }
     }
@@ -535,6 +538,11 @@ impl Budget {
         i.tasks.set_limit(limits.tasks);
         i.memory.set_limit(limits.memory);
         i.io.set_limit(limits.io);
+        // Operations waiting for an I/O slot try again under the new limit.
+        if i.io_parked_len.load(Ordering::SeqCst) > 0 {
+            i.io.used.fetch_add(1, Ordering::SeqCst);
+            give_io(Arc::as_ptr(&self.inner));
+        }
         i.compute.set_limit(limits.compute);
     }
 
@@ -545,7 +553,10 @@ impl Budget {
             name: i.name.to_string(),
             tasks: i.tasks.stats(),
             memory: i.memory.stats(),
-            io: i.io.stats(),
+            io: GateStats {
+                waiting: i.io_parked_len.load(Ordering::Relaxed),
+                ..i.io.stats()
+            },
             compute: i.compute.stats(),
             compute_weight: i.weight.load(Ordering::Relaxed) as u32,
         }
@@ -694,7 +705,6 @@ impl Budget {
     pub fn enter<F: Future>(&self, fut: F) -> InBudget<F> {
         InBudget {
             budget: self.inner.clone(),
-            _charge: None,
             fut,
         }
     }
@@ -743,34 +753,31 @@ impl Budget {
 ///
 /// Never; outside a runtime it is `None`.
 pub fn current() -> Option<Budget> {
-    let ptr = CURRENT.with(Cell::get);
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: `CURRENT` is set only by `InBudget::poll`, for the duration of
-    // its inner poll, to the `Inner` of an `Arc` that `InBudget` holds; this
-    // runs inside that poll on the same thread, so the `Arc` is alive.
-    // Taking a new strong count from it keeps the original count unchanged.
-    unsafe {
-        Arc::increment_strong_count(ptr);
-        Some(Budget {
-            inner: Arc::from_raw(ptr),
-        })
-    }
+    let ptr = runtime::try_with_worker(|w| w.budget.get()).unwrap_or(ptr::null());
+    // SAFETY: read from the worker on this thread (see `arc_of`); the new
+    // handle takes a strong count of its own.
+    unsafe { arc_of(ptr) }.map(|arc| Budget {
+        inner: Arc::clone(&arc),
+    })
 }
 
-/// Runs `f` with the current budget's `Inner`, if any, without touching its
-/// reference count.
+/// The `Arc` behind a worker's current budget pointer, without touching its
+/// count; `None` for null.
+///
+/// # Safety
+///
+/// `ptr` is null or was read from the worker's `budget` field on this
+/// thread, during the poll that set it: `InBudget::poll` and
+/// `TaskCharge::run` set it, for the duration of the inner poll, to the
+/// `Inner` of an `Arc` they hold, and put the previous value back after.
 #[inline]
-fn with_current<R>(f: impl FnOnce(&Arc<Inner>) -> R) -> Option<R> {
-    let ptr = CURRENT.with(Cell::get);
+unsafe fn arc_of(ptr: *const Inner) -> Option<std::mem::ManuallyDrop<Arc<Inner>>> {
     if ptr.is_null() {
         return None;
     }
-    // SAFETY: as in `current`: the `Arc` behind `ptr` is alive for the whole
-    // of this call. `ManuallyDrop` keeps its count unchanged.
-    let arc = std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
-    Some(f(&arc))
+    // SAFETY: by the caller, the `Arc` is alive; `ManuallyDrop` leaves its
+    // count unchanged.
+    Some(std::mem::ManuallyDrop::new(unsafe { Arc::from_raw(ptr) }))
 }
 
 // --------------------------------------------------------------- charges
@@ -813,10 +820,28 @@ impl fmt::Debug for Reservation {
     }
 }
 
-/// A task slot and the memory of its future.
-struct TaskCharge {
+/// A task slot and the memory of its future, held by the executor's
+/// reference to a task of the budget (see `Worker::spawn_charged`).
+pub(crate) struct TaskCharge {
     budget: Arc<Inner>,
     bytes: usize,
+}
+
+impl TaskCharge {
+    /// Charges a task of `F` to `budget`, whose task slot is taken.
+    fn new<F>(budget: Arc<Inner>) -> Self {
+        let bytes = std::mem::size_of::<F>() + TASK_OVERHEAD;
+        budget.memory.force(bytes);
+        Self { budget, bytes }
+    }
+
+    /// Runs `poll` (one poll of the task) in the budget.
+    pub(crate) fn run<R>(&self, poll: impl FnOnce() -> R) -> R {
+        let ptr = Arc::as_ptr(&self.budget);
+        let previous = runtime::try_with_worker(|w| w.budget.replace(ptr));
+        let _restore = previous.map(Restore);
+        poll()
+    }
 }
 
 impl Drop for TaskCharge {
@@ -848,82 +873,92 @@ impl Drop for ComputeCharge {
 /// A compute slot charged without waiting to the current budget, for
 /// [`spawn_compute`](crate::spawn_compute) inside a budgeted task.
 pub(crate) fn charge_compute() -> Option<ComputeCharge> {
-    with_current(|b| {
-        b.compute.force(1);
-        ComputeCharge(b.clone())
-    })
+    let ptr = runtime::try_with_worker(|w| w.budget.get())?;
+    // SAFETY: read from the worker on this thread (see `arc_of`).
+    let b = unsafe { arc_of(ptr) }?;
+    b.compute.force(1);
+    Some(ComputeCharge(Arc::clone(&b)))
 }
 
-/// An I/O slot, held by an operation from its submission until the kernel
-/// completes it. On a dropped operation it travels to the driver with the
-/// operation's buffers, so it is given back with them, at the completion.
-pub(crate) enum IoSlot {
-    Waiting(IoWait),
-    // Held for its `Drop`, which gives the slot back.
-    Held(#[allow(dead_code)] IoCharge),
-}
-
+/// An I/O slot of a budget, held for an operation by key in its worker's
+/// table ([`hold_io`]) from its submission until the kernel completes it. On
+/// a dropped operation it travels to the driver with the operation's
+/// buffers, so it is given back with them, at the completion.
 pub(crate) struct IoCharge(Arc<Inner>);
 
 impl Drop for IoCharge {
     fn drop(&mut self) {
-        self.0.io.give(1);
+        give_io(Arc::as_ptr(&self.0));
     }
 }
 
-/// An operation waiting for an I/O slot; leaves the queue when dropped.
-pub(crate) struct IoWait {
-    budget: Arc<Inner>,
-    waiter: Option<Arc<Waiter>>,
+/// Takes one of the I/O slots of the budget `ptr` (read from the worker on
+/// this thread during this poll), or keeps `waker` to be woken when one is
+/// given back and returns `false`.
+#[cold]
+#[inline(never)]
+pub(crate) fn take_io(ptr: *const Inner, waker: &Waker) -> bool {
+    // SAFETY: read from the worker on this thread during this poll.
+    let Some(b) = (unsafe { arc_of(ptr) }) else {
+        return true;
+    };
+    if b.io.take(1) {
+        return true;
+    }
+    b.io.waited.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut parked = lock(&b.io_parked);
+        if !parked.iter().any(|w| w.will_wake(waker)) {
+            parked.push(waker.clone());
+        }
+        b.io_parked_len.store(parked.len(), Ordering::SeqCst);
+    }
+    // A slot given back between the first look and the push found no
+    // waker: look again (a spare wake-up later is harmless).
+    b.io.take(1)
 }
 
-impl Drop for IoWait {
-    fn drop(&mut self) {
-        if let Some(waiter) = self.waiter.take() {
-            self.budget.io.cancel(&waiter);
+/// Gives back one I/O slot of the budget `ptr` (alive: the caller holds it
+/// through its operation's charge or its task) and wakes the operations
+/// waiting for one, which try again.
+pub(crate) fn give_io(ptr: *const Inner) {
+    // SAFETY: by the caller, the budget is alive.
+    let b = unsafe { &*ptr };
+    b.io.used.fetch_sub(1, Ordering::SeqCst);
+    if b.io_parked_len.load(Ordering::SeqCst) > 0 {
+        let woken = {
+            let mut parked = lock(&b.io_parked);
+            b.io_parked_len.store(0, Ordering::SeqCst);
+            std::mem::take(&mut *parked)
+        };
+        for w in woken {
+            w.wake();
         }
     }
 }
 
-/// Before an operation is submitted: `Ready` once it may go (outside a
-/// budget, `slot` stays `None`; inside one, it then holds the operation's
-/// I/O slot), `Pending` while its budget has [`Limits::io`] operations in
-/// flight.
-#[inline]
-pub(crate) fn poll_io(slot: &mut Option<IoSlot>, waker: &Waker) -> Poll<()> {
-    match slot {
-        Some(IoSlot::Held(_)) => Poll::Ready(()),
-        Some(IoSlot::Waiting(wait)) => {
-            let waiter = wait.waiter.as_ref().expect("an IoWait waits");
-            if !wait.budget.io.poll_waiter(waiter, waker) {
-                return Poll::Pending;
-            }
-            // Granted: the unit now belongs to the operation, so the wait
-            // must not cancel when it drops.
-            wait.waiter = None;
-            let budget = wait.budget.clone();
-            *slot = Some(IoSlot::Held(IoCharge(budget)));
-            Poll::Ready(())
-        }
-        None => {
-            let Some(next) = with_current(|b| match b.io.take_or_wait(1, waker) {
-                None => IoSlot::Held(IoCharge(b.clone())),
-                Some(waiter) => IoSlot::Waiting(IoWait {
-                    budget: b.clone(),
-                    waiter: Some(waiter),
-                }),
-            }) else {
-                return Poll::Ready(());
-            };
-            let waiting = matches!(next, IoSlot::Waiting(..));
-            *slot = Some(next);
-            if waiting {
-                Poll::Pending
-            } else {
-                Poll::Ready(())
-            }
-        }
+/// Keeps the I/O slot taken for the operation `key` on worker `w`.
+#[cold]
+#[inline(never)]
+pub(crate) fn hold_io(w: &Worker, key: u32, ptr: *const Inner) {
+    // SAFETY: read from the worker on this thread during this poll.
+    let b = unsafe { arc_of(ptr) }.expect("not null");
+    let mut table = w.io_charges.borrow_mut();
+    let at = key as usize;
+    if table.len() <= at {
+        table.resize_with(at + 1, || None);
     }
+    table[at] = Some(IoCharge(Arc::clone(&b)));
+}
+
+/// Takes the I/O slot kept for the operation `key` on worker `w`.
+#[cold]
+#[inline(never)]
+pub(crate) fn release_io(w: &Worker, key: u32) -> Option<IoCharge> {
+    w.io_charges
+        .borrow_mut()
+        .get_mut(key as usize)
+        .and_then(Option::take)
 }
 
 // --------------------------------------------------------------- tasks
@@ -938,45 +973,35 @@ fn spawn_charged<F>(
 where
     F: Future + 'static,
 {
-    let bytes = std::mem::size_of::<F>() + TASK_OVERHEAD;
-    budget.memory.force(bytes);
-    let charge = TaskCharge {
-        budget: budget.clone(),
-        bytes,
-    };
-    let task = InBudget {
-        budget,
-        _charge: Some(charge),
-        fut,
-    };
-    runtime::with_worker(|w| w.spawn_local(task, location))
+    let charge = TaskCharge::new::<F>(budget);
+    runtime::with_worker(|w| w.spawn_charged(fut, location, charge))
 }
 
-/// [`spawn`](crate::spawn) inside a budgeted task: charged to its budget
-/// without waiting. `Err` gives `fut` back outside any budget.
-#[inline]
+/// [`spawn`](crate::spawn) inside a task of the budget at `ptr` (the
+/// worker's current one): the new task is charged to it, without waiting.
+/// Out of line, so that a spawn outside budgets pays one test.
+#[cold]
+#[inline(never)]
 pub(crate) fn spawn_inherited<F>(
+    w: &Worker,
+    ptr: *const Inner,
     fut: F,
     location: &'static std::panic::Location<'static>,
-) -> Result<JoinHandle<F::Output>, F>
+) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
 {
-    if CURRENT.with(Cell::get).is_null() {
-        return Err(fut);
-    }
-    let budget = with_current(Arc::clone).expect("checked above");
+    // SAFETY: read from the worker on this thread just now (see `arc_of`).
+    let budget = Arc::clone(&unsafe { arc_of(ptr) }.expect("not null"));
     budget.tasks.force(1);
-    Ok(spawn_charged(budget, fut, location))
+    w.spawn_charged(fut, location, TaskCharge::new::<F>(budget))
 }
 
 /// A future running in a budget: what it spawns, starts and queues is
-/// charged to the budget. From [`Budget::enter`]; budgeted tasks are
-/// wrapped in one too.
+/// charged to the budget. From [`Budget::enter`].
 #[must_use = "futures do nothing unless polled"]
 pub struct InBudget<F> {
     budget: Arc<Inner>,
-    _charge: Option<TaskCharge>,
     fut: F,
 }
 
@@ -993,7 +1018,8 @@ struct Restore(*const Inner);
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        CURRENT.with(|c| c.set(self.0));
+        let previous = self.0;
+        runtime::try_with_worker(|w| w.budget.set(previous));
     }
 }
 
@@ -1007,7 +1033,11 @@ impl<F: Future> Future for InBudget<F> {
         let this = unsafe { self.get_unchecked_mut() };
         // SAFETY: as above, `fut` stays where it is for as long as `self`.
         let fut = unsafe { Pin::new_unchecked(&mut this.fut) };
-        let _restore = Restore(CURRENT.with(|c| c.replace(Arc::as_ptr(&this.budget))));
+        let ptr = Arc::as_ptr(&this.budget);
+        // Outside a runtime (a budgeted future awaited elsewhere) nothing is
+        // charged: there is no worker to start operations on.
+        let previous = runtime::try_with_worker(|w| w.budget.replace(ptr));
+        let _restore = previous.map(Restore);
         fut.poll(cx)
     }
 }

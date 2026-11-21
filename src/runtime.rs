@@ -444,6 +444,10 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+    /// The budget of the task being polled, or null (see [`crate::budget`]).
+    pub(crate) budget: Cell<*const crate::budget::Inner>,
+    /// The budget I/O slots of operations in flight, by driver key.
+    pub(crate) io_charges: RefCell<Vec<Option<crate::budget::IoCharge>>>,
 }
 
 thread_local! {
@@ -530,6 +534,8 @@ impl Worker {
             draining: Cell::new(false),
             main_location: Cell::new(panic::Location::caller()),
             observe: observe::Local::default(),
+            budget: Cell::new(std::ptr::null()),
+            io_charges: RefCell::new(Vec::new()),
         }))
     }
 
@@ -714,16 +720,6 @@ impl Worker {
                 if !self.queue.borrow().is_empty() || self.spin_for_work(spin) {
                     continue;
                 }
-            }
-
-            // Resources of operations cancelled in this turn that the kernel
-            // no longer uses (the epoll driver frees them at once): dropping
-            // them may give back a budget's I/O slot and wake a task, which
-            // must run before the worker sleeps.
-            let graveyard = self.driver.borrow_mut().take_graveyard();
-            if !graveyard.is_empty() {
-                drop(graveyard);
-                continue;
             }
 
             let wait = match self.timers.borrow().next_deadline() {

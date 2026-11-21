@@ -1299,7 +1299,9 @@ impl Epoll {
             mem::take(&mut self.ready)
         } else {
             let timeout = match mode {
-                _ if self.completions.any() => Some(Duration::ZERO),
+                // Dropping the resources of cancelled operations may give
+                // back a budget's I/O slot and wake a task: do not sleep.
+                _ if self.completions.any() || !self.graveyard.is_empty() => Some(Duration::ZERO),
                 Park::Poll => Some(Duration::ZERO),
                 Park::Wait(timeout) => timeout,
             };

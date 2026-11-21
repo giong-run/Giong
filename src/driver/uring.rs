@@ -1449,6 +1449,10 @@ impl Uring {
                     Ok(())
                 }
             }
+            // Resources of operations cancelled since the last turn wait to be
+            // dropped, which may give back a budget's I/O slot and wake a
+            // task: collect, but do not sleep.
+            Park::Wait(_) if !self.graveyard.is_empty() => self.enter(0, None),
             Park::Wait(timeout) => self.enter(1, timeout),
         };
         if let Err(e) = res {

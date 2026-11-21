@@ -570,10 +570,54 @@ fn drop_quietly<T>(value: T) {
     let _ = panic::catch_unwind(AssertUnwindSafe(move || drop(value)));
 }
 
+/// A task of a budget: polled in it, and holding its charge until the
+/// executor lets go of the task (see [`crate::budget`]).
+struct Charged {
+    task: Rc<dyn Runnable>,
+    charge: crate::budget::TaskCharge,
+}
+
+impl Runnable for Charged {
+    fn run(&self, cx: &mut Context<'_>) -> Poll<()> {
+        self.charge.run(|| self.task.run(cx))
+    }
+
+    fn cancel(&self) {
+        self.task.cancel();
+    }
+}
+
 impl Worker {
     pub(crate) fn spawn_local<F>(&self, fut: F, location: Location) -> JoinHandle<F::Output>
     where
         F: Future + 'static,
+    {
+        self.spawn_wrapped(fut, location, |task| task)
+    }
+
+    /// [`spawn_local`](Self::spawn_local) for a task of a budget. The
+    /// future is polled by the same code as outside budgets (a wrapper
+    /// around the future would compile each spawned future's poll twice, and
+    /// keep it from being inlined where it was).
+    pub(crate) fn spawn_charged<F>(
+        &self,
+        fut: F,
+        location: Location,
+        charge: crate::budget::TaskCharge,
+    ) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+    {
+        self.spawn_wrapped(fut, location, move |task| {
+            Rc::new(Charged { task, charge }) as Rc<dyn Runnable>
+        })
+    }
+
+    #[inline(always)]
+    fn spawn_wrapped<F, W>(&self, fut: F, location: Location, wrap: W) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        W: FnOnce(Rc<dyn Runnable>) -> Rc<dyn Runnable>,
     {
         let task = Rc::new(LocalTask {
             join: JoinState {
@@ -588,7 +632,7 @@ impl Worker {
         self.next_task_uid.set(uid + 1);
 
         let mut tasks = self.tasks.borrow_mut();
-        let slot = tasks.insert(TaskSlot {
+        let slot = tasks.insert_inline(TaskSlot {
             task: None,
             location,
             uid,
@@ -598,7 +642,7 @@ impl Worker {
         let handle_task: Rc<dyn Joinable<F::Output>> = task.clone();
         let task = Task {
             state: waker_state,
-            fut: TaskRef(task),
+            fut: TaskRef(wrap(task)),
         };
         tasks.get_mut(slot).expect("slot just inserted").task = Some(task);
         drop(tasks);
@@ -615,6 +659,7 @@ impl Worker {
 
     /// The waker state for a new task in `slot`: a retired one when there
     /// is one, so that a spawn costs one allocation instead of two.
+    #[inline(always)]
     fn task_waker(&self, slot: usize) -> Arc<TaskWaker> {
         if let Some(state) = self.spare_wakers.borrow_mut().pop() {
             // Nobody else holds it (see `retire`), so plain stores will do.
@@ -764,12 +809,15 @@ where
     F: Future + 'static,
 {
     let location = std::panic::Location::caller();
-    // Inside a budgeted task the new task is charged to the same budget.
-    let fut = match crate::budget::spawn_inherited(fut, location) {
-        Ok(handle) => return handle,
-        Err(fut) => fut,
-    };
-    runtime::with_worker(|w| w.spawn_local(fut, location))
+    runtime::with_worker(|w| {
+        let budget = w.budget.get();
+        if budget.is_null() {
+            w.spawn_local(fut, location)
+        } else {
+            // Inside a budgeted task the new task is charged to the same budget.
+            crate::budget::spawn_inherited(w, budget, fut, location)
+        }
+    })
 }
 
 /// Yields to the executor, letting other tasks and pending I/O make progress.
