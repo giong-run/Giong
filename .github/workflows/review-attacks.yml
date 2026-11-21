@@ -1,0 +1,46 @@
+name: Review attacks
+
+# Review harness only (not for merging): hostile and racy use of the
+# drivers on real macOS, many runs in a row.
+on:
+  pull_request:
+    paths:
+      - tests/review_attacks.rs
+      - .github/workflows/review-attacks.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-attacks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  attacks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+        profile: [debug, release]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Attack tests, 10 runs
+        run: |
+          flag=""; [ "${{ matrix.profile }}" = release ] && flag=--release
+          cargo test -p giong $flag --test review_attacks --no-run
+          cargo test -p giong $flag --test review_attacks diag -- --nocapture || true
+          for i in $(seq 1 10); do
+            echo "::group::run $i"
+            perl -e 'alarm shift; exec @ARGV' 900 cargo test -p giong $flag --test review_attacks -- --nocapture --test-threads 2 --skip diag 2>&1 | tee run.log
+            status=${PIPESTATUS[0]}
+            echo "::endgroup::"
+            if [ "$status" != 0 ]; then echo "::error::run $i failed ($status)"; exit 1; fi
+          done
