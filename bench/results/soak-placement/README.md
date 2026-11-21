@@ -13,3 +13,7 @@ also handed from worker to worker.
 - The Soak workflow, 240 minutes, on commit 12a264f
   ([run 44883087572](https://github.com/giong-run/Giong/actions/runs/44883087572)): all five
   jobs passed (runner kernel: 317,381,629 connections; Linux 6.18 in QEMU: 829,766,373).
+- The Soak workflow, 240 minutes, on commit bbf13c8 (the final rule)
+  ([run 44903037710](https://github.com/giong-run/Giong/actions/runs/44903037710)): all five
+  jobs passed (runner kernel: 317,285,649 connections, 28,610,288 cross-worker hops;
+  Linux 6.18 in QEMU: 828,640,512 connections), 0 connects refused.
