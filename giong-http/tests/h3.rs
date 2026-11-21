@@ -219,3 +219,56 @@ fn the_h3_crate_talks_to_serve_h3() {
     });
     drop(server);
 }
+
+/// A client that allows the server no unidirectional stream, and keeps
+/// the connection alive with PINGs, is closed after the write timeout
+/// instead of holding it forever: the server cannot open its control
+/// stream (RFC 9114 section 6.2 asks for three).
+#[test]
+fn a_client_without_credit_for_the_control_stream_is_closed() {
+    let (server_tls, client_tls) = tls();
+    let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
+    std::thread::spawn(move || {
+        giong::Builder::new()
+            .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+            .block_on(async move {
+                let endpoint = giong_quic::Endpoint::server(
+                    "127.0.0.1:0".parse().unwrap(),
+                    giong_quic::ServerConfig::new(server_tls).unwrap(),
+                )
+                .unwrap();
+                tx.send(endpoint.local_addr().unwrap()).unwrap();
+                let server = Server::new().write_timeout(Duration::from_millis(300));
+                let serve = server.serve_h3(endpoint, App);
+                let _ = giong::time::timeout(Duration::from_secs(20), serve).await;
+            })
+            .unwrap();
+    });
+    let addr = rx.recv().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap();
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .max_concurrent_uni_streams(0u32.into())
+            .keep_alive_interval(Some(Duration::from_millis(100)));
+        let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config);
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let why = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the server held the connection");
+        // H3_EXCESSIVE_LOAD.
+        match why {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code.into_inner(), 0x107, "{close:?}");
+            }
+            other => panic!("{other}"),
+        }
+    });
+}

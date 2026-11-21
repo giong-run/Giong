@@ -139,7 +139,7 @@ impl Connection {
         if let Some(why) = state.closed.borrow().as_ref() {
             return Err(StreamError::Refused(why.clone()));
         }
-        let (mut send, recv) = match shared.quic.open_bi().await {
+        let (send, recv) = match shared.quic.open_bi().await {
             Ok(pair) => pair,
             Err(e) => {
                 state.lost(&e);

@@ -291,15 +291,31 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
     });
     // The control stream, which stays open for as long as the connection
     // does: closing it is a connection error (section 6.2.1).
-    let Ok(mut control) = conn.quic.open_uni().await else {
-        return;
-    };
+    // A client that gives no credit for it (no unidirectional stream, or
+    // no bytes on one) would hold the connection without being served:
+    // it must allow three (section 6.2), so it is closed after the write
+    // timeout.
     let mut out = Vec::with_capacity(16);
     write_varint(&mut out, StreamType::CONTROL);
     Settings::write_frame(&mut out, cfg.max_head_size as u64);
-    if control.write_all(&out).await.is_err() {
-        return;
-    }
+    let opened = timeout(cfg.write_timeout, async {
+        let mut control = conn.quic.open_uni().await?;
+        control.write_all(&out).await?;
+        std::io::Result::Ok(control)
+    })
+    .await;
+    let mut control = match opened {
+        Ok(Ok(control)) => control,
+        Ok(Err(_)) => return,
+        Err(_) => {
+            conn.closed.set(true);
+            conn.quic.close(
+                Code::ExcessiveLoad as u32,
+                b"no credit for the control stream",
+            );
+            return;
+        }
+    };
     drop(giong::spawn(peer_streams(conn.clone())));
 
     // The lowest request stream not accepted yet: what GOAWAY announces.
@@ -324,8 +340,16 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
     // that lets it retry them elsewhere.
     out.clear();
     frame::write_goaway(&mut out, next_id);
-    if control.write_all(&out).await.is_err() {
-        return;
+    // Bounded too, or a client that gives no credit would hold shutdown.
+    match timeout(cfg.write_timeout, control.write_all(&out)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return,
+        Err(_) => {
+            if !conn.closed.replace(true) {
+                conn.quic.close(Code::NoError as u32, b"");
+            }
+            return;
+        }
     }
     loop {
         let idle = poll_fn(|cx| {
