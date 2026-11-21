@@ -1,0 +1,3 @@
+2026-11-20T11:15:13Z soak io_uring start
+2026-11-20T11:15:13Z soak epoll start
+2026-11-20T12:22:29Z stopped by hand at about 1 h 7 min: restarted on 892d904 (#145) so one soak covers rc.1

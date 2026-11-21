@@ -262,3 +262,34 @@ Runs that had to wait for the soak. The scripts are `scripts-0.9/br1-queue.sh`,
 - **GSO (#141), `two-host/gso/`:** 1,200-byte datagrams to the other machine,
   2,433,648 a second at 67 ns of sender CPU each with GSO, against about 925,000 at
   1,080 ns without (Tokio 936,283). GRO on the receiving side was not verified.
+
+## 9. Short soak of the release candidate and the simulation's long runs
+
+**Short soak (`rc-short-soak/`), passed.** `scripts-0.9/shortsoak.sh`: `tests/soak.rs` for
+4 hours on each driver, with both processes at once on br-2. Main `892d904` (tree
+`052fb47c`, the 1.0 release candidate with #145), kernel 7.0.0-43, 16 NIC queues, 4
+workers per process. It ran 2026-11-20 12:22:49Z to 16:22:59Z.
+
+| | io_uring | epoll |
+|---|---:|---:|
+| result | passed (14,400 s) | passed (14,400 s) |
+| unexpected errors | 0 | 0 |
+| connections | 319,948,914 | 319,172,355 |
+| echoes | 719,866,942 | 718,121,214 |
+| descriptors at 10 min / 1 h / 2 h / 3 h / after | 391 / 404 / 392 / 392 / 17 | 401 / 364 / 408 / 373 / 21 |
+| resident memory at 10 min / 4 h | 9.68 / 10.12 MiB | 7.37 / 7.58 MiB |
+
+An earlier start on `6a3645c` was stopped after about 67 minutes, with no errors, and
+restarted on `892d904` so that one soak covers the release candidate
+(`shortsoak-6a3645c/`). `tests/soak.rs` churns TCP, UDP and files: the giong-tls changes
+in the candidate are not exercised by it.
+
+**Simulation long runs (`sim-long-runs/`)**, after the 72-hour soaks:
+
+- main `faa18a3`, `GIONG_SIM_SEEDS=16000 GIONG_SIM_SOAK_DAYS=14600`: every test passed.
+  With 64,000 seeds and 29,200 days, `tests/http.rs` `h2_hostile` failed with a correct
+  408 that the test did not expect. The seed reported then (48106) does not replay: the
+  sweeps were not deterministic until #160. Seeds reported before #160 cannot be replayed.
+- main `b07333d` (with #160), 64,000 seeds and 29,200 days: every test binary that finished
+  passed, `h2_hostile` included. The simulated-days soak test was stopped before it ended
+  to keep the short soak's machine quiet.
