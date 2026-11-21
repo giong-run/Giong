@@ -548,8 +548,10 @@ fn a_resumed_client_sends_its_first_stream_in_early_data() {
             assert_eq!(recv.read_to_end(64).await.unwrap(), b"ylrae");
             assert!(conn.handshake().await.unwrap());
             // After the handshake, streams are not early any more.
-            let (send, recv) = conn.open_bi().await.unwrap();
+            let (mut send, recv) = conn.open_bi().await.unwrap();
             assert!(!recv.is_early());
+            // Ended empty (dropping it unfinished would reset it).
+            send.finish().unwrap();
             drop((send, recv));
             assert_eq!(echo_on(&conn, b"late").await.unwrap(), b"etal");
             assert_eq!(*seen.borrow(), [false, true, false, false]);
@@ -615,9 +617,10 @@ fn a_server_without_early_data_waits_for_the_handshake() {
             let cfg = ClientConfig::new(client_tls(ca)).unwrap().early_data(true);
             for round in 0..2 {
                 let conn = client.connect_early(addr, "localhost", &cfg).await.unwrap();
-                let (send, recv) = conn.open_bi().await.unwrap();
+                let (mut send, recv) = conn.open_bi().await.unwrap();
                 // No ticket that allows early data: connect_early waited.
                 assert!(!recv.is_early(), "round {round}");
+                send.finish().unwrap();
                 drop((send, recv));
                 assert_eq!(echo_on(&conn, b"x").await.unwrap(), b"x");
                 conn.close(0, b"");
@@ -757,6 +760,48 @@ fn connections_not_accepted_are_closed_with_their_endpoint() {
                 .expect("the connection outlived its endpoint");
             let e = ended.err().unwrap().to_string();
             assert!(e.contains("closed by peer"), "{e}");
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_writer_waiting_for_credit_is_woken_after_its_reading_half_is_dropped() {
+    giong::Builder::new()
+        .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            // The server reads only after a while, so the client's writer
+            // waits for flow control credit meanwhile.
+            giong::spawn(async move {
+                let conn = server.accept().await.unwrap();
+                let (_send, mut recv) = conn.accept_bi().await.unwrap();
+                giong::time::sleep(Duration::from_millis(200)).await;
+                let got = recv.read_to_end(16 << 20).await.unwrap();
+                assert_eq!(got.len(), 8 << 20);
+                giong::time::sleep(Duration::from_secs(5)).await;
+            });
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            let writer = giong::spawn(async move {
+                send.write_all(&payload(8 << 20)).await.unwrap();
+                send.finish().unwrap();
+                send
+            });
+            // The reading half goes while the writer is blocked.
+            giong::time::sleep(Duration::from_millis(50)).await;
+            drop(recv);
+            giong::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("the writer was never woken")
+                .unwrap();
         })
         .unwrap();
 }

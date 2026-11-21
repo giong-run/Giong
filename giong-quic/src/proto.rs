@@ -55,6 +55,9 @@ pub(crate) struct Shared {
 struct Wakers {
     read: Option<Waker>,
     write: Option<Waker>,
+    /// The handles of the stream still held: two for a bidirectional
+    /// stream, one for a unidirectional one. The entry goes with the last.
+    halves: u8,
 }
 
 struct Conn {
@@ -909,7 +912,14 @@ impl Shared {
             };
             match id {
                 Some(id) => {
-                    c.streams.insert(id, Wakers::default());
+                    let halves = if dir == Dir::Bi { 2 } else { 1 };
+                    c.streams.insert(
+                        id,
+                        Wakers {
+                            halves,
+                            ..Wakers::default()
+                        },
+                    );
                     // One handle per half.
                     c.refs += if dir == Dir::Bi { 2 } else { 1 };
                     let sid = Sid {
@@ -1062,10 +1072,22 @@ impl Shared {
         st.mark(h);
     }
 
-    pub(crate) fn forget_stream(&self, h: usize, s: Sid) {
+    /// One half of a stream is dropped: its waker goes, and the entry
+    /// with the last half, so that the other half is still woken.
+    pub(crate) fn forget_stream(&self, h: usize, s: Sid, write: bool) {
         if let Some(Some(c)) = self.st.borrow_mut().conns.get_mut(h) {
             if !c.stale(s) {
-                c.streams.remove(&s.id);
+                if let Some(w) = c.streams.get_mut(&s.id) {
+                    if write {
+                        w.write = None;
+                    } else {
+                        w.read = None;
+                    }
+                    w.halves = w.halves.saturating_sub(1);
+                    if w.halves == 0 {
+                        c.streams.remove(&s.id);
+                    }
+                }
             }
         }
     }

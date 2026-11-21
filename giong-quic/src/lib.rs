@@ -358,6 +358,7 @@ impl Drop for SendStream {
         if !self.finished {
             self.sh.reset(self.h, self.id, 0);
         }
+        self.sh.forget_stream(self.h, self.id, true);
         self.sh.release(self.h);
     }
 }
@@ -429,7 +430,7 @@ impl Drop for RecvStream {
         if !self.done {
             self.sh.stop(self.h, self.id, 0);
         }
-        self.sh.forget_stream(self.h, self.id);
+        self.sh.forget_stream(self.h, self.id, false);
         self.sh.release(self.h);
     }
 }
