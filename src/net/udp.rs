@@ -274,8 +274,11 @@ impl UdpSocket {
     }
 
     /// Wraps a socket created by the standard library, with the options it
-    /// was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(socket: std::net::UdpSocket) -> Self {
         // SAFETY: we take over the descriptor that `socket` owned.
         Self::from_socket(unsafe { Socket::from_raw_fd(socket.into_raw_fd()) })

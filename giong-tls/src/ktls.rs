@@ -554,7 +554,7 @@ fn send_record_now(fd: RawFd, record_type: u8, data: &[u8]) -> io::Result<bool> 
         // SAFETY: `msg` points at `iov`, `data` and `control`, which live
         // until the call returns, with their true lengths; the kernel only
         // reads `data`.
-        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | crate::NO_SIGNAL) };
         if n >= 0 {
             return if n as usize == data.len() {
                 Ok(true)

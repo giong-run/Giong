@@ -53,7 +53,9 @@ pub(crate) unsafe fn stat_at(
 }
 
 impl Bell {
-    /// A non-blocking, close-on-exec pipe.
+    /// A non-blocking, close-on-exec pipe. macOS has no `pipe2`, so the
+    /// flags are set after the `pipe`: a `fork` and `exec` on another thread
+    /// in between would see the two descriptors (as with `accept` below).
     pub(crate) fn new() -> io::Result<Self> {
         let mut fds = [0; 2];
         // SAFETY: `fds` has room for the two descriptors.

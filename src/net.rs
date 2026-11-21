@@ -312,7 +312,7 @@ impl StreamSocket {
         // driver would set the mode at the first operation anyway.
         #[cfg(target_os = "macos")]
         let nonblocking = sock.set_nonblocking(true).is_ok();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
@@ -934,9 +934,14 @@ impl TcpListener {
     /// On macOS the workers share one listening socket instead (each
     /// listener is a duplicate of the first one bound to the address), and
     /// take connections from its one queue as they come: whichever worker
-    /// accepts first gets the next connection. The socket is bound without
-    /// `SO_REUSEPORT`, so no other process can bind the address while a
-    /// listener lives.
+    /// accepts first gets the next connection. Every worker waiting in
+    /// `accept` is woken for each connection, and all but one find nothing.
+    /// The socket is bound without `SO_REUSEPORT`, so no other user's
+    /// process can bind the address while a listener lives. A process of
+    /// the same user still can bind one specific IP address of a port that
+    /// giong listens on with the wildcard address, by setting
+    /// `SO_REUSEADDR` (the BSD rule); listen on the specific address to
+    /// refuse that too.
     ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
@@ -1025,8 +1030,11 @@ impl TcpListener {
     }
 
     /// Wraps a listener created by the standard library, with the options
-    /// it was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// it was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(listener: std::net::TcpListener) -> Self {
         // SAFETY: we take over the descriptor that `listener` owned.
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };

@@ -164,7 +164,7 @@ pub(crate) fn random_bytes(buf: &mut [u8]) -> bool {
 }
 
 /// Accepts a connection as a close-on-exec, non-blocking descriptor;
-/// `-errno` on failure (`EINTR` included).
+/// -1 with `errno` set on failure (`EINTR` included).
 pub(crate) fn accept(fd: RawFd) -> isize {
     let flags = libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
     // SAFETY: null address pointers ask for no peer address.

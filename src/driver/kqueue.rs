@@ -255,11 +255,13 @@ impl Poller for Kqueue {
         ];
         let mut results = changes;
         // A filter that was never added (see `register`) reports ENOENT:
-        // the descriptor is out of the set either way.
+        // the descriptor is out of the set either way. What counts is the
+        // read filter: once it is gone, the next wait adds both again (a
+        // write filter left behind only reports once more), whereas a
+        // `false` here would keep the descriptor counted as armed, and a
+        // reader would wait on a filter that no longer exists.
         self.apply(&changes, &mut results).is_ok()
-            && results
-                .iter()
-                .all(|r| matches!(receipt_errno(r), 0 | libc::ENOENT))
+            && matches!(receipt_errno(&results[0]), 0 | libc::ENOENT)
     }
 
     fn wait(&mut self, timeout: Option<Duration>) -> usize {
