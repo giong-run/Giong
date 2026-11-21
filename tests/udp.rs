@@ -516,6 +516,11 @@ fn a_shared_port_keeps_each_sender_on_one_socket_with_read_from() {
 /// must reach the same socket, and the senders must not all reach one.
 /// Afterwards the port is free again.
 fn shared_port_keeps_senders_apart(ip: [u8; 4], read_from_parity: usize) {
+    // macOS answers only on 127.0.0.1 unless told otherwise, and keeps its
+    // port range elsewhere than /proc.
+    if cfg!(target_os = "macos") {
+        return;
+    }
     const WORKERS: usize = 4;
     let addr = port_outside_ephemeral_range(ip);
     let bound = Arc::new(AtomicUsize::new(0));
