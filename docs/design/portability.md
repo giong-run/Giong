@@ -347,15 +347,18 @@ a claim the tests back.
 and TLS soak tests (connection churn, cancellation, UDP, files, TLS
 handshakes and resumption) for 2 h on each runner, with every check the
 Linux soak makes, but a quarter of the clients (`GIONG_SOAK_CLIENTS`: 8
-per worker instead of 32, 4 instead of 16 for TLS). At the full load the
-macOS kernel ran out of buffers: it draws every socket buffer from one
-mbuf pool, the soak keeps a few hundred sockets holding unread data on
-purpose, and sends and connects then failed with `ENOBUFS` for 0.05-0.15%
-of connections (Linux makes the sender wait instead). Those runs had no
-hang and no leak (25 descriptors and 9 MB at the end of 102 million
-connections). A short TIME_WAIT (`net.inet.tcp.msl` 250 ms) keeps the
-churn from using up the ephemeral ports. Whether giong should wait and
-retry a send that fails with `ENOBUFS`, rather than report it, is open.
+per worker instead of 32, 4 instead of 16 for TLS). At the full load,
+sends and connects failed with `ENOBUFS` (the kernel had no buffer for
+them) for 0.05-0.15% of connections; Linux makes the sender wait instead.
+At a quarter of the clients the runtime soak on both runners and the TLS
+soak on macOS 26 had no error at all, and the TLS soak on macOS 15 met
+two short bursts of `ENOBUFS` (1,590 errors in 15.4 million connections,
+0.01%) while the kernel's buffer use, logged every minute, stayed well
+below what it had reached before. So the load is not the whole cause.
+None of these runs hung or leaked (23-25 descriptors at the end, flat
+memory). A short TIME_WAIT (`net.inet.tcp.msl` 250 ms) keeps the churn
+from using up the ephemeral ports. giong reports `ENOBUFS` as the kernel
+gives it; waiting and retrying instead is planned for 1.2.1.
 
 **Speed on macOS.** `bench/core.sh` on the runners
 (`.github/workflows/macos-bench.yml`, 5 rounds, median wall time in ns per

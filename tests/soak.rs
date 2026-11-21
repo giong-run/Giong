@@ -36,9 +36,8 @@ mod common;
 const CLIENTS: usize = 32;
 
 /// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS`. The macOS
-/// runners take fewer: their kernel draws every socket buffer from one
-/// mbuf pool, too small for this many sockets holding unread data, and a
-/// send or connect then fails with `ENOBUFS` (Linux makes the sender wait).
+/// runners take fewer: at the full load their kernel refuses some sends and
+/// connects with `ENOBUFS` (no buffer), where Linux makes the sender wait.
 fn clients() -> usize {
     std::env::var("GIONG_SOAK_CLIENTS")
         .ok()
