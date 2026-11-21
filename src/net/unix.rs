@@ -143,6 +143,8 @@ impl UnixStream {
 
     /// Connects to `addr`: a path, or on Linux an abstract name (see
     /// [`UnixListener::bind_addr`]).
+    ///
+    /// Cancel safe, as [`connect`](Self::connect).
     pub async fn connect_addr(addr: &SocketAddr) -> io::Result<Self> {
         let addr = fds::sock_addr(addr)?;
         let inner = StreamSocket::connect(new_socket()?, addr).await?;
@@ -503,6 +505,9 @@ impl UnixDatagram {
     /// Sends `buf` as one message to the connected peer, together with
     /// copies of the descriptors `fds`. The same rules as
     /// [`UnixStream::send_with_fds`].
+    ///
+    /// Not cancel safe: if the future is dropped, the message and its
+    /// descriptors may or may not have been sent.
     pub async fn send_with_fds<B: IoBuf>(
         &self,
         buf: B,
@@ -514,6 +519,9 @@ impl UnixDatagram {
     /// Sends `buf` as one message to the socket at `path`, together with
     /// copies of the descriptors `fds`. The same rules as
     /// [`UnixStream::send_with_fds`].
+    ///
+    /// Not cancel safe: if the future is dropped, the message and its
+    /// descriptors may or may not have been sent.
     pub async fn send_to_with_fds<B: IoBuf, P: AsRef<Path>>(
         &self,
         buf: B,

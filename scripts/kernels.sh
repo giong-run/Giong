@@ -83,7 +83,7 @@ root="$WORK/initramfs"
 rm -rf "$root"
 mkdir -p "$root"/{bin,tests,proc,sys,dev,tmp,etc}
 cp "$busybox" "$root/bin/busybox"
-for applet in sh mount ip poweroff cat echo uname date mkdir ulimit modprobe depmod; do
+for applet in sh mount ip poweroff cat echo true false sleep uname date mkdir ulimit modprobe depmod; do
     ln -s busybox "$root/bin/$applet"
 done
 # The kernel loads modules it needs (the crypto behind kernel TLS) through

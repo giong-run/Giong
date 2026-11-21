@@ -384,6 +384,10 @@ impl Child {
     /// Waits for the child to exit while collecting all it writes to its
     /// piped stdout and stderr (closing its stdin first). A stream that was
     /// not piped comes back empty. Unbounded, as [`Command::output`].
+    ///
+    /// Cancel safe in that nothing leaks: if the future is dropped, the
+    /// output collected so far is lost, and the child runs on (or is killed,
+    /// with [`Command::kill_on_drop`]) and is reaped when it exits.
     pub async fn wait_with_output(mut self) -> io::Result<Output> {
         drop(self.stdin.take());
         let stdout = self.stdout.take();
