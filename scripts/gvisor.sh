@@ -39,16 +39,20 @@ fi
 list="${1:-}"
 if [ -z "$list" ]; then
     list=target/gvisor-test-binaries.txt
-    cargo test --release -p giong -p giong-http --no-run --message-format=json |
+    # The same command and features as CI's shared release build, so that it
+    # is found up to date there; then only giong's and giong-http's binaries.
+    cargo test --release --workspace --all-features --no-run --message-format=json |
         python3 -c '
-import json, sys
+import json, os, sys
+mine = {os.getcwd(), os.path.join(os.getcwd(), "giong-http")}
 for line in sys.stdin:
     msg = json.loads(line)
-    if msg.get("reason") == "compiler-artifact" and msg.get("executable") and msg["profile"]["test"]:
+    if (msg.get("reason") == "compiler-artifact" and msg.get("executable")
+            and msg["profile"]["test"] and os.path.dirname(msg["manifest_path"]) in mine):
         print(msg["executable"])
 ' > "$list"
 fi
-cargo build --release -p giong-http --example defaults
+cargo build --release --workspace --all-features --example defaults
 
 # The tests that share ports between workers or bind them again at once,
 # the runtime's own tests, and giong-http's servers.
