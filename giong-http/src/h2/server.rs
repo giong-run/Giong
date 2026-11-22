@@ -75,6 +75,12 @@ use crate::response::{Body, FileBody, Response};
 use crate::server::{catching, drop_quietly, give_buffer, take_buffer, Config, Handler, Transport};
 use crate::trailers::Trailers;
 
+/// How long the client has to acknowledge our SETTINGS before the
+/// connection ends with `SETTINGS_TIMEOUT` (RFC 9113, section 6.5.3).
+/// Until then it is treated as not knowing our limits, which costs more
+/// to serve: a client must not keep that state.
+const SETTINGS_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The smallest window a stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`
 /// is half the body budget divided among the streams, within this and the
 /// protocol's default).
@@ -444,6 +450,8 @@ pub(crate) struct Session {
     pub(crate) wakers: Wakers,
     /// Since when no stream has been open.
     idle_since: Instant,
+    /// When the client must have acknowledged our SETTINGS by.
+    settings_deadline: Instant,
     /// Requests have followed one another within `KEEP_STREAMS`: the memory
     /// for streams is kept between them, and given back once the connection
     /// has been idle for that long.
@@ -500,6 +508,7 @@ impl Session {
             events: Vec::new(),
             wakers: Wakers::default(),
             idle_since: Instant::now(),
+            settings_deadline: Instant::now() + SETTINGS_ACK_TIMEOUT,
             warm: false,
             released: false,
             starts_shrunk: false,
@@ -2083,6 +2092,9 @@ impl Session {
         if let Some(block) = &self.block {
             at(block.deadline);
         }
+        if !self.settings_acked && !self.failed {
+            at(self.settings_deadline);
+        }
         if self.ids.is_empty() {
             if self.goaway.is_none() {
                 at(self.idle_since + self.cfg.idle_timeout);
@@ -2106,6 +2118,14 @@ impl Session {
 
     /// Handles what timed out by `now`.
     pub(crate) fn on_timer(&mut self, now: Instant) {
+        if !self.settings_acked && self.settings_deadline <= now {
+            self.fail(ConnError {
+                reason: Reason::SettingsTimeout,
+                code: Code::Http2Protocol,
+                detail: "the client did not acknowledge the server's SETTINGS within 10 s",
+            });
+            return;
+        }
         if self.block.as_ref().is_some_and(|b| b.deadline <= now) {
             self.fail(protocol(
                 "a header block was not finished within the request timeout",
@@ -2572,6 +2592,7 @@ mod tests {
     #[test]
     fn stream_memory_is_kept_while_requests_follow_and_released_when_idle() {
         let mut s = Session::new(crate::Server::new().cfg, None);
+        s.settings_acked = true;
         // One request, then idle: given back at once.
         let slot = s.open(1, true, None, false);
         s.remove(slot, Failure::Abandoned, false);
@@ -2608,6 +2629,39 @@ mod tests {
         while s.pop_event().is_some() {}
         s.release();
         assert!(!s.keeps_streams());
+    }
+
+    #[test]
+    fn a_client_that_never_acknowledges_our_settings_is_cut_off() {
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        let deadline = s.settings_deadline;
+        assert_eq!(s.next_deadline(), Some(deadline));
+        s.on_timer(deadline - Duration::from_millis(1));
+        assert!(!s.failed());
+        s.on_timer(deadline);
+        assert!(s.failed());
+        // The GOAWAY says why.
+        let mut out = &s.out[..];
+        let mut code = None;
+        while out.len() >= frame::HEAD_LEN {
+            let head = Head::parse(out);
+            let payload = &out[frame::HEAD_LEN..frame::HEAD_LEN + head.len];
+            if head.kind == frame::GOAWAY {
+                code = Some(frame::read_u32(&payload[4..8]));
+            }
+            out = &out[frame::HEAD_LEN + head.len..];
+        }
+        assert_eq!(code, Some(Reason::SettingsTimeout as u32));
+
+        // Acknowledged in time: no such deadline any more.
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        s.on_settings(
+            Head::parse(&[0, 0, 0, frame::SETTINGS, frame::ACK, 0, 0, 0, 0]),
+            &[],
+        )
+        .unwrap();
+        assert!(s.settings_acked);
+        assert_ne!(s.next_deadline(), Some(s.settings_deadline));
     }
 
     #[test]
