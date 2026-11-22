@@ -8,14 +8,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use giong::error::{self, Code};
-use giong::net::{TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream};
+use giong::net::{TcpListener, TcpStream, UdpSocket};
+#[cfg(unix)]
+use giong::net::{UnixListener, UnixStream};
 use giong::{ChosenBy, DriverKind, IoUringFeature};
 
-/// The readiness driver of this platform: epoll on Linux, kqueue on macOS.
+/// The driver of this platform that is not io_uring: epoll on Linux,
+/// kqueue on macOS, the completion port on Windows.
 #[cfg(target_os = "linux")]
 const READINESS: DriverKind = DriverKind::Epoll;
 #[cfg(target_os = "macos")]
 const READINESS: DriverKind = DriverKind::Kqueue;
+#[cfg(windows)]
+const READINESS: DriverKind = DriverKind::Iocp;
 
 /// `true` if io_uring works here (it is blocked, for instance, under
 /// `scripts/no-io-uring.py` or in a container). Where CI says it must work
@@ -64,6 +69,7 @@ fn driver_names_are_what_giong_driver_accepts() {
     assert_eq!(DriverKind::IoUring.name(), "io_uring");
     assert_eq!(DriverKind::Epoll.to_string(), "epoll");
     assert_eq!(DriverKind::Kqueue.to_string(), "kqueue");
+    assert_eq!(DriverKind::Iocp.to_string(), "iocp");
 }
 
 const CHILD: &str = "GIONG_TEST_DRIVER_CHILD";
@@ -135,6 +141,7 @@ fn an_unknown_giong_driver_is_an_error() {
         assert!(line.contains("GIONG-E0004"), "{line}");
         assert!(line.contains("\"devpoll\""), "{line}");
         assert!(line.contains("io_uring or epoll"), "{line}");
+        assert!(line.contains("iocp"), "{line}");
     }
     let _ = Code::InvalidConfig;
 }
@@ -152,6 +159,12 @@ fn a_driver_this_system_does_not_have_is_refused_by_build() {
     let missing = [
         (DriverKind::IoUring, Code::IoUringUnavailable, "io_uring"),
         (DriverKind::Epoll, Code::InvalidConfig, "epoll"),
+    ];
+    #[cfg(windows)]
+    let missing = [
+        (DriverKind::IoUring, Code::IoUringUnavailable, "io_uring"),
+        (DriverKind::Epoll, Code::InvalidConfig, "epoll"),
+        (DriverKind::Kqueue, Code::InvalidConfig, "kqueue"),
     ];
     if std::env::var_os(CHILD).is_some() {
         let err = giong::Builder::new()
@@ -340,6 +353,7 @@ impl Echo for TcpStream {
     }
 }
 
+#[cfg(unix)]
 impl Echo for UnixStream {
     async fn ping(self) -> std::io::Result<Vec<u8>> {
         let (r, _) = self.write_all(b"ping".to_vec()).await;
@@ -362,14 +376,13 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for kind in kinds {
+        #[cfg(unix)]
         let dir = dir.clone();
         giong::Builder::new()
             .driver(kind)
             .block_on(async move {
                 let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
                 let tcp_addr = tcp.local_addr().unwrap();
-                let path = dir.join(format!("{kind}.sock"));
-                let unix = UnixListener::bind(&path).unwrap();
                 giong::spawn(async move {
                     loop {
                         let s = tcp.accept().await.unwrap();
@@ -380,16 +393,22 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
                         });
                     }
                 });
-                giong::spawn(async move {
-                    loop {
-                        let s = unix.accept().await.unwrap();
-                        giong::spawn(async move {
-                            let (r, buf) = s.read(vec![0u8; 16]).await;
-                            let n = r.unwrap();
-                            let _ = s.write_all(buf[..n].to_vec()).await;
-                        });
-                    }
-                });
+                #[cfg(unix)]
+                let path = dir.join(format!("{kind}.sock"));
+                #[cfg(unix)]
+                {
+                    let unix = UnixListener::bind(&path).unwrap();
+                    giong::spawn(async move {
+                        loop {
+                            let s = unix.accept().await.unwrap();
+                            giong::spawn(async move {
+                                let (r, buf) = s.read(vec![0u8; 16]).await;
+                                let n = r.unwrap();
+                                let _ = s.write_all(buf[..n].to_vec()).await;
+                            });
+                        }
+                    });
+                }
                 // A port nobody listens on, kept bound (without listening) for
                 // the whole test. A port that was bound and closed again could
                 // be taken by another test meanwhile, or become the source port
@@ -406,6 +425,7 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
                     )
                     .unwrap();
                 let refused = reserved.local_addr().unwrap().as_socket().unwrap();
+                #[cfg(unix)]
                 let missing = dir.join("missing.sock");
                 // Generous: a working echo takes microseconds.
                 let limit = Duration::from_secs(2);
@@ -416,12 +436,15 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
                         echo_within(s, limit).await,
                         "{kind}: TCP after a refused connect"
                     );
-                    assert!(UnixStream::connect(&missing).await.is_err());
-                    let s = UnixStream::connect(&path).await.unwrap();
-                    assert!(
-                        echo_within(s, limit).await,
-                        "{kind}: Unix after a failed connect"
-                    );
+                    #[cfg(unix)]
+                    {
+                        assert!(UnixStream::connect(&missing).await.is_err());
+                        let s = UnixStream::connect(&path).await.unwrap();
+                        assert!(
+                            echo_within(s, limit).await,
+                            "{kind}: Unix after a failed connect"
+                        );
+                    }
                 }
             })
             .unwrap();
@@ -430,6 +453,7 @@ fn a_failed_connect_does_not_stall_the_next_socket() {
 }
 
 /// `(major, minor)` of the running kernel.
+#[cfg(target_os = "linux")]
 fn kernel_version() -> (u32, u32) {
     // SAFETY: `utsname` is plain data; `uname` fills it.
     let mut u: libc::utsname = unsafe { std::mem::zeroed() };
@@ -476,12 +500,15 @@ fn io_uring_features_are_the_ones_the_kernel_has() {
         if let Ok(expected) = std::env::var("GIONG_TEST_EXPECT_IO_URING_FEATURES") {
             assert_eq!(got.join(","), expected);
         }
+        #[cfg(target_os = "linux")]
         if kernel_version() >= (6, 12) {
             assert!(got.contains(&"packed-buffers"), "{got:?}");
         }
+        #[cfg(target_os = "linux")]
         if kernel_version() >= (5, 18) {
             assert!(got.contains(&"registered-ring"), "{got:?}");
         }
+        #[cfg(target_os = "linux")]
         if kernel_version() >= (6, 2) {
             assert!(got.contains(&"zero-copy-send"), "{got:?}");
         }
