@@ -252,7 +252,7 @@ fn write_state(root: &Path, all: &[Started]) -> Result<(), Failure> {
 }
 
 /// Makes a file that holds a password readable by its owner only.
-fn restrict(path: &Path) {
+pub(crate) fn restrict(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1118,7 +1118,7 @@ pub fn set_env_text(text: &str, key: &str, value: &str) -> String {
 
 /// Adds `.env` and `.giong/` to `.gitignore` when they are not there: both
 /// hold the database's password.
-fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
+pub(crate) fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
     let path = root.join(".gitignore");
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let has = |p: &str| {

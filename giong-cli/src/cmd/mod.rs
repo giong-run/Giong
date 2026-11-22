@@ -11,6 +11,7 @@ use crate::report::{Failure, Report};
 
 pub mod db;
 pub mod doctor;
+pub mod env;
 pub mod explain;
 pub mod help;
 pub mod openapi;
@@ -39,6 +40,7 @@ pub const COMMANDS: &[&Command] = &[
     // `image`, `openapi`, `record`.
     &doctor::COMMAND,
     &db::COMMAND,
+    &env::COMMAND,
     &explain::COMMAND,
     &routes::COMMAND,
     &openapi::COMMAND,
