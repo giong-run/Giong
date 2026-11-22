@@ -42,28 +42,44 @@ impl FakeDns {
             .map(|((name, t), reply)| ((name.to_string(), t), reply))
             .collect();
         let table = Arc::new(table);
-        // A TCP port whose UDP twin is free too (another test may hold it).
-        // The TCP port is chosen first: a TCP port can be busy with closed
-        // connections in TIME_WAIT, which UDP ports never are, and Windows
-        // hands out ports in sequence, so the twin of a fresh UDP port was
-        // often one that this suite's own connections had just closed.
-        // Listeners whose twin is busy stay open until a pair is found:
-        // closed at once, the next bind may be given the same port again.
-        let mut busy = Vec::new();
-        let (udp, tcp, addr) = (0..100)
-            .find_map(|_| {
-                let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
-                let addr = tcp.local_addr().unwrap();
-                match StdUdpSocket::bind(addr) {
-                    Ok(udp) => Some((udp, tcp, addr)),
-                    Err(_) => {
-                        busy.push(tcp);
-                        None
+        // A port free for both TCP and UDP (another test may hold either).
+        // Tries alternate between a fresh TCP port with its UDP twin and a
+        // fresh UDP port with its TCP twin, as each way fails in runs on
+        // Windows, which hands out ports in sequence: the TCP twin of a
+        // fresh UDP port can be one this suite's connections left in
+        // TIME_WAIT, and on a runner 100 fresh TCP ports in a row had their
+        // UDP twins refused. Sockets whose twin is busy stay open until a
+        // pair is found: closed at once, the next bind may be given the
+        // same port again.
+        let (mut busy_tcp, mut busy_udp, mut refusal) = (Vec::new(), Vec::new(), None);
+        let (udp, tcp, addr) = (0..200)
+            .find_map(|i| {
+                if i % 2 == 0 {
+                    let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                    let addr = tcp.local_addr().unwrap();
+                    match StdUdpSocket::bind(addr) {
+                        Ok(udp) => Some((udp, tcp, addr)),
+                        Err(err) => {
+                            refusal = Some(err);
+                            busy_tcp.push(tcp);
+                            None
+                        }
+                    }
+                } else {
+                    let udp = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+                    let addr = udp.local_addr().unwrap();
+                    match StdTcpListener::bind(addr) {
+                        Ok(tcp) => Some((udp, tcp, addr)),
+                        Err(err) => {
+                            refusal = Some(err);
+                            busy_udp.push(udp);
+                            None
+                        }
                     }
                 }
             })
-            .expect("no free UDP and TCP port pair");
-        drop(busy);
+            .unwrap_or_else(|| panic!("no free UDP and TCP port pair; last refusal: {refusal:?}"));
+        drop((busy_tcp, busy_udp));
         let queries = Arc::new(Mutex::new(Vec::new()));
 
         let (t, q) = (table.clone(), queries.clone());
