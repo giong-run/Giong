@@ -269,6 +269,8 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
 | [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
 | [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
+| [GIONG-E5022](E5022.md) | `DevRunning` | giong dev already serves this project |
+| [GIONG-E5023](E5023.md) | `CompilerWarning` | the compiler has a warning |
 | [GIONG-E5030](E5030.md) | `BadProjectName` | the project name is not valid |
 | [GIONG-E5031](E5031.md) | `TargetNotEmpty` | the directory for the new project is not empty |
 | [GIONG-E5032](E5032.md) | `BadTemplateChoice` | the template does not offer that choice |

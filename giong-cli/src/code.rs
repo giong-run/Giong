@@ -1,9 +1,18 @@
 //! The codes the `giong` command reports: `GIONG-E5000` to `GIONG-E5099`.
 //!
 //! Ranges (one owner each, so work in parallel never collides):
-//! E5000-E5029 the command itself, `doctor`, `check`, `explain`, `clean`, `mcp`, `dev`;
-//! E5030-E5039 and E5080-E5089 `new`, `ai`, `fix`; E5040-E5079 `db`, config,
-//! dashboard, `openapi`, `top`, `bench`, recording, `image`; E5090-E5099 free.
+//!
+//! | Codes | Owner (thread) | Commands |
+//! |---|---|---|
+//! | E5000-E5029 | A | the command itself, `doctor`, `check`, `explain`, `clean`, `mcp`, `dev` |
+//! | E5030-E5039, E5080-E5089 | B | `new`, `ai`, `fix` |
+//! | E5040-E5049 | C | `db`, config |
+//! | E5050-E5054 | D | routes, `openapi`, dashboard |
+//! | E5055-E5059 | C | `top` |
+//! | E5060-E5064 | C | `bench` |
+//! | E5065-E5069 | D | recording |
+//! | E5070-E5079 | C | `image` |
+//! | E5090-E5099 | | free |
 //!
 //! Findings may also carry the runtime's own codes (`GIONG-E0001` when io_uring
 //! is blocked, for example): [`Code::runtime`] makes one. Every code here has a
@@ -56,6 +65,8 @@ codes! {
     MCP_UNREACHABLE = 5019, "McpUnreachable", "the service's giong-mcp does not answer";
     WATCH_LIMIT = 5020, "WatchLimit", "too many files to watch";
     NO_LINKER = 5021, "NoLinker", "no linker found";
+    DEV_RUNNING = 5022, "DevRunning", "giong dev already serves this project";
+    COMPILER_WARNING = 5023, "CompilerWarning", "the compiler has a warning";
     BAD_NAME = 5030, "BadProjectName", "the project name is not valid";
     TARGET_NOT_EMPTY = 5031, "TargetNotEmpty", "the directory for the new project is not empty";
     BAD_TEMPLATE_CHOICE = 5032, "BadTemplateChoice", "the template does not offer that choice";
