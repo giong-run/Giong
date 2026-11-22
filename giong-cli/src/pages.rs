@@ -2773,4 +2773,19 @@ Another `giong dev` is running for the same project: `.giong/dev.json` names its
 
 [All error codes](README.md)
 "#),
+    (5023, r#"# GIONG-E5023: the compiler has a warning
+
+Raised by the `giong` command (giong-cli): `giong check`, `giong dev`. In JSON output: `"code": "GIONG-E5023"`.
+
+## What happened
+
+rustc compiled the code but warned about it: an unused variable or import, unreachable code, a deprecated item. The finding carries the lint name (`[unused_variables]`) and the compiler's whole message.
+
+## How to fix it
+
+- Do what the compiler's message says; when its suggestion is machine-applicable, `giong fix` applies it.
+- If the warning is wrong for this code, allow it where it applies with `#[allow(name)]` and a comment saying why.
+
+[All error codes](README.md)
+"#),
 ];

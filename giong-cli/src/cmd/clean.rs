@@ -341,9 +341,9 @@ struct Unit {
 
 /// The units of a profile directory, in either layout cargo writes:
 ///
-/// - up to cargo 1.97: `.fingerprint/<name>-<hash>/`, and files and
+/// - the older layout (cargo 1.97 writes it): `.fingerprint/<name>-<hash>/`, and files and
 ///   directories named `*-<hash>*` in `deps/`, `build/` and `examples/`;
-/// - from the build-dir layout (cargo 1.98 on): one directory per unit,
+/// - the build-dir layout (cargo 1.100 writes it): one directory per unit,
 ///   `build/<package>/<hash>/`, holding `fingerprint/` and `out/`.
 fn units(profile: &Path) -> Vec<Unit> {
     let mut by_hash: HashMap<String, Unit> = HashMap::new();

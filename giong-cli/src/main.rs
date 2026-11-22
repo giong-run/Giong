@@ -14,6 +14,7 @@ mod cmd;
 mod code;
 mod dotenv;
 mod host;
+mod lint;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
 mod project;

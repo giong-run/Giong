@@ -176,7 +176,13 @@ struct Dev {
     log: Arc<Mutex<File>>,
     current: Option<Service>,
     retiring: Vec<Retiring>,
+    /// Builds started after the first one that served.
     restarts: u64,
+    /// A build has started once.
+    served: bool,
+    /// Every start attempted: names each service's giong-mcp socket, so a new
+    /// build never takes the socket of the one still serving.
+    starts: u64,
     started_at: u64,
     build: BuildState,
     report: Report,
@@ -249,6 +255,8 @@ impl Dev {
             current: None,
             retiring: Vec::new(),
             restarts: 0,
+            starts: 0,
+            served: false,
             started_at: unix_ms(),
             build: BuildState::default(),
             report: Report::new("dev"),
@@ -262,6 +270,9 @@ impl Dev {
     /// that takes them).
     fn bind(&mut self, listen: Vec<SocketAddr>) -> Result<(), Failure> {
         if listen.is_empty() {
+            if self.once {
+                return Ok(());
+            }
             self.say(
                 "note",
                 "no LISTEN address (in --listen, the environment or .env): each restart stops \
@@ -543,7 +554,10 @@ impl Dev {
                 if let Some(old) = self.current.replace(service) {
                     self.retire(old);
                 }
-                self.restarts += 1;
+                if self.served {
+                    self.restarts += 1;
+                }
+                self.served = true;
                 self.write_state();
                 let took = changed_at.elapsed();
                 let addrs: Vec<String> = self.listen.iter().map(|a| a.to_string()).collect();
@@ -591,7 +605,8 @@ impl Dev {
 
     fn start(&mut self, exe: &Path, shared: bool) -> Result<Service, Finding> {
         let state_dir = self.project.root.join(".giong");
-        let mcp = state_dir.join(format!("mcp-{}-{}.sock", std::process::id(), self.restarts));
+        self.starts += 1;
+        let mcp = state_dir.join(format!("mcp-{}-{}.sock", std::process::id(), self.starts));
         let _ = fs::remove_file(&mcp);
         let mut cmd = Process::new(exe);
         cmd.args(&self.service_args)
@@ -662,6 +677,11 @@ impl Dev {
         let until = Instant::now() + Duration::from_millis(300);
         while Instant::now() < until {
             if let Ok(Some(status)) = service.child.try_wait() {
+                // With --once, a program that finishes its work at once and
+                // succeeds is a run like any other.
+                if self.once && status.success() {
+                    break;
+                }
                 return Err(self.exited_finding(&service, Some(status)));
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -725,6 +745,9 @@ impl Dev {
                 settle_until = Some(Instant::now() + SETTLE_AFTER_READY);
             }
             if let Ok(Some(status)) = service.child.try_wait() {
+                if self.once && status.success() {
+                    return Ok(binds);
+                }
                 return Err(self.exited_finding(service, Some(status)));
             }
             if settle_until.is_some_and(|t| Instant::now() >= t) {
@@ -915,9 +938,14 @@ impl Dev {
     fn service_ended(&mut self, service: &Service, status: Option<ExitStatus>) {
         let _ = fs::remove_file(&service.mcp);
         if status.is_some_and(|s| s.success()) {
+            let then = if self.once {
+                ""
+            } else {
+                "; save a file to start it again"
+            };
             self.say(
                 "exited",
-                "the service exited (status 0); save a file to start it again".into(),
+                format!("the service exited (status 0){then}"),
                 json!({"pid": service.pid, "code": 0}),
             );
             return;
@@ -927,7 +955,11 @@ impl Dev {
         let finding = self.exited_finding(service, status);
         self.say(
             "exited",
-            format!("{}; fix it and save to start it again", finding.title),
+            if self.once {
+                finding.title.clone()
+            } else {
+                format!("{}; fix it and save to start it again", finding.title)
+            },
             json!({"pid": service.pid, "code": status.and_then(|s| s.code()), "finding": finding.to_json()}),
         );
         self.report.push(finding);
@@ -1078,7 +1110,7 @@ fn terminate(child: &Child) {
 }
 
 /// Whether a process is alive (`kill -0`).
-fn alive(pid: u64) -> bool {
+pub(crate) fn alive(pid: u64) -> bool {
     if cfg!(unix) {
         Process::new("kill")
             .args(["-0", &pid.to_string()])
