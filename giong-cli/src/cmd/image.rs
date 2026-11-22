@@ -703,6 +703,34 @@ fn run(args: &Args) -> Result<Report, Failure> {
             "run giong image inside the service's project",
         )
     })?;
+    // Every flag is checked before cargo runs: a typo fails at once.
+    let push = args.value("push");
+    let explicit = match (args.value("tag"), push) {
+        (Some(t), _) => Some(parse_ref(t)?),
+        (None, Some(p)) => Some(parse_ref(p)?),
+        (None, None) => None,
+    };
+    if let Some(p) = push {
+        parse_ref(p)?;
+    }
+    let port_flag = match args.number::<u16>("port")? {
+        Some(0) => {
+            return Err(Failure::new(
+                Code::USAGE,
+                "--port 0 is not a port",
+                "give the port the service listens on, such as --port 8080",
+            ))
+        }
+        other => other,
+    };
+    let mut added = Vec::new();
+    if let Some(list) = args.value("add") {
+        for rel in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            collect(&root, rel, &mut added)?;
+        }
+    }
+    let (target, sub) = choose_target(args.value("target"))?;
+
     let project = Project::at(&cwd)?;
     let manifest =
         std::fs::canonicalize(root.join("Cargo.toml")).unwrap_or_else(|_| root.join("Cargo.toml"));
@@ -727,42 +755,20 @@ fn run(args: &Args) -> Result<Report, Failure> {
         .unwrap_or("latest")
         .to_string();
 
-    let push = args.value("push");
-    let (name, tag) = match (args.value("tag"), push) {
-        (Some(t), _) => parse_ref(t)?,
-        (None, Some(p)) => parse_ref(p)?,
-        (None, None) => parse_ref(&format!(
+    let (name, tag) = match explicit {
+        Some(r) => r,
+        None => parse_ref(&format!(
             "{}:{}",
             image_name(&pkg_name),
             pkg_version.replace('+', "_")
         ))?,
     };
-    if let Some(p) = push {
-        parse_ref(p)?;
-    }
-    let port = match args.number::<u16>("port")? {
-        Some(0) => {
-            return Err(Failure::new(
-                Code::USAGE,
-                "--port 0 is not a port",
-                "give the port the service listens on, such as --port 8080",
-            ))
-        }
-        Some(p) => p,
-        None => std::fs::read_to_string(root.join(".env.example"))
+    let port = port_flag.unwrap_or_else(|| {
+        std::fs::read_to_string(root.join(".env.example"))
             .ok()
             .and_then(|t| port_from_example(&t))
-            .unwrap_or(8080),
-    };
-    // --add first: a typo fails before a long build.
-    let mut added = Vec::new();
-    if let Some(list) = args.value("add") {
-        for rel in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            collect(&root, rel, &mut added)?;
-        }
-    }
-
-    let (target, sub) = choose_target(args.value("target"))?;
+            .unwrap_or(8080)
+    });
     let mut extra = Vec::new();
     if let Some(t) = &target {
         extra.push("--target".to_string());
