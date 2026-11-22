@@ -478,6 +478,7 @@ version = "1.3.0"
 dependencies = [
  "giong",
  "giong-http",
+ "giong-web",
  "libc",
  "serde_json",
 ]
