@@ -112,8 +112,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "1.2.0", features = ["tls"] }
-giong-tls = "1.2.0"
+giong-http = { version = "1.3.0", features = ["tls"] }
+giong-tls = "1.3.0"
 ```
 
 ```rust,no_run
@@ -214,12 +214,59 @@ Memory per connection, measured with `bench/hold` over HTTP/2 with prior knowled
 
 An idle connection gives its buffers back, so what it keeps is its task, its HPACK tables and its state; an idle HTTP/1.1 connection still costs 1.9 KiB. Results are in `bench/results/h2/`.
 
+## HTTP/3 (unstable)
+
+The `unstable-http3` feature adds HTTP/3 (RFC 9114) on [`giong-quic`](../giong-quic/README.md),
+for the same handlers, on Linux and macOS. It needs Rust 1.85, and may change before it is
+stabilised; the default build does not have it.
+
+```toml
+giong-http = { version = "1.3.0", features = ["unstable-http3", "client"] }
+giong-quic = "1.3.0"
+```
+
+```rust,ignore
+use giong_http::{Request, Response, Server};
+
+async fn handler(req: Request) -> Response {
+    Response::text(format!("hello over {}", req.version()))
+}
+
+async fn serve(tls: rustls::ServerConfig) -> std::io::Result<()> {
+    // `tls` allows TLS 1.3 and has `alpn_protocols` set to `vec![b"h3".to_vec()]`.
+    let config = giong_quic::ServerConfig::new(tls)?;
+    let endpoint = giong_quic::Endpoint::server("0.0.0.0:443".parse().unwrap(), config)?;
+    Server::new().serve_h3(endpoint, handler).await;
+    Ok(())
+}
+```
+
+- **Browsers find it through `Alt-Svc`.** Have the server that answers over TCP add
+  `Response::header("alt-svc", "h3=\":443\"; ma=86400")`, with the UDP port of the
+  endpoint.
+- **Limits come from the endpoint**: the requests a client may have open at once are its
+  `TransportConfig::max_streams`, and an idle connection closes after its
+  `TransportConfig::idle_timeout`. On shutdown the client gets `GOAWAY`, requests in flight
+  finish, and later ones are refused with `H3_REQUEST_REJECTED` so the client can retry them
+  elsewhere.
+- **Trailers** travel both ways as over HTTP/2. A streamed request body goes over HTTP/1.1
+  or HTTP/2.
+- **The client**: `Client::builder().http3(quic)` uses HTTP/3 for origins that advertise it
+  with `Alt-Svc`, and falls back to TCP for five minutes when the QUIC handshake does not
+  answer; `http3_prior_knowledge(quic)` speaks it at once. With early data on in `quic`,
+  only GET, HEAD and OPTIONS requests without a body go in 0-RTT. Not through a proxy.
+- **Checked** with `h3spec` in CI: 85 of 86 cases pass and none fails (the other needs
+  0-RTT, which the example leaves off). `cargo run --release -p giong-http --features
+  unstable-http3 --example h3` serves it locally (`curl -k --http3-only https://localhost:8443/`).
+- **Not measured yet** end to end; the QUIC layer underneath is in
+  [docs/BENCHMARKS.md](../docs/BENCHMARKS.md#quic).
+
 ## Client
 
 The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "1.2.0", features = ["client"] }
+giong-http = { version = "1.3.0", features = ["client"] }
 ```
 
 ```rust,no_run
@@ -289,7 +336,7 @@ Results are in `bench/results/http-client/`.
 
 ## Not there yet
 
-Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2 through an `http://` proxy (HTTPS through a proxy's tunnel gets HTTP/2), the `Upgrade: h2c` handshake.
+Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, `br` and `zstd`, SOCKS proxies, HTTP/2 through an `http://` proxy (HTTPS through a proxy's tunnel gets HTTP/2), the `Upgrade: h2c` handshake.
 
 ## Tests
 
