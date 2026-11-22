@@ -302,17 +302,27 @@ fn signal_ready(fd: RawFd) {
 }
 
 fn send_byte(fd: RawFd, byte: u8) {
+    // One sender at a time: on macOS, a non-blocking send(2) fails with
+    // EAGAIN, and the byte is lost, while another thread is sending on the
+    // same socket (the workers each report their binds at the same moment).
+    static SENDING: Mutex<()> = Mutex::new(());
+    let _one = SENDING.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: `fd` is a descriptor giong dev handed down and keeps open in
     // this process; the buffer is one valid byte. On a socket, send(2) with
     // MSG_DONTWAIT | MSG_NOSIGNAL neither blocks nor signals; on a pipe
     // (ENOTSOCK) the descriptor is made non-blocking and written.
     unsafe {
-        let sent = libc::send(
-            fd,
-            (&byte as *const u8).cast(),
-            1,
-            libc::MSG_DONTWAIT | NOSIGNAL,
-        );
+        let sent = loop {
+            let sent = libc::send(
+                fd,
+                (&byte as *const u8).cast(),
+                1,
+                libc::MSG_DONTWAIT | NOSIGNAL,
+            );
+            if sent >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break sent;
+            }
+        };
         if sent < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ENOTSOCK) {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags >= 0 && flags & libc::O_NONBLOCK == 0 {

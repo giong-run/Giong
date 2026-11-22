@@ -57,7 +57,7 @@ fn dev_child() {
             async move {
                 eprintln!("dev_child: worker {worker} binds {addr}");
                 let l = giong::net::TcpListener::bind(addr.as_str()).unwrap();
-                eprintln!("dev_child: worker {worker} bound; {}", ready_state());
+                eprintln!("dev_child: worker {worker} bound");
                 assert_eq!(l.local_addr().unwrap().to_string(), addr);
                 // Dropping a duplicate leaves the shared socket listening.
                 drop(giong::net::TcpListener::bind(addr.as_str()).unwrap());
@@ -71,41 +71,6 @@ fn dev_child() {
             }
         })
         .unwrap();
-}
-
-/// What the child sees of its ready descriptor and parent, printed when
-/// the test fails.
-fn ready_state() -> String {
-    let parent = std::env::var("GIONG_DEV_PARENT").unwrap_or_default();
-    let Some(fd) = std::env::var("GIONG_DEV_READY")
-        .ok()
-        .and_then(|r| r.parse::<i32>().ok())
-    else {
-        return "no GIONG_DEV_READY".into();
-    };
-    // SAFETY: plain syscalls on a descriptor number; a zero-length send
-    // carries nothing.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        let fd_err = std::io::Error::last_os_error();
-        let mut ty: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let got = libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_TYPE,
-            (&mut ty as *mut libc::c_int).cast(),
-            &mut len,
-        );
-        let ty_err = std::io::Error::last_os_error();
-        let sent = libc::send(fd, b"".as_ptr().cast(), 0, libc::MSG_DONTWAIT);
-        let send_err = std::io::Error::last_os_error();
-        format!(
-            "parent {} (GIONG_DEV_PARENT {parent}); ready fd {fd}: F_GETFD {flags} ({fd_err}), \
-             SO_TYPE {got}/{ty} ({ty_err}), empty send {sent} ({send_err})",
-            libc::getppid()
-        )
-    }
 }
 
 /// Kills the service if the test fails half way, so no copy is left behind.
