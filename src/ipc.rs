@@ -2,7 +2,8 @@
 //!
 //! A channel is a pair of byte rings in memory both processes map, one per
 //! direction, set up over a Unix socket. Sending a message copies it into
-//! the ring; receiving hands out the bytes where they lie. While both sides
+//! the ring; receiving copies it out (or, from a peer you trust, hands out
+//! the bytes where they lie: [`Receiver::recv_in_place`]). While both sides
 //! are busy no system call is made at all; a side that runs out of messages
 //! (or of room) sleeps on an eventfd and is woken only when the other side
 //! sees it sleeping. Compared with a Unix socket, this removes the kernel
