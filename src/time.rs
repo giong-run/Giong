@@ -337,7 +337,11 @@ impl Timers {
                     let entry = self.entries.get(idx).expect("timer entry");
                     (entry.next, entry.at)
                 };
-                if at <= now_ns {
+                // Only a timer of this slot's own millisecond fires here. The
+                // others go down a level and fire as the loop reaches their
+                // slots, so that timers fire in the order of their deadlines
+                // even when the loop wakes up late, past several of them.
+                if tick_of(at) <= deadline && at <= now_ns {
                     fired.push(self.entries.remove(idx).expect("timer entry").waker);
                 } else {
                     // Cascade to a lower level, now that time has moved on,
@@ -658,6 +662,13 @@ mod tests {
                         waker.wake();
                     }
                     let mut got = std::mem::take(&mut *fired.lock().unwrap());
+                    // In the order of their deadlines, to the millisecond.
+                    let ticks: Vec<u128> =
+                        got.iter().map(|id| live[id].0 / NANOS_PER_TICK).collect();
+                    assert!(
+                        ticks.windows(2).all(|w| w[0] <= w[1]),
+                        "seed {seed}: timers fired out of order at {now_ns} ns: {ticks:?}"
+                    );
                     got.sort_unstable();
                     // A timer is due once its deadline has passed, to the
                     // nanosecond.
@@ -734,6 +745,27 @@ mod tests {
         for seed in 200..=215 {
             run_model(seed, 3_000, 30 * 86_400_000, 7_200_000_000);
         }
+    }
+
+    #[test]
+    fn timers_fire_in_deadline_order_when_the_loop_wakes_late() {
+        // Deadlines a few hundred milliseconds out share a slot of a coarse
+        // level. A loop that wakes up past all of them (as on Windows, whose
+        // waits can end late by a scheduler quantum) must still fire them in
+        // order.
+        let start = Instant::now();
+        let mut wheel = Timers::starting_at(start);
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        for ms in [290, 260, 280, 270, 300] {
+            let waker = Waker::from(Arc::new(Recorder(ms, fired.clone())));
+            wheel.insert(start + Duration::from_millis(ms), waker);
+        }
+        for late in [275, 400] {
+            for waker in wheel.expired(start + Duration::from_millis(late)) {
+                waker.wake();
+            }
+        }
+        assert_eq!(*fired.lock().unwrap(), [260, 270, 280, 290, 300]);
     }
 
     #[test]
