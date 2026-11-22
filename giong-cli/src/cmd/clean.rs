@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -331,87 +331,106 @@ fn last_use(meta: &fs::Metadata) -> Option<SystemTime> {
     modified.max(accessed)
 }
 
+/// One unit cargo built (a crate, a build script, its output), with every
+/// path that belongs to it.
+struct Unit {
+    hash: String,
+    rustc: Option<u64>,
+    paths: Vec<PathBuf>,
+}
+
+/// The units of a profile directory, in either layout cargo writes:
+///
+/// - up to cargo 1.97: `.fingerprint/<name>-<hash>/`, and files and
+///   directories named `*-<hash>*` in `deps/`, `build/` and `examples/`;
+/// - from the build-dir layout (cargo 1.98 on): one directory per unit,
+///   `build/<package>/<hash>/`, holding `fingerprint/` and `out/`.
+fn units(profile: &Path) -> Vec<Unit> {
+    let mut by_hash: HashMap<String, Unit> = HashMap::new();
+    let dir_entries = |p: PathBuf| fs::read_dir(p).into_iter().flatten().flatten();
+    for unit in dir_entries(profile.join(".fingerprint")) {
+        let name = unit.file_name().to_string_lossy().into_owned();
+        if let Some(hash) = unit_hash(&name) {
+            by_hash.insert(
+                hash.to_string(),
+                Unit {
+                    hash: hash.to_string(),
+                    rustc: unit_rustc(&unit.path()),
+                    paths: vec![unit.path()],
+                },
+            );
+        }
+    }
+    for sub in ["build", "deps", "examples"] {
+        for e in dir_entries(profile.join(sub)) {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let stem = name.split('.').next().unwrap_or(&name);
+            if let Some(unit) = unit_hash(stem).and_then(|h| by_hash.get_mut(h)) {
+                unit.paths.push(e.path());
+            } else if sub == "build" && e.file_type().is_ok_and(|t| t.is_dir()) {
+                // The new layout: build/<package>/<hash>/fingerprint.
+                for u in dir_entries(e.path()) {
+                    let hash = u.file_name().to_string_lossy().into_owned();
+                    let is_hash = hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+                    if is_hash && u.path().join("fingerprint").is_dir() {
+                        let unit = by_hash.entry(hash.clone()).or_insert_with(|| Unit {
+                            hash: hash.clone(),
+                            rustc: None,
+                            paths: Vec::new(),
+                        });
+                        unit.rustc = unit
+                            .rustc
+                            .or_else(|| unit_rustc(&u.path().join("fingerprint")));
+                        unit.paths.push(u.path());
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<Unit> = by_hash.into_values().collect();
+    out.sort_by(|a, b| a.hash.cmp(&b.hash));
+    out
+}
+
+/// The newest write or read of any file under `paths`; unknown or future
+/// times count as now.
+fn newest_use(paths: &[PathBuf], now: SystemTime) -> SystemTime {
+    let mut newest = UNIX_EPOCH;
+    let mut stack: Vec<PathBuf> = paths.to_vec();
+    while let Some(p) = stack.pop() {
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.is_dir() {
+            stack.extend(
+                fs::read_dir(&p)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path()),
+            );
+        }
+        let t = last_use(&meta).filter(|t| *t <= now).unwrap_or(now);
+        newest = newest.max(t);
+    }
+    newest
+}
+
 /// Units built by another compiler (or not used for `days`), and stale
 /// incremental data, in every profile directory of `target`.
 pub fn plan(target: &Path, current_rustc: Option<u64>, days: Option<u64>) -> Plan {
     let now = SystemTime::now();
     let mut paths = Vec::new();
     for profile in profile_dirs(target) {
-        // Every unit: its compiler, and when any of its files was last used.
-        let mut rustc: HashMap<String, Option<u64>> = HashMap::new();
-        let mut used: HashMap<String, SystemTime> = HashMap::new();
-        let mut note_use = |hash: &str, path: &Path| {
-            let mut stack = vec![path.to_path_buf()];
-            while let Some(p) = stack.pop() {
-                let Ok(meta) = fs::symlink_metadata(&p) else {
-                    continue;
-                };
-                if meta.is_dir() {
-                    if let Ok(entries) = fs::read_dir(&p) {
-                        stack.extend(entries.flatten().map(|e| e.path()));
-                    }
-                }
-                // Unknown or in the future: as good as used now.
-                let t = last_use(&meta).filter(|t| *t <= now).unwrap_or(now);
-                let e = used.entry(hash.to_string()).or_insert(t);
-                if t > *e {
-                    *e = t;
-                }
-            }
-        };
-        if let Ok(units) = fs::read_dir(profile.join(".fingerprint")) {
-            for unit in units.flatten() {
-                let name = unit.file_name().to_string_lossy().into_owned();
-                let Some(hash) = unit_hash(&name) else {
-                    continue;
-                };
-                rustc.insert(hash.to_string(), unit_rustc(&unit.path()));
-                note_use(hash, &unit.path());
-            }
-        }
-        if days.is_some() {
-            for sub in ["deps", "build"] {
-                for e in fs::read_dir(profile.join(sub))
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let stem = name.split('.').next().unwrap_or(&name);
-                    if let Some(h) = unit_hash(stem) {
-                        if rustc.contains_key(h) {
-                            note_use(h, &e.path());
-                        }
-                    }
-                }
-            }
-        }
-        let stale: HashSet<&String> = rustc
-            .iter()
-            .filter(|(hash, then)| {
-                let other_compiler = matches!((current_rustc, then), (Some(n), Some(t)) if n != *t);
-                let unused = days.is_some_and(|d| {
-                    used.get(*hash)
-                        .and_then(|t| now.duration_since(*t).ok())
-                        .is_some_and(|age| age > days_to_duration(d))
-                });
-                other_compiler || unused
-            })
-            .map(|(h, _)| h)
-            .collect();
-        if !stale.is_empty() {
-            for sub in [".fingerprint", "build", "deps", "examples"] {
-                for e in fs::read_dir(profile.join(sub))
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let stem = name.split('.').next().unwrap_or(&name);
-                    if unit_hash(stem).is_some_and(|h| stale.contains(&h.to_string())) {
-                        paths.push(e.path());
-                    }
-                }
+        for unit in units(&profile) {
+            let other_compiler =
+                matches!((current_rustc, unit.rustc), (Some(n), Some(t)) if n != t);
+            let unused = days.is_some_and(|d| {
+                now.duration_since(newest_use(&unit.paths, now))
+                    .is_ok_and(|age| age > days_to_duration(d))
+            });
+            if other_compiler || unused {
+                paths.extend(unit.paths);
             }
         }
         let incremental_days = days.unwrap_or(INCREMENTAL_DAYS);
@@ -426,6 +445,7 @@ pub fn plan(target: &Path, current_rustc: Option<u64>, days: Option<u64>) -> Pla
         }
     }
     paths.sort();
+    paths.dedup();
     Plan {
         paths,
         reason: match days {
@@ -487,20 +507,15 @@ pub fn unit_rustc(unit: &Path) -> Option<u64> {
 /// custom profiles, and the same under `<target-triple>/`).
 pub fn profile_dirs(target: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = fs::read_dir(target) else {
-        return out;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
+    for e in fs::read_dir(target).into_iter().flatten().flatten() {
         if !e.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        if p.join(".fingerprint").is_dir() {
-            out.push(p);
-        } else if let Ok(inner) = fs::read_dir(&p) {
-            for i in inner.flatten() {
-                if i.file_type().is_ok_and(|t| t.is_dir()) && i.path().join(".fingerprint").is_dir()
-                {
+        if is_profile(&e.path()) {
+            out.push(e.path());
+        } else {
+            for i in fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                if i.file_type().is_ok_and(|t| t.is_dir()) && is_profile(&i.path()) {
                     out.push(i.path());
                 }
             }
@@ -508,6 +523,25 @@ pub fn profile_dirs(target: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// A profile directory, in either layout: `.fingerprint/`, or a unit in
+/// `build/<package>/<hash>/fingerprint/`.
+fn is_profile(dir: &Path) -> bool {
+    dir.join(".fingerprint").is_dir()
+        || fs::read_dir(dir.join("build"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(64)
+            .any(|pkg| {
+                fs::read_dir(pkg.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .take(8)
+                    .any(|u| u.path().join("fingerprint").is_dir())
+            })
 }
 
 /// Whether cargo made `dir`: its `CACHEDIR.TAG` says cargo created it, or it
@@ -585,16 +619,10 @@ pub fn current_rustc_hash(project_dir: &Path) -> Result<Option<u64>, Failure> {
              giong clean --all needs no probe",
         ));
     }
-    let mut hash = None;
-    for profile in profile_dirs(&probe.join("target")) {
-        if let Ok(units) = fs::read_dir(profile.join(".fingerprint")) {
-            for u in units.flatten() {
-                if let Some(h) = unit_rustc(&u.path()) {
-                    hash = Some(h);
-                }
-            }
-        }
-    }
+    let hash = profile_dirs(&probe.join("target"))
+        .iter()
+        .flat_map(|p| units(p))
+        .find_map(|u| u.rustc);
     let _ = fs::remove_dir_all(&probe);
     Ok(hash)
 }
@@ -678,23 +706,22 @@ mod tests {
         );
         assert!(is_cargo_build(&t, false));
         let p = plan(&t, Some(2), None);
-        let names: Vec<String> = p
-            .paths
-            .iter()
-            .map(|x| x.strip_prefix(&t).unwrap().display().to_string())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                format!("debug/.fingerprint/serde-{old}"),
-                format!("debug/build/serde-{old}"),
-                format!("debug/deps/libserde-{old}.rlib"),
-                format!("debug/deps/libserde-{old}.rmeta"),
-                format!("debug/deps/serde-{old}.d"),
-                format!("x86_64-unknown-linux-gnu/release/.fingerprint/a-{old}"),
-                format!("x86_64-unknown-linux-gnu/release/deps/a-{old}"),
-            ]
-        );
+        // Compared as paths: `\\` on Windows.
+        let at = |rel: String| rel.split('/').fold(t.clone(), |p, c| p.join(c));
+        let mut want: Vec<PathBuf> = [
+            format!("debug/.fingerprint/serde-{old}"),
+            format!("debug/build/serde-{old}"),
+            format!("debug/deps/libserde-{old}.rlib"),
+            format!("debug/deps/libserde-{old}.rmeta"),
+            format!("debug/deps/serde-{old}.d"),
+            format!("x86_64-unknown-linux-gnu/release/.fingerprint/a-{old}"),
+            format!("x86_64-unknown-linux-gnu/release/deps/a-{old}"),
+        ]
+        .into_iter()
+        .map(at)
+        .collect();
+        want.sort();
+        assert_eq!(p.paths, want);
         // Unknown compiler: nothing is removed.
         assert!(plan(&t, None, None).paths.is_empty());
         // --days 0 removes every unit (all are older than 0 days).
@@ -705,6 +732,53 @@ mod tests {
             .iter()
             .any(|x| x.ends_with(format!("libserde-{new}.rlib"))));
         assert!(!p.paths.iter().any(|x| x.ends_with("app")));
+        fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn the_build_dir_layout_is_swept_too() {
+        let t = temp("clean-new-layout");
+        let old = "1111111111111111";
+        let new = "2222222222222222";
+        tree(
+            &t,
+            &[
+                ("CACHEDIR.TAG", CARGO_TAG),
+                (
+                    &format!("debug/build/serde/{old}/fingerprint/lib-serde.json"),
+                    r#"{"rustc":1}"#,
+                ),
+                (
+                    &format!("debug/build/serde/{old}/out/libserde-{old}.rlib"),
+                    "old",
+                ),
+                (
+                    &format!("debug/build/serde/{new}/fingerprint/lib-serde.json"),
+                    r#"{"rustc":2}"#,
+                ),
+                (
+                    &format!("debug/build/serde/{new}/out/libserde-{new}.rlib"),
+                    "new",
+                ),
+                ("debug/libapp.rlib", "uplifted"),
+            ],
+        );
+        assert_eq!(profile_dirs(&t), [t.join("debug")]);
+        assert!(is_cargo_build(&t, true));
+        let p = plan(&t, Some(2), None);
+        assert_eq!(
+            p.paths,
+            [t.join("debug").join("build").join("serde").join(old)]
+        );
+        // The probe's hash is found in this layout as well.
+        assert_eq!(
+            profile_dirs(&t)
+                .iter()
+                .flat_map(|p| units(p))
+                .filter_map(|u| u.rustc)
+                .max(),
+            Some(2)
+        );
         fs::remove_dir_all(&t).unwrap();
     }
 
