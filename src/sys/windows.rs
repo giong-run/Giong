@@ -715,13 +715,14 @@ pub(crate) enum AcceptWake {
 ///
 /// Only the flag stops the thread. A datagram is not proof of a `stop`:
 /// any program on the machine can see the socket's port, and Windows lets
-/// a socket of another user bind the wildcard address on a port that a
-/// socket without `SO_EXCLUSIVEADDRUSE` holds on one address, and send
-/// from there with the socket's own address as the source. One datagram
-/// would then have ended the thread for good, and every listener of the
-/// shared address would have stopped taking connections. The socket's
-/// bind is exclusive, and a datagram without the flag is read and
-/// ignored.
+/// another socket bind the wildcard address on that port (even with
+/// `SO_EXCLUSIVEADDRUSE` on this one) and send from there with this
+/// socket's own address as the source. One datagram would then have ended
+/// the thread for good, and every listener of the shared address would
+/// have stopped taking connections. So a datagram without the flag is read
+/// and ignored. The bind is exclusive all the same, so that no socket can
+/// take over the address itself, and with it the byte of `stop` (the flag
+/// is also looked at every 100 ms).
 pub(crate) struct AcceptEvents {
     listener: RawSock,
     wake: RawSock,
@@ -1069,9 +1070,10 @@ mod tests {
 
     /// The thread that hands out the connections of a shared port stops
     /// for `stop` only. A datagram that reaches its wake socket some other
-    /// way (here sent by the socket itself, which is what a socket that
-    /// took the port's wildcard address could forge) is read and ignored,
-    /// and nothing else can bind the port.
+    /// way is read and ignored: one sent by the socket itself, which is
+    /// what another socket can forge, and, where Windows lets a socket bind
+    /// the wildcard address on the wake socket's port (real Windows does,
+    /// Wine does not), one forged from there.
     #[test]
     fn only_stop_ends_a_wait_for_connections() {
         use std::os::windows::io::AsRawSocket;
@@ -1093,10 +1095,12 @@ mod tests {
         };
         assert_eq!(rc, 0);
         let port = u16::from_be(addr.sin_port);
-        assert!(
-            std::net::UdpSocket::bind(("0.0.0.0", port)).is_err(),
-            "the wake socket's port could be bound by another socket"
-        );
+        if let Ok(forger) = std::net::UdpSocket::bind(("0.0.0.0", port)) {
+            for _ in 0..3 {
+                forger.send_to(&[7], ("127.0.0.1", port)).unwrap();
+                assert_eq!(events.wait(Some(20)), super::AcceptWake::Timeout);
+            }
+        }
 
         for _ in 0..3 {
             // SAFETY: one byte from a local, to the socket's own address.
