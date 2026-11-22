@@ -381,6 +381,127 @@ fn a_stopped_service_is_reported_not_fatal() {
     assert_eq!(v["error"]["code"], "GIONG-E5053", "{v}");
 }
 
+/// A package of no dependencies whose binary prints a line and stays up for
+/// `secs` seconds: enough for `giong dev` to build and run.
+fn tiny_project(tag: &str, secs: u64) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("giong-cli-dash-dev-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"tiny\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/main.rs"),
+        format!(
+            "fn main() {{ println!(\"hello from tiny\"); \
+             std::thread::sleep(std::time::Duration::from_secs({secs})); }}\n"
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+/// Runs `giong dev --once --json` with `flags` in `dir`; gives the child and
+/// its stdout lines as they come.
+fn dev_once(dir: &Path, flags: &[&str]) -> (Dash, mpsc::Receiver<Value>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_giong"))
+        .args(["dev", "--once", "--json"])
+        .args(flags)
+        .current_dir(dir)
+        .env_remove("GIONG_MCP")
+        .env_remove("LISTEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    (Dash(child, String::new()), rx)
+}
+
+/// The next line that `want` accepts, within 120 s (a cold cargo build).
+fn next(rx: &mpsc::Receiver<Value>, want: impl Fn(&Value) -> bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let v = rx
+            .recv_timeout(left)
+            .unwrap_or_else(|e| panic!("no matching line from giong dev: {e}"));
+        if want(&v) {
+            return v;
+        }
+    }
+}
+
+#[test]
+fn giong_dev_ui_serves_the_dashboard() {
+    let dir = tiny_project("ui", 10);
+    let (_dev, rx) = dev_once(&dir, &["--ui-port", "0"]);
+    let event = next(&rx, |v| v["event"] == "dashboard");
+    let addr = event["url"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    next(&rx, |v| v["event"] == "ready");
+    eventually(|| get(&addr, "/api/state")["dev"]["build"]["state"] == "ok");
+    eventually(|| {
+        get(&addr, "/api/log")["entries"]
+            .as_array()
+            .is_some_and(|l| l.iter().any(|x| x.to_string().contains("hello from tiny")))
+    });
+    // The guards hold for the dashboard giong dev serves too.
+    let (status, _) = raw(
+        &addr,
+        &format!("GET /api/state HTTP/1.1\r\nHost: {addr}\r\n\r\n"),
+    );
+    assert_eq!(status, 403);
+}
+
+#[test]
+fn giong_dev_runs_without_the_dashboard_when_its_ports_are_taken() {
+    // Ten free ports in a row, held while giong dev starts.
+    let held = (0..50)
+        .find_map(|_| {
+            let first = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            let base = first.local_addr().ok()?.port();
+            if base > u16::MAX - 10 {
+                return None;
+            }
+            let mut all = vec![first];
+            for p in base + 1..base + 10 {
+                all.push(std::net::TcpListener::bind(("127.0.0.1", p)).ok()?);
+            }
+            Some((base, all))
+        })
+        .expect("ten free ports in a row");
+    let dir = tiny_project("busy", 2);
+    let port = held.0.to_string();
+    let (mut dev, rx) = dev_once(&dir, &["--ui-port", &port]);
+    let warning = next(&rx, |v| v["event"] == "warning");
+    assert_eq!(warning["code"], "GIONG-E5053", "{warning}");
+    // The service still builds and runs, and the report keeps the warning.
+    let report = next(&rx, |v| v["command"] == "dev");
+    assert_eq!(report["ok"], true, "{report}");
+    let finding = &report["findings"][0];
+    assert_eq!(finding["code"], "GIONG-E5053", "{report}");
+    assert_eq!(finding["severity"], "warning", "{report}");
+    assert!(dev.0.wait().unwrap().success());
+    drop(held);
+}
+
 /// Keeps a demo running for a person or a browser test to look at:
 /// `GIONG_DASH_DEMO_SECS=600 cargo test -p giong-cli --test dashboard demo -- --ignored --nocapture`.
 #[test]
