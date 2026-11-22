@@ -14,6 +14,7 @@ pub mod explain;
 pub mod fix;
 pub mod help;
 pub mod new;
+pub mod test;
 pub mod version;
 
 /// A command of `giong`.
@@ -38,6 +39,7 @@ pub const COMMANDS: &[&Command] = &[
     &new::COMMAND,
     &ai::COMMAND,
     &fix::COMMAND,
+    &test::COMMAND,
     &explain::COMMAND,
     &version::COMMAND,
     &help::COMMAND,

@@ -69,6 +69,9 @@ codes! {
     FIX_DIRTY = 5080, "FixDirty", "the project has changes that are not committed";
     FIX_FAILED = 5081, "FixFailed", "cargo could not apply its fixes";
     FIX_CONFLICT = 5082, "FixConflict", "a fix no longer matches the code";
+    TEST_FAILED = 5083, "TestFailed", "a test failed";
+    DRIVER_NOT_HERE = 5084, "DriverNotHere", "the tests could not run on every driver";
+    NEXTEST_MISSING = 5085, "NextestMissing", "cargo-nextest is not installed";
 }
 
 impl Code {

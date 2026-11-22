@@ -2954,4 +2954,50 @@ A fix found by `giong check` names bytes of a file that no longer hold the code 
 
 [All error codes](README.md)
 "#),
+    (5083, r#"# GIONG-E5083: a test failed
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5083"`.
+
+## What happened
+
+A test failed. `giong test` runs the suite on the default driver (io_uring on Linux when the kernel allows it), then again with `GIONG_DRIVER=epoll`, because containers with Docker's default seccomp profile get epoll. The finding names the test, the driver it failed on and what it printed.
+
+## How to fix it
+
+- Run that one test with its output: `cargo test <name> -- --nocapture` (add `GIONG_DRIVER=epoll` in front when it failed only on epoll).
+- A test that fails only on one driver often reads one message with one `recv()`. TCP keeps no message boundaries: read until the whole message is in (`read_exact`, or a framed reader).
+- A test that needs a database reads `DATABASE_URL` or `REDIS_URL`. `giong test` loads them from `.env`; `giong db up` writes them there.
+
+[All error codes](README.md)
+"#),
+    (5084, r#"# GIONG-E5084: the tests could not run on every driver
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5084"`.
+
+## What happened
+
+`giong test` ran the suite once. On Linux it runs it a second time with `GIONG_DRIVER=epoll`, the driver containers get when io_uring is blocked. The epoll driver exists only on Linux, so on macOS and Windows that second run was left out. This is a note, not an error.
+
+## How to fix it
+
+- Run `giong test` on Linux, or let CI run it there, before you ship to a Linux server or container.
+- Projects made by `giong new` already run both drivers in their CI workflow.
+
+[All error codes](README.md)
+"#),
+    (5085, r#"# GIONG-E5085: cargo-nextest is not installed
+
+Raised by the `giong` command (giong-cli): `giong test --nextest`. In JSON output: `"code": "GIONG-E5085"`.
+
+## What happened
+
+`--nextest` runs the suite with `cargo nextest run`, but `cargo nextest --version` did not work, so cargo-nextest is not installed for this toolchain.
+
+## How to fix it
+
+- Install it: `cargo install cargo-nextest --locked`.
+- Or leave out `--nextest`: `giong test` then runs `cargo test`.
+
+[All error codes](README.md)
+"#),
 ];

@@ -282,3 +282,6 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5080](E5080.md) | `FixDirty` | the project has changes that are not committed |
 | [GIONG-E5081](E5081.md) | `FixFailed` | cargo could not apply its fixes |
 | [GIONG-E5082](E5082.md) | `FixConflict` | a fix no longer matches the code |
+| [GIONG-E5083](E5083.md) | `TestFailed` | a test failed |
+| [GIONG-E5084](E5084.md) | `DriverNotHere` | the tests could not run on every driver |
+| [GIONG-E5085](E5085.md) | `NextestMissing` | cargo-nextest is not installed |
