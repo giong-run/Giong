@@ -78,7 +78,7 @@ for line in sys.stdin:
             continue
         # giong-cli runs the giong binary, cargo, git and containers, none of
         # which the guests have, and does not depend on the kernel.
-        if "/giong-cli#" in msg["package_id"]:
+        if msg["manifest_path"].endswith("/giong-cli/Cargo.toml"):
             continue
         print(msg["executable"])
 '
