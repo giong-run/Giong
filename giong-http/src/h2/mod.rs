@@ -8,7 +8,7 @@
 
 pub(crate) mod frame;
 pub(crate) mod hpack;
-mod request;
+pub(crate) mod request;
 mod server;
 mod wake;
 
