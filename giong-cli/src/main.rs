@@ -16,8 +16,10 @@ mod host;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
 mod project;
+mod record;
 mod report;
 mod service;
+mod web_client;
 
 use std::process::ExitCode;
 

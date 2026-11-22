@@ -110,7 +110,9 @@ pub fn base_url(flag: Option<&str>) -> String {
         .and_then(|root| DevState::read(&root))
         .and_then(|d| d.listen.into_iter().next())
         .map(|addr| {
-            let addr = addr.replace("0.0.0.0", "127.0.0.1").replace("[::]", "[::1]");
+            let addr = addr
+                .replace("0.0.0.0", "127.0.0.1")
+                .replace("[::]", "[::1]");
             if addr.contains("://") {
                 addr
             } else {
@@ -234,7 +236,10 @@ mod tests {
     #[test]
     fn sample_paths_fill_parameters() {
         assert_eq!(sample_path("/users/{id}"), "/users/1");
-        assert_eq!(sample_path("/teams/{team}/users/{user_id}"), "/teams/team/users/1");
+        assert_eq!(
+            sample_path("/teams/{team}/users/{user_id}"),
+            "/teams/team/users/1"
+        );
         assert_eq!(sample_path("/files/{*path}"), "/files/path/example");
         assert_eq!(sample_path("/"), "/");
         assert_eq!(sample_path("/health"), "/health");
@@ -243,7 +248,10 @@ mod tests {
     #[test]
     fn curl_lines_carry_method_body_and_quoting() {
         let b = "http://127.0.0.1:8080";
-        assert_eq!(curl(b, &route("GET", "/a")), "curl -i 'http://127.0.0.1:8080/a'");
+        assert_eq!(
+            curl(b, &route("GET", "/a")),
+            "curl -i 'http://127.0.0.1:8080/a'"
+        );
         assert_eq!(
             curl(b, &route("POST", "/users")),
             "curl -i -X POST -H 'Content-Type: application/json' -d '{}' 'http://127.0.0.1:8080/users'"

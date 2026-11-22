@@ -61,6 +61,11 @@ codes! {
     MCP_TOOL_ERROR = 5052, "McpToolError", "the service's giong-mcp refused a call";
     WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";
     SERVICE_WARNING = 5056, "ServiceWarning", "the service reports a warning";
+    NO_RECORDING = 5065, "NoRecording", "no recorded requests to use";
+    RECORDED_CASE_FAILED = 5066, "RecordedCaseFailed", "a recorded case answers differently";
+    RECORDING_INVALID = 5067, "RecordingInvalid", "a recording cannot be read or used";
+    RECORD_VALUE_MISSING = 5068, "RecordValueMissing", "a recorded case needs a value that is not set";
+    REPLAY_UNREACHABLE = 5069, "ReplayUnreachable", "the service to replay against does not answer";
 }
 
 impl Code {

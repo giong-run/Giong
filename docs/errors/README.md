@@ -274,3 +274,8 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |
 | [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
 | [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
+| [GIONG-E5065](E5065.md) | `NoRecording` | no recorded requests to use |
+| [GIONG-E5066](E5066.md) | `RecordedCaseFailed` | a recorded case answers differently |
+| [GIONG-E5067](E5067.md) | `RecordingInvalid` | a recording cannot be read or used |
+| [GIONG-E5068](E5068.md) | `RecordValueMissing` | a recorded case needs a value that is not set |
+| [GIONG-E5069](E5069.md) | `ReplayUnreachable` | the service to replay against does not answer |

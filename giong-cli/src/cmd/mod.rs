@@ -14,6 +14,7 @@ pub mod doctor;
 pub mod explain;
 pub mod help;
 pub mod openapi;
+pub mod record;
 pub mod routes;
 pub mod top;
 pub mod version;
@@ -42,6 +43,7 @@ pub const COMMANDS: &[&Command] = &[
     &clean::COMMAND,
     &routes::COMMAND,
     &openapi::COMMAND,
+    &record::COMMAND,
     &top::COMMAND,
     &version::COMMAND,
     &help::COMMAND,

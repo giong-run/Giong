@@ -123,7 +123,10 @@ fn operation(r: &Route, base: &str) -> Value {
     );
     op.insert(
         "description".into(),
-        json!(format!("Added at {}. {} middleware.", r.added_at, r.middleware)),
+        json!(format!(
+            "Added at {}. {} middleware.",
+            r.added_at, r.middleware
+        )),
     );
     let params: Vec<Value> = r
         .params
@@ -186,7 +189,10 @@ fn operation(r: &Route, base: &str) -> Value {
     if r.stream_limit.is_some() {
         responses.insert(
             "413".into(),
-            problem(&["GIONG-E1111"], "the body is longer than the route's limit"),
+            problem(
+                &["GIONG-E1111"],
+                "the body is longer than the route's limit",
+            ),
         );
     } else if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH") {
         responses.insert(
@@ -200,11 +206,15 @@ fn operation(r: &Route, base: &str) -> Value {
     }
     responses.insert(
         "500".into(),
-        problem(&["GIONG-E1210"], "the handler failed; the cause is in the log"),
+        problem(
+            &["GIONG-E1210"],
+            "the handler failed; the cause is in the log",
+        ),
     );
     responses.insert(
         "503".into(),
-        problem(&["GIONG-E1209", "GIONG-E1211"],
+        problem(
+            &["GIONG-E1209", "GIONG-E1211"],
             "no answer in time, or a service the handler needs is down",
         ),
     );
@@ -337,9 +347,15 @@ mod tests {
 
     #[test]
     fn operation_ids_are_readable_and_unique() {
-        assert_eq!(operation_id(&route("GET", "/users/{id}", &["id"])), "get_users_by_id");
+        assert_eq!(
+            operation_id(&route("GET", "/users/{id}", &["id"])),
+            "get_users_by_id"
+        );
         assert_eq!(operation_id(&route("GET", "/", &[])), "get_root");
-        assert_eq!(operation_id(&route("PUT", "/files/{*path}", &["path"])), "put_files_by_path");
+        assert_eq!(
+            operation_id(&route("PUT", "/files/{*path}", &["path"])),
+            "put_files_by_path"
+        );
         assert_eq!(operation_id(&route("GET", "/a-b.c", &[])), "get_a_b_c");
     }
 
@@ -347,15 +363,18 @@ mod tests {
     fn the_document_has_paths_parameters_errors_and_samples() {
         let mut up = route("PUT", "/files/{*path}", &["path"]);
         up.stream_limit = Some(1024);
-        let apps = vec![(
-            vec![0, 1],
-            vec![
-                route("GET", "/users/{id}", &["id"]),
-                route("POST", "/users", &[]),
-                up,
-                route("PROPFIND", "/dav", &[]),
-            ],
-        ), (vec![0], vec![route("GET", "/users/{id}", &["id"])])];
+        let apps = vec![
+            (
+                vec![0, 1],
+                vec![
+                    route("GET", "/users/{id}", &["id"]),
+                    route("POST", "/users", &[]),
+                    up,
+                    route("PROPFIND", "/dav", &[]),
+                ],
+            ),
+            (vec![0], vec![route("GET", "/users/{id}", &["id"])]),
+        ];
         let doc = document(&apps, "api", "1.2.3", "http://127.0.0.1:8080");
         assert_eq!(doc["openapi"], "3.1.0");
         assert_eq!(doc["info"]["title"], "api");
