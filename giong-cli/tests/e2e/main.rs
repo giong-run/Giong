@@ -16,9 +16,11 @@
 mod harness;
 mod schema;
 
+mod bench;
 mod clean;
 mod contract;
 mod doctor;
+mod env;
 mod explain;
 mod new_ai;
 mod scenarios;
