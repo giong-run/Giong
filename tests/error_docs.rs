@@ -39,7 +39,7 @@ fn every_code_has_its_page() {
         let name = entry.unwrap().file_name().into_string().unwrap();
         // E4001-E4099 are giong-proto's (a prototype for 1.1 with its own
         // `ErrorKind`, checked by giong-proto/tests/error_docs.rs); E5000-E5099
-        // are the giong command's (giong-cli/tests/error_docs.rs).
+        // are the giong command's (checked in giong-cli/src/code.rs, its tests).
         assert!(
             name == "README.md"
                 || pages.contains(&name)

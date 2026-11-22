@@ -407,6 +407,7 @@ dependencies = [
  "giong-mcp",
  "giong-web",
  "serde_json",
+ "socket2",
 ]
 
 [[package]]

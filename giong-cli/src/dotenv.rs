@@ -4,8 +4,9 @@
 //!
 //! The format is the common subset every tool agrees on: `KEY=value`, an
 //! optional `export ` in front, `#` comments on their own line, values in
-//! single quotes (taken as they are) or double quotes (with `\n`, `\"`, `\\`),
-//! and unquoted values cut at ` #`. No variable expansion: a value is what is
+//! single quotes (taken as they are) or double quotes (with `\n`, `\"`, `\\`,
+//! and over several lines), and unquoted values cut at ` #`. A leading byte
+//! order mark is skipped. No variable expansion: a value is what is
 //! written.
 
 use std::path::Path;
@@ -28,13 +29,20 @@ pub struct BadLine {
 pub fn parse(text: &str) -> (Vec<Var>, Vec<BadLine>) {
     let mut vars = Vec::new();
     let mut bad = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
         let line = i as u32 + 1;
-        let l = raw.trim();
+        let l = lines[i].trim();
+        i += 1;
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
-        let l = l.strip_prefix("export ").map(str::trim_start).unwrap_or(l);
+        let l = match l.strip_prefix("export") {
+            Some(rest) if rest.starts_with([' ', '\t']) => rest.trim_start(),
+            _ => l,
+        };
         let Some((key, value)) = l.split_once('=') else {
             bad.push(BadLine {
                 line,
@@ -66,7 +74,20 @@ pub fn parse(text: &str) -> (Vec<Var>, Vec<BadLine>) {
                 }
             }
         } else if let Some(rest) = value.strip_prefix('"') {
-            match unquote_double(rest) {
+            // A value may go on over the next lines until its quote closes.
+            let mut joined = rest.to_string();
+            let mut v = unquote_double(&joined);
+            let mut j = i;
+            while v.is_none() && j < lines.len() {
+                joined.push('\n');
+                joined.push_str(lines[j]);
+                j += 1;
+                v = unquote_double(&joined);
+            }
+            if v.is_some() {
+                i = j;
+            }
+            match v {
                 Some(v) => v,
                 None => {
                     bad.push(BadLine {
@@ -117,6 +138,30 @@ pub fn read(path: &Path) -> Option<(Vec<Var>, Vec<BadLine>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bom_tabs_and_values_over_several_lines() {
+        let (vars, bad) =
+            parse("\u{feff}A=1\nexport\tB=2\nKEY=\"-----BEGIN\nabc\n-----END\"\nC=3\n");
+        assert!(bad.is_empty(), "{bad:?}");
+        let got: Vec<(&str, &str, u32)> = vars
+            .iter()
+            .map(|v| (v.key.as_str(), v.value.as_str(), v.line))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("A", "1", 1),
+                ("B", "2", 2),
+                ("KEY", "-----BEGIN\nabc\n-----END", 3),
+                ("C", "3", 6)
+            ]
+        );
+        // A quote never closed is one bad line, and the lines after it count.
+        let (vars, bad) = parse("A=\"open\nB=2\n");
+        assert_eq!(bad.len(), 1);
+        assert_eq!(vars.len(), 1);
+    }
 
     #[test]
     fn the_common_subset() {

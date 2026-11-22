@@ -2,7 +2,10 @@
 //! from the tools on the `PATH` elsewhere. Each reader returns `None` when it
 //! cannot tell, and the parsers are separate so tests can feed them text.
 
-use std::process::Command;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// A version such as `1.80.0` or a kernel's `6.18.44-fc-v726`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -37,23 +40,84 @@ pub fn parse_version(text: &str) -> Option<Version> {
     None
 }
 
-/// Runs a program and gives its standard output, if it ran and succeeded.
+/// How long a tool may take to answer (a rustup lock or a network mount can
+/// hang one forever).
+pub const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Runs a program and gives its standard output, if it ran and succeeded
+/// within [`TOOL_TIMEOUT`].
 pub fn output(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
-    if !out.status.success() {
-        return None;
+    run(Command::new(program).args(args)).ok()
+}
+
+/// [`output`], with `dir` as the working directory (a rust-toolchain file
+/// there picks the toolchain).
+pub fn output_in(dir: &Path, program: &str, args: &[&str]) -> Option<String> {
+    run(Command::new(program).args(args).current_dir(dir)).ok()
+}
+
+/// Why a tool gave no output.
+#[derive(Debug)]
+pub enum ToolError {
+    /// It could not be started.
+    Missing(std::io::Error),
+    /// It exited with a failure; its standard error.
+    Failed(String),
+    /// It took longer than [`TOOL_TIMEOUT`] and was stopped.
+    TimedOut,
+}
+
+/// Runs `cmd` with its output captured, stopped after [`TOOL_TIMEOUT`].
+pub fn run(cmd: &mut Command) -> Result<String, ToolError> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(ToolError::Missing)?;
+    // Read both pipes on threads so a chatty tool cannot block on a full one.
+    let mut out = child.stdout.take().expect("piped");
+    let mut err = child.stderr.take().expect("piped");
+    let out_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out.read_to_end(&mut b);
+        b
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err.read_to_end(&mut b);
+        b
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if start.elapsed() < TOOL_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ToolError::TimedOut);
+            }
+        }
+    };
+    let stdout = out_t.join().unwrap_or_default();
+    let stderr = err_t.join().unwrap_or_default();
+    if !status.success() {
+        return Err(ToolError::Failed(
+            String::from_utf8_lossy(&stderr).trim().to_string(),
+        ));
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 /// Whether a program can be started.
 pub fn exists(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    !matches!(
+        run(Command::new(program).args(args)),
+        Err(ToolError::Missing(_))
+    )
 }
 
 pub fn rustc_version() -> Option<Version> {

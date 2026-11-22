@@ -13,6 +13,15 @@
 //!  "data": {}}
 //! ```
 //!
+//! When the command cannot do its job at all, the document has `"ok": false`, no
+//! findings, and an `error` object instead:
+//!
+//! ```json
+//! {"command": "clean", "version": "1.3.0", "ok": false,
+//!  "error": {"code": "GIONG-E5000", "message": "...", "fix": "...", "url": "..."},
+//!  "findings": [], "data": {}}
+//! ```
+//!
 //! `file`, `line`, `column` appear when the finding is about a place in the code;
 //! `edits` when `giong fix` can apply the fix (all of them, or none);
 //! `data` holds what the command found besides problems (the driver it probed, the
@@ -200,6 +209,9 @@ pub struct Report {
     data: Map<String, Value>,
     /// Lines for people, printed before the findings (text mode only).
     lines: Vec<String>,
+    /// Nothing is printed at the end (a command that spoke on its own,
+    /// such as `mcp`).
+    quiet: bool,
 }
 
 impl Report {
@@ -209,7 +221,14 @@ impl Report {
             findings: Vec::new(),
             data: Map::new(),
             lines: Vec::new(),
+            quiet: false,
         }
+    }
+
+    /// A report that prints nothing when the command ends.
+    pub fn quiet(mut self) -> Report {
+        self.quiet = true;
+        self
     }
 
     pub fn push(&mut self, finding: Finding) {
@@ -285,6 +304,9 @@ impl Report {
 
     /// Prints the report and gives the exit status.
     pub fn finish(self, json: bool) -> ExitCode {
+        if self.quiet {
+            return ExitCode::SUCCESS;
+        }
         let text = if json {
             format!("{}\n", self.to_json())
         } else {
@@ -318,9 +340,10 @@ pub fn fail(command: &str, failure: &Failure, json: bool) -> ExitCode {
             "findings": [],
             "data": {},
         });
-        println!("{doc}");
+        // A closed pipe is not worth a panic: the exit status still says it.
+        let _ = writeln!(io::stdout().lock(), "{doc}");
     } else {
-        eprintln!("giong: {failure}");
+        let _ = writeln!(io::stderr().lock(), "giong: {failure}");
     }
     ExitCode::from(2)
 }
