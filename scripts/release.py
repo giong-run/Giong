@@ -148,6 +148,27 @@ def workspace_crates():
     return {n: crates[n] for n in order}
 
 
+def lock_files():
+    """Every Cargo.lock in the repository, repo-relative: the workspace's, and those of
+    the separate workspaces under bench/, fuzz/, sim/ and the crates' fuzz/ directories,
+    which take the workspace crates by path. CI builds several of them with --locked."""
+    out = []
+    for p in sorted(ROOT.rglob("Cargo.lock")):
+        rel = p.relative_to(ROOT).as_posix()
+        if rel.startswith("target/") or "/target/" in rel:
+            continue
+        out.append(rel)
+    return out
+
+
+def path_entry_re(crate, version=None):
+    """A Cargo.lock entry for a workspace crate taken by path: no `source` line follows
+    its version (one from crates.io, which a bench may use to compare releases, has one)."""
+    v = re.escape(version) if version else r'[^"]+'
+    return re.compile(r'(^name = "' + re.escape(crate) + r'"\r?\nversion = ")(' + v + r')("\r?\n)(?!source = )',
+                      re.M)
+
+
 def manifest(crate_dir):
     return "Cargo.toml" if crate_dir in (".", "") else f"{crate_dir}/Cargo.toml"
 
@@ -233,11 +254,13 @@ def check_versions():
         for dep, req in re.findall(r'^(' + crate_names_re() + r')\s*=\s*\{[^}]*\bpath\s*=[^}]*\bversion\s*=\s*"([^"]+)"', text, re.M):
             if req != v:
                 problems.append(f"{rel}: the dependency on {dep} asks for {req}, the workspace is at {v}")
-    lock = read("Cargo.lock")
-    for crate in workspace_crates():
-        m = re.search(r'^name = "' + re.escape(crate) + r'"\r?\nversion = "([^"]+)"', lock, re.M)
-        if m and m[1] != v:
-            problems.append(f"Cargo.lock: {crate} is at {m[1]}, the workspace at {v}")
+    for rel in lock_files():
+        lock = read(rel)
+        for crate in workspace_crates():
+            for m in path_entry_re(crate).finditer(lock):
+                if m[2] != v:
+                    problems.append(f"{rel}: {crate} is at {m[2]}, the workspace at {v} "
+                                    "(python3 scripts/release.py sync-locks)")
     return problems
 
 
@@ -411,12 +434,9 @@ def bump_files(old, new, date, commits):
                       lambda m: m[1] + new + '"', text, flags=re.M)
         write(rel, text)
         changed.append(rel)
-    lock = read("Cargo.lock")
-    for crate in workspace_crates():
-        lock = re.sub(r'(^name = "' + re.escape(crate) + r'"\r?\nversion = ")' + re.escape(old) + '"',
-                      lambda m: m[1] + new + '"', lock, flags=re.M)
-    write("Cargo.lock", lock)
-    changed.append("Cargo.lock")
+    # Every Cargo.lock, the separate workspaces' too (bench/, fuzz/, sim/), which CI
+    # builds with --locked: a path entry carries the crate's version.
+    changed += sync_locks(new)
 
     # CHANGELOG.md: Unreleased, with the changelog.d/ entries merged in, becomes the
     # new section, and the entries are deleted.
@@ -462,6 +482,28 @@ def bump_files(old, new, date, commits):
     if problems := check_site():
         fail("\n".join(problems))
     return changed, drafted, short_old if short_old != short_new else None
+
+
+def sync_locks(version):
+    """Set every path entry of a workspace crate in every Cargo.lock to `version`.
+    Returns the files it changed."""
+    changed = []
+    for rel in lock_files():
+        text = before = read(rel)
+        for crate in workspace_crates():
+            text = path_entry_re(crate).sub(lambda m: m[1] + version + m[3], text)
+        if text != before:
+            write(rel, text)
+            changed.append(rel)
+    return changed
+
+
+def cmd_sync_locks(_args):
+    v = workspace_version()
+    changed = sync_locks(v)
+    for rel in changed:
+        print(f"{rel}: workspace crates set to {v}")
+    print(f"ok: {len(lock_files())} Cargo.lock files at {v}")
 
 
 def cmd_prepare(args):
@@ -661,6 +703,7 @@ def main():
     sub.add_parser("unreleased").set_defaults(fn=cmd_unreleased)
     sub.add_parser("version").set_defaults(fn=cmd_version)
     sub.add_parser("crates").set_defaults(fn=cmd_crates)
+    sub.add_parser("sync-locks").set_defaults(fn=cmd_sync_locks)
     pp = sub.add_parser("prepare")
     pp.add_argument("version", nargs="?", default="auto", help="auto, patch, minor, major or X.Y.Z")
     pp.add_argument("--pr", action="store_true", help="commit on release/X.Y.Z, push and open the pull request")

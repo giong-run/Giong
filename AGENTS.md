@@ -141,9 +141,14 @@ scripts/instr.py check       # instructions per operation and heap per idle conn
 
 Continuous integration requires `all-checks` on every pull request, which passes when
 every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`, `test`, `fallback`,
-`tsan` and the jobs named below. A change is done when all of them would pass. A pull
-request is merged through the merge queue, which runs the same jobs once more on `main`
-with the pull request merged, and merges it only if they pass. `main` then moves to the
+`tsan` and the jobs named below. A change is done when all of them would pass. The `plan`
+job (`scripts/ci-scope.py`) picks how much a run does: a pull request ready for review runs
+every job once (each suite one round, two ThreadSanitizer runs), a draft runs a short set
+(lint, msrv, default features, the build, one round of the tests), and a pull request that
+changes no file a build or test reads (the site, `changelog.d/`, prose) runs `lint` and
+`msrv` only. A pull request is merged through the merge queue, which runs every job, with
+every repetition (five rounds, three ThreadSanitizer runs), on `main` with the pull request
+merged, and merges it only if they pass (docs/DEVELOPMENT.md, "CI tiers"). `main` then moves to the
 commit that run tested, so a push to `main` (`.github/workflows/main.yml`) runs the jobs
 again only when no merge queue run passed for that commit, or when the push changes one
 of the two workflows.
@@ -260,7 +265,14 @@ is loaded.
 - **Pull requests in flight conflict in the merge queue.** One that merges first can put
   another out of date while the queue is testing it, and the queue ejects it. Before
   enqueueing, `scripts/preflight.sh --against <open pull requests>` names the files that
-  conflict; the usual ones are README test counts and shared platform files.
+  conflict; the usual ones are README test counts and shared platform files. Two pull
+  requests can also each pass alone and fail together: `bench/instr/baseline.csv` limits
+  are the usual case (both add a little heap to the same path). Merge `main` in and run
+  `scripts/instr.py check` again when the other one lands first.
+- **A push cancels the CI run in progress.** Push a finished step, not each edit: in
+  November 2026 more than half of all pull request runs were cancelled by the next push
+  after running a median of 7 minutes. Iterate locally (`scripts/preflight.sh --quick`, run
+  by the pre-push hook) and as a draft.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that
