@@ -78,7 +78,7 @@ find in the same pull request.
 5. **Pass the gate, `scripts/preflight.sh`, before marking a pull request ready.** It reads the files the
    branch changes and runs every check CI runs that they call for: the merge into `main`,
    `scripts/release.py check`, and when Rust changed fmt, clippy and docs with warnings as
-   errors, the Rust 1.80 check and the tests on io_uring and on epoll (of the crates that
+   errors, the minimum Rust versions (`scripts/msrv.sh`, the same script as CI's `msrv` job) and the tests on io_uring and on epoll (of the crates that
    changed, or of the whole workspace when the runtime did); `scripts/semver.sh` when a
    published crate's code changed; one round of ThreadSanitizer for unsafe code and
    anything that crosses threads; loom for the wake-ups; and every fuzz target of a crate

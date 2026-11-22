@@ -19,7 +19,7 @@
 #
 # What the gate runs, by what changed:
 #   always                    merge into the base, scripts/release.py check
-#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, Rust 1.80 check,
+#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, scripts/msrv.sh,
 #                             the tests on io_uring and on epoll: of the crates that
 #                             changed, or of the whole workspace when the runtime did
 #   a published crate's src   scripts/semver.sh (no breaking change since the release)
@@ -41,7 +41,7 @@ BASE=origin/main
 AGAINST=""
 MODE=gate
 FUZZ_SECS="${FUZZ_SECS:-30}"
-MSRV=1.80.0
+MSRV=$(scripts/msrv.sh versions | head -n 1)   # every MSRV toolchain: scripts/msrv.sh
 SEMVER_CHECKS=0.51.0   # the version CI installs (.github/workflows/ci.yml, job semver)
 # The stable compiler CI pins (RUST_STABLE in .github/workflows/ci.yml): clippy's lints
 # and cargo's behaviour change between releases, so the gate runs the same one.
@@ -50,7 +50,7 @@ STABLE=$(sed -n 's/^  RUST_STABLE: "\(.*\)"$/\1/p' .github/workflows/ci.yml | he
 install_tools() {
     set -e
     rustup toolchain install "$STABLE" --profile minimal -c rustfmt -c clippy
-    rustup toolchain install "$MSRV" --profile minimal
+    for v in $(scripts/msrv.sh versions); do rustup toolchain install "$v" --profile minimal; done
     rustup toolchain install nightly --profile minimal -c rust-src
     rustup component add rustfmt clippy
     cargo install --locked cargo-fuzz
@@ -197,7 +197,7 @@ else
     echo "Tests: ${!CRATES[*]}, on io_uring and on epoll."
 fi
 GATE=()
-[ "$RUST" = 1 ] && GATE+=("Rust $MSRV check")
+[ "$RUST" = 1 ] && GATE+=("MSRV checks (scripts/msrv.sh: $(scripts/msrv.sh versions | paste -sd ' '))")
 [ "$SEMVER" = 1 ] && GATE+=("semver (scripts/semver.sh)")
 [ "$TSAN" = 1 ] && GATE+=("ThreadSanitizer, one round (scripts/check.sh tsan)")
 [ "$LOOM" = 1 ] && GATE+=("loom (scripts/check.sh loom)")
@@ -279,8 +279,9 @@ if [ "$RUST" = 1 ]; then
 fi
 
 if [ "$MODE" = gate ]; then
-    if [ "$RUST" = 1 ] && need "cargo +$MSRV --version" "Rust $MSRV"; then
-        step "Rust $MSRV" cargo +"$MSRV" check --workspace --all-features --quiet
+    if [ "$RUST" = 1 ] && need "scripts/msrv.sh versions | while read -r v; do cargo +\$v --version || exit 1; done" \
+        "Rust $(scripts/msrv.sh versions | paste -sd ' ')"; then
+        step "MSRV (scripts/msrv.sh)" scripts/msrv.sh
     fi
     if [ "$SEMVER" = 1 ] && need "cargo semver-checks --version" "cargo-semver-checks"; then
         step "semver" scripts/semver.sh

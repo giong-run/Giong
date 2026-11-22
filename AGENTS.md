@@ -108,7 +108,7 @@ Run these from the repository root. All tests use loopback; none needs the inter
 scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
 scripts/preflight.sh --quick  # the fast part, while iterating
 scripts/preflight.sh --against 172,173   # also merge with those open pull requests
-scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (CI's pinned stable, 1.80, 1.85, nightly, cargo-fuzz, semver-checks)
 
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
@@ -118,7 +118,7 @@ cargo check -p giong --target x86_64-pc-windows-msvc   # Windows, runtime crate 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo +1.80.0 check --workspace --all-features   # the minimum Rust version, libraries only
+scripts/msrv.sh                     # the minimum Rust versions (1.80, 1.85 for giong-quic), libraries only; CI runs the same
 
 scripts/check.sh test        # release build, every test 5 times; ROUNDS=1 for one pass
 scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1, then on epoll
