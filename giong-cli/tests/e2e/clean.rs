@@ -43,11 +43,88 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A unit that looks like one an older compiler built: a copy of a real
-/// fingerprint directory under a new hash, with another `rustc` value, and
-/// its outputs in deps/.
-fn fake_old_unit(debug: &Path, name: &str, hash: &str) -> Vec<PathBuf> {
-    let fp = debug.join(".fingerprint");
+/// Cargo's two layouts of a build directory: up to Rust 1.9x every unit's
+/// fingerprint sits in `<profile>/.fingerprint/<name>-<hash>/` and its
+/// outputs in `<profile>/deps/`; newer cargo keeps each unit in
+/// `<profile>/build/<name>/<hash>/` (`fingerprint/`, `out/`, ...). The tests
+/// run on whichever the toolchain writes.
+fn new_layout(profile: &Path) -> bool {
+    !profile.join(".fingerprint").is_dir()
+}
+
+/// The directories that hold a unit's fingerprint JSON, in either layout.
+fn unit_dirs(profile: &Path) -> Vec<PathBuf> {
+    if new_layout(profile) {
+        let mut out = Vec::new();
+        for pkg in std::fs::read_dir(profile.join("build"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for unit in std::fs::read_dir(pkg.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                if unit.path().join("fingerprint").is_dir() {
+                    out.push(unit.path());
+                }
+            }
+        }
+        out
+    } else {
+        std::fs::read_dir(profile.join(".fingerprint"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect()
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path, edit_json: &dyn Fn(&mut Value)) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap().flatten() {
+        let src = e.path();
+        let dst = to.join(e.file_name());
+        if src.is_dir() {
+            copy_tree(&src, &dst, edit_json);
+            continue;
+        }
+        let mut bytes = std::fs::read(&src).unwrap();
+        if src.extension().is_some_and(|x| x == "json") {
+            if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
+                edit_json(&mut v);
+                bytes = serde_json::to_vec(&v).unwrap();
+            }
+        }
+        std::fs::write(dst, bytes).unwrap();
+    }
+}
+
+/// A unit that looks like one an older compiler built: a copy of a real unit
+/// under a new hash, with another `rustc` value, and an output of 4 KiB.
+/// Returns every path that must be gone after `giong clean`.
+fn fake_old_unit(profile: &Path, name: &str, hash: &str) -> Vec<PathBuf> {
+    let other_rustc = |v: &mut Value| {
+        if let Some(n) = v["rustc"].as_u64() {
+            v["rustc"] = Value::from(n.wrapping_add(1));
+        }
+    };
+    if new_layout(profile) {
+        let real = profile.join("build").join(name);
+        let real = std::fs::read_dir(&real)
+            .unwrap_or_else(|e| panic!("no unit of {name} in {}: {e}", real.display()))
+            .flatten()
+            .find(|e| e.path().join("fingerprint").is_dir())
+            .expect("a real unit")
+            .path();
+        let fake = profile.join("build").join(name).join(hash);
+        copy_tree(&real, &fake, &other_rustc);
+        std::fs::create_dir_all(fake.join("out")).unwrap();
+        std::fs::write(fake.join("out/lib.rlib"), vec![0u8; 4096]).unwrap();
+        return vec![fake];
+    }
+    let fp = profile.join(".fingerprint");
     let real = std::fs::read_dir(&fp)
         .unwrap()
         .flatten()
@@ -55,21 +132,21 @@ fn fake_old_unit(debug: &Path, name: &str, hash: &str) -> Vec<PathBuf> {
         .expect("a real unit")
         .path();
     let fake = fp.join(format!("{name}-{hash}"));
-    std::fs::create_dir_all(&fake).unwrap();
-    for e in std::fs::read_dir(&real).unwrap().flatten() {
-        let mut bytes = std::fs::read(e.path()).unwrap();
-        if e.path().extension().is_some_and(|x| x == "json") {
-            let mut v: Value = serde_json::from_slice(&bytes).unwrap();
-            v["rustc"] = Value::from(v["rustc"].as_u64().unwrap().wrapping_add(1));
-            bytes = serde_json::to_vec(&v).unwrap();
-        }
-        std::fs::write(fake.join(e.file_name()), bytes).unwrap();
-    }
-    let lib = debug.join(format!("deps/lib{name}-{hash}.rlib"));
-    let dep = debug.join(format!("deps/{name}-{hash}.d"));
+    copy_tree(&real, &fake, &other_rustc);
+    let lib = profile.join(format!("deps/lib{name}-{hash}.rlib"));
+    let dep = profile.join(format!("deps/{name}-{hash}.d"));
     std::fs::write(&lib, vec![0u8; 4096]).unwrap();
     std::fs::write(&dep, "x").unwrap();
     vec![fake, lib, dep]
+}
+
+/// Where a stale unit's output may be a symlink, in either layout.
+fn stale_output_path(profile: &Path, name: &str, hash: &str, stale: &[PathBuf]) -> PathBuf {
+    if new_layout(profile) {
+        stale[0].join("out/linked")
+    } else {
+        profile.join(format!("build/{name}-{hash}"))
+    }
 }
 
 fn set_old(path: &Path, days: u64) {
@@ -221,7 +298,7 @@ fn a_symlink_inside_target_is_removed_not_followed() {
     let precious = dir.write("precious/data.txt", "do not delete");
     let stale = fake_old_unit(&debug, "linky", "0f0f0f0f0f0f0f0f");
     // A unit output that is a symlink to a directory outside target/.
-    let link = debug.join("build/linky-0f0f0f0f0f0f0f0f");
+    let link = stale_output_path(&debug, "linky", "0f0f0f0f0f0f0f0f", &stale);
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(precious.parent().unwrap(), &link).unwrap();
     let v = giong(["clean", "--json"])
@@ -380,10 +457,9 @@ fn days_keeps_units_rebuilt_today() {
     let dir = TempDir::new("clean-days-today");
     new_package(&dir, "today", "");
     build(dir.path());
-    let fp = dir.join("target/debug/.fingerprint");
-    for e in std::fs::read_dir(&fp).unwrap().flatten() {
+    for unit in unit_dirs(&dir.join("target/debug")) {
         // Only the directory: as if the unit was first built 60 days ago.
-        let f = std::fs::File::open(e.path()).unwrap();
+        let f = std::fs::File::open(unit).unwrap();
         let _ = f.set_modified(SystemTime::now() - Duration::from_secs(60 * 86_400));
     }
     dir.write(

@@ -38,10 +38,18 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
+            toolchain: stable
             slow: "1"
+          # Cargo before its new build-dir layout (units in .fingerprint/
+          # and deps/): giong clean must handle both.
+          - os: ubuntu-24.04
+            toolchain: "1.97.0"
+            slow: "0"
           - os: macos-15
+            toolchain: stable
             slow: "1"
           - os: windows-2025
+            toolchain: stable
             slow: "0"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -51,7 +59,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.toolchain }}
       - name: Unit and end-to-end tests
         run: cargo test -p giong-cli --all-targets
       - name: Known bugs (allowed to fail)
@@ -66,7 +74,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "### Known-bug tests on ${{ matrix.os }}"
+            echo "### Known-bug tests on ${{ matrix.os }} (${{ matrix.toolchain }})"
             if [ -f known.log ]; then
               echo
               echo "Still failing (the bug is not fixed):"
