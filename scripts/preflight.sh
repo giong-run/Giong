@@ -309,4 +309,4 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 [ "$MODE" = quick ] && echo "Quick mode: run scripts/preflight.sh without --quick before pushing."
-echo "CI runs every job on the pull request and again in the merge queue."
+echo "CI runs every job once when the pull request is ready for review, and all of them, repeated, in the merge queue."
