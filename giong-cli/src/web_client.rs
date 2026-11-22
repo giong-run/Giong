@@ -586,7 +586,11 @@ mod tests {
         assert!(got.starts_with("POST /api/u?x=1 HTTP/1.1\r\n"), "{got}");
         assert!(got.contains(&format!("Host: {addr}\r\n")), "{got}");
         assert!(got.contains("Content-Length: 2\r\n"), "{got}");
-        assert!(!got.contains("evil") && !got.contains("999"), "{got}");
+        // Header lines, not the whole text: the port itself may hold "999".
+        assert!(!got.contains("Host: evil\r\n"), "{got}");
+        assert!(!got.contains("content-length: 999\r\n"), "{got}");
+        assert_eq!(got.matches("Host: ").count(), 1, "{got}");
+        assert_eq!(got.to_ascii_lowercase().matches("content-length: ").count(), 1, "{got}");
         assert!(got.contains("content-type: application/json\r\n"), "{got}");
     }
 
