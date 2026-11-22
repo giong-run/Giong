@@ -811,6 +811,61 @@ fn a_stuck_file_operation_does_not_hold_up_the_others() {
     drop(writer.join().unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no mkfifo")]
+fn a_full_pool_of_stuck_file_operations_does_not_hold_up_the_others() {
+    // On epoll, file operations run on the process's blocking threads, at
+    // most 64 of them. With 64 opens of FIFOs that have no writer, every
+    // thread was stuck and every other file operation of the process waited
+    // behind them for good.
+    const OPENS: usize = 64;
+    let dir = TempDir::new("pool-stuck");
+    let paths: Vec<PathBuf> = (0..OPENS).map(|i| dir.path(&i.to_string())).collect();
+    for path in &paths {
+        let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let plain = dir.path("plain");
+    std::fs::write(&plain, b"hello").unwrap();
+    let opens = paths.clone();
+    giong::Builder::new()
+        .driver(READINESS)
+        .block_on(async move {
+            let handles: Vec<_> = opens
+                .into_iter()
+                .map(|path| giong::spawn(async move { File::open(path).await.map(drop) }))
+                .collect();
+            // Time for every open to reach a thread and block there.
+            giong::time::sleep(Duration::from_millis(200)).await;
+            let start = Instant::now();
+            let read = timeout(Duration::from_secs(5), fs::read(&plain)).await;
+            assert!(
+                matches!(&read, Ok(Ok(data)) if data == b"hello"),
+                "a read behind 64 stuck opens did not complete after {:?}: {read:?}",
+                start.elapsed()
+            );
+            // Let the opens finish: a FIFO opened for reading and writing has
+            // a writer.
+            let ends: Vec<std::fs::File> = paths
+                .iter()
+                .map(|path| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+            drop(ends);
+        })
+        .unwrap();
+}
+
 #[test]
 fn files_work_on_every_worker() {
     let dir = TempDir::new("workers");
