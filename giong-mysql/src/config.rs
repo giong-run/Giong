@@ -218,7 +218,10 @@ impl Config {
     /// `value` is SQL, so a string needs quotes:
     /// `.session_variable("sql_mode", "'STRICT_ALL_TABLES'")` or
     /// `.session_variable("transaction_isolation", "'READ-COMMITTED'")`. The
-    /// name must be a plain identifier. They are set again whenever a pooled
+    /// value must be one expression: a `;`, a comment, a backslash or a `,`
+    /// outside quotes and parentheses is refused when connecting, so that a
+    /// value cannot set another variable (`'', autocommit = 0`). The name
+    /// must be a plain identifier. They are set again whenever a pooled
     /// connection's session is reset.
     ///
     /// The variables giong-mysql sets itself are refused: the character set
@@ -447,6 +450,13 @@ impl Config {
                      pool when a session changed. Leave it out"
                 )));
             }
+            if let Err(why) = one_expression(value) {
+                return Err(Error::config(format!(
+                    "the value of the session variable {name} {why}: a value is one SQL \
+                     expression, such as 'STRICT_ALL_TABLES' or 5; set each variable with its \
+                     own session_variable call"
+                )));
+            }
             sql.push_str(&format!(", SESSION {name} = {value}"));
         }
         Ok(sql)
@@ -479,6 +489,54 @@ impl FromStr for Config {
     fn from_str(url: &str) -> Result<Self, Error> {
         parse_url(url)
     }
+}
+
+/// Checks that `value` is one SQL expression, so that it cannot end the
+/// `SET` it is put in (`;`), set another variable (`, autocommit = 0`, which
+/// would bypass the variables refused above) or comment out the rest.
+/// Commas inside parentheses and quotes are fine. A backslash is refused:
+/// whether it escapes a quote depends on the server's `sql_mode`.
+fn one_expression(value: &str) -> Result<(), &'static str> {
+    let b = value.as_bytes();
+    let (mut depth, mut i) = (0usize, 0);
+    if value.trim().is_empty() {
+        return Err("is empty");
+    }
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                // A doubled quote stands for itself inside the string.
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return Err("has a quote that is not closed"),
+                        Some(&c) if c == q && b.get(i + 1) == Some(&q) => i += 2,
+                        Some(&c) if c == q => break,
+                        Some(b'\\') => return Err("holds a backslash"),
+                        Some(_) => i += 1,
+                    }
+                }
+            }
+            b'\\' => return Err("holds a backslash"),
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or("has a ')' that closes nothing")?
+            }
+            b';' => return Err("holds a ';'"),
+            b',' if depth == 0 => return Err("holds a ',' outside parentheses and quotes"),
+            b'#' => return Err("holds a comment"),
+            b'-' if b.get(i + 1) == Some(&b'-') => return Err("holds a comment"),
+            b'/' if b.get(i + 1) == Some(&b'*') => return Err("holds a comment"),
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return Err("has a '(' that is not closed");
+    }
+    Ok(())
 }
 
 fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
@@ -811,6 +869,35 @@ mod tests {
             let c = Config::new().session_variable(name, "1");
             let e = c.session_sql(Server::MySql).unwrap_err().to_string();
             assert!(e.contains("Leave it out"), "{name}: {e}");
+        }
+        // A value is one expression: it cannot set a refused variable after
+        // a comma, end the SET or comment out the rest.
+        for value in [
+            "'', autocommit = 0",
+            "1; SET autocommit = 0",
+            "1 -- x",
+            "1 # x",
+            "1 /* x */",
+            "'a\\', autocommit = 0 -- '",
+            "'open",
+            "(1",
+            "1)",
+            "",
+        ] {
+            let c = Config::new().session_variable("sql_mode", value);
+            let e = c.session_sql(Server::MySql).unwrap_err().to_string();
+            assert!(e.contains("one SQL expression"), "{value:?}: {e}");
+        }
+        for value in [
+            "'STRICT_ALL_TABLES,NO_ZERO_DATE'",
+            "CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
+            "'it''s'",
+            "`x`",
+            "5",
+            "@@GLOBAL.sql_mode",
+        ] {
+            let c = Config::new().session_variable("sql_mode", value);
+            assert!(c.session_sql(Server::MySql).is_ok(), "{value:?}");
         }
         let lock = Config::new().session_variable("lock_wait_timeout", "5");
         assert!(lock.session_sql(Server::MySql).is_ok());
