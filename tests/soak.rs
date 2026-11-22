@@ -628,7 +628,9 @@ fn open_handles() -> BTreeMap<usize, String> {
     handles
 }
 
-/// The descriptors or handles open now that were not in `before`.
+/// The descriptors or handles open now that were not in `before`, and on
+/// Windows the threads alive now: a handle a thread holds for itself (an
+/// event Winsock or giong keeps per thread) goes with its thread.
 fn new_handles(before: &BTreeMap<usize, String>) -> String {
     let now = open_handles();
     let new: Vec<String> = now
@@ -636,7 +638,73 @@ fn new_handles(before: &BTreeMap<usize, String>) -> String {
         .filter(|(n, what)| before.get(n) != Some(what))
         .map(|(n, what)| format!("{n:#x} {what}"))
         .collect();
-    format!("[{}]", new.join(", "))
+    #[cfg(unix)]
+    let threads = String::new();
+    #[cfg(windows)]
+    let threads = format!("; threads alive: {}", live_threads().join(", "));
+    format!("[{}]{threads}", new.join(", "))
+}
+
+/// The threads of this process, by id and name (unnamed: `-`).
+#[cfg(windows)]
+fn live_threads() -> Vec<String> {
+    #[repr(C)]
+    struct ThreadEntry {
+        size: u32,
+        usage: u32,
+        thread: u32,
+        owner: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> isize;
+        fn Thread32First(snapshot: isize, entry: *mut ThreadEntry) -> i32;
+        fn Thread32Next(snapshot: isize, entry: *mut ThreadEntry) -> i32;
+        fn OpenThread(access: u32, inherit: i32, thread: u32) -> isize;
+        fn GetThreadDescription(thread: isize, description: *mut *mut u16) -> i32;
+        fn LocalFree(memory: *mut u16) -> *mut u16;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const TH32CS_SNAPTHREAD: u32 = 4;
+    const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x800;
+    let pid = std::process::id();
+    let mut threads = Vec::new();
+    // SAFETY: plain calls with an entry of the size it says; the snapshot,
+    // each thread handle and each description are freed once read.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == -1 {
+            return threads;
+        }
+        let mut entry = std::mem::zeroed::<ThreadEntry>();
+        entry.size = std::mem::size_of::<ThreadEntry>() as u32;
+        let mut more = Thread32First(snapshot, &mut entry) != 0;
+        while more {
+            if entry.owner == pid {
+                let mut name = String::from("-");
+                let thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, entry.thread);
+                if thread != 0 {
+                    let mut text = std::ptr::null_mut();
+                    if GetThreadDescription(thread, &mut text) >= 0 && !text.is_null() {
+                        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+                        let read = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                        if !read.is_empty() {
+                            name = read;
+                        }
+                        LocalFree(text);
+                    }
+                    CloseHandle(thread);
+                }
+                threads.push(format!("{} {name}", entry.thread));
+            }
+            more = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    threads
 }
 
 /// The descriptor count once it is back to `before` or below, or after 15
@@ -678,6 +746,8 @@ fn soak() {
     run(workers, 5);
     let fds_before = open_fds();
     let handles_before = open_handles();
+    #[cfg(windows)]
+    eprintln!("soak: threads before: {}", live_threads().join(", "));
     let (counters, samples, idle) = run(workers, secs);
 
     let c = &counters;
