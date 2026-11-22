@@ -878,6 +878,7 @@ impl Dev {
     }
 
     /// The old build gets SIGTERM and `--grace` to finish.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     fn retire(&mut self, mut old: Service) {
         #[cfg(unix)]
         Self::stop_accepting(&mut old);

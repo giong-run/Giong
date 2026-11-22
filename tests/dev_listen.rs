@@ -112,14 +112,26 @@ fn restarts_share_the_socket_and_refuse_nothing() {
             .unwrap();
         // Two workers, each binding twice: four bytes.
         let mut got = [0u8; 4];
-        if let Err(e) = ours.read_exact(&mut got) {
+        let mut have = 0;
+        let read = loop {
+            if have == got.len() {
+                break Ok(());
+            }
+            match ours.read(&mut got[have..]) {
+                Ok(0) => break Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => have += n,
+                Err(e) => break Err(e),
+            }
+        };
+        if let Err(e) = read {
             let status = service.0.try_wait();
             let _ = service.0.kill();
             let mut err = String::new();
             let _ = service.0.stderr.take().unwrap().read_to_string(&mut err);
             panic!(
-                "round {round}: the build did not report its binds ({e}); \
-                 it had {status:?}; its standard error:\n{err}"
+                "round {round}: the build reported {have} of 4 binds ({:?}), then {e}; \
+                 it had {status:?}; its standard error:\n{err}",
+                &got[..have]
             );
         }
         assert_eq!(&got, b"\n\n\n\n", "round {round}");
