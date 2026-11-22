@@ -194,8 +194,30 @@ struct Conn {
 /// while none of them on the connection succeeds.
 const LIMIT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The longest pause between prepares tried at the limit.
+/// The longest pause between the first prepares tried at the limit.
 const LIMIT_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The longest pause once [`LIMIT_QUICK_TRIES`] have failed: the limit is
+/// then held by other clients for a while, and a slower pace leaves the
+/// server's time to them.
+const LIMIT_PAUSE_LONG: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Tries at the limit paced by [`LIMIT_PAUSE`] before [`LIMIT_PAUSE_LONG`].
+const LIMIT_QUICK_TRIES: u32 = 6;
+
+/// `pause`, less a random part of up to half of it, so that connections
+/// (of this process and of others) that met the limit together do not all
+/// try again at the same moment.
+fn jittered(pause: std::time::Duration) -> std::time::Duration {
+    use std::hash::{BuildHasher, Hasher};
+    // Not for secrets: only spreads the tries. The standard library seeds
+    // each RandomState differently.
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let half = pause / 2;
+    pause - half.mul_f64((seed % 1024) as f64 / 1024.0)
+}
 
 /// A turn that tasks take one at a time, first come first served.
 #[derive(Default)]
@@ -1087,7 +1109,8 @@ impl Conn {
     /// When the server holds as many prepared statements as it allows, for
     /// all its clients together, prepares on this connection take turns:
     /// each closes the statements the connection is not using and tries
-    /// again, pausing between tries, until it gets its statement or no
+    /// again, pausing between tries (1 ms doubling to 20 ms, then to 100 ms,
+    /// each less a random part of up to half), until it gets its statement or no
     /// prepare on the connection has succeeded for [`LIMIT_PATIENCE`].
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
         if self.turn.busy() && !self.is_cached(sql) {
@@ -1125,7 +1148,9 @@ impl Conn {
         let _turn = self.turn.take().await;
         let mut pause = std::time::Duration::from_millis(1);
         let mut closed = 0;
+        let mut tries = 0u32;
         loop {
+            tries += 1;
             closed += self.close_unused();
             let again = match self.statement_once(sql).await {
                 Ok(stmt) => {
@@ -1137,7 +1162,8 @@ impl Conn {
             };
             let since = self.turn_progress.get().map_or(entered, |p| p.max(entered));
             let now = giong::time::Instant::now();
-            if now + pause > since + LIMIT_PATIENCE {
+            let wait = jittered(pause);
+            if now + wait > since + LIMIT_PATIENCE {
                 let db = again.db().cloned().expect("a server error");
                 let first = first.take().unwrap_or(again);
                 return Err(Error::with_db(
@@ -1154,8 +1180,13 @@ impl Conn {
                     db,
                 ));
             }
-            giong::time::sleep(pause).await;
-            pause = (pause * 2).min(LIMIT_PAUSE);
+            giong::time::sleep(wait).await;
+            let cap = if tries < LIMIT_QUICK_TRIES {
+                LIMIT_PAUSE
+            } else {
+                LIMIT_PAUSE_LONG
+            };
+            pause = (pause * 2).min(cap);
         }
     }
 
@@ -1920,6 +1951,17 @@ impl std::fmt::Debug for CancelToken {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pauses_at_the_limit_are_spread_over_their_second_half() {
+        let pause = std::time::Duration::from_millis(100);
+        let waits: std::collections::HashSet<_> = (0..64).map(|_| jittered(pause)).collect();
+        assert!(
+            waits.iter().all(|w| *w >= pause / 2 && *w <= pause),
+            "{waits:?}"
+        );
+        assert!(waits.len() > 8, "{waits:?}");
+    }
 
     #[test]
     fn the_turn_goes_in_order_and_skips_tasks_that_gave_up() {
