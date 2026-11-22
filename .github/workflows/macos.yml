@@ -86,9 +86,10 @@ jobs:
         with:
           toolchain: nightly
           components: rust-src
-      # The two signal tests are skipped as on Linux: TSan holds a signal
+      # The signal tests are skipped as on Linux: TSan holds a signal
       # back until the thread next calls a function it intercepts, and a
       # worker waiting in kevent calls none.
       - run: >
           cargo test -Zbuild-std --target aarch64-apple-darwin -p giong --all-features --tests
           -- --skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned
+          --skip a_second_signal_ends_a_process_whose_shutdown_hangs

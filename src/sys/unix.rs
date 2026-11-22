@@ -5,7 +5,7 @@
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 use crate::error::Code;
 
@@ -166,9 +166,33 @@ static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
 /// Set while a runtime has the handlers installed.
 static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
+/// Signals seen since the handlers were installed.
+static SIGNALS_SEEN: AtomicUsize = AtomicUsize::new(0);
 
-/// Async-signal-safe: only `write(2)`, with `errno` preserved.
-extern "C" fn on_signal(_signal: libc::c_int) {
+/// Async-signal-safe: only `write(2)`, with `errno` preserved, and for a
+/// second signal `getpid(2)`, `sigaction(2)` and `raise(3)` or `_exit(2)`.
+extern "C" fn on_signal(signal: libc::c_int) {
+    if SIGNALS_SEEN.fetch_add(1, Ordering::Relaxed) > 0 {
+        // The shutdown the first signal asked for has not finished: do what
+        // the signal does with no handler, and end the process. The signal
+        // stays blocked while this handler runs, so it is delivered, with
+        // its default action, as the handler returns. Process 1 (the
+        // program a container runs) is not ended by a signal's default
+        // action, so it exits with the status a shell gives a process the
+        // signal ended.
+        // SAFETY: all four calls are async-signal-safe; the action is valid.
+        unsafe {
+            if libc::getpid() == 1 {
+                libc::_exit(128 + signal);
+            }
+            let mut action: libc::sigaction = mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+            libc::raise(signal);
+        }
+        return;
+    }
     let fd = SIGNAL_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let errno = super::errno_location();
@@ -222,6 +246,7 @@ impl SignalGuard {
             }
             // Forget signals that arrived while nobody was listening.
             super::drain(fd);
+            SIGNALS_SEEN.store(0, Ordering::SeqCst);
 
             let mut action: libc::sigaction = mem::zeroed();
             action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;

@@ -1132,6 +1132,10 @@ impl Builder {
 
     /// Request a runtime shutdown when the process receives SIGINT or SIGTERM
     /// (default: `false`). Only applies to [`Runtime::run`].
+    ///
+    /// A second SIGINT or SIGTERM ends the process at once, as it would
+    /// with no handler: a shutdown that hangs, or a main future that never
+    /// returns, can still be stopped with a second Ctrl-C.
     pub fn shutdown_on_signals(mut self, enable: bool) -> Self {
         self.signals = enable;
         self

@@ -539,6 +539,89 @@ fn sigterm_still_works_after_worker_0_returned() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
+fn a_second_signal_ends_a_process_whose_shutdown_hangs() {
+    // The handlers took every SIGINT and SIGTERM: once a shutdown had been
+    // asked for, a main future that never returned kept the process running,
+    // and Ctrl-C could no longer stop it.
+    if std::env::var_os("GIONG_SIGNAL_CHILD_HANG").is_some() {
+        giong::Builder::new()
+            .workers(2)
+            .shutdown_on_signals(true)
+            .build()
+            .unwrap()
+            .run(|index| async move {
+                if index == 0 {
+                    println!("ready");
+                    giong::shutdown_signal().await;
+                    println!("shutdown asked");
+                }
+                // Never answers the shutdown.
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        println!("clean exit");
+        return;
+    }
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(exe)
+        .args([
+            "--exact",
+            "a_second_signal_ends_a_process_whose_shutdown_hangs",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("GIONG_SIGNAL_CHILD_HANG", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert!(
+        lines.by_ref().any(|l| l.unwrap().contains("ready")),
+        "child never became ready"
+    );
+    // SAFETY: kill with the child's pid.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert!(
+        lines
+            .by_ref()
+            .any(|l| l.unwrap().contains("shutdown asked")),
+        "the first SIGTERM did not ask for a shutdown"
+    );
+    // The first signal only asks: the process is still running.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the first SIGTERM ended the process"
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
+    let status = status.unwrap_or_else(|| panic!("the second SIGTERM was ignored: {rest:?}"));
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "{status:?}, output: {rest:?}"
+    );
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down() {
