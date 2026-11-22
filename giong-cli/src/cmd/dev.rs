@@ -279,6 +279,9 @@ impl Dev {
     /// that takes them).
     fn bind(&mut self, listen: Vec<SocketAddr>) -> Result<(), Failure> {
         if listen.is_empty() {
+            if self.once {
+                return Ok(());
+            }
             self.say(
                 "note",
                 "no LISTEN address (in --listen, the environment or .env): each restart stops \
@@ -682,6 +685,11 @@ impl Dev {
         let until = Instant::now() + Duration::from_millis(300);
         while Instant::now() < until {
             if let Ok(Some(status)) = service.child.try_wait() {
+                // With --once, a program that finishes its work at once and
+                // succeeds is a run like any other.
+                if self.once && status.success() {
+                    break;
+                }
                 return Err(self.exited_finding(&service, Some(status)));
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -745,6 +753,9 @@ impl Dev {
                 settle_until = Some(Instant::now() + SETTLE_AFTER_READY);
             }
             if let Ok(Some(status)) = service.child.try_wait() {
+                if self.once && status.success() {
+                    return Ok(binds);
+                }
                 return Err(self.exited_finding(service, Some(status)));
             }
             if settle_until.is_some_and(|t| Instant::now() >= t) {
@@ -935,9 +946,14 @@ impl Dev {
     fn service_ended(&mut self, service: &Service, status: Option<ExitStatus>) {
         let _ = fs::remove_file(&service.mcp);
         if status.is_some_and(|s| s.success()) {
+            let then = if self.once {
+                ""
+            } else {
+                "; save a file to start it again"
+            };
             self.say(
                 "exited",
-                "the service exited (status 0); save a file to start it again".into(),
+                format!("the service exited (status 0){then}"),
                 json!({"pid": service.pid, "code": 0}),
             );
             return;
@@ -947,7 +963,11 @@ impl Dev {
         let finding = self.exited_finding(service, status);
         self.say(
             "exited",
-            format!("{}; fix it and save to start it again", finding.title),
+            if self.once {
+                finding.title.clone()
+            } else {
+                format!("{}; fix it and save to start it again", finding.title)
+            },
             json!({"pid": service.pid, "code": status.and_then(|s| s.code()), "finding": finding.to_json()}),
         );
         self.report.push(finding);
