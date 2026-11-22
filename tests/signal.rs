@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Signals as streams. In a test binary of their own: handlers are
 //! process-wide.
 

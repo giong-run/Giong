@@ -1,6 +1,9 @@
 //! Choosing where new work starts: `Handle::spawn_balanced` and
 //! `Handle::least_loaded_worker`.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};

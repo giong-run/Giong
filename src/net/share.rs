@@ -135,6 +135,9 @@ impl Held {
             // A socket that no longer listens does not conflict with one
             // that sets `SO_REUSEADDR`, as every listener does.
             Proto::Tcp => drop(sock.shutdown(Shutdown::Both)),
+            // Windows closes a socket at once, and its sockets are bound
+            // exclusively, which the option cannot be set on.
+            Proto::Udp if cfg!(windows) => {}
             Proto::Udp => {
                 drop(sock.set_reuse_address(true));
                 // Until it is closed, the socket is still a member of the
@@ -191,9 +194,19 @@ pub(crate) fn bind(
     // it off: with `SO_REUSEADDR`, any user's socket that sets it too could
     // bind the port and receive its datagrams. `SO_REUSEPORT` is for sockets
     // of the same user.
-    if proto == Proto::Tcp {
+    //
+    // Not on Windows: `SO_REUSEADDR` there lets a second socket bind a
+    // port that is being listened on and take its connections, and a
+    // closed listener's port is free again at once without it.
+    if proto == Proto::Tcp && cfg!(unix) {
         sock.set_reuse_address(true)?;
     }
+    // Nor can another socket that sets `SO_REUSEADDR` bind over this one
+    // there (a more specific address on the same port, which would take
+    // its connections or datagrams): Windows refuses that only for a
+    // socket bound with `SO_EXCLUSIVEADDRUSE`.
+    #[cfg(windows)]
+    crate::sys::set_exclusive_address(&sock)?;
     if !share {
         sock.bind(&addr.into())?;
         check_bound(&sock, addr)?;
@@ -212,7 +225,7 @@ pub(crate) fn bind(
     if first {
         bind_first(proto, &sock, addr, known.released)?;
     } else {
-        sock.set_reuse_port(true)?;
+        set_reuse_port(&sock)?;
         sock.bind(&addr.into())?;
         check_bound(&sock, addr)?;
     }
@@ -285,6 +298,20 @@ fn bind_shared(
     ))
 }
 
+/// Lets the other workers' sockets bind the port `sock` binds.
+#[cfg(unix)]
+fn set_reuse_port(sock: &Socket) -> io::Result<()> {
+    sock.set_reuse_port(true)
+}
+
+/// Windows has no `SO_REUSEPORT`: a port has one socket there, which the
+/// workers' listeners and UDP sockets share as handles to it (see
+/// `net::spread` and `net::udp::spread`); only the first of them binds.
+#[cfg(windows)]
+fn set_reuse_port(_sock: &Socket) -> io::Result<()> {
+    Ok(())
+}
+
 /// Binds the first socket of a port in this process: without
 /// `SO_REUSEPORT`, so that the bind fails with `EADDRINUSE` when a socket
 /// that is not one of this process's released ones holds `addr`, then sets
@@ -296,7 +323,7 @@ fn bind_first(proto: Proto, sock: &Socket, addr: SocketAddr, released: bool) -> 
     // pass another process's socket that sets it, so it is set only while
     // this process may have released sockets on the port, and only for the
     // bind.
-    let marked = proto == Proto::Udp && released;
+    let marked = proto == Proto::Udp && released && cfg!(unix);
     if marked {
         sock.set_reuse_address(true)?;
     }
@@ -304,7 +331,7 @@ fn bind_first(proto: Proto, sock: &Socket, addr: SocketAddr, released: bool) -> 
     check_bound(sock, addr)?;
     // The kernel looks at both options as they are when a later socket
     // binds, so the next worker joins this one.
-    sock.set_reuse_port(true)?;
+    set_reuse_port(sock)?;
     if marked {
         sock.set_reuse_address(false)?;
     }

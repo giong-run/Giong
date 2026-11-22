@@ -199,7 +199,8 @@ is loaded.
 3. **`unsafe`** only with a `// SAFETY:` comment saying why it is sound, a test that would
    catch misuse, and clean `scripts/check.sh tsan` and `scripts/valgrind.sh` runs.
 4. **No new dependency** without a reason stated in the pull request. The runtime depends
-   on `io-uring`, `libc` and `socket2` only.
+   on `socket2`, plus `libc` on Unix, `io-uring` on Linux and `windows-sys` on Windows,
+   and nothing else.
 5. **Public items are documented.** Futures are not `Send` by design: tasks stay on their
    worker, and `Rc`/`RefCell` are fine. Buffers are passed by value and handed back, as in
    `write_all(buf)` returning `(io::Result<()>, buf)`.
