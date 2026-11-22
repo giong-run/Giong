@@ -284,3 +284,8 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |
 | [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
 | [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
+| [GIONG-E5060](E5060.md) | `BenchTarget` | the service to measure cannot be reached |
+| [GIONG-E5061](E5061.md) | `BenchAgainst` | the build to compare against cannot be made |
+| [GIONG-E5062](E5062.md) | `BenchGeneratorBehind` | the load generator fell behind its schedule |
+| [GIONG-E5063](E5063.md) | `BenchErrors` | requests failed during the benchmark |
+| [GIONG-E5064](E5064.md) | `BenchRegression` | the change is slower than the build it is compared with |

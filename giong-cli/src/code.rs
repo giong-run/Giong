@@ -71,6 +71,11 @@ codes! {
     MCP_TOOL_ERROR = 5052, "McpToolError", "the service's giong-mcp refused a call";
     WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";
     SERVICE_WARNING = 5056, "ServiceWarning", "the service reports a warning";
+    BENCH_TARGET = 5060, "BenchTarget", "the service to measure cannot be reached";
+    BENCH_AGAINST = 5061, "BenchAgainst", "the build to compare against cannot be made";
+    BENCH_GENERATOR_BEHIND = 5062, "BenchGeneratorBehind", "the load generator fell behind its schedule";
+    BENCH_ERRORS = 5063, "BenchErrors", "requests failed during the benchmark";
+    BENCH_REGRESSION = 5064, "BenchRegression", "the change is slower than the build it is compared with";
 }
 
 impl Code {

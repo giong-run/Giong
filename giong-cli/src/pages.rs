@@ -2985,4 +2985,80 @@ giong-mcp's `overview` listed a warning other than a stuck worker: workers that 
 
 [All error codes](README.md)
 "#),
+    (5060, r#"# GIONG-E5060: the service to measure cannot be reached
+
+Raised by the `giong` command (giong-cli): `giong bench`. In JSON output: `"code": "GIONG-E5060"`.
+
+## What happened
+
+`giong bench` could not measure the service: the URL is not a plain `http://` URL, its host does not resolve, nothing answers there, the service it started did not listen on the address in `LISTEN` in time, or the service exited during a round. The message names which, with the last lines of the service's log (`.giong/bench/service.log`).
+
+## How to fix it
+
+- Give a URL like `http://127.0.0.1:8080/`. HTTPS is not measured: start the service without `TLS_CERT` and `TLS_KEY` for the benchmark.
+- When `giong bench` starts the service, the service must listen on the address in `LISTEN` (services made by `giong new` do). Otherwise start it yourself and give its URL: `giong bench http://127.0.0.1:8080/`.
+- If the service exited, read `.giong/bench/service.log`: a missing `DATABASE_URL` (`giong env check`) or a panic is the usual cause.
+
+[All error codes](README.md)
+"#),
+    (5061, r#"# GIONG-E5061: the build to compare against cannot be made
+
+Raised by the `giong` command (giong-cli): `giong bench --against`. In JSON output: `"code": "GIONG-E5061"`.
+
+## What happened
+
+`--against <ref>` names a git commit, branch or tag to build and measure next to the working tree. The project is not in a git repository, the ref does not name a commit, `git worktree add` failed, or that commit does not build in release mode.
+
+## How to fix it
+
+- Check the ref: `git rev-parse --verify <ref>` must print a commit. Fetch it first if it is a remote branch (`git fetch origin main`, then `--against origin/main`).
+- If the older commit does not build, pick a later one, or build it by hand to see why (the message has cargo's first error).
+
+[All error codes](README.md)
+"#),
+    (5062, r#"# GIONG-E5062: the load generator fell behind its schedule
+
+Raised by the `giong` command (giong-cli): `giong bench` with a fixed rate. In JSON output: `"code": "GIONG-E5062"`.
+
+## What happened
+
+With a fixed rate, every request has a time it is due, and its latency counts from then, so a service that stalls is charged for every request that waited (no coordinated omission). Here the load generator itself woke late: at the 99th percentile it sent requests more than a millisecond after they were due, because the machine is busy (the service and the generator share its cores) or the rate needs more threads than the machine runs well. Those latencies include the generator's own delay.
+
+## How to fix it
+
+- Lower `--rate` or `--conns`, close other programs, or run the generator on another machine against the service's URL.
+- On Linux, a machine without frequency scaling or other load gives steadier numbers; numbers that matter come from the benchmark lab (`bench/lab`), not a laptop.
+
+[All error codes](README.md)
+"#),
+    (5063, r#"# GIONG-E5063: requests failed during the benchmark
+
+Raised by the `giong` command (giong-cli): `giong bench`. In JSON output: `"code": "GIONG-E5063"`.
+
+## What happened
+
+Some requests got no answer (the connection was refused, reset or timed out) or got an error status (4xx or 5xx). Their count is in the report; latencies of answered requests are still reported, but a service that fails fast looks faster than it is. More than 1% failed is an error; fewer is a warning.
+
+## How to fix it
+
+- Check the path and method: `giong bench --path /health` for a route that exists, `--method POST --data '{...}'` for one that needs a body.
+- Read the service's log (`.giong/bench/service.log` when `giong bench` started it): a pool too small for `--conns`, a database that is not up, or a timeout shorter than the service's work (`--timeout`).
+
+[All error codes](README.md)
+"#),
+    (5064, r#"# GIONG-E5064: the change is slower than the build it is compared with
+
+Raised by the `giong` command (giong-cli): `giong bench --against <ref> --max-regression <percent>`. In JSON output: `"code": "GIONG-E5064"`.
+
+## What happened
+
+In every round the working tree was slower than the build of `<ref>` (99th percentile latency at a fixed rate, or requests per second with `--rate max`), and the median difference is larger than `--max-regression`. Rounds alternate between the two builds, so a slow machine affects both. With 5 rounds a build (the default), two identical builds would separate in every round by chance less than 1% of the time; `--max-regression` needs at least 3 rounds a build (10%).
+
+## How to fix it
+
+- Profile the change: `giong top --profile` on the running service shows where the time goes.
+- If the slowdown is expected (more work per request), raise `--max-regression` for this comparison and say why in the pull request.
+
+[All error codes](README.md)
+"#),
 ];

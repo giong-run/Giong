@@ -12,9 +12,11 @@ mod args;
 mod cmd;
 mod code;
 mod dotenv;
+mod hist;
 mod host;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
+mod loadgen;
 mod project;
 mod report;
 mod service;
