@@ -7,9 +7,10 @@ use serde_json::{json, Value};
 
 use crate::harness::*;
 
-/// Commands that are not tools: the server itself, the long-running `dev`
-/// (its state is the `dev_status` tool), and the two about giong itself.
-const NOT_TOOLS: &[&str] = &["mcp", "dev", "help", "version"];
+/// Commands that are not tools: the server itself, the ones that serve until
+/// stopped (`dev`, whose state is the `dev_status` tool, and `dashboard`),
+/// and the two about giong itself.
+const NOT_TOOLS: &[&str] = &["mcp", "dev", "dashboard", "help", "version"];
 
 /// Sends `lines` to a fresh `giong mcp` in `dir`, closes its input, and
 /// returns every line it printed, each parsed as JSON.
