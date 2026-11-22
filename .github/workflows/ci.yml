@@ -532,6 +532,28 @@ jobs:
                 "$t" -q
               done'
 
+  # The tests that share a port between workers, the runtime's own and
+  # giong-http's, in a container under gVisor (runsc): GKE Sandbox and many
+  # sandboxes for AI agents run it, and its network stack records SO_REUSEPORT
+  # at the bind, unlike Linux (scripts/gvisor.sh).
+  gvisor:
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - name: Fetch the release build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      - run: scripts/gvisor.sh
+
   # giong-http with its defaults, in a container limited to 128 MiB, under
   # hundreds of uploads that stop one byte short: it must not be OOM-killed,
   # and a well-behaved client mixed in must keep getting answers. One and four
@@ -912,12 +934,12 @@ jobs:
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
   # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
-  # versions, the simulation, musl) hold a merge back as well. When `plan` chose a
+  # versions, the simulation, gVisor, musl) hold a merge back as well. When `plan` chose a
   # short set (a draft, or a pull request that changes no code), the jobs it left
   # out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in the
   # merge queue every job must.
   all-checks:
-    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl]
+    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl]
     if: always()
     runs-on: ubuntu-24.04
     steps:
