@@ -282,51 +282,73 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
     dev.wait_until(
         "the first build to answer",
         Duration::from_secs(600),
-        || get(addr, "/").is_ok_and(|(s, _)| s < 500),
+        || get(addr, "/health").is_ok_and(|(s, _)| s < 500),
     );
-    let (status, body) = get(addr, "/").unwrap();
-    assert!(status < 400, "GET / answered {status}: {body}");
 
-    // The text the handler returns, found in the source, is what we edit.
-    let marker = body
-        .split(|c: char| !(c.is_alphanumeric() || c == ' ' || c == '!' || c == ','))
-        .filter(|s| s.trim().len() >= 4)
-        .max_by_key(|s| s.len())
-        .unwrap_or_else(|| panic!("no text to edit in the body {body:?}"))
-        .trim()
-        .to_string();
-    let files = grep_files(&app.join("src"), "rs", &marker);
-    assert!(!files.is_empty(), "the body text {marker:?} is not in src/");
+    // A route whose answer is a string literal of the source: that literal
+    // is what we edit. Templates differ, so try a few.
+    let (path, marker, files) = PROBES
+        .iter()
+        .find_map(|path| {
+            let (status, body) = get(addr, path).ok()?;
+            if status >= 400 {
+                return None;
+            }
+            let mut words: Vec<&str> = body
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.len() >= 4)
+                .collect();
+            words.sort_by_key(|w| std::cmp::Reverse(w.len()));
+            words.into_iter().find_map(|w| {
+                let marker = format!("\"{w}");
+                let files = grep_files(&app.join("src"), "rs", &marker);
+                (!files.is_empty()).then(|| (*path, marker, files))
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "none of {PROBES:?} answers with a string literal of src/\n{}",
+                dev.log()
+            )
+        });
 
     // A client in a loop, counting failures, from here to the end.
     let stop = Arc::new(AtomicBool::new(false));
     let ok = Arc::new(AtomicU64::new(0));
     let failures = Arc::new(Mutex::new(Vec::<String>::new()));
-    let client = {
-        let (stop, ok, failures) = (stop.clone(), ok.clone(), failures.clone());
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                match get(addr, "/") {
-                    Ok((s, _)) if s < 500 => {
-                        ok.fetch_add(1, Ordering::Relaxed);
+    // Several clients at once, as in a browser with a page open and an agent
+    // probing: a reload must not drop a request that was queued meanwhile.
+    let clients: Vec<_> = (0..4)
+        .map(|_| {
+            let (stop, ok, failures) = (stop.clone(), ok.clone(), failures.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match get(addr, path) {
+                        Ok((s, _)) if s < 500 => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok((s, b)) => failures.lock().unwrap().push(format!("{s} {b}")),
+                        Err(e) => failures.lock().unwrap().push(e),
                     }
-                    Ok((s, b)) => failures.lock().unwrap().push(format!("{s} {b}")),
-                    Err(e) => failures.lock().unwrap().push(e),
                 }
-            }
+            })
         })
-    };
+        .collect();
 
     for round in 1..=3 {
         let new_text = format!("e2e reload {round}");
         for f in &files {
             let t = std::fs::read_to_string(f).unwrap();
-            std::fs::write(f, t.replace(&marker_for(round, &marker), &new_text)).unwrap();
+            std::fs::write(
+                f,
+                t.replace(&marker_for(round, &marker), &format!("\"{new_text}")),
+            )
+            .unwrap();
         }
         dev.wait_until(
             &format!("edit {round} to answer"),
             Duration::from_secs(300),
-            || get(addr, "/").is_ok_and(|(_, b)| b.contains(&new_text)),
+            || get(addr, path).is_ok_and(|(_, b)| b.contains(&new_text)),
         );
     }
     // A build error keeps the old process serving.
@@ -334,14 +356,17 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
     let good = std::fs::read_to_string(&broken).unwrap();
     std::fs::write(&broken, format!("{good}\nfn this_does_not_compile( {{\n")).unwrap();
     std::thread::sleep(Duration::from_secs(5));
-    let (s, b) = get(addr, "/").expect("the old build stops answering after a failed build");
+    let (s, b) = get(addr, path).expect("the old build stops answering after a failed build");
     assert!(s < 500 && b.contains("e2e reload 3"), "{s} {b}");
     std::fs::write(&broken, good).unwrap();
 
     stop.store(true, Ordering::Relaxed);
-    client.join().unwrap();
+    for c in clients {
+        c.join().unwrap();
+    }
     let failures = failures.lock().unwrap();
     let served = ok.load(Ordering::Relaxed);
+    eprintln!("dev reload: {served} requests over 3 reloads and a failed build");
     assert!(served > 50, "only {served} requests ran during the reloads");
     assert!(
         failures.is_empty(),
@@ -355,10 +380,13 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
 
 /// The text to replace in round `round`: the original body first, then what
 /// the round before wrote.
+/// Paths tried for a route that returns a literal of the source.
+const PROBES: &[&str] = &["/", "/hello/e2e", "/health"];
+
 fn marker_for(round: u32, original: &str) -> String {
     if round == 1 {
         original.to_string()
     } else {
-        format!("e2e reload {}", round - 1)
+        format!("\"e2e reload {}", round - 1)
     }
 }
