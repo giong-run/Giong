@@ -862,11 +862,14 @@ impl AcceptEvents {
         }
     }
 
-    /// Reads the wake socket empty: a datagram that came without
-    /// [`stop`](Self::stop) must not keep every wait short.
+    /// Reads what waits on the wake socket, so that a datagram that came
+    /// without [`stop`](Self::stop) does not keep every wait short. At most
+    /// [`DRAIN_MAX`](Self::DRAIN_MAX) datagrams per wait: a program that
+    /// floods the socket must not keep the thread from the listener, which
+    /// the same `select` reports.
     fn drain(&self) {
         let mut buf = [0u8; 16];
-        loop {
+        for _ in 0..Self::DRAIN_MAX {
             // SAFETY: a local buffer of the size given; the socket is open
             // while `self` lives and does not block.
             let n = unsafe { WinSock::recv(self.wake, buf.as_mut_ptr(), buf.len() as i32, 0) };
@@ -877,6 +880,9 @@ impl AcceptEvents {
             }
         }
     }
+
+    /// Datagrams [`drain`](Self::drain) reads per wait.
+    const DRAIN_MAX: usize = 64;
 
     /// Makes [`wait`](Self::wait) return [`AcceptWake::Stop`], now and
     /// from here on.
@@ -1109,8 +1115,20 @@ mod tests {
             assert_eq!(events.wait(Some(20)), super::AcceptWake::Timeout);
             assert_eq!(events.pause(20), super::AcceptWake::Timeout);
         }
+        // A flood of them does not hide a connection: the listener is
+        // reported by the same wait.
+        for _ in 0..4 * super::AcceptEvents::DRAIN_MAX {
+            // SAFETY: as above.
+            unsafe { WinSock::send(events.wake, [7u8].as_ptr(), 1, 0) };
+        }
         let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        assert_eq!(events.wait(Some(5_000)), super::AcceptWake::Accept);
+        let started = std::time::Instant::now();
+        while events.wait(Some(5_000)) != super::AcceptWake::Accept {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "never saw the connection"
+            );
+        }
 
         events.stop();
         assert_eq!(events.wait(None), super::AcceptWake::Stop);
