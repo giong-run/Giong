@@ -169,7 +169,8 @@ pub struct PoolStats {
     pub busy: usize,
     /// Jobs waiting for a thread.
     pub queued: usize,
-    /// Jobs finished since the pool was created.
+    /// Jobs finished since the pool was created. A job is counted just
+    /// after its handle has been given its value.
     pub completed: u64,
     /// The most threads the pool may have.
     pub max_threads: usize,

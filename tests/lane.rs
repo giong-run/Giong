@@ -187,7 +187,17 @@ fn the_blocking_lane_never_has_more_threads_than_its_limit() {
             }
             assert_eq!(sum, 28);
             assert_eq!(peak.load(Ordering::SeqCst), 2);
-            assert_eq!(giong::handle().lane_stats().blocking.completed, 8);
+            // A job is counted just after its handle has its value, so the
+            // last count can trail the last `await` by a moment.
+            let mut completed = 0;
+            for _ in 0..200 {
+                completed = giong::handle().lane_stats().blocking.completed;
+                if completed == 8 {
+                    break;
+                }
+                giong::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(completed, 8);
         })
         .unwrap();
 }
