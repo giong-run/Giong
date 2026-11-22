@@ -43,15 +43,19 @@ MODE=gate
 FUZZ_SECS="${FUZZ_SECS:-30}"
 MSRV=1.80.0
 SEMVER_CHECKS=0.51.0   # the version CI installs (.github/workflows/ci.yml, job semver)
+# The stable compiler CI pins (RUST_STABLE in .github/workflows/ci.yml): clippy's lints
+# and cargo's behaviour change between releases, so the gate runs the same one.
+STABLE=$(sed -n 's/^  RUST_STABLE: "\(.*\)"$/\1/p' .github/workflows/ci.yml | head -n 1)
 
 install_tools() {
     set -e
+    rustup toolchain install "$STABLE" --profile minimal -c rustfmt -c clippy
     rustup toolchain install "$MSRV" --profile minimal
     rustup toolchain install nightly --profile minimal -c rust-src
     rustup component add rustfmt clippy
     cargo install --locked cargo-fuzz
     cargo install --locked cargo-semver-checks --version "$SEMVER_CHECKS"
-    echo "ok: $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
+    echo "ok: $STABLE (CI's stable), $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
 }
 
 install_hook() {
@@ -90,6 +94,14 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# Every cargo call below that names no toolchain uses CI's stable compiler.
+if [ -n "$STABLE" ] && rustup run "$STABLE" rustc --version > /dev/null 2>&1; then
+    export RUSTUP_TOOLCHAIN="$STABLE"
+elif [ -n "$STABLE" ]; then
+    echo "warning: CI builds with Rust $STABLE, which is not installed here ($(rustc --version 2>/dev/null));" \
+        "clippy and the tests may disagree with CI. Install it: scripts/preflight.sh --install" >&2
+fi
 
 if ! git rev-parse --verify --quiet "$BASE^{commit}" > /dev/null; then
     echo "error: $BASE does not exist here; run 'git fetch origin main' or pass --base" >&2

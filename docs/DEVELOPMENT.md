@@ -58,6 +58,12 @@ ran. A failure that only a repetition shows (a race, a rare timing) is then foun
 queue instead of on the pull request, and ejects the pull request from it: fix it like any
 red job.
 
+**One compiler.** CI's stable Rust is pinned (`RUST_STABLE` in the workflows), not
+`stable`, so a Rust release cannot turn `main` red overnight, and `scripts/preflight.sh`
+runs the same version (`--install` installs it; the gate warns when it is missing). Raise
+the pin in a pull request of its own after each Rust release, fixing what the new lints
+find in the same pull request.
+
 ## One change, start to finish
 
 1. **Take one item** from the backlog of your line of work (see [The backlog](#the-backlog)).

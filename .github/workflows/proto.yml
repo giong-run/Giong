@@ -20,6 +20,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The stable compiler of every job that does not name one (MSRV, nightly and
+  # instr name their own). Pinned, not `stable`, so that a new Rust release
+  # (new lints, a new target/ layout) cannot turn main red overnight and so that
+  # scripts/preflight.sh runs the same compiler locally. Raise it in a pull
+  # request of its own when a Rust release comes out.
+  RUST_STABLE: "1.100.0"
   CARGO_TERM_COLOR: always
   PROTOBUF_TAG: v36.2
 
@@ -30,7 +36,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       # Building the runner takes about 10 minutes; it changes only with the tag.
       # The runner loads the jsoncpp library that the build fetches and builds
       # beside it, so the cache holds both.
@@ -54,7 +60,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - name: Differential tests against prost, message structs
         working-directory: giong-proto/conformance
         env:
