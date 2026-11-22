@@ -465,10 +465,11 @@ impl<F: Future> Runnable for LocalTask<F> {
             Err(payload) => Err(JoinError::Panic(payload)),
         };
         // The future's own drop runs before the handle learns the result,
-        // as it did when the task was freed right after completing.
-        *slot = None;
+        // as it did when the task was freed right after completing. A panic
+        // in it is the task's panic.
+        let dropped = panic::catch_unwind(AssertUnwindSafe(|| *slot = None));
         drop(slot);
-        self.join.complete(result);
+        self.join.complete(panicked_in_drop(result, dropped));
         Poll::Ready(())
     }
 
@@ -546,10 +547,12 @@ impl<Fut: Future> Future for RemoteTask<Fut> {
             }
         };
         let guard = this.guard.take().expect("checked above");
-        // SAFETY: dropped in place exactly once: `guard` is `None` from now
-        // on, which is what `Drop` checks.
-        unsafe { ManuallyDrop::drop(&mut this.fut) };
-        guard.0.complete(result);
+        let dropped = panic::catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: dropped in place exactly once: `guard` is `None` from
+            // now on, which is what `Drop` checks.
+            unsafe { ManuallyDrop::drop(&mut this.fut) }
+        }));
+        guard.0.complete(panicked_in_drop(result, dropped));
         Poll::Ready(())
     }
 }
@@ -561,6 +564,20 @@ impl<Fut: Future> Drop for RemoteTask<Fut> {
             // the pinning promise.
             unsafe { ManuallyDrop::drop(&mut self.fut) };
         }
+    }
+}
+
+/// The result of a task whose future was dropped after it finished, with
+/// `dropped` what dropping it did: a panic there replaces the value, as a
+/// panic while polling would have. (The handle used to report the task as
+/// cancelled.)
+fn panicked_in_drop<T>(
+    result: Result<T, JoinError>,
+    dropped: std::thread::Result<()>,
+) -> Result<T, JoinError> {
+    match (result, dropped) {
+        (Ok(_), Err(payload)) => Err(JoinError::Panic(payload)),
+        (result, _) => result,
     }
 }
 

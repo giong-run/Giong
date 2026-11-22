@@ -127,18 +127,28 @@ pub(crate) fn errno_location() -> *mut i32 {
 
 /// CPUs the calling thread is allowed to run on.
 pub(crate) fn allowed_cpus() -> Vec<usize> {
-    // SAFETY: `set` is a valid, zeroed cpu_set_t of the size we pass.
-    unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        if libc::sched_getaffinity(0, mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+    // `cpu_set_t` holds 1024 CPUs. A kernel built for more possible CPUs
+    // refuses a smaller mask with EINVAL, so the mask grows until it fits.
+    let mut words = mem::size_of::<libc::cpu_set_t>() / 8;
+    loop {
+        let mut mask = vec![0u64; words];
+        // SAFETY: `mask` is `words * 8` bytes, aligned like `cpu_set_t`
+        // (an array of u64), and the kernel writes at most that much.
+        let res = unsafe {
+            libc::sched_getaffinity(0, words * 8, mask.as_mut_ptr().cast::<libc::cpu_set_t>())
+        };
+        if res == 0 {
+            return (0..words * 64)
+                .filter(|&cpu| mask[cpu / 64] >> (cpu % 64) & 1 == 1)
+                .collect();
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) || words >= 1 << 16 {
             let n = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1);
             return (0..n).collect();
         }
-        (0..libc::CPU_SETSIZE as usize)
-            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-            .collect()
+        words *= 2;
     }
 }
 
@@ -148,11 +158,13 @@ pub(crate) const CAN_PIN: bool = true;
 /// Pins the calling thread to `cpu`. Failure is not fatal: the worker just
 /// stays unpinned.
 pub(crate) fn pin_to_cpu(cpu: usize) {
-    // SAFETY: as above.
+    // At least a `cpu_set_t`, and more for a CPU beyond its 1024.
+    let words = (cpu / 64 + 1).max(mem::size_of::<libc::cpu_set_t>() / 8);
+    let mut mask = vec![0u64; words];
+    mask[cpu / 64] |= 1 << (cpu % 64);
+    // SAFETY: `mask` is `words * 8` bytes, aligned like `cpu_set_t`.
     unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set);
+        libc::sched_setaffinity(0, words * 8, mask.as_ptr().cast::<libc::cpu_set_t>());
     }
 }
 
@@ -312,4 +324,27 @@ pub(crate) unsafe fn sendmmsg(
     flags: libc::c_int,
 ) -> isize {
     libc::sendmmsg(fd, msgs, count as libc::c_uint, flags) as isize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{allowed_cpus, pin_to_cpu};
+
+    #[test]
+    #[cfg_attr(miri, ignore = "sets the thread's CPU affinity")]
+    fn pinning_reads_back_and_a_cpu_past_1024_does_not_panic() {
+        std::thread::spawn(|| {
+            let cpus = allowed_cpus();
+            assert!(!cpus.is_empty());
+            assert!(cpus.windows(2).all(|w| w[0] < w[1]), "{cpus:?}");
+            pin_to_cpu(cpus[cpus.len() - 1]);
+            assert_eq!(allowed_cpus(), [cpus[cpus.len() - 1]]);
+            // No such CPU here: the kernel refuses, and the thread stays as
+            // it was. It used to index past a 1024-CPU mask and panic.
+            pin_to_cpu(5000);
+            assert_eq!(allowed_cpus(), [cpus[cpus.len() - 1]]);
+        })
+        .join()
+        .unwrap();
+    }
 }

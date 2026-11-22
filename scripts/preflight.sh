@@ -16,7 +16,8 @@
 #
 # What the gate runs, by what changed:
 #   always                    merge into the base, scripts/release.py check
-#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, Rust 1.80 check,
+#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, Rust 1.80 checks
+#                             (1.85 for giong-quic and giong-http, as CI's msrv job),
 #                             the tests on io_uring and on epoll: of the crates that
 #                             changed, or of the whole workspace when the runtime did
 #   a published crate's src   scripts/semver.sh (no breaking change since the release)
@@ -39,16 +40,20 @@ AGAINST=""
 MODE=gate
 FUZZ_SECS="${FUZZ_SECS:-30}"
 MSRV=1.80.0
+# giong-quic, and giong-http with all features (unstable-http3 uses it), need 1.85: the same
+# split as the msrv job of .github/workflows/ci.yml.
+MSRV_QUIC=1.85.0
 SEMVER_CHECKS=0.51.0   # the version CI installs (.github/workflows/ci.yml, job semver)
 
 install_tools() {
     set -e
     rustup toolchain install "$MSRV" --profile minimal
+    rustup toolchain install "$MSRV_QUIC" --profile minimal
     rustup toolchain install nightly --profile minimal -c rust-src
     rustup component add rustfmt clippy
     cargo install --locked cargo-fuzz
     cargo install --locked cargo-semver-checks --version "$SEMVER_CHECKS"
-    echo "ok: $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
+    echo "ok: $MSRV, $MSRV_QUIC, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
 }
 
 while [ $# -gt 0 ]; do
@@ -153,7 +158,7 @@ else
     echo "Tests: ${!CRATES[*]}, on io_uring and on epoll."
 fi
 GATE=()
-[ "$RUST" = 1 ] && GATE+=("Rust $MSRV check")
+[ "$RUST" = 1 ] && GATE+=("Rust $MSRV and $MSRV_QUIC checks")
 [ "$SEMVER" = 1 ] && GATE+=("semver (scripts/semver.sh)")
 [ "$TSAN" = 1 ] && GATE+=("ThreadSanitizer, one round (scripts/check.sh tsan)")
 [ "$LOOM" = 1 ] && GATE+=("loom (scripts/check.sh loom)")
@@ -236,7 +241,14 @@ fi
 
 if [ "$MODE" = gate ]; then
     if [ "$RUST" = 1 ] && need "cargo +$MSRV --version" "Rust $MSRV"; then
-        step "Rust $MSRV" cargo +"$MSRV" check --workspace --all-features --quiet
+        step "Rust $MSRV" cargo +"$MSRV" check --workspace --all-features --quiet \
+            --exclude giong-quic --exclude giong-http
+        step "Rust $MSRV (giong-http, tls and client)" \
+            cargo +"$MSRV" check -p giong-http --features tls,client --quiet
+    fi
+    if [ "$RUST" = 1 ] && need "cargo +$MSRV_QUIC --version" "Rust $MSRV_QUIC"; then
+        step "Rust $MSRV_QUIC (giong-quic, giong-http)" \
+            cargo +"$MSRV_QUIC" check -p giong-quic -p giong-http --all-features --quiet
     fi
     if [ "$SEMVER" = 1 ] && need "cargo semver-checks --version" "cargo-semver-checks"; then
         step "semver" scripts/semver.sh

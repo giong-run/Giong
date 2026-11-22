@@ -1356,6 +1356,11 @@ impl Runtime {
             let spawned = thread::Builder::new()
                 .name(format!("giong-{index}"))
                 .spawn(move || {
+                    #[cfg(test)]
+                    if tests::PANIC_ON_START.load(std::sync::atomic::Ordering::Relaxed) == index + 1
+                    {
+                        panic!("worker {index} failed to start (test)");
+                    }
                     if let Some(cpu) = cpu {
                         pin_to_cpu(cpu);
                     }
@@ -1408,16 +1413,21 @@ impl Runtime {
         drop(tx);
 
         let mut first_err = spawn_err;
+        let mut reported = 0;
         for _ in 0..threads.len() {
             match rx.recv() {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => reported += 1,
                 Ok(Err(e)) => {
+                    reported += 1;
                     first_err.get_or_insert(e);
                 }
                 Err(_) => break,
             }
         }
-        gate.open(first_err.is_none());
+        // A thread that ended without reporting panicked while it started:
+        // then no worker runs, and its panic is raised below, now rather
+        // than when the others end.
+        gate.open(first_err.is_none() && reported == threads.len());
 
         let mut panic_payload = None;
         for t in threads {
@@ -2049,6 +2059,37 @@ fn pin_to_cpu(cpu: usize) {
 #[cfg(test)]
 mod tests {
     use super::{default_workers, pin_by_default};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `n` makes worker `n - 1` panic before it reports that it started.
+    pub(super) static PANIC_ON_START: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn a_worker_that_panics_while_starting_fails_the_runtime_at_once() {
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        PANIC_ON_START.store(2, Ordering::Relaxed);
+        let result = std::panic::catch_unwind(|| {
+            super::Builder::new()
+                .workers(3)
+                .build()
+                .unwrap()
+                .run(move |_| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+        });
+        PANIC_ON_START.store(0, Ordering::Relaxed);
+        let payload = result.expect_err("the runtime ran with a worker fewer");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(message.contains("failed to start"), "{message:?}");
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "workers ran user code");
+    }
 
     #[test]
     fn the_default_worker_count_follows_the_cpu_quota() {
