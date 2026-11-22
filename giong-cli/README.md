@@ -85,7 +85,6 @@ claude mcp add giong -- giong mcp
 
 Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document, plus `dev_status` for a running `giong dev`.
 
-<<<<<<< HEAD
 ## giong routes and giong openapi
 
 ```sh
@@ -131,7 +130,7 @@ One page in the browser for the service `giong dev` runs in this project, on `ht
 - a box to send any request to the service
 
 It reads what the service already gives, its output and its giong-mcp, so the service runs no extra code for it. Only this machine can open it: it listens on 127.0.0.1, answers only a loopback `Host`, and its API needs a header that pages of other sites cannot send, so a web page cannot read it or send requests through it. `giong dev --ui` starts it with the service.
-=======
+
 ## giong db
 
 ```sh
@@ -175,7 +174,6 @@ giong image [--tag name:tag] [--add static,migrations] [--load] [--push ghcr.io/
 ```
 
 An OCI image of the service without Docker or a Dockerfile: one layer with the release binary at `/app`, CA certificates and a nonroot user, no shell; static with musl when that target is installed (`rustup target add x86_64-unknown-linux-musl`), else with this machine's glibc libraries. The same source gives the same digest. `--load` hands it to Docker or Podman, `--push` to skopeo, crane, Docker or Podman.
->>>>>>> origin/claude/project-thread-np249q-cli
 
 ## Error codes
 

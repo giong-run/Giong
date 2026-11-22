@@ -89,13 +89,11 @@ codes! {
     BENCH_GENERATOR_BEHIND = 5062, "BenchGeneratorBehind", "the load generator fell behind its schedule";
     BENCH_ERRORS = 5063, "BenchErrors", "requests failed during the benchmark";
     BENCH_REGRESSION = 5064, "BenchRegression", "the change is slower than the build it is compared with";
-<<<<<<< HEAD
     NO_RECORDING = 5065, "NoRecording", "no recorded requests to use";
     RECORDED_CASE_FAILED = 5066, "RecordedCaseFailed", "a recorded case answers differently";
     RECORDING_INVALID = 5067, "RecordingInvalid", "a recording cannot be read or used";
     RECORD_VALUE_MISSING = 5068, "RecordValueMissing", "a recorded case needs a value that is not set";
     REPLAY_UNREACHABLE = 5069, "ReplayUnreachable", "the service to replay against does not answer";
-=======
     IMAGE_TARGET = 5070, "ImageTarget", "the service cannot be built for Linux here";
     IMAGE_LIBRARIES = 5071, "ImageLibraries", "the shared libraries of the binary cannot be found";
     IMAGE_NO_CERTS = 5072, "ImageNoCerts", "no CA certificates to put in the image";
@@ -103,7 +101,6 @@ codes! {
     IMAGE_LOAD = 5074, "ImageLoad", "the image could not be loaded into Docker or Podman";
     IMAGE_PUSH = 5075, "ImagePush", "the image could not be pushed to the registry";
     IMAGE_TAG = 5076, "ImageTag", "the image name or tag is not valid";
->>>>>>> origin/claude/project-thread-np249q-cli
 }
 
 impl Code {

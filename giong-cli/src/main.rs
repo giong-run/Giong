@@ -26,10 +26,7 @@ mod report;
 mod service;
 mod sha256;
 mod watch;
-<<<<<<< HEAD
 mod web_client;
-=======
->>>>>>> origin/claude/project-thread-np249q-cli
 
 use std::process::ExitCode;
 
