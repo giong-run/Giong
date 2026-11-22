@@ -5,10 +5,11 @@ name: Soak
 # operations, in the process and with kernel TLS (giong-tls/tests/soak.rs),
 # each followed by checks that no descriptor, memory or driver state was left
 # behind. Run it by hand with another duration from the Actions tab.
-# Each twice: on the runner's kernel, and on Linux 6.18 booted in QEMU, where
-# streams receive through packed buffer rings (6.12 and newer), which cut a
-# receive wherever a shared buffer fills up, and where kernel TLS takes new
-# keys on a live connection (6.14 and newer).
+# Each twice on Linux: on the runner's kernel, and on Linux 6.18 booted in
+# QEMU, where streams receive through packed buffer rings (6.12 and newer),
+# which cut a receive wherever a shared buffer fills up, and where kernel TLS
+# takes new keys on a live connection (6.14 and newer). The runtime's soak
+# also runs on Windows.
 # Then years of simulated uptime under hostile faults (sim/README.md), on new
 # seeds every night: rare fault combinations show up only after thousands of
 # seeds, more than the per-PR run can afford.
@@ -50,6 +51,59 @@ jobs:
         run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - name: Soak
         run: SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak ${{ matrix.workload }}
+
+  # The same churn on Windows, through the completion port driver: the
+  # handle count and working set stand in for descriptors and resident
+  # memory.
+  soak-windows:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Soak
+        shell: bash
+        # Line tables, so that the stack of a handle left over names
+        # giong's functions too.
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+        run: |
+          GIONG_SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) \
+            cargo test -p giong --release --locked --test soak -- --ignored --nocapture
+
+  # The ported suites again and again on the other Windows image for as
+  # long: cancellation and wake-up races that one pass in a hundred hits.
+  repeat-windows:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      SUITES: >-
+        --lib --test executor --test channels --test time --test shutdown
+        --test observe --test spin --test net --test udp --test cancel
+        --test multi --test balance --test dns --test fs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: cargo test -p giong --release --locked --no-run $SUITES
+      - name: Repeat the suites
+        run: |
+          end=$(( SECONDS + ${{ inputs.minutes || '120' }} * 60 ))
+          runs=0
+          while [ "$SECONDS" -lt "$end" ]; do
+            runs=$(( runs + 1 ))
+            # A run takes about a minute: one past 15 is a hang, and its
+            # log names the test (libtest reports one running over 60 s).
+            timeout 900 cargo test -p giong --release --locked -q $SUITES > run.log 2>&1 ||
+              { echo "run $runs failed (exit $?, 124 is a hang)"; cat run.log; exit 1; }
+          done
+          echo "$runs runs passed" | tee -a "$GITHUB_STEP_SUMMARY"
 
   soak-packed-buffers:
     runs-on: ubuntu-24.04

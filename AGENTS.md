@@ -9,17 +9,19 @@ pull requests, handoff), is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## What this is
 
-giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
-driver where io_uring is blocked or the kernel is too old. It aims to be the best Rust
+giong is a thread-per-core async runtime, built on io_uring on Linux, with an epoll
+driver where io_uring is blocked or the kernel is too old, a kqueue driver on macOS (for
+development) and an I/O completion port driver on Windows (the `giong` crate only, from
+1.4). Linux is the platform it is tuned and measured on. It aims to be the best Rust
 async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
 is built for code that agents write: strict types, coded errors with the cause and the
 fix, and an API that stays on major version 1 for many years. One Cargo
-workspace, twelve crates and three examples:
+workspace, thirteen crates and three examples:
 
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client`; HTTP/3 for both behind `unstable-http3` (Rust 1.85) |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL and MariaDB client and per-worker pool |
@@ -31,6 +33,7 @@ workspace, twelve crates and three examples:
 | `giong-proto/` | `giong-proto` (new in 1.1) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
 | `giong-grpc-build/` | `giong-grpc-build` (new in 1.1) | generates giong-proto messages and giong-grpc service traits, servers and clients from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
 | `giong-grpc/` | `giong-grpc` (new in 1.1) | gRPC servers and clients on giong-http's HTTP/2: the four kinds of call, deadlines, cancellation, metadata, gzip, health and reflection; codes `GIONG-E4101`-`E4110`. `interop/run.sh` runs gRPC's interoperability cases against grpc-go (needs Go); `tests/generated/` and `src/generated/` hold generated code that `tests/generated.rs` keeps current (`GIONG_GRPC_REGENERATE=1` rewrites it) |
+| `giong-quic/` | `giong-quic` (new in 1.3) | QUIC on giong's UDP sockets, one endpoint per worker, TLS 1.3 from rustls, the engine underneath quinn-proto; codes `GIONG-E3601`-`E3605`. Needs Rust 1.85, the one crate above giong's 1.80 |
 | `examples/proto-hello/` | `proto-hello` (not published) | giong-grpc-build and giong-proto in one small program |
 | `examples/grpc-hello/` | `grpc-hello` (not published) | a gRPC server and client: a unary method and a server stream, health and reflection |
 
@@ -77,8 +80,11 @@ Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README
 
 ## The machine you need
 
-- **Linux 6.0 or newer with io_uring allowed**, to test both drivers. giong does not
-  build on macOS or Windows.
+- **Linux 6.0 or newer with io_uring allowed**, to test both Linux drivers. Every crate
+  also builds and passes its tests on macOS (kqueue); on Windows only the `giong` crate
+  builds (`cargo test -p giong`), and Unix sockets are `cfg(unix)`. A change to a shared
+  file in `src/driver/` or `src/sys/` must keep all three building: CI runs macOS and
+  Windows jobs, and `docs/design/portability.md` has the `cfg` rules.
 - **Docker blocks io_uring with its default seccomp profile.** Inside such a container,
   or on an older kernel, the tests still pass, but on the epoll driver only: the io_uring
   half of the suite goes untested. `tests/driver.rs` and `tests/blocked.rs` check which
@@ -107,6 +113,7 @@ scripts/preflight.sh --install           # the toolchains and tools the gate nee
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
 cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
+cargo check -p giong --target x86_64-pc-windows-msvc   # Windows, runtime crate only (rustup target add it first)
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -153,8 +160,10 @@ connection, both within 1% of `bench/instr/baseline.csv`; a change meant to move
 commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
 in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
 operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
-profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
-against other server versions (`servers`) on every pull request, and fuzzes the parsers
+profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`), HTTP/3 and QUIC with h3spec
+(`h3spec`) and the database crates against other server versions (`servers`) on every pull
+request, every crate's tests on macOS 15 and 26 (`macos.yml`) and the runtime's on Windows
+Server 2022 and 2025 (`windows-runtime.yml`), and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
 `giong-web`, `giong-mcp`, each in its `fuzz/`) and runs the soak test every night, on the
 runner's kernel and on Linux 6.18 in QEMU; the 6.12 and 6.18 `kernels` jobs soak for a
@@ -187,7 +196,8 @@ is loaded.
 3. **`unsafe`** only with a `// SAFETY:` comment saying why it is sound, a test that would
    catch misuse, and clean `scripts/check.sh tsan` and `scripts/valgrind.sh` runs.
 4. **No new dependency** without a reason stated in the pull request. The runtime depends
-   on `io-uring`, `libc` and `socket2` only.
+   on `socket2`, plus `libc` on Unix, `io-uring` on Linux and `windows-sys` on Windows,
+   and nothing else.
 5. **Public items are documented.** Futures are not `Send` by design: tasks stay on their
    worker, and `Rc`/`RefCell` are fine. Buffers are passed by value and handed back, as in
    `write_all(buf)` returning `(io::Result<()>, buf)`.

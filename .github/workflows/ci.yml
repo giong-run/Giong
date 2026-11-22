@@ -62,8 +62,17 @@ jobs:
         with:
           toolchain: 1.80.0
       # Libraries only: the tests generate certificates with rcgen, whose
-      # dependencies need a newer compiler.
-      - run: cargo check --workspace --all-features
+      # dependencies need a newer compiler. giong-quic, and giong-http's
+      # unstable-http3 feature that uses it, need Rust 1.85 (quinn-proto's
+      # minimum since its 0.11.15 security fix): every other crate and
+      # feature is checked with 1.80, those two with 1.85.
+      - run: >
+          cargo check --workspace --all-features --exclude giong-quic --exclude giong-http
+      - run: cargo check -p giong-http --features tls,client
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.85.0
+      - run: cargo +1.85.0 check -p giong-quic -p giong-http --all-features
 
   # giong as most users build it: no features at all. Every other job turns
   # on all features, so code that only compiles, or only passes, with a

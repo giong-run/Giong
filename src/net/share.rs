@@ -53,12 +53,18 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::{Ipv4Addr, Shutdown, SocketAddr};
+#[cfg(unix)]
+use std::net::Ipv4Addr;
+use std::net::{Shutdown, SocketAddr};
 #[cfg(any(target_os = "macos", giong_libkqueue))]
 use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+#[cfg(unix)]
+use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use socket2::{Domain, Socket, Type};
+use socket2::Socket;
+#[cfg(unix)]
+use socket2::{Domain, Type};
 
 /// The transport a port belongs to: TCP and UDP ports are separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -141,6 +147,9 @@ impl Held {
             // A socket that no longer listens does not conflict with one
             // that sets `SO_REUSEADDR`, as every listener does.
             Proto::Tcp => drop(sock.shutdown(Shutdown::Both)),
+            // Windows closes a socket at once, and its sockets are bound
+            // exclusively, which the option cannot be set on.
+            Proto::Udp if cfg!(windows) => {}
             Proto::Udp => {
                 drop(sock.set_reuse_address(true));
                 // Until it is closed, the socket is still a member of the
@@ -188,8 +197,8 @@ pub(crate) fn bind(
 enum Joins {
     /// Find out ([`late_reuse_port_joins`]).
     Find,
-    /// They cannot, as on gVisor. For tests, which run on Linux.
-    #[cfg(test)]
+    /// They cannot, as on gVisor. For tests.
+    #[cfg(all(test, unix))]
     Never,
 }
 
@@ -208,9 +217,19 @@ fn bind_with(
         // socket keeps it off: with `SO_REUSEADDR`, any user's socket that
         // sets it too could bind the port and receive its datagrams.
         // `SO_REUSEPORT` is for sockets of the same user.
-        if proto == Proto::Tcp {
+        //
+        // Not on Windows: `SO_REUSEADDR` there lets a second socket bind a
+        // port that is being listened on and take its connections, and a
+        // closed listener's port is free again at once without it.
+        if proto == Proto::Tcp && cfg!(unix) {
             sock.set_reuse_address(true)?;
         }
+        // Nor can another socket that sets `SO_REUSEADDR` bind over this one
+        // there (a more specific address on the same port, which would take
+        // its connections or datagrams): Windows refuses that only for a
+        // socket bound with `SO_EXCLUSIVEADDRUSE`.
+        #[cfg(windows)]
+        crate::sys::set_exclusive_address(&sock)?;
         Ok::<_, io::Error>(sock)
     };
     if !share {
@@ -230,7 +249,7 @@ fn bind_with(
         bind_first(proto, new, addr, known.released, joins)?
     } else {
         let sock = new()?;
-        sock.set_reuse_port(true)?;
+        set_reuse_port(&sock)?;
         sock.bind(&addr.into())?;
         check_bound(&sock, addr)?;
         sock
@@ -304,6 +323,20 @@ fn bind_shared(
     ))
 }
 
+/// Lets the other workers' sockets bind the port `sock` binds.
+#[cfg(unix)]
+fn set_reuse_port(sock: &Socket) -> io::Result<()> {
+    sock.set_reuse_port(true)
+}
+
+/// Windows has no `SO_REUSEPORT`: a port has one socket there, which the
+/// workers' listeners and UDP sockets share as handles to it (see
+/// `net::spread` and `net::udp::spread`); only the first of them binds.
+#[cfg(windows)]
+fn set_reuse_port(_sock: &Socket) -> io::Result<()> {
+    Ok(())
+}
+
 /// Binds the first socket of a port in this process: without
 /// `SO_REUSEPORT`, so that the bind fails with `EADDRINUSE` when a socket
 /// that is not one of this process's released ones holds `addr`, then sets
@@ -329,7 +362,7 @@ fn bind_first(
 ) -> io::Result<Socket> {
     let late = match joins {
         Joins::Find => late_reuse_port_joins(proto),
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         Joins::Never => false,
     };
     // Two UDP sockets that both set `SO_REUSEADDR` never conflict, so this
@@ -337,7 +370,7 @@ fn bind_first(
     // pass another process's socket that sets it, so it is set only while
     // this process may have released sockets on the port, and only for the
     // bind.
-    let marked = proto == Proto::Udp && released;
+    let marked = proto == Proto::Udp && released && cfg!(unix);
     if late || !released {
         let sock = new()?;
         if marked {
@@ -348,7 +381,7 @@ fn bind_first(
         if late {
             // The kernel looks at both options as they are when a later
             // socket binds, so the next worker joins this one.
-            sock.set_reuse_port(true)?;
+            set_reuse_port(&sock)?;
             if marked {
                 sock.set_reuse_address(false)?;
             }
@@ -361,13 +394,14 @@ fn bind_first(
     // them: there is no check then, a socket of another process that bound
     // the port since this one's were released is joined, not refused.
     let sock = new()?;
-    sock.set_reuse_port(true)?;
+    set_reuse_port(&sock)?;
     sock.bind(&addr.into())?;
     check_bound(&sock, addr)?;
     Ok(sock)
 }
 
 /// A socket of `proto` for `addr`'s address family, with no options set.
+#[cfg(unix)]
 fn new_socket(proto: Proto, addr: SocketAddr) -> io::Result<Socket> {
     let ty = match proto {
         Proto::Tcp => Type::STREAM,
@@ -384,6 +418,7 @@ fn new_socket(proto: Proto, addr: SocketAddr) -> io::Result<Socket> {
 /// system calls on a loopback port the kernel picks; where that cannot be
 /// tried, Linux's answer. Not on the port being bound: a socket in its group,
 /// even for a moment, would take a share of what is sent to it.
+#[cfg(unix)]
 fn late_reuse_port_joins(proto: Proto) -> bool {
     static TCP: OnceLock<bool> = OnceLock::new();
     static UDP: OnceLock<bool> = OnceLock::new();
@@ -394,6 +429,13 @@ fn late_reuse_port_joins(proto: Proto) -> bool {
     *once.get_or_init(|| try_late_reuse_port(proto).unwrap_or(true))
 }
 
+/// Windows: only the first socket of a port binds (see [`set_reuse_port`]).
+#[cfg(windows)]
+fn late_reuse_port_joins(_proto: Proto) -> bool {
+    true
+}
+
+#[cfg(unix)]
 fn try_late_reuse_port(proto: Proto) -> io::Result<bool> {
     let any = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let first = new_socket(proto, any)?;
@@ -457,6 +499,7 @@ mod tests {
 
     /// As [`udp`], the way it goes where a socket that takes `SO_REUSEPORT`
     /// after its bind lets no one join it (gVisor).
+    #[cfg(unix)]
     fn udp_early(addr: SocketAddr) -> io::Result<(Socket, Option<Held>)> {
         bind_with(
             Proto::Udp,
@@ -467,6 +510,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn tcp_early(addr: SocketAddr) -> io::Result<(Socket, Option<Held>)> {
         bind_with(
             Proto::Tcp,
@@ -665,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn linux_lets_workers_join_a_socket_that_took_reuse_port_after_its_bind() {
         // What the first bind of a port relies on here; gVisor answers no.
@@ -675,6 +720,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     #[cfg_attr(miri, ignore = "Miri cannot set SO_REUSEPORT")]
     fn where_reuse_port_counts_at_the_bind_the_first_socket_checks_with_another() {
         // UDP: refused while another process's socket holds the port, then

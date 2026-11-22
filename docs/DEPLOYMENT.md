@@ -24,7 +24,7 @@ giong::block_on(async {
 ```
 
 `giong-mcp`'s `overview` shows the same for each worker. The
-[README](../README.md#two-drivers-io_uring-and-epoll) has the measured difference.
+[benchmarks](BENCHMARKS.md#io_uring-against-epoll) have the measured difference.
 
 So a container needs no special settings to run giong. Allow io_uring, as this page shows,
 when you want its speed:
