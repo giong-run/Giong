@@ -94,8 +94,10 @@ jobs:
           runs=0
           while [ "$SECONDS" -lt "$end" ]; do
             runs=$(( runs + 1 ))
-            cargo test -p giong --release --locked -q $SUITES > run.log 2>&1 ||
-              { echo "run $runs failed"; cat run.log; exit 1; }
+            # A run takes about a minute: one past 15 is a hang, and its
+            # log names the test (libtest reports one running over 60 s).
+            timeout 900 cargo test -p giong --release --locked -q $SUITES > run.log 2>&1 ||
+              { echo "run $runs failed (exit $?, 124 is a hang)"; cat run.log; exit 1; }
           done
           echo "$runs runs passed" | tee -a "$GITHUB_STEP_SUMMARY"
 

@@ -55,7 +55,8 @@ jobs:
       - name: Repeat the tests 30 times
         run: |
           for i in $(seq 1 30); do
-            cargo test -p giong --release --locked -q $SUITES > run.log 2>&1 || { echo "run $i failed"; cat run.log; exit 1; }
+            # One past 15 minutes is a hang; its log names the test.
+            timeout 900 cargo test -p giong --release --locked -q $SUITES > run.log 2>&1 || { echo "run $i failed (exit $?, 124 is a hang)"; cat run.log; exit 1; }
           done
           echo "30 runs passed" >> "$GITHUB_STEP_SUMMARY"
 
