@@ -590,7 +590,11 @@ mod tests {
         assert!(!got.contains("Host: evil\r\n"), "{got}");
         assert!(!got.contains("content-length: 999\r\n"), "{got}");
         assert_eq!(got.matches("Host: ").count(), 1, "{got}");
-        assert_eq!(got.to_ascii_lowercase().matches("content-length: ").count(), 1, "{got}");
+        assert_eq!(
+            got.to_ascii_lowercase().matches("content-length: ").count(),
+            1,
+            "{got}"
+        );
         assert!(got.contains("content-type: application/json\r\n"), "{got}");
     }
 
