@@ -196,6 +196,27 @@ fn env_from_dotenv(root: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The unit tests build small projects with cargo while they run inside
+/// `cargo test` themselves: the outer run's build settings (a sanitizer's
+/// RUSTFLAGS, its target directory and target, its GIONG_DRIVER) are not the
+/// inner project's.
+#[cfg(test)]
+pub(crate) fn without_outer_build(cmd: &mut std::process::Command) {
+    for var in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_ENCODED_RUSTDOCFLAGS",
+        "CARGO_BUILD_TARGET",
+        "CARGO_TARGET_DIR",
+        "TSAN_OPTIONS",
+        "GIONG_DRIVER",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
 /// Runs the suite once; streams its output to stderr when `echo`.
 fn run_once(
     root: &Path,
@@ -216,6 +237,8 @@ fn run_once(
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(test)]
+    without_outer_build(&mut cmd);
     if let Some(d) = driver {
         cmd.env("GIONG_DRIVER", d);
     }

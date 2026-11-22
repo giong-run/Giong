@@ -281,16 +281,22 @@ fn dirty(root: &Path) -> Option<Vec<String>> {
 /// Runs clippy (or, without it, `cargo check`) with JSON messages.
 fn compiler_messages(root: &Path, cargo_args: &[String]) -> Result<(String, bool), Failure> {
     let run = |sub: &str| {
-        cargo()
-            .arg(sub)
+        let mut cmd = cargo();
+        cmd.arg(sub)
             .args(["--all-targets", "--message-format=json", "--quiet"])
             .args(cargo_args)
-            .current_dir(root)
-            .output()
+            .current_dir(root);
+        #[cfg(test)]
+        crate::cmd::test::without_outer_build(&mut cmd);
+        cmd.output()
     };
     let out = run("clippy").map_err(cargo_missing)?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() && stderr.contains("no such command") {
+    // No clippy: cargo says "no such command", or rustup says the component
+    // "is not installed" for this toolchain. The compiler's own fixes remain.
+    if !out.status.success()
+        && (stderr.contains("no such command") || stderr.contains("is not installed"))
+    {
         let out = run("check").map_err(cargo_missing)?;
         return Ok((String::from_utf8_lossy(&out.stdout).into_owned(), false));
     }
@@ -631,11 +637,7 @@ mod tests {
         .unwrap();
         let before = "use std::collections::HashMap;\n\nfn main() {\n    let v = vec![1];\n    if v.len() == 0 {\n        println!(\"empty\");\n    }\n}\n";
         fs::write(dir.join("src/main.rs"), before).unwrap();
-        let has_clippy = cargo()
-            .args(["clippy", "--version"])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        let (json, _) = compiler_messages(&dir, &[]).unwrap();
+        let (json, has_clippy) = compiler_messages(&dir, &[]).unwrap();
         let (fixes, err) = suggestions(&json, &dir);
         assert!(err.is_none(), "{err:?}");
         let applied = apply(&dir, fixes);
