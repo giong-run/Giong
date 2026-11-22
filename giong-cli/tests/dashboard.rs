@@ -417,6 +417,12 @@ fn dev_once(dir: &Path, flags: &[&str]) -> (Dash, mpsc::Receiver<Value>) {
         .current_dir(dir)
         .env_remove("GIONG_MCP")
         .env_remove("LISTEN")
+        // The tiny project builds with plain cargo, not with this test run's
+        // sanitizer flags, target or build directory (ThreadSanitizer jobs).
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
