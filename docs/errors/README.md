@@ -289,3 +289,10 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5062](E5062.md) | `BenchGeneratorBehind` | the load generator fell behind its schedule |
 | [GIONG-E5063](E5063.md) | `BenchErrors` | requests failed during the benchmark |
 | [GIONG-E5064](E5064.md) | `BenchRegression` | the change is slower than the build it is compared with |
+| [GIONG-E5070](E5070.md) | `ImageTarget` | the service cannot be built for Linux here |
+| [GIONG-E5071](E5071.md) | `ImageLibraries` | the shared libraries of the binary cannot be found |
+| [GIONG-E5072](E5072.md) | `ImageNoCerts` | no CA certificates to put in the image |
+| [GIONG-E5073](E5073.md) | `ImageAdd` | a file to add to the image is not usable |
+| [GIONG-E5074](E5074.md) | `ImageLoad` | the image could not be loaded into Docker or Podman |
+| [GIONG-E5075](E5075.md) | `ImagePush` | the image could not be pushed to the registry |
+| [GIONG-E5076](E5076.md) | `ImageTag` | the image name or tag is not valid |

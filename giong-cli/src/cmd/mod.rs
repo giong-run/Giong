@@ -15,6 +15,7 @@ pub mod doctor;
 pub mod env;
 pub mod explain;
 pub mod help;
+pub mod image;
 pub mod openapi;
 pub mod routes;
 pub mod top;
@@ -44,6 +45,7 @@ pub const COMMANDS: &[&Command] = &[
     &db::COMMAND,
     &env::COMMAND,
     &explain::COMMAND,
+    &image::COMMAND,
     &routes::COMMAND,
     &openapi::COMMAND,
     &top::COMMAND,

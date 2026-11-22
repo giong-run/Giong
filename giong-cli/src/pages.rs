@@ -3061,4 +3061,109 @@ In every round the working tree was slower than the build of `<ref>` (99th perce
 
 [All error codes](README.md)
 "#),
+    (5070, r#"# GIONG-E5070: the service cannot be built for Linux here
+
+Raised by the `giong` command (giong-cli): `giong image`. In JSON output: `"code": "GIONG-E5070"`.
+
+## What happened
+
+An image runs a Linux binary. On Linux, `giong image` builds for this machine, statically with musl when the `x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`) target is installed, otherwise against glibc with this machine's libraries copied in. On macOS and Windows it needs a musl target and `cargo zigbuild` to cross-build. Here neither works, or the build is not a Linux ELF binary.
+
+## How to fix it
+
+- On Linux: nothing is needed; for a smaller, fully static image, `rustup target add x86_64-unknown-linux-musl`.
+- On macOS or Windows: `rustup target add x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl` for ARM servers) and `cargo install cargo-zigbuild` (it needs Zig: `brew install zig` or `winget install zig.zig`).
+- Give the target yourself with `--target <triple>` when the server's architecture differs from this machine's.
+
+[All error codes](README.md)
+"#),
+    (5071, r#"# GIONG-E5071: the shared libraries of the binary cannot be found
+
+Raised by the `giong` command (giong-cli): `giong image`. In JSON output: `"code": "GIONG-E5071"`.
+
+## What happened
+
+The binary is linked against glibc, so the image needs the libraries it loads (`libc.so.6`, `libgcc_s.so.1`, the dynamic loader). `giong image` asks `ldd` for them and copies them from this machine; `ldd` is missing, failed, or names a library that is not installed.
+
+## How to fix it
+
+- Build statically instead: `rustup target add x86_64-unknown-linux-musl`, then run `giong image` again (it picks the musl target by itself).
+- Install the missing library with the system's package manager, or run `ldd` on the binary to see what it lacks.
+
+[All error codes](README.md)
+"#),
+    (5072, r#"# GIONG-E5072: no CA certificates to put in the image
+
+Raised by the `giong` command (giong-cli): `giong image`. In JSON output: `"code": "GIONG-E5072"`.
+
+## What happened
+
+The image carries the CA certificates of this machine (`/etc/ssl/certs/ca-certificates.crt` or the other usual places), so the service can check the certificates of HTTPS servers, databases and APIs it calls. None was found, so the image has none: outgoing TLS connections will fail to verify. A service that makes no outgoing TLS connection does not need them.
+
+## How to fix it
+
+- Install the CA bundle (`ca-certificates` on Debian, Ubuntu and Alpine; `ca-certificates` or `openssl` on macOS through Homebrew), or point `SSL_CERT_FILE` at a PEM bundle before running `giong image`.
+
+[All error codes](README.md)
+"#),
+    (5073, r#"# GIONG-E5073: a file to add to the image is not usable
+
+Raised by the `giong` command (giong-cli): `giong image --add`. In JSON output: `"code": "GIONG-E5073"`.
+
+## What happened
+
+`--add` takes paths inside the project (comma-separated, such as `static,migrations`), copied under `/app` in the image with the same relative path. This one does not exist, is outside the project (absolute or with `..`), or cannot be read.
+
+## How to fix it
+
+- Give a path relative to the project root that exists: `giong image --add static,migrations`.
+- Files the service needs at run time go under `/app`, its working directory; read them with a relative path (`static/index.html`).
+
+[All error codes](README.md)
+"#),
+    (5074, r#"# GIONG-E5074: the image could not be loaded into Docker or Podman
+
+Raised by the `giong` command (giong-cli): `giong image --load`. In JSON output: `"code": "GIONG-E5074"`.
+
+## What happened
+
+`--load` hands the image file to `docker load` or `podman load` (`GIONG_CONTAINER_RUNTIME` chooses), so it can be run right away. Neither answers, or the load failed; the image file itself was written and is still usable.
+
+## How to fix it
+
+- Start Docker or Podman, or load the file yourself: `docker load -i <file>` (Docker 25 or newer reads OCI archives), `podman load -i <file>`.
+- Leave out `--load` to only write the file, and push it with `giong image --push` or `skopeo copy oci-archive:<file> docker://<ref>`.
+
+[All error codes](README.md)
+"#),
+    (5075, r#"# GIONG-E5075: the image could not be pushed to the registry
+
+Raised by the `giong` command (giong-cli): `giong image --push <ref>`. In JSON output: `"code": "GIONG-E5075"`.
+
+## What happened
+
+`--push` sends the image with the first tool found: `skopeo`, `crane`, then `docker` or `podman` (load, tag, push). None is installed, the registry refused the login, or the reference names a repository the account cannot write to. The image file was written and is still usable.
+
+## How to fix it
+
+- Log in first: `docker login ghcr.io` (crane and skopeo read the same credentials), or `skopeo login`.
+- Check the reference: `ghcr.io/<owner>/<name>:<tag>`, with a repository the account can push to.
+
+[All error codes](README.md)
+"#),
+    (5076, r#"# GIONG-E5076: the image name or tag is not valid
+
+Raised by the `giong` command (giong-cli): `giong image --tag` and `--push`. In JSON output: `"code": "GIONG-E5076"`.
+
+## What happened
+
+An image reference is `[registry/]name[:tag]`: the name in lower case (letters, digits, and `.`, `_`, `-` between them, `/` between parts), the tag up to 128 letters, digits, `_`, `.` and `-`, not starting with `.` or `-`. By default the name is the package's and the tag its version.
+
+## How to fix it
+
+- Write `--tag myservice:1.2.0` or `--push ghcr.io/owner/myservice:1.2.0`.
+- Upper-case letters are not allowed in the name: `MyService` becomes `myservice`.
+
+[All error codes](README.md)
+"#),
 ];

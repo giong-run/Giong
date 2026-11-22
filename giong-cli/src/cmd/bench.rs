@@ -437,12 +437,30 @@ fn build(
     bin: Option<&str>,
     quiet: bool,
 ) -> Result<PathBuf, Failure> {
+    let extra: Vec<String> = target_dir
+        .map(|t| vec!["--target-dir".to_string(), t.display().to_string()])
+        .unwrap_or_default();
+    build_release(dir, "build", &extra, bin, quiet, "giong bench")
+}
+
+/// `cargo <subcommand> --release` (`build`, or `zigbuild` to cross-build)
+/// with `extra` arguments in `dir`; returns the one binary it built.
+/// `command` names the giong command in messages.
+pub(crate) fn build_release(
+    dir: &Path,
+    subcommand: &str,
+    extra: &[String],
+    bin: Option<&str>,
+    quiet: bool,
+    command: &str,
+) -> Result<PathBuf, Failure> {
     let mut cmd = cargo();
     cmd.args([
-        "build",
+        subcommand,
         "--release",
         "--message-format=json-render-diagnostics",
     ])
+    .args(extra)
     .current_dir(dir)
     .stdout(Stdio::piped())
     .stderr(if quiet {
@@ -452,9 +470,6 @@ fn build(
     });
     if let Some(b) = bin {
         cmd.args(["--bin", b]);
-    }
-    if let Some(t) = target_dir {
-        cmd.arg("--target-dir").arg(t);
     }
     let out = cmd.output().map_err(cargo_missing)?;
     if !out.status.success() {
@@ -466,8 +481,11 @@ fn build(
         };
         return Err(Failure::new(
             Code::CARGO_FAILED,
-            format!("cargo build --release failed in {}: {first}", dir.display()),
-            "fix the build (cargo build --release shows the errors)",
+            format!(
+                "cargo {subcommand} --release failed in {}: {first}",
+                dir.display()
+            ),
+            format!("fix the build (cargo {subcommand} --release shows the errors)"),
         ));
     }
     let mut bins: Vec<(String, PathBuf)> = Vec::new();
@@ -490,7 +508,7 @@ fn build(
         0 => Err(Failure::new(
             Code::BENCH_TARGET,
             format!("the project in {} builds no binary", dir.display()),
-            "run giong bench in the service's package, or give the URL of a running service",
+            format!("run {command} in the service's package"),
         )),
         1 => Ok(bins.remove(0).1),
         _ => Err(Failure::new(
@@ -503,7 +521,7 @@ fn build(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            format!("choose one: giong bench --bin {}", bins[0].0),
+            format!("choose one: {command} --bin {}", bins[0].0),
         )),
     }
 }

@@ -78,6 +78,13 @@ codes! {
     BENCH_GENERATOR_BEHIND = 5062, "BenchGeneratorBehind", "the load generator fell behind its schedule";
     BENCH_ERRORS = 5063, "BenchErrors", "requests failed during the benchmark";
     BENCH_REGRESSION = 5064, "BenchRegression", "the change is slower than the build it is compared with";
+    IMAGE_TARGET = 5070, "ImageTarget", "the service cannot be built for Linux here";
+    IMAGE_LIBRARIES = 5071, "ImageLibraries", "the shared libraries of the binary cannot be found";
+    IMAGE_NO_CERTS = 5072, "ImageNoCerts", "no CA certificates to put in the image";
+    IMAGE_ADD = 5073, "ImageAdd", "a file to add to the image is not usable";
+    IMAGE_LOAD = 5074, "ImageLoad", "the image could not be loaded into Docker or Podman";
+    IMAGE_PUSH = 5075, "ImagePush", "the image could not be pushed to the registry";
+    IMAGE_TAG = 5076, "ImageTag", "the image name or tag is not valid";
 }
 
 impl Code {
