@@ -8,6 +8,56 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-22
+
+macOS support: a kqueue driver, tested on macOS 15 and macOS 26 on Apple Silicon (Intel Macs
+and macOS 14 or older are not tested), with the whole test suite, ThreadSanitizer and 2-hour
+soaks passing there. A stream write or connect that meets `ENOBUFS` on macOS now waits for
+buffers instead of failing at once. Nothing changes on Linux, nothing is removed or changed in
+meaning, and upgrading from 1.1 needs no code changes.
+
+### Added
+
+- **giong**: on macOS, a stream write or connect that gets `ENOBUFS` (no network buffer
+  for the call) waits for buffers, as it would on Linux, instead of failing at once: it is
+  tried again after 1 ms, then 2, 4, 8, 16 and every 32 ms, for at most 2 s, while the
+  worker runs its other tasks. A connect whose new socket could not be made for want of
+  buffers makes it again, one the shortage broke after it began starts over on a new
+  socket, and TLS streams wait the same way. After 2 s the error is the new
+  `GIONG-E0028` (`Code::NetworkBuffersExhausted`, kind `OutOfMemory`), with the kernel's
+  error as its source. Datagram sends keep the kernel's `ENOBUFS`. Nothing changes on
+  Linux ([#205](https://github.com/giong-run/Giong/pull/205)).
+- **giong**: macOS support: a kqueue driver for the readiness loop (`DriverKind::Kqueue`,
+  chosen by default on macOS), with each worker woken through an `EVFILT_USER` event of
+  its own queue. The workers of a TCP or UDP address share one socket, bound without
+  `SO_REUSEPORT`, so no other process can take the port. Every socket has `SO_NOSIGPIPE`;
+  streams are non-blocking from the start (macOS waits in a send to a full socket even with
+  `MSG_DONTWAIT`); UDP sockets that giong binds take datagrams of every length UDP allows.
+  The whole test suite passes on macOS 15 and macOS 26 (Apple Silicon), as do
+  ThreadSanitizer and the soak tests. What still differs from Linux is listed in
+  `docs/design/portability.md` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: the portability layer under the drivers (`src/sys/`, one `Poller` trait for
+  epoll and kqueue, a wake-up per driver), on which the macOS and Windows drivers are
+  built; no change on Linux ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: `ResolverConfig::system` reads the resolver macOS writes to
+  `/etc/resolv.conf` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong-tls**: `TlsConnector::with_system_roots` reads the keychain's trust settings on
+  macOS ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong-http**: `Server::min_free_memory` reads the kernel's free and inactive pages on
+  macOS ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong-mcp**: process figures come from `proc_pidinfo` on macOS
+  ([#173](https://github.com/giong-run/Giong/pull/173)).
+
+### Fixed
+
+- **giong**: `Builder::build` refuses a driver the operating system does not have:
+  io_uring with `GIONG-E0001`, the others with `GIONG-E0004`, whether named through
+  `Builder::driver` or `GIONG_DRIVER` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: `ResolverConfig::parse` (and so `ResolverConfig::system`) keeps a
+  `nameserver` with a zone, such as `fe80::1%en0`, as a scoped IPv6 address; it was skipped,
+  which could leave only the `127.0.0.1` fallback
+  ([#173](https://github.com/giong-run/Giong/pull/173)).
+
 ## [1.1.0] - 2026-11-21
 
 gRPC on giong: three new crates, giong-proto, giong-grpc-build and giong-grpc. Also HTTP
@@ -2647,7 +2697,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/giong-run/Giong/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/giong-run/Giong/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/giong-run/Giong/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...v1.0.0

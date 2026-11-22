@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "giong-compat"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytes",
  "futures-io",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-grpc-build",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc-build"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "prost",
  "prost-types",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mcp"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-http",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mysql"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -389,7 +389,7 @@ dependencies = [
 
 [[package]]
 name = "giong-postgres"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -401,11 +401,11 @@ dependencies = [
 
 [[package]]
 name = "giong-proto"
-version = "1.1.0"
+version = "1.2.0"
 
 [[package]]
 name = "giong-redis"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "giong-web"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-http",
