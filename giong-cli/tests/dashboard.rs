@@ -386,6 +386,19 @@ fn a_stopped_service_is_reported_not_fatal() {
     assert_eq!(v["error"]["code"], "GIONG-E5053", "{v}");
 }
 
+/// Whether cargo runs here: `giong dev` builds with it, and CI also runs
+/// these test binaries in a bare container without it.
+fn have_cargo() -> bool {
+    let ok = Command::new("cargo")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipped: cargo not found");
+    }
+    ok
+}
+
 /// A package of no dependencies whose binary prints a line and stays up for
 /// `secs` seconds: enough for `giong dev` to build and run.
 fn tiny_project(tag: &str, secs: u64) -> PathBuf {
@@ -457,6 +470,9 @@ fn next(rx: &mpsc::Receiver<Value>, want: impl Fn(&Value) -> bool) -> Value {
 
 #[test]
 fn giong_dev_ui_serves_the_dashboard() {
+    if !have_cargo() {
+        return;
+    }
     let dir = tiny_project("ui", 10);
     let (_dev, rx) = dev_once(&dir, &["--ui-port", "0"]);
     let event = next(&rx, |v| v["event"] == "dashboard");
@@ -483,6 +499,9 @@ fn giong_dev_ui_serves_the_dashboard() {
 
 #[test]
 fn giong_dev_runs_without_the_dashboard_when_its_ports_are_taken() {
+    if !have_cargo() {
+        return;
+    }
     // Ten free ports in a row, held while giong dev starts.
     let held = (0..50)
         .find_map(|_| {
