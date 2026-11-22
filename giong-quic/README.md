@@ -35,7 +35,7 @@ Errors are `io::Error`s carrying a giong error code (`GIONG-E3601` to `GIONG-E36
 
 The engine underneath is quinn-proto. Nothing of it appears in the API, so a native engine built for io_uring can replace it later without a change for users.
 
-Linux only, like giong. Minimum Rust version 1.80.
+Linux and macOS, like giong. Minimum Rust version 1.85, above giong's 1.80: the fixed quinn-proto needs it.
 
 ## License
 

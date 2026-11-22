@@ -1397,11 +1397,13 @@ mod tests {
             p.push(0);
         }
         p.extend_from_slice(&[0x40 | (payload >> 8) as u8, payload as u8]);
-        p.extend(std::iter::repeat(0).take(payload));
+        p.extend(std::iter::repeat_n(0, payload));
         p
     }
 
     #[test]
+    // Two different wakers are needed, which `Waker::noop` cannot give.
+    #[allow(clippy::manual_noop_waker)]
     fn a_task_polled_again_is_not_added_again() {
         struct Task;
         impl std::task::Wake for Task {

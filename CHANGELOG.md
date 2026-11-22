@@ -13,8 +13,11 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 HTTP/3: a new crate, giong-quic, carries QUIC on giong's own UDP sockets, and giong-http
 serves and requests HTTP/3 behind the `unstable-http3` feature, on Linux and macOS. Both
 features are off by default and may still change before they are stabilised; the default
-build is unchanged. Nothing is removed or changed in meaning, and upgrading from 1.2 needs no
-code changes.
+build is unchanged. giong-quic, and with it `unstable-http3`, needs Rust 1.85: the QUIC
+engine underneath, quinn-proto, needs it from the release that fixes a remote memory
+exhaustion (GHSA-4w2j-m93h-cj5j) on. Every other crate and feature still builds with Rust
+1.80. Nothing is removed or changed in meaning, and upgrading from 1.2 needs no code
+changes.
 
 ### Added
 
