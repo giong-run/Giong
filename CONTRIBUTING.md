@@ -93,6 +93,9 @@ cargo +nightly fuzz run hpack          # HTTP/2 header compression
 cargo +nightly fuzz run h2             # a whole HTTP/2 connection, the server's side
 cargo +nightly fuzz run h2_client      # the client's side of HTTP/2
 cargo +nightly fuzz run response_body  # the client's response body framing
+cargo +nightly fuzz run h3             # HTTP/3 frames and QPACK field sections
+cargo +nightly fuzz run h3_server      # a whole HTTP/3 connection, over QUIC on loopback
+cargo +nightly fuzz run h3_client      # the HTTP/3 client against a hostile server, over QUIC on loopback
 cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, session, url
 cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, session, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: connection, url

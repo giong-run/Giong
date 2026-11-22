@@ -1,6 +1,6 @@
 [package]
 name = "giong"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Gióng — a thread-per-core async runtime for Linux, built on io_uring, with an epoll fallback"
@@ -10,10 +10,10 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", "giong-quic/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
 
 [workspace]
-members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
+members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "giong-quic", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
 exclude = ["bench", "sim"]
 
 [dependencies]
@@ -26,6 +26,12 @@ socket2 = { version = "0.6", features = ["all"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.2"
+
+[features]
+# UDP offloads for QUIC on UdpSocket: GSO, GRO, ECN, the local address of a
+# datagram and the source address of a send, socket buffer sizes, "don't
+# fragment". Not part of the 1.0 API: may change until it is stabilised.
+unstable-udp-offload = []
 
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).

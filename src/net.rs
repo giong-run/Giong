@@ -25,7 +25,7 @@ pub(crate) mod dns;
 mod fds;
 mod sendq;
 mod share;
-mod udp;
+pub(crate) mod udp;
 mod unix;
 
 #[cfg(target_os = "linux")]
@@ -36,6 +36,8 @@ pub use dns::{Resolver, ResolverConfig};
 pub use fds::{PeerCred, MAX_FDS};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
+#[cfg(feature = "unstable-udp-offload")]
+pub use udp::{SendOptions, GRO_RECV_BUFFER};
 #[cfg(target_os = "linux")]
 pub use unix::UnixDatagram;
 pub use unix::{UnixListener, UnixStream};
