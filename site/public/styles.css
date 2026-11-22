@@ -705,6 +705,20 @@ pre.code .t { color: var(--code-type); }
 .doc-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1.25rem; }
 .doc-meta .crate-links { font-size: 0.875rem; color: var(--fg-3); }
 .doc-meta .crate-links a { color: var(--fg-2); }
+.doc-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.ver-menu { position: relative; }
+.ver-menu > summary { display: inline-flex; align-items: center; gap: 0.4rem; list-style: none; cursor: pointer; font: 600 0.8125rem/1 var(--mono); color: var(--fg); background: var(--ember-wash); border: 1px solid var(--ember-3); border-radius: 999px; padding: 0.55rem 0.85rem; }
+.ver-menu > summary::-webkit-details-marker { display: none; }
+.ver-menu > summary::after { content: "▾"; color: var(--ember-ink); font-size: 0.75rem; }
+.ver-menu[open] > summary::after { content: "▴"; }
+.ver-list { position: absolute; z-index: 20; top: calc(100% + 0.35rem); left: 0; min-width: 11rem; display: grid; padding: 0.35rem; background: var(--ink-2); border: 1px solid var(--line-2); border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25); }
+.ver-list a { display: flex; justify-content: space-between; gap: 1rem; padding: 0.5rem 0.65rem; border-radius: 6px; text-decoration: none; color: var(--fg-2); font: 0.8125rem/1.2 var(--mono); }
+.ver-list a:hover { background: var(--ink-3); color: var(--fg); }
+.ver-list a[aria-current] { color: var(--fg); background: var(--ember-wash); }
+.ver-list a b { font-weight: 600; }
+.ver-list a span { color: var(--ember-ink); }
+.ver-note { border: 1px solid var(--ember-3); background: var(--ember-wash); border-radius: var(--radius); padding: 0.75rem 1rem; font-size: 0.9375rem; color: var(--fg); }
+.ver-note a { color: var(--ember-ink); font-weight: 600; }
 .doc-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .act { display: inline-flex; align-items: center; gap: 0.45rem; font: 500 0.8125rem/1 var(--body); color: var(--fg); text-decoration: none; cursor: pointer; background: var(--ink-2); border: 1px solid var(--line-2); border-radius: 999px; padding: 0.55rem 0.9rem; }
 .act svg { width: 1rem; height: 1rem; flex: none; color: var(--fg-3); }
