@@ -652,11 +652,22 @@ impl Server {
     /// streams), lower it to bound memory more tightly, as in a small
     /// container.
     ///
-    /// At the limit the server stops accepting until a connection closes.
-    /// New clients wait in the kernel's listen queue meanwhile instead of
-    /// being refused, so the server does not run out of file descriptors
-    /// because of the number of clients. Connections handed to
-    /// [`serve_connection`](Self::serve_connection) are not counted.
+    /// At the limit, when a new client arrives, the connection that has
+    /// been idle longest (HTTP/1.1 between requests, HTTP/2 with no request
+    /// open) is closed to make room for it, as nginx does with keep-alive
+    /// connections: idle connections, from one client or from many
+    /// browsers, cannot keep new clients out. The idle connection ends as
+    /// if its client had closed it (HTTP/2 sends `GOAWAY`), and clients
+    /// open a new one when they need it. A connection receiving or
+    /// answering a request is never closed for this. If none is idle, the
+    /// server stops accepting until a connection closes, and new clients
+    /// wait in the kernel's listen queue instead of being refused, so the
+    /// server does not run out of file descriptors because of the number
+    /// of clients (one client past the limit is accepted and waits). Idle
+    /// connections are closed this way on Linux and macOS; on Windows the
+    /// server waits. Connections handed to
+    /// [`serve_connection`](Self::serve_connection) are not counted, and
+    /// HTTP/3 connections are not closed this way.
     ///
     /// Below the limit, new connections are refused while the process is
     /// low on memory: see [`min_free_memory`](Self::min_free_memory).
@@ -792,6 +803,7 @@ impl Server {
         let accept = || listener.accept();
         self.accept_loop(
             accept,
+            fd_of,
             |stream: TcpStream, slot| {
                 let _ = stream.set_nodelay(true);
                 drop(giong::spawn(
@@ -824,6 +836,7 @@ impl Server {
         let accept = || listener.accept();
         self.accept_loop(
             accept,
+            fd_of,
             |stream: UnixStream, slot| {
                 drop(giong::spawn(
                     Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
@@ -872,6 +885,7 @@ impl Server {
         let accept = || listener.accept();
         self.accept_loop(
             accept,
+            fd_of,
             |stream: TcpStream, slot| {
                 let _ = stream.set_nodelay(true);
                 let acceptor = acceptor.clone();
@@ -896,10 +910,9 @@ impl Server {
                         return;
                     };
                     if h2 {
-                        let _slot = slot;
                         // On the heap, so that HTTP/1.1 connections do not
                         // carry the larger HTTP/2 state.
-                        HeapFuture::new(serve_h2(tls, cfg, peer, handler)).await;
+                        HeapFuture::new(serve_h2(tls, cfg, peer, handler, slot)).await;
                     } else {
                         Conn::new(tls, cfg, Some(slot)).serve(handler).await;
                     }
@@ -970,6 +983,8 @@ impl Server {
         };
         self.accept_loop(
             accept,
+            // QUIC connections share the endpoint's socket.
+            |_| -1,
             |conn: giong_quic::Connection, slot| {
                 let handler = handler.clone();
                 drop(giong::spawn(async move {
@@ -990,6 +1005,7 @@ impl Server {
     async fn accept_loop<S, A>(
         &self,
         accept: impl Fn() -> A,
+        fd: impl Fn(&S) -> i32,
         spawn: impl Fn(S, Slot),
         refuse: impl Fn(S),
     ) where
@@ -999,7 +1015,8 @@ impl Server {
             u64::MAX => crate::memory::auto_reserve(),
             bytes => bytes,
         };
-        let spawn = |stream: S, slot: Slot| {
+        let spawn = |stream: S, mut slot: Slot| {
+            slot.set_fd(fd(&stream));
             if crate::memory::low(reserve) {
                 drop(slot);
                 refuse(stream);
@@ -1009,11 +1026,22 @@ impl Server {
             }
         };
         let slots = Rc::new(Slots::new(self.cfg.max_connections));
+        // Below the limit, a slot first and then the connection. At the
+        // limit, the connection first, so that an idle connection is asked
+        // to make room only for a client that is there (one connection past
+        // the limit waits meanwhile, instead of in the listen queue).
+        //
         // Cancel safe: a slot taken by a dropped future is given back, and
-        // `accept` itself loses no connection.
+        // `accept` itself loses no connection, except the one accepted at
+        // the limit while it waits for its slot.
         let next = || async {
-            let slot = slots.take().await;
-            accept().await.map(|stream| (stream, slot))
+            if slots.full() {
+                let stream = accept().await?;
+                Ok((stream, slots.take(true).await))
+            } else {
+                let slot = slots.take(false).await;
+                accept().await.map(|stream| (stream, slot))
+            }
         };
         while let Some(accepted) = giong::until_shutdown(next()).await {
             match accepted {
@@ -1046,10 +1074,32 @@ impl Server {
 
 /// The open connections of one accept loop, against its limit. Only the
 /// accept loop waits for a slot, so one waker is enough.
+///
+/// At the limit, with a new client waiting, an idle connection (HTTP/1.1
+/// between requests, HTTP/2 with no stream open) is asked to close, so that
+/// idle keep-alive connections cannot keep new clients out, as nginx reuses
+/// its keep-alive connections. The accept loop asks by shutting down the
+/// reading side of the connection's socket: the connection reads the end
+/// of its stream, as if the client had closed it, and closes as it would
+/// then. So no connection keeps a waker for this, and the accept loop keeps
+/// two bits and a number per connection, by file descriptor. A connection
+/// marks itself idle and busy; the search for the one idle longest runs
+/// only at the limit. Only on Unix: elsewhere connections are not marked,
+/// and the accept loop waits for one to close.
 struct Slots {
     open: Cell<usize>,
     max: usize,
     waiter: Cell<Option<Waker>>,
+    /// A bit per file descriptor: the connection on it is idle.
+    idle: RefCell<Vec<u64>>,
+    /// A bit per file descriptor: the connection on it was asked to close.
+    evicted: RefCell<Vec<u64>>,
+    /// Per file descriptor: when the connection on it last became idle, in
+    /// `next_idle` order (wrapping).
+    idle_since: RefCell<Vec<u32>>,
+    next_idle: Cell<u32>,
+    /// Connections asked to close that have not closed yet.
+    evicting: Cell<usize>,
 }
 
 impl Slots {
@@ -1058,35 +1108,167 @@ impl Slots {
             open: Cell::new(0),
             max,
             waiter: Cell::new(None),
+            idle: RefCell::new(Vec::new()),
+            evicted: RefCell::new(Vec::new()),
+            idle_since: RefCell::new(Vec::new()),
+            next_idle: Cell::new(0),
+            evicting: Cell::new(0),
         }
     }
 
+    fn full(&self) -> bool {
+        self.open.get() >= self.max
+    }
+
     /// Waits until fewer than `max` connections are open, then takes a slot.
-    async fn take(self: &Rc<Self>) -> Slot {
+    /// Meanwhile, with `evict` (a new connection waits for the slot), asks
+    /// an idle connection to close, unless one asked is still closing.
+    async fn take(self: &Rc<Self>, evict: bool) -> Slot {
         poll_fn(|cx| {
-            if self.open.get() < self.max {
+            if !self.full() {
                 self.open.set(self.open.get() + 1);
-                Poll::Ready(Slot(self.clone()))
+                Poll::Ready(Slot {
+                    slots: self.clone(),
+                    fd: -1,
+                })
             } else {
                 self.waiter.set(Some(cx.waker().clone()));
+                if evict && self.evicting.get() == 0 {
+                    self.evict_one();
+                }
                 Poll::Pending
             }
         })
         .await
     }
+
+    /// Asks the connection idle longest to close, if one is idle.
+    #[cfg(unix)]
+    fn evict_one(&self) {
+        let mut idle = self.idle.borrow_mut();
+        let since = self.idle_since.borrow();
+        let now = self.next_idle.get();
+        let mut oldest: Option<(u32, usize)> = None;
+        for (word, &bits) in idle.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let fd = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let age = now.wrapping_sub(since[fd]);
+                if oldest.map_or(true, |(a, _)| age > a) {
+                    oldest = Some((age, fd));
+                }
+            }
+        }
+        let Some((_, fd)) = oldest else {
+            return;
+        };
+        let (word, bit) = (fd / 64, 1u64 << (fd % 64));
+        idle[word] &= !bit;
+        self.evicted.borrow_mut()[word] |= bit;
+        self.evicting.set(self.evicting.get() + 1);
+        // SAFETY: `fd` is the socket of an open connection of this loop,
+        // which keeps it open until its slot is dropped (right after it
+        // closes the socket, in the same poll), and `ManuallyDrop` never
+        // closes it here.
+        let socket = mem::ManuallyDrop::new(unsafe {
+            <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd as std::os::fd::RawFd)
+        });
+        // `shutdown` is the same call for TCP and Unix sockets. It fails
+        // only if the client is already gone, and the connection then reads
+        // the end of its stream anyway.
+        let _ = socket.shutdown(std::net::Shutdown::Read);
+    }
+
+    #[cfg(not(unix))]
+    fn evict_one(&self) {}
 }
 
 /// One open connection; frees its slot when dropped.
-struct Slot(Rc<Slots>);
+pub(crate) struct Slot {
+    slots: Rc<Slots>,
+    /// The connection's socket, or -1 for one the accept loop does not
+    /// shut down (QUIC, or not on Unix).
+    fd: i32,
+}
+
+impl Slot {
+    /// Records the connection's socket, accepted after the slot was taken.
+    fn set_fd(&mut self, fd: i32) {
+        if fd < 0 {
+            return;
+        }
+        self.fd = fd;
+        let words = fd as usize / 64 + 1;
+        for bits in [&self.slots.idle, &self.slots.evicted] {
+            let mut bits = bits.borrow_mut();
+            if bits.len() < words {
+                bits.resize(words, 0);
+            }
+        }
+        let mut since = self.slots.idle_since.borrow_mut();
+        if since.len() < words * 64 {
+            since.resize(words * 64, 0);
+        }
+    }
+
+    /// The connection waits for its next request (`true`) or is serving
+    /// one (`false`). Becoming idle while the accept loop waits at the limit
+    /// wakes it, to ask this connection or another idle one to close.
+    pub(crate) fn set_idle(&self, idle: bool) {
+        if self.fd < 0 {
+            return;
+        }
+        let (word, bit) = (self.fd as usize / 64, 1u64 << (self.fd % 64));
+        let slots = &*self.slots;
+        let mut bits = slots.idle.borrow_mut();
+        if !idle {
+            bits[word] &= !bit;
+        } else if bits[word] & bit == 0 {
+            // A connection asked to close may come back here once (if a
+            // request was on its way), then reads the end of its stream:
+            // nothing else is asked to close meanwhile (`evicting`).
+            bits[word] |= bit;
+            let order = slots.next_idle.get();
+            slots.next_idle.set(order.wrapping_add(1));
+            slots.idle_since.borrow_mut()[self.fd as usize] = order;
+            if slots.full() {
+                if let Some(waker) = slots.waiter.take() {
+                    waker.wake();
+                }
+            }
+        }
+    }
+}
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let slots = &self.0;
+        let slots = &*self.slots;
+        if self.fd >= 0 {
+            let (word, bit) = (self.fd as usize / 64, 1u64 << (self.fd % 64));
+            slots.idle.borrow_mut()[word] &= !bit;
+            let mut evicted = slots.evicted.borrow_mut();
+            if evicted[word] & bit != 0 {
+                evicted[word] &= !bit;
+                slots.evicting.set(slots.evicting.get() - 1);
+            }
+        }
         slots.open.set(slots.open.get() - 1);
         if let Some(waker) = slots.waiter.take() {
             waker.wake();
         }
     }
+}
+
+/// The socket of a connection, for [`Slots`].
+#[cfg(unix)]
+fn fd_of<S: std::os::fd::AsRawFd>(stream: &S) -> i32 {
+    stream.as_raw_fd()
+}
+
+#[cfg(not(unix))]
+fn fd_of<S>(_: &S) -> i32 {
+    -1
 }
 
 /// Refused connections a worker may still be answering at once; past this
@@ -1178,8 +1360,9 @@ async fn serve_h2<T: Transport, H: Handler>(
     cfg: Config,
     peer: Option<SocketAddr>,
     handler: Rc<H>,
+    slot: Slot,
 ) {
-    crate::h2::serve(&stream, cfg, peer, &*handler, Vec::new()).await;
+    crate::h2::serve(&stream, cfg, peer, &*handler, Vec::new(), Some(&slot)).await;
 }
 
 /// Why a connection stops reading requests.
@@ -1356,7 +1539,14 @@ impl<T: Transport> Conn<T> {
                     let input = self.buf[self.pos..].to_vec();
                     self.release_read_buffer_all();
                     self.charge.shrink_to(0);
-                    let h2 = crate::h2::serve(&self.stream, self.cfg, self.peer, handler, input);
+                    let h2 = crate::h2::serve(
+                        &self.stream,
+                        self.cfg,
+                        self.peer,
+                        handler,
+                        input,
+                        self._slot.as_ref(),
+                    );
                     HeapFuture::new(h2).await;
                     return;
                 }
@@ -1943,8 +2133,18 @@ impl<T: Transport> Conn<T> {
                 return Err(End::Close);
             }
             give_buffer(mem::take(&mut self.out));
+            // At `max_connections`, the accept loop may shut the reading side
+            // of an idle connection down: it then reads the end of its
+            // stream here, and closes.
+            if let Some(slot) = &self._slot {
+                slot.set_idle(true);
+            }
             let recv = timeout(self.cfg.idle_timeout, self.stream.recv());
-            match giong::until_shutdown(recv).await {
+            let received = giong::until_shutdown(recv).await;
+            if let Some(slot) = &self._slot {
+                slot.set_idle(false);
+            }
+            match received {
                 Some(received) => received,
                 None => {
                     // Shutting down: a request that was already on its way is
