@@ -118,6 +118,13 @@ pub use runtime::{
     until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,
 };
 
+/// Makes stream sends and connects fail with `ENOBUFS`, as macOS does when its
+/// network buffers run out, to test how giong waits for them. Built only with
+/// `--cfg giong_inject_enobufs`. Not part of the API.
+#[cfg(giong_inject_enobufs)]
+#[doc(hidden)]
+pub mod inject_enobufs;
+
 /// Entry points for the fuzz targets in `fuzz/`, built only by `cargo fuzz`
 /// (`--cfg fuzzing`). Not part of the API.
 #[cfg(fuzzing)]

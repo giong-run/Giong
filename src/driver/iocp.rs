@@ -1092,7 +1092,7 @@ impl Iocp {
         }
         match io {
             MultiIo::Accept { fd } => self.poll_accept(key, fd, waker),
-            MultiIo::Recv { fd } => self.poll_recv(key, fd, waker),
+            MultiIo::Recv { fd, .. } => self.poll_recv(key, fd, waker),
             MultiIo::RecvMsg { fd, hdr } => {
                 // SAFETY: the header of a multishot receive outlives it.
                 let name_len = unsafe { (*hdr).namelen }.max(0) as usize;

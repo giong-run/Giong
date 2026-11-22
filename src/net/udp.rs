@@ -230,9 +230,12 @@ impl UdpSocket {
     /// share a port between processes on purpose, create the sockets
     /// yourself and pass them to [`from_std`](Self::from_std).
     ///
-    /// On macOS every worker can bind the address too, and the port is
-    /// checked the same way, but the kernel gives all its datagrams to one
-    /// of the sockets: one worker receives them. giong also raises the
+    /// On macOS every worker can bind the address too, and no other process
+    /// can: the sockets of one address in a process are duplicates of one
+    /// socket bound without `SO_REUSEPORT`, so each datagram goes to the
+    /// worker that reads first, and [`connect`](Self::connect) on one of
+    /// them connects them all (bind a port of its own for a connected
+    /// socket). giong also raises the
     /// socket's send buffer there to 65,535 bytes when it is smaller (the
     /// system's default refuses datagrams over 9,216 bytes), so a datagram
     /// of any length UDP allows can be sent, as on Linux.
@@ -310,8 +313,11 @@ impl UdpSocket {
     }
 
     /// Wraps a socket created by the standard library, with the options it
-    /// was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(socket: std::net::UdpSocket) -> Self {
         // SAFETY: we take over the descriptor that `socket` owned.
         Self::from_socket(unsafe { Socket::from_raw_fd(socket.into_raw_fd()) })

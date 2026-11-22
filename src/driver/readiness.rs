@@ -51,11 +51,22 @@ use crate::buf::{BufPool, RecvBuf};
 use crate::slab::Slab;
 use crate::sys;
 
+#[cfg(any(target_os = "macos", giong_inject_enobufs))]
+mod nobufs;
+
 /// What the readiness driver needs from the kernel's event queue (epoll,
 /// kqueue). Tokens are 64 bits: [`WAKE`] and [`DONE`] for the two bells,
 /// otherwise a descriptor number in the lower half and a generation in the
 /// upper half.
 pub(crate) trait Poller: Sized {
+    /// A look that cannot wait (`Park::Poll`) is skipped while no
+    /// descriptor is registered: it could only find the two bells, whose
+    /// news keeps (the blocking threads' reports are read from memory, and
+    /// a wake-up stays pending for the next wait). Set where a look costs
+    /// far more than the polls between looks: on macOS each `kevent` is an
+    /// involuntary context switch (about 20 µs on the CI runners), while an
+    /// `epoll_wait` that finds nothing is cheap, so epoll keeps looking.
+    const SKIP_EMPTY_POLL: bool;
     /// Creates the event queue.
     fn new() -> io::Result<Self>;
     /// Makes the worker's wake-up: ringing it from any thread makes
@@ -323,6 +334,10 @@ unsafe fn run_blocking(io: Io) -> i32 {
     }
 }
 
+/// A datagram of an earlier `recvmmsg` (pool buffer, length written), or
+/// the error it met after its datagrams.
+type Ahead = Result<(u16, u32), i32>;
+
 /// The readiness driver over poller `P`.
 pub(crate) struct Readiness<P: Poller> {
     poller: P,
@@ -334,14 +349,17 @@ pub(crate) struct Readiness<P: Poller> {
     ops: Slab<EOp>,
     /// By multishot operation: datagrams received in the same `recvmmsg` as
     /// one already handed out, as pool buffers and the length of what was
-    /// written into each. Apart from the operations, which every stream
-    /// has, so that they stay small.
-    ahead: HashMap<usize, VecDeque<(u16, u32)>>,
+    /// written into each, then the error (a negative `errno`) that the
+    /// receive met after them, if any (see `sys::take_recv_error`). Apart
+    /// from the operations, which every stream has, so that they stay small.
+    ahead: HashMap<usize, VecDeque<Ahead>>,
     /// Busy datagram sockets (descriptor, generation) to take out of the
     /// poller's set once no task waits on them (see [`QUIET_AFTER`]).
     quieting: Vec<(RawFd, u32)>,
     /// What is known about each descriptor, indexed by its number.
     fds: Vec<Option<Slot>>,
+    /// How many of `fds` are [`Slot::Pollable`].
+    pollable: usize,
     next_gen: u32,
     /// Events collected by `has_completions` and not dispatched yet.
     ready: usize,
@@ -352,6 +370,9 @@ pub(crate) struct Readiness<P: Poller> {
     /// descriptor is to be closed when the last one reports.
     busy: HashMap<RawFd, (u32, bool)>,
     graveyard: Vec<Box<dyn Any>>,
+    /// Sends and connects waiting out a shortage of network buffers.
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    retries: nobufs::Retries,
 }
 
 impl<P: Poller> Readiness<P> {
@@ -366,6 +387,7 @@ impl<P: Poller> Readiness<P> {
             completions,
             ops: Slab::new(),
             fds: Vec::new(),
+            pollable: 0,
             next_gen: 1,
             ready: 0,
             done: Vec::new(),
@@ -374,6 +396,8 @@ impl<P: Poller> Readiness<P> {
             ahead: HashMap::new(),
             quieting: Vec::new(),
             graveyard: Vec::new(),
+            #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+            retries: nobufs::Retries::default(),
         };
         driver.poller.watch(driver.completions.fd(), DONE)?;
         Ok(driver)
@@ -419,7 +443,10 @@ impl<P: Poller> Readiness<P> {
         if self.fds.len() <= i {
             self.fds.resize_with(i + 1, || None);
         }
-        self.fds[i] = Some(slot);
+        self.pollable += usize::from(matches!(slot, Slot::Pollable(_)));
+        if let Some(Slot::Pollable(_)) = self.fds[i].replace(slot) {
+            self.pollable -= 1;
+        }
     }
 
     /// `true` if reads and writes on file descriptor `fd` can wait for
@@ -455,7 +482,9 @@ impl<P: Poller> Readiness<P> {
     /// Forgets what is known about `fd`, which is being closed.
     fn forget(&mut self, fd: RawFd) {
         if let Some(slot) = usize::try_from(fd).ok().and_then(|i| self.fds.get_mut(i)) {
-            *slot = None;
+            if let Some(Slot::Pollable(_)) = slot.take() {
+                self.pollable -= 1;
+            }
         }
     }
 
@@ -534,6 +563,10 @@ impl<P: Poller> Readiness<P> {
         if let Err(e) = self.register(fd) {
             return Attempt::Done(e);
         }
+        #[cfg(giong_inject_enobufs)]
+        if let Some(res) = nobufs::inject::refused(io, *connecting) {
+            return Attempt::Done(res);
+        }
         // SAFETY: for every call below, the pointers come from `Op`
         // resources, valid while the operation exists; the descriptor is
         // non-blocking.
@@ -541,12 +574,21 @@ impl<P: Poller> Readiness<P> {
             match *io {
                 Io::Connect { fd, addr, len } => {
                     if *connecting {
-                        return Attempt::Done(connect_result(fd)).or_wait(fd, Dir::Write);
+                        let res = connect_result(fd);
+                        #[cfg(giong_inject_enobufs)]
+                        let res = nobufs::inject::connected(res, connecting);
+                        return Attempt::Done(res).or_wait(fd, Dir::Write);
                     }
                     let res = match libc::connect(fd, addr, len) {
                         0 => 0,
                         _ => neg_errno(),
                     };
+                    // Tried again after `ENOBUFS`, the call may find the
+                    // first one under way after all.
+                    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                    let res = nobufs::connect_again(res);
+                    #[cfg(giong_inject_enobufs)]
+                    let res = nobufs::inject::connected(res, connecting);
                     if res == -libc::EINPROGRESS || res == -libc::EINTR {
                         // In progress: done when the socket becomes writable.
                         *connecting = true;
@@ -651,6 +693,16 @@ impl<P: Poller> Readiness<P> {
         }
         let mut connecting = false;
         match self.attempt(io, &mut connecting) {
+            #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+            Attempt::Done(res) if nobufs::retries(io, connecting, res) => {
+                let key = self.ops.insert(EOp::Ready {
+                    io: *io,
+                    connecting,
+                });
+                // The first step is always taken.
+                self.retries.schedule(key, waker);
+                Start::Submitted(key)
+            }
             Attempt::Done(res) => Start::Done(res, 0),
             Attempt::Wait(fd, dir) => {
                 let key = self.ops.insert(EOp::Ready {
@@ -745,12 +797,21 @@ impl<P: Poller> Readiness<P> {
             }
             _ => panic!("giong: operation polled in an invalid state"),
         };
+        // One comparison while no operation waits for network buffers.
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        if !self.retries.is_empty() && self.retries.waiting(key, waker) {
+            return Poll::Pending;
+        }
         if !spend_budget() {
             waker.wake_by_ref();
             return Poll::Pending;
         }
         match self.attempt(&io, &mut connecting) {
             Attempt::Done(res) => {
+                #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                if self.retry_later(key, &io, connecting, res, waker) {
+                    return Poll::Pending;
+                }
                 self.ops.remove(key);
                 Poll::Ready((res, 0))
             }
@@ -758,10 +819,32 @@ impl<P: Poller> Readiness<P> {
                 if let Some(EOp::Ready { connecting: c, .. }) = self.ops.get_mut(key) {
                     *c = connecting;
                 }
+                #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                self.retries.forget(key);
                 self.wait(fd, dir, waker);
                 Poll::Pending
             }
         }
+    }
+
+    /// `true` if operation `key`, whose attempt came to `res`, waits for
+    /// network buffers and is tried again later (see [`nobufs`]); otherwise
+    /// it no longer waits for them.
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    #[cold]
+    fn retry_later(
+        &mut self,
+        key: usize,
+        io: &Io,
+        connecting: bool,
+        res: i32,
+        waker: &Waker,
+    ) -> bool {
+        if nobufs::retries(io, connecting, res) && self.retries.schedule(key, waker) {
+            return true;
+        }
+        self.retries.forget(key);
+        false
     }
 
     pub(crate) fn cancel_op(
@@ -805,6 +888,8 @@ impl<P: Poller> Readiness<P> {
             Some(EOp::Ready { .. }) => {
                 // Nothing is using the resources any more.
                 self.ops.remove(key);
+                #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                self.retries.forget(key);
                 if let Some(data) = data {
                     self.graveyard.push(data);
                 }
@@ -840,7 +925,7 @@ impl<P: Poller> Readiness<P> {
             _ => panic!("giong: polling an invalid multishot operation"),
         };
         let (fd, hdr) = match io {
-            MultiIo::Accept { fd } | MultiIo::Recv { fd } => (fd, None),
+            MultiIo::Accept { fd } | MultiIo::Recv { fd, .. } => (fd, None),
             MultiIo::RecvMsg { fd, hdr } => (fd, Some(hdr)),
         };
         if let Some(hdr) = hdr {
@@ -872,10 +957,18 @@ impl<P: Poller> Readiness<P> {
         hdr: *const libc::msghdr,
         waker: &Waker,
     ) -> MultiPoll {
-        if let Some((bid, len)) = self.ahead.get_mut(&key).and_then(VecDeque::pop_front) {
+        match self.ahead.get_mut(&key).and_then(VecDeque::pop_front) {
             // Received earlier, in the same system call as another.
-            let pool = self.pool.clone();
-            return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
+            Some(Ok((bid, len))) => {
+                let pool = self.pool.clone();
+                return MultiPoll::Data(RecvBuf::pooled(pool, bid, 0, len));
+            }
+            // What that system call met after them.
+            Some(Err(res)) => {
+                self.disarm(key);
+                return MultiPoll::Item(res);
+            }
+            None => {}
         }
         if !spend_budget() {
             waker.wake_by_ref();
@@ -981,7 +1074,12 @@ impl<P: Poller> Readiness<P> {
             let name_space = unsafe { (*hdr).msg_namelen as usize };
             let out = self.recvmmsg_into_pool(key, fd, name_space, room);
             let got = match out {
-                Some(Ok(_)) => 1 + self.ahead.get(&key).map_or(0, VecDeque::len),
+                Some(Ok(_)) => {
+                    1 + self
+                        .ahead
+                        .get(&key)
+                        .map_or(0, |a| a.iter().filter(|d| d.is_ok()).count())
+                }
                 _ => 0,
             };
             self.set_batch(key, room, got);
@@ -1148,9 +1246,17 @@ impl<P: Poller> Readiness<P> {
             if i == 0 {
                 first = Some((total as i32, pooled_flags(bid)));
             } else if matches!(self.ops.get(key), Some(EOp::Multi { .. })) {
-                self.ahead.entry(key).or_default().push_back((bid, total));
+                self.ahead
+                    .entry(key)
+                    .or_default()
+                    .push_back(Ok((bid, total)));
             } else {
                 self.pool.release(bid);
+            }
+        }
+        if let Some(errno) = sys::take_recv_error() {
+            if matches!(self.ops.get(key), Some(EOp::Multi { .. })) {
+                self.ahead.entry(key).or_default().push_back(Err(-errno));
             }
         }
         first.map(Ok)
@@ -1220,7 +1326,7 @@ impl<P: Poller> Readiness<P> {
                 .then(|| self.ahead.remove(&key))
                 .flatten()
             {
-                for (bid, _) in ahead {
+                for (bid, _) in ahead.into_iter().flatten() {
                     self.pool.release(bid);
                 }
             }
@@ -1235,6 +1341,9 @@ impl<P: Poller> Readiness<P> {
         if self.ready > 0 || self.completions.any() {
             return true;
         }
+        if self.nothing_to_poll() {
+            return false;
+        }
         self.ready = self.wait_events(Some(Duration::ZERO));
         self.ready > 0
     }
@@ -1242,20 +1351,39 @@ impl<P: Poller> Readiness<P> {
     pub(crate) fn park(&mut self, mode: Park) -> Vec<Box<dyn Any>> {
         let n = if self.ready > 0 {
             mem::take(&mut self.ready)
+        } else if matches!(mode, Park::Poll) && self.nothing_to_poll() {
+            0
         } else {
             let timeout = match mode {
                 _ if self.completions.any() => Some(Duration::ZERO),
                 Park::Poll => Some(Duration::ZERO),
                 Park::Wait(timeout) => timeout,
             };
+            #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+            let timeout = if self.retries.is_empty() {
+                timeout
+            } else {
+                self.retries.limit(timeout)
+            };
             self.wait_events(timeout)
         };
         self.dispatch(n);
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        if !self.retries.is_empty() {
+            self.retries.wake_due();
+        }
         if !self.quieting.is_empty() {
             self.leave_busy_sets();
         }
         self.collect_blocking();
         mem::take(&mut self.graveyard)
+    }
+
+    /// `true` if a look that cannot wait is to be skipped (see
+    /// [`Poller::SKIP_EMPTY_POLL`]).
+    #[inline]
+    fn nothing_to_poll(&self) -> bool {
+        P::SKIP_EMPTY_POLL && self.pollable == 0
     }
 
     /// Waits for events; `None` waits without a time limit.
@@ -1269,7 +1397,10 @@ impl<P: Poller> Readiness<P> {
             let (token, readable, writable) = self.poller.event(i);
             match token {
                 WAKE => self.wake.seen(),
-                DONE => {} // collected below
+                // Collected below; a ring left over from results that
+                // were already taken is reset, or every wait would end
+                // at once.
+                DONE => self.completions.quiet(),
                 token => {
                     let fd = token as u32 as usize;
                     let gen = (token >> 32) as u32;
@@ -1451,4 +1582,38 @@ pub(super) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    type Platform = super::super::epoll::Epoll;
+    #[cfg(all(not(target_os = "linux"), any(target_os = "macos", giong_libkqueue)))]
+    type Platform = super::super::kqueue::Kqueue;
+
+    /// A blocking job that finishes while its worker takes the results
+    /// rings the bell after the results are gone. The next wait sees the
+    /// ring and resets it: the one after waits again.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call epoll_wait or kevent")]
+    fn a_late_ring_of_the_blocking_threads_does_not_end_every_wait() {
+        let mut driver = Readiness::<Platform>::new(BufPool::new(2, 64).unwrap()).unwrap();
+        driver.completions.push(usize::MAX, 0);
+        let mut taken = Vec::new();
+        driver.completions.take(&mut taken);
+        assert_eq!(taken.len(), 1);
+        // The ring of a job whose result was already taken.
+        driver.completions.ring();
+        driver.park(Park::Wait(Some(Duration::from_millis(1))));
+        let wait = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        driver.park(Park::Wait(Some(wait)));
+        assert!(
+            start.elapsed() >= wait - Duration::from_millis(5),
+            "{:?}",
+            start.elapsed()
+        );
+    }
 }

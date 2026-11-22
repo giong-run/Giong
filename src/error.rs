@@ -54,8 +54,8 @@ macro_rules! codes {
         /// Codes are grouped by where they come from: `E00xx` the runtime,
         /// `E01xx` networking and name resolution, `E02xx` files, `E11xx`
         /// giong-http, `E12xx` giong-web, `E13xx` giong-mcp, `E14xx`
-        /// giong-compat, `E2xxx` giong-tls, `E30xx` giong-postgres, `E31xx` giong-mysql and `E32xx`
-        /// giong-redis. Each
+        /// giong-compat, `E2xxx` giong-tls, `E30xx` giong-postgres, `E31xx`
+        /// giong-mysql, `E32xx` giong-redis and `E41xx` giong-grpc. Each
         /// has a page under `docs/errors/` in the repository;
         /// [`url`](Code::url) links to it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -151,6 +151,17 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+
+    // -------------------------------------------------------------- macOS
+    /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
+    /// longer than giong waits: sockets holding much unread data bring it
+    /// on, and some virtual machines get it in bursts. A stream send or
+    /// connect waits
+    /// for buffers and is tried again for up to 2 seconds before it fails
+    /// with this code (a datagram send keeps the kernel's error). The
+    /// kernel's error is the [`source`](std::error::Error::source), so
+    /// `raw_os_error` stays reachable.
+    NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
@@ -273,6 +284,11 @@ codes! {
     /// connection without TLS; a TLS connection is closed before its
     /// handshake.
     HttpServerLowMemory = 1121, OutOfMemory, "connection refused: the server is low on memory";
+    /// A trailer field cannot be sent as written: a name that is not a
+    /// token, a field that means nothing after a body (`content-length`,
+    /// `transfer-encoding`, `host` and the like), or a value with a line
+    /// break or another control character. Raised by `Trailers::field`.
+    HttpInvalidTrailer = 1122, InvalidInput, "invalid HTTP trailer field";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
@@ -468,6 +484,43 @@ codes! {
     RedisProtocol = 3210, InvalidData, "Redis protocol error";
     /// The reply did not arrive within the response timeout.
     RedisTimeout = 3211, TimedOut, "Redis reply timed out";
+
+    // -------------------------------------------------------- giong-grpc
+    /// A metadata name or value cannot be sent as written: a name that is
+    /// not lowercase letters, digits, `-`, `_` and `.`, a name gRPC keeps
+    /// for itself (`grpc-` and the HTTP fields), or a text value with
+    /// bytes outside printable ASCII.
+    GrpcInvalidMetadata = 4101, InvalidInput, "invalid gRPC metadata";
+    /// A gRPC message is larger than the limit of the side that reads or
+    /// writes it. The call ends with `RESOURCE_EXHAUSTED`.
+    GrpcMessageTooLarge = 4102, InvalidData, "gRPC message too large";
+    /// The other end broke the gRPC protocol: a message cut short, a
+    /// frame flag other than 0 or 1, a response without `grpc-status`, a
+    /// content type that is not `application/grpc`, a `grpc-timeout` that
+    /// does not parse, or compressed data that does not inflate.
+    GrpcProtocol = 4103, InvalidData, "gRPC protocol error";
+    /// A message is compressed with an encoding this side does not have
+    /// (only `gzip` and `identity` are supported). The call ends with
+    /// `UNIMPLEMENTED`.
+    GrpcEncoding = 4104, Unsupported, "unsupported gRPC message encoding";
+    /// A gRPC message is not valid protobuf for its type; the message
+    /// carries the giong-proto code that says why.
+    GrpcDecode = 4105, InvalidData, "gRPC message is not valid protobuf";
+    /// The connection for a gRPC call could not be opened, or broke
+    /// before the call ended. The call ends with `UNAVAILABLE`.
+    GrpcTransport = 4106, ConnectionAborted, "gRPC connection failed";
+    /// The address given to a gRPC channel is not an `http` or `https`
+    /// URL with a host.
+    GrpcEndpoint = 4107, InvalidInput, "invalid gRPC endpoint";
+    /// A gRPC call did not end within its deadline. The call ends with
+    /// `DEADLINE_EXCEEDED`.
+    GrpcDeadline = 4108, TimedOut, "gRPC deadline exceeded";
+    /// A gRPC call was cancelled before it ended: the client dropped it
+    /// or reset its stream. The call ends with `CANCELLED`.
+    GrpcCancelled = 4109, ConnectionAborted, "gRPC call cancelled";
+    /// The server has no such gRPC service or method. The call ends with
+    /// `UNIMPLEMENTED`.
+    GrpcUnimplemented = 4110, Unsupported, "gRPC method not found";
 }
 
 impl Code {

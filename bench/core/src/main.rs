@@ -69,7 +69,14 @@ const XMSGS: u64 = 4_000_000;
 const CHAIN: u64 = 1_000;
 const CHAIN_ROUNDS: u64 = 400;
 const RR: u64 = 100_000;
+/// macOS keeps a closed loopback connection's port in TIME_WAIT for 30 s
+/// and has 16,384 ephemeral ports: 10,000 per run would run out of them by
+/// the second runtime (connect fails with `ETIMEDOUT`). `bench/core.sh`
+/// also waits out TIME_WAIT after each `connect` run there.
+#[cfg(target_os = "linux")]
 const CONNECTS: u64 = 10_000;
+#[cfg(not(target_os = "linux"))]
+const CONNECTS: u64 = 2_000;
 const LOOKUPS: u64 = 200_000;
 
 /// The workloads, written once and expanded inside each runtime's module,

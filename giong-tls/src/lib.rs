@@ -82,6 +82,13 @@ mod certs;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod ktls;
+
+/// The flag that makes a send to a closed peer fail with `EPIPE` instead of
+/// raising `SIGPIPE`. macOS has none: giong's sockets carry `SO_NOSIGPIPE`.
+#[cfg(target_os = "linux")]
+const NO_SIGNAL: libc::c_int = libc::MSG_NOSIGNAL;
+#[cfg(target_os = "macos")]
+const NO_SIGNAL: libc::c_int = 0;
 mod received;
 
 pub use certs::Certificates;
@@ -304,6 +311,15 @@ fn broken() -> io::Error {
         "open a new connection. A write cancelled half-way (a dropped future, a timeout) \
          leaves a partial record or message behind, so the stream cannot go on.",
     )
+}
+
+/// `true` for `ENOBUFS` on macOS, which has no network buffer for the send
+/// at that moment: the send sent nothing, and giong's own sends wait for
+/// buffers (GIONG-E0028), so the sends here made without waiting treat it
+/// as a full socket. Linux makes a TCP sender wait instead.
+#[inline]
+fn no_buffers(e: &io::Error) -> bool {
+    cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::ENOBUFS)
 }
 
 /// Every certificate in `pem`, or an error if there is none.
@@ -1515,7 +1531,7 @@ impl TlsStream {
                     std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
                     unsent.as_ptr().cast(),
                     len,
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    libc::MSG_DONTWAIT | NO_SIGNAL,
                 )
             };
             if n >= 0 {
@@ -1532,6 +1548,9 @@ impl TlsStream {
             match e.kind() {
                 io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock => return Ok(()),
+                // macOS out of network buffers: like a full socket, what was
+                // not sent waits for the next send, which waits for them.
+                _ if no_buffers(&e) => return Ok(()),
                 _ => {
                     self.broken.set(true);
                     *unsent = Vec::new();
@@ -1946,10 +1965,13 @@ impl TlsStream {
             wire.drain(..n as usize);
         } else {
             let e = io::Error::last_os_error();
+            // Out of network buffers (macOS): `send_wire` below waits for
+            // them, as for room in the socket.
             if !matches!(
                 e.kind(),
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
+            ) && !no_buffers(&e)
+            {
                 self.broken.set(true);
                 wire.clear();
                 return Err(e);

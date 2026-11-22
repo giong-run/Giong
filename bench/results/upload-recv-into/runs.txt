@@ -1,0 +1,170 @@
+# First A/B: branch at 64f376d (before review changes)
+main  1048576 rps 3020.2 p99 10321.9 cpu_us 325.79 non2xx 0
+branch  1048576 rps 7240.0 p99 3760.1 cpu_us 135.99 non2xx 0
+main  262144 rps 12163.0 p99 2285.6 cpu_us 81.51 non2xx 0
+branch  262144 rps 20700.4 p99 1085.4 cpu_us 47.82 non2xx 0
+main  65536 rps 40922.4 p99 817.2 cpu_us 24.19 non2xx 0
+branch  65536 rps 46121.4 p99 504.8 cpu_us 21.57 non2xx 0
+main  4096 rps 111598.8 p99 300.0 cpu_us 8.87 non2xx 0
+branch  4096 rps 104863.0 p99 328.7 cpu_us 9.36 non2xx 0
+main  json rps 136566.8 p99 935.9 cpu_us 7.22 non2xx 0
+branch  json rps 130783.4 p99 944.1 cpu_us 7.57 non2xx 0
+main GIONG_DRIVER=epoll 1048576 rps 3460.0 p99 6373.4 cpu_us 286.34 non2xx 0
+branch GIONG_DRIVER=epoll 1048576 rps 7621.6 p99 3809.3 cpu_us 130.06 non2xx 0
+main GIONG_DRIVER=epoll 262144 rps 17061.6 p99 1585.2 cpu_us 57.62 non2xx 0
+branch GIONG_DRIVER=epoll 262144 rps 26753.0 p99 1046.5 cpu_us 37.0 non2xx 0
+main GIONG_DRIVER=epoll 65536 rps 40630.0 p99 596.0 cpu_us 24.45 non2xx 0
+branch GIONG_DRIVER=epoll 65536 rps 48928.8 p99 455.7 cpu_us 20.33 non2xx 0
+main GIONG_DRIVER=epoll 4096 rps 81860.8 p99 394.2 cpu_us 12.13 non2xx 0
+branch GIONG_DRIVER=epoll 4096 rps 81182.2 p99 322.6 cpu_us 12.21 non2xx 0
+main GIONG_DRIVER=epoll json rps 102487.2 p99 1159.2 cpu_us 9.43 non2xx 0
+branch GIONG_DRIVER=epoll json rps 107586.2 p99 989.2 cpu_us 9.23 non2xx 0
+main  1048576 rps 2928.8 p99 10190.8 cpu_us 338.79 non2xx 0
+branch  1048576 rps 7414.8 p99 3956.7 cpu_us 133.01 non2xx 0
+main  262144 rps 12174.0 p99 2383.9 cpu_us 81.16 non2xx 0
+branch  262144 rps 20153.8 p99 1388.5 cpu_us 49.36 non2xx 0
+main  65536 rps 41111.8 p99 813.1 cpu_us 24.08 non2xx 0
+branch  65536 rps 50318.8 p99 455.7 cpu_us 19.74 non2xx 0
+main  4096 rps 116516.0 p99 265.2 cpu_us 8.53 non2xx 0
+branch  4096 rps 110399.4 p99 281.6 cpu_us 8.98 non2xx 0
+main  json rps 143167.0 p99 907.3 cpu_us 6.9 non2xx 0
+branch  json rps 158560.0 p99 829.4 cpu_us 6.25 non2xx 0
+main GIONG_DRIVER=epoll 1048576 rps 3771.4 p99 5619.7 cpu_us 264.49 non2xx 0
+branch GIONG_DRIVER=epoll 1048576 rps 7551.8 p99 3989.5 cpu_us 131.48 non2xx 0
+main GIONG_DRIVER=epoll 262144 rps 16454.6 p99 1306.6 cpu_us 60.36 non2xx 0
+branch GIONG_DRIVER=epoll 262144 rps 24987.2 p99 911.4 cpu_us 39.88 non2xx 0
+main GIONG_DRIVER=epoll 65536 rps 41485.4 p99 571.4 cpu_us 24.02 non2xx 0
+branch GIONG_DRIVER=epoll 65536 rps 48431.8 p99 492.5 cpu_us 20.44 non2xx 0
+main GIONG_DRIVER=epoll 4096 rps 89668.8 p99 279.6 cpu_us 11.1 non2xx 0
+branch GIONG_DRIVER=epoll 4096 rps 80857.6 p99 326.7 cpu_us 12.28 non2xx 0
+main GIONG_DRIVER=epoll json rps 104676.4 p99 1034.2 cpu_us 9.44 non2xx 0
+branch GIONG_DRIVER=epoll json rps 107457.0 p99 1042.4 cpu_us 9.21 non2xx 0
+main  1048576 rps 3046.6 p99 9601.0 cpu_us 325.16 non2xx 0
+branch  1048576 rps 7418.4 p99 3448.8 cpu_us 133.17 non2xx 0
+main  262144 rps 13071.0 p99 2105.3 cpu_us 75.21 non2xx 0
+branch  262144 rps 21152.2 p99 1437.7 cpu_us 46.72 non2xx 0
+main  65536 rps 41495.8 p99 776.2 cpu_us 23.82 non2xx 0
+branch  65536 rps 49014.4 p99 616.4 cpu_us 20.03 non2xx 0
+main  4096 rps 108461.0 p99 328.7 cpu_us 9.13 non2xx 0
+branch  4096 rps 111519.0 p99 291.8 cpu_us 8.86 non2xx 0
+main  json rps 137272.0 p99 882.7 cpu_us 7.2 non2xx 0
+branch  json rps 136431.0 p99 956.4 cpu_us 7.22 non2xx 0
+main GIONG_DRIVER=epoll 1048576 rps 3698.4 p99 7553.0 cpu_us 267.9 non2xx 0
+branch GIONG_DRIVER=epoll 1048576 rps 7647.0 p99 3694.6 cpu_us 129.19 non2xx 0
+main GIONG_DRIVER=epoll 262144 rps 17283.6 p99 1298.4 cpu_us 57.56 non2xx 0
+branch GIONG_DRIVER=epoll 262144 rps 26196.8 p99 923.6 cpu_us 37.79 non2xx 0
+main GIONG_DRIVER=epoll 65536 rps 41061.2 p99 596.0 cpu_us 24.11 non2xx 0
+branch GIONG_DRIVER=epoll 65536 rps 46708.6 p99 517.1 cpu_us 21.27 non2xx 0
+main GIONG_DRIVER=epoll 4096 rps 80471.4 p99 412.7 cpu_us 12.28 non2xx 0
+branch GIONG_DRIVER=epoll 4096 rps 83586.6 p99 312.3 cpu_us 11.88 non2xx 0
+main GIONG_DRIVER=epoll json rps 104160.6 p99 1101.8 cpu_us 9.5 non2xx 0
+branch GIONG_DRIVER=epoll json rps 103117.8 p99 1191.9 cpu_us 9.55 non2xx 0
+
+# Final A/B, part 1: uploads of 1 MiB, 256 KiB and 64 KiB, /json, mixed (3 rounds)
+# columns: version driver case rps cpu_us bad [mixed: /json req/s, p50 us, p99 us]
+main GIONG_DRIVER=io_uring 1048576 rps 2973.4 cpu_us 332.03 bad 0
+branch GIONG_DRIVER=io_uring 1048576 rps 6597.2 cpu_us 149.74 bad 0
+main GIONG_DRIVER=io_uring 262144 rps 12137.6 cpu_us 81.68 bad 0
+branch GIONG_DRIVER=io_uring 262144 rps 20886.6 cpu_us 47.39 bad 0
+main GIONG_DRIVER=io_uring 65536 rps 39126.0 cpu_us 25.34 bad 0
+branch GIONG_DRIVER=io_uring 65536 rps 48305.4 cpu_us 20.6 bad 0
+main GIONG_DRIVER=io_uring json rps 137536.6 cpu_us 7.21 bad 0
+branch GIONG_DRIVER=io_uring json rps 128796.2 cpu_us 7.66 bad 0
+main GIONG_DRIVER=io_uring mixed rps 38045.0 cpu_us 25.93 bad 0  json_rps 36136 json_p50 324.6 json_p99 1282.0
+branch GIONG_DRIVER=io_uring mixed rps 50095.2 cpu_us 19.73 bad 0  json_rps 47587 json_p50 239.1 json_p99 940.0
+main GIONG_DRIVER=epoll 1048576 rps 3246.0 cpu_us 304.69 bad 0
+branch GIONG_DRIVER=epoll 1048576 rps 7731.0 cpu_us 128.65 bad 0
+main GIONG_DRIVER=epoll 262144 rps 17319.0 cpu_us 57.54 bad 0
+branch GIONG_DRIVER=epoll 262144 rps 24638.6 cpu_us 40.24 bad 0
+main GIONG_DRIVER=epoll 65536 rps 41654.8 cpu_us 23.8 bad 0
+branch GIONG_DRIVER=epoll 65536 rps 47524.6 cpu_us 20.83 bad 0
+main GIONG_DRIVER=epoll json rps 105994.2 cpu_us 9.4 bad 0
+branch GIONG_DRIVER=epoll json rps 90047.8 cpu_us 11.09 bad 0
+main GIONG_DRIVER=epoll mixed rps 41679.8 cpu_us 23.71 bad 0  json_rps 39593 json_p50 300.0 json_p99 1134.6
+branch GIONG_DRIVER=epoll mixed rps 49964.8 cpu_us 19.91 bad 0  json_rps 47460 json_p50 250.4 json_p99 895.0
+main GIONG_DRIVER=io_uring 1048576 rps 2660.0 cpu_us 371.73 bad 0
+branch GIONG_DRIVER=io_uring 1048576 rps 5967.0 cpu_us 164.43 bad 0
+main GIONG_DRIVER=io_uring 262144 rps 12804.8 cpu_us 77.69 bad 0
+branch GIONG_DRIVER=io_uring 262144 rps 21283.6 cpu_us 46.51 bad 0
+main GIONG_DRIVER=io_uring 65536 rps 38920.8 cpu_us 25.26 bad 0
+branch GIONG_DRIVER=io_uring 65536 rps 51885.0 cpu_us 19.18 bad 0
+main GIONG_DRIVER=io_uring json rps 123878.2 cpu_us 8.02 bad 0
+branch GIONG_DRIVER=io_uring json rps 146483.4 cpu_us 6.78 bad 0
+main GIONG_DRIVER=io_uring mixed rps 36571.6 cpu_us 26.98 bad 0  json_rps 34736 json_p50 343.0 json_p99 1314.8
+branch GIONG_DRIVER=io_uring mixed rps 52594.8 cpu_us 18.66 bad 0  json_rps 49952 json_p50 229.9 json_p99 895.0
+main GIONG_DRIVER=epoll 1048576 rps 3242.0 cpu_us 306.09 bad 0
+branch GIONG_DRIVER=epoll 1048576 rps 7574.8 cpu_us 131.08 bad 0
+main GIONG_DRIVER=epoll 262144 rps 16954.4 cpu_us 58.18 bad 0
+branch GIONG_DRIVER=epoll 262144 rps 24245.8 cpu_us 40.96 bad 0
+main GIONG_DRIVER=epoll 65536 rps 39755.0 cpu_us 24.86 bad 0
+branch GIONG_DRIVER=epoll 65536 rps 47134.8 cpu_us 21.14 bad 0
+main GIONG_DRIVER=epoll json rps 107137.8 cpu_us 9.27 bad 0
+branch GIONG_DRIVER=epoll json rps 101893.8 cpu_us 9.76 bad 0
+main GIONG_DRIVER=epoll mixed rps 43148.8 cpu_us 22.98 bad 0  json_rps 40982 json_p50 293.9 json_p99 1118.2
+branch GIONG_DRIVER=epoll mixed rps 51620.2 cpu_us 19.24 bad 0  json_rps 49029 json_p50 249.3 json_p99 817.2
+main GIONG_DRIVER=io_uring 1048576 rps 2912.4 cpu_us 338.41 bad 0
+branch GIONG_DRIVER=io_uring 1048576 rps 6542.2 cpu_us 151.0 bad 0
+main GIONG_DRIVER=io_uring 262144 rps 12186.8 cpu_us 80.94 bad 0
+branch GIONG_DRIVER=io_uring 262144 rps 21202.4 cpu_us 47.0 bad 0
+main GIONG_DRIVER=io_uring 65536 rps 39354.4 cpu_us 25.15 bad 0
+branch GIONG_DRIVER=io_uring 65536 rps 48298.4 cpu_us 20.57 bad 0
+main GIONG_DRIVER=io_uring json rps 132213.6 cpu_us 7.51 bad 0
+branch GIONG_DRIVER=io_uring json rps 146754.4 cpu_us 6.72 bad 0
+main GIONG_DRIVER=io_uring mixed rps 37340.8 cpu_us 26.15 bad 0  json_rps 35465 json_p50 328.7 json_p99 1323.0
+branch GIONG_DRIVER=io_uring mixed rps 51909.4 cpu_us 19.04 bad 0  json_rps 49302 json_p50 233.0 json_p99 903.2
+main GIONG_DRIVER=epoll 1048576 rps 3514.6 cpu_us 282.37 bad 0
+branch GIONG_DRIVER=epoll 1048576 rps 7028.2 cpu_us 141.75 bad 0
+main GIONG_DRIVER=epoll 262144 rps 16307.6 cpu_us 61.0 bad 0
+branch GIONG_DRIVER=epoll 262144 rps 26308.0 cpu_us 37.94 bad 0
+main GIONG_DRIVER=epoll 65536 rps 40311.0 cpu_us 24.6 bad 0
+branch GIONG_DRIVER=epoll 65536 rps 47737.2 cpu_us 20.81 bad 0
+main GIONG_DRIVER=epoll json rps 106627.8 cpu_us 9.31 bad 0
+branch GIONG_DRIVER=epoll json rps 106154.8 cpu_us 9.34 bad 0
+main GIONG_DRIVER=epoll mixed rps 44029.6 cpu_us 22.41 bad 0  json_rps 41818 json_p50 289.8 json_p99 1101.8
+branch GIONG_DRIVER=epoll mixed rps 53380.0 cpu_us 18.58 bad 0  json_rps 50702 json_p50 236.0 json_p99 804.9
+
+# Final A/B, part 2: final code; /json 5 more rounds, uploads of 3 MiB and 1 MiB (3 rounds), GIONG_MAX_BODY=4194304
+main GIONG_DRIVER=io_uring json rps 136193.8 cpu_us 7.27 bad 0
+branch GIONG_DRIVER=io_uring json rps 134634.6 cpu_us 7.34 bad 0
+main GIONG_DRIVER=epoll json rps 105856.2 cpu_us 9.41 bad 0
+branch GIONG_DRIVER=epoll json rps 105471.2 cpu_us 9.42 bad 0
+main GIONG_DRIVER=io_uring json rps 128359.2 cpu_us 7.71 bad 0
+branch GIONG_DRIVER=io_uring json rps 127164.2 cpu_us 7.8 bad 0
+main GIONG_DRIVER=epoll json rps 107569.8 cpu_us 9.23 bad 0
+branch GIONG_DRIVER=epoll json rps 109847.6 cpu_us 9.0 bad 0
+main GIONG_DRIVER=io_uring json rps 139989.2 cpu_us 7.04 bad 0
+branch GIONG_DRIVER=io_uring json rps 134419.2 cpu_us 7.38 bad 0
+main GIONG_DRIVER=epoll json rps 104257.6 cpu_us 9.54 bad 0
+branch GIONG_DRIVER=epoll json rps 102248.2 cpu_us 9.57 bad 0
+main GIONG_DRIVER=io_uring json rps 140121.4 cpu_us 7.09 bad 0
+branch GIONG_DRIVER=io_uring json rps 139199.2 cpu_us 7.14 bad 0
+main GIONG_DRIVER=epoll json rps 108954.6 cpu_us 9.1 bad 0
+branch GIONG_DRIVER=epoll json rps 106975.2 cpu_us 9.27 bad 0
+main GIONG_DRIVER=io_uring json rps 149374.8 cpu_us 6.62 bad 0
+branch GIONG_DRIVER=io_uring json rps 137844.6 cpu_us 7.18 bad 0
+main GIONG_DRIVER=epoll json rps 109591.8 cpu_us 9.08 bad 0
+branch GIONG_DRIVER=epoll json rps 110001.8 cpu_us 9.0 bad 0
+main GIONG_DRIVER=io_uring 3145728 rps 542.8 cpu_us 1639.19 bad 0
+branch GIONG_DRIVER=io_uring 3145728 rps 1445.6 cpu_us 669.52 bad 0
+main GIONG_DRIVER=io_uring 1048576 rps 2863.0 cpu_us 345.99 bad 0
+branch GIONG_DRIVER=io_uring 1048576 rps 6678.6 cpu_us 147.42 bad 0
+main GIONG_DRIVER=epoll 3145728 rps 478.8 cpu_us 2074.69 bad 0
+branch GIONG_DRIVER=epoll 3145728 rps 2570.6 cpu_us 385.94 bad 0
+main GIONG_DRIVER=epoll 1048576 rps 3389.0 cpu_us 293.32 bad 0
+branch GIONG_DRIVER=epoll 1048576 rps 7441.4 cpu_us 132.31 bad 0
+main GIONG_DRIVER=io_uring 3145728 rps 628.4 cpu_us 1443.42 bad 0
+branch GIONG_DRIVER=io_uring 3145728 rps 1404.8 cpu_us 693.66 bad 0
+main GIONG_DRIVER=io_uring 1048576 rps 2760.2 cpu_us 357.05 bad 0
+branch GIONG_DRIVER=io_uring 1048576 rps 6756.8 cpu_us 145.96 bad 0
+main GIONG_DRIVER=epoll 3145728 rps 590.8 cpu_us 1669.47 bad 0
+branch GIONG_DRIVER=epoll 3145728 rps 2468.2 cpu_us 401.93 bad 0
+main GIONG_DRIVER=epoll 1048576 rps 3541.8 cpu_us 279.27 bad 0
+branch GIONG_DRIVER=epoll 1048576 rps 7778.4 cpu_us 128.08 bad 0
+main GIONG_DRIVER=io_uring 3145728 rps 602.8 cpu_us 1485.15 bad 0
+branch GIONG_DRIVER=io_uring 3145728 rps 1512.6 cpu_us 649.82 bad 0
+main GIONG_DRIVER=io_uring 1048576 rps 2860.8 cpu_us 342.18 bad 0
+branch GIONG_DRIVER=io_uring 1048576 rps 6478.2 cpu_us 152.23 bad 0
+main GIONG_DRIVER=epoll 3145728 rps 450.2 cpu_us 2201.88 bad 0
+branch GIONG_DRIVER=epoll 3145728 rps 2498.4 cpu_us 395.08 bad 0
+main GIONG_DRIVER=epoll 1048576 rps 3629.6 cpu_us 274.81 bad 0
+branch GIONG_DRIVER=epoll 1048576 rps 7666.8 cpu_us 129.51 bad 0

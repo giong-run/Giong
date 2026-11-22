@@ -208,9 +208,9 @@ plan or a limit of macOS itself):
 | Files | io_uring, or blocking pool on epoll | blocking pool (as epoll) | macOS has no usable async file I/O |
 | `sync_all`/`sync_data` | `fsync`/`fdatasync` | `F_FULLFSYNC` for both | slower but durable; macOS has no `fdatasync` |
 | `allocate` | `fallocate` | `F_PREALLOCATE` + `ftruncate` | emulated; same visible result |
-| TCP port shared by workers | `SO_REUSEPORT` spreads connections by a hash of their addresses | one listening socket, duplicated for each worker (`src/net/share.rs`): whichever worker accepts first gets the connection | different spread, same API; `SO_REUSEPORT` on macOS would send every connection to one socket |
-| UDP port shared by workers | `SO_REUSEPORT` spreads datagrams by sender | each worker binds with `SO_REUSEPORT`; the kernel gives every datagram to one socket | macOS limit: one worker receives |
-| Port guard against a second process | the first socket of a port binds without `SO_REUSEPORT` (`src/net/share.rs`) | TCP: the shared socket never has `SO_REUSEPORT`, so nothing else can bind while it lives. UDP: a probe socket without the option is bound and closed before the first bind | TCP stronger than Linux; UDP checked at the first bind only (a process of the same user that sets `SO_REUSEPORT` can join later) |
+| TCP port shared by workers | `SO_REUSEPORT` spreads connections by a hash of their addresses | one listening socket, duplicated for each worker (`src/net/share.rs`): whichever worker accepts first gets the connection; every worker waiting in `accept` is woken for each connection (a herd: all but one find nothing), and balanced listeners judge the other workers by their work alone, since being awake says nothing there | different spread, same API; `SO_REUSEPORT` on macOS would send every connection to one socket; one acceptor at a time is a 1.2.x item |
+| UDP port shared by workers | `SO_REUSEPORT` spreads datagrams by sender | one socket bound without `SO_REUSEPORT`, duplicated for each worker (`src/net/share.rs`); each datagram goes to the worker that reads first | macOS differs: no spreading by sender, and `connect` on one worker's socket connects them all |
+| Port guard against a second process | the first socket of a port binds without `SO_REUSEPORT` (`src/net/share.rs`) | the shared socket never has `SO_REUSEPORT`, so nothing else can bind the address while it lives (with `SO_REUSEPORT` on a wildcard socket, XNU would let any user's socket join and take the traffic) | stronger than Linux, for TCP and UDP |
 | Largest UDP datagram | 65507 bytes | 65507 bytes: giong raises the send buffer of the sockets it binds to 65,535 bytes, where the system's default (`net.inet.udp.maxdgram`) refuses datagrams over 9216 | equivalent; a `from_std` socket keeps what it was given |
 | Listen backlog | `net.core.somaxconn` (4096) | `kern.ipc.somaxconn` (128) | macOS limit; bursts of connections are refused sooner |
 | A send to a full socket | `MSG_DONTWAIT` on every send | every stream is non-blocking from the start (`StreamSocket::new`): macOS waits in a send even with `MSG_DONTWAIT`, which only a receive honours there | equivalent |
@@ -335,6 +335,103 @@ on macOS is the kernel's part (`EVFILT_USER`), which the lost wake-up race
 of `tests/wake.rs` exercises on the runners (300,000 cross-thread wake-ups
 with and without spinning), and which ThreadSanitizer checks there over
 the tests of the `giong` crate (`.github/workflows/macos.yml`).
+
+**Tested versions.** macOS 15 and macOS 26 on Apple Silicon, the GitHub
+runners every pull request runs on (`.github/workflows/macos.yml`). Intel
+Macs and macOS 14 or older are not tested: GitHub cancels `macos-14` jobs
+for this repository, and its Intel runners were not used. Nothing in the
+driver is specific to Apple Silicon or to these versions, but that is not
+a claim the tests back.
+
+**Soak on macOS.** `.github/workflows/macos-soak.yml` runs the runtime
+and TLS soak tests (connection churn, cancellation, UDP, files, TLS
+handshakes and resumption) for 2 h on each runner, with every check the
+Linux soak makes and the same load (`GIONG_SOAK_CLIENTS`: 32 per worker,
+16 for TLS). Before giong waited for buffers, sends and connects failed
+with `ENOBUFS` (the kernel had no buffer for them) for 0.05-0.15% of
+connections at that load; Linux makes the sender wait instead. At a
+quarter of the clients the runtime soak on both runners and the TLS soak
+on macOS 26 had no error at all, and the TLS soak on macOS 15 met two
+short bursts of `ENOBUFS` (1,590 errors in 15.4 million connections,
+0.01%) while the kernel's buffer use, logged every minute, stayed well
+below what it had reached before. So the load is not the whole cause.
+None of these runs hung or leaked (23-25 descriptors at the end, flat
+memory). A short TIME_WAIT (`net.inet.tcp.msl` 250 ms) keeps the churn
+from using up the ephemeral ports.
+
+**Waiting for network buffers.** On macOS a stream send (`send`,
+`sendmsg`, `sendfile`) or connect that gets `ENOBUFS` is tried again on a
+timer, since the socket stays writable and a readiness wait would spin:
+after 1 ms, then 2, 4, 8, 16 and every 32 ms, each step varied by up to a
+quarter, for at most 2 s (`driver/readiness/nobufs.rs`). The operation
+stays pending, so the worker runs its other tasks meanwhile, and a
+`time::timeout` or a dropped future ends the wait as it ends a readiness
+wait; `ENOBUFS` is all or nothing on a call, so nothing was sent. A
+connect the shortage broke after it began has a dead socket and starts
+over on a new one, and a connect whose socket could not be made
+(`socket(2)` fails with `ENOBUFS` too) makes it again, within the same
+2 s (`StreamSocket::connect_new`).
+giong-tls sends its queued records without waiting in two places, and
+leaves them queued on `ENOBUFS` as on `EAGAIN`, for the next send, which
+waits. After 2 s the error is GIONG-E0028 (`NetworkBuffersExhausted`,
+kind `OutOfMemory`, the kernel's error as its source). A datagram send
+keeps the kernel's `ENOBUFS`, as on Linux. Rust's standard library, mio
+and Tokio return the kernel's `ENOBUFS` as it is. None of this is built
+on Linux; on macOS it costs one comparison per poll of an operation while
+nothing waits. Tests make the failures with a hook built only with
+`--cfg giong_inject_enobufs` (`tests/enobufs.rs`, on macOS CI and on Linux
+with epoll or libkqueue).
+
+**Speed on macOS.** `bench/core.sh` on the runners
+(`.github/workflows/macos-bench.yml`, 5 rounds, median wall time in ns per
+operation, CPU time in brackets; one runtime thread except `tokio-mt`;
+commit 66f3b90; best wall time in bold):
+
+| Workload | | giong | tokio-ct | tokio-mt | smol |
+|---|---|---|---|---|---|
+| spawn | macOS 26 | **60** (59) | 566 (220) | 284 (485) | 402 (271) |
+| | macOS 15 | **79** (69) | 699 (269) | 384 (665) | 388 (235) |
+| yield | macOS 26 | **16** (16) | 704 (159) | 50 (104) | 241 (142) |
+| | macOS 15 | **16** (16) | 713 (150) | 78 (166) | 338 (176) |
+| pingpong | macOS 26 | **89** (89) | 22,937 (3,652) | 13,972 (14,858) | 23,265 (4,033) |
+| | macOS 15 | **111** (111) | 28,908 (4,333) | 14,086 (14,853) | 30,370 (5,182) |
+| mpsc | macOS 26 | **14** (14) | 387 (80) | 447 (205) | 46 (45) |
+| | macOS 15 | **14** (14) | 453 (96) | 358 (256) | 51 (51) |
+| bounded | macOS 26 | **24** (24) | 222 (81) | 168 (297) | 243 (80) |
+| | macOS 15 | **25** (25) | 319 (108) | 193 (359) | 266 (81) |
+| oneshot | macOS 26 | **181** (181) | 24,439 (4,005) | 13,767 (14,680) | 23,979 (3,797) |
+| | macOS 15 | **186** (186) | 28,966 (4,788) | 17,560 (19,688) | 29,290 (4,818) |
+| chain | macOS 26 | **139** (138) | 714 (234) | 368 (571) | 347 (246) |
+| | macOS 15 | **186** (185) | 977 (362) | 684 (1,113) | 446 (323) |
+| timers | macOS 26 | **366** (365) | 1,288 (639) | 542 (1,145) | 681 (575) |
+| | macOS 15 | **558** (558) | 2,380 (1,519) | 1,906 (3,387) | 916 (789) |
+| timeout | macOS 26 | **26** | 33 | 33 | 28 |
+| | macOS 15 | **26** | 33 | 35 | 28 |
+| xthread | macOS 26 | **14** (22) | 217 (83) | 68 (130) | 38 (70) |
+| | macOS 15 | **17** (25) | 249 (88) | 80 (153) | 37 (72) |
+| tcp-rr | macOS 26 | **41,045** (22,689) | 48,688 (27,297) | 53,839 (33,064) | 49,319 (27,547) |
+| | macOS 15 | **52,240** (28,923) | 55,108 (29,687) | 65,508 (40,951) | 56,432 (33,225) |
+| connect | macOS 26 | 84,765 (49,448) | 76,873 (54,269) | 115,595 (91,286) | **76,188** (52,328) |
+| | macOS 15 | 102,092 (50,857) | 100,430 (60,709) | 127,922 (100,034) | **76,539** (49,434) |
+| lookup | macOS 26 | **225** | 208,849 | 188,608 | 211,183 |
+| | macOS 15 | **208** | 195,121 | 182,266 | 191,524 |
+
+On these virtual Macs every `kevent` call costs an involuntary context
+switch, about 20 µs. Two changes came from that: the worker looks for I/O
+after every 61 polls rather than after every batch, and a look that cannot
+wait is skipped while no descriptor is registered. Together they took
+pingpong from 62,000 to 89 ns and yield from 376 to 16 ns (2 context
+switches for 1.28 million yields instead of 20,005).
+
+The loss: connect, where smol is faster in wall time on both runners
+(76,000 against giong's 85,000 and 102,000 ns), while giong uses about
+the same CPU (49,000 and 51,000 against 52,000 and 49,000). Connect is
+the noisiest workload here (a run of 2,000 connections, then 31 s for
+TIME_WAIT); in the earlier run on b531ee7 giong was first on macOS 15
+(78,000 against smol's 87,000). giong makes the same system calls per
+TCP round trip as Tokio (`strace -c` on Linux, where the readiness code is
+the same: two `recvfrom`, one of them `EAGAIN`, one `sendto` and one
+wait).
 
 ## 8. Next steps
 

@@ -123,10 +123,9 @@ impl ResolverConfig {
             let mut words = line.split_whitespace();
             match words.next() {
                 Some("nameserver") => {
-                    // A zone index (`fe80::1%eth0`) is not supported; skip it.
-                    if let Some(ip) = words.next().and_then(|w| w.parse::<IpAddr>().ok()) {
+                    if let Some(server) = words.next().and_then(nameserver) {
                         if cfg.nameservers.len() < 3 {
-                            cfg.nameservers.push(SocketAddr::new(ip, 53));
+                            cfg.nameservers.push(server);
                         }
                     }
                 }
@@ -998,6 +997,49 @@ fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
     }
 }
 
+/// A `nameserver` address on port 53. An IPv6 address may carry a zone
+/// (`fe80::1%en0` or `fe80::1%4`), as macOS writes for a router's
+/// link-local address: the interface it names, which must exist.
+fn nameserver(word: &str) -> Option<SocketAddr> {
+    let Some((ip, zone)) = word.split_once('%') else {
+        return word
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, 53));
+    };
+    let ip = ip.parse::<std::net::Ipv6Addr>().ok()?;
+    let scope = match zone.parse::<u32>() {
+        Ok(index) => index,
+        Err(_) => interface_index(zone)?,
+    };
+    // A link-local address needs an interface to be sent to.
+    if scope == 0 && ip.segments()[0] & 0xffc0 == 0xfe80 {
+        return None;
+    }
+    Some(std::net::SocketAddrV6::new(ip, 53, 0, scope).into())
+}
+
+/// The index of the network interface `name`, if there is one.
+#[cfg(unix)]
+fn interface_index(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated string.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    (index != 0).then_some(index)
+}
+
+/// The index of the network interface `name` (such as `ethernet_32768` or
+/// `loopback_0`), if there is one.
+#[cfg(windows)]
+fn interface_index(name: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: a NUL-terminated string.
+    let index = unsafe {
+        windows_sys::Win32::NetworkManagement::IpHelper::if_nametoindex(name.as_ptr().cast())
+    };
+    (index != 0).then_some(index)
+}
+
 /// The current thread's resolver for the system configuration, reloaded when
 /// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds; on
 /// Windows, the hosts file and what the adapters report).
@@ -1263,6 +1305,52 @@ mod tests {
         assert!(tc.truncated);
     }
 
+    /// macOS writes a router's link-local address with its interface
+    /// (`fe80::1%en0`); the zone becomes the address's scope. One naming no
+    /// interface, or zone 0 on a link-local address, is skipped.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call if_nametoindex")]
+    fn a_nameserver_with_a_zone_gets_its_scope() {
+        #[cfg(target_os = "linux")]
+        let lo = "lo".to_string();
+        #[cfg(target_os = "macos")]
+        let lo = "lo0".to_string();
+        // Windows names interfaces like `loopback_0`; the loopback's index
+        // is 1.
+        #[cfg(windows)]
+        let lo = {
+            let mut name = [0u8; 256];
+            // SAFETY: a buffer of at least IF_MAX_STRING_SIZE + 1 bytes.
+            let named = unsafe {
+                windows_sys::Win32::NetworkManagement::IpHelper::if_indextoname(
+                    1,
+                    name.as_mut_ptr(),
+                )
+            };
+            assert!(!named.is_null(), "no interface with index 1");
+            let len = name.iter().position(|&b| b == 0).unwrap();
+            String::from_utf8_lossy(&name[..len]).into_owned()
+        };
+        let cfg = ResolverConfig::parse(
+            &format!(
+                "nameserver fe80::1%nosuchif0\nnameserver fe80::4%0\nnameserver fe80::2%{lo}\nnameserver fe80::3%7\n"
+            ),
+            "",
+        );
+        let scopes: Vec<_> = cfg
+            .nameservers
+            .iter()
+            .map(|a| match a {
+                SocketAddr::V6(a) => (a.ip().segments()[7], a.port(), a.scope_id()),
+                SocketAddr::V4(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(scopes.len(), 2, "{scopes:?}");
+        assert_eq!(scopes[0].0, 2);
+        assert!(scopes[0].2 > 0, "{scopes:?}");
+        assert_eq!(scopes[1], (3, 53, 7));
+    }
+
     #[test]
     fn windows_takes_the_name_servers_of_its_adapters() {
         // One test on every platform (the simulation's index is built from
@@ -1306,7 +1394,6 @@ mod tests {
             "# comment\n\
              nameserver 10.96.0.10\n\
              nameserver 2001:db8::53 ; trailing comment\n\
-             nameserver fe80::1%eth0\n\
              nameserver 10.0.0.3\nnameserver 10.0.0.4\n\
              domain ignored.example\n\
              search default.svc.cluster.local svc.cluster.local cluster.local.\n\

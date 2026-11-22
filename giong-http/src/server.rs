@@ -25,12 +25,24 @@ use crate::heap::HeapFuture;
 use crate::parse::{find_head_end, parse_head};
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, Response};
+use crate::trailers::Trailers;
 
 /// Responses to pipelined requests are sent together, up to this many bytes.
 const FLUSH_AT: usize = 64 * 1024;
 /// A body at least this large is not copied after its head: the two go out
 /// in one vectored write instead (see `Transport::write_all_with_body`).
 const SEPARATE_BODY_AT: usize = 32 * 1024;
+
+/// The rest of a request body of at least this many bytes is received
+/// straight into the read buffer (`Transport::recv_into`), not copied out of
+/// the runtime's receive buffers.
+const RECV_INTO_AT: usize = 64 * 1024;
+
+/// The room `recv_body_into` makes in the read buffer at a time: as much as
+/// the buffer already holds, at least `FIRST_STEP` and at most `RESERVE_STEP`.
+const FIRST_STEP: usize = 1024 * 1024;
+const RESERVE_STEP: usize = 8 * 1024 * 1024;
+
 /// After an error response, how long the connection keeps discarding input so
 /// that the client can read the response instead of getting a reset.
 const ERROR_LINGER: Duration = Duration::from_secs(1);
@@ -192,6 +204,30 @@ pub trait Transport: 'static {
     /// while the server can still read what it sends.
     fn close_write(&self) -> impl Future<Output = ()>;
 
+    /// Receives into the free capacity at the end of `buf` and hands it back
+    /// with the number of bytes added; `Ok(0)` is the end of the stream. The
+    /// server uses it for the rest of a large request body, whose size it
+    /// knows. Not part of the API: it may change in any release.
+    ///
+    /// The default appends what [`recv`](Self::recv) returns.
+    /// [`TcpStream`] and [`UnixStream`] receive straight into `buf`,
+    /// without copying the body out of the runtime's receive buffers. Unlike
+    /// `recv`, it need not be cancel safe: the server closes the connection
+    /// when it gives up on one.
+    #[doc(hidden)]
+    fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
+        async move {
+            let mut buf = buf;
+            match self.recv().await {
+                Ok(chunk) => {
+                    buf.extend_from_slice(&chunk);
+                    (Ok(chunk.len()), buf)
+                }
+                Err(e) => (Err(e), buf),
+            }
+        }
+    }
+
     /// The address of the remote end, if the transport has one. Handlers see
     /// it as [`Request::peer_addr`]. The default is `None`.
     fn peer_addr(&self) -> Option<SocketAddr> {
@@ -208,6 +244,10 @@ impl Transport for TcpStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         TcpStream::write_all(self, buf)
+    }
+
+    fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
+        TcpStream::recv_into(self, buf)
     }
 
     async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
@@ -248,6 +288,10 @@ impl Transport for UnixStream {
 
     fn write_all(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<()>, Vec<u8>)> {
         UnixStream::write_all(self, buf)
+    }
+
+    fn recv_into(&self, buf: Vec<u8>) -> impl Future<Output = (io::Result<usize>, Vec<u8>)> {
+        UnixStream::recv_into(self, buf)
     }
 
     async fn write_all_with_body(&self, head: Vec<u8>, body: Body) -> (io::Result<()>, Vec<u8>) {
@@ -506,7 +550,7 @@ impl Server {
     /// How long a keep-alive connection may sit between requests before it is
     /// closed (default: 60 s).
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.idle_timeout = timeout;
+        self.cfg.idle_timeout = crate::bounded(timeout);
         self
     }
 
@@ -514,14 +558,14 @@ impl Server {
     /// the moment the server first has to wait for more of it (default: 30 s).
     /// Slower clients get `408 Request Timeout`.
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.request_timeout = timeout;
+        self.cfg.request_timeout = crate::bounded(timeout);
         self
     }
 
     /// How long a client may take to accept a batch of responses before the
     /// connection is dropped (default: 30 s).
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
-        self.cfg.write_timeout = timeout;
+        self.cfg.write_timeout = crate::bounded(timeout);
         self
     }
 
@@ -590,7 +634,7 @@ impl Server {
     /// 100 ms). Requests in progress are not affected by this: they get the
     /// runtime's [`shutdown_grace`](giong::Builder::shutdown_grace).
     pub fn shutdown_linger(mut self, linger: Duration) -> Self {
-        self.cfg.shutdown_linger = linger;
+        self.cfg.shutdown_linger = crate::bounded(linger);
         self
     }
 
@@ -1171,6 +1215,8 @@ struct Conn<T> {
     /// Where the unparsed data starts in `buf`.
     pos: usize,
     /// How much of the unparsed data has been searched for the end of a head.
+    /// While a large body is awaited (`body_into`), how many bytes from `pos`
+    /// the read buffer must hold instead: no head is searched for then.
     scanned: usize,
     /// Responses not sent yet.
     out: Vec<u8>,
@@ -1183,6 +1229,11 @@ struct Conn<T> {
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
+    /// A large body is awaited: `read_more` receives it straight into the
+    /// read buffer, until the buffer holds `scanned` bytes from `pos`. (A
+    /// flag beside the others, and a field that is idle meanwhile, so that
+    /// no connection grows.)
+    body_into: bool,
     /// What the unparsed data and the body being decoded hold against the
     /// worker's budget for requests (see `budget`).
     charge: Charge,
@@ -1206,6 +1257,7 @@ impl<T: Transport> Conn<T> {
             closing: false,
             deadline: None,
             first: true,
+            body_into: false,
             charge: Charge::none(),
             _slot: slot,
         }
@@ -1427,7 +1479,13 @@ impl<T: Transport> Conn<T> {
     async fn pump(&mut self, body: &Streamed) -> Result<(), Failure> {
         body.pipe.asked().await;
         let result = if body.chunked {
-            self.pump_chunked(body).await
+            match self.pump_chunked(body).await {
+                Ok(trailers) => {
+                    body.pipe.finish_with(Ok(()), Some(trailers));
+                    return Ok(());
+                }
+                Err(failure) => Err(failure),
+            }
         } else {
             self.pump_length(body).await
         };
@@ -1463,7 +1521,7 @@ impl<T: Transport> Conn<T> {
         Ok(())
     }
 
-    async fn pump_chunked(&mut self, body: &Streamed) -> Result<(), Failure> {
+    async fn pump_chunked(&mut self, body: &Streamed) -> Result<Trailers, Failure> {
         let mut decoder = Decoder::new(usize::try_from(body.limit).unwrap_or(usize::MAX));
         // What arrived with the head, then what follows, less what the
         // decoder has read.
@@ -1482,7 +1540,7 @@ impl<T: Transport> Conn<T> {
                         // The start of the next request.
                         self.append(&input[used..]);
                     }
-                    return Ok(());
+                    return Ok(decoder.trailers.take().map(|t| *t).unwrap_or_default());
                 }
                 Ok(Progress::NeedMore) => {
                     input.drain(..decoder.consume());
@@ -1562,9 +1620,13 @@ impl<T: Transport> Conn<T> {
                         }
                     }
                 }
-                Next::End => {
+                Next::End(trailers) => {
                     if chunked {
-                        self.out.extend_from_slice(b"0\r\n\r\n");
+                        self.out.extend_from_slice(b"0\r\n");
+                        if let Some(trailers) = trailers {
+                            trailers.write_lines(&mut self.out);
+                        }
+                        self.out.extend_from_slice(b"\r\n");
                     }
                     return Ok(());
                 }
@@ -1691,10 +1753,15 @@ impl<T: Transport> Conn<T> {
             // Refused before the body is read (and before `100 Continue`)
             // if it cannot fit in the worker's budget.
             self.admit(head.len + len)?;
+            if len >= RECV_INTO_AT {
+                self.body_into = true;
+                self.scanned = head.len + len;
+            }
             while self.buf.len() - self.pos - head.len < len {
                 self.send_continue(&head, &mut interim_sent);
                 self.read_more(false).await?;
             }
+            self.body_into = false;
             let start = self.pos + head.len;
             (BodyBytes::InBuffer(start..start + len), head.len + len)
         };
@@ -1723,6 +1790,57 @@ impl<T: Transport> Conn<T> {
         Ok((req, None))
     }
 
+    /// Receives until the read buffer holds `want` bytes from `pos` (a
+    /// request with a large body), straight into the buffer: the body is not
+    /// copied out of the runtime's receive buffers. Leaves the buffer as it
+    /// is if a handler still holds a request in it; the caller's usual loop
+    /// then receives the rest.
+    async fn recv_body_into(&mut self, want: usize) -> Result<(), End> {
+        let Some(buf) = Rc::get_mut(&mut self.buf) else {
+            return Ok(());
+        };
+        if self.pos > 0 {
+            buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let request_timeout = self.cfg.request_timeout;
+        let deadline = *self
+            .deadline
+            .get_or_insert_with(|| Instant::now() + request_timeout);
+        while self.buf.len() < want {
+            let Some(buf) = Rc::get_mut(&mut self.buf) else {
+                return Ok(());
+            };
+            let mut buf = mem::take(buf);
+            // Room for more of the body: as much as has arrived (which the
+            // budget charges), at least 1 MiB and at most 8 MiB. A client
+            // that announces a large body and sends little is not given room
+            // for what it announced. Each step past the first may copy the
+            // buffer, so they are not smaller: growing from 64 KiB costs a
+            // third of the 1 MiB uploads per second on io_uring.
+            if buf.capacity() == buf.len() {
+                let step = buf.len().clamp(FIRST_STEP, RESERVE_STEP);
+                buf.reserve_exact((want - buf.len()).min(step));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (res, back) = match timeout(left, self.stream.recv_into(buf)).await {
+                Ok(received) => received,
+                Err(_) => return Err(End::Status(408)),
+            };
+            *Rc::get_mut(&mut self.buf).expect("the read buffer is not shared") = back;
+            match res {
+                Ok(n) if n > 0 => {}
+                // Closed by the peer, or an I/O error.
+                _ => return Err(End::Close),
+            }
+            // Charged as it arrives, like what `read_more` receives: past the
+            // worker's budget for requests being received, the connection is
+            // refused (`Busy`), so stalled uploads cannot hold more than it.
+            self.account(0)?;
+        }
+        Ok(())
+    }
+
     /// Answers `Expect: 100-continue` once, before waiting for the body.
     fn send_continue(&mut self, head: &crate::parse::Head, sent: &mut bool) {
         if head.expect_continue && head.minor == 1 && !*sent {
@@ -1742,6 +1860,11 @@ impl<T: Transport> Conn<T> {
             self.release_read_buffer();
         }
         self.flush().await?;
+        if self.body_into && Rc::get_mut(&mut self.buf).is_some() {
+            // Boxed, so that it adds nothing to the state every waiting
+            // connection keeps.
+            return Box::pin(self.recv_body_into(self.scanned)).await;
+        }
         let received = if idle {
             if self.closing {
                 return Err(End::Close);

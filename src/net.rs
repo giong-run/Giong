@@ -70,6 +70,110 @@ pub(crate) fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
 }
 
+/// [`os_err`] for the result of a stream send or connect. On macOS,
+/// `ENOBUFS` there comes after the driver waited for network buffers (see
+/// `driver/readiness/nobufs.rs`), and gets its code.
+#[inline]
+pub(crate) fn send_err(res: i32) -> io::Error {
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    if res == -libc::ENOBUFS {
+        return nobufs::exhausted(os_err(res));
+    }
+    os_err(res)
+}
+
+/// The net layer's part in waiting out a shortage of network buffers on
+/// macOS: the connects the shortage broke after they began, and
+/// `sendfile(2)`. The driver retries the rest (see
+/// `driver/readiness/nobufs.rs`, whose steps these are). Datagram sends are
+/// left alone: their `ENOBUFS` is returned as the kernel's error, as on
+/// Linux, since a datagram may be dropped.
+#[cfg(any(target_os = "macos", giong_inject_enobufs))]
+pub(crate) mod nobufs {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use socket2::Socket;
+
+    use crate::error::{Code, Error};
+
+    const GIVE_UP: Duration = Duration::from_secs(2);
+    const FIRST: Duration = Duration::from_millis(1);
+    const MOST: Duration = Duration::from_millis(32);
+
+    /// `ENOBUFS` with its code, after giong waited for buffers.
+    #[cold]
+    pub(crate) fn exhausted(err: io::Error) -> io::Error {
+        Error::new(
+            Code::NetworkBuffersExhausted,
+            "the system ran out of network buffers (ENOBUFS), and still had none after 2 s",
+            "read from every connection promptly, cap how many connections can hold unread \
+             data at once, and lower SO_RCVBUF if the program raised it; netstat -m shows how \
+             many requests for network buffers macOS denied. If it keeps happening with \
+             little in use, treat the error as transient and try again later.",
+        )
+        .with_source(err)
+        .into()
+    }
+
+    pub(crate) fn is_exhausted(err: &io::Error) -> bool {
+        crate::error::code(err) == Some(Code::NetworkBuffersExhausted)
+    }
+
+    /// Waits between tries, as the driver does, within [`GIVE_UP`] from when
+    /// it was made.
+    pub(crate) struct Backoff {
+        since: Instant,
+        step: Duration,
+    }
+
+    impl Backoff {
+        pub(crate) fn new() -> Self {
+            Self {
+                since: Instant::now(),
+                step: Duration::ZERO,
+            }
+        }
+
+        /// Waits for the next try; `false`, at once, if it would end past
+        /// [`GIVE_UP`].
+        pub(crate) async fn wait(&mut self) -> bool {
+            self.step = if self.step.is_zero() {
+                FIRST
+            } else {
+                (self.step * 2).min(MOST)
+            };
+            if self.since.elapsed() + self.step > GIVE_UP {
+                return false;
+            }
+            crate::time::sleep(self.step).await;
+            true
+        }
+
+        /// What is left of [`GIVE_UP`].
+        pub(crate) fn left(&self) -> Duration {
+            GIVE_UP.saturating_sub(self.since.elapsed())
+        }
+    }
+
+    /// A socket from `make`. `socket(2)` fails with `ENOBUFS` when macOS
+    /// has no buffer for the new socket; that error comes back with its
+    /// code, for the caller to wait and try again.
+    pub(crate) fn socket(make: impl Fn() -> io::Result<Socket>) -> io::Result<Socket> {
+        #[cfg(giong_inject_enobufs)]
+        if crate::inject_enobufs::socket() {
+            return Err(exhausted(io::Error::from_raw_os_error(libc::ENOBUFS)));
+        }
+        make().map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOBUFS) {
+                exhausted(e)
+            } else {
+                e
+            }
+        })
+    }
+}
+
 /// A multishot operation slot owned by a socket: the driver key plus the uid
 /// of the worker whose driver it belongs to.
 pub(crate) struct MultiSlot {
@@ -116,6 +220,22 @@ impl MultiSlot {
             }
         }
     }
+}
+
+/// A pooled receive of less than this is a small message.
+const SMALL_RECV: usize = 2048;
+
+/// After this many small messages in a row, a stream in `bulk` mode goes
+/// back to the multishot receive: its traffic is small messages again. (One
+/// small receive alone proves nothing: the rest of a buffer the kernel has
+/// partly filled can be small.)
+const SMALL_RECVS_TO_LEAVE_BULK: u8 = 8;
+
+/// What [`StreamSocket::recv_into`] found when it stopped the pooled receive.
+enum Stopped {
+    Data(RecvBuf),
+    Item(i32),
+    Empty,
 }
 
 /// A task's place among those waiting on one [`MultiSlot`], for a future
@@ -316,6 +436,11 @@ pub(crate) struct StreamSocket {
     /// Data was taken from the multishot receive since the socket was last
     /// checked for an end of stream the kernel did not report.
     check_end: Cell<bool>,
+    /// `recv_into` has been used, and small messages have not come in a row
+    /// since: the pooled receive takes one buffer at a time instead of all
+    /// the data there is (io_uring).
+    /// 0, or 1 plus the number of small messages received in a row since.
+    bulk: Cell<u8>,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -359,7 +484,7 @@ impl StreamSocket {
         // driver would set the mode at the first operation anyway.
         #[cfg(target_os = "macos")]
         let nonblocking = sock.set_nonblocking(true).is_ok();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(any(target_os = "linux", windows))]
         let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
@@ -371,6 +496,7 @@ impl StreamSocket {
             send_abandoned: Cell::new(false),
             unix: Cell::new(false),
             check_end: Cell::new(false),
+            bulk: Cell::new(0),
             _not_send: PhantomData,
         }
     }
@@ -446,6 +572,48 @@ impl StreamSocket {
         Some(copied.clone())
     }
 
+    /// Connects a socket made by `make` to `addr`. On macOS, a socket that
+    /// could not be made for want of network buffers is made again, and a
+    /// connect that the shortage broke after it began is made again on a new
+    /// socket. All of it stays within the 2 s the driver waits for buffers:
+    /// a connect on a new socket gets what is left of them, not 2 s of its
+    /// own.
+    pub(crate) async fn connect_new(
+        make: impl Fn() -> io::Result<Socket>,
+        addr: SockAddr,
+    ) -> io::Result<Self> {
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        {
+            let mut backoff = nobufs::Backoff::new();
+            let mut res = match nobufs::socket(&make) {
+                Ok(sock) => Self::connect(sock, addr.clone()).await,
+                Err(e) => Err(e),
+            };
+            loop {
+                match res {
+                    Err(e) if nobufs::is_exhausted(&e) && backoff.wait().await => {
+                        res = match nobufs::socket(&make) {
+                            Ok(sock) => {
+                                let connect = Self::connect(sock, addr.clone());
+                                match crate::time::timeout(backoff.left(), connect).await {
+                                    Ok(res) => res,
+                                    // Out of time while the driver waited for
+                                    // buffers (dropping the connect closed its
+                                    // socket).
+                                    Err(_) => Err(e),
+                                }
+                            }
+                            Err(again) => Err(again),
+                        };
+                    }
+                    res => return res,
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", giong_inject_enobufs)))]
+        Self::connect(make()?, addr).await
+    }
+
     /// Connects `sock` to `addr` through the driver.
     pub(crate) async fn connect(sock: Socket, addr: SockAddr) -> io::Result<Self> {
         // On the heap so the address the operation points at does not move
@@ -466,7 +634,7 @@ impl StreamSocket {
         // `KernelBox`.
         let (res, _, _addr) = unsafe { Op::new(io, addr) }.await;
         if res < 0 {
-            return Err(os_err(res));
+            return Err(send_err(res));
         }
         Ok(stream)
     }
@@ -494,6 +662,16 @@ impl StreamSocket {
                     }
                     MultiPoll::Data(buf) => {
                         self.check_end.set(true);
+                        let bulk = self.bulk.get();
+                        if bulk > 0 {
+                            self.bulk.set(match buf.len() < SMALL_RECV {
+                                // Small messages again: back to the multishot
+                                // receive, which costs less for them.
+                                true if bulk > SMALL_RECVS_TO_LEAVE_BULK => 0,
+                                true => bulk + 1,
+                                false => 1,
+                            });
+                        }
                         return Poll::Ready(Ok(buf));
                     }
                     MultiPoll::NeedArm => {
@@ -501,7 +679,13 @@ impl StreamSocket {
                             return Poll::Pending;
                         }
                         let fd = self.sock.as_raw_fd();
-                        driver.arm_multi(key, MultiIo::Recv { fd });
+                        driver.arm_multi(
+                            key,
+                            MultiIo::Recv {
+                                fd,
+                                once: self.bulk.get() > 0,
+                            },
+                        );
                     }
                     MultiPoll::Pending => {
                         if driver.kind() == crate::DriverKind::IoUring && self.end_was_missed() {
@@ -538,6 +722,85 @@ impl StreamSocket {
         // SAFETY: the kernel wrote `res` bytes at the start of the buffer.
         unsafe { buf.set_init(res as usize) };
         (Ok(res as usize), buf)
+    }
+
+    /// Receives into the free capacity at the end of `buf` (8 KiB is made
+    /// free if there is none), after whatever [`recv`](Self::recv) has taken
+    /// from the socket already. Unlike `read`, it may follow `recv` on the
+    /// same stream, and `recv` may follow it: the kernel's receive into the
+    /// pool is stopped first, and the next `recv` starts it again. For a
+    /// large body whose size is known, this saves copying it out of pool
+    /// buffers. `Ok(0)` is the end of the stream. Until the pooled receive
+    /// brings several small messages in a row, the stream's pooled receives
+    /// take one buffer at a time.
+    ///
+    /// Not cancel safe, like `read`: if the future is dropped, bytes the
+    /// receive had already taken from the socket are lost.
+    pub(crate) async fn recv_into(&self, mut buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        // From now on the pooled receive takes one buffer at a time, so the
+        // next large body is still in the socket when its head is parsed.
+        self.bulk.set(1);
+        if runtime::with_worker(|w| self.recv.is_active(w)) {
+            match poll_fn(|cx| self.poll_stop_recv(cx)).await {
+                Stopped::Data(chunk) => {
+                    buf.extend_from_slice(&chunk);
+                    return (Ok(chunk.len()), buf);
+                }
+                Stopped::Item(0) => return (Ok(0), buf),
+                Stopped::Item(res) if res < 0 => return (Err(os_err(res)), buf),
+                Stopped::Item(_) => {
+                    return (
+                        Err(unexpected("io_uring returned data without a buffer")),
+                        buf,
+                    )
+                }
+                Stopped::Empty => {}
+            }
+        }
+        if buf.capacity() == buf.len() {
+            buf.reserve(8192);
+        }
+        let start = buf.len();
+        let len = (buf.capacity() - start).min(u32::MAX as usize) as u32;
+        let io = Io::Recv {
+            fd: self.sock.as_raw_fd(),
+            // SAFETY: `start` is within the allocation (at most its capacity).
+            buf: unsafe { buf.as_mut_ptr().add(start) },
+            len,
+        };
+        // SAFETY: a `Vec`'s bytes stay put when it moves, and nothing else
+        // touches them until the operation hands the vector back.
+        let (res, _, mut buf) = unsafe { Op::new(io, buf) }.await;
+        if res < 0 {
+            return (Err(os_err(res)), buf);
+        }
+        // SAFETY: the kernel wrote `res` bytes after the first `start`.
+        unsafe { buf.set_len(start + res as usize) };
+        (Ok(res as usize), buf)
+    }
+
+    /// For [`recv_into`](Self::recv_into): what the pooled receive holds, in
+    /// order, then `Empty` once it is stopped and holds nothing. The readiness
+    /// drivers (epoll, kqueue) receive only when asked, so they never hold
+    /// anything.
+    fn poll_stop_recv(&self, cx: &mut Context<'_>) -> Poll<Stopped> {
+        runtime::with_worker(|w| {
+            let key = self.recv.key(w);
+            let mut driver = w.driver.borrow_mut();
+            if driver.kind() != crate::DriverKind::IoUring {
+                return Poll::Ready(Stopped::Empty);
+            }
+            match driver.poll_multi(key, cx.waker()) {
+                MultiPoll::Item(res) => Poll::Ready(Stopped::Item(res)),
+                MultiPoll::Data(buf) => Poll::Ready(Stopped::Data(buf)),
+                MultiPoll::NeedArm => Poll::Ready(Stopped::Empty),
+                MultiPoll::Pending => {
+                    // Its last completion wakes this task.
+                    driver.restart_multi(key);
+                    Poll::Pending
+                }
+            }
+        })
     }
 
     pub(crate) async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
@@ -651,7 +914,7 @@ impl StreamSocket {
         let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), bufs)
+            (Err(send_err(res)), bufs)
         } else {
             (Ok(res as usize), bufs)
         }
@@ -745,7 +1008,7 @@ impl StreamSocket {
             unsafe { Op::new(io, (buf, control, iov, msg)) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), buf, control)
+            (Err(send_err(res)), buf, control)
         } else {
             (Ok(res as usize), buf, control)
         }
@@ -773,6 +1036,8 @@ impl StreamSocket {
         let fd = self.sock.as_raw_fd();
         let (mut offset, mut left) = (offset, len);
         let mut since_yield = 0;
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        let mut backoff: Option<nobufs::Backoff> = None;
         while left > 0 {
             let count = left.min(SENDFILE_MAX) as usize;
             // The socket is non-blocking, so the call never waits; `offset`
@@ -781,6 +1046,10 @@ impl StreamSocket {
             let n = crate::sys::sendfile(fd, file, &mut moved, count);
             match n {
                 n if n > 0 => {
+                    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                    {
+                        backoff = None;
+                    }
                     let n = n as u64;
                     offset += n;
                     left -= n;
@@ -809,6 +1078,18 @@ impl StreamSocket {
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
                         Some(crate::sys::errno::EINTR) => {}
+                        // The pool of network buffers is empty: wait for it
+                        // as stream sends do.
+                        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                        Some(libc::ENOBUFS) => {
+                            if !backoff
+                                .get_or_insert_with(nobufs::Backoff::new)
+                                .wait()
+                                .await
+                            {
+                                return Err(nobufs::exhausted(err));
+                            }
+                        }
                         Some(crate::sys::errno::EAGAIN) => {
                             // SAFETY: the operation has no pointers.
                             let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
@@ -922,7 +1203,7 @@ impl StreamSocket {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
             if let Some(res) = self.send_now(bytes) {
                 return if res < 0 {
-                    (Err(os_err(res)), buf)
+                    (Err(send_err(res)), buf)
                 } else {
                     (Ok(res as usize), buf)
                 };
@@ -946,7 +1227,7 @@ impl StreamSocket {
         let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), buf)
+            (Err(send_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }
@@ -1079,9 +1360,14 @@ impl TcpListener {
     /// On macOS the workers share one listening socket instead (each
     /// listener is a duplicate of the first one bound to the address), and
     /// take connections from its one queue as they come: whichever worker
-    /// accepts first gets the next connection. The socket is bound without
-    /// `SO_REUSEPORT`, so no other process can bind the address while a
-    /// listener lives.
+    /// accepts first gets the next connection. Every worker waiting in
+    /// `accept` is woken for each connection, and all but one find nothing.
+    /// The socket is bound without `SO_REUSEPORT`, so no other user's
+    /// process can bind the address while a listener lives. A process of
+    /// the same user still can bind one specific IP address of a port that
+    /// giong listens on with the wildcard address, by setting
+    /// `SO_REUSEADDR` (the BSD rule); listen on the specific address to
+    /// refuse that too.
     ///
     /// On Windows a port has one listening socket. The workers' listeners
     /// share it: from the second listener on, one thread accepts the
@@ -1202,8 +1488,11 @@ impl TcpListener {
     }
 
     /// Wraps a listener created by the standard library, with the options
-    /// it was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// it was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(listener: std::net::TcpListener) -> Self {
         // SAFETY: we take over the descriptor that `listener` owned.
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };
@@ -1359,8 +1648,8 @@ impl TcpStream {
 
     /// Connects to exactly this address, without name resolution.
     pub(crate) async fn connect_addr(addr: SocketAddr) -> io::Result<Self> {
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        let inner = StreamSocket::connect(sock, addr.into()).await?;
+        let make = || Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP));
+        let inner = StreamSocket::connect_new(make, addr.into()).await?;
         Ok(Self { inner })
     }
 
@@ -1419,6 +1708,18 @@ impl TcpStream {
     /// already taken from the socket are lost. [`recv`](Self::recv) is.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.read(buf).await
+    }
+
+    /// Receives into the free capacity at the end of `buf`, after what
+    /// [`recv`](Self::recv) has already taken; `recv` may come before and
+    /// after it. For the crates of this workspace (giong-http reads large
+    /// request bodies with it), not part of the API.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost.
+    #[doc(hidden)]
+    pub async fn recv_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.inner.recv_into(buf).await
     }
 
     /// Writes some bytes of `buf`, returning how many were written.

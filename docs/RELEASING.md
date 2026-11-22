@@ -21,9 +21,11 @@ request; everything else is automated and safe to re-run.
    request `chore(release): giong X.Y.Z` on the branch `release/X.Y.Z` that:
    - bumps `version` in every workspace crate, the path dependencies between them and
      `Cargo.lock`;
-   - turns `## [Unreleased]` in `CHANGELOG.md` into `## [X.Y.Z] - <date>` and updates
-     the compare links at the bottom; when `Unreleased` is empty it drafts the entries
-     from the conventional commit subjects, marked with a comment saying so;
+   - turns `## [Unreleased]` in `CHANGELOG.md`, with every entry in `changelog.d/`
+     merged into its section, into `## [X.Y.Z] - <date>`, deletes the `changelog.d/`
+     files and updates the compare links at the bottom (`python3 scripts/release.py
+     unreleased` shows the merged section beforehand); when both are empty it drafts the
+     entries from the conventional commit subjects, marked with a comment saying so;
    - updates install snippets such as `giong-http = "0.2"` in the crate READMEs, and
      lists any prose that still names the old minor version (for example
      "Status: 0.2.") for you to rewrite;
@@ -177,7 +179,7 @@ Done once per repository; listed so it can be checked or rebuilt.
 
 | What | Where | State |
 |---|---|---|
-| Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http, giong-postgres, giong-mysql, giong-redis: done (2026-11-13); giong-web, giong-mcp (0.4.0) and giong-compat (0.5.0): first version published by hand, then added (see [Adding a crate](#adding-a-crate)). All nine crates done (2026-11-14) |
+| Trusted publisher for each crate: `giong-run` / `Giong` / `release.yml` / environment `release` | crates.io → crate → Settings | giong, giong-tls, giong-http, giong-postgres, giong-mysql, giong-redis: done (2026-11-13); giong-web, giong-mcp (0.4.0) and giong-compat (0.5.0): first version published by hand, then added (see [Adding a crate](#adding-a-crate)). All nine crates done (2026-11-14). giong-proto, giong-grpc-build and giong-grpc (1.1.0): first version published by hand, then added |
 | Environment `release`, deployments from `v*` tags only | repo Settings → Environments | done |
 | Branch protection on `main` with the CI checks `lint`, `msrv`, `test`, `fallback`, `tsan` | repo Settings → Branches | done |
 | Merge queue on `main`: *Require merge queue* (squash, build concurrency 2), and `all-checks` added to the required checks, so that every CI job holds a merge back | repo Settings → Branches → `main` | done (2026-11-15) |

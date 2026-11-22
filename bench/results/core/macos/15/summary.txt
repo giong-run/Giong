@@ -1,0 +1,79 @@
+5 rounds; ns per operation, median [min-max]
+workload   runtime          wall      min      max      cpu
+spawn      giong            79.1     68.5     91.3     69.2
+spawn      tokio-ct        698.9    633.4    801.3    269.0
+spawn      tokio-local     701.6    624.8    818.6    273.0
+spawn      tokio-mt        383.7    334.8    469.7    665.1
+spawn      smol            388.0    338.0    400.7    234.9
+
+yield      giong            15.8     15.7     17.6     15.8
+yield      tokio-ct        713.3    586.1    829.1    149.9
+yield      tokio-local     735.0    609.1    992.8    166.2
+yield      tokio-mt         78.0     56.3    111.7    166.1
+yield      smol            337.9    238.1    368.1    176.1
+
+pingpong   giong           111.0     99.7    185.3    110.7
+pingpong   tokio-ct      28908.1  28040.8  36247.4   4332.9
+pingpong   tokio-local   29040.3  22143.6  32814.9   4314.5
+pingpong   tokio-mt      14086.4  11423.9  17836.1  14852.9
+pingpong   smol          30370.2  27312.3  37978.2   5181.9
+
+mpsc       giong            14.0     13.5     14.5     14.0
+mpsc       tokio-ct        452.7    438.1    615.8     95.6
+mpsc       tokio-local     458.0    442.0    537.0    100.8
+mpsc       tokio-mt        358.2     95.3    502.5    256.0
+mpsc       smol             50.7     48.8     53.9     50.7
+
+bounded    giong            25.3     23.5     26.3     25.1
+bounded    tokio-ct        318.7    252.8    387.6    107.6
+bounded    tokio-local     348.9    225.5    392.3    113.5
+bounded    tokio-mt        192.9    160.1    278.4    358.9
+bounded    smol            265.8    245.6    405.2     81.2
+
+oneshot    giong           186.4    173.6    208.2    186.3
+oneshot    tokio-ct      28965.9  27080.9  29993.0   4788.2
+oneshot    tokio-local   29257.8  27788.9  30797.5   4996.8
+oneshot    tokio-mt      17559.5  12472.2  18691.2  19687.9
+oneshot    smol          29289.7  28509.1  31460.1   4818.0
+
+chain      giong           185.7    167.3    189.3    184.8
+chain      tokio-ct        977.2    834.4   1541.4    361.9
+chain      tokio-local     931.4    766.2   1078.3    365.3
+chain      tokio-mt        683.7    558.8    754.1   1113.2
+chain      smol            446.3    387.2    482.2    322.9
+
+timers     giong           558.2    439.9    871.1    558.2
+timers     tokio-ct       2380.2   2037.1   2726.4   1518.7
+timers     tokio-local    2094.9   2019.2   2403.6   1333.9
+timers     tokio-mt       1906.0   1716.0   1986.5   3386.9
+timers     smol            915.7    806.3   1069.1    788.5
+
+timeout    giong            25.7     25.2     29.0     25.6
+timeout    tokio-ct         32.9     32.2     35.8     32.8
+timeout    tokio-local      34.2     32.6     37.8     34.2
+timeout    tokio-mt         34.7     32.8     39.5     34.9
+timeout    smol             28.1     27.1     30.6     28.1
+
+xthread    giong            16.5     11.4     17.2     25.4
+xthread    tokio-ct        249.0    208.9    299.9     87.5
+xthread    tokio-local     226.5    204.5    303.2     78.4
+xthread    tokio-mt         80.3     67.9     82.0    153.3
+xthread    smol             37.4     36.3     41.6     71.8
+
+tcp-rr     giong         52240.0  40309.7  57668.5  28923.1
+tcp-rr     tokio-ct      55108.2  43415.7  58180.8  29686.8
+tcp-rr     tokio-local   55761.7  38175.4  57651.6  30657.9
+tcp-rr     tokio-mt      65508.2  41618.4  67485.8  40950.5
+tcp-rr     smol          56431.6  37863.8  59717.7  33225.4
+
+connect    giong        102092.2  57584.3 104265.1  50857.0
+connect    tokio-ct     100430.4  63976.0 121111.0  60709.0
+connect    tokio-local  108042.5  72763.4 139639.3  64067.0
+connect    tokio-mt     127922.2  88388.7 150764.0 100034.0
+connect    smol          76539.0  70636.6 143568.9  49433.5
+
+lookup     giong           208.0    170.7    293.6    208.0
+lookup     tokio-ct     195120.9 124917.7 246227.9 102338.2
+lookup     tokio-local  181197.7 130226.1 234277.1  95092.6
+lookup     tokio-mt     182266.1 131472.4 253830.7  94150.4
+lookup     smol         191524.1 129356.7 240376.6  99507.5

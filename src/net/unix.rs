@@ -96,7 +96,7 @@ impl UnixStream {
     /// connection is left behind.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let addr = SockAddr::unix(path)?;
-        let inner = StreamSocket::connect(new_socket()?, addr).await?.unix();
+        let inner = StreamSocket::connect_new(new_socket, addr).await?.unix();
         Ok(Self { inner })
     }
 
@@ -145,6 +145,18 @@ impl UnixStream {
     /// already taken from the socket are lost. [`recv`](Self::recv) is.
     pub async fn read<B: IoBufMut>(&self, buf: B) -> (io::Result<usize>, B) {
         self.inner.read(buf).await
+    }
+
+    /// Receives into the free capacity at the end of `buf`, after what
+    /// [`recv`](Self::recv) has already taken; `recv` may come before and
+    /// after it. For the crates of this workspace (giong-http reads large
+    /// request bodies with it), not part of the API.
+    ///
+    /// Not cancel safe: if the future is dropped, bytes the receive had
+    /// already taken from the socket are lost.
+    #[doc(hidden)]
+    pub async fn recv_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.inner.recv_into(buf).await
     }
 
     /// Writes some bytes of `buf`, returning how many were written.

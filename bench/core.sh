@@ -35,6 +35,10 @@ for round in $(seq "$ROUNDS"); do
             fi
             # tr: Windows ends each line with a carriage return too.
             $PIN target/release/bench-core "$r" "$w" | tr -d '\r' >>"$OUT/raw.csv"
+            $PIN target/release/bench-core "$r" "$w" >>"$OUT/raw.csv"
+            # macOS: let the connections' ports leave TIME_WAIT (30 s), so
+            # the next run does not run out of them (see CONNECTS).
+            if [ "$w" = connect ] && [ "$(uname)" = Darwin ]; then sleep 31; fi
         done
     done
     echo "round $round done" >&2

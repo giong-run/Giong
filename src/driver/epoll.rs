@@ -16,6 +16,8 @@ pub(crate) struct Epoll {
 }
 
 impl Poller for Epoll {
+    const SKIP_EMPTY_POLL: bool = false;
+
     fn new() -> io::Result<Self> {
         // SAFETY: plain syscall; the result is checked.
         let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };

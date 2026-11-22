@@ -10,6 +10,10 @@ use giong::net::{TcpListener, TcpStream};
 
 fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }
 
+/// The most a connection may hold of a request not complete yet: a 1 MiB
+/// body (bench/lab) and its head.
+const MAX_PENDING: usize = (1 << 20) + 64 * 1024;
+
 fn find_head_end(b: &[u8]) -> Option<usize> { b.windows(4).position(|w| w == b"\r\n\r\n") }
 
 fn content_length(head: &[u8]) -> usize {
@@ -35,7 +39,8 @@ fn query_n(q: &[u8]) -> u32 {
         .unwrap_or(25)
 }
 
-fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
+/// `received` is the length of the request's body.
+fn respond(path: &[u8], received: usize, out: &mut Vec<u8>, body: &mut Vec<u8>) {
     body.clear();
     let (route, query) = match path.iter().position(|&c| c == b'?') {
         Some(i) => (&path[..i], &path[i + 1..]),
@@ -53,6 +58,10 @@ fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
             body.push(b']');
         }
         b"/compute" => { let _ = write!(body, r#"{{"result":{}}}"#, fib(black_box(query_n(query)))); }
+        // The benchmark lab's payloads (bench/lab): an answer of `n` bytes,
+        // and a request body of any size, counted.
+        b"/bytes" => body.resize(query_n(query) as usize, b'x'),
+        b"/upload" => { let _ = write!(body, r#"{{"received":{received}}}"#); }
         _ => {
             out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
             return;
@@ -64,16 +73,21 @@ fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
 
 
 
-/// Handles every complete request in `buf`; returns how many bytes were consumed.
-fn handle_requests(buf: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) -> usize {
+/// Handles every complete request in `buf`; returns how many bytes were
+/// consumed. `need` becomes the length of the incomplete request left, when
+/// its head is in (so that a large body is not searched again for every
+/// chunk that arrives), and 0 otherwise.
+fn handle_requests(buf: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>, need: &mut usize) -> usize {
     let mut used = 0;
+    *need = 0;
     while let Some(end) = find_head_end(&buf[used..]) {
         let head = &buf[used..used + end];
         let total = end + 4 + content_length(head);
         if buf.len() - used < total {
+            *need = total;
             break;
         }
-        respond(path_of(head), out, body);
+        respond(path_of(head), total - end - 4, out, body);
         used += total;
     }
     used
@@ -82,6 +96,7 @@ fn handle_requests(buf: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) -> usize {
 async fn serve(stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let mut pending: Vec<u8> = Vec::new();
+    let mut need = 0;
     let mut out: Vec<u8> = Vec::with_capacity(8192);
     let mut body: Vec<u8> = Vec::with_capacity(16384);
     loop {
@@ -90,15 +105,17 @@ async fn serve(stream: TcpStream) {
             _ => return,
         };
         if pending.is_empty() {
-            let used = handle_requests(&chunk, &mut out, &mut body);
+            let used = handle_requests(&chunk, &mut out, &mut body, &mut need);
             pending.extend_from_slice(&chunk[used..]);
         } else {
             pending.extend_from_slice(&chunk);
-            let used = handle_requests(&pending, &mut out, &mut body);
-            pending.drain(..used);
+            if pending.len() >= need {
+                let used = handle_requests(&pending, &mut out, &mut body, &mut need);
+                pending.drain(..used);
+            }
         }
         drop(chunk);
-        if pending.len() > 64 * 1024 {
+        if pending.len() > MAX_PENDING {
             return;
         }
         if !out.is_empty() {

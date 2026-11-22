@@ -3,7 +3,9 @@
 Instructions for AI coding agents working in this repository. People should read
 [CONTRIBUTING.md](CONTRIBUTING.md); this file says the same things in the order an agent
 needs them, adds the traps that cost time, and is kept short on purpose. Where the two
-disagree, CONTRIBUTING.md wins: report the difference.
+disagree, CONTRIBUTING.md wins: report the difference. How a change goes from an item to a
+merge, with several agents working at once (preflight, changelog entries, conflicts between
+pull requests, handoff), is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## What this is
 
@@ -12,7 +14,7 @@ driver where io_uring is blocked or the kernel is too old. It aims to be the bes
 async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
 is built for code that agents write: strict types, coded errors with the cause and the
 fix, and an API that stays on major version 1 for many years. One Cargo
-workspace, nine crates and an example service:
+workspace, twelve crates and three examples:
 
 | Path | Crate | What it is |
 |---|---|---|
@@ -26,6 +28,11 @@ workspace, nine crates and an example service:
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
 | `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
+| `giong-proto/` | `giong-proto` (new in 1.1) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
+| `giong-grpc-build/` | `giong-grpc-build` (new in 1.1) | generates giong-proto messages and giong-grpc service traits, servers and clients from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
+| `giong-grpc/` | `giong-grpc` (new in 1.1) | gRPC servers and clients on giong-http's HTTP/2: the four kinds of call, deadlines, cancellation, metadata, gzip, health and reflection; codes `GIONG-E4101`-`E4110`. `interop/run.sh` runs gRPC's interoperability cases against grpc-go (needs Go); `tests/generated/` and `src/generated/` hold generated code that `tests/generated.rs` keeps current (`GIONG_GRPC_REGENERATE=1` rewrites it) |
+| `examples/proto-hello/` | `proto-hello` (not published) | giong-grpc-build and giong-proto in one small program |
+| `examples/grpc-hello/` | `grpc-hello` (not published) | a gRPC server and client: a unary method and a server stream, health and reflection |
 
 `bench/` holds separate workspaces (the servers giong is compared with). Do not build them
 unless the task is about benchmarks.
@@ -92,6 +99,11 @@ Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README
 Run these from the repository root. All tests use loopback; none needs the internet.
 
 ```bash
+scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
+scripts/preflight.sh --quick  # the fast part, while iterating
+scripts/preflight.sh --against 172,173   # also merge with those open pull requests
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
+
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
 cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
@@ -113,6 +125,9 @@ scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kerne
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
 scripts/valgrind.sh          # memcheck on the single-threaded suites
 python3 scripts/release.py check   # READMEs, CHANGELOG and site agree with the version
+giong-proto/conformance/run.sh     # Google's protobuf conformance suite (builds the runner once, ~10 min)
+(cd giong-proto/conformance && cargo test --release)   # differential tests against prost
+giong-grpc/interop/run.sh          # gRPC's interoperability cases against grpc-go, both directions (needs Go 1.24+)
 scripts/semver.sh            # no breaking API change since the last release (cargo-semver-checks)
 scripts/instr.py check       # instructions per operation and heap per idle connection vs bench/instr/baseline.csv
 ```
@@ -198,7 +213,9 @@ is loaded.
 ## Changes, commits and pull requests
 
 - Branch from `main` as `<type>/<short-description>`. Never push to `main`; it is
-  protected.
+  protected. Leave nothing behind: a superseded pull request is closed with a comment
+  naming what replaces it and its branch deleted; a branch never stays without a pull
+  request (docs/DEVELOPMENT.md, *Leave nothing behind*).
 - Commits follow Conventional Commits: `<type>(<scope>): <imperative summary, lower case,
   no full stop>`. Types: `feat`, `fix`, `perf`, `refactor`, `test`, `docs`, `bench`,
   `ci`, `chore`. Scopes: the runtime's parts (`runtime`, `executor`, `driver`, `net`,
@@ -211,8 +228,11 @@ is loaded.
   whose message is the one `main` should get; for several commits it is the title and the
   list of their messages. Either way the title must be a valid commit summary. Fill in
   `.github/PULL_REQUEST_TEMPLATE.md`, including how the change was tested.
-- Anything a user would notice gets a line under `## [Unreleased]` in `CHANGELOG.md`
-  ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/)), grouped by crate.
+- Anything a user would notice gets an entry in a new file in `changelog.d/`
+  ([changelog.d/README.md](changelog.d/README.md)), never an edit to `CHANGELOG.md`: pull
+  requests in flight then do not conflict, and the release pull request merges the files
+  into `CHANGELOG.md` ([Keep a Changelog](https://keepachangelog.com/en/1.1.0/) sections,
+  entries grouped by crate).
 - Documentation is in English only: the READMEs, the docs and the comments. Each crate has
   one `README.md`. `scripts/release.py check` verifies the images and install snippets in
   them, not the test counts or benchmark numbers: update those by hand when a change moves
@@ -228,6 +248,11 @@ is loaded.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps
+
+- **Pull requests in flight conflict in the merge queue.** One that merges first can put
+  another out of date while the queue is testing it, and the queue ejects it. Before
+  enqueueing, `scripts/preflight.sh --against <open pull requests>` names the files that
+  conflict; the usual ones are README test counts and shared platform files.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that

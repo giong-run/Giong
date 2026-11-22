@@ -88,7 +88,10 @@ pub(crate) fn process() -> Value {
         rlim_max: 0,
     };
     // SAFETY: `limit` is a writable `rlimit`.
-    let fd_limit = (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0)
+    // No limit (`RLIM_INFINITY`) is `null`, as on Linux: the number is
+    // beyond what JSON carries exactly.
+    let fd_limit = (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0
+        && limit.rlim_cur != libc::RLIM_INFINITY)
         .then_some(limit.rlim_cur);
     json!({
         "pid": std::process::id(),

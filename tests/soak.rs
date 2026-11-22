@@ -39,6 +39,16 @@ const CLIENTS: usize = 32;
 /// `client`): with 4 workers, about 85 connects a second.
 #[cfg(windows)]
 const WINDOWS_CONNECT_GAP: Duration = Duration::from_millis(1500);
+
+/// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS` for a
+/// lighter run.
+fn clients() -> usize {
+    std::env::var("GIONG_SOAK_CLIENTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CLIENTS)
+}
 const RECV_BUFFERS: usize = 512;
 
 #[derive(Default)]
@@ -715,7 +725,7 @@ fn soak() {
             .max()
             .unwrap();
         // Each open connection holds two descriptors, client and server.
-        let slack = (2 * workers * CLIENTS + 16) as u64;
+        let slack = (2 * workers * clients() + 16) as u64;
         assert!(
             second <= first + slack,
             "descriptor count grew: at most {first} in the first half, {second} in the second"
@@ -825,8 +835,9 @@ fn run(workers: usize, secs: u64) -> Run {
                     sleep(Duration::from_millis(100)).await;
 
                     let mut tasks = Vec::new();
-                    for i in 0..CLIENTS {
-                        let rng = Rng::new((worker * CLIENTS + i) as u64 + 1);
+                    let clients = clients();
+                    for i in 0..clients {
+                        let rng = Rng::new((worker * clients + i) as u64 + 1);
                         tasks.push(giong::spawn(client(addr, deadline, rng, counters.clone())));
                     }
                     let udp_socket = UdpSocket::from_std(udp_socket);
