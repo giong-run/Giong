@@ -1082,25 +1082,44 @@ impl Server {
 /// reading side of the connection's socket: the connection reads the end
 /// of its stream, as if the client had closed it, and closes as it would
 /// then. So no connection keeps a waker for this, and the accept loop keeps
-/// two bits and a number per connection, by file descriptor. A connection
-/// marks itself idle and busy; the search for the one idle longest runs
-/// only at the limit. Only on Unix: elsewhere connections are not marked,
-/// and the accept loop waits for one to close.
+/// three bits and two numbers per connection, in places numbered from 0
+/// and reused: memory follows the connections this loop had open at once,
+/// not the file descriptor numbers of the process. A connection marks
+/// itself idle and busy; the search for the one idle longest runs only at
+/// the limit. Only on Unix: elsewhere connections are not marked, and the
+/// accept loop waits for one to close.
 struct Slots {
     open: Cell<usize>,
     max: usize,
     waiter: Cell<Option<Waker>>,
-    /// A bit per file descriptor: the connection on it is idle.
+    /// Per place: the connection's socket, and when it last became idle.
+    places: RefCell<Vec<Place>>,
+    /// A bit per place: a connection is in it.
+    used: RefCell<Vec<u64>>,
+    /// A bit per place: the connection in it is idle.
     idle: RefCell<Vec<u64>>,
-    /// A bit per file descriptor: the connection on it was asked to close.
+    /// A bit per place: the connection in it was asked to close.
     evicted: RefCell<Vec<u64>>,
-    /// Per file descriptor: when the connection on it last became idle, in
-    /// `next_idle` order (wrapping).
-    idle_since: RefCell<Vec<u32>>,
+    /// No word of `used` below this one has a free place.
+    free_from: Cell<usize>,
     next_idle: Cell<u32>,
     /// Connections asked to close that have not closed yet.
     evicting: Cell<usize>,
 }
+
+/// One connection's entry in [`Slots`].
+#[derive(Clone, Copy)]
+struct Place {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fd: i32,
+    /// When the connection last became idle, in `next_idle` order
+    /// (wrapping).
+    since: u32,
+}
+
+/// A [`Slot`] with no place: the accept loop does not shut its connection
+/// down (QUIC, or not on Unix).
+const NO_PLACE: u32 = u32::MAX;
 
 impl Slots {
     fn new(max: usize) -> Self {
@@ -1108,9 +1127,11 @@ impl Slots {
             open: Cell::new(0),
             max,
             waiter: Cell::new(None),
+            places: RefCell::new(Vec::new()),
+            used: RefCell::new(Vec::new()),
             idle: RefCell::new(Vec::new()),
             evicted: RefCell::new(Vec::new()),
-            idle_since: RefCell::new(Vec::new()),
+            free_from: Cell::new(0),
             next_idle: Cell::new(0),
             evicting: Cell::new(0),
         }
@@ -1129,7 +1150,7 @@ impl Slots {
                 self.open.set(self.open.get() + 1);
                 Poll::Ready(Slot {
                     slots: self.clone(),
-                    fd: -1,
+                    place: NO_PLACE,
                 })
             } else {
                 self.waiter.set(Some(cx.waker().clone()));
@@ -1146,33 +1167,38 @@ impl Slots {
     #[cfg(unix)]
     fn evict_one(&self) {
         let mut idle = self.idle.borrow_mut();
-        let since = self.idle_since.borrow();
+        let places = self.places.borrow();
         let now = self.next_idle.get();
         let mut oldest: Option<(u32, usize)> = None;
         for (word, &bits) in idle.iter().enumerate() {
             let mut bits = bits;
             while bits != 0 {
-                let fd = word * 64 + bits.trailing_zeros() as usize;
+                let place = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let age = now.wrapping_sub(since[fd]);
+                let age = now.wrapping_sub(places[place].since);
                 if oldest.map_or(true, |(a, _)| age > a) {
-                    oldest = Some((age, fd));
+                    oldest = Some((age, place));
                 }
             }
         }
-        let Some((_, fd)) = oldest else {
+        let Some((_, place)) = oldest else {
             return;
         };
-        let (word, bit) = (fd / 64, 1u64 << (fd % 64));
+        let (word, bit) = (place / 64, 1u64 << (place % 64));
         idle[word] &= !bit;
-        self.evicted.borrow_mut()[word] |= bit;
-        self.evicting.set(self.evicting.get() + 1);
+        let mut evicted = self.evicted.borrow_mut();
+        if evicted[word] & bit == 0 {
+            evicted[word] |= bit;
+            self.evicting.set(self.evicting.get() + 1);
+        }
         // SAFETY: `fd` is the socket of an open connection of this loop,
         // which keeps it open until its slot is dropped (right after it
         // closes the socket, in the same poll), and `ManuallyDrop` never
         // closes it here.
         let socket = mem::ManuallyDrop::new(unsafe {
-            <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(fd as std::os::fd::RawFd)
+            <std::net::TcpStream as std::os::fd::FromRawFd>::from_raw_fd(
+                places[place].fd as std::os::fd::RawFd,
+            )
         });
         // `shutdown` is the same call for TCP and Unix sockets. It fails
         // only if the client is already gone, and the connection then reads
@@ -1187,39 +1213,52 @@ impl Slots {
 /// One open connection; frees its slot when dropped.
 pub(crate) struct Slot {
     slots: Rc<Slots>,
-    /// The connection's socket, or -1 for one the accept loop does not
-    /// shut down (QUIC, or not on Unix).
-    fd: i32,
+    /// The connection's place in [`Slots`], or [`NO_PLACE`].
+    place: u32,
 }
 
 impl Slot {
-    /// Records the connection's socket, accepted after the slot was taken.
+    /// Records the connection's socket, accepted after the slot was taken,
+    /// in the lowest free place.
     fn set_fd(&mut self, fd: i32) {
         if fd < 0 {
             return;
         }
-        self.fd = fd;
-        let words = fd as usize / 64 + 1;
-        for bits in [&self.slots.idle, &self.slots.evicted] {
-            let mut bits = bits.borrow_mut();
-            if bits.len() < words {
-                bits.resize(words, 0);
-            }
+        let slots = &*self.slots;
+        let mut used = slots.used.borrow_mut();
+        let mut word = slots.free_from.get();
+        while word < used.len() && used[word] == u64::MAX {
+            word += 1;
         }
-        let mut since = self.slots.idle_since.borrow_mut();
-        if since.len() < words * 64 {
-            since.resize(words * 64, 0);
+        if word == used.len() {
+            used.push(0);
+            slots.idle.borrow_mut().push(0);
+            slots.evicted.borrow_mut().push(0);
         }
+        let bit = (!used[word]).trailing_zeros() as usize;
+        used[word] |= 1 << bit;
+        slots.free_from.set(word);
+        let place = word * 64 + bit;
+        let mut places = slots.places.borrow_mut();
+        // Every place below this one is taken, so it is at most one past
+        // the end.
+        let entry = Place { fd, since: 0 };
+        match places.get_mut(place) {
+            Some(p) => *p = entry,
+            None => places.push(entry),
+        }
+        self.place = place as u32;
     }
 
     /// The connection waits for its next request (`true`) or is serving
     /// one (`false`). Becoming idle while the accept loop waits at the limit
     /// wakes it, to ask this connection or another idle one to close.
     pub(crate) fn set_idle(&self, idle: bool) {
-        if self.fd < 0 {
+        if self.place == NO_PLACE {
             return;
         }
-        let (word, bit) = (self.fd as usize / 64, 1u64 << (self.fd % 64));
+        let place = self.place as usize;
+        let (word, bit) = (place / 64, 1u64 << (place % 64));
         let slots = &*self.slots;
         let mut bits = slots.idle.borrow_mut();
         if !idle {
@@ -1231,7 +1270,7 @@ impl Slot {
             bits[word] |= bit;
             let order = slots.next_idle.get();
             slots.next_idle.set(order.wrapping_add(1));
-            slots.idle_since.borrow_mut()[self.fd as usize] = order;
+            slots.places.borrow_mut()[place].since = order;
             if slots.full() {
                 if let Some(waker) = slots.waiter.take() {
                     waker.wake();
@@ -1244,13 +1283,18 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         let slots = &*self.slots;
-        if self.fd >= 0 {
-            let (word, bit) = (self.fd as usize / 64, 1u64 << (self.fd % 64));
+        if self.place != NO_PLACE {
+            let place = self.place as usize;
+            let (word, bit) = (place / 64, 1u64 << (place % 64));
+            slots.used.borrow_mut()[word] &= !bit;
             slots.idle.borrow_mut()[word] &= !bit;
             let mut evicted = slots.evicted.borrow_mut();
             if evicted[word] & bit != 0 {
                 evicted[word] &= !bit;
                 slots.evicting.set(slots.evicting.get() - 1);
+            }
+            if word < slots.free_from.get() {
+                slots.free_from.set(word);
             }
         }
         slots.open.set(slots.open.get() - 1);
@@ -2350,6 +2394,50 @@ mod tests {
         assert_eq!(other.stream_body(&req), Some(5));
         let status = giong::block_on(async { shared.call(req).await.status() });
         assert_eq!(status, 204);
+    }
+
+    /// A connection's place in the accept loop's bookkeeping follows the
+    /// connections open at once, not its file descriptor number, and a
+    /// freed place is taken again first.
+    #[test]
+    fn connection_places_are_reused_whatever_the_descriptor() {
+        giong::block_on(async {
+            let slots = Rc::new(Slots::new(1000));
+            let mut held = Vec::new();
+            for i in 0..130 {
+                let mut slot = slots.take(false).await;
+                slot.set_fd(1_000_000 + i);
+                assert_eq!(slot.place, i as u32);
+                held.push(slot);
+            }
+            assert_eq!(slots.places.borrow().len(), 130);
+            assert_eq!(slots.used.borrow().len(), 3);
+            // Free one place in the first word and one in the second.
+            drop(held.remove(70));
+            drop(held.remove(5));
+            let mut slot = slots.take(false).await;
+            slot.set_fd(7);
+            assert_eq!(slot.place, 5);
+            held.push(slot);
+            let mut slot = slots.take(false).await;
+            slot.set_fd(8);
+            assert_eq!(slot.place, 70);
+            held.push(slot);
+            let mut slot = slots.take(false).await;
+            slot.set_fd(9);
+            assert_eq!(slot.place, 130);
+            held.push(slot);
+            assert_eq!(slots.places.borrow().len(), 131);
+            // Idle marks and the age order travel with the place.
+            held[0].set_idle(true);
+            held[1].set_idle(true);
+            held[0].set_idle(false);
+            assert_eq!(slots.idle.borrow()[0], 0b10);
+            drop(held);
+            assert_eq!(slots.open.get(), 0);
+            assert!(slots.used.borrow().iter().all(|&w| w == 0));
+            assert!(slots.idle.borrow().iter().all(|&w| w == 0));
+        });
     }
 
     /// The fixed refusal for low memory announces its own length.
