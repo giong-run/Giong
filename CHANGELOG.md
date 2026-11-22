@@ -8,6 +8,38 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-22
+
+HTTP/3: a new crate, giong-quic, carries QUIC on giong's own UDP sockets, and giong-http
+serves and requests HTTP/3 behind the `unstable-http3` feature, on Linux and macOS. Both
+features are off by default and may still change before they are stabilised; the default
+build is unchanged. giong-quic, and with it `unstable-http3`, needs Rust 1.85: the QUIC
+engine underneath, quinn-proto, needs it from the release that fixes a remote memory
+exhaustion (GHSA-4w2j-m93h-cj5j) on. Every other crate and feature still builds with Rust
+1.80. Nothing is removed or changed in meaning, and upgrading from 1.2 needs no code
+changes.
+
+### Added
+
+- **giong**: UDP offloads behind the `unstable-udp-offload` feature: GSO and per-datagram
+  options (source address, ECN) through `UdpSocket::send_segments_to`, `send_to_with` and
+  `SendOptions`; GRO, ECN and the local address on receive through `set_gro`,
+  `set_recv_ecn`, `set_recv_local_addr` and `Datagram::segments`, `ecn` and `local_ip`.
+  GSO and GRO are Linux only: elsewhere `set_gro(true)` and a segmented send return an
+  error, and `gso_supported` says no. Off by default, at no cost to the default build
+  ([#172](https://github.com/giong-run/Giong/pull/172)).
+- **giong-quic**: a new crate, QUIC (RFC 9000) on giong: per-worker endpoints whose
+  connection IDs name their worker, so datagrams that reach the wrong worker are passed on;
+  bidirectional and unidirectional streams, 0-RTT, Retry under load, stateless resets and
+  address validation tokens shared by every worker of a configuration
+  ([#172](https://github.com/giong-run/Giong/pull/172)).
+- **giong-http**: HTTP/3 (RFC 9114) behind the `unstable-http3` feature: `Server::serve_h3`,
+  and a client that follows `Alt-Svc`, sends 0-RTT only for requests that are safe to replay,
+  and falls back to the next address when one does not answer. Trailer fields travel both
+  ways as over HTTP/2; a streamed request body goes over HTTP/1.1 or HTTP/2, and is refused
+  by a client with `http3_prior_knowledge`; `Client::preconnect` opens the QUIC connection
+  ([#172](https://github.com/giong-run/Giong/pull/172)).
+
 ## [1.2.0] - 2026-11-22
 
 macOS support: a kqueue driver, tested on macOS 15 and macOS 26 on Apple Silicon (Intel Macs
@@ -2697,7 +2729,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/giong-run/Giong/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/giong-run/Giong/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/giong-run/Giong/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/giong-run/Giong/compare/v1.0.0...v1.0.1
