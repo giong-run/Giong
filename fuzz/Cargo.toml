@@ -30,3 +30,10 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "udp_control"
+path = "fuzz_targets/udp_control.rs"
+test = false
+doc = false
+bench = false

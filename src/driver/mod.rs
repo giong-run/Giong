@@ -1005,6 +1005,17 @@ impl Driver {
         })
     }
 
+    /// [`try_send_to`](Self::try_send_to) for a prepared message (control
+    /// data such as `UDP_SEGMENT`): `sendmsg(2)`.
+    #[cfg(feature = "unstable-udp-offload")]
+    pub(crate) fn try_sendmsg(&mut self, fd: RawFd, msg: *const libc::msghdr) -> Option<i32> {
+        if self.has_queued_submissions() {
+            return None;
+        }
+        // SAFETY: the caller's header points at live buffers.
+        send_now(|| unsafe { libc::sendmsg(fd, msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) })
+    }
+
     /// A future that waited on multishot operation `key` with `waker` was
     /// dropped (see `net::Waiting`).
     pub(crate) fn leave_multi(&mut self, key: usize, waker: &Waker) {

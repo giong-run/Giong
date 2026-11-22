@@ -43,8 +43,9 @@ def inline(text, link=lambda url: url):
     return re.sub(r"\x00(\d+)\x00", lambda m: codes[int(m.group(1))], text)
 
 
-def render(src, link=lambda url: url, heading_shift=0, heading_ids=True):
-    """Markdown to HTML. Headings move down by `heading_shift` levels."""
+def render(src, link=lambda url: url, heading_shift=0, heading_ids=True, code=None):
+    """Markdown to HTML. Headings move down by `heading_shift` levels. `code(lang, text)`,
+    when given, returns the HTML inside a fenced block (for highlighting)."""
     lines = src.replace("\r\n", "\n").split("\n")
     out = []
     i = 0
@@ -83,7 +84,8 @@ def render(src, link=lambda url: url, heading_shift=0, heading_ids=True):
                 i += 1
             i += 1
             cls = f' class="lang-{lang}"' if lang else ""
-            out.append(f'<pre class="code"><code{cls}>{html.escape(chr(10).join(body), quote=False)}</code></pre>')
+            inner = code(lang, chr(10).join(body)) if code else html.escape(chr(10).join(body), quote=False)
+            out.append(f'<pre class="code"><code{cls}>{inner}</code></pre>')
             continue
         m = HEADING.match(line)
         if m:
@@ -100,7 +102,7 @@ def render(src, link=lambda url: url, heading_shift=0, heading_ids=True):
             while i < n and lines[i].strip().startswith(">"):
                 quote.append(re.sub(r"^\s*>\s?", "", lines[i]))
                 i += 1
-            out.append(f"<blockquote>{render(chr(10).join(quote), link, heading_shift, heading_ids)}</blockquote>")
+            out.append(f"<blockquote>{render(chr(10).join(quote), link, heading_shift, heading_ids, code)}</blockquote>")
             continue
         if stripped.startswith("|") and i + 1 < n and re.match(r"^\s*\|[\s:|-]+\|\s*$", lines[i + 1]):
             para(buf); buf = []
@@ -117,7 +119,7 @@ def render(src, link=lambda url: url, heading_shift=0, heading_ids=True):
             out.append(f'<div class="table-scroll"><table><thead><tr>{th}</tr></thead><tbody>{tb}</tbody></table></div>')
             continue
         if LIST_ITEM.match(line) and not buf:
-            i = _list(lines, i, out, link)
+            i = _list(lines, i, out, link, code)
             continue
         buf.append(line)
         i += 1
@@ -125,16 +127,31 @@ def render(src, link=lambda url: url, heading_shift=0, heading_ids=True):
     return "\n".join(out)
 
 
-def _list(lines, i, out, link):
-    """Parse a (nested) list starting at line i; return the index after it."""
-    items = []          # (indent, ordered, text)
+def _list(lines, i, out, link, code=None):
+    """Parse a (nested) list starting at line i; return the index after it. A fenced
+    code block indented under an item belongs to that item."""
+    items = []          # (indent, ordered, text, blocks)
     n = len(lines)
     while i < n:
         line = lines[i]
         m = LIST_ITEM.match(line)
         if m:
-            items.append([len(m.group(1).expandtabs(4)), m.group(2)[0].isdigit(), m.group(3)])
+            items.append([len(m.group(1).expandtabs(4)), m.group(2)[0].isdigit(), m.group(3), []])
             i += 1
+            continue
+        f = FENCE.match(line)
+        if f and f.group(1) and items:
+            pad, fence, lang = len(f.group(1)), f.group(2), f.group(3)
+            body = []
+            i += 1
+            while i < n and not lines[i].strip().startswith(fence):
+                body.append(lines[i][pad:] if lines[i][:pad].strip() == "" else lines[i].lstrip())
+                i += 1
+            i += 1
+            text = chr(10).join(body)
+            inner = code(lang, text) if code else html.escape(text, quote=False)
+            cls = f' class="lang-{lang}"' if lang else ""
+            items[-1][3].append(["code", f'<pre class="code"><code{cls}>{inner}</code></pre>'])
             continue
         if not line.strip():
             # A blank line ends the list unless the next text belongs to it.
@@ -150,7 +167,13 @@ def _list(lines, i, out, link):
                 continue
             break
         if line.startswith((" ", "\t")) and items:
-            items[-1][2] += " " + line.strip()
+            blocks = items[-1][3]
+            if not blocks:
+                items[-1][2] += " " + line.strip()
+            elif blocks[-1][0] == "text" and lines[i - 1].strip():
+                blocks[-1][1] += " " + line.strip()
+            else:
+                blocks.append(["text", line.strip()])
             i += 1
             continue
         break
@@ -158,16 +181,17 @@ def _list(lines, i, out, link):
     html_out = []
     stack = []          # (indent, tag)
 
-    def li(text):
+    def li(text, blocks=()):
         cls = ""
         box = re.match(r"^\[([ xX])\]\s+(.*)$", text)
         if box:
             done = box.group(1) != " "
             cls = ' class="task is-done"' if done else ' class="task"'
             text = box.group(2)
-        return f"<li{cls}>{inline(text, link)}"
+        extra = "".join(b if kind == "code" else f"<p>{inline(b, link)}</p>" for kind, b in blocks)
+        return f"<li{cls}>{inline(text, link)}{extra}"
 
-    for indent, ordered, text in items:
+    for indent, ordered, text, blocks in items:
         tag = "ol" if ordered else "ul"
         if not stack or indent > stack[-1][0]:
             html_out.append(f"<{tag}>")
@@ -176,7 +200,7 @@ def _list(lines, i, out, link):
             while stack and indent < stack[-1][0]:
                 html_out.append(f"</li></{stack.pop()[1]}>")
             html_out.append("</li>")
-        html_out.append(li(text))
+        html_out.append(li(text, blocks))
     while stack:
         html_out.append(f"</li></{stack.pop()[1]}>")
     out.append("".join(html_out))
