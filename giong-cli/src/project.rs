@@ -17,6 +17,9 @@ pub struct Project {
     pub root: PathBuf,
     /// Where cargo writes builds.
     pub target_dir: PathBuf,
+    /// Where cargo keeps intermediate build files (`build.build-dir`): the
+    /// target directory unless that is configured.
+    pub build_dir: PathBuf,
     /// `cargo metadata` (without dependencies resolved twice).
     pub metadata: Value,
 }
@@ -77,9 +80,14 @@ impl Project {
                 .map(String::from)
                 .unwrap_or_else(|| root.join("target").display().to_string()),
         );
+        let build_dir = metadata["build_directory"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| target_dir.clone());
         Ok(Project {
             root,
             target_dir,
+            build_dir,
             metadata,
         })
     }

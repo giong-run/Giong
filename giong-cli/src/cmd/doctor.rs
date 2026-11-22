@@ -72,10 +72,15 @@ fn run(args: &Args) -> Result<Report, Failure> {
     let mut r = Report::new("doctor");
     machine(&mut r);
     if !args.has("machine") {
-        if let Ok(project) = Project::here() {
-            project_checks(&project, &mut r);
-        } else {
-            r.data("project", json!(null));
+        match Project::here() {
+            Ok(project) => project_checks(&project, &mut r),
+            // Outside a project there is nothing to check; a project cargo
+            // cannot read is the first thing to fix.
+            Err(f) if f.code == Code::NOT_A_PROJECT => r.data("project", json!(null)),
+            Err(f) => {
+                r.data("project", json!(null));
+                r.push(Finding::new(f.code, Severity::Error, f.what).fix(f.fix));
+            }
         }
     }
     let errors = r
@@ -105,13 +110,42 @@ fn machine(r: &mut Report) {
     r.data("arch", json!(std::env::consts::ARCH));
     r.data("cpus", json!(host::cpus()));
 
-    match host::rustc_version() {
-        None => r.push(
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    match host::run(std::process::Command::new(&rustc).arg("--version"))
+        .map(|out| host::parse_version(&out))
+    {
+        Err(host::ToolError::Missing(_)) => r.push(
             Finding::new(Code::CARGO_FAILED, Severity::Error, "rustc was not found")
                 .detail("giong needs the Rust toolchain on the PATH")
                 .fix("install Rust with rustup (https://rustup.rs) and open a new terminal"),
         ),
-        Some(v) => {
+        Err(host::ToolError::Failed(stderr)) => r.push(
+            Finding::new(
+                Code::CARGO_FAILED,
+                Severity::Error,
+                "rustc is installed but fails",
+            )
+            .detail(stderr)
+            .fix("rustup default stable picks a toolchain; rustup update repairs one"),
+        ),
+        Err(host::ToolError::TimedOut) => r.push(
+            Finding::new(
+                Code::CARGO_FAILED,
+                Severity::Error,
+                "rustc --version did not answer within 20 seconds",
+            )
+            .detail("another rustup may hold its lock while it downloads a toolchain")
+            .fix("wait for the other rustup or cargo to finish, then run giong doctor again"),
+        ),
+        Ok(None) => r.push(
+            Finding::new(
+                Code::CARGO_FAILED,
+                Severity::Warning,
+                "rustc printed no version",
+            )
+            .fix("check what rustc --version prints"),
+        ),
+        Ok(Some(v)) => {
             r.data("rustc", json!(v.to_string()));
             if v < MSRV {
                 r.push(rust_too_old(v, MSRV, "the giong crates"));
@@ -119,7 +153,9 @@ fn machine(r: &mut Report) {
         }
     }
 
-    if cfg!(unix) && !host::exists("cc", &["--version"]) {
+    // macOS's /usr/bin/cc is a shim that exists without the Command Line
+    // Tools: it must also succeed.
+    if cfg!(unix) && host::output("cc", &["--version"]).is_none() {
         r.push(
             Finding::new(Code::NO_LINKER, Severity::Error, "no C linker (cc) found")
                 .detail("Rust links binaries with the system's cc")
@@ -287,7 +323,7 @@ fn rust_too_old(v: Version, need: Version, who: &str) -> Finding {
 fn project_checks(p: &Project, r: &mut Report) {
     r.data("project", json!(p.root.display().to_string()));
     // (name, features, manifest relative to the root)
-    let mut deps: Vec<(String, Vec<String>, String)> = Vec::new();
+    let mut deps: Vec<(String, String, Vec<String>, String)> = Vec::new();
     for pkg in p.packages() {
         let manifest = pkg["manifest_path"]
             .as_str()
@@ -301,24 +337,26 @@ fn project_checks(p: &Project, r: &mut Report) {
         for d in pkg["dependencies"].as_array().into_iter().flatten() {
             if d["kind"].is_null() || d["kind"] == "normal" {
                 let name = d["name"].as_str().unwrap_or("").to_string();
+                // `rt = { package = "tokio" }` is written under its new name.
+                let key = d["rename"].as_str().unwrap_or(&name).to_string();
                 let features = d["features"]
                     .as_array()
                     .into_iter()
                     .flatten()
                     .filter_map(|f| f.as_str().map(String::from))
                     .collect();
-                deps.push((name, features, manifest.clone()));
+                deps.push((name, key, features, manifest.clone()));
             }
         }
     }
     for (name, replacement) in TOKIO_CRATES {
         let mut seen = std::collections::HashSet::new();
-        for (d, features, manifest) in &deps {
+        for (d, key, features, manifest) in &deps {
             if d != name || !needs_tokio_runtime(d, features) || !seen.insert(manifest) {
                 continue;
             }
             let text = std::fs::read_to_string(p.root.join(manifest)).unwrap_or_default();
-            let (line, col) = find_line(&text, name);
+            let (line, col) = find_line(&text, key);
             r.push(
                 Finding::new(
                     Code::TOKIO_CRATE,
@@ -334,7 +372,7 @@ fn project_checks(p: &Project, r: &mut Report) {
             );
         }
     }
-    let quic = deps.iter().any(|(d, f, _)| {
+    let quic = deps.iter().any(|(d, _, f, _)| {
         d == "giong-quic" || (d == "giong-http" && f.iter().any(|f| f == "unstable-http3"))
     });
     if quic {
@@ -342,8 +380,10 @@ fn project_checks(p: &Project, r: &mut Report) {
             r.push(rust_too_old(v, MSRV_QUIC, "giong-quic and HTTP/3"));
         }
     }
-    if let Some(f) = dev_profile_finding(&p.manifest()) {
-        r.push(f);
+    if !debug_set_elsewhere(&p.root) {
+        if let Some(f) = dev_profile_finding(&p.manifest()) {
+            r.push(f);
+        }
     }
     env_checks(&p.root, r);
     let bytes = dir_size(&p.target_dir);
@@ -395,26 +435,39 @@ pub fn dev_profile_finding(manifest: &str) -> Option<Finding> {
         .detail("line tables are enough for backtraces, and make rebuilds faster and target/ smaller (measured: 181 to 140 MB for a small giong-web service)")
         .fix("set debug = \"line-tables-only\" under [profile.dev] in Cargo.toml")
     };
+    let newline = if manifest.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut offset = 0;
     let mut header_end = None;
+    let mut table = String::new();
+    let mut line_no = 0u32;
     for line in manifest.split_inclusive('\n') {
-        let t = line.trim();
-        if header_end.is_none() {
-            if t == "[profile.dev]" {
+        line_no += 1;
+        let t = strip_comment(line).trim();
+        if let Some(name) = table_header(t) {
+            table = name;
+            if table == "profile.dev" && header_end.is_none() {
                 header_end = Some(offset + line.len());
             }
-        } else if t.starts_with('[') {
-            break;
-        } else if let Some(rest) = t.strip_prefix("debug") {
-            let rest = rest.trim_start();
-            if let Some(value) = rest.strip_prefix('=') {
-                let value = value.split('#').next().unwrap_or("").trim();
-                let full = matches!(value, "true" | "2" | "\"full\"");
-                if !full {
+        } else if let Some((key, value)) = t.split_once('=') {
+            let key: String = key.chars().filter(|c| !c.is_whitespace()).collect();
+            let value = value.trim();
+            // The dev profile written as dotted keys or an inline table:
+            // said, but not edited (an edit could duplicate a key).
+            let dotted = (table.is_empty() && key.starts_with("profile.dev"))
+                || (table == "profile" && (key == "dev" || key.starts_with("dev.")));
+            if dotted {
+                return manifest_sets_debug(value, &key)
+                    .then(|| finding().at("Cargo.toml", line_no, 1));
+            }
+            if table == "profile.dev" && key == "debug" {
+                if !matches!(value, "true" | "2" | "\"full\"" | "'full'") {
                     return None;
                 }
                 let start = offset + line.find(value).unwrap_or(0);
-                let line_no = manifest[..offset].matches('\n').count() as u32 + 1;
                 return Some(finding().at("Cargo.toml", line_no, 1).edits(vec![Edit {
                     file: "Cargo.toml".into(),
                     start,
@@ -426,18 +479,26 @@ pub fn dev_profile_finding(manifest: &str) -> Option<Finding> {
         offset += line.len();
     }
     let (start, replacement) = match header_end {
-        Some(at) => (at, "debug = \"line-tables-only\"\n".to_string()),
-        None => {
-            let sep = if manifest.is_empty() || manifest.ends_with("\n\n") {
+        Some(at) => {
+            // A header on the last line, without a line break after it.
+            let sep = if manifest[..at].ends_with('\n') {
                 ""
-            } else if manifest.ends_with('\n') {
-                "\n"
             } else {
-                "\n\n"
+                newline
+            };
+            (at, format!("{sep}debug = \"line-tables-only\"{newline}"))
+        }
+        None => {
+            let sep = if manifest.is_empty() || manifest.ends_with(&format!("{newline}{newline}")) {
+                String::new()
+            } else if manifest.ends_with('\n') {
+                newline.to_string()
+            } else {
+                format!("{newline}{newline}")
             };
             (
                 manifest.len(),
-                format!("{sep}[profile.dev]\ndebug = \"line-tables-only\"\n"),
+                format!("{sep}[profile.dev]{newline}debug = \"line-tables-only\"{newline}"),
             )
         }
     };
@@ -449,13 +510,97 @@ pub fn dev_profile_finding(manifest: &str) -> Option<Finding> {
     }]))
 }
 
+/// For the dotted forms: whether the dev profile does not turn full debug
+/// information off (`dev.debug = 1`, `dev = { debug = "line-tables-only" }`).
+fn manifest_sets_debug(value: &str, key: &str) -> bool {
+    if key.ends_with("debug") {
+        return matches!(value, "true" | "2" | "\"full\"" | "'full'");
+    }
+    if key == "dev" || key == "profile.dev" {
+        return !value.contains("debug");
+    }
+    // Another dotted key (`dev.opt-level`): the default debug applies,
+    // unless a debug key follows, which this simple reader does not track.
+    true
+}
+
+/// `[ profile.dev ]` -> `profile.dev`; `None` for a line that is no header.
+fn table_header(line: &str) -> Option<String> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    let inner = inner.trim_start_matches('[').trim_end_matches(']');
+    Some(
+        inner
+            .split('.')
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+/// The line without a `#` comment (a `#` inside a string stays).
+fn strip_comment(line: &str) -> &str {
+    let mut quote = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '#') => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Whether the dev profile's debug setting comes from outside Cargo.toml:
+/// `CARGO_PROFILE_DEV_DEBUG`, or `.cargo/config.toml` in the project or above.
+fn debug_set_elsewhere(root: &Path) -> bool {
+    if std::env::var_os("CARGO_PROFILE_DEV_DEBUG").is_some() {
+        return true;
+    }
+    root.ancestors().any(|d| {
+        ["config.toml", "config"].iter().any(|name| {
+            let Ok(text) = std::fs::read_to_string(d.join(".cargo").join(name)) else {
+                return false;
+            };
+            let mut table = String::new();
+            text.lines().any(|line| {
+                let t = strip_comment(line).trim();
+                if let Some(name) = table_header(t) {
+                    table = name;
+                    return false;
+                }
+                let key: String = t
+                    .split('=')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect();
+                t.contains('=')
+                    && ((table == "profile.dev" && key == "debug")
+                        || (table == "profile" && key == "dev.debug")
+                        || (table.is_empty() && key == "profile.dev.debug"))
+            })
+        })
+    })
+}
+
 fn env_checks(root: &Path, r: &mut Report) {
     let Some((example, _)) = dotenv::read(&root.join(".env.example")) else {
         return;
     };
-    let local = dotenv::read(&root.join(".env"))
-        .map(|(v, _)| v)
-        .unwrap_or_default();
+    let (local, bad) = dotenv::read(&root.join(".env")).unwrap_or_default();
+    for b in bad {
+        r.push(
+            Finding::new(
+                Code::ENV_MISSING,
+                Severity::Warning,
+                format!(".env line {} is not read: {}", b.line, b.why),
+            )
+            .fix("write it as KEY=value (values with spaces or # in double quotes)")
+            .at(".env", b.line, 1),
+        );
+    }
     let mut values = std::collections::HashMap::new();
     for v in &local {
         values.insert(v.key.clone(), v.value.clone());
@@ -506,13 +651,35 @@ fn env_checks(root: &Path, r: &mut Report) {
 }
 
 /// The line and column where `word` first appears as a key (`word =` or `word.`).
-fn find_line(text: &str, word: &str) -> (u32, u32) {
+fn find_line(text: &str, key: &str) -> (u32, u32) {
+    // Only in a table of normal dependencies: [dependencies],
+    // [target.'cfg(..)'.dependencies], or the key's own [dependencies.<key>].
+    let mut in_deps = false;
     for (i, line) in text.lines().enumerate() {
+        let t = strip_comment(line).trim();
+        if let Some(table) = table_header(t) {
+            if table == format!("dependencies.{key}")
+                || table.ends_with(&format!(".dependencies.{key}"))
+            {
+                return (i as u32 + 1, 1);
+            }
+            in_deps = table == "dependencies"
+                || (table.starts_with("target.") && table.ends_with(".dependencies"));
+            continue;
+        }
+        if !in_deps {
+            continue;
+        }
+        let lead = line.len() - line.trim_start().len();
         let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix(word) {
+        let quoted = format!("\"{key}\"");
+        if let Some(rest) = t
+            .strip_prefix(quoted.as_str())
+            .or_else(|| t.strip_prefix(key))
+        {
             let rest = rest.trim_start();
             if rest.starts_with('=') || rest.starts_with('.') {
-                return (i as u32 + 1, (line.len() - t.len()) as u32 + 1);
+                return (i as u32 + 1, lead as u32 + 1);
             }
         }
     }
@@ -597,6 +764,41 @@ mod tests {
         for v in ["\"line-tables-only\"", "0", "false", "1", "\"limited\""] {
             assert!(dev_profile_finding(&format!("[profile.dev]\ndebug = {v}\n")).is_none());
         }
+        // Every header spelling, a comment, CRLF, no final line break.
+        for (m, want) in [
+            (
+                "[profile.dev] # fast\nopt-level = 1\n",
+                "[profile.dev] # fast\ndebug = \"line-tables-only\"\nopt-level = 1\n",
+            ),
+            (
+                "[ profile.dev ]\n",
+                "[ profile.dev ]\ndebug = \"line-tables-only\"\n",
+            ),
+            (
+                "[profile.dev]",
+                "[profile.dev]\ndebug = \"line-tables-only\"\n",
+            ),
+            (
+                "[package]\r\n",
+                "[package]\r\n\r\n[profile.dev]\r\ndebug = \"line-tables-only\"\r\n",
+            ),
+            (
+                "[profile.dev]\ndebug = 'full'\n",
+                "[profile.dev]\ndebug = \"line-tables-only\"\n",
+            ),
+        ] {
+            assert_eq!(apply(m, &dev_profile_finding(m).unwrap()), want, "{m:?}");
+        }
+        // Dotted forms: said, never edited.
+        for m in [
+            "[profile]\ndev = { opt-level = 1 }\n",
+            "[profile]\ndev.opt-level = 1\n",
+            "profile.dev.debug = true\n",
+        ] {
+            let f = dev_profile_finding(m).unwrap();
+            assert!(!f.fixable, "{m:?}");
+        }
+        assert!(dev_profile_finding("[profile]\ndev = { debug = 1 }\n").is_none());
         // `debug` of another profile does not count.
         let m = "[profile.release]\ndebug = true\n";
         assert!(dev_profile_finding(m).is_some());
@@ -630,6 +832,12 @@ mod tests {
         assert_eq!(find_line(m, "sqlx"), (3, 3));
         assert_eq!(find_line(m, "tokio"), (4, 1));
         assert_eq!(find_line(m, "axum"), (1, 1));
+        // Not in [workspace.dependencies] or dev-dependencies; a renamed one
+        // by its key; a [dependencies.<key>] table.
+        let m = "[workspace.dependencies]\ntokio = \"1\"\n[dev-dependencies]\nrt = \"1\"\n[dependencies]\nrt = { package = \"tokio\" }\n[dependencies.sqlx]\nversion = \"0.8\"\n";
+        assert_eq!(find_line(m, "rt"), (6, 1));
+        assert_eq!(find_line(m, "tokio"), (1, 1));
+        assert_eq!(find_line(m, "sqlx"), (7, 1));
     }
 
     #[test]
