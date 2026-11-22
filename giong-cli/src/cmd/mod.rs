@@ -12,6 +12,9 @@ use crate::report::{Failure, Report};
 pub mod doctor;
 pub mod explain;
 pub mod help;
+pub mod openapi;
+pub mod routes;
+pub mod top;
 pub mod version;
 
 /// A command of `giong`.
@@ -35,6 +38,9 @@ pub const COMMANDS: &[&Command] = &[
     // `image`, `openapi`, `record`.
     &doctor::COMMAND,
     &explain::COMMAND,
+    &routes::COMMAND,
+    &openapi::COMMAND,
+    &top::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];

@@ -56,6 +56,11 @@ codes! {
     MCP_UNREACHABLE = 5019, "McpUnreachable", "the service's giong-mcp does not answer";
     WATCH_LIMIT = 5020, "WatchLimit", "too many files to watch";
     NO_LINKER = 5021, "NoLinker", "no linker found";
+    NO_SERVICE = 5050, "NoService", "no running service to ask";
+    MCP_NO_TOOL = 5051, "McpNoTool", "the service's giong-mcp lacks a tool";
+    MCP_TOOL_ERROR = 5052, "McpToolError", "the service's giong-mcp refused a call";
+    WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";
+    SERVICE_WARNING = 5056, "ServiceWarning", "the service reports a warning";
 }
 
 impl Code {

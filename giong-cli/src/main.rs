@@ -17,6 +17,7 @@ mod host;
 mod pages;
 mod project;
 mod report;
+mod service;
 
 use std::process::ExitCode;
 
