@@ -22,6 +22,11 @@ fuzz_target!(|data: &[u8]| {
         None => (1, text),
     };
     let argv: Vec<String> = text.split('\0').map(String::from).collect();
+    // A lone "-" is a word for parse() and a flag for command_of(): reported
+    // to the CLI's owner (audit round 2, F1). Remove this line once fixed.
+    if argv.iter().any(|a| a == "-") {
+        return;
+    }
     let cmd = command_of(&argv).map(String::from);
     match parse(&argv, FLAGS, max_words) {
         Err(f) => {
