@@ -17,6 +17,7 @@ mod harness;
 mod schema;
 
 mod bench;
+mod check;
 mod clean;
 mod contract;
 mod doctor;

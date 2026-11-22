@@ -17,7 +17,7 @@ const STDIO_SERVERS: &[&str] = &["mcp"];
 
 const SCENARIOS: &[&str] = &[
     "doctor", "explain", "clean", "version", "help", "new", "dev", "ai", "fix", "test", "env",
-    "bench", "mcp",
+    "bench", "mcp", "check",
 ];
 
 /// How long a command may take outside a project before it is called hung:
