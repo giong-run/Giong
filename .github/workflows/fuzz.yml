@@ -81,6 +81,7 @@ jobs:
           all=$(jq -c -s . <<'EOF'
           { "crate": "giong", "dir": ".", "target": "dns_response", "flags": "-max_len=65538 -timeout=2" }
           { "crate": "giong", "dir": ".", "target": "resolv_conf" }
+          { "crate": "giong", "dir": ".", "target": "udp_control" }
           { "crate": "giong-http", "target": "head" }
           { "crate": "giong-http", "target": "chunked" }
           { "crate": "giong-http", "target": "connection" }
@@ -91,6 +92,9 @@ jobs:
           { "crate": "giong-http", "target": "hpack" }
           { "crate": "giong-http", "target": "h2" }
           { "crate": "giong-http", "target": "h2_client" }
+          { "crate": "giong-http", "target": "h3" }
+          { "crate": "giong-http", "target": "h3_server" }
+          { "crate": "giong-http", "target": "h3_client" }
           { "crate": "giong-postgres", "target": "messages" }
           { "crate": "giong-postgres", "target": "scram" }
           { "crate": "giong-postgres", "target": "url" }
@@ -107,6 +111,7 @@ jobs:
           { "crate": "giong-web", "target": "request" }
           { "crate": "giong-tls", "target": "ktls_records" }
           { "crate": "giong-mcp", "target": "request" }
+          { "crate": "giong-quic", "target": "packet" }
           { "crate": "giong-proto", "target": "differential" }
           { "crate": "giong-grpc", "target": "framing" }
           { "crate": "giong-grpc", "target": "gzip" }

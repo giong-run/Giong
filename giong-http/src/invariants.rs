@@ -577,35 +577,40 @@ pub mod h2_connection {
 
         async fn call(&self, req: Request) -> Response {
             assert!(req.version() == crate::Version::Http2);
-            assert!(req.body().len() <= 64);
-            if let Some(body) = req.body_stream() {
-                while let Ok(Some(piece)) = body.chunk().await {
-                    assert!(!piece.is_empty());
-                }
-            }
-            let path = req.path().to_string();
-            if path.contains('n') {
-                return Response::new(204);
-            }
-            if path.contains("big") {
-                return Response::new(200).body(vec![b'b'; 3000]);
-            }
-            if path.contains('r') {
-                let (tx, body) = Body::channel();
-                let abort = path.contains('x');
-                drop(giong::spawn(async move {
-                    if tx.send(&b"ab"[..]).await.is_err() {
-                        return;
-                    }
-                    if abort {
-                        return tx.abort();
-                    }
-                    let _ = tx.send(&b"cde"[..]).await;
-                }));
-                return Response::new(200).body(body);
-            }
-            Response::text("ok")
+            answer(req).await
         }
+    }
+
+    /// What the fuzzed handlers do, whatever the version of HTTP.
+    pub(crate) async fn answer(req: Request) -> Response {
+        assert!(req.body().len() <= 64);
+        if let Some(body) = req.body_stream() {
+            while let Ok(Some(piece)) = body.chunk().await {
+                assert!(!piece.is_empty());
+            }
+        }
+        let path = req.path().to_string();
+        if path.contains('n') {
+            return Response::new(204);
+        }
+        if path.contains("big") {
+            return Response::new(200).body(vec![b'b'; 3000]);
+        }
+        if path.contains('r') {
+            let (tx, body) = Body::channel();
+            let abort = path.contains('x');
+            drop(giong::spawn(async move {
+                if tx.send(&b"ab"[..]).await.is_err() {
+                    return;
+                }
+                if abort {
+                    return tx.abort();
+                }
+                let _ = tx.send(&b"cde"[..]).await;
+            }));
+            return Response::new(200).body(body);
+        }
+        Response::text("ok")
     }
 
     /// The server for fuzzing: short timeouts, so that a stalled stream
@@ -641,5 +646,415 @@ pub mod h2_connection {
             rest = &rest[n..];
         }
         input
+    }
+}
+
+// ------------------------------------------------------------------ HTTP/3
+
+/// Checks QPACK on `input` (see `h3::qpack::check`).
+pub fn check_qpack(input: &[u8]) -> bool {
+    crate::h3::qpack::check(input)
+}
+
+/// What HTTP/3 framing must guarantee for any bytes: reading never panics
+/// and never claims more than it was given; a frame header that reads
+/// writes back to bytes that read the same; SETTINGS and the one-integer
+/// frames parse or fail cleanly. Returns `true` if `input` starts with a
+/// frame header a server accepts.
+pub fn check_h3_frames(input: &[u8]) -> bool {
+    use crate::h3::frame::{
+        parse_single_id, read_varint, write_varint, Header, Need, On, Settings,
+    };
+    if let Some((value, used)) = read_varint(input) {
+        assert!(used <= input.len() && matches!(used, 1 | 2 | 4 | 8));
+        let mut out = Vec::new();
+        write_varint(&mut out, value);
+        assert!(out.len() <= used);
+        assert_eq!(read_varint(&out), Some((value, out.len())));
+    }
+    let mut accepted = false;
+    for on in [On::Control, On::Request] {
+        if let Ok(Need::Got(header)) = Header::read(input, on) {
+            assert!(header.size <= input.len());
+            let mut out = Vec::new();
+            Header::write(&mut out, header.kind, header.len);
+            assert_eq!(
+                Header::read(&out, on),
+                Ok(Need::Got(Header {
+                    size: out.len(),
+                    ..header
+                }))
+            );
+            accepted = true;
+        }
+    }
+    if let Ok(settings) = Settings::parse(input) {
+        let mut out = Vec::new();
+        Settings::write_frame(&mut out, settings.max_field_section_size);
+        let Ok(Need::Got(header)) = Header::read(&out, On::Control) else {
+            panic!("our SETTINGS frame has a header");
+        };
+        let ours = Settings::parse(&out[header.size..]).expect("our SETTINGS parse");
+        assert_eq!(ours.max_field_section_size, settings.max_field_section_size);
+    }
+    if let Ok(id) = parse_single_id(input) {
+        assert_eq!(read_varint(input), Some((id, input.len())));
+    }
+    accepted
+}
+
+/// What a client sends on one HTTP/3 connection, built from fuzz data
+/// (see [`h3_input`]).
+#[cfg(feature = "unstable-http3")]
+pub struct H3Input {
+    /// The control stream, from its stream type on; `None`: not opened.
+    pub control: Option<Vec<u8>>,
+    /// The other unidirectional streams, each from its stream type on.
+    pub uni: Vec<Vec<u8>>,
+    /// The request streams.
+    pub requests: Vec<H3Request>,
+}
+
+/// One request stream of an [`H3Input`].
+#[cfg(feature = "unstable-http3")]
+pub struct H3Request {
+    /// What the client writes on it.
+    pub bytes: Vec<u8>,
+    /// The stream is finished after `bytes`; otherwise it is reset.
+    pub finish: bool,
+}
+
+/// What a client sends on an HTTP/3 connection, built from fuzz data: a
+/// control stream that mostly starts as it must, request streams of well
+/// delimited frames with field sections a real encoder made (so that
+/// requests get through to the handlers), and now and then frames that do
+/// not belong, lengths that lie and raw bytes.
+#[cfg(feature = "unstable-http3")]
+pub fn h3_input(data: &[u8]) -> H3Input {
+    use crate::h3::frame::{kind, setting, write_varint, Header, Settings, StreamType};
+    use crate::h3::qpack::Encoder as Qpack;
+
+    /// Appends a frame whose payload is these integers.
+    fn integers(out: &mut Vec<u8>, kind: u64, values: &[u64]) {
+        let mut payload = Vec::new();
+        for &value in values {
+            write_varint(&mut payload, value);
+        }
+        Header::write(out, kind, payload.len() as u64);
+        out.extend_from_slice(&payload);
+    }
+
+    let mut d = Bytes(data);
+    let mut input = H3Input {
+        control: None,
+        uni: Vec::new(),
+        requests: Vec::new(),
+    };
+    let how = d.byte() % 32;
+    if how != 0 {
+        let mut control = Vec::new();
+        write_varint(&mut control, StreamType::CONTROL);
+        match how {
+            // No SETTINGS: whatever comes first is in its place.
+            1 => {}
+            // A setting HTTP/2 owns.
+            2 => integers(&mut control, kind::SETTINGS, &[0x02, 0]),
+            // Settings known and unknown.
+            3 => integers(
+                &mut control,
+                kind::SETTINGS,
+                &[
+                    setting::MAX_FIELD_SECTION_SIZE,
+                    100,
+                    0x21,
+                    7,
+                    setting::QPACK_MAX_TABLE_CAPACITY,
+                    0,
+                ],
+            ),
+            _ => Settings::write_frame(&mut control, 1 << 20),
+        }
+        input.control = Some(control);
+    }
+    while !d.0.is_empty() {
+        match d.byte() % 16 {
+            // A request.
+            0..=10 if input.requests.len() < 8 => {
+                // One request in four is one a server must not accept.
+                let hostile = d.byte() % 4 == 3;
+                let method = if hostile {
+                    d.pick(&["CONNECT", "get", "GET"])
+                } else {
+                    d.pick(&["GET", "POST", "HEAD", "PUT", "OPTIONS"])
+                };
+                let path = if hostile {
+                    d.pick(&["*", "", "x", "/"])
+                } else {
+                    d.pick(&["/", "/s", "/r", "/n", "/sr", "/big?q", "/rx", "/a/b?c=d"])
+                };
+                let mut fields = vec![(":method", method)];
+                if !hostile || d.byte() % 4 != 3 {
+                    fields.push((":scheme", "https"));
+                }
+                if !hostile || d.byte() % 4 != 3 {
+                    fields.push((":path", path));
+                }
+                fields.push((":authority", "example.com"));
+                for _ in 0..d.byte() % 4 {
+                    fields.push(if hostile {
+                        d.pick(&[
+                            ("content-length", "3"),
+                            ("te", "gzip"),
+                            ("connection", "close"),
+                            ("transfer-encoding", "chunked"),
+                            ("Upper", "x"),
+                            (":path", "/again"),
+                            ("host", "other"),
+                            ("x-ctl", "a\x01b"),
+                        ])
+                    } else {
+                        d.pick(&[
+                            ("accept", "*/*"),
+                            ("user-agent", "fuzz"),
+                            ("cookie", "a=1"),
+                            ("cookie", "b=2"),
+                            ("content-length", "0"),
+                            ("expect", "100-continue"),
+                            ("te", "trailers"),
+                            ("host", "example.com"),
+                            ("x-long", "0123456789012345678901234567890123456789"),
+                        ])
+                    });
+                }
+                let mut block = Vec::new();
+                let flags = d.byte();
+                if flags >= 0xf8 {
+                    // Not a field section at all.
+                    block.extend_from_slice(d.take(usize::from(flags & 0x1f)));
+                } else {
+                    Qpack::begin(&mut block);
+                    for (name, value) in fields {
+                        let index = d.pick(&[Index::Yes, Index::No, Index::Never]);
+                        Qpack::field(name.as_bytes(), value.as_bytes(), index, &mut block);
+                    }
+                }
+                let mut bytes = Vec::new();
+                Header::write(&mut bytes, kind::HEADERS, block.len() as u64);
+                bytes.extend_from_slice(&block);
+                for _ in 0..d.byte() % 4 {
+                    match d.byte() % 16 {
+                        0..=8 => {
+                            let n = d.byte() as usize % 70;
+                            let body = d.take(n);
+                            Header::write(&mut bytes, kind::DATA, body.len() as u64);
+                            bytes.extend_from_slice(body);
+                        }
+                        // Trailers, now and then with what they may not hold.
+                        9 | 10 => {
+                            let field =
+                                d.pick(&[("x-trailer", "1"), ("x-sum", "2"), (":status", "200")]);
+                            block.clear();
+                            Qpack::begin(&mut block);
+                            Qpack::field(
+                                field.0.as_bytes(),
+                                field.1.as_bytes(),
+                                Index::Yes,
+                                &mut block,
+                            );
+                            Header::write(&mut bytes, kind::HEADERS, block.len() as u64);
+                            bytes.extend_from_slice(&block);
+                        }
+                        // A frame of a type nobody knows: skipped.
+                        11 | 12 => {
+                            let n = d.byte() as usize % 8;
+                            let payload = d.take(n);
+                            Header::write(&mut bytes, 0x21, payload.len() as u64);
+                            bytes.extend_from_slice(payload);
+                        }
+                        // A frame that does not belong on a request stream.
+                        13 => {
+                            let kind = d.pick(&[
+                                kind::SETTINGS,
+                                kind::GOAWAY,
+                                kind::CANCEL_PUSH,
+                                kind::MAX_PUSH_ID,
+                                kind::PUSH_PROMISE,
+                                0x02,
+                                0x06,
+                                0x09,
+                            ]);
+                            integers(&mut bytes, kind, &[0]);
+                        }
+                        // A length that says more than follows.
+                        14 => {
+                            let kind = d.pick(&[kind::DATA, kind::HEADERS, 0x21]);
+                            Header::write(&mut bytes, kind, 1000);
+                            bytes.extend_from_slice(d.take(4));
+                        }
+                        _ => {
+                            let n = d.byte() as usize % 16;
+                            bytes.extend_from_slice(d.take(n));
+                        }
+                    }
+                }
+                input.requests.push(H3Request {
+                    bytes,
+                    finish: d.byte() % 8 != 7,
+                });
+            }
+            // A frame on the control stream.
+            0..=12 => {
+                let (kind, value) = d.pick(&[
+                    (0x21, 1),
+                    (0x21, 2),
+                    (kind::MAX_PUSH_ID, 3),
+                    (kind::MAX_PUSH_ID, 7),
+                    (kind::GOAWAY, 9),
+                    (kind::GOAWAY, 0),
+                    (kind::GOAWAY, 3),
+                    (kind::MAX_PUSH_ID, 3),
+                    (kind::MAX_PUSH_ID, 1),
+                    (kind::CANCEL_PUSH, 0),
+                    (kind::CANCEL_PUSH, 9),
+                    (kind::SETTINGS, 0x21),
+                    (kind::DATA, 0),
+                    (kind::HEADERS, 0),
+                    (0x21, 5),
+                    (0x02, 0),
+                ]);
+                if let Some(control) = &mut input.control {
+                    integers(control, kind, &[value, 0][..1 + usize::from(kind == 4)]);
+                }
+            }
+            // Another unidirectional stream.
+            13 | 14 if input.uni.len() < 6 => {
+                let mut bytes = Vec::new();
+                write_varint(
+                    &mut bytes,
+                    d.pick(&[
+                        StreamType::CONTROL,
+                        StreamType::PUSH,
+                        StreamType::QPACK_ENCODER,
+                        StreamType::QPACK_DECODER,
+                        0x21,
+                        0x21,
+                        0x42,
+                    ]),
+                );
+                let n = d.byte() as usize % 8;
+                bytes.extend_from_slice(d.take(n));
+                input.uni.push(bytes);
+            }
+            // A request stream of anything.
+            _ if input.requests.len() < 8 => {
+                let n = d.byte() as usize % 32;
+                input.requests.push(H3Request {
+                    bytes: d.take(n).to_vec(),
+                    finish: d.byte() % 8 != 7,
+                });
+            }
+            _ => {}
+        }
+    }
+    input
+}
+
+/// Checks what the server wrote on a request stream that it ended without
+/// an error: interim responses, one final response, then its body, and
+/// nothing else; field sections that decode and start with a status; a
+/// body of the length the response announced.
+#[cfg(feature = "unstable-http3")]
+pub fn check_h3_response(mut output: &[u8]) {
+    use crate::h3::frame::{kind, read_varint};
+
+    let mut status = None;
+    let mut announced: Option<u64> = None;
+    let mut body = 0u64;
+    while !output.is_empty() {
+        let (kind, a) = read_varint(output).expect("a frame type");
+        let (len, b) = read_varint(&output[a..]).expect("a frame length");
+        let payload = output
+            .get(a + b..a + b + len as usize)
+            .expect("a whole frame");
+        output = &output[a + b + len as usize..];
+        match kind {
+            kind::HEADERS => {
+                assert!(status.is_none(), "a field section after the response");
+                let mut fields = 0;
+                let mut this = None;
+                crate::h3::qpack::decode(payload, |name, value| {
+                    if name == b":status" {
+                        assert_eq!(fields, 0, ":status is not first");
+                        let text = std::str::from_utf8(value).expect("a status");
+                        this = Some(text.parse::<u16>().expect("a status"));
+                    } else {
+                        assert!(!name.starts_with(b":"), "a pseudo-header field");
+                        assert!(!name.iter().any(u8::is_ascii_uppercase));
+                        if name == b"content-length" {
+                            let text = std::str::from_utf8(value).expect("a length");
+                            announced = Some(text.parse().expect("a length"));
+                        }
+                    }
+                    fields += 1;
+                })
+                .expect("a field section that decodes");
+                let this = this.expect("a status");
+                assert!((100..600).contains(&this), "status {this}");
+                if this >= 200 {
+                    status = Some(this);
+                } else {
+                    assert!(announced.is_none(), "an interim response with a length");
+                }
+            }
+            kind::DATA => {
+                assert!(status.is_some(), "DATA before the response");
+                body += len;
+            }
+            kind => panic!("the server sent a frame of type {kind:#x}"),
+        }
+    }
+    let status = status.expect("a stream that ends cleanly holds a response");
+    if matches!(status, 204 | 304) {
+        assert_eq!(body, 0, "a body after {status}");
+    }
+    // A response to HEAD announces a length and has no body.
+    if let Some(announced) = announced {
+        assert!(body == 0 || body == announced, "{body} of {announced}");
+    }
+}
+
+/// The server side of an HTTP/3 connection driven by fuzz data: shared by
+/// the randomised test and the `h3_server` fuzz target.
+#[cfg(feature = "unstable-http3")]
+pub mod h3_connection {
+    use std::time::Duration;
+
+    use crate::{Handler, Request, Response, Server};
+
+    /// Like [`h2_connection::Fuzzed`](super::h2_connection::Fuzzed), over
+    /// HTTP/3.
+    pub struct Fuzzed;
+
+    impl Handler for Fuzzed {
+        fn stream_body(&self, req: &Request) -> Option<u64> {
+            req.path().contains('s').then_some(64)
+        }
+
+        async fn call(&self, req: Request) -> Response {
+            assert!(req.version() == crate::Version::Http3);
+            assert!(req.header("host").is_some());
+            super::h2_connection::answer(req).await
+        }
+    }
+
+    /// The server for fuzzing: small limits and short timeouts, so that a
+    /// stalled stream costs milliseconds.
+    pub fn server() -> Server {
+        Server::new()
+            .max_head_size(1024)
+            .max_body_size(64)
+            .request_timeout(Duration::from_millis(20))
+            .write_timeout(Duration::from_millis(20))
+            .idle_timeout(Duration::from_millis(20))
     }
 }

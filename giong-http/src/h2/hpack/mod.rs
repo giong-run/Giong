@@ -5,7 +5,7 @@
 //! anything RFC 7541 does not allow is a [`Error`], which HTTP/2 turns into
 //! a connection error of type `COMPRESSION_ERROR`.
 
-mod huffman;
+pub(crate) mod huffman;
 mod huffman_codes;
 
 use std::cell::RefCell;
