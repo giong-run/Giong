@@ -13,6 +13,8 @@ mod server;
 mod wake;
 
 pub(crate) use frame::PREFACE;
+#[cfg(feature = "unstable-http3")]
+pub(crate) use server::budget;
 pub(crate) use server::serve;
 #[cfg(test)]
 mod tests;
