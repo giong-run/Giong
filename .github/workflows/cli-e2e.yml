@@ -61,7 +61,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
       - name: Unit and end-to-end tests
-        run: cargo test -p giong-cli --all-targets
+        run: cargo test -p giong-cli --all-targets --no-fail-fast
       - name: Known bugs (allowed to fail)
         id: known
         continue-on-error: true
