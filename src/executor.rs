@@ -576,8 +576,17 @@ fn panicked_in_drop<T>(
     dropped: std::thread::Result<()>,
 ) -> Result<T, JoinError> {
     match (result, dropped) {
-        (Ok(_), Err(payload)) => Err(JoinError::Panic(payload)),
-        (result, _) => result,
+        (Ok(value), Err(payload)) => {
+            drop_quietly(value);
+            Err(JoinError::Panic(payload))
+        }
+        // The first panic is the one reported; a payload's own destructor
+        // may panic too.
+        (result, Err(payload)) => {
+            drop_quietly(payload);
+            result
+        }
+        (result, Ok(())) => result,
     }
 }
 

@@ -129,17 +129,25 @@ pub(crate) fn errno_location() -> *mut i32 {
 pub(crate) fn allowed_cpus() -> Vec<usize> {
     // `cpu_set_t` holds 1024 CPUs. A kernel built for more possible CPUs
     // refuses a smaller mask with EINVAL, so the mask grows until it fits.
-    let mut words = mem::size_of::<libc::cpu_set_t>() / 8;
+    // The kernel's mask is an array of `unsigned long`.
+    const BYTES: usize = mem::size_of::<libc::c_ulong>();
+    const BITS: usize = BYTES * 8;
+    let mut words = mem::size_of::<libc::cpu_set_t>() / BYTES;
     loop {
-        let mut mask = vec![0u64; words];
-        // SAFETY: `mask` is `words * 8` bytes, aligned like `cpu_set_t`
-        // (an array of u64), and the kernel writes at most that much.
+        let mut mask: Vec<libc::c_ulong> = vec![0; words];
+        // SAFETY: `mask` is `words * BYTES` bytes, aligned like `cpu_set_t`
+        // (an array of `unsigned long`), and the kernel writes at most that
+        // much.
         let res = unsafe {
-            libc::sched_getaffinity(0, words * 8, mask.as_mut_ptr().cast::<libc::cpu_set_t>())
+            libc::sched_getaffinity(
+                0,
+                words * BYTES,
+                mask.as_mut_ptr().cast::<libc::cpu_set_t>(),
+            )
         };
         if res == 0 {
-            return (0..words * 64)
-                .filter(|&cpu| mask[cpu / 64] >> (cpu % 64) & 1 == 1)
+            return (0..words * BITS)
+                .filter(|&cpu| mask[cpu / BITS] >> (cpu % BITS) & 1 == 1)
                 .collect();
         }
         if io::Error::last_os_error().raw_os_error() != Some(libc::EINVAL) || words >= 1 << 16 {
@@ -158,13 +166,16 @@ pub(crate) const CAN_PIN: bool = true;
 /// Pins the calling thread to `cpu`. Failure is not fatal: the worker just
 /// stays unpinned.
 pub(crate) fn pin_to_cpu(cpu: usize) {
-    // At least a `cpu_set_t`, and more for a CPU beyond its 1024.
-    let words = (cpu / 64 + 1).max(mem::size_of::<libc::cpu_set_t>() / 8);
-    let mut mask = vec![0u64; words];
-    mask[cpu / 64] |= 1 << (cpu % 64);
-    // SAFETY: `mask` is `words * 8` bytes, aligned like `cpu_set_t`.
+    // At least a `cpu_set_t`, and more for a CPU beyond its 1024. The
+    // kernel's mask is an array of `unsigned long`.
+    const BYTES: usize = mem::size_of::<libc::c_ulong>();
+    const BITS: usize = BYTES * 8;
+    let words = (cpu / BITS + 1).max(mem::size_of::<libc::cpu_set_t>() / BYTES);
+    let mut mask: Vec<libc::c_ulong> = vec![0; words];
+    mask[cpu / BITS] |= 1 << (cpu % BITS);
+    // SAFETY: `mask` is `words * BYTES` bytes, aligned like `cpu_set_t`.
     unsafe {
-        libc::sched_setaffinity(0, words * 8, mask.as_ptr().cast::<libc::cpu_set_t>());
+        libc::sched_setaffinity(0, words * BYTES, mask.as_ptr().cast::<libc::cpu_set_t>());
     }
 }
 
