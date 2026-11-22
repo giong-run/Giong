@@ -13,6 +13,7 @@ pub mod bench;
 pub mod clean;
 pub mod dashboard;
 pub mod db;
+pub mod dev;
 pub mod doctor;
 pub mod env;
 pub mod explain;
@@ -42,6 +43,7 @@ pub struct Command {
 pub const COMMANDS: &[&Command] = &[
     // Thread B adds `new`, `ai`, `fix` here; thread C `db`, `top`, `bench`,
     // `image`, `openapi`, `record`.
+    &dev::COMMAND,
     &doctor::COMMAND,
     &bench::COMMAND,
     &db::COMMAND,

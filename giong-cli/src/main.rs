@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod args;
+mod build;
 mod cmd;
 mod code;
 mod dashboard;
@@ -23,6 +24,7 @@ mod record;
 mod report;
 mod service;
 mod sha256;
+mod watch;
 mod web_client;
 
 use std::process::ExitCode;
@@ -30,7 +32,21 @@ use std::process::ExitCode;
 use crate::report::fail;
 
 fn main() -> ExitCode {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv = Vec::new();
+    for (i, a) in std::env::args_os().skip(1).enumerate() {
+        match a.into_string() {
+            Ok(a) => argv.push(a),
+            Err(a) => {
+                let failure = report::Failure::new(
+                    code::Code::USAGE,
+                    format!("argument {} ({a:?}) is not valid UTF-8", i + 1),
+                    "giong takes names and paths in UTF-8; rename the file or directory",
+                );
+                let json = std::env::args_os().any(|a| a == "--json");
+                return fail("giong", &failure, json);
+            }
+        }
+    }
     run(&argv)
 }
 
@@ -43,6 +59,18 @@ fn run(argv: &[String]) -> ExitCode {
         Some(name) => name.to_string(),
         None => {
             // `giong`, `giong --help`, `giong --version`.
+            if let Some(bad) = argv
+                .iter()
+                .take_while(|a| *a != "--")
+                .find(|a| !matches!(a.as_str(), "--help" | "--version" | "--json"))
+            {
+                let failure = report::Failure::new(
+                    code::Code::USAGE,
+                    format!("giong has no option {bad:?}"),
+                    "giong --help lists the commands; options go after the command",
+                );
+                return fail("giong", &failure, json);
+            }
             if argv.iter().any(|a| a == "--version") {
                 return cmd::version::print(json);
             }

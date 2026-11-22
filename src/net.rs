@@ -19,6 +19,8 @@
 mod addr;
 mod balance;
 pub(crate) mod dns;
+#[cfg(unix)]
+mod inherit;
 mod sendq;
 mod share;
 pub(crate) mod udp;
@@ -306,6 +308,10 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
 pub(crate) struct ListenSocket {
     sock: ManuallyDrop<Socket>,
     accept: MultiSlot,
+    /// A socket handed down by `giong dev`: it stops accepting when told to
+    /// (see `inherit`).
+    #[cfg(unix)]
+    inherited: bool,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -320,8 +326,18 @@ impl ListenSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
+            #[cfg(unix)]
+            inherited: false,
             _not_send: PhantomData,
         }
+    }
+
+    /// A socket `giong dev` handed down (see `inherit`).
+    #[cfg(unix)]
+    pub(crate) fn inherited(sock: Socket) -> Self {
+        let mut listener = Self::new(sock);
+        listener.inherited = true;
+        listener
     }
 
     pub(crate) fn socket(&self) -> &Socket {
@@ -337,6 +353,10 @@ impl ListenSocket {
         runtime::with_worker(|w| {
             let key = self.accept.key(w);
             let mut driver = w.driver.borrow_mut();
+            #[cfg(unix)]
+            if self.inherited {
+                return inherit::poll_accept(&self.sock, key, &mut driver, cx);
+            }
             loop {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res) if res >= 0 => {
@@ -1226,6 +1246,13 @@ impl TcpListener {
     /// `SO_REUSEADDR` (the BSD rule); listen on the specific address to
     /// refuse that too.
     ///
+    /// Under `giong dev` (the giong command's development loop), an address
+    /// `giong dev` listens on for the service is not bound again: every
+    /// listener for it is a duplicate of `giong dev`'s socket
+    /// (`GIONG_DEV_LISTEN`), which stays open while the service is rebuilt
+    /// and restarted, so no connection is refused in between. Elsewhere the
+    /// variable is unset and nothing changes.
+    ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
     /// `"localhost:8080"` is refused with `GIONG-E0100`, which says what to
@@ -1252,6 +1279,18 @@ impl TcpListener {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
+        // Under `giong dev`, the address may be one of the listening sockets
+        // it keeps open across restarts: share that socket (see `inherit`).
+        #[cfg(unix)]
+        if let Some(sock) = inherit::take(addr)? {
+            return Ok(Self {
+                inner: ListenSocket::inherited(sock),
+                balance: None,
+                // Not counted as this process's hold on the port: dropping a
+                // duplicate must not stop the shared socket listening.
+                held: None,
+            });
+        }
         // Linux 6.0.16 to 6.0.19 report success for a bind to an address in
         // use and leave the socket unbound: `share::bind` checks the port.
         let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
