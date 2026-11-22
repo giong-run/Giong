@@ -545,7 +545,8 @@ fn sigterm_still_works_after_worker_0_returned() {
 fn a_second_signal_ends_a_process_whose_shutdown_hangs() {
     // The handlers took every SIGINT and SIGTERM: once a shutdown had been
     // asked for, a main future that never returned kept the process running,
-    // and Ctrl-C could no longer stop it.
+    // and Ctrl-C could no longer stop it. A second request now ends it; two
+    // signals within 250 ms are one request.
     if std::env::var_os("GIONG_SIGNAL_CHILD_HANG").is_some() {
         giong::Builder::new()
             .workers(2)
@@ -585,20 +586,27 @@ fn a_second_signal_ends_a_process_whose_shutdown_hangs() {
         lines.by_ref().any(|l| l.unwrap().contains("ready")),
         "child never became ready"
     );
+    // One request that arrives twice, as when a wrapper forwards the Ctrl-C
+    // its process group also got: two signals at once only ask.
+    let first = Instant::now();
     // SAFETY: kill with the child's pid.
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
     assert!(
         lines
             .by_ref()
             .any(|l| l.unwrap().contains("shutdown asked")),
-        "the first SIGTERM did not ask for a shutdown"
+        "the first signal did not ask for a shutdown"
     );
-    // The first signal only asks: the process is still running.
     std::thread::sleep(Duration::from_millis(100));
     assert!(
         child.try_wait().unwrap().is_none(),
-        "the first SIGTERM ended the process"
+        "two signals at once ended the process"
     );
+    // A signal 250 ms or more after the first is a second request.
+    std::thread::sleep(Duration::from_millis(400).saturating_sub(first.elapsed()));
     // SAFETY: as above.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let start = Instant::now();

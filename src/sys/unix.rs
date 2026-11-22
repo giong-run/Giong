@@ -5,7 +5,7 @@
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use crate::error::Code;
 
@@ -166,13 +166,54 @@ static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
 /// Set while a runtime has the handlers installed.
 static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
-/// Signals seen since the handlers were installed.
-static SIGNALS_SEEN: AtomicUsize = AtomicUsize::new(0);
+/// When the first signal since the handlers were installed arrived, in
+/// nanoseconds of `CLOCK_MONOTONIC`; 0 before it.
+static FIRST_SIGNAL: AtomicU64 = AtomicU64::new(0);
+/// SIGINT, and SIGTERM, were ignored before the handlers were installed
+/// (as in a background job of a non-interactive shell).
+static INT_IGNORED: AtomicBool = AtomicBool::new(false);
+static TERM_IGNORED: AtomicBool = AtomicBool::new(false);
 
-/// Async-signal-safe: only `write(2)`, with `errno` preserved, and for a
-/// second signal `getpid(2)`, `sigaction(2)` and `raise(3)` or `_exit(2)`.
+/// A signal this soon after the first is part of the same request: one
+/// Ctrl-C reaches every process of the terminal's foreground group, and
+/// wrappers (cargo-watch, watchexec, process managers) forward it to their
+/// child too, so one key press can deliver two signals. Someone pressing
+/// Ctrl-C again because a shutdown hangs is always slower than this.
+const SAME_REQUEST_NS: u64 = 250_000_000;
+
+/// `CLOCK_MONOTONIC` in nanoseconds; never 0. Async-signal-safe.
+fn monotonic_ns() -> u64 {
+    // SAFETY: all-zero is a valid timespec, which the call fills in.
+    let mut ts: libc::timespec = unsafe { mem::zeroed() };
+    // SAFETY: a valid clock and pointer; `clock_gettime` is
+    // async-signal-safe.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
+        .max(1)
+}
+
+/// Async-signal-safe: only `clock_gettime(2)` and `write(2)`, with `errno`
+/// preserved, and for a second signal `getpid(2)`, `sigaction(2)` and
+/// `raise(3)` or `_exit(2)`.
 extern "C" fn on_signal(signal: libc::c_int) {
-    if SIGNALS_SEEN.fetch_add(1, Ordering::Relaxed) > 0 {
+    let now = monotonic_ns();
+    if let Err(first) = FIRST_SIGNAL.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+    {
+        if now.saturating_sub(first) < SAME_REQUEST_NS {
+            // The same request as the first: its shutdown is under way.
+            return;
+        }
+        let ignored = if signal == libc::SIGINT {
+            &INT_IGNORED
+        } else {
+            &TERM_IGNORED
+        };
+        if ignored.load(Ordering::Relaxed) {
+            // With no handler the signal would have done nothing.
+            return;
+        }
         // The shutdown the first signal asked for has not finished: do what
         // the signal does with no handler, and end the process. The signal
         // stays blocked while this handler runs, so it is delivered, with
@@ -246,7 +287,15 @@ impl SignalGuard {
             }
             // Forget signals that arrived while nobody was listening.
             super::drain(fd);
-            SIGNALS_SEEN.store(0, Ordering::SeqCst);
+            FIRST_SIGNAL.store(0, Ordering::SeqCst);
+            // What each signal did before, read before the handlers go in.
+            for (signal, ignored) in [(libc::SIGINT, &INT_IGNORED), (libc::SIGTERM, &TERM_IGNORED)]
+            {
+                let mut current: libc::sigaction = mem::zeroed();
+                let was_ignored = libc::sigaction(signal, std::ptr::null(), &mut current) == 0
+                    && current.sa_sigaction == libc::SIG_IGN;
+                ignored.store(was_ignored, Ordering::SeqCst);
+            }
 
             let mut action: libc::sigaction = mem::zeroed();
             action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;

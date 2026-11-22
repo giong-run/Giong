@@ -1135,7 +1135,9 @@ impl Builder {
     ///
     /// A second SIGINT or SIGTERM ends the process at once, as it would
     /// with no handler: a shutdown that hangs, or a main future that never
-    /// returns, can still be stopped with a second Ctrl-C.
+    /// returns, can still be stopped with a second Ctrl-C. A signal within
+    /// 250 ms of the first counts as the same request, since one Ctrl-C can
+    /// arrive twice (wrappers such as cargo-watch forward it to their child).
     pub fn shutdown_on_signals(mut self, enable: bool) -> Self {
         self.signals = enable;
         self
