@@ -1372,12 +1372,14 @@ impl<T: Transport> Conn<T> {
             // its own: a local that has been borrowed is kept in the
             // connection's future across every later `.await`, so `req` must
             // only be moved from here on.
-            let (minor, head_only, wants_keep_alive, req) = {
+            let (minor, head_only, connect, wants_keep_alive, req) = {
                 let req = req;
                 let minor = req.head.minor;
-                let head_only = req.method() == "HEAD";
+                let method = req.method();
+                let head_only = method == "HEAD";
+                let connect = method == "CONNECT";
                 let wants_keep_alive = !req.head.close && (minor == 1 || req.head.keep_alive);
-                (minor, head_only, wants_keep_alive, req)
+                (minor, head_only, connect, wants_keep_alive, req)
             };
 
             let (resp, body_read) = match streamed {
@@ -1438,8 +1440,17 @@ impl<T: Transport> Conn<T> {
             let streams = resp.is_streaming() && resp.sends_body(head_only);
             // Without chunked encoding (HTTP/1.0), a streamed body ends when
             // the connection does.
-            let keep_alive =
-                wants_keep_alive && !self.closing && body_read && !(streams && minor == 0);
+            // After a 2xx to CONNECT, the client and the proxies on the way
+            // take what follows on the connection for a tunnel (RFC 9110,
+            // section 9.3.6), which the server has none of: what a proxy in
+            // front passes on blindly must not be read as requests it never
+            // saw.
+            let tunnel = connect && (200..300).contains(&resp.status());
+            let keep_alive = wants_keep_alive
+                && !self.closing
+                && body_read
+                && !(streams && minor == 0)
+                && !tunnel;
             self.reserve_out();
             let stream = {
                 let mut resp = resp;
