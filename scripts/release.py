@@ -355,8 +355,26 @@ def check_site():
     return []
 
 
+def check_toolchain_pins():
+    """Every workflow pins the same stable compiler (RUST_STABLE), and none asks for
+    `stable` itself: one compiler for CI and scripts/preflight.sh."""
+    problems, pins = [], {}
+    for wf in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        rel = wf.relative_to(ROOT).as_posix()
+        text = read(rel)
+        for m in re.finditer(r'^\s*RUST_STABLE:\s*"([^"]+)"', text, re.M):
+            pins.setdefault(m[1], []).append(rel)
+        if re.search(r"^\s*toolchain:\s*stable\s*$", text, re.M):
+            problems.append(f"{rel}: asks for `toolchain: stable`; use ${{{{ env.RUST_STABLE }}}}")
+    if len(pins) > 1:
+        problems.append("the workflows pin different stable compilers: " +
+                        "; ".join(f"{v} in {', '.join(files)}" for v, files in sorted(pins.items())))
+    return problems
+
+
 def cmd_check(_args):
-    problems = check_versions() + check_readmes() + check_changelog() + check_fragments() + check_site()
+    problems = (check_versions() + check_readmes() + check_changelog() + check_fragments() + check_site()
+                + check_toolchain_pins())
     for p in problems:
         print(("::error::" if _in_actions() else "") + p)
     if problems:

@@ -47,8 +47,8 @@ The job `plan` (`scripts/ci-scope.py`) chooses what a run does; `scripts/preflig
 |---|---|---|
 | Pull request that changes no file a build or test reads: `site/`, `changelog.d/`, `bench/results/`, `assets/`, `skills/`, prose | `lint` (fmt, clippy, docs, `release.py check`, which builds the site) and `msrv` | 2 min |
 | Draft pull request | the above, default features, the release build, one round of the tests on io_uring; the Fuzz, gRPC, Proto and macOS workflows skip drafts | 16 min, 1,000 runner-seconds (a twelfth of a full run) |
-| Pull request ready for review | every job once: each suite one round on every tier, two ThreadSanitizer runs, the kernels and server versions four at a time, Miri, Kani, instr, macOS | 17 min of jobs, 8,400 runner-seconds (two thirds of a full run) |
-| Merge queue, a push to `main` that no queue run tested, a dispatch | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, every matrix entry at once | 24 min, 12,200 runner-seconds |
+| Pull request ready for review | every job once: each suite one round on every tier, two ThreadSanitizer runs, the kernels and server versions four at a time, Miri, Kani, instr, macOS, Windows (when code it builds changed) | 17 min of jobs, 8,400 runner-seconds (two thirds of a full run) |
+| Merge queue, a push to `main` that no queue run tested, a dispatch | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, every matrix entry at once; macOS and Windows (`macos-checks`, `windows-checks`) | 24 min, 12,200 runner-seconds |
 
 The times are those of the pull request that introduced the tiers (#218) and of the queue
 runs before it. **Runners are the scarce resource**: the organisation gets 60 Linux jobs at

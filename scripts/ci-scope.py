@@ -17,6 +17,10 @@ Prints `key=value` lines for $GITHUB_OUTPUT:
     rounds  how often scripts/check.sh repeats each suite
     tsan    the ThreadSanitizer matrix, as JSON
 
+`--relevant PREFIX...` narrows a workflow to the files it tests: a pull request that
+changes none of them gets scope `docs` (that workflow's tests skip). The Windows workflow
+uses it for the code that builds on Windows.
+
 Anything it cannot place counts as code, and anything but a pull request is `full`: when
 in doubt, more runs, never fewer. The merge queue always runs everything, so main is
 tested exactly as before whatever this script decides for a pull request.
@@ -77,9 +81,11 @@ def is_docs(path, included):
     return True
 
 
-def plan(files, event, draft):
+def plan(files, event, draft, relevant=None):
     included = included_markdown()
     code = [f for f in files if not is_docs(f, included)]
+    if relevant is not None:
+        code = [f for f in code if f.startswith(tuple(relevant))]
     if event != "pull_request":
         scope = "full"
     elif files and not code:
@@ -96,9 +102,11 @@ def main():
     ap.add_argument("--event", default="pull_request")
     ap.add_argument("--draft", action="store_true")
     ap.add_argument("--explain", action="store_true", help="also say why, on stderr")
+    ap.add_argument("--relevant", nargs="+", metavar="PREFIX",
+                    help="only files under these paths count as code for this workflow")
     args = ap.parse_args()
     files = [line.strip() for line in sys.stdin if line.strip()]
-    scope, code = plan(files, args.event, args.draft)
+    scope, code = plan(files, args.event, args.draft, args.relevant)
     heavy = scope in ("pr", "full")
     print(f"scope={scope}")
     print(f"heavy={'true' if heavy else 'false'}")
