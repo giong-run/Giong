@@ -45,7 +45,7 @@ io_uring,postgres-query,instructions,10248.5,1
 io_uring,postgres-query,allocations,16.000,1
 io_uring,mysql-query,instructions,14128.6,1
 io_uring,mysql-query,allocations,27.000,1
-io_uring,idle-http1,heap_bytes,2029.8,1
+io_uring,idle-http1,heap_bytes,2007.0,1
 io_uring,idle-http1,rss_bytes,2222.1,10
 io_uring,idle-http1,allocations,3.030,1
 io_uring,idle-h2,heap_bytes,4493.3,1
