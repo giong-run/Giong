@@ -221,8 +221,8 @@ for the same handlers, on Linux and macOS. It needs Rust 1.85, and may change be
 stabilised; the default build does not have it.
 
 ```toml
-giong-http = { version = "1.4.0", features = ["unstable-http3", "client"] }
-giong-quic = "1.4.0"
+giong-http = { version = "1.3.0", features = ["unstable-http3", "client"] }
+giong-quic = "1.3.0"
 ```
 
 ```rust,ignore
