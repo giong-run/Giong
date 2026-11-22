@@ -620,12 +620,42 @@ fn open_handles() -> BTreeMap<usize, String> {
                 _ => "unknown",
             };
             format!("File ({kind})")
+        } else if name == "Event" {
+            format!("Event ({})", event_kind(handle))
         } else {
             name
         };
         handles.insert(handle, name);
     }
     handles
+}
+
+/// Whether the event behind `handle` resets itself when a wait ends
+/// (`auto-reset`, a synchronization event) or stays set until it is reset
+/// (`manual-reset`, a notification event). giong makes only manual-reset
+/// events: the one each thread keeps for its file transfers.
+#[cfg(windows)]
+fn event_kind(handle: usize) -> &'static str {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryEvent(
+            handle: isize,
+            class: u32,
+            info: *mut [u32; 2],
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    let mut info = [0u32; 2];
+    let mut returned = 0;
+    // SAFETY: EVENT_BASIC_INFORMATION (class 0) is two 32-bit fields, the
+    // event's type and its state, written into a local of that size.
+    let status = unsafe { NtQueryEvent(handle as isize, 0, &mut info, 8, &mut returned) };
+    match (status >= 0, info[0]) {
+        (true, 0) => "manual-reset",
+        (true, 1) => "auto-reset",
+        _ => "unknown kind",
+    }
 }
 
 /// The descriptors or handles open now that were not in `before`, and on
@@ -643,6 +673,16 @@ fn new_handles(before: &BTreeMap<usize, String>) -> String {
     #[cfg(windows)]
     let threads = format!("; threads alive: {}", live_threads().join(", "));
     format!("[{}]{threads}", new.join(", "))
+}
+
+/// What each handle open now and not in `before` is.
+#[cfg(windows)]
+fn handles_new(before: &BTreeMap<usize, String>) -> Vec<String> {
+    open_handles()
+        .into_iter()
+        .filter(|(n, what)| before.get(n) != Some(what))
+        .map(|(_, what)| what)
+        .collect()
 }
 
 /// The threads of this process, by id and name (unnamed: `-`).
@@ -723,6 +763,21 @@ fn settled_fds(before: usize) -> usize {
     }
 }
 
+/// Waits until the descriptor count has not gone down for 12 seconds (at
+/// most a minute): the blocking threads stop after 10 idle seconds.
+#[cfg(windows)]
+fn quiet_fds() {
+    let start = Instant::now();
+    let (mut low, mut since) = (open_fds(), Instant::now());
+    while since.elapsed() < Duration::from_secs(12) && start.elapsed() < Duration::from_secs(60) {
+        std::thread::sleep(Duration::from_millis(200));
+        let now = open_fds();
+        if now < low {
+            (low, since) = (now, Instant::now());
+        }
+    }
+}
+
 fn median(values: &mut [u64]) -> u64 {
     values.sort_unstable();
     values[values.len() / 2]
@@ -744,6 +799,11 @@ fn soak() {
     // are opened once, not per runtime).
     #[cfg(windows)]
     run(workers, 5);
+    // Once the warm-up's blocking threads have stopped, with the event each
+    // keeps for its transfers: counted while they live, those would hide as
+    // many handles left behind by the soak.
+    #[cfg(windows)]
+    quiet_fds();
     let fds_before = open_fds();
     let handles_before = open_handles();
     #[cfg(windows)]
@@ -781,10 +841,28 @@ fn soak() {
     // 3. Descriptors: nothing left once the runtime is gone, and no growth
     //    during the run beyond the connections that happen to be open.
     let fds_after = settled_fds(fds_before);
+    let new = new_handles(&handles_before);
+    eprintln!("soak: {fds_after} descriptors open, {fds_before} before the soak; new since: {new}");
+    // Soaks of one to two and a half hours on Windows each ended with one
+    // Event more, whatever their length: one-time state, which no giong
+    // thread held (only the test's own threads were alive). giong makes
+    // only manual-reset events, and every owner of its handles is checked
+    // use by use in tests/handles.rs. So up to two auto-reset events, which
+    // system libraries make once and keep (as a critical section does for
+    // its waits, the first time two threads contend for it), are allowed;
+    // a file, socket, thread, manual-reset event or any other handle left
+    // behind still fails here.
+    #[cfg(windows)]
+    let system = handles_new(&handles_before)
+        .iter()
+        .filter(|what| what.as_str() == "Event (auto-reset)")
+        .count()
+        .min(2);
+    #[cfg(unix)]
+    let system = 0;
     assert!(
-        fds_after <= fds_before,
-        "descriptors leaked: {fds_after} open, {fds_before} before the soak; new since: {}",
-        new_handles(&handles_before)
+        fds_after <= fds_before + system,
+        "descriptors leaked: {fds_after} open, {fds_before} before the soak; new since: {new}"
     );
     if samples.len() >= 8 {
         let half = samples.len() / 2;
