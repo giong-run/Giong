@@ -44,6 +44,16 @@ use giong_tls::{ktls_stats, ktls_support, Ktls, TlsAcceptor, TlsConnector, TlsSt
 
 /// Client tasks per worker.
 const CLIENTS: usize = 16;
+
+/// Client tasks per worker: [`CLIENTS`], or `GIONG_SOAK_CLIENTS` for a
+/// lighter run.
+fn clients() -> usize {
+    std::env::var("GIONG_SOAK_CLIENTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(CLIENTS)
+}
 const RECV_BUFFERS: usize = 512;
 
 #[derive(Default)]
@@ -470,13 +480,40 @@ impl Pki {
 }
 
 fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
+    // macOS lists a process's own descriptors in /dev/fd.
+    let dir = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    std::fs::read_dir(dir).unwrap().count()
 }
 
+#[cfg(target_os = "linux")]
 fn rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     let line = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap();
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// Resident memory from the kernel's task information (`proc_pidinfo`).
+#[cfg(target_os = "macos")]
+fn rss_kib() -> u64 {
+    // SAFETY: all-zero is a valid `proc_taskinfo`, which the call fills in;
+    // the size passed is its size.
+    unsafe {
+        let mut info: libc::proc_taskinfo = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        let n = libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        );
+        assert_eq!(n, size, "proc_pidinfo: {}", std::io::Error::last_os_error());
+        info.pti_resident_size / 1024
+    }
 }
 
 fn median(values: &mut [u64]) -> u64 {
@@ -617,8 +654,9 @@ fn soak() {
                     });
 
                     let mut tasks = Vec::new();
-                    for i in 0..CLIENTS {
-                        let rng = Rng::new((worker * CLIENTS + i) as u64 + 1);
+                    let clients = clients();
+                    for i in 0..clients {
+                        let rng = Rng::new((worker * clients + i) as u64 + 1);
                         tasks.push(giong::spawn(client(
                             addrs.clone(),
                             connectors.clone(),
@@ -721,7 +759,7 @@ fn soak() {
             .max()
             .unwrap();
         // Each open connection holds two descriptors, client and server.
-        let slack = (2 * workers * CLIENTS + 16) as u64;
+        let slack = (2 * workers * clients() + 16) as u64;
         assert!(
             second <= first + slack,
             "descriptor count grew: at most {first} in the first half, {second} in the second"

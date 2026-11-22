@@ -68,8 +68,8 @@ to type.
   The API was settled in 0.7 ([review](docs/reviews/2026-11-api-freeze.md)), and
   `cargo-semver-checks` runs on every pull request.
 - **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
-  io_uring is blocked. macOS (for development) and Windows come after 1.0
-  ([ROADMAP.md](ROADMAP.md)).
+  io_uring is blocked. macOS runs on a kqueue driver (tested on macOS 15 and 26, Apple
+  Silicon); Windows comes later ([ROADMAP.md](ROADMAP.md)).
 
 ## Let your agent look inside the running service
 
@@ -183,9 +183,11 @@ connection, the same as the others.
   Compose and Kubernetes.
 - Rust 1.80 or newer. How this minimum, the kernel minimums and the API move during 1.x:
   [docs/STABILITY.md](docs/STABILITY.md).
-- giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
-  `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
-  are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
+- macOS works with a kqueue driver. It is tested on macOS 15 and 26 on Apple Silicon (the
+  GitHub runners); Intel Macs and older versions of macOS are not tested.
+- giong does **not** build on Windows. Use WSL2 (`uname -r`; run `wsl --update` for a 6.x
+  kernel), a Linux virtual machine, or Docker. Windows is planned
+  ([ROADMAP.md](ROADMAP.md)).
 
 ## Quick start
 

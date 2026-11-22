@@ -1,0 +1,45 @@
+# Gióng against Tokio and smol on macOS (the kqueue driver): the core
+# micro-benchmarks of bench/core.sh (spawn, polls, channels, timers,
+# cross-thread wake-ups, TCP round trips, connects, lookups), on macOS 15
+# and 26. The summary goes to the job summary and the artifact.
+#
+# Run it from the Actions tab, or by pushing a branch named bench/macos-*.
+
+name: macOS bench
+
+on:
+  push:
+    branches: ["bench/macos-*"]
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Rounds of every runtime and workload
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: sw_vers && sysctl -n hw.ncpu machdep.cpu.brand_string
+      - name: Core benchmarks
+        run: |
+          ulimit -n 65536 || ulimit -n 10240
+          bench/core.sh ${{ inputs.rounds || '5' }} "$PWD/results"
+          { echo '```'; cat results/summary.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: bench-core-${{ matrix.os }}
+          path: results/

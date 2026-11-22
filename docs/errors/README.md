@@ -43,6 +43,12 @@ when it is no longer raised.
 | [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
 | [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
 
+## macOS
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E0028](E0028.md) | `NetworkBuffersExhausted` | the system ran out of network buffers |
+
 ## Network and name resolution
 
 | Code | `Code::` | Meaning |

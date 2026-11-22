@@ -96,7 +96,7 @@ impl UnixStream {
     /// connection is left behind.
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let addr = SockAddr::unix(path)?;
-        let inner = StreamSocket::connect(new_socket()?, addr).await?.unix();
+        let inner = StreamSocket::connect_new(new_socket, addr).await?.unix();
         Ok(Self { inner })
     }
 
@@ -113,6 +113,11 @@ impl UnixStream {
     pub fn from_std(stream: std::os::unix::net::UnixStream) -> Self {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             inner: StreamSocket::new(sock).unix(),
         }
