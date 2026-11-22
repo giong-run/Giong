@@ -25,6 +25,25 @@ const OUTER_BUILD: &[&str] = &[
     "TSAN_OPTIONS",
 ];
 
+/// Whether these programs run here; the tests that build a project skip
+/// without them (CI runs the test binaries in a bare container too).
+fn tools(names: &[&str]) -> bool {
+    let missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| {
+            !Command::new(n)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("skipped: {} not found", missing.join(", "));
+    }
+    missing.is_empty()
+}
+
 fn giong(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Value) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_giong"));
     cmd.args(args).arg("--json").current_dir(cwd);
@@ -117,6 +136,9 @@ fn list(archive: &str) -> Vec<String> {
 
 #[test]
 fn the_archive_is_reproducible_and_complete() {
+    if !tools(&["cargo", "tar"]) {
+        return;
+    }
     let p = Project::new("repro");
     let date = [("SOURCE_DATE_EPOCH", "1700000000")];
     let (code, a) = giong(&p.dir, &["image", "--add", "static"], &date);
@@ -303,6 +325,9 @@ fn the_image_loads_runs_as_nonroot_and_serves() {
         eprintln!("skipped: neither Docker nor Podman answers");
         return;
     };
+    if !tools(&["cargo"]) {
+        return;
+    }
     let p = Project::new("run");
     let id = std::process::id();
     // The default (static with musl when installed), then glibc with this

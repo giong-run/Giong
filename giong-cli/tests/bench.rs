@@ -24,6 +24,25 @@ const OUTER_BUILD: &[&str] = &[
     "TSAN_OPTIONS",
 ];
 
+/// Whether these programs run here; the tests that build a project skip
+/// without them (CI runs the test binaries in a bare container too).
+fn tools(names: &[&str]) -> bool {
+    let missing: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| {
+            !Command::new(n)
+                .arg("--version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        })
+        .collect();
+    if !missing.is_empty() {
+        eprintln!("skipped: {} not found", missing.join(", "));
+    }
+    missing.is_empty()
+}
+
 fn giong(cwd: &Path, args: &[&str]) -> (i32, Value) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_giong"));
     cmd.args(args)
@@ -322,6 +341,9 @@ fn git(dir: &Path, args: &[&str]) {
 
 #[test]
 fn a_project_is_built_started_and_compared_with_a_commit() {
+    if !tools(&["cargo", "git"]) {
+        return;
+    }
     let dir = scratch("proj");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -458,6 +480,9 @@ fn a_project_is_built_started_and_compared_with_a_commit() {
 
 #[test]
 fn a_service_that_exits_is_reported_with_its_log() {
+    if !tools(&["cargo"]) {
+        return;
+    }
     let dir = scratch("exits");
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
