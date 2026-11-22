@@ -371,7 +371,12 @@ fn a_kept_alive_connection_closing_as_the_request_goes_is_retried_only_when_safe
         client.post(&base2).send().await.unwrap();
         let e = client.post(&base2).send().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Closed);
-        assert!(e.to_string().contains("not sent again by itself"), "{e}");
+        let text = e.to_string();
+        assert!(text.contains("not sent again by itself"), "{e}");
+        // The code and its link are said once, at the start and the end.
+        assert!(text.starts_with("GIONG-E1106: POST "), "{e}");
+        assert_eq!(text.matches("GIONG-E1106").count(), 1, "{e}");
+        assert_eq!(text.matches(" See https://").count(), 1, "{e}");
         assert!(e.is_transient());
         let _ = base;
     });
