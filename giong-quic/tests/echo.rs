@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use giong_quic::{ClientConfig, Endpoint, ServerConfig};
+use giong_quic::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 
 const ALPN: &[u8] = b"giong-test";
 
@@ -637,16 +637,22 @@ fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
         .recv_buffers(512, giong::net::GRO_RECV_BUFFER)
         .block_on(async {
             let (tls, ca) = server_tls();
+            // No connection may time out while the waves run: one that did
+            // would free its place, and a later one would take it. Under
+            // ThreadSanitizer the waves outlast the default 30 seconds.
+            let patient = || TransportConfig::default().idle_timeout(Duration::from_secs(600));
             // Nobody accepts on this endpoint.
             let server = Endpoint::server(
                 "127.0.0.1:0".parse().unwrap(),
-                ServerConfig::new(tls).unwrap(),
+                ServerConfig::new(tls).unwrap().transport(patient()),
             )
             .unwrap();
             let addr = server.local_addr().unwrap();
             let client =
                 std::rc::Rc::new(Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap());
-            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca))
+                .unwrap()
+                .transport(patient());
             let (mut made, mut refused) = (Vec::new(), 0);
             // In waves, so that the client's own socket keeps up.
             for _ in 0..12 {
