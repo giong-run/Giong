@@ -8,12 +8,37 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 fn cpu_ns() -> u64 {
     // SAFETY: getrusage only writes into the struct we pass.
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
     let t = |tv: libc::timeval| tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1000;
     t(u.ru_utime) + t(u.ru_stime)
+}
+
+#[cfg(windows)]
+fn cpu_ns() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the pseudo handle of this process, and four locals to fill.
+    unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    // In units of 100 ns.
+    let t = |f: FILETIME| ((u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime)) * 100;
+    t(kernel) + t(user)
 }
 
 /// A yield that every runtime handles the same way: wake, then pending.
