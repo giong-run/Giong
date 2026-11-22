@@ -5,7 +5,7 @@
   and `ipc::connect` meet on a Unix socket path, hand over a sealed memfd and four
   eventfds, and give each side a `Sender` and a `Receiver`. Messages are bounded (a quarter
   of the capacity), sending waits while the channel is full, and the receiver reads in
-  place. A process that dies is reported (`GIONG-E0094`), and so is one that corrupts the
+  place. The listener runs handshakes as tasks of their own, up to 64 at once with 5 seconds each, so a process that connects and sends nothing holds up no other ([#246](https://github.com/giong-run/Giong/issues/246)). A process that dies is reported (`GIONG-E0094`), and so is one that corrupts the
   ring (`GIONG-E0091`); the receiving process checks every position and length it reads.
   On a spinning worker (`spin_before_park`), a waiting receiver is watched from the spin
   loop and neither side makes a system call. A sender publishes a burst of messages with

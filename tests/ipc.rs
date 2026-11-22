@@ -518,3 +518,79 @@ fn a_peer_that_closes_its_socket_mid_channel_is_gone_after_its_messages() {
         assert_eq!(code(&err), Some(Code::IpcPeerGone), "{err}");
     });
 }
+
+#[test]
+fn a_client_that_sends_no_handshake_does_not_hold_up_the_next() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 4096).unwrap();
+        let server = giong::spawn(async move {
+            let (_tx, mut rx) = listener.accept().await.unwrap();
+            let got = rx.recv().await.unwrap().unwrap().to_vec();
+            (listener, got)
+        });
+        // Connected and silent, and staying so.
+        let silent: Vec<_> = (0..3)
+            .map(|_| StdUnixStream::connect(&path.0).unwrap())
+            .collect();
+        let (mut tx, _rx) = timeout(Duration::from_secs(2), ipc::connect(&path.0, 4096))
+            .await
+            .expect("a silent client held up the handshake of the next")
+            .unwrap();
+        tx.send(b"through").await.unwrap();
+        let (listener, got) = server.await.unwrap();
+        assert_eq!(got, b"through");
+        // The silent clients are given up on, with the handshake code, and
+        // their connections closed.
+        let started = std::time::Instant::now();
+        let err = listener.accept().await.unwrap_err();
+        assert_eq!(code(&err), Some(Code::IpcHandshake), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Read without blocking the worker, which closes them.
+        for mut s in silent {
+            s.set_nonblocking(true).unwrap();
+            let mut b = [0u8; 1];
+            let closed = async {
+                loop {
+                    match std::io::Read::read(&mut s, &mut b) {
+                        Ok(n) => return n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            sleep(Duration::from_millis(10)).await
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            };
+            assert_eq!(timeout(Duration::from_secs(10), closed).await.unwrap(), 0);
+        }
+    });
+}
+
+#[test]
+fn dropping_the_listener_ends_the_handshakes_under_way() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 4096).unwrap();
+        let mut silent = StdUnixStream::connect(&path.0).unwrap();
+        // The handshake starts, and goes on after the accept is given up.
+        assert!(timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err());
+        drop(listener);
+        silent.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 1];
+        let closed = async {
+            loop {
+                match std::io::Read::read(&mut silent, &mut b) {
+                    Ok(n) => return n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(10)).await
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        };
+        // Well before the 5 seconds a silent client is given.
+        assert_eq!(timeout(Duration::from_secs(2), closed).await.unwrap(), 0);
+    });
+}
