@@ -124,9 +124,15 @@ fn it_answers_its_own_page_and_refuses_other_hosts_and_sites() {
         ),
     );
     assert_eq!(s, 403, "a cross-origin POST to the API was let in: {body}");
-    // A second Host header must not smuggle another name past the check.
-    let (s, body) = get(p, "/", &format!("Host: evil.example\r\n{host}"));
-    assert_eq!(s, 403, "{body}");
+    // Two Host headers, in either order, are refused (RFC 9112: 400).
+    for two in [
+        format!("Host: evil.example\r\n{host}"),
+        format!("{host}Host: evil.example\r\n"),
+        format!("{host}Host:\r\n"),
+    ] {
+        let (s, body) = get(p, "/", &two);
+        assert!(matches!(s, 400 | 403), "{two:?} was let in: {body}");
+    }
 }
 
 #[test]
