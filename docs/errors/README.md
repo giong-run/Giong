@@ -287,3 +287,6 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5083](E5083.md) | `TestFailed` | a test failed |
 | [GIONG-E5084](E5084.md) | `DriverNotHere` | the tests could not run on every driver |
 | [GIONG-E5085](E5085.md) | `NextestMissing` | cargo-nextest is not installed |
+| [GIONG-E5086](E5086.md) | `TestTimeout` | the tests took longer than the time limit |
+| [GIONG-E5087](E5087.md) | `GitInitFailed` | git init failed in the new project |
+| [GIONG-E5088](E5088.md) | `DotenvBuildSetting` | .env sets a cargo or rustc setting |

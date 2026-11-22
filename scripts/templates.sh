@@ -9,7 +9,8 @@
 #
 # The database tests read DATABASE_URL, MYSQL_URL and REDIS_URL (MYSQL_URL becomes the
 # DATABASE_URL of the mysql projects). Without them a project's database tests print
-# SKIPPED and pass; with GIONG_TEMPLATES_REQUIRE_DB=1 (as in CI) a SKIPPED fails the run.
+# SKIPPED and pass, and its service is not started (it needs its database); with
+# GIONG_TEMPLATES_REQUIRE_DB=1 (as in CI) a SKIPPED fails the run.
 # Projects are written under $GIONG_TEMPLATES_DIR (default: a temporary directory) and
 # share one target directory, so each one only compiles its own code.
 set -uo pipefail
@@ -99,6 +100,11 @@ while read -r name flags; do
     case "$flags" in
         *mysql*) url_env=(env "DATABASE_URL=${MYSQL_URL:-}") ;;
     esac
+    # The service needs its database to start: without one, no smoke run.
+    missing=""
+    case "$flags" in *postgres*) [ -n "${DATABASE_URL:-}" ] || missing="DATABASE_URL" ;; esac
+    case "$flags" in *mysql*) [ -n "${MYSQL_URL:-}" ] || missing="MYSQL_URL" ;; esac
+    case "$flags" in *redis*) [ -n "${REDIS_URL:-}" ] || missing="${missing:+$missing and }REDIS_URL" ;; esac
     log="$WORK/$name.log"
     ok=1
     (
@@ -108,7 +114,12 @@ while read -r name flags; do
         cargo clippy -q --all-targets -- -D warnings
         "${url_env[@]}" cargo test -q -- --show-output 2>&1
         "${url_env[@]}" env GIONG_DRIVER=epoll cargo test -q -- --show-output 2>&1
-        smoke "$name" "${url_env[@]}"
+        if [ -n "$missing" ]; then
+            # Its tests printed SKIPPED for the same reason.
+            echo "smoke: SKIPPED for $name: $missing is not set"
+        else
+            smoke "$name" "${url_env[@]}"
+        fi
     ) >"$log" 2>&1 || ok=0
     if [ "$ok" = 1 ] && [ "${GIONG_TEMPLATES_REQUIRE_DB:-0}" = 1 ] && grep -q SKIPPED "$log"; then
         echo "a test was skipped, but GIONG_TEMPLATES_REQUIRE_DB=1:"

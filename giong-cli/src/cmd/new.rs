@@ -81,10 +81,10 @@ fn options(args: &Args) -> Result<(PathBuf, Options), Failure> {
             "write giong new api (or giong new path/to/api)",
         ));
     };
-    let dir = PathBuf::from(word);
+    let dir = without_dots(Path::new(word));
     let name = match args.value("name") {
         Some(n) => n.to_string(),
-        None => project_name(&dir).ok_or_else(|| {
+        None => project_name(&resolved(&dir)).ok_or_else(|| {
             Failure::new(
                 Code::BAD_NAME,
                 format!("{word:?} does not end in a name the project could have"),
@@ -125,6 +125,36 @@ fn options(args: &Args) -> Result<(PathBuf, Options), Failure> {
 }
 
 /// The last part of the path, as the name a project in it would have.
+/// The path without its `.` parts (`yy/.` is `yy`), `.` when nothing is left.
+fn without_dots(path: &Path) -> PathBuf {
+    let clean: PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if clean.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        clean
+    }
+}
+
+/// The absolute path with `..` taken back, for the name only: `giong new .`
+/// in an empty `api` directory makes a project called api.
+fn resolved(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn project_name(dir: &Path) -> Option<String> {
     let last = dir.components().next_back()?;
     match last {
@@ -135,7 +165,7 @@ fn project_name(dir: &Path) -> Option<String> {
 
 /// Fails unless `dir` is missing or an empty directory. Returns whether it
 /// has to be created.
-fn check_target(dir: &Path) -> Result<bool, Failure> {
+fn check_target(dir: &Path) -> Result<(), Failure> {
     match fs::read_dir(dir) {
         Ok(mut entries) => {
             if entries.next().is_some() {
@@ -146,9 +176,9 @@ fn check_target(dir: &Path) -> Result<bool, Failure> {
                      existing project, run giong ai init in it",
                 ));
             }
-            Ok(false)
+            Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Failure::new(
             Code::TARGET_NOT_EMPTY,
             format!("{} cannot be used: {e}", dir.display()),
@@ -162,7 +192,30 @@ fn check_target(dir: &Path) -> Result<bool, Failure> {
 }
 
 /// Writes every file, or nothing: on an error, what was written is removed.
-fn write_all(dir: &Path, create: bool, files: &[scaffold::File]) -> Result<(), Failure> {
+/// Creates `path` and the parents it lacks, recording each directory it made.
+fn make_dirs(path: &Path, made: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = Some(path);
+    while let Some(p) = at {
+        if p.as_os_str().is_empty() || p.exists() {
+            break;
+        }
+        missing.push(p.to_path_buf());
+        at = p.parent();
+    }
+    for p in missing.into_iter().rev() {
+        match fs::create_dir(&p) {
+            Ok(()) => made.push(p),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Writes every file; on a failure, takes back every file and directory it
+/// made (and nothing that was there before).
+fn write_all(dir: &Path, files: &[scaffold::File]) -> Result<(), Failure> {
     let failed = |what: String, e: std::io::Error| {
         Failure::new(
             Code::WRITE_FAILED,
@@ -171,14 +224,14 @@ fn write_all(dir: &Path, create: bool, files: &[scaffold::File]) -> Result<(), F
         )
     };
     let mut written: Vec<PathBuf> = Vec::new();
+    let mut made: Vec<PathBuf> = Vec::new();
     let result = (|| {
-        if create {
-            fs::create_dir_all(dir).map_err(|e| failed(dir.display().to_string(), e))?;
-        }
+        make_dirs(dir, &mut made).map_err(|e| failed(dir.display().to_string(), e))?;
         for f in files {
             let path = dir.join(&f.path);
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|e| failed(parent.display().to_string(), e))?;
+                make_dirs(parent, &mut made)
+                    .map_err(|e| failed(parent.display().to_string(), e))?;
             }
             // create_new: never replace a file, even one that appeared meanwhile.
             let mut file = fs::OpenOptions::new()
@@ -193,12 +246,11 @@ fn write_all(dir: &Path, create: bool, files: &[scaffold::File]) -> Result<(), F
         Ok(())
     })();
     if result.is_err() {
-        if create {
-            let _ = fs::remove_dir_all(dir);
-        } else {
-            for path in written.iter().rev() {
-                let _ = fs::remove_file(path);
-            }
+        for path in written.iter().rev() {
+            let _ = fs::remove_file(path);
+        }
+        for d in made.iter().rev() {
+            let _ = fs::remove_dir(d);
         }
     }
     result
@@ -258,12 +310,18 @@ fn run(args: &Args) -> Result<Report, Failure> {
         );
     }
 
+    check_target(&dir)?;
     if args.has("dry-run") {
+        let mut paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        if !args.has("no-ai") {
+            paths.extend(ai::files_for_new());
+        }
+        paths.sort();
         r.data("files", json!(paths));
         r.data("written", json!(false));
         r.line(format!(
             "giong new would write {} files to {}:",
-            files.len(),
+            paths.len(),
             dir.display()
         ));
         for p in &paths {
@@ -272,8 +330,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
         return Ok(r);
     }
 
-    let create = check_target(&dir)?;
-    write_all(&dir, create, &files)?;
+    write_all(&dir, &files)?;
     let mut all_paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
 
     if !args.has("no-ai") {
@@ -292,12 +349,12 @@ fn run(args: &Args) -> Result<Report, Failure> {
             Err(why) => {
                 r.push(
                     Finding::new(
-                        Code::WRITE_FAILED,
-                        Severity::Info,
+                        Code::GIT_INIT_FAILED,
+                        Severity::Warning,
                         "no git repository was started",
                     )
                     .detail(why)
-                    .fix("run git init in the project when you want one"),
+                    .fix("run git init in the project when you want one (giong fix needs one)"),
                 );
                 false
             }
@@ -309,10 +366,11 @@ fn run(args: &Args) -> Result<Report, Failure> {
 
     let cd = format!("cd {}", dir.display());
     let mut next = vec![cd];
-    if !o.dbs.is_empty() {
+    let offer = ai::Offer::here();
+    if !o.dbs.is_empty() && offer.db {
         next.push("giong db up".into());
     }
-    next.push("giong dev".into());
+    next.push(if offer.dev { "giong dev" } else { "cargo run" }.into());
     r.data("next", json!(next));
 
     let what = match (o.template, o.dbs.is_empty()) {
@@ -381,8 +439,12 @@ mod tests {
 
         let code = |line: &str| options(&parse(line)).unwrap_err().code;
         assert_eq!(code("new"), Code::USAGE);
-        assert_eq!(code("new ."), Code::BAD_NAME);
-        assert_eq!(code("new .."), Code::BAD_NAME);
+        assert_eq!(code("new /"), Code::BAD_NAME);
+        // `yy/.` is yy; `.` and `..` take the name of the directory they mean.
+        let (dir, o) = options(&parse("new yy/.")).unwrap();
+        assert_eq!((dir, o.name.as_str()), (PathBuf::from("yy"), "yy"));
+        assert_eq!(without_dots(Path::new("./.")), PathBuf::from("."));
+        assert!(resolved(Path::new("a/b/../c/.")).ends_with("a/c"));
         assert_eq!(code("new My-Api"), Code::BAD_NAME);
         assert_eq!(code("new x --template rocket"), Code::BAD_TEMPLATE_CHOICE);
         assert_eq!(code("new x --db mongo"), Code::BAD_TEMPLATE_CHOICE);
@@ -467,27 +529,51 @@ mod tests {
 
     #[test]
     fn a_write_that_fails_leaves_nothing_behind() {
-        let dir = scratch("partial");
-        // A file where a directory has to go: src/ cannot be made.
+        let base = scratch("partial");
+        // A file where a directory has to go: a.txt/ cannot be made.
         let files = vec![
             scaffold::File {
                 path: "a.txt".into(),
                 text: "a".into(),
             },
             scaffold::File {
+                path: "src/deep/x.rs".into(),
+                text: "x".into(),
+            },
+            scaffold::File {
                 path: "a.txt/b.txt".into(),
                 text: "b".into(),
             },
         ];
-        let f = write_all(&dir, true, &files).unwrap_err();
+        // Every directory it made goes, the parents of the project too.
+        let dir = base.join("n/a/f3");
+        fs::create_dir_all(&base).unwrap();
+        let f = write_all(&dir, &files).unwrap_err();
         assert_eq!(f.code, Code::WRITE_FAILED);
-        assert!(!dir.exists());
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0, "n/ is gone");
 
+        // A directory that was there stays, and is empty again.
+        write_all(&base, &files).unwrap_err();
+        assert!(base.exists());
+        assert_eq!(fs::read_dir(&base).unwrap().count(), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn dry_run_refuses_what_a_run_refuses_and_lists_the_agent_files() {
+        let dir = scratch("dry-full");
         fs::create_dir_all(&dir).unwrap();
-        write_all(&dir, false, &files).unwrap_err();
-        assert!(dir.exists(), "a directory that was there stays");
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0, "and is empty again");
+        fs::write(dir.join("x"), "x").unwrap();
+        let f = run(&parse(&format!("new {} --dry-run", dir.display()))).unwrap_err();
+        assert_eq!(f.code, Code::TARGET_NOT_EMPTY);
         fs::remove_dir_all(&dir).unwrap();
+
+        let r = run(&parse(&format!("new {} --dry-run", dir.display()))).unwrap();
+        let files = r.data_value("files").unwrap().as_array().unwrap().clone();
+        for agent in ai::files_for_new() {
+            assert!(files.iter().any(|f| f == agent.as_str()), "{agent}");
+        }
+        assert!(!dir.exists());
     }
 
     #[test]
@@ -496,7 +582,7 @@ mod tests {
         let r = run(&parse(&format!("new {} --template grpc", dir.display()))).unwrap();
         assert!(dir.join("AGENTS.md").is_file());
         assert!(dir.join("CLAUDE.md").is_file());
-        assert!(dir.join(".mcp.json").is_file());
+        assert_eq!(dir.join(".mcp.json").is_file(), ai::Offer::here().mcp);
         let git = r.data_value("git").unwrap().as_bool().unwrap();
         assert_eq!(git, dir.join(".git").is_dir());
         fs::remove_dir_all(&dir).unwrap();

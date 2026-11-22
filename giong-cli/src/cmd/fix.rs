@@ -63,34 +63,91 @@ pub struct Applied {
     pub done: Vec<Fix>,
     /// Fixes left out, with the reason.
     pub skipped: Vec<(Fix, String)>,
-    /// The new text of each changed file (relative path).
+    /// The new text of each changed file (relative path, with `/`).
     pub files: BTreeMap<String, String>,
+    /// The text each changed file had when the fixes were checked: a file
+    /// that no longer has it changed meanwhile and must not be written.
+    pub before: BTreeMap<String, String>,
 }
 
-/// Applies fixes to the files under `root` (in memory): a fix whose edits
-/// overlap an earlier fix, repeat one exactly (dropped quietly), fall outside
-/// the file or between the bytes of a character is skipped.
+/// A fix's file as a path inside the project, with `/`: `None` for an
+/// absolute path, a `..`, or a path that leaves the project through a link.
+fn inside(root: &Path, file: &str) -> Option<String> {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for c in Path::new(file).components() {
+        match c {
+            Component::Normal(p) => parts.push(p.to_str()?.to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let rel = parts.join("/");
+    // A link inside the project may point out of it.
+    if let (Ok(full), Ok(base)) = (fs::canonicalize(root.join(&rel)), fs::canonicalize(root)) {
+        if !full.starts_with(&base) {
+            return None;
+        }
+    }
+    Some(rel)
+}
+
+/// Whether two edits of one file collide: their ranges overlap, or both
+/// insert at the same place (they would land in an order nobody chose).
+fn collide(a: (usize, usize), b: (usize, usize)) -> bool {
+    (a.0 < b.1 && b.0 < a.1) || (a.0 == a.1 && b.0 == b.1 && a.0 == b.0)
+}
+
+/// Applies fixes to the files under `root` (in memory). A fix is skipped
+/// whole when one of its edits names a file outside the project or one that
+/// cannot be read, falls outside the file or between the bytes of a
+/// character, collides with another edit of the same fix, or collides with an
+/// earlier fix. The same fix twice is applied once.
 pub fn apply(root: &Path, fixes: Vec<Fix>) -> Applied {
     let mut out = Applied::default();
     let mut originals: BTreeMap<String, Option<String>> = BTreeMap::new();
-    // Byte ranges taken so far, per file (in original offsets).
-    let mut taken: BTreeMap<String, Vec<(usize, usize, String)>> = BTreeMap::new();
+    // Edits taken so far, per file (in original offsets).
+    let mut taken: BTreeMap<String, Vec<Edit>> = BTreeMap::new();
     let mut accepted: Vec<Fix> = Vec::new();
-    'fixes: for fix in fixes {
+    'fixes: for mut fix in fixes {
         if fix.edits.is_empty() {
             continue;
         }
+        let skip = |out: &mut Applied, fix: &Fix, why: String| {
+            out.skipped.push((fix.clone(), why));
+        };
+        // Paths first: `./a.rs` and `a.rs` are one file.
+        for e in &mut fix.edits {
+            match inside(root, &e.file) {
+                Some(rel) => e.file = rel,
+                None => {
+                    let why = format!("{} is not a file of the project", e.file);
+                    skip(&mut out, &fix, why);
+                    continue 'fixes;
+                }
+            }
+        }
+        let mut edits: Vec<Edit> = Vec::new();
+        for e in &fix.edits {
+            if !edits.contains(e) {
+                edits.push(e.clone());
+            }
+        }
+        fix.edits = edits;
         // The same fix twice (lib and test builds both report it): once.
         if accepted.iter().any(|a| a.edits == fix.edits) {
             continue;
         }
-        for e in &fix.edits {
+        for (i, e) in fix.edits.iter().enumerate() {
             let text = originals
                 .entry(e.file.clone())
                 .or_insert_with(|| fs::read_to_string(root.join(&e.file)).ok());
             let Some(text) = text else {
-                out.skipped
-                    .push((fix.clone(), format!("{} cannot be read", e.file)));
+                let why = format!("{} cannot be read", e.file);
+                skip(&mut out, &fix, why);
                 continue 'fixes;
             };
             if e.start > e.end
@@ -98,50 +155,45 @@ pub fn apply(root: &Path, fixes: Vec<Fix>) -> Applied {
                 || !text.is_char_boundary(e.start)
                 || !text.is_char_boundary(e.end)
             {
-                out.skipped.push((
-                    fix.clone(),
-                    format!("{} no longer has the code this fix was made for", e.file),
-                ));
+                let why = format!("{} no longer has the code this fix was made for", e.file);
+                skip(&mut out, &fix, why);
                 continue 'fixes;
             }
-            for (s, end, repl) in taken.get(&e.file).into_iter().flatten() {
-                let same = *s == e.start && *end == e.end && *repl == e.replacement;
-                let overlap = e.start < *end && *s < e.end
-                    // Two insertions at one place would land in an order nobody chose.
-                    || (e.start == e.end && *s == *end && e.start == *s);
-                if overlap && !same {
-                    out.skipped.push((
-                        fix.clone(),
-                        format!("another fix changes the same code in {}", e.file),
-                    ));
-                    continue 'fixes;
-                }
+            let own = fix.edits[..i]
+                .iter()
+                .any(|o| o.file == e.file && collide((o.start, o.end), (e.start, e.end)));
+            if own {
+                let why = format!("its own edits overlap in {}", e.file);
+                skip(&mut out, &fix, why);
+                continue 'fixes;
+            }
+            let other = taken
+                .get(&e.file)
+                .into_iter()
+                .flatten()
+                .any(|t| t != e && collide((t.start, t.end), (e.start, e.end)));
+            if other {
+                let why = format!("another fix changes the same code in {}", e.file);
+                skip(&mut out, &fix, why);
+                continue 'fixes;
             }
         }
         for e in &fix.edits {
-            taken
-                .entry(e.file.clone())
-                .or_default()
-                .push((e.start, e.end, e.replacement.clone()));
+            taken.entry(e.file.clone()).or_default().push(e.clone());
         }
         accepted.push(fix);
     }
-    // Apply per file from the end, so earlier offsets stay right.
-    let mut per_file: BTreeMap<String, Vec<&Edit>> = BTreeMap::new();
-    for fix in &accepted {
-        for e in &fix.edits {
-            let list = per_file.entry(e.file.clone()).or_default();
-            if !list.contains(&e) {
-                list.push(e);
-            }
-        }
-    }
-    for (file, mut edits) in per_file {
-        let mut text = originals[&file].clone().expect("checked above");
+    // Apply per file from the end, so earlier offsets stay right. Every edit
+    // was checked against the file and against every other above.
+    for (file, mut edits) in taken {
+        let before = originals[&file].clone().expect("checked above");
+        let mut text = before.clone();
         edits.sort_by_key(|e| std::cmp::Reverse((e.start, e.end)));
+        edits.dedup();
         for e in edits {
             text.replace_range(e.start..e.end, &e.replacement);
         }
+        out.before.insert(file.clone(), before);
         out.files.insert(file, text);
     }
     out.done = accepted;
@@ -253,12 +305,6 @@ fn check_fixes(findings: &[Finding]) -> Vec<Fix> {
         .collect()
 }
 
-/// giong check's own findings for the project. Until `giong check` lands in
-/// this branch it has none.
-fn giong_findings(_project: &Project, _cargo_args: &[String]) -> Vec<Finding> {
-    Vec::new()
-}
-
 /// Whether a git repository around `root` has changes that are not committed.
 /// `None` when it is not a repository or git is missing.
 fn dirty(root: &Path) -> Option<Vec<String>> {
@@ -365,7 +411,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
             );
             fixes.clear();
         }
-        fixes.extend(check_fixes(&giong_findings(&project, &args.rest)));
+        fixes.extend(check_fixes(&super::check::findings(&project, &args.rest)?));
         let applied = apply(&root, fixes);
         if applied.done.is_empty() {
             skipped.extend(applied.skipped);
@@ -373,19 +419,20 @@ fn run(args: &Args) -> Result<Report, Failure> {
         }
         for fix in &applied.done {
             let e = &fix.edits[0];
-            let text = fs::read_to_string(root.join(&e.file)).unwrap_or_default();
-            done.push((fix.clone(), line_of(&text, e.start)));
+            let text = applied.before.get(&e.file).map_or("", String::as_str);
+            done.push((fix.clone(), line_of(text, e.start)));
         }
         skipped = applied.skipped;
         if dry_run {
             for fix in &applied.done {
                 for e in &fix.edits {
-                    let text = fs::read_to_string(root.join(&e.file)).unwrap_or_default();
-                    let old = &text[e.start..e.end];
+                    // `apply` checked every range against this text.
+                    let text = applied.before.get(&e.file).map_or("", String::as_str);
+                    let old = text.get(e.start..e.end).unwrap_or("");
                     r.line(format!(
                         "{}:{}: {}",
                         e.file,
-                        line_of(&text, e.start),
+                        line_of(text, e.start),
                         fix.title
                     ));
                     for l in old.lines() {
@@ -399,6 +446,21 @@ fn run(args: &Args) -> Result<Report, Failure> {
             break;
         }
         for (file, text) in &applied.files {
+            // Changed since the fixes were checked (an editor saved it): leave it.
+            let now = fs::read_to_string(root.join(file)).ok();
+            if now.as_ref() != applied.before.get(file) {
+                for fix in applied
+                    .done
+                    .iter()
+                    .filter(|f| f.edits.iter().any(|e| &e.file == file))
+                {
+                    skipped.push((fix.clone(), format!("{file} changed while giong fix ran")));
+                }
+                done.retain(|(f, _)| {
+                    !(applied.done.contains(f) && f.edits.iter().any(|e| &e.file == file))
+                });
+                continue;
+            }
             fs::write(root.join(file), text).map_err(|e| {
                 Failure::new(
                     Code::WRITE_FAILED,
@@ -410,6 +472,16 @@ fn run(args: &Args) -> Result<Report, Failure> {
     }
     for (fix, why) in &skipped {
         let e = &fix.edits[0];
+        let (line, col) = match fs::read_to_string(root.join(&e.file)) {
+            Ok(text) if e.start <= text.len() && text.is_char_boundary(e.start) => {
+                let line_start = text[..e.start].rfind('\n').map_or(0, |i| i + 1);
+                (
+                    line_of(&text, e.start),
+                    text[line_start..e.start].chars().count() + 1,
+                )
+            }
+            _ => (1, 1),
+        };
         r.push(
             Finding::new(
                 Code::FIX_CONFLICT,
@@ -418,7 +490,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
             )
             .detail(why.clone())
             .fix("run giong fix again; if it stays, apply it by hand")
-            .at(&e.file, 0, 0),
+            .at(&e.file, line as u32, col as u32),
         );
     }
     if !clippy {
@@ -658,5 +730,52 @@ mod tests {
         assert_eq!(line_of("a\nb\nc", 0), 1);
         assert_eq!(line_of("a\nb\nc", 2), 2);
         assert_eq!(line_of("a\nb\nc", 99), 3);
+    }
+
+    /// Paths and ranges are checked before anything is applied.
+    #[test]
+    fn apply_trusts_no_path_and_no_range() {
+        let dir = scratch("trust");
+        let outside = dir.with_extension("outside.txt");
+        fs::write(&outside, "keep\n").unwrap();
+        fs::write(dir.join("a.rs"), "abcdef\n").unwrap();
+        let one = |e: Edit| Fix {
+            what: "t".into(),
+            title: "t".into(),
+            edits: vec![e],
+        };
+        let name = outside.file_name().unwrap().to_str().unwrap().to_string();
+        // Outside the project: by `..`, by an absolute path.
+        for file in [format!("../{name}"), outside.display().to_string()] {
+            let a = apply(&dir, vec![one(edit(&file, 0, 4, "gone"))]);
+            assert!(a.done.is_empty() && a.files.is_empty(), "{file}");
+            assert_eq!(a.skipped.len(), 1, "{file}");
+        }
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep\n");
+        // `./a.rs` and `a.rs` are one file: two overlapping fixes, one applies.
+        let a = apply(
+            &dir,
+            vec![one(edit("./a.rs", 0, 2, "X")), one(edit("a.rs", 1, 3, "Y"))],
+        );
+        assert_eq!((a.done.len(), a.skipped.len()), (1, 1));
+        assert_eq!(a.files["a.rs"], "Xcdef\n");
+        // The edits of one fix that overlap each other: the fix is skipped.
+        let both = Fix {
+            what: "t".into(),
+            title: "t".into(),
+            edits: vec![edit("a.rs", 0, 4, "X"), edit("a.rs", 2, 6, "Y")],
+        };
+        let a = apply(&dir, vec![both]);
+        assert!(a.done.is_empty() && a.files.is_empty());
+        // Past the end, and between the bytes of a character: skipped, no panic.
+        fs::write(dir.join("u.rs"), "é\n").unwrap();
+        let a = apply(
+            &dir,
+            vec![one(edit("a.rs", 5, 99, "Z")), one(edit("u.rs", 1, 2, "Z"))],
+        );
+        assert!(a.done.is_empty());
+        assert_eq!(a.skipped.len(), 2);
+        fs::remove_file(&outside).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

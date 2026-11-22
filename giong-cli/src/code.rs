@@ -83,6 +83,9 @@ codes! {
     TEST_FAILED = 5083, "TestFailed", "a test failed";
     DRIVER_NOT_HERE = 5084, "DriverNotHere", "the tests could not run on every driver";
     NEXTEST_MISSING = 5085, "NextestMissing", "cargo-nextest is not installed";
+    TEST_TIMEOUT = 5086, "TestTimeout", "the tests took longer than the time limit";
+    GIT_INIT_FAILED = 5087, "GitInitFailed", "git init failed in the new project";
+    DOTENV_BUILD_SETTING = 5088, "DotenvBuildSetting", ".env sets a cargo or rustc setting";
 }
 
 impl Code {

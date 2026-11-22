@@ -6,8 +6,10 @@
 //! Safe to run again and again: in a file someone else wrote it only adds or
 //! replaces its own marked block (`<!-- giong:begin -->` ... `<!-- giong:end -->`),
 //! a whole file it rewrites only when the file carries its `<!-- giong:owned -->`
-//! line, and in `.mcp.json` it adds its server when it is missing and touches
-//! nothing else.
+//! line near its top, and in `.mcp.json` it adds its server when it is missing
+//! and touches nothing else. A file it cannot read (not UTF-8, no permission)
+//! is never treated as missing, and `CLAUDE.md` linked to `AGENTS.md` is left
+//! to the link.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,8 +30,9 @@ pub const COMMAND: Command = Command {
             Writes, at the root of the project: AGENTS.md (the Gióng rules and this project's \
             commands, read by Codex, Copilot, Cursor, Gemini and others), CLAUDE.md (imports \
             AGENTS.md for Claude Code), .cursor/rules/giong.mdc, the Gióng skill of this release \
-            in .claude/skills/giong/, and the giong MCP server in .mcp.json (this command over \
-            stdio, which also reaches the service giong dev runs). Run it again at \
+            in .claude/skills/giong/, and the giong MCP server in .mcp.json (giong mcp over stdio, \
+            which also reaches the service giong dev runs; written once this giong has the mcp \
+            command). The files name only the giong commands this build has. Run it again at \
             any time: it replaces only what it wrote (a marked block, or a file with its \
             giong:owned line) and never changes anything else. giong new runs it.",
     flags: &[Flag {
@@ -67,7 +70,101 @@ enum Change {
     Keep(Finding),
 }
 
-fn agents_block(version: &str) -> String {
+/// The giong commands this build has: the agent files name only those, so an
+/// agent is never told to run a command that does not exist yet.
+#[derive(Clone, Copy, Debug)]
+pub struct Offer {
+    pub mcp: bool,
+    pub dev: bool,
+    pub check: bool,
+    pub fix: bool,
+    pub test: bool,
+    pub doctor: bool,
+    pub db: bool,
+}
+
+impl Offer {
+    pub fn here() -> Offer {
+        let has = |name: &str| super::COMMANDS.iter().any(|c| c.name == name);
+        Offer {
+            mcp: has("mcp"),
+            dev: has("dev"),
+            check: has("check"),
+            fix: has("fix"),
+            test: has("test"),
+            doctor: has("doctor"),
+            db: has("db"),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn all() -> Offer {
+        Offer {
+            mcp: true,
+            dev: true,
+            check: true,
+            fix: true,
+            test: true,
+            doctor: true,
+            db: true,
+        }
+    }
+}
+
+/// The rows of the commands table, for the commands this build has.
+fn command_rows(offer: &Offer) -> String {
+    let mut rows = String::from("| To | Run |\n|---|---|\n");
+    let mut row = |when: bool, to: &str, run: &str| {
+        if when {
+            rows.push_str(&format!("| {to} | {run} |\n"));
+        }
+    };
+    row(
+        offer.dev,
+        "Run the service, restarting on every change",
+        "`giong dev`",
+    );
+    row(
+        offer.check,
+        "Check a change before finishing",
+        if offer.fix {
+            "`giong check --json`, then `giong fix` for what it can fix"
+        } else {
+            "`giong check --json`"
+        },
+    );
+    row(
+        true,
+        "Run the tests",
+        if offer.test {
+            "`giong test` (or `cargo test`, then `GIONG_DRIVER=epoll cargo test`)"
+        } else {
+            "`cargo test`, then `GIONG_DRIVER=epoll cargo test`"
+        },
+    );
+    row(true, "Explain an error code", "`giong explain <code>`");
+    row(
+        offer.doctor,
+        "Check the machine and the project",
+        "`giong doctor`",
+    );
+    row(
+        offer.db,
+        "Start the database, apply migrations",
+        "`giong db up`, `giong db migrate`",
+    );
+    rows
+}
+
+fn agents_block(version: &str, offer: &Offer) -> String {
+    let rows = command_rows(offer);
+    let mcp = if offer.mcp {
+        "\nThe `giong` MCP server in `.mcp.json` serves these commands to agents and, while `giong dev`\n\
+         runs the service, the service's own view of itself (workers, tasks by spawn line, pools, a\n\
+         blocked worker): ask it rather than guess why the service is slow or stuck.\n"
+    } else {
+        ""
+    };
     format!(
         r#"{BEGIN} (written by giong ai init: edit outside this block, it is replaced) -->
 ## Gióng
@@ -92,19 +189,7 @@ skill in `.claude/skills/giong/SKILL.md` has every rule; the ones that matter mo
   giong-postgres and giong-mysql (not sqlx), giong-redis (not redis-rs), giong-grpc (not
   tonic). A crate that needs the Tokio runtime panics on a worker.
 
-| To | Run |
-|---|---|
-| Run the service, restarting on every change | `giong dev` |
-| Check a change before finishing | `giong check --json`, then `giong fix` for what it can fix |
-| Run the tests | `giong test` (or `cargo test`, then `GIONG_DRIVER=epoll cargo test`) |
-| Explain an error code | `giong explain <code>` |
-| Check the machine and the project | `giong doctor` |
-| Start the database, apply migrations | `giong db up`, `giong db migrate` |
-
-The `giong` MCP server in `.mcp.json` serves these commands to agents and, while `giong dev`
-runs the service, the service's own view of itself (workers, tasks by spawn line, pools, a
-blocked worker): ask it rather than guess why the service is slow or stuck.
-{END}
+{rows}{mcp}{END}
 "#
     )
 }
@@ -114,17 +199,25 @@ const CLAUDE_BLOCK: &str =
 @AGENTS.md\n\
 <!-- giong:end -->\n";
 
-fn cursor_rule() -> String {
-    "---\n\
-     description: Gióng rules for this Rust project\n\
-     alwaysApply: true\n\
-     ---\n\
-     <!-- giong:owned (giong ai init rewrites this file; delete this line to keep your edits) -->\n\n\
-     This project runs on Gióng, a thread-per-core async runtime for Rust. Read `AGENTS.md` at\n\
-     the root before changing code: it has the rules and the commands. Before finishing a\n\
-     change, run `giong check --json` and fix what it reports (`giong fix` applies the\n\
-     mechanical fixes).\n"
-        .to_string()
+fn cursor_rule(offer: &Offer) -> String {
+    let finish = match (offer.check, offer.fix) {
+        (true, true) => {
+            " Before finishing a\nchange, run `giong check --json` and fix what it reports (`giong fix` applies the\nmechanical fixes).\n"
+        }
+        (true, false) => {
+            " Before finishing a\nchange, run `giong check --json` and fix what it reports.\n"
+        }
+        _ => "\n",
+    };
+    format!(
+        "---\n\
+         description: Gióng rules for this Rust project\n\
+         alwaysApply: true\n\
+         ---\n\
+         <!-- giong:owned (giong ai init rewrites this file; delete this line to keep your edits) -->\n\n\
+         This project runs on Gióng, a thread-per-core async runtime for Rust. Read `AGENTS.md` at\n\
+         the root before changing code: it has the rules and the commands.{finish}"
+    )
 }
 
 /// The skill, marked as written by `ai init` and stamped with the version.
@@ -148,51 +241,88 @@ fn skill(version: &str) -> String {
     }
 }
 
-/// Puts `block` into `existing`: in place of the marked block, or at the end.
+/// The byte ranges of giong's blocks in `text` (each from its begin marker to
+/// just past its end marker and line break), or `None` when a block is not
+/// closed or ends before it begins.
+fn blocks(text: &str) -> Option<Vec<(usize, usize)>> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    loop {
+        let begin = text[from..].find(BEGIN).map(|i| from + i);
+        let end = text[from..].find(END).map(|i| from + i);
+        match (begin, end) {
+            (None, None) => return Some(out),
+            (Some(b), Some(e)) if b < e => {
+                // No second begin inside this block.
+                if text[b + BEGIN.len()..e].contains(BEGIN) {
+                    return None;
+                }
+                let mut after = e + END.len();
+                if text[after..].starts_with("\r\n") {
+                    after += 2;
+                } else if text[after..].starts_with('\n') {
+                    after += 1;
+                }
+                out.push((b, after));
+                from = after;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Puts `block` into `existing`: in place of the first marked block (later
+/// copies are dropped), or at the end. A file with CRLF line ends gets the
+/// block with CRLF too.
 fn merge_block(existing: Option<&str>, block: &str, new_file: &str, path: &str) -> Change {
     let Some(text) = existing else {
         return Change::Write(new_file.to_string());
     };
-    let begin = text.find(BEGIN);
-    let end = text.find(END);
-    let merged = match (begin, end) {
-        (Some(b), Some(e)) if b < e => {
-            let mut after = e + END.len();
-            if text[after..].starts_with("\r\n") {
-                after += 2;
-            } else if text[after..].starts_with('\n') {
-                after += 1;
-            }
-            format!("{}{block}{}", &text[..b], &text[after..])
-        }
-        (None, None) => {
-            let sep = if text.is_empty() || text.ends_with("\n\n") {
-                ""
-            } else if text.ends_with('\n') {
-                "\n"
-            } else {
-                "\n\n"
-            };
-            format!("{text}{sep}{block}")
-        }
-        _ => {
-            return Change::Keep(
-                Finding::new(
-                    Code::AGENT_FILE_FOREIGN,
-                    Severity::Warning,
-                    format!("{path} has a giong block that is not closed"),
-                )
-                .detail(format!(
-                    "{path} has `{BEGIN}` without `{END}` after it (or the other way round), so \
-                     giong cannot tell which part is its own; the file was left as it is."
-                ))
-                .fix(format!(
-                    "delete the giong lines from {path}, or close the block, and run giong ai \
-                     init again"
-                ))
-                .at(path, 1, 1),
+    let block = if text.contains("\r\n") {
+        block.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        block.to_string()
+    };
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let Some(found) = blocks(text) else {
+        return Change::Keep(
+            Finding::new(
+                Code::AGENT_FILE_FOREIGN,
+                Severity::Warning,
+                format!("{path} has a giong block that is not closed"),
             )
+            .detail(format!(
+                "{path} has `{BEGIN}` without `{END}` after it (or the other way round), so \
+                 giong cannot tell which part is its own; the file was left as it is."
+            ))
+            .fix(format!(
+                "delete the giong lines from {path}, or close the block, and run giong ai \
+                 init again"
+            ))
+            .at(path, 1, 1),
+        );
+    };
+    let merged = if found.is_empty() {
+        let sep = if text.is_empty() || text.ends_with(&format!("{nl}{nl}")) {
+            String::new()
+        } else if text.ends_with('\n') {
+            nl.to_string()
+        } else {
+            format!("{nl}{nl}")
+        };
+        format!("{text}{sep}{block}")
+    } else {
+        let mut merged = String::with_capacity(text.len() + block.len());
+        let mut at = 0;
+        for (i, (b, e)) in found.iter().enumerate() {
+            merged.push_str(&text[at..*b]);
+            if i == 0 {
+                merged.push_str(&block);
+            }
+            at = *e;
         }
+        merged.push_str(&text[at..]);
+        merged
     };
     if merged == text {
         Change::Same
@@ -201,12 +331,18 @@ fn merge_block(existing: Option<&str>, block: &str, new_file: &str, path: &str) 
     }
 }
 
+/// Whether a file carries the owned marker at the start of a line near its
+/// top (after a front matter at most), not just anywhere in its text.
+fn is_owned(text: &str) -> bool {
+    text.lines().take(12).any(|l| l.starts_with(OWNED))
+}
+
 /// A file `ai init` owns entirely: written when missing or still marked.
 fn owned_file(existing: Option<&str>, content: String, path: &str) -> Change {
     match existing {
         None => Change::Write(content),
         Some(text) if text == content => Change::Same,
-        Some(text) if text.contains(OWNED) => Change::Write(content),
+        Some(text) if is_owned(text) => Change::Write(content),
         Some(_) => Change::Keep(
             Finding::new(
                 Code::AGENT_FILE_FOREIGN,
@@ -245,6 +381,9 @@ fn merge_mcp(existing: Option<&str>) -> Change {
             .at(".mcp.json", 1, 1),
         )
     };
+    // A byte order mark (some Windows editors write one) is kept as it was.
+    let bom = existing.is_some_and(|t| t.starts_with('\u{feff}'));
+    let existing = existing.map(|t| t.strip_prefix('\u{feff}').unwrap_or(t));
     let mut doc = match existing {
         None => Value::Object(Map::new()),
         Some(text) if text.trim().is_empty() => Value::Object(Map::new()),
@@ -272,68 +411,133 @@ fn merge_mcp(existing: Option<&str>) -> Change {
     if !added {
         return Change::Same;
     }
-    let mut text = serde_json::to_string_pretty(&doc).expect("a Value always serialises");
+    let mut text = if bom {
+        "\u{feff}".to_string()
+    } else {
+        String::new()
+    };
+    text.push_str(&serde_json::to_string_pretty(&doc).expect("a Value always serialises"));
     text.push('\n');
     Change::Write(text)
 }
 
+/// A file of the plan as it is on disk.
+enum OnDisk {
+    Missing,
+    Text(String),
+    /// It exists but could not be read (not UTF-8, no permission): never
+    /// treated as missing, so never overwritten.
+    Unreadable(String),
+}
+
+fn on_disk(path: &Path) -> OnDisk {
+    match fs::read_to_string(path) {
+        Ok(text) => OnDisk::Text(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => OnDisk::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            OnDisk::Unreadable("it is not UTF-8 text".into())
+        }
+        Err(e) => OnDisk::Unreadable(e.to_string()),
+    }
+}
+
+fn unreadable(rel: &str, why: &str) -> Change {
+    Change::Keep(
+        Finding::new(
+            Code::AGENT_FILE_FOREIGN,
+            Severity::Warning,
+            format!("{rel} could not be read and was left as it is"),
+        )
+        .detail(format!(
+            "{rel} exists, but {why}, so giong cannot tell what is in it and does not touch it."
+        ))
+        .fix(format!(
+            "save {rel} as UTF-8 (or make it readable), then run giong ai init again"
+        ))
+        .at(rel, 1, 1),
+    )
+}
+
+/// Whether two paths name the same file (a link to the other, or a hard link).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// The changes for a project root, without writing anything.
-fn plan(root: &Path, version: &str) -> Vec<(String, Change)> {
-    let read = |rel: &str| fs::read_to_string(root.join(rel)).ok();
-    let block = agents_block(version);
+fn plan(root: &Path, version: &str, offer: &Offer) -> Vec<(String, Change)> {
+    let block = agents_block(version, offer);
     let agents_new = format!(
         "# AGENTS.md\n\nInstructions for coding agents working on this project.\n\n{block}\n\
          ## This project\n\nAdd what an agent should know about this project here, outside the \
          giong block.\n"
     );
-    vec![
-        (
-            "AGENTS.md".into(),
-            merge_block(
-                read("AGENTS.md").as_deref(),
-                &block,
-                &agents_new,
-                "AGENTS.md",
-            ),
-        ),
-        (
-            "CLAUDE.md".into(),
-            merge_block(
-                read("CLAUDE.md").as_deref(),
-                CLAUDE_BLOCK,
-                &format!("# CLAUDE.md\n\n{CLAUDE_BLOCK}"),
-                "CLAUDE.md",
-            ),
-        ),
-        (
-            ".cursor/rules/giong.mdc".into(),
-            owned_file(
-                read(".cursor/rules/giong.mdc").as_deref(),
-                cursor_rule(),
-                ".cursor/rules/giong.mdc",
-            ),
-        ),
-        (
-            ".claude/skills/giong/SKILL.md".into(),
-            owned_file(
-                read(".claude/skills/giong/SKILL.md").as_deref(),
-                skill(version),
-                ".claude/skills/giong/SKILL.md",
-            ),
-        ),
-        (".mcp.json".into(), merge_mcp(read(".mcp.json").as_deref())),
-    ]
+    let claude_new = format!("# CLAUDE.md\n\n{CLAUDE_BLOCK}");
+    let each = |rel: &str, change: &dyn Fn(Option<&str>) -> Change| {
+        let c = match on_disk(&root.join(rel)) {
+            OnDisk::Missing => change(None),
+            OnDisk::Text(t) => change(Some(&t)),
+            OnDisk::Unreadable(why) => unreadable(rel, &why),
+        };
+        (rel.to_string(), c)
+    };
+    let mut out = vec![each("AGENTS.md", &|t| {
+        merge_block(t, &block, &agents_new, "AGENTS.md")
+    })];
+    if same_file(&root.join("CLAUDE.md"), &root.join("AGENTS.md")) {
+        // CLAUDE.md links to AGENTS.md (or the other way round): Claude Code
+        // reads the rules through the link, and an import would point the
+        // file at itself.
+        out.push(("CLAUDE.md".to_string(), Change::Same));
+    } else {
+        out.push(each("CLAUDE.md", &|t| {
+            merge_block(t, CLAUDE_BLOCK, &claude_new, "CLAUDE.md")
+        }));
+    }
+    out.push(each(".cursor/rules/giong.mdc", &|t| {
+        owned_file(t, cursor_rule(offer), ".cursor/rules/giong.mdc")
+    }));
+    out.push(each(".claude/skills/giong/SKILL.md", &|t| {
+        owned_file(t, skill(version), ".claude/skills/giong/SKILL.md")
+    }));
+    if offer.mcp {
+        out.push(each(".mcp.json", &merge_mcp));
+    }
+    out
 }
 
 /// Applies the changes. `version` is the giong version the project uses, when
 /// known (giong new); otherwise it is read from the project.
 pub fn init_dir(root: &Path, version: Option<&str>) -> Outcome {
-    apply(root, version.unwrap_or(GIONG_VERSION), false)
+    apply(
+        root,
+        version.unwrap_or(GIONG_VERSION),
+        false,
+        &Offer::here(),
+    )
 }
 
-fn apply(root: &Path, version: &str, dry_run: bool) -> Outcome {
+/// The files `init_dir` would write in an empty directory.
+pub fn files_for_new() -> Vec<String> {
+    let mut files: Vec<String> = [
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".cursor/rules/giong.mdc",
+        ".claude/skills/giong/SKILL.md",
+    ]
+    .map(String::from)
+    .to_vec();
+    if Offer::here().mcp {
+        files.push(".mcp.json".into());
+    }
+    files
+}
+
+fn apply(root: &Path, version: &str, dry_run: bool, offer: &Offer) -> Outcome {
     let mut out = Outcome::default();
-    for (rel, change) in plan(root, version) {
+    for (rel, change) in plan(root, version, offer) {
         match change {
             Change::Same => out.unchanged.push(rel),
             Change::Keep(finding) => out.findings.push(finding),
@@ -443,7 +647,12 @@ fn run(args: &Args) -> Result<Report, Failure> {
             }
         }
     }
-    let out = apply(&project.root, GIONG_VERSION, args.has("dry-run"));
+    let out = apply(
+        &project.root,
+        GIONG_VERSION,
+        args.has("dry-run"),
+        &Offer::here(),
+    );
     for f in out.findings {
         r.push(f);
     }
@@ -482,10 +691,160 @@ mod tests {
         fs::read_to_string(dir.join(rel)).unwrap()
     }
 
+    /// ai init with every command offered, whatever this build has.
+    fn every(dir: &Path) -> Outcome {
+        apply(dir, GIONG_VERSION, false, &Offer::all())
+    }
+
+    /// A file a person saved in Latin-1, and an .mcp.json with a server of
+    /// theirs in it: neither is UTF-8, so neither is touched.
+    #[test]
+    fn files_that_are_not_utf8_are_left_alone() {
+        let dir = scratch("latin1");
+        let agents = b"# Mes r\xe8gles\nNe pas effacer.\n".to_vec();
+        let mcp = b"{\"mcpServers\":{\"db\":{\"command\":\"psql\",\"note\":\"caf\xe9\"}}}".to_vec();
+        fs::write(dir.join("AGENTS.md"), &agents).unwrap();
+        fs::write(dir.join(".mcp.json"), &mcp).unwrap();
+        let out = every(&dir);
+        assert_eq!(fs::read(dir.join("AGENTS.md")).unwrap(), agents);
+        assert_eq!(fs::read(dir.join(".mcp.json")).unwrap(), mcp);
+        let unreadable = out
+            .findings
+            .iter()
+            .filter(|f| f.code == Code::AGENT_FILE_FOREIGN && f.title.contains("could not be read"))
+            .count();
+        assert_eq!(unreadable, 2, "{:?}", out.findings);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// CLAUDE.md as a link to AGENTS.md: AGENTS.md gets the rules once, no
+    /// import of itself, and a second run changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn claude_md_linked_to_agents_md() {
+        for (link, target) in [("CLAUDE.md", "AGENTS.md"), ("AGENTS.md", "CLAUDE.md")] {
+            let dir = scratch("link");
+            fs::write(dir.join(target), "# Rules\n").unwrap();
+            std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
+            every(&dir);
+            let text = read(&dir, "AGENTS.md");
+            assert!(text.contains("## Gióng"), "{link}: {text}");
+            assert!(!text.contains("@AGENTS.md"), "{link}: {text}");
+            assert_eq!(text.matches(BEGIN).count(), 1, "{link}: {text}");
+            for _ in 0..2 {
+                let again = every(&dir);
+                assert!(again.written.is_empty(), "{link}: {:?}", again.written);
+            }
+            assert!(fs::symlink_metadata(dir.join(link))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_second_copy_of_the_block_is_dropped() {
+        let block = "<!-- giong:begin -->\nnew\n<!-- giong:end -->\n";
+        let text = "a\n<!-- giong:begin -->\nold\n<!-- giong:end -->\nb\n<!-- giong:begin -->\nolder\n<!-- giong:end -->\nc\n";
+        match merge_block(Some(text), block, "", "AGENTS.md") {
+            Change::Write(t) => assert_eq!(t, format!("a\n{block}b\nc\n")),
+            other => panic!("{other:?}"),
+        }
+        // A begin inside a block is not a block giong can trust.
+        let nested = "<!-- giong:begin -->\n<!-- giong:begin -->\n<!-- giong:end -->\n";
+        assert!(matches!(
+            merge_block(Some(nested), block, "", "x"),
+            Change::Keep(_)
+        ));
+    }
+
+    #[test]
+    fn a_crlf_file_gets_a_crlf_block() {
+        let block = "<!-- giong:begin -->\nnew\n<!-- giong:end -->\n";
+        match merge_block(Some("# Ours\r\nline\r\n"), block, "", "AGENTS.md") {
+            Change::Write(t) => {
+                assert_eq!(
+                    t,
+                    "# Ours\r\nline\r\n\r\n<!-- giong:begin -->\r\nnew\r\n<!-- giong:end -->\r\n"
+                );
+                assert!(!t.replace("\r\n", "").contains('\n'), "mixed line ends");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_owned_marker_counts_only_at_the_top() {
+        assert!(is_owned("---\na: b\n---\n<!-- giong:owned (x) -->\nbody\n"));
+        let quoted = format!(
+            "# Notes\n\n{}\nWe quote `<!-- giong:owned` here.\n",
+            "line\n".repeat(20)
+        );
+        assert!(!is_owned(&quoted));
+        assert!(!is_owned(
+            "text that mentions <!-- giong:owned in the middle\n"
+        ));
+    }
+
+    #[test]
+    fn mcp_json_with_a_byte_order_mark() {
+        match merge_mcp(Some(
+            "\u{feff}{\"mcpServers\": {\"db\": {\"command\": \"psql\"}}}",
+        )) {
+            Change::Write(t) => {
+                assert!(t.starts_with('\u{feff}'));
+                let v: Value = serde_json::from_str(&t[3..]).unwrap();
+                assert_eq!(v["mcpServers"]["db"]["command"], "psql");
+                assert_eq!(v["mcpServers"]["giong"]["args"][0], "mcp");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Commands this build does not have are not offered to the agent.
+    #[test]
+    fn only_commands_that_exist_are_named() {
+        let none = Offer {
+            mcp: false,
+            dev: false,
+            check: false,
+            fix: false,
+            test: false,
+            doctor: false,
+            db: false,
+        };
+        let dir = scratch("offer");
+        let out = apply(&dir, GIONG_VERSION, false, &none);
+        assert!(!dir.join(".mcp.json").exists());
+        assert_eq!(out.written.len(), 4);
+        let agents = read(&dir, "AGENTS.md");
+        for gone in [
+            "giong dev",
+            "giong check",
+            "giong fix",
+            "giong test",
+            "giong doctor",
+            "giong db",
+            "MCP",
+        ] {
+            assert!(!agents.contains(gone), "{gone} in {agents}");
+        }
+        assert!(agents.contains("GIONG_DRIVER=epoll cargo test"));
+        assert!(!read(&dir, ".cursor/rules/giong.mdc").contains("giong check"));
+        // This build: every command named exists.
+        let here = Offer::here();
+        assert_eq!(
+            here.mcp,
+            crate::cmd::COMMANDS.iter().any(|c| c.name == "mcp")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn writes_everything_then_nothing() {
         let dir = scratch("fresh");
-        let first = init_dir(&dir, None);
+        let first = every(&dir);
         assert!(first.findings.is_empty(), "{:?}", first.findings);
         assert_eq!(first.written.len(), 5, "{:?}", first.written);
         assert!(
@@ -503,7 +862,7 @@ mod tests {
         assert_eq!(mcp["mcpServers"]["giong"]["args"][0], "mcp");
         assert_eq!(mcp["mcpServers"].as_object().unwrap().len(), 1);
 
-        let second = init_dir(&dir, None);
+        let second = every(&dir);
         assert!(
             second.written.is_empty(),
             "idempotent: {:?}",
@@ -525,7 +884,7 @@ mod tests {
             r#"{"zeta": 1, "mcpServers": {"db": {"command": "pg-mcp"}, "giong": {"command": "/opt/giong", "args": ["mcp"]}}, "alpha": true}"#,
         )
         .unwrap();
-        let out = init_dir(&dir, None);
+        let out = every(&dir);
         assert_eq!(out.findings.len(), 1, "{:?}", out.findings);
         assert_eq!(out.findings[0].code, Code::AGENT_FILE_FOREIGN);
         assert_eq!(read(&dir, ".cursor/rules/giong.mdc"), "my own rule\n");
@@ -558,7 +917,7 @@ mod tests {
             .replace("## Gióng", "## Changed")
             .replace("Build with make.", "Build with just.");
         fs::write(dir.join("AGENTS.md"), &edited).unwrap();
-        init_dir(&dir, None);
+        every(&dir);
         let again = read(&dir, "AGENTS.md");
         assert!(again.contains("## Gióng") && !again.contains("## Changed"));
         assert!(again.contains("Build with just."));
@@ -581,7 +940,7 @@ mod tests {
             .join("\n")
             + "\nmore of mine\n";
         fs::write(dir.join(".cursor/rules/giong.mdc"), &mine).unwrap();
-        let out = init_dir(&dir, None);
+        let out = every(&dir);
         assert_eq!(out.findings[0].code, Code::AGENT_FILE_FOREIGN);
         assert_eq!(read(&dir, ".cursor/rules/giong.mdc"), mine);
         fs::remove_dir_all(&dir).unwrap();
@@ -592,7 +951,7 @@ mod tests {
         let dir = scratch("broken");
         for bad in ["{not json", "[1, 2]", r#"{"mcpServers": 3}"#] {
             fs::write(dir.join(".mcp.json"), bad).unwrap();
-            let out = init_dir(&dir, None);
+            let out = every(&dir);
             assert!(
                 out.findings
                     .iter()
@@ -602,12 +961,10 @@ mod tests {
             assert_eq!(read(&dir, ".mcp.json"), bad);
         }
         fs::write(dir.join(".mcp.json"), "  \n").unwrap();
-        assert!(init_dir(&dir, None)
-            .written
-            .contains(&".mcp.json".to_string()));
+        assert!(every(&dir).written.contains(&".mcp.json".to_string()));
 
         fs::write(dir.join("AGENTS.md"), "x\n<!-- giong:begin\nhalf a block\n").unwrap();
-        let out = init_dir(&dir, None);
+        let out = every(&dir);
         assert!(out
             .findings
             .iter()
@@ -624,7 +981,7 @@ mod tests {
         let block = "<!-- giong:begin -->\nnew\n<!-- giong:end -->\n";
         let text = "a\r\n<!-- giong:begin -->\r\nold\r\n<!-- giong:end -->\r\nb\r\n";
         match merge_block(Some(text), block, "", "AGENTS.md") {
-            Change::Write(t) => assert_eq!(t, format!("a\r\n{block}b\r\n")),
+            Change::Write(t) => assert_eq!(t, format!("a\r\n{}b\r\n", block.replace('\n', "\r\n"))),
             other => panic!("{other:?}"),
         }
     }
@@ -632,7 +989,7 @@ mod tests {
     #[test]
     fn dry_run_writes_nothing() {
         let dir = scratch("dry");
-        let out = apply(&dir, GIONG_VERSION, true);
+        let out = apply(&dir, GIONG_VERSION, true, &Offer::all());
         assert_eq!(out.written.len(), 5);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         fs::remove_dir_all(&dir).unwrap();

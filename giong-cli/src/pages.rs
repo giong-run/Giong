@@ -3030,4 +3030,50 @@ Raised by the `giong` command (giong-cli): `giong test --nextest`. In JSON outpu
 
 [All error codes](README.md)
 "#),
+    (5086, r#"# GIONG-E5086: the tests took longer than the time limit
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5086"`.
+
+## What happened
+
+A run of the suite went on longer than `--timeout` seconds (1800 by default), so `giong test` stopped cargo and every test process it had started. The finding names the tests libtest reported as running for over 60 seconds. A test that waits for a reply, a lock or a message that never comes runs for ever.
+
+## How to fix it
+
+- Run the named test alone: `cargo test <name> -- --nocapture`, and see where it waits.
+- Give every wait for another party a deadline: `giong::time::timeout(duration, fut)`. A test then fails with the reason instead of hanging.
+- For a suite that is slow rather than stuck, raise the limit: `giong test --timeout 3600`, or `--timeout 0` for none.
+
+[All error codes](README.md)
+"#),
+    (5087, r#"# GIONG-E5087: git init failed in the new project
+
+Raised by the `giong` command (giong-cli): `giong new`. In JSON output: `"code": "GIONG-E5087"`.
+
+## What happened
+
+`giong new` wrote every file of the project, then ran `git init` in it, and that failed (the message says why: often git is not installed, or the directory is inside a repository that git refuses to nest in). The project itself is complete. This is a warning.
+
+## How to fix it
+
+- Install git and run `git init` in the project, or leave it out: `giong new --no-git`.
+- `giong fix` refuses to run on changes that are not committed, so a project without git needs `giong fix --allow-dirty`.
+
+[All error codes](README.md)
+"#),
+    (5088, r#"# GIONG-E5088: .env sets a cargo or rustc setting
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5088"`.
+
+## What happened
+
+`.env` holds the service's configuration (`DATABASE_URL`, `REDIS_URL`, ...), and `giong test` gives its variables to the tests. A variable that changes how cargo or rustc build (`RUSTFLAGS`, `RUSTDOCFLAGS`, anything starting with `CARGO`, `RUSTC` or `RUSTUP_`) would change the build of the tests, and only under `giong test`, so it was left out.
+
+## How to fix it
+
+- Put build settings where cargo reads them for every command: `.cargo/config.toml` (`[build] rustflags = [...]`, `[build] target-dir = "..."`), or the shell.
+- Delete the variable from `.env`.
+
+[All error codes](README.md)
+"#),
 ];

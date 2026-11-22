@@ -22,7 +22,9 @@
   uncommitted changes (`--allow-dirty` to go ahead), and `--dry-run` shows the diff.
 - **giong-cli**: `giong test` runs the suite with the variables of `.env`, then again with
   `GIONG_DRIVER=epoll` on Linux (the driver a container without io_uring gets), and reports
-  each failure with its driver and its output; `--quick` runs once, `--nextest` uses
-  cargo-nextest.
-- **giong-cli**: codes `GIONG-E5030` to `GIONG-E5039` and `GIONG-E5080` to `GIONG-E5085`,
+  each failure with its driver and its output. A run that takes over 30 minutes
+  (`--timeout`) is stopped with every process it started, naming the tests still running;
+  cargo and rustc settings in `.env` are left out of the build. `--quick` runs once,
+  `--nextest` uses cargo-nextest.
+- **giong-cli**: codes `GIONG-E5030` to `GIONG-E5039` and `GIONG-E5080` to `GIONG-E5088`,
   each with a page in `docs/errors/`.
