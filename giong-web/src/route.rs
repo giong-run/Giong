@@ -395,11 +395,77 @@ impl Captures {
         self.len -= 1;
     }
 
+    #[cfg(test)]
     pub(crate) fn get(&self, i: usize) -> Option<(usize, usize)> {
         (i < self.len).then(|| {
             let (s, e) = self.spans[i];
             (s as usize, e as usize)
         })
+    }
+}
+
+/// How many parameter spans [`Params`] holds without a heap allocation.
+const INLINE_PARAMS: usize = 4;
+
+/// The parameters of a matched request as a [`Req`](crate::Req) keeps
+/// them: byte ranges into the request target, so that reading one slices
+/// the target without finding the path in it again (into the path when it
+/// is not part of the target: the `/` of `http://host`). Smaller than
+/// [`Captures`], which a lookup fills: a `Req` is moved several times on
+/// its way to a handler, and most patterns have a few parameters at most.
+pub(crate) struct Params {
+    len: u8,
+    /// Whether the spans are in the target rather than in the path.
+    in_target: bool,
+    inline: [(u32, u32); INLINE_PARAMS],
+    /// Every span, when there are more than `INLINE_PARAMS`.
+    more: Option<Box<[(u32, u32); MAX_PARAMS]>>,
+}
+
+impl Params {
+    /// The spans of `caps`, which are ranges into a path that starts
+    /// `base` bytes into the target, or into a path of its own (`None`).
+    pub(crate) fn new(caps: &Captures, base: Option<usize>) -> Self {
+        let shift = base.unwrap_or(0) as u32;
+        let at = |(s, e): (u32, u32)| (s + shift, e + shift);
+        let spans = &caps.spans[..caps.len];
+        let mut inline = [(0, 0); INLINE_PARAMS];
+        let more = if spans.len() <= INLINE_PARAMS {
+            for (slot, &span) in inline.iter_mut().zip(spans) {
+                *slot = at(span);
+            }
+            None
+        } else {
+            let mut all = Box::new([(0, 0); MAX_PARAMS]);
+            for (slot, &span) in all.iter_mut().zip(spans) {
+                *slot = at(span);
+            }
+            Some(all)
+        };
+        Self {
+            len: caps.len as u8,
+            in_target: base.is_some(),
+            inline,
+            more,
+        }
+    }
+
+    /// Whether [`get`](Self::get) gives ranges into the target (else into
+    /// the path).
+    pub(crate) fn in_target(&self) -> bool {
+        self.in_target
+    }
+
+    /// Where parameter `i` is in the target (or the path).
+    pub(crate) fn get(&self, i: usize) -> Option<(usize, usize)> {
+        if i >= self.len as usize {
+            return None;
+        }
+        let (s, e) = match &self.more {
+            Some(all) => all[i],
+            None => self.inline[i],
+        };
+        Some((s as usize, e as usize))
     }
 }
 
@@ -485,10 +551,15 @@ fn search<'t>(
         return check(&node.here, method, matched);
     }
     let start = pos + 1;
-    let end = path[start..].find('/').map_or(path.len(), |i| start + i);
+    // `/` and `%` are ASCII: a byte search finds them, with no character
+    // decoding.
+    let end = path.as_bytes()[start..]
+        .iter()
+        .position(|&b| b == b'/')
+        .map_or(path.len(), |i| start + i);
     let seg = &path[start..end];
 
-    let child = if seg.contains('%') {
+    let child = if seg.as_bytes().contains(&b'%') {
         // `%7E` and `~` are the same character; a segment that does not
         // decode matches no text.
         percent::decode(seg)

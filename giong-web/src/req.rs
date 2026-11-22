@@ -11,7 +11,7 @@ use giong::error::Code;
 use giong_http::Request;
 
 use crate::percent;
-use crate::route::Captures;
+use crate::route::Params;
 use crate::Error;
 
 /// What a route knows about itself: its pattern and parameter names.
@@ -82,7 +82,7 @@ pub struct Req<S = ()> {
     http: Request,
     state: Rc<S>,
     route: Option<Rc<RouteInfo>>,
-    caps: Captures,
+    params: Params,
     id: Option<IdBuf>,
     extensions: Vec<Box<dyn Any>>,
 }
@@ -92,13 +92,13 @@ impl<S> Req<S> {
         http: Request,
         state: Rc<S>,
         route: Option<Rc<RouteInfo>>,
-        caps: Captures,
+        params: Params,
     ) -> Self {
         Self {
             http,
             state,
             route,
-            caps,
+            params,
             id: None,
             extensions: Vec::new(),
         }
@@ -217,11 +217,16 @@ impl<S> Req<S> {
     fn raw_param(&self, name: &str) -> Result<(&str, bool), Error> {
         let route = self.route.as_deref();
         let index = route.and_then(|r| r.names.iter().position(|n| &**n == name));
-        let span = index.and_then(|i| self.caps.get(i));
+        let span = index.and_then(|i| self.params.get(i));
         match (span, route, index) {
             (Some((start, end)), Some(r), Some(i)) => {
                 let catch_all = r.catch_all && i + 1 == r.names.len();
-                Ok((&self.http.path()[start..end], catch_all))
+                let source = if self.params.in_target() {
+                    self.http.target()
+                } else {
+                    self.http.path()
+                };
+                Ok((&source[start..end], catch_all))
             }
             _ => {
                 let pattern = route.map_or("(no route)", |r| &r.pattern);
