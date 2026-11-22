@@ -154,11 +154,15 @@ fn an_unknown_giong_driver_is_an_error() {
 #[cfg_attr(giong_libkqueue, ignore = "the libkqueue build has every driver")]
 fn a_driver_this_system_does_not_have_is_refused_by_build() {
     #[cfg(target_os = "linux")]
-    let missing = [(DriverKind::Kqueue, Code::InvalidConfig, "kqueue")];
+    let missing = [
+        (DriverKind::Kqueue, Code::InvalidConfig, "kqueue"),
+        (DriverKind::Iocp, Code::InvalidConfig, "iocp"),
+    ];
     #[cfg(target_os = "macos")]
     let missing = [
         (DriverKind::IoUring, Code::IoUringUnavailable, "io_uring"),
         (DriverKind::Epoll, Code::InvalidConfig, "epoll"),
+        (DriverKind::Iocp, Code::InvalidConfig, "iocp"),
     ];
     #[cfg(windows)]
     let missing = [
