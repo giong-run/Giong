@@ -6,9 +6,11 @@ name: Fuzz
 # router and request handling, giong-mcp's request handling, giong-grpc's
 # message framing, gzip, timeouts, status messages, metadata and descriptors, the PostgreSQL,
 # MySQL and Redis protocol readers, and what giong-tls reads of the peer's
-# records around kernel TLS. Every night each target runs for 10 minutes and
+# records around kernel TLS, giong-quic's packets and giong-proto's decoder
+# against the reference one. Every night each target runs for 10 minutes and
 # its corpus is kept in the Actions cache, so the corpus keeps growing. A pull
-# request gets a one-minute run of the targets of the crates it changes (one
+# request gets a one-minute run of the targets of the crates it changes, and
+# of the targets that go through them (one
 # target of each crate when it changes this file), and a push to main a
 # one-minute run of every target, which catches a change in one crate that
 # breaks another's target. A crash fails the job and uploads the input that
@@ -28,6 +30,9 @@ on:
       - "giong-tls/**"
       - "giong-mcp/**"
       - "giong-grpc/**"
+      - "giong-grpc-build/**"
+      - "giong-proto/**"
+      - "giong-quic/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -41,6 +46,9 @@ on:
       - "giong-tls/**"
       - "giong-mcp/**"
       - "giong-grpc/**"
+      - "giong-grpc-build/**"
+      - "giong-proto/**"
+      - "giong-quic/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
@@ -134,7 +142,18 @@ jobs:
               crates=$(sed -n -e 's#^\(src\|fuzz\)/.*#giong#p' -e 's#^\(giong-[a-z0-9-]*\)/.*#\1#p' <<<"$changed" \
                 | sort -u | jq -R . | jq -c -s .)
             fi
-            all=$(jq -c --argjson crates "$crates" '[.[] | select(.crate as $c | $crates | index($c))]' <<<"$all")
+            # Targets that drive another crate run when it changes too:
+            # giong-http's h3 targets go through giong-quic, giong-proto's
+            # differential target and giong-grpc read code that
+            # giong-grpc-build generates, and giong-grpc reads giong-proto.
+            all=$(jq -c --argjson crates "$crates" '
+              def changed($c): $crates | index($c);
+              [.[] | select(
+                changed(.crate)
+                or (changed("giong-quic") and .crate == "giong-http" and (.target | startswith("h3")))
+                or (changed("giong-grpc-build") and (.crate == "giong-proto" or .crate == "giong-grpc"))
+                or (changed("giong-proto") and .crate == "giong-grpc")
+              )]' <<<"$all")
           fi
           echo "Targets: $(jq -r 'map(.crate + " " + .target) | join(", ")' <<<"$all")"
           echo "matrix={\"include\":$all}" >> "$GITHUB_OUTPUT"
