@@ -2870,7 +2870,7 @@ Raised by the `giong` command (giong-cli): `giong ai init` (also run by `giong n
 
 ## What happened
 
-`giong ai init` adds two MCP servers to `.mcp.json` (`giong`, this command over stdio, and `giong-service`, the running service's giong-mcp), keeping every other server and key. The file is not one JSON object with an object under `mcpServers`, so giong left it untouched rather than guess.
+`giong ai init` adds the `giong` MCP server (this command over stdio) to `.mcp.json`, keeping every other server and key. The file is not one JSON object with an object under `mcpServers`, so giong left it untouched rather than guess.
 
 ## How to fix it
 

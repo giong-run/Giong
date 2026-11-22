@@ -11,8 +11,8 @@
   against real servers in CI (`scripts/templates.sh`), and `examples/rest-api` is now the
   `web` template's output.
 - **giong-cli**: `giong ai init` (also run by `giong new`) writes `AGENTS.md`, `CLAUDE.md`, a
-  Cursor rule, the Gióng skill of the release in `.claude/skills/giong/`, and the `giong` and
-  `giong-service` MCP servers in `.mcp.json`. It can run again at any time: it replaces only
+  Cursor rule, the Gióng skill of the release in `.claude/skills/giong/`, and the `giong` MCP
+  server in `.mcp.json`. It can run again at any time: it replaces only
   its own marked block or files and never reorders or drops anything else.
 - **giong-cli**: codes `GIONG-E5030` to `GIONG-E5039` and `GIONG-E5080` to `GIONG-E5082`,
   each with a page in `docs/errors/`.

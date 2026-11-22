@@ -6,8 +6,8 @@
 //! Safe to run again and again: in a file someone else wrote it only adds or
 //! replaces its own marked block (`<!-- giong:begin -->` ... `<!-- giong:end -->`),
 //! a whole file it rewrites only when the file carries its `<!-- giong:owned -->`
-//! line, and in `.mcp.json` it adds its two servers when they are missing and
-//! touches nothing else.
+//! line, and in `.mcp.json` it adds its server when it is missing and touches
+//! nothing else.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,8 +28,8 @@ pub const COMMAND: Command = Command {
             Writes, at the root of the project: AGENTS.md (the Gióng rules and this project's \
             commands, read by Codex, Copilot, Cursor, Gemini and others), CLAUDE.md (imports \
             AGENTS.md for Claude Code), .cursor/rules/giong.mdc, the Gióng skill of this release \
-            in .claude/skills/giong/, and two MCP servers in .mcp.json: giong (this command, \
-            over stdio) and giong-service (the running service's giong-mcp). Run it again at \
+            in .claude/skills/giong/, and the giong MCP server in .mcp.json (this command over \
+            stdio, which also reaches the service giong dev runs). Run it again at \
             any time: it replaces only what it wrote (a marked block, or a file with its \
             giong:owned line) and never changes anything else. giong new runs it.",
     flags: &[Flag {
@@ -101,10 +101,9 @@ skill in `.claude/skills/giong/SKILL.md` has every rule; the ones that matter mo
 | Check the machine and the project | `giong doctor` |
 | Start the database, apply migrations | `giong db up`, `giong db migrate` |
 
-To see inside the running service (workers, tasks by spawn line, pools, a blocked worker),
-use the MCP servers in `.mcp.json`: `giong` (this project's commands) and `giong-service`
-(the service's giong-mcp, when it runs with `GIONG_MCP=127.0.0.1:7777` and
-`GIONG_MCP_TOKEN`).
+The `giong` MCP server in `.mcp.json` serves these commands to agents and, while `giong dev`
+runs the service, the service's own view of itself (workers, tasks by spawn line, pools, a
+blocked worker): ask it rather than guess why the service is slow or stuck.
 {END}
 "#
     )
@@ -228,23 +227,15 @@ fn owned_file(existing: Option<&str>, content: String, path: &str) -> Change {
 
 /// Adds giong's MCP servers to `.mcp.json`, keeping everything else.
 fn merge_mcp(existing: Option<&str>) -> Change {
-    let servers = [
-        ("giong", json!({"command": "giong", "args": ["mcp"]})),
-        (
-            "giong-service",
-            json!({
-                "type": "http",
-                "url": "http://127.0.0.1:7777/mcp",
-                "headers": {"Authorization": "Bearer ${GIONG_MCP_TOKEN:-}"}
-            }),
-        ),
-    ];
+    // One server: `giong mcp` serves this project's commands and, while
+    // `giong dev` runs the service, forwards the service's own giong-mcp tools.
+    let servers = [("giong", json!({"command": "giong", "args": ["mcp"]}))];
     let invalid = |why: String| {
         Change::Keep(
             Finding::new(
                 Code::MCP_JSON_INVALID,
                 Severity::Error,
-                ".mcp.json could not be read, so its MCP servers were not added",
+                ".mcp.json could not be read, so the giong MCP server was not added",
             )
             .detail(why)
             .fix(
@@ -510,7 +501,7 @@ mod tests {
         assert!(skill.contains(OWNED));
         let mcp: Value = serde_json::from_str(&read(&dir, ".mcp.json")).unwrap();
         assert_eq!(mcp["mcpServers"]["giong"]["args"][0], "mcp");
-        assert_eq!(mcp["mcpServers"]["giong-service"]["type"], "http");
+        assert_eq!(mcp["mcpServers"].as_object().unwrap().len(), 1);
 
         let second = init_dir(&dir, None);
         assert!(
@@ -557,7 +548,7 @@ mod tests {
             mcp["mcpServers"]["giong"]["command"], "/opt/giong",
             "theirs is kept"
         );
-        assert!(mcp["mcpServers"]["giong-service"].is_object());
+        assert_eq!(mcp["mcpServers"].as_object().unwrap().len(), 2);
         // The order of the keys stays the user's.
         let zeta = text.find("zeta").unwrap();
         assert!(zeta < text.find("mcpServers").unwrap() && text.find("alpha").unwrap() > zeta);

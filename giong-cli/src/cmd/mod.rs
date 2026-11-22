@@ -11,6 +11,7 @@ use crate::report::{Failure, Report};
 
 pub mod ai;
 pub mod explain;
+pub mod fix;
 pub mod help;
 pub mod new;
 pub mod version;
@@ -36,6 +37,7 @@ pub const COMMANDS: &[&Command] = &[
     // `image`, `openapi`, `record`.
     &new::COMMAND,
     &ai::COMMAND,
+    &fix::COMMAND,
     &explain::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
