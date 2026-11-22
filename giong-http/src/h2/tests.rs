@@ -217,6 +217,7 @@ struct TestServer {
 
 impl TestServer {
     fn start(server: Server) -> Self {
+        quiet_expected_panics();
         let app = App::default();
         let state = app.0.clone();
         let rt = giong::Builder::new()
@@ -659,6 +660,31 @@ impl Client {
 
 fn reason(code: u32) -> &'static str {
     Reason::from_u32(code).map_or("unknown", Reason::name)
+}
+
+/// Prints the panics a test causes on purpose, whose message says "(expected
+/// by this test)", as one line, without a backtrace; every other panic goes
+/// to the default hook. A handler's panic runs the hook on the worker that
+/// then answers 500: with `RUST_BACKTRACE` set, symbolizing a backtrace there
+/// took 1.5 s a panic under ThreadSanitizer, past the client's read timeout
+/// on a loaded machine.
+fn quiet_expected_panics() {
+    static QUIET: std::sync::Once = std::sync::Once::new();
+    QUIET.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+            if message.is_some_and(|m| m.contains("(expected by this test)")) {
+                eprintln!("{info}");
+            } else {
+                default(info);
+            }
+        }));
+    });
 }
 
 // ------------------------------------------------------------------- tests
