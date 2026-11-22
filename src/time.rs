@@ -8,7 +8,13 @@
 //!
 //! A timer fires at its deadline, to the precision of the clock and of the
 //! kernel's wake-up, and never early: a sleep of 1 ms takes about 1.05 ms
-//! on Linux.
+//! on Linux. Timers fire in the order of their deadlines to the
+//! millisecond; within one millisecond, in no set order.
+//!
+//! After timers fire, a worker waits for the next ones until at least a
+//! millisecond later, so that thousands of timers cost about one wake-up per
+//! millisecond, not one each. A loop of sleeps shorter than 1 ms therefore
+//! takes about 1 ms a turn.
 
 use std::fmt;
 use std::future::Future;
@@ -492,6 +498,11 @@ impl fmt::Debug for Sleep {
 }
 
 /// Completes after `duration` has elapsed.
+///
+/// Never early, and late by about the kernel's wake-up time. Right after
+/// other timers of the worker fired, by up to a millisecond: a loop of
+/// sleeps shorter than 1 ms takes about 1 ms a turn (see the [module
+/// documentation](self)).
 pub fn sleep(duration: Duration) -> Sleep {
     let now = Instant::now();
     // Saturate instead of panicking on absurd durations.
