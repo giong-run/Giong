@@ -266,3 +266,128 @@ impl Drop for SignalGuard {
         SIGNALS_IN_USE.store(false, Ordering::SeqCst);
     }
 }
+
+/// `MSG_DONTWAIT`: this one call does not wait, whatever the socket's mode.
+pub(crate) const MSG_DONTWAIT: i32 = libc::MSG_DONTWAIT;
+
+/// One piece of a vectored send or receive.
+pub(crate) type IoVec = libc::iovec;
+
+/// An IPv6 socket address, the largest giong reads from a datagram.
+pub(crate) type SockAddrIn6 = libc::sockaddr_in6;
+
+/// The address family of IPv4, as a socket address carries it.
+pub(crate) const AF_INET: i32 = libc::AF_INET;
+/// The address family of IPv6.
+pub(crate) const AF_INET6: i32 = libc::AF_INET6;
+/// The flag a received message carries when its end was cut off.
+pub(crate) const MSG_TRUNC: i32 = libc::MSG_TRUNC;
+
+/// The piece of `len` bytes at `base`.
+#[inline(always)]
+pub(crate) fn io_vec(base: *const u8, len: usize) -> IoVec {
+    libc::iovec {
+        iov_base: base.cast_mut().cast(),
+        iov_len: len,
+    }
+}
+
+/// Where a piece starts and how long it is.
+#[inline(always)]
+pub(crate) fn io_vec_parts(v: &IoVec) -> (*const u8, usize) {
+    (v.iov_base as *const u8, v.iov_len)
+}
+
+/// Points a piece at `base`, keeping its length.
+#[inline(always)]
+pub(crate) fn io_vec_set_base(v: &mut IoVec, base: *const u8) {
+    v.iov_base = base.cast_mut().cast();
+}
+
+/// The header of a receive that only says how much room the sender's
+/// address gets: `name_len` bytes, and nothing else.
+pub(crate) const fn recv_header(name_len: usize) -> MsgHdr {
+    // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
+    let mut hdr: MsgHdr = unsafe { mem::zeroed() };
+    hdr.msg_namelen = name_len as SockLen;
+    hdr
+}
+
+/// Points a message header at `count` pieces.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_iov(msg: *mut MsgHdr, iov: *mut IoVec, count: usize) {
+    (*msg).msg_iov = iov;
+    (*msg).msg_iovlen = count as _;
+}
+
+/// Points a message header at `len` bytes of ancillary data.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_control(msg: *mut MsgHdr, control: *mut u8, len: usize) {
+    (*msg).msg_control = control.cast();
+    (*msg).msg_controllen = len as _;
+}
+
+/// Points a message header at an address of `len` bytes, or at room for one.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_name(msg: *mut MsgHdr, name: *mut u8, len: SockLen) {
+    (*msg).msg_name = name.cast();
+    (*msg).msg_namelen = len;
+}
+
+/// The length of the address in a message header.
+#[inline(always)]
+pub(crate) fn msg_name_len(msg: &MsgHdr) -> usize {
+    msg.msg_namelen as usize
+}
+
+/// `send(2)` that does not wait: the bytes sent, or -1 with `errno` set.
+///
+/// # Safety
+///
+/// `buf` must be valid for `len` bytes.
+#[inline(always)]
+pub(crate) unsafe fn send_nowait(fd: RawSock, buf: *const u8, len: usize) -> isize {
+    libc::send(fd, buf.cast(), len, super::MSG_NOSIGNAL | MSG_DONTWAIT)
+}
+
+/// `sendto(2)` that does not wait: the bytes sent, or -1 with `errno` set.
+///
+/// # Safety
+///
+/// `buf` must be valid for `len` bytes and `addr` for `addr_len`.
+#[inline(always)]
+pub(crate) unsafe fn send_to_nowait(
+    fd: RawSock,
+    buf: *const u8,
+    len: usize,
+    addr: *const SockAddr,
+    addr_len: SockLen,
+) -> isize {
+    libc::sendto(
+        fd,
+        buf.cast(),
+        len,
+        super::MSG_NOSIGNAL | MSG_DONTWAIT,
+        addr,
+        addr_len,
+    )
+}
+
+/// `true` if a send with `flags` waits for room in the socket's buffer;
+/// `false` if it asked not to (`MSG_DONTWAIT`).
+#[inline(always)]
+pub(crate) fn send_waits(flags: i32) -> bool {
+    flags & MSG_DONTWAIT == 0
+}

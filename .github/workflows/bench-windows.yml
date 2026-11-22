@@ -1,0 +1,50 @@
+name: Windows benchmarks
+
+# The core micro-benchmarks (bench/core.sh) on the Windows runners: Gióng's
+# completion port driver against Tokio and smol. Shared virtual machines,
+# runs not pinned to cores: for comparing runtimes on the same machine, not
+# for absolute numbers. Runs when the benchmarks change.
+on:
+  pull_request:
+    paths:
+      - bench/core/**
+      - bench/core.sh
+      - .github/workflows/bench-windows.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - run: nproc && systeminfo | grep -E "OS Name|OS Version|Processor|Total Physical"
+      - name: Core benchmarks
+        env:
+          RUNTIMES: giong tokio-ct tokio-local tokio-mt smol
+          # No `connect`: each run opens 10,000 connections, and Windows
+          # keeps a closed one's port in TIME_WAIT for two minutes, so the
+          # 16,384 ephemeral ports run out by the second runtime.
+          WORKLOADS: spawn yield pingpong mpsc bounded oneshot chain timers timeout xthread tcp-rr lookup
+        run: bench/core.sh 5 "../results/core/${{ matrix.os }}"
+      - run: cat "bench/results/core/${{ matrix.os }}/summary.txt" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-core-${{ matrix.os }}
+          path: bench/results/core/${{ matrix.os }}
