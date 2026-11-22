@@ -133,7 +133,14 @@ impl<S> Req<S> {
     /// * a `/` (`%2F`) in a one-segment parameter (`{name}`), which would
     ///   make it several segments;
     /// * a catch-all (`{*path}`) value that starts with `/` (`/files//etc`),
-    ///   which `Path::join` would take as an absolute path.
+    ///   which `Path::join` would take as an absolute path;
+    /// * on Windows, also: a `\` (`%5C`), which separates directories there
+    ///   as `/` does (so `..\` is refused, a one-segment parameter holds no
+    ///   `\`, and a value starting with `\` or `\\server` is refused); a `:`
+    ///   (`C:\`, `C:x`, a file's `:stream`); a segment that is `.` or `..`
+    ///   once Windows drops the spaces at its end; and the name of a device
+    ///   (`CON`, `NUL`, `COM1`, `nul.txt`...), which Windows opens instead
+    ///   of a file.
     ///
     /// So a catch-all can be joined to a directory as it is:
     ///
@@ -402,27 +409,84 @@ impl<S> Req<S> {
 /// a handler joining it to a directory would take outside that directory.
 /// See [`Req::param`].
 fn check_path_value(text: &str, catch_all: bool) -> Result<(), &'static str> {
-    // Most values have none of these: one scan, and done.
-    if !text.bytes().any(|b| matches!(b, b'.' | b'/' | 0)) {
+    check_path_value_on(text, catch_all, cfg!(windows))
+}
+
+/// [`check_path_value`] for Windows paths or Unix ones, whichever this
+/// build joins values to; tested both ways on every platform.
+fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(), &'static str> {
+    // Most values have none of these: one scan, and done. On Windows, a
+    // value without them may still name a device (`con`, `nul`...).
+    let marked = text
+        .bytes()
+        .any(|b| matches!(b, b'.' | b'/' | 0) || (windows && matches!(b, b'\\' | b':')));
+    if !marked && !(windows && names_a_device(text)) {
         return Ok(());
     }
     if text.contains('\0') {
         return Err("a NUL character (%00) is not allowed");
     }
-    if !catch_all && text.contains('/') {
-        return Err("a `/` (%2F) is not allowed in a parameter of one segment");
+    if windows && text.contains(':') {
+        return Err(
+            "a `:` (%3A) is not allowed: on Windows it names a drive (`C:`) or a file's stream",
+        );
     }
-    if text.starts_with('/') {
-        return Err("the value starts with `/`, which would make it an absolute path");
+    // On Windows `\` separates directories as `/` does.
+    let separator = |c: char| c == '/' || (windows && c == '\\');
+    if !catch_all && text.contains(separator) {
+        return Err(if windows {
+            "a `/` or `\\` (%2F, %5C) is not allowed in a parameter of one segment"
+        } else {
+            "a `/` (%2F) is not allowed in a parameter of one segment"
+        });
     }
-    for segment in text.split('/') {
+    if text.starts_with(separator) {
+        return Err(if windows {
+            "the value starts with `/` or `\\`, which would make it an absolute or UNC path"
+        } else {
+            "the value starts with `/`, which would make it an absolute path"
+        });
+    }
+    for segment in text.split(separator) {
+        // Windows drops the spaces at the end of a name: `.. ` is `..`.
+        let segment = if windows {
+            segment.trim_end_matches(' ')
+        } else {
+            segment
+        };
         match segment {
             "." => return Err("a `.` segment is not allowed"),
             ".." => return Err("a `..` segment is not allowed"),
+            _ if windows && names_a_device(segment) => {
+                return Err(
+                    "the name of a Windows device (CON, PRN, AUX, NUL, COM1-9, LPT1-9) is not \
+                     allowed",
+                )
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+/// Whether Windows opens `name` (one segment) as a device rather than a
+/// file: `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`,
+/// `CONIN$` and `CONOUT$`, in any case, with any extension (`nul.txt`) and
+/// spaces at the end.
+fn names_a_device(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let b = stem.as_bytes();
+    match b.len() {
+        3 => ["CON", "PRN", "AUX", "NUL"]
+            .iter()
+            .any(|d| stem.eq_ignore_ascii_case(d)),
+        4 => {
+            (b[..3].eq_ignore_ascii_case(b"COM") || b[..3].eq_ignore_ascii_case(b"LPT"))
+                && matches!(b[3], b'1'..=b'9')
+        }
+        6 | 7 => stem.eq_ignore_ascii_case("CONIN$") || stem.eq_ignore_ascii_case("CONOUT$"),
+        _ => false,
+    }
 }
 
 /// Parses a parameter value, with the parser's own words for the failure.
@@ -475,5 +539,69 @@ impl<S> fmt::Debug for Req<S> {
             .field("request_id", &self.request_id())
             .field("body_len", &self.body().len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_path_value_on;
+
+    /// What Windows' `Path::join` and file APIs read as a way out of the
+    /// directory: `\` separators, drives, UNC and device paths, streams,
+    /// and the names of devices.
+    #[test]
+    fn windows_separators_drives_and_devices_are_refused_there() {
+        for (value, catch_all, why) in [
+            ("..\\..\\windows\\win.ini", true, "`..`"),
+            ("a\\..\\..\\secret", true, "`..`"),
+            ("a/..\\x", true, "`..`"),
+            (".\\x", true, "`.`"),
+            ("a\\.. \\x", true, "`..`"),
+            ("a/. /x", true, "`.`"),
+            ("\\windows\\win.ini", true, "starts with"),
+            ("\\\\server\\share\\x", true, "starts with"),
+            ("C:\\windows\\win.ini", true, "`:`"),
+            ("C:secret", true, "`:`"),
+            ("a/file.txt:stream", true, "`:`"),
+            ("a\\b", false, "`\\`"),
+            ("..\\secret", false, "`\\`"),
+            ("con", false, "device"),
+            ("a/NUL.txt", true, "device"),
+            ("a/com1", true, "device"),
+            ("Lpt9.log", false, "device"),
+            ("conout$", false, "device"),
+            ("aux ", false, "device"),
+        ] {
+            let e = check_path_value_on(value, catch_all, true)
+                .expect_err(&format!("{value:?} must be refused on Windows"));
+            assert!(e.contains(why), "{value:?}: {e}");
+        }
+        for value in [
+            "a/b.txt",
+            "...",
+            "a/.../b",
+            "console.log",
+            "com10",
+            "a.b/c d",
+            "nul1",
+        ] {
+            assert_eq!(check_path_value_on(value, true, true), Ok(()), "{value:?}");
+        }
+    }
+
+    /// On Unix those are ordinary file names: nothing changes there.
+    #[test]
+    fn backslashes_colons_and_device_names_are_plain_names_on_unix() {
+        for value in [
+            "..\\..\\x",
+            "C:\\x",
+            "\\\\server\\share",
+            "con",
+            "a/NUL.txt",
+            "a:b",
+        ] {
+            assert_eq!(check_path_value_on(value, true, false), Ok(()), "{value:?}");
+        }
+        assert!(check_path_value_on("a/../b", true, false).is_err());
     }
 }
