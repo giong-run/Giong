@@ -8,6 +8,69 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-22
+
+### Added
+
+- **Documentation**: [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md), how to build, deploy
+  and test a service on giong, each rule with its reason; a skill for coding agents,
+  [skills/giong](skills/giong/SKILL.md); and [docs/BENCHMARKS.md](docs/BENCHMARKS.md), every
+  benchmark table, moved out of the README. giong.run has a page for every crate and guide,
+  each also as Markdown, with "Copy for agent" and "Copy prompt" buttons, and serves the
+  skill as a zip with the release's documentation
+  ([#212](https://github.com/giong-run/Giong/pull/212)).
+- **Benchmarks**: build time, disk and binary size of a small service on giong-web against
+  axum with tower-http (`bench/build.sh`, [docs/BENCHMARKS.md](docs/BENCHMARKS.md#build-time-and-size)):
+  22 crates against 83, a clean debug build in 7.4 s against 18.8 s, a stripped binary of
+  1.45 MB against 3.60 MB.
+- **giong**: Windows support. The runtime, TCP, UDP, files, timers, DNS and signals run on
+  Windows through a completion-port driver (tested on Windows Server 2022 and 2025),
+  `DriverKind::Iocp` (`GIONG_DRIVER=iocp`), the only driver there. Listeners and UDP
+  sockets of one address on several workers share one socket, as Windows has no
+  `SO_REUSEPORT`: a thread hands connections round to the listeners and datagrams to the
+  sockets by the sender's address. Files are read and written overlapped through the port,
+  other file operations and consoles go to the blocking threads, and the DNS configuration
+  comes from the network adapters. `Builder::shutdown_on_signals` listens for Ctrl+C,
+  Ctrl+Break, console close, log-off and shutdown. Not yet on Windows: Unix sockets,
+  `unstable-udp-offload` (a compile error), system trust roots, more than 64 CPUs, and the
+  crates other than giong ([#174](https://github.com/giong-run/Giong/pull/174)).
+
+### Changed
+
+- **Roadmap**: the developer kit (the `giong` command) in 1.5.0, then 1.5.x (deep debugging
+  on every platform, then every number measured again on bare metal), and 1.6 and 1.7 as
+  proposed milestones. giong.run's home page shows each crate head to head with the Tokio
+  crate it replaces, with the losses next to the wins, the build numbers and what comes
+  next; the roadmap page draws every milestone on one track, gives each one ahead a card,
+  and no longer calls a milestone shipped before its release is out. Every other page
+  follows: big measured numbers at the top of the crates, benchmarks and releases pages,
+  the head-to-head table and the build numbers on the benchmarks page, each crate's
+  result against the crate it replaces on the crates page, and a 404 page of its own.
+
+### Security
+
+- **giong-web**: on Windows, `Req::param` refuses path parameters that `Path::join` there would
+  take out of the directory: `..\` and `.\` segments (`%5C`), a `\` in a one-segment parameter,
+  values that start with `\` or `\\server` (UNC), a `:` (`C:\windows`, `C:x`, `file:stream`),
+  `.` or `..` followed by spaces, and device names (`CON`, `NUL`, `COM1`, `nul.txt`...). Before,
+  only `/` counted as a separator, so `GET /files/..%5C..%5Cwindows%5Cwin.ini` passed the check
+  that documents a catch-all as safe to join to a directory. Nothing changes on Linux and
+  macOS, where these are ordinary file names.
+- **giong-http**: an HTTP/2 SETTINGS frame moves the stream windows once, by the last
+  `SETTINGS_INITIAL_WINDOW_SIZE` it holds, instead of once per value. A frame of the largest
+  default size holds 2,730 of them: with 100 streams open, a client made each frame cost
+  273,000 stream updates, about 2 seconds of a worker per connection for the frames the flood
+  limit lets through. The check that no window passes 2^31-1 still takes the largest value in
+  the frame, as processing the values in order would
+  ([#233](https://github.com/giong-run/Giong/issues/233)).
+- **giong-http**: `Server::serve_h3` (`unstable-http3`) bounds the response bytes a
+  connection holds that the client has not taken, as HTTP/2 does: handlers wait once a
+  connection holds the larger of `max_body_size` and 1 MiB. A client that asked for many
+  large answers on one connection and gave no flow-control credit made the server hold
+  them all until the write timeout: 100 answers of 10 MB on one connection took the
+  server from 4 to 959 MiB, now 24 MiB
+  ([#231](https://github.com/giong-run/Giong/issues/231)).
+
 ## [1.3.0] - 2026-11-22
 
 HTTP/3: a new crate, giong-quic, carries QUIC on giong's own UDP sockets, and giong-http
@@ -2729,7 +2792,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/giong-run/Giong/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/giong-run/Giong/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/giong-run/Giong/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/giong-run/Giong/compare/v1.0.1...v1.1.0
