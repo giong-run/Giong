@@ -478,6 +478,9 @@ fn statements_that_change_the_session_are_refused_on_shared_connections() {
             "SELECT @v := 1",
             "PREPARE p FROM 'SELECT 1'",
             "HANDLER pool_tmp OPEN",
+            // A procedure may do any of the above, out of sight.
+            "CALL pool_p()",
+            "  /* c */ call pool_p(1, @out)",
         ] {
             let e = pool.execute(sql, &[]).await.unwrap_err();
             assert_eq!(e.kind(), ErrorKind::Statement, "{sql:?}: {e}");

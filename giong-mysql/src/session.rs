@@ -198,6 +198,11 @@ pub(crate) fn changes_in(words: &Words, sql: &str) -> Option<&'static str> {
         Some("SQL prepared statements belong to the session")
     } else if words.is(0, &["HANDLER"]) {
         Some("a HANDLER belongs to the session")
+    } else if words.is(0, &["CALL"]) {
+        Some(
+            "CALL runs a stored procedure, which may change the session (variables, a \
+             transaction, locks) where the server does not report it",
+        )
     } else if temporary_table(words) {
         Some("a temporary table belongs to the session")
     } else {
@@ -266,6 +271,8 @@ mod tests {
             "SELECT @n := @n + 1 FROM t",
             "SELECT a INTO @v FROM t",
             "SELECT a FROM t INTO\n  @v",
+            "CALL p()",
+            "call db.p(?)",
         ] {
             assert!(may_change(sql), "{sql}");
             assert!(changes(sql).is_some(), "{sql}");
@@ -281,7 +288,6 @@ mod tests {
         // Anything but a plain read or write may change the session when
         // a connection is given back.
         for sql in [
-            "CALL p()",
             "LOCK TABLES t WRITE",
             "FLUSH TABLES WITH READ LOCK",
             "DO GET_LOCK('a', 0)",
