@@ -140,8 +140,11 @@ impl<S> Req<S> {
     ///   (`C:\`, `C:x`, a file's `:stream`); a segment that is `.` or `..`
     ///   once Windows drops the spaces at its end; a name that ends in `.`
     ///   or a space, which Windows drops, opening another file (`.env.` is
-    ///   `.env`); and the name of a device (`CON`, `NUL`, `COM1`, `COM¹`,
-    ///   `nul.txt`...), which Windows opens instead of a file. A value such
+    ///   `.env`); a name with `~` and a digit before its extension, which
+    ///   Windows may read as the short 8.3 name of another file
+    ///   (`SECRE~1.TXT` for `secret-keys.txt`); and the name of a device
+    ///   (`CON`, `NUL`, `COM0`, `COM¹`, `nul.txt`...), which Windows opens
+    ///   instead of a file. A value such
     ///   as a time (`10:00`) or a URN is therefore refused on Windows: read
     ///   it with [`param_raw`](Self::param_raw) and parse it yourself.
     ///
@@ -420,9 +423,9 @@ fn check_path_value(text: &str, catch_all: bool) -> Result<(), &'static str> {
 fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(), &'static str> {
     // Most values have none of these: one scan, and done. On Windows, a
     // value without them may still name a device (`con`, `nul`...).
-    let marked = text
-        .bytes()
-        .any(|b| matches!(b, b'.' | b'/' | 0) || (windows && matches!(b, b'\\' | b':' | b' ')));
+    let marked = text.bytes().any(|b| {
+        matches!(b, b'.' | b'/' | 0) || (windows && matches!(b, b'\\' | b':' | b' ' | b'~'))
+    });
     if !marked && !(windows && names_a_device(text)) {
         return Ok(());
     }
@@ -462,8 +465,14 @@ fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(),
             ".." => return Err("a `..` segment is not allowed"),
             _ if windows && names_a_device(segment) => {
                 return Err(
-                    "the name of a Windows device (CON, PRN, AUX, NUL, COM1-9, LPT1-9) is not \
+                    "the name of a Windows device (CON, PRN, AUX, NUL, COM0-9, LPT0-9) is not \
                      allowed",
+                )
+            }
+            _ if windows && looks_short(segment) => {
+                return Err(
+                    "a name with `~` and a digit before its extension is not allowed: Windows \
+                     may read it as the short 8.3 name (`SECRE~1.TXT`) of another file",
                 )
             }
             // Windows drops the dots and spaces at the end of a name, so
@@ -481,7 +490,7 @@ fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(),
 }
 
 /// Whether Windows opens `name` (one segment) as a device rather than a
-/// file: `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`
+/// file: `CON`, `PRN`, `AUX`, `NUL`, `COM0` to `COM9`, `LPT0` to `LPT9`
 /// (and with the superscript digits `¹`, `²`, `³`), `CONIN$` and
 /// `CONOUT$`, in any case, with any extension (`nul.txt`) and spaces at the
 /// end.
@@ -500,8 +509,19 @@ fn names_a_device(name: &str) -> bool {
     (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
         && matches!(
             (digit.next(), digit.next()),
-            (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+            (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
         )
+}
+
+/// Whether Windows may take `name` (one segment) for the short 8.3 name of
+/// another file (`PROGRA~1`, `SECRE~1.TXT`): a `~` followed by a digit
+/// before the extension. Such a name opens the long-named file it stands
+/// for, so a check of the long name (a deny-list, a prefix) does not see it.
+fn looks_short(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("");
+    stem.as_bytes()
+        .windows(2)
+        .any(|w| w[0] == b'~' && w[1].is_ascii_digit())
 }
 
 /// Parses a parameter value, with the parser's own words for the failure.
@@ -590,6 +610,14 @@ mod tests {
             ("COM\u{b9}", false, "device"),
             ("lpt\u{b2}.txt", false, "device"),
             ("a/COM\u{b3}", true, "device"),
+            // So do COM0 and LPT0.
+            ("com0", false, "device"),
+            ("a/LPT0.txt", true, "device"),
+            // A short 8.3 name opens the file whose long name it stands for,
+            // past any check of the long name.
+            ("SECRE~1.TXT", false, "8.3"),
+            ("a/PROGRA~1/x", true, "8.3"),
+            ("env~12", false, "8.3"),
             // Windows drops a name's trailing dots and spaces, so these open
             // another file (`a/.env`, `secret.txt`) or the directory itself.
             ("a/.env.", true, "ends in"),
@@ -613,6 +641,10 @@ mod tests {
             "com10",
             "a.b/c d",
             "nul1",
+            "~user",
+            "a~b.txt",
+            "a~.txt",
+            "notes.tx~1",
         ] {
             assert_eq!(check_path_value_on(value, true, true), Ok(()), "{value:?}");
         }
