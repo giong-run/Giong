@@ -2909,52 +2909,6 @@ Docker or Podman could not create, start or remove the database container, or th
 
 [All error codes](README.md)
 "#),
-    (5050, r#"# GIONG-E5050: no running service to ask
-
-Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5050"`.
-
-## What happened
-
-The command reads a running service through its giong-mcp server, and found none to ask: no `--mcp` flag, no `GIONG_MCP` in the environment, and no `giong dev` serving the project in the current directory (`.giong/dev.json`).
-
-## How to fix it
-
-- Start the service with `giong dev` in the project and run the command from the same project.
-- Or run the service with `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` set (16 characters or more), keep `let _mcp = giong_mcp::start_from_env(&handle);` alive in it, and pass `--mcp 127.0.0.1:7777` with the same `GIONG_MCP_TOKEN`.
-- A service listening on a Unix socket: `--mcp unix:/path/to/mcp.sock` (no token needed).
-
-[All error codes](README.md)
-"#),
-    (5051, r#"# GIONG-E5051: the service's giong-mcp lacks a tool
-
-Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi` and `giong dashboard`. In JSON output: `"code": "GIONG-E5051"`.
-
-## What happened
-
-The service's giong-mcp answered, but has no tool the command needs. The `routes` tool is there only when giong-mcp is built with its `web` feature, and only from giong-mcp 1.5.
-
-## How to fix it
-
-- Turn on the feature in the service's `Cargo.toml`: `giong-mcp = { version = "1.5", features = ["web"] }`, with giong-web 1.5 or newer, and rebuild.
-- Use a giong-mcp of the same version as the `giong` command (`giong --version`).
-
-[All error codes](README.md)
-"#),
-    (5052, r#"# GIONG-E5052: the service's giong-mcp refused a call
-
-Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5052"`.
-
-## What happened
-
-The service's giong-mcp answered the call with an error, or with an answer this command cannot read. The message says which: a refused argument, a worker that did not answer, or an answer of another version.
-
-## How to fix it
-
-- Read the message: a worker that does not answer is stuck (`giong top` shows which and in which task).
-- Use giong-mcp and the `giong` command of the same version.
-
-[All error codes](README.md)
-"#),
     (5055, r#"# GIONG-E5055: a worker of the service is stuck in one task
 
 Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5055"`.
@@ -2982,6 +2936,52 @@ giong-mcp's `overview` listed a warning other than a stuck worker: workers that 
 ## How to fix it
 
 - Read the detail. For epoll: see [GIONG-E0001](E0001.md) and `giong doctor`. For open files: raise the limit (`ulimit -n`, `LimitNOFILE=` in a systemd unit, or the container's `nofile` ulimit) or find the leak (`giong top` lists tasks by spawn line).
+
+[All error codes](README.md)
+"#),
+    (5057, r#"# GIONG-E5057: no running service to ask
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5057"`.
+
+## What happened
+
+The command reads a running service through its giong-mcp server, and found none to ask: no `--mcp` flag, no `GIONG_MCP` in the environment, and no `giong dev` serving the project in the current directory (`.giong/dev.json`).
+
+## How to fix it
+
+- Start the service with `giong dev` in the project and run the command from the same project.
+- Or run the service with `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` set (16 characters or more), keep `let _mcp = giong_mcp::start_from_env(&handle);` alive in it, and pass `--mcp 127.0.0.1:7777` with the same `GIONG_MCP_TOKEN`.
+- A service listening on a Unix socket: `--mcp unix:/path/to/mcp.sock` (no token needed).
+
+[All error codes](README.md)
+"#),
+    (5058, r#"# GIONG-E5058: the service's giong-mcp lacks a tool
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi` and `giong dashboard`. In JSON output: `"code": "GIONG-E5058"`.
+
+## What happened
+
+The service's giong-mcp answered, but has no tool the command needs. The `routes` tool is there only when giong-mcp is built with its `web` feature, and only from giong-mcp 1.5.
+
+## How to fix it
+
+- Turn on the feature in the service's `Cargo.toml`: `giong-mcp = { version = "1.5", features = ["web"] }`, with giong-web 1.5 or newer, and rebuild.
+- Use a giong-mcp of the same version as the `giong` command (`giong --version`).
+
+[All error codes](README.md)
+"#),
+    (5059, r#"# GIONG-E5059: the service's giong-mcp refused a call
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5059"`.
+
+## What happened
+
+The service's giong-mcp answered the call with an error, or with an answer this command cannot read. The message says which: a refused argument, a worker that did not answer, or an answer of another version.
+
+## How to fix it
+
+- Read the message: a worker that does not answer is stuck (`giong top` shows which and in which task).
+- Use giong-mcp and the `giong` command of the same version.
 
 [All error codes](README.md)
 "#),

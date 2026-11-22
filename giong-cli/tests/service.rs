@@ -280,7 +280,7 @@ fn no_service_and_a_dead_socket_are_coded_failures() {
     let dir = temp_dir("none");
     let (status, r) = giong(&dir, &["routes"], &[]);
     assert_eq!(status, 2, "{r}");
-    assert_eq!(r["error"]["code"], "GIONG-E5050", "{r}");
+    assert_eq!(r["error"]["code"], "GIONG-E5057", "{r}");
     let gone = dir.join("gone.sock");
     let (status, r) = giong(
         &dir,

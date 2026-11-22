@@ -2,8 +2,10 @@
 //!
 //! Ranges (one owner each, so work in parallel never collides):
 //! E5000-E5029 the command itself, `doctor`, `check`, `explain`, `clean`, `mcp`, `dev`;
-//! E5030-E5039 and E5080-E5089 `new`, `ai`, `fix`; E5040-E5079 `db`, config,
-//! dashboard, `openapi`, `top`, `bench`, recording, `image`; E5090-E5099 free.
+//! E5030-E5039 and E5080-E5089 `new`, `ai`, `fix`; E5040-E5049 `db`, config;
+//! E5050-E5054 and E5065-E5069 `routes`, `openapi`, dashboard, recording;
+//! E5055-E5059 `top` and the giong-mcp client; E5060-E5064 `bench`;
+//! E5070-E5079 `image`; E5090-E5099 free.
 //!
 //! Findings may also carry the runtime's own codes (`GIONG-E0001` when io_uring
 //! is blocked, for example): [`Code::runtime`] makes one. Every code here has a
@@ -66,11 +68,11 @@ codes! {
     MIGRATION_UNKNOWN = 5047, "MigrationUnknown", "the database has a migration the project does not";
     DB_NOT_MANAGED = 5048, "DbNotManaged", "the database was not started by giong db up";
     DB_START_FAILED = 5049, "DbStartFailed", "the database container could not start";
-    NO_SERVICE = 5050, "NoService", "no running service to ask";
-    MCP_NO_TOOL = 5051, "McpNoTool", "the service's giong-mcp lacks a tool";
-    MCP_TOOL_ERROR = 5052, "McpToolError", "the service's giong-mcp refused a call";
     WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";
     SERVICE_WARNING = 5056, "ServiceWarning", "the service reports a warning";
+    NO_SERVICE = 5057, "NoService", "no running service to ask";
+    MCP_NO_TOOL = 5058, "McpNoTool", "the service's giong-mcp lacks a tool";
+    MCP_TOOL_ERROR = 5059, "McpToolError", "the service's giong-mcp refused a call";
     BENCH_TARGET = 5060, "BenchTarget", "the service to measure cannot be reached";
     BENCH_AGAINST = 5061, "BenchAgainst", "the build to compare against cannot be made";
     BENCH_GENERATOR_BEHIND = 5062, "BenchGeneratorBehind", "the load generator fell behind its schedule";

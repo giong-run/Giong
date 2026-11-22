@@ -279,11 +279,11 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5047](E5047.md) | `MigrationUnknown` | the database has a migration the project does not |
 | [GIONG-E5048](E5048.md) | `DbNotManaged` | the database was not started by giong db up |
 | [GIONG-E5049](E5049.md) | `DbStartFailed` | the database container could not start |
-| [GIONG-E5050](E5050.md) | `NoService` | no running service to ask |
-| [GIONG-E5051](E5051.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
-| [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |
 | [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
 | [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
+| [GIONG-E5057](E5057.md) | `NoService` | no running service to ask |
+| [GIONG-E5058](E5058.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
+| [GIONG-E5059](E5059.md) | `McpToolError` | the service's giong-mcp refused a call |
 | [GIONG-E5060](E5060.md) | `BenchTarget` | the service to measure cannot be reached |
 | [GIONG-E5061](E5061.md) | `BenchAgainst` | the build to compare against cannot be made |
 | [GIONG-E5062](E5062.md) | `BenchGeneratorBehind` | the load generator fell behind its schedule |

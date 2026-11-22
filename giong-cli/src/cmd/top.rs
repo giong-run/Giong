@@ -298,6 +298,18 @@ pub fn findings(overview: &Value) -> Vec<Finding> {
         .collect()
 }
 
+/// A screen drawn over the last one without clearing it first (no flicker):
+/// home, each line followed by erase-to-end-of-line, then erase below.
+fn repaint(screen: &str) -> String {
+    let mut out = String::from("\x1b[H");
+    for line in screen.lines() {
+        out.push_str(line);
+        out.push_str("\x1b[K\n");
+    }
+    out.push_str("\x1b[J");
+    out
+}
+
 fn terminal_width() -> usize {
     std::env::var("COLUMNS")
         .ok()
@@ -365,7 +377,10 @@ fn run(args: &Args) -> Result<Report, Failure> {
                 // and keep trying, as top does for a process that is gone.
                 let _ = write!(
                     out,
-                    "\x1b[H\x1b[2J{f}\n\nretrying every {interval} ms (Ctrl-C to stop)\n"
+                    "{}",
+                    repaint(&format!(
+                        "{f}\n\nretrying every {interval} ms (Ctrl-C to stop)"
+                    ))
                 );
                 let _ = out.flush();
                 std::thread::sleep(Duration::from_millis(interval));
@@ -377,8 +392,11 @@ fn run(args: &Args) -> Result<Report, Failure> {
         let screen = render(&snap, terminal_width());
         let _ = write!(
             out,
-            "\x1b[H\x1b[2J{screen}\n{} via {} (Ctrl-C to stop)\n",
-            svc.found_in, svc.endpoint
+            "{}",
+            repaint(&format!(
+                "{screen}\n{} via {} (Ctrl-C to stop)",
+                svc.found_in, svc.endpoint
+            ))
         );
         let _ = out.flush();
         let spent = started.elapsed();
@@ -389,6 +407,11 @@ fn run(args: &Args) -> Result<Report, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repaints_erase_what_the_last_screen_left() {
+        assert_eq!(repaint("a\nbc"), "\x1b[Ha\x1b[K\nbc\x1b[K\n\x1b[J");
+    }
 
     fn sample() -> Snapshot {
         Snapshot {
