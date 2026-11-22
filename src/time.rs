@@ -98,6 +98,11 @@ pub(crate) struct Timers {
     /// No later than the earliest deadline in `due`; `u64::MAX` when it is
     /// empty.
     due_at: u64,
+    /// One tick after the last time timers fired. The event loop does not
+    /// wake up for timers again before then: a lone timer still fires at its
+    /// deadline, while many timers close together fire in batches, at most
+    /// one wake-up per millisecond, as when deadlines were rounded to ticks.
+    quiet_until: u64,
     seq: u64,
 }
 
@@ -124,6 +129,7 @@ impl Timers {
             earliest: [u64::MAX; SLOTS],
             due: NIL,
             due_at: u64::MAX,
+            quiet_until: 0,
             seq: 0,
         }
     }
@@ -280,7 +286,8 @@ impl Timers {
     }
 
     /// When the event loop must wake up next for timers: at the earliest
-    /// deadline itself, not at the start of its millisecond.
+    /// deadline itself, not at the start of its millisecond, unless timers
+    /// fired less than a tick ago (see `quiet_until`).
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         let wheel = match self.next_expiration() {
             Some((0, slot, _)) => self.earliest[slot],
@@ -289,7 +296,7 @@ impl Timers {
             None => u64::MAX,
         };
         let at = wheel.min(self.due_at);
-        (at != u64::MAX).then(|| self.start + Duration::from_nanos(at))
+        (at != u64::MAX).then(|| self.start + Duration::from_nanos(at.max(self.quiet_until)))
     }
 
     /// Advances the wheel to `now` and returns the wakers of all due timers:
@@ -341,6 +348,9 @@ impl Timers {
         if now_tick > self.elapsed {
             self.elapsed = now_tick;
         }
+        if !fired.is_empty() {
+            self.quiet_until = now_ns.saturating_add(NANOS_PER_TICK as u64);
+        }
         fired
     }
 
@@ -355,6 +365,7 @@ impl Timers {
         }
         self.due = NIL;
         self.due_at = u64::MAX;
+        self.quiet_until = 0;
         self.entries
             .take_all()
             .into_iter()
@@ -613,6 +624,8 @@ mod tests {
         let mut live: BTreeMap<u64, (u128, TimerKey)> = BTreeMap::new();
         let mut now_ns: u128 = 0;
         let mut next_id = 0u64;
+        // A tick after timers last fired: the loop may wait until then.
+        let mut quiet_until: u128 = 0;
 
         for _ in 0..steps {
             match rng.below(10) {
@@ -656,6 +669,9 @@ mod tests {
                         got, expected,
                         "seed {seed}: wrong set of timers fired at {now_ns} ns"
                     );
+                    if !got.is_empty() {
+                        quiet_until = now_ns + NANOS_PER_TICK;
+                    }
                     for id in &got {
                         let (deadline_ns, key) = live.remove(id).unwrap();
                         assert!(deadline_ns <= now_ns, "timer {id} fired early");
@@ -671,8 +687,13 @@ mod tests {
             match (wheel.next_deadline(), live.values().map(|(d, _)| *d).min()) {
                 (None, None) => {}
                 (Some(wake), Some(earliest_ns)) => {
+                    // At the earliest deadline, or a tick after timers last
+                    // fired if that is later: never later than both.
                     let wake_ns = wake.duration_since(start).as_nanos();
-                    assert!(wake_ns <= earliest_ns, "seed {seed}: would oversleep");
+                    assert!(
+                        wake_ns <= earliest_ns.max(quiet_until),
+                        "seed {seed}: would oversleep"
+                    );
                     assert!(wake_ns > now_ns, "seed {seed}: wake-up in the past");
                 }
                 (wake, earliest) => {
