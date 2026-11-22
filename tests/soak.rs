@@ -21,6 +21,7 @@
 //! ```
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::net::{Shutdown, SocketAddr};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -524,6 +525,110 @@ fn runtime_life() {
     drop(holder);
 }
 
+/// What each open descriptor is, by number: where its link in `/proc` or
+/// `/dev/fd` points. Only for the message of a failed check.
+#[cfg(unix)]
+fn open_handles() -> BTreeMap<usize, String> {
+    let dir = if cfg!(target_os = "macos") {
+        "/dev/fd"
+    } else {
+        "/proc/self/fd"
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return BTreeMap::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let fd = entry.file_name().to_str()?.parse().ok()?;
+            let target = std::fs::read_link(entry.path()).ok()?;
+            Some((fd, target.display().to_string()))
+        })
+        .collect()
+}
+
+/// What each open handle is, by value: its object type (`File` for a file
+/// or socket, `Event`, `Thread`, `Key`, ...). Only for the message of a
+/// failed check. Handle values are multiples of 4; the ones in use stay
+/// well below the bound searched.
+#[cfg(windows)]
+fn open_handles() -> BTreeMap<usize, String> {
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryObject(
+            handle: isize,
+            class: u32,
+            info: *mut u64,
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    const OBJECT_TYPE_INFORMATION: u32 = 2;
+    let mut buf = vec![0u64; 256];
+    let mut handles = BTreeMap::new();
+    for handle in (4..0x4_0000usize).step_by(4) {
+        let mut returned = 0;
+        // SAFETY: a buffer of the length given, which the call fills with an
+        // OBJECT_TYPE_INFORMATION; asking for the type never blocks, unlike
+        // asking for the name. A value that is no handle fails.
+        let status = unsafe {
+            NtQueryObject(
+                handle as isize,
+                OBJECT_TYPE_INFORMATION,
+                buf.as_mut_ptr(),
+                (buf.len() * 8) as u32,
+                &mut returned,
+            )
+        };
+        if status < 0 {
+            continue;
+        }
+        // SAFETY: on success the buffer starts with the type's name, a
+        // UNICODE_STRING whose characters the call wrote into the buffer.
+        let name = unsafe {
+            let name = &*(buf.as_ptr() as *const UnicodeString);
+            let chars = std::slice::from_raw_parts(name.buffer, name.length as usize / 2);
+            String::from_utf16_lossy(chars)
+        };
+        // A file handle says what it is: a disk file, a pipe or socket
+        // (sockets are pipes to GetFileType), a character device.
+        let name = if name == "File" {
+            use windows_sys::Win32::Storage::FileSystem::GetFileType;
+            // SAFETY: a handle the query above found open; asking for its
+            // kind does not block.
+            let kind = unsafe { GetFileType(handle as _) };
+            let kind = match kind {
+                1 => "disk",
+                2 => "character device",
+                3 => "pipe or socket",
+                _ => "unknown",
+            };
+            format!("File ({kind})")
+        } else {
+            name
+        };
+        handles.insert(handle, name);
+    }
+    handles
+}
+
+/// The descriptors or handles open now that were not in `before`.
+fn new_handles(before: &BTreeMap<usize, String>) -> String {
+    let now = open_handles();
+    let new: Vec<String> = now
+        .iter()
+        .filter(|(n, what)| before.get(n) != Some(what))
+        .map(|(n, what)| format!("{n:#x} {what}"))
+        .collect();
+    format!("[{}]", new.join(", "))
+}
+
 /// The descriptor count once it is back to `before` or below, or after 15
 /// seconds. On Linux and macOS it is back at once. Windows' handle count
 /// also holds what threads that are still ending use, such as the blocking
@@ -562,6 +667,7 @@ fn soak() {
     #[cfg(windows)]
     run(workers, 5);
     let fds_before = open_fds();
+    let handles_before = open_handles();
     let (counters, samples, idle) = run(workers, secs);
 
     let c = &counters;
@@ -597,7 +703,8 @@ fn soak() {
     let fds_after = settled_fds(fds_before);
     assert!(
         fds_after <= fds_before,
-        "descriptors leaked: {fds_after} open, {fds_before} before the soak"
+        "descriptors leaked: {fds_after} open, {fds_before} before the soak; new since: {}",
+        new_handles(&handles_before)
     );
     if samples.len() >= 8 {
         let half = samples.len() / 2;
