@@ -1259,6 +1259,7 @@ impl Client {
                                 .conn()
                                 .send(
                                     request.clone(),
+                                    reused,
                                     method == "HEAD",
                                     config.max_head_size,
                                     &what,
