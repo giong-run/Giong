@@ -396,6 +396,10 @@ struct Deferred {
 
 impl Deferred {
     fn is_empty(&self) -> bool {
+        #[cfg(windows)]
+        if !self.sock_closes.is_empty() {
+            return false;
+        }
         self.multis.is_empty() && self.cancels.is_empty() && self.closes.is_empty()
     }
 }
@@ -2048,7 +2052,29 @@ fn pin_to_cpu(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workers, pin_by_default};
+    use super::{default_workers, pin_by_default, Deferred};
+
+    /// Every kind of deferred work keeps `close_deferred` from skipping the
+    /// turn: on Windows a socket alone was ignored, and stayed open (#289).
+    #[test]
+    fn a_deferred_close_of_any_kind_is_work() {
+        assert!(Deferred::default().is_empty());
+        #[cfg(unix)]
+        {
+            let mut deferred = Deferred::default();
+            deferred.closes.push(-1);
+            assert!(!deferred.is_empty());
+        }
+        let mut deferred = Deferred::default();
+        deferred.multis.push(0);
+        assert!(!deferred.is_empty());
+        #[cfg(windows)]
+        {
+            let mut deferred = Deferred::default();
+            deferred.sock_closes.push(super::sys::RawSock::MAX);
+            assert!(!deferred.is_empty());
+        }
+    }
 
     #[test]
     fn the_default_worker_count_follows_the_cpu_quota() {
