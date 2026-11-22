@@ -845,6 +845,35 @@ fn a_cancel_token_stops_working_once_its_connection_goes_back() {
     });
 }
 
+#[test]
+fn a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        let conn = pool.get().await.unwrap();
+        let id = conn.connection_id();
+        let token = conn.cancel_token();
+        // The cancel passes the check and starts connecting...
+        let mut cancel = std::pin::pin!(token.cancel());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(cancel.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // ...and the connection goes back before its KILL QUERY arrives:
+        // the next task must not get that connection.
+        drop(conn);
+        let next = pool.get().await.unwrap();
+        assert_ne!(
+            next.connection_id(),
+            id,
+            "a connection a KILL is on its way to"
+        );
+        cancel.await.unwrap();
+        let row = next.query_one("SELECT SLEEP(0.2)", &[]).await.unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    });
+}
+
 /// Both futures, polled together on this task.
 async fn futures_join<A: std::future::Future, B: std::future::Future>(
     a: A,
