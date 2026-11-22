@@ -627,11 +627,18 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
     assert!(start.elapsed() < Duration::from_secs(5));
 
     // A connection that is used stays open past the idle timeout in total.
+    // The pauses are a sixth of the idle timeout: macOS lets a sleeping
+    // thread wake late by up to the length of its sleep (a 150 ms sleep
+    // took 300 to 310 ms on GitHub's macOS runners), so half the timeout
+    // was not enough margin.
     let mut c = server.client();
-    for i in 0..4 {
-        std::thread::sleep(Duration::from_millis(150));
+    let start = Instant::now();
+    let mut i = 0;
+    while start.elapsed() < Duration::from_millis(600) {
+        std::thread::sleep(Duration::from_millis(50));
         c.send(format!("GET /{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
         assert_eq!(c.reply().status, 200);
+        i += 1;
     }
 }
 
