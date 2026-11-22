@@ -10,6 +10,13 @@ use std::time::{Duration, Instant};
 
 mod common;
 
+/// Taken by each test for its whole run: each needs a core for its busy
+/// worker. Two at once, with the spinning workers of the second, can leave
+/// a busy worker without a CPU for tens of milliseconds on a 4-vCPU runner;
+/// its CPU time then says it is idle, which is true, and it gets a
+/// connection.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
 #[test]
 fn a_saturated_worker_with_few_tasks_loses_new_connections_to_a_quiet_one_with_many() {
     // Worker 0 holds 50 idle tasks (think idle keep-alive connections);
@@ -42,6 +49,7 @@ fn time_spent_spinning_for_work_does_not_count_as_busy() {
 /// worker 1 one task that never lets it rest. A plain thread opens 8
 /// connections a few milliseconds apart; returns how many each worker got.
 fn saturated_worker_case(spin: Option<Duration>) -> Vec<usize> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (_holder, port) = common::shared_port();
     let mut builder = giong::Builder::new().workers(2);
     if let Some(spin) = spin {

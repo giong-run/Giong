@@ -103,11 +103,12 @@ pub(crate) struct WorkerShared {
     wake: OnceLock<crate::driver::WakeHandle>,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
-    /// The clock of the worker thread's CPU time, for balanced listeners
-    /// telling how busy it has been (see `RuntimeShared::busy_ns_of`); set
-    /// when the worker starts.
+    /// The clock of the worker thread's CPU time, and when the worker
+    /// started on [`observe::clock_ns`], for balanced listeners telling how
+    /// busy it has been (see `RuntimeShared::busy_ns_of`); set when the
+    /// worker starts.
     #[cfg(all(target_os = "linux", not(miri)))]
-    cpu_clock: OnceLock<libc::clockid_t>,
+    cpu_clock: OnceLock<(libc::clockid_t, u64)>,
 }
 
 impl WorkerShared {
@@ -270,13 +271,14 @@ impl RuntimeShared {
     }
 
     /// Nanoseconds of CPU time worker `i` has spent working so far: the
-    /// CPU time of its thread, less the time it spent spinning for work.
-    /// `None` before its thread has started, after it has ended, under Miri
-    /// and off Linux. One system call: the kernel keeps a thread's CPU time.
+    /// CPU time of its thread, less the time it spent spinning for work;
+    /// and when it started, on [`observe::clock_ns`]. `None` before its
+    /// thread has started, after it has ended, under Miri and off Linux.
+    /// One system call: the kernel keeps a thread's CPU time.
     #[cfg(all(target_os = "linux", not(miri)))]
-    pub(crate) fn busy_ns_of(&self, i: usize) -> Option<u64> {
+    pub(crate) fn busy_ns_of(&self, i: usize) -> Option<(u64, u64)> {
         let w = &self.workers[i];
-        let clock = *w.cpu_clock.get()?;
+        let (clock, started) = *w.cpu_clock.get()?;
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -290,12 +292,12 @@ impl RuntimeShared {
             .ok()?
             .saturating_mul(1_000_000_000)
             .saturating_add(u64::try_from(ts.tv_nsec).ok()?);
-        Some(cpu.saturating_sub(w.counters.spin_ns()))
+        Some((cpu.saturating_sub(w.counters.spin_ns()), started))
     }
 
     /// See the Linux version: a thread's CPU time is not read here.
     #[cfg(not(all(target_os = "linux", not(miri))))]
-    pub(crate) fn busy_ns_of(&self, _i: usize) -> Option<u64> {
+    pub(crate) fn busy_ns_of(&self, _i: usize) -> Option<(u64, u64)> {
         None
     }
 
@@ -557,11 +559,12 @@ impl Worker {
         // balanced listeners then go by counts.
         #[cfg(all(target_os = "linux", not(miri)))]
         {
+            let started = observe::clock_ns();
             let mut clock: libc::clockid_t = 0;
             // SAFETY: `pthread_self` names the calling thread, which is the
             // worker's own; `clock` is a valid place for the result.
             if unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock) } == 0 {
-                let _ = shared.cpu_clock.set(clock);
+                let _ = shared.cpu_clock.set((clock, started));
             }
         }
         Ok(Rc::new(Self {

@@ -190,10 +190,6 @@ impl Busy {
     }
 
     fn sample(&self, rt: &RuntimeShared, now: u64, last: u64) {
-        let window = now.saturating_sub(last);
-        // The first sample only sets the starting point.
-        let measured = last != 0 && window > 0;
-        let fresh = window <= STALE_NS;
         let (mut busy_sum, mut tasks_sum) = (0u64, 0u64);
         for (i, w) in self.workers.iter().enumerate() {
             let (tasks, _, _) = rt.counts_of(i);
@@ -202,15 +198,27 @@ impl Busy {
             let polls_was = w.polls_at.swap(polls, Ordering::Relaxed);
             // A worker whose CPU time cannot be read (not started, ended, or
             // Miri) counts as idle: then counts of tasks decide.
-            let Some(busy) = rt.busy_ns_of(i) else {
+            let Some((busy, started)) = rt.busy_ns_of(i) else {
                 w.busy_at.store(NO_BASE, Ordering::Relaxed);
                 w.share.store(0, Ordering::Relaxed);
                 continue;
             };
             let busy_was = w.busy_at.swap(busy, Ordering::Relaxed);
-            if !measured || busy_was == NO_BASE {
+            // With no sample of the worker to compare with (the group's
+            // first, or its CPU time could not be read at the last one), it
+            // is measured since it started: so a member accepting while
+            // another takes the group's second sample does not go by
+            // figures never measured.
+            let based = last != 0 && busy_was != NO_BASE;
+            let (busy_was, polls_was, window) = if based {
+                (busy_was, polls_was, now.saturating_sub(last))
+            } else {
+                (0, 0, now.saturating_sub(started))
+            };
+            if window == 0 {
                 continue;
             }
+            let fresh = based && window <= STALE_NS;
             // Spinning is taken off by wall time, so the figure can go down
             // after a spin during which the thread was descheduled: that
             // counts as no work.
@@ -234,10 +242,8 @@ impl Busy {
             busy_sum += share;
             tasks_sum += tasks as u64;
         }
-        if measured {
-            let per_task = (busy_sum / tasks_sum.max(1)).max(MIN_COST);
-            self.per_task.store(per_task, Ordering::Relaxed);
-        }
+        let per_task = (busy_sum / tasks_sum.max(1)).max(MIN_COST);
+        self.per_task.store(per_task, Ordering::Relaxed);
         self.taken_at.store(now, Ordering::Release);
     }
 
@@ -307,7 +313,8 @@ impl Member {
                         })
                         .collect();
                     let busy = Busy::new(rt.workers());
-                    // The starting point of the first measurement.
+                    // How busy each worker has been since it started, until
+                    // the next sample.
                     busy.refresh(&rt);
                     let group = Arc::new(Group {
                         rt,
