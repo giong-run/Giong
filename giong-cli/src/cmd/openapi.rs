@@ -47,7 +47,11 @@ pub const COMMAND: Command = Command {
 
 /// The package name and version of the project here, if any.
 fn package() -> Option<(String, String)> {
-    let root = service::project_root()?;
+    package_at(&service::project_root()?)
+}
+
+/// The package name and version of the project at `root`, if any.
+pub fn package_at(root: &std::path::Path) -> Option<(String, String)> {
     let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
     let mut in_package = false;
     let (mut name, mut version) = (None, None);

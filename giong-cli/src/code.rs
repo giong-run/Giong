@@ -59,6 +59,8 @@ codes! {
     NO_SERVICE = 5050, "NoService", "no running service to ask";
     MCP_NO_TOOL = 5051, "McpNoTool", "the service's giong-mcp lacks a tool";
     MCP_TOOL_ERROR = 5052, "McpToolError", "the service's giong-mcp refused a call";
+    DASHBOARD_PORT_IN_USE = 5053, "DashboardPortInUse", "the dashboard's port is in use";
+    DASHBOARD_FAILED = 5054, "DashboardFailed", "the dashboard could not do what the page asked";
     WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";
     SERVICE_WARNING = 5056, "ServiceWarning", "the service reports a warning";
     NO_RECORDING = 5065, "NoRecording", "no recorded requests to use";

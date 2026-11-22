@@ -2804,6 +2804,38 @@ The service's giong-mcp answered the call with an error, or with an answer this 
 
 [All error codes](README.md)
 "#),
+    (5053, r#"# GIONG-E5053: the dashboard's port is in use
+
+Raised by the `giong` command (giong-cli): `giong dashboard`. In JSON output: `"code": "GIONG-E5053"`.
+
+## What happened
+
+`giong dashboard` serves its page on `127.0.0.1:7700` (or `--port`), and something else already listens there: most often another dashboard, opened by `giong dashboard` or `giong dev --ui` in another terminal. (`giong dev --ui` itself tries the nine ports after 7700 before giving up, and prints the one it took.)
+
+## How to fix it
+
+- Open the dashboard that is already running: `http://127.0.0.1:7700/`.
+- Or pick another port: `giong dashboard --port 7710`.
+- To see what holds the port: `lsof -i :7700` (macOS, Linux) or `ss -ltnp 'sport = :7700'` (Linux).
+
+[All error codes](README.md)
+"#),
+    (5054, r#"# GIONG-E5054: the dashboard could not do what the page asked
+
+Raised by the `giong` command (giong-cli): `giong dashboard` and `giong dev --ui`, in the answers the dashboard page shows. In JSON: `"code": "GIONG-E5054"`.
+
+## What happened
+
+The dashboard page asked the `giong` command for something it could not do: the service's log could not be read (permissions), saving a recorded request as a case could not run `giong record save`, or the dashboard failed while answering (a bug: the terminal running the dashboard shows the panic). It also stops with this code when it cannot listen at all for a reason other than a taken port.
+
+## How to fix it
+
+- Check that the log `giong dev` writes (`.giong/dev.log`) can be read by you.
+- Run the step by hand to see its full report: `giong record save <number> --name <name>` (numbers from `giong record list`).
+- If the terminal shows a panic, report it with that text: it is a bug in the dashboard, not in your service.
+
+[All error codes](README.md)
+"#),
     (5055, r#"# GIONG-E5055: a worker of the service is stuck in one task
 
 Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5055"`.

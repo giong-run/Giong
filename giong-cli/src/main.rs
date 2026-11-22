@@ -11,6 +11,7 @@
 mod args;
 mod cmd;
 mod code;
+mod dashboard;
 mod dotenv;
 mod host;
 #[rustfmt::skip] // generated (see src/pages.rs)

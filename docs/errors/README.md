@@ -272,6 +272,8 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5050](E5050.md) | `NoService` | no running service to ask |
 | [GIONG-E5051](E5051.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
 | [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |
+| [GIONG-E5053](E5053.md) | `DashboardPortInUse` | the dashboard's port is in use |
+| [GIONG-E5054](E5054.md) | `DashboardFailed` | the dashboard could not do what the page asked |
 | [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
 | [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
 | [GIONG-E5065](E5065.md) | `NoRecording` | no recorded requests to use |

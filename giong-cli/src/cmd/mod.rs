@@ -10,6 +10,7 @@ use crate::code::Code;
 use crate::report::{Failure, Report};
 
 pub mod clean;
+pub mod dashboard;
 pub mod doctor;
 pub mod explain;
 pub mod help;
@@ -44,6 +45,7 @@ pub const COMMANDS: &[&Command] = &[
     &routes::COMMAND,
     &openapi::COMMAND,
     &record::COMMAND,
+    &dashboard::COMMAND,
     &top::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
