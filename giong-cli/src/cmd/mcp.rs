@@ -19,6 +19,7 @@ use serde_json::{json, Map, Value};
 
 use super::{Command, COMMANDS};
 use crate::args::{Args, Kind};
+use crate::code::Code;
 use crate::report::{Failure, Report};
 
 pub const COMMAND: Command = Command {
@@ -36,9 +37,18 @@ pub const COMMAND: Command = Command {
 
 const PROTOCOL: &str = "2025-06-18";
 /// Commands an agent cannot run as a tool: they never return, or are this.
-const NOT_TOOLS: &[&str] = &["dev", "mcp", "help", "version"];
+const NOT_TOOLS: &[&str] = &["dev", "dashboard", "mcp", "help", "version"];
 
-fn run(_: &Args) -> Result<Report, Failure> {
+fn run(args: &Args) -> Result<Report, Failure> {
+    // Standard output carries JSON-RPC: a report document there would break
+    // the client, and printing nothing would look like success.
+    if args.json() {
+        return Err(Failure::new(
+            Code::USAGE,
+            "giong mcp answers in JSON-RPC on standard output, so --json does not apply to it",
+            "run giong mcp without --json (claude mcp add giong -- giong mcp)",
+        ));
+    }
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
