@@ -1071,9 +1071,10 @@ fn run(workers: usize, secs: u64) -> Run {
 /// some paths run (see the soak's final check), and that first time can
 /// fall in any life: a later life once ended one handle up
 /// ([#294](https://github.com/giong-run/Giong/issues/294)). So lives 2 to 5
-/// run with handle tracing, and up to two new events whose open the trace
-/// places inside ws2_32 or mswsock are allowed, as in the soak. Anything
-/// else still fails, with where each new event was opened.
+/// run with handle tracing, the count is checked once tracing has stopped,
+/// and up to two new events whose open the trace places inside ws2_32 or
+/// mswsock are allowed, as in the soak. Anything else still fails, with
+/// where each new event was opened.
 #[test]
 fn the_descriptor_count_is_flat_over_runtime_lives() {
     let before = open_fds();
@@ -1087,21 +1088,25 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
     let handles_first = open_handles();
     #[cfg(windows)]
     let origins = origins::watch();
-    // The watcher's own thread holds handles while it runs.
     #[cfg(windows)]
-    let watching = open_fds().saturating_sub(first);
+    let tracing = origins.is_some();
     #[cfg(unix)]
-    let watching = 0;
+    let tracing = false;
     for _ in 0..4 {
         runtime_life();
-        counts.push(settled_fds(first + watching).saturating_sub(watching));
+        counts.push(settled_fds(first));
     }
     #[cfg(windows)]
     let traced = origins.map(origins::Watcher::finish);
     #[allow(unused_mut)]
     let mut new = String::new();
+    // While tracing runs, the watcher's thread and its snapshots of the
+    // handle table hold handles of their own, a varying number at any one
+    // moment (a CI run counted 89, 90, 89, 90 over lives that left nothing
+    // behind), so each life's count is only printed then, and the check
+    // is on the count once the watcher has stopped.
     #[cfg(windows)]
-    let system = match traced {
+    let (system, last) = match traced {
         Some(origins) => {
             let last = settled_fds(first);
             let now = open_handles();
@@ -1113,21 +1118,29 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
             let (report, winsock) = origins.report(&events);
             let since = new_handles(&handles_first);
             new = format!("; after tracing: {last}; new since the first life: {since}{report}");
-            winsock.min(2)
+            (winsock.min(2), last)
         }
-        None => 0,
+        None => (0, 0),
     };
     #[cfg(unix)]
-    let system = 0;
+    let (system, last) = (0, 0);
     eprintln!(
         "descriptors: {before} before, then after each life: {:?}{new}",
         &counts[1..]
     );
-    assert!(
-        counts[2..].iter().all(|&n| n <= first + system),
-        "descriptors grew over runtime lives: {before} before, then {:?}{new}",
-        &counts[1..]
-    );
+    if tracing {
+        assert!(
+            last <= first + system,
+            "descriptors grew over runtime lives: {before} before, then {:?}{new}",
+            &counts[1..]
+        );
+    } else {
+        assert!(
+            counts[2..].iter().all(|&n| n <= first),
+            "descriptors grew over runtime lives: {before} before, then {:?}{new}",
+            &counts[1..]
+        );
+    }
 }
 
 /// Where each event the soak sees appear was made: Windows' handle tracing
