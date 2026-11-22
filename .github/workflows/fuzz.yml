@@ -36,6 +36,7 @@ on:
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
+      - "scripts/fuzz-reach.py"
   pull_request:
     paths:
       - "giong-http/**"
@@ -52,6 +53,7 @@ on:
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
+      - "scripts/fuzz-reach.py"
   workflow_dispatch:
     inputs:
       seconds:
@@ -131,9 +133,10 @@ jobs:
           )
           if [ "$EVENT" = pull_request ]; then
             changed=$(git diff --name-only HEAD^1 HEAD)
-            if grep -qx '.github/workflows/fuzz.yml' <<<"$changed"; then
-              # A change to this file: one target of each crate, enough to
-              # see that every crate's fuzz job still runs.
+            if grep -qxE '\.github/workflows/fuzz\.yml|scripts/fuzz-reach\.py' <<<"$changed"; then
+              # A change to this file or to fuzz-reach.py: one target of
+              # each crate, enough to see that every crate's fuzz job still
+              # runs.
               all=$(jq -c 'group_by(.crate) | map(.[0])' <<<"$all")
               crates=$(jq -c '[.[].crate]' <<<"$all")
             else
@@ -142,18 +145,13 @@ jobs:
               crates=$(sed -n -e 's#^\(src\|fuzz\)/.*#giong#p' -e 's#^\(giong-[a-z0-9-]*\)/.*#\1#p' <<<"$changed" \
                 | sort -u | jq -R . | jq -c -s .)
             fi
-            # Targets that drive another crate run when it changes too:
-            # giong-http's h3 targets go through giong-quic, giong-proto's
-            # differential target and giong-grpc read code that
-            # giong-grpc-build generates, and giong-grpc reads giong-proto.
-            all=$(jq -c --argjson crates "$crates" '
-              def changed($c): $crates | index($c);
-              [.[] | select(
-                changed(.crate)
-                or (changed("giong-quic") and .crate == "giong-http" and (.target | startswith("h3")))
-                or (changed("giong-grpc-build") and (.crate == "giong-proto" or .crate == "giong-grpc"))
-                or (changed("giong-proto") and .crate == "giong-grpc")
-              )]' <<<"$all")
+            # The targets that go through a changed crate run too
+            # (giong-http's go through giong-quic, giong-web's through
+            # giong-http...): scripts/fuzz-reach.py follows the path
+            # dependencies of each fuzz package. A change to the core crate
+            # does not spread; a push to main runs every target.
+            crates=$(python3 scripts/fuzz-reach.py "$crates")
+            all=$(jq -c --argjson crates "$crates" '[.[] | select(.crate as $c | $crates | index($c))]' <<<"$all")
           fi
           echo "Targets: $(jq -r 'map(.crate + " " + .target) | join(", ")' <<<"$all")"
           echo "matrix={\"include\":$all}" >> "$GITHUB_OUTPUT"
