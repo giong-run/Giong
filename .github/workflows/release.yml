@@ -2,8 +2,9 @@ name: Release
 
 # Runs on a tag vX.Y.Z: pushed by release-tag.yml when a release pull request is
 # merged (which starts this workflow with workflow_dispatch on the tag), or
-# pushed by hand. It publishes the three crates to crates.io, creates the GitHub
-# Release and deploys giong.run. See docs/RELEASING.md.
+# pushed by hand. It publishes the crates to crates.io, creates the GitHub
+# Release, attaches the prebuilt giong command to it and deploys giong.run.
+# See docs/RELEASING.md.
 #
 # crates.io uses Trusted Publishing: each crate trusts this repository, this
 # workflow file and the `release` environment, and the job exchanges its OIDC
@@ -174,6 +175,89 @@ jobs:
           if [ "$PRERELEASE" = true ]; then flags="--prerelease --latest=false"; else flags="--latest"; fi
           gh release create "$GITHUB_REF_NAME" --verify-tag \
             --title "giong $VERSION" --notes-file notes.md $flags
+
+  # The giong command, prebuilt for each platform and attached to the Release:
+  # what giong.run/install.sh and install.ps1 download. Each archive holds
+  # giong-<version>-<target>/giong (giong.exe on Windows) and has a .sha256
+  # next to it. Linux builds are static (musl), so one binary runs on every
+  # distribution (giong is pure Rust: no C toolchain needed). Re-running replaces the assets (--clobber). The install
+  # scripts fall back to cargo install while an asset is missing, so this job
+  # does not hold up the site.
+  binaries:
+    needs: [verify, github-release]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-15 }
+          - { target: x86_64-apple-darwin, os: macos-15 }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - name: Build giong
+        run: cargo build --release --locked -p giong-cli --target ${{ matrix.target }}
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="giong-$VERSION-$TARGET"
+          mkdir "$name"
+          cp LICENSE* README.md "$name"/ 2> /dev/null || true
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "target/$TARGET/release/giong.exe" "$name/"
+            "$name/giong.exe" version
+            archive="$name.zip"
+            7z a -tzip "$archive" "$name" > /dev/null
+            sha=$(sha256sum "$archive" | cut -d' ' -f1)
+          else
+            cp "target/$TARGET/release/giong" "$name/"
+            # The x86_64 macOS build is cross-compiled on an arm64 runner,
+            # which runs it through Rosetta when installed; skip it otherwise.
+            "$name/giong" version || [ "$TARGET" = x86_64-apple-darwin ]
+            archive="$name.tar.gz"
+            tar -czf "$archive" "$name"
+            if command -v sha256sum > /dev/null; then
+              sha=$(sha256sum "$archive" | cut -d' ' -f1)
+            else
+              sha=$(shasum -a 256 "$archive" | cut -d' ' -f1)
+            fi
+          fi
+          echo "$sha  $archive" > "$archive.sha256"
+          cat "$archive.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$archive" "$archive.sha256" \
+            --clobber --repo "$GITHUB_REPOSITORY"
+      # What a user runs, against the assets just uploaded.
+      - name: Install with install.sh
+        if: runner.os != 'Windows' && matrix.target != 'x86_64-apple-darwin'
+        env:
+          GIONG_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          GIONG_INSTALL="$RUNNER_TEMP/giong-bin" sh site/public/install.sh
+          "$RUNNER_TEMP/giong-bin/giong" version | grep -F "giong $GIONG_VERSION"
+      - name: Install with install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GIONG_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          $env:GIONG_INSTALL = Join-Path $env:RUNNER_TEMP "giong-bin"
+          Get-Content site/public/install.ps1 -Raw | Invoke-Expression
+          $out = & (Join-Path $env:GIONG_INSTALL "giong.exe") version
+          if ($out -notmatch [regex]::Escape("giong $env:GIONG_VERSION")) { throw "installed: $out" }
 
   site:
     needs: github-release
