@@ -8,14 +8,19 @@
 //! which ends the wait as any wake-up does. The approach Go takes since
 //! 1.23; .NET's thread pool does the same.
 //!
+//! Arming costs three system calls, so a wait for the same deadline as the
+//! last one, whose packet has not come yet, keeps the alarm as it is: a
+//! busy server parks again and again before its next I/O timeout.
+//!
 //! The calls live in ntdll and are looked up when the driver starts. Where
 //! one is missing (Wine, Windows before 10 1803 for the timer flag), the
 //! driver keeps the millisecond timeout alone.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem;
 use std::ptr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_ALL, HANDLE};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
@@ -43,6 +48,15 @@ type CancelPacket = unsafe extern "system" fn(HANDLE, u8) -> i32;
 /// What `GetProcAddress` returns.
 type Export = unsafe extern "system" fn() -> isize;
 
+/// The completion key of the alarm's packet; every other packet has 0.
+pub(super) const KEY: usize = 1;
+
+/// Deadlines this close are the same deadline: the caller passes the time
+/// left, so each wait for one timer computes it again a few microseconds
+/// apart. An alarm kept for a deadline this much earlier or later rings
+/// at most this much off.
+const SAME_DEADLINE: Duration = Duration::from_micros(50);
+
 /// What [`Alarm::set`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Set {
@@ -60,6 +74,12 @@ pub(super) struct Alarm {
     packet: HANDLE,
     associate: AssociatePacket,
     cancel: CancelPacket,
+    /// When the armed alarm rings; `None` when its packet has come (see
+    /// [`Alarm::rang`]) or it is not armed.
+    armed: Cell<Option<Instant>>,
+    /// How many times the timer was set.
+    #[cfg(test)]
+    arms: Cell<u32>,
 }
 
 impl Alarm {
@@ -106,12 +126,23 @@ impl Alarm {
             packet,
             associate,
             cancel,
+            armed: Cell::new(None),
+            #[cfg(test)]
+            arms: Cell::new(0),
         })
     }
 
     /// Has `port` get a packet with no operation once `after` has passed,
     /// replacing what an earlier `set` asked for.
     pub(super) fn set(&self, port: HANDLE, after: Duration) -> Set {
+        let now = Instant::now();
+        let at = now.checked_add(after);
+        if let (Some(armed), Some(at)) = (self.armed.get(), at) {
+            if armed.max(at) - armed.min(at) <= SAME_DEADLINE {
+                return if armed > now { Set::Armed } else { Set::No };
+            }
+        }
+        self.armed.set(None);
         // The packet of an earlier set may still wait on the timer, or be
         // queued and not taken yet: both go. STATUS_CANCELLED says the
         // timer had fired and the association ended by itself.
@@ -132,16 +163,18 @@ impl Alarm {
         if unsafe { SetWaitableTimer(self.timer, &due, 0, None, ptr::null(), 0) } == 0 {
             return Set::No;
         }
+        #[cfg(test)]
+        self.arms.set(self.arms.get() + 1);
         let mut signaled = 0u8;
         // SAFETY: our packet and timer, and the caller's open port. The
         // packet carries no `OVERLAPPED` (a null context), which the driver
-        // takes for a wake-up.
+        // takes for a wake-up, and the key [`KEY`].
         let status = unsafe {
             (self.associate)(
                 self.packet,
                 port,
                 self.timer,
-                ptr::null(),
+                KEY as *const c_void,
                 ptr::null(),
                 0,
                 0,
@@ -149,10 +182,20 @@ impl Alarm {
             )
         };
         match (status, signaled) {
-            (STATUS_SUCCESS, 0) => Set::Armed,
+            (STATUS_SUCCESS, 0) => {
+                self.armed.set(at);
+                Set::Armed
+            }
             (STATUS_SUCCESS, _) => Set::Expired,
             _ => Set::No,
         }
+    }
+}
+
+impl Alarm {
+    /// The port reported the alarm's packet: the next `set` arms again.
+    pub(super) fn rang(&self) {
+        self.armed.set(None);
     }
 }
 
@@ -165,5 +208,61 @@ impl Drop for Alarm {
             CloseHandle(self.packet);
             CloseHandle(self.timer);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::IO::{
+        CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
+    };
+
+    /// Waits up to `ms` for one packet; its key, or `None`.
+    fn next_key(port: HANDLE, ms: u32) -> Option<usize> {
+        // SAFETY: all-zero is a valid entry.
+        let mut entry: OVERLAPPED_ENTRY = unsafe { mem::zeroed() };
+        let mut n = 0u32;
+        // SAFETY: our port; one entry of room.
+        let ok = unsafe { GetQueuedCompletionStatusEx(port, &mut entry, 1, &mut n, ms, 0) };
+        (ok != 0 && n == 1).then_some(entry.lpCompletionKey)
+    }
+
+    /// A wait for the deadline the alarm is already armed for keeps it; a
+    /// wait for another deadline, or after the packet came, arms again.
+    #[test]
+    fn the_same_deadline_keeps_the_alarm() {
+        let Some(alarm) = Alarm::new() else {
+            eprintln!("skipped: this Windows has no high-resolution wait packets");
+            return;
+        };
+        // SAFETY: a new port; closed below.
+        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
+        assert!(!port.is_null());
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(40);
+        assert_eq!(alarm.set(port, deadline - Instant::now()), Set::Armed);
+        assert_eq!(alarm.arms.get(), 1);
+        for _ in 0..10 {
+            assert_eq!(alarm.set(port, deadline - Instant::now()), Set::Armed);
+        }
+        assert_eq!(alarm.arms.get(), 1, "the same deadline set the timer again");
+        assert_eq!(next_key(port, 1_000), Some(KEY));
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        alarm.rang();
+        // An earlier deadline arms again, and so does the old one once
+        // its packet has come.
+        assert_eq!(alarm.set(port, Duration::from_millis(30)), Set::Armed);
+        assert_eq!(alarm.set(port, Duration::from_millis(10)), Set::Armed);
+        assert_eq!(alarm.arms.get(), 3);
+        let start = Instant::now();
+        assert_eq!(next_key(port, 1_000), Some(KEY));
+        let took = start.elapsed();
+        assert!(took < Duration::from_millis(25), "rang after {took:?}");
+        // The replaced alarm's packet never comes.
+        assert_eq!(next_key(port, 100), None);
+        // SAFETY: our port, closed once.
+        unsafe { CloseHandle(port) };
     }
 }

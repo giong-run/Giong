@@ -1526,6 +1526,10 @@ impl Iocp {
                 // from the wait is all it asks.
                 if !entry.lpOverlapped.is_null() {
                     self.complete(entry);
+                } else if entry.lpCompletionKey == alarm::KEY {
+                    if let Some(alarm) = &self.alarm {
+                        alarm.rang();
+                    }
                 }
             }
             if n < BATCH {
