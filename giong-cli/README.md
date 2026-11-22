@@ -34,7 +34,7 @@ The exit status is 0 when nothing is wrong, 1 when a finding is an error, and 2 
 ## giong dev
 
 ```sh
-giong dev [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--workers N] [--prod-like] [--once] [-- service arguments]
+giong dev [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--workers N] [--prod-like] [--once] [--ui] [--ui-port N] [-- service arguments]
 ```
 
 Builds the service and runs it. On every save it builds again, starts the new build next to the old one, and swaps it in once it accepts connections: measured 0 failed requests over 30 restarts under constant load, on io_uring and on epoll. A build that fails, or one that stops at start-up, leaves the running build serving and prints the compiler's errors. A change to `.env` alone restarts without building.
@@ -43,7 +43,7 @@ How the swap works: `giong dev` binds the service's listening sockets itself and
 
 The listening addresses come from `--listen`, else `LISTEN` in the environment, else `LISTEN` in `.env`. Without one, with a giong older than 1.5, or on Windows, `giong dev` stops the old build before starting the new one: restarts still work, with a moment where the port is closed.
 
-The service gets the variables of `.env` (those not already set), `WORKERS=2` so a laptop stays usable (`--workers N` sets another number, `--prod-like` leaves it to the service: every core), `RUST_BACKTRACE=1`, and `GIONG_MCP` set to a Unix socket so [giong-mcp](https://github.com/giong-run/Giong/tree/main/giong-mcp) can answer. Its output goes to the terminal and to `.giong/dev.log`; `.giong/dev.json` holds the state of the session (process ids, addresses, the last build and its errors) for other tools, and `--json` prints one event per line. `--once` builds, runs the service until it exits, and stops.
+The service gets the variables of `.env` (those not already set), `WORKERS=2` so a laptop stays usable (`--workers N` sets another number, `--prod-like` leaves it to the service: every core), `RUST_BACKTRACE=1`, and `GIONG_MCP` set to a Unix socket so [giong-mcp](https://github.com/giong-run/Giong/tree/main/giong-mcp) can answer. Its output goes to the terminal and to `.giong/dev.log`; `.giong/dev.json` holds the state of the session (process ids, addresses, the last build and its errors) for other tools, and `--json` prints one event per line. `--once` builds, runs the service until it exits, and stops. `--ui` also serves the [dashboard](#giong-dashboard) on `http://127.0.0.1:7700` (or the first free port of the nine after it; `--ui-port N` picks another start); when all ten are taken the service runs without it and a `GIONG-E5053` warning says so.
 
 ## giong check
 
@@ -84,6 +84,52 @@ claude mcp add giong -- giong mcp
 ```
 
 Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document, plus `dev_status` for a running `giong dev`.
+
+## giong routes and giong openapi
+
+```sh
+giong routes [--mcp ADDRESS] [--base-url URL]
+giong openapi [--out FILE] [--title TEXT] [--mcp ADDRESS] [--base-url URL]
+```
+
+`giong routes` asks the running service which routes its giong-web apps serve: method, pattern, path parameters, streamed bodies, middleware, the line that added each route, and a curl line to try it. The service needs giong-mcp with its `web` feature; it is found through `.giong/dev.json` while `giong dev` runs, or `--mcp` (`GIONG_MCP` and `GIONG_MCP_TOKEN` otherwise).
+
+`giong openapi` writes an OpenAPI 3.1 document from the same list: every path and method, path parameters, the coded problem+json answers giong-web makes itself (a parameter that does not parse, a body too long or not JSON, a handler that failed or timed out) and a curl sample per operation. Bodies are marked as not described, because giong-web reads them at run time and a guessed schema would mislead. Operation ids are unique, methods keep their case (only the standard upper-case ones are OpenAPI operations; others are listed under `x-giong-other-methods`), and routes of one shape share one path.
+
+## giong record
+
+```sh
+giong record list [--route TEXT] [--method M] [--status 404|4xx] [--limit N] [--from LOG]
+giong record show NUMBER
+giong record save NUMBERS|3-7|last|all [--name NAME | --out FILE] [--append | --force]
+giong record replay [FILE...] [--base-url URL] [--timeout-ms N]
+```
+
+Turns real requests into tests. Add giong-web's `Record` middleware to the router; while `giong dev` runs, every answered request is written to `.giong/dev.log` with its headers and bodies, secret headers redacted. `list` and `show` read them, and `save` writes the chosen ones to `tests/recorded/<name>.json` as cases:
+
+- dates, UUIDs, hex ids and tokens the service made become placeholders such as `{{uuid}}` and `{{time}}`
+- an id the service made and a later request uses is captured (`{{capture:user_id}}`) and filled in again, so the cases pass against a service whose ids start elsewhere
+- values the request itself sent stay literal, and the answer refers to them by name (`"no user {{user_id}}"`)
+- redacted headers are read from `GIONG_RECORD_<HEADER>` when the cases run
+
+`replay` sends the cases in order to the running service (or `--base-url`) and checks each answer: the status, `Content-Type`, the headers recorded and the body field by field. A difference is a `GIONG-E5066` error at the case's line with the expected and actual values, so `giong record replay` fails a CI run the way a test does. Case files are plain JSON, meant to be read, edited and committed.
+
+## giong dashboard
+
+```sh
+giong dashboard [--port N] [--mcp ADDRESS] [--base-url URL] [--log FILE]
+```
+
+One page in the browser for the service `giong dev` runs in this project, on `http://127.0.0.1:7700`:
+
+- the build state and the last compiler error
+- the live request log, with status and time taken, and bodies when `Record` is on; each request can be copied as curl, sent again, or saved as a `giong record` case
+- routes, with a Try button, curl lines and an OpenAPI download
+- workers and tasks by the line that spawned them, with a one-second profile
+- connection pools, the service's own output, and its warnings with their error pages
+- a box to send any request to the service
+
+It reads what the service already gives, its output and its giong-mcp, so the service runs no extra code for it. Only this machine can open it: it listens on 127.0.0.1, answers only a loopback `Host`, and its API needs a header that pages of other sites cannot send, so a web page cannot read it or send requests through it. `giong dev --ui` starts it with the service.
 
 ## Error codes
 
