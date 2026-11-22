@@ -190,7 +190,8 @@ pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
             // `struct in_pktinfo`: interface index, the local address to
             // answer from (`ipi_spec_dst`, read here), then the header's
             // destination, which for a broadcast is not an address of ours.
-            // macOS leaves `ipi_spec_dst` empty: the destination then.
+            // When `ipi_spec_dst` is empty (always on macOS, and possible
+            // on Linux), the destination is the local address instead.
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
                 if let Some(d) = data.get(..12) {
                     let spec: [u8; 4] = d[4..8].try_into().expect("four bytes");

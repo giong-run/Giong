@@ -78,6 +78,9 @@ pub(crate) struct Member {
     id: u64,
     seen: u64,
     peers: HashMap<u16, Sender<Forwarded>>,
+    /// The workers of the group (the peers and this one), sorted; kept
+    /// with `peers` so that an Initial packet allocates nothing.
+    workers: Vec<u16>,
 }
 
 impl Member {
@@ -101,6 +104,7 @@ impl Member {
             // Looked up at the first datagram that needs it.
             seen: u64::MAX,
             peers: HashMap::new(),
+            workers: Vec::new(),
         };
         (member, rx)
     }
@@ -140,6 +144,10 @@ impl Member {
                 .filter(|(&worker, _)| worker != self.worker)
                 .filter_map(|(&worker, list)| Some((worker, list.first()?.1.clone())))
                 .collect();
+            self.workers.clear();
+            self.workers.extend(self.peers.keys().copied());
+            self.workers.push(self.worker);
+            self.workers.sort_unstable();
             self.seen = now;
         }
     }
@@ -152,6 +160,12 @@ impl Member {
     /// client chose (its first Initial packets, and its 0-RTT ones) is
     /// hashed to a worker of the address, the same on every worker, so
     /// that a first flight of several datagrams meets in one place.
+    ///
+    /// Right after a worker joins or leaves, workers can briefly see
+    /// different groups and choose different owners. A handshake split
+    /// that way is not lost: the client sends its Initial again, and by
+    /// then every worker sees the same group. A forwarded datagram is
+    /// handled where it arrives and never forwarded again.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub(crate) fn long_owner(&mut self, datagram: &[u8]) -> Option<u16> {
         let dcid = cid::long_dcid(datagram)?;
@@ -161,9 +175,7 @@ impl Member {
         let worker = match named {
             Some(worker) => worker,
             None => {
-                let mut workers: Vec<u16> = self.peers.keys().copied().collect();
-                workers.push(self.worker);
-                workers.sort_unstable();
+                let workers = &self.workers;
                 // FNV-1a: the same on every worker, and enough to spread
                 // the IDs clients pick at random.
                 let hash = dcid.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
