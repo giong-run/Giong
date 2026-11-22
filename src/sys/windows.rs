@@ -511,6 +511,9 @@ type OnSignal = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// number so that it can leave again.
 static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new(Vec::new());
 
+/// Console events seen since a runtime last started listening.
+static SIGNALS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Called by Windows, on a thread it starts for the purpose, for Ctrl+C and
 /// Ctrl+Break, and when the console is closed or the user logs off or the
 /// system shuts down. `TRUE` says the event is handled, so the process is
@@ -522,12 +525,20 @@ static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new
 /// event at the latest. So for those the handler waits, which gives the
 /// runtimes that time to shut down; the process ends when its main thread
 /// does, or when Windows ends it.
+///
+/// Only the first event asks for a shutdown. A second one, while the
+/// shutdown has not finished, is left to the default handler, which ends
+/// the process, as a second `SIGINT` or `SIGTERM` does on Unix: a shutdown
+/// that hangs can still be stopped with a second Ctrl+C.
 unsafe extern "system" fn console_event(kind: u32) -> BOOL {
     let ends_process = matches!(
         kind,
         CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT
     );
     if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT && !ends_process {
+        return 0;
+    }
+    if SIGNALS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0 {
         return 0;
     }
     let listeners: Vec<OnSignal> = match ON_SIGNAL.lock() {
@@ -572,6 +583,8 @@ impl SignalGuard {
             return Err(std::io::Error::from_raw_os_error(code));
         }
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Forget events from before this runtime listened.
+        SIGNALS_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
         ON_SIGNAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1013,6 +1026,42 @@ pub(crate) fn hosts_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The first Ctrl+C asks the runtimes to shut down and keeps the
+    /// process; a second one is left to the default handler, which ends
+    /// it. Listening again starts the count over.
+    #[test]
+    fn only_the_first_console_event_is_handled() {
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let seen = asked.clone();
+        let guard = super::SignalGuard::install(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        // SAFETY: a plain call of the handler; nothing ends the process.
+        unsafe {
+            assert_eq!(super::console_event(CTRL_C_EVENT), 1, "first is handled");
+            assert_eq!(
+                super::console_event(CTRL_C_EVENT),
+                0,
+                "second ends the process"
+            );
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+        drop(guard);
+        let seen = asked.clone();
+        let _guard = super::SignalGuard::install(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { super::console_event(CTRL_C_EVENT) }, 1);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
     /// A thread's event for blocking transfers is closed when the thread
     /// ends: the blocking pool starts and ends threads all the time, and an
     /// event left behind by each was one handle more for good.
