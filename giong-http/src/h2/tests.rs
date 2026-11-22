@@ -814,6 +814,93 @@ fn responses_follow_the_clients_flow_control() {
 }
 
 #[test]
+fn initial_window_size_moves_the_stream_windows_once_per_frame() {
+    let server = TestServer::start(Server::new());
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    let id = c.get("/bytes?n=5000");
+    let sent = |frames: Vec<Frame>| -> usize {
+        frames
+            .iter()
+            .filter(|f| f.head.kind == frame::DATA && f.head.stream == id)
+            .map(|f| f.payload.len())
+            .sum()
+    };
+    assert_eq!(sent(c.frames_within(Duration::from_millis(100))), 0);
+    // Several values in one frame: the last one counts.
+    let mut out = Vec::new();
+    frame::write_settings(
+        &mut out,
+        &[
+            (frame::INITIAL_WINDOW_SIZE, 100_000),
+            (frame::INITIAL_WINDOW_SIZE, 0),
+            (frame::INITIAL_WINDOW_SIZE, 1000),
+        ],
+    );
+    c.write(&out);
+    assert_eq!(sent(c.frames_within(Duration::from_millis(300))), 1000);
+    // The rest, so that the stream ends.
+    let mut out = Vec::new();
+    frame::write_settings(&mut out, &[(frame::INITIAL_WINDOW_SIZE, 65_535)]);
+    c.write(&out);
+    assert_eq!(sent(c.frames_within(Duration::from_millis(300))), 4000);
+
+    // A value that takes a window past 2^31-1 is an error even when a later
+    // one in the same frame would bring it back.
+    let mut d = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    let id = d.get("/sleep?ms=3000");
+    let mut out = Vec::new();
+    frame::write_window_update(&mut out, id, frame::MAX_WINDOW as u32);
+    frame::write_settings(
+        &mut out,
+        &[
+            (frame::INITIAL_WINDOW_SIZE, 10),
+            (frame::INITIAL_WINDOW_SIZE, 0),
+        ],
+    );
+    d.write(&out);
+    match d.goaway() {
+        Ended::GoAway(code, _) => assert_eq!(reason(code), "FLOW_CONTROL_ERROR"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn settings_frames_full_of_window_sizes_cost_one_pass_over_the_streams() {
+    let server = TestServer::start(Server::new());
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    // 100 streams wait on their windows, then come SETTINGS frames of the
+    // largest size, each holding 2,730 window sizes. Applying each one to
+    // every stream was 273,000 stream updates per frame.
+    for _ in 0..100 {
+        c.get("/bytes?n=5000");
+    }
+    c.frames_within(Duration::from_millis(100));
+    let entries = vec![(frame::INITIAL_WINDOW_SIZE, 0); frame::DEFAULT_FRAME_SIZE / 6];
+    let mut out = Vec::new();
+    for _ in 0..600 {
+        frame::write_settings(&mut out, &entries);
+    }
+    frame::write_ping(&mut out, false, b"measured");
+    let start = Instant::now();
+    c.write(&out);
+    loop {
+        let f = c.frame().expect("the connection stays open");
+        if f.head.kind == frame::PING && f.head.has(frame::ACK) {
+            break;
+        }
+    }
+    // About 0.1 s in a debug build; 8 s before.
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    // Every stream gets the window to end.
+    let mut out = Vec::new();
+    frame::write_settings(&mut out, &[(frame::INITIAL_WINDOW_SIZE, 65_535)]);
+    c.write(&out);
+}
+
+#[test]
 fn bodies_held_by_a_connection_stay_within_a_budget() {
     // Bodies of up to 64 KiB: the budget is then 1 MiB, half of it shared
     // by 100 streams at first.
