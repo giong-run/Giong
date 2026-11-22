@@ -278,6 +278,87 @@ NOT_YET = [
     "No independent audit: every crate has been reviewed, but by the project's AI agents",
 ]
 
+# ---------------------------------------------------------------- home: head to head
+# Each giong crate against the Tokio-based crate it replaces: the README's table "Against
+# the Tokio crate each giong crate replaces" and docs/BENCHMARKS.md. (job, giong side,
+# rival, giong value, rival value, giong label, rival label, verdict, unit, script).
+# `lower`: lower is better for this row. The losses sit next to the wins on the page.
+SCOREBOARD = dict(
+    h2="Head to head with the crates it replaces",
+    lede=("Every giong crate measured against the Tokio-based crate it replaces: one core each, "
+          "the same machine, the same load, the script in the repository. The losses are listed "
+          "right underneath."),
+    rows=[
+        ("HTTPS, kept-alive", "giong-http + giong-tls", "Axum + rustls",
+         146.6, 81.2, "146.6k", "81.2k", "1.8×", "requests/s", "bench/tls.sh"),
+        ("Routing and JSON", "giong-web", "axum",
+         152.5, 118.3, "152.5k", "118.3k", "1.3×", "requests/s", "bench/web.sh"),
+        ("gRPC, 100-byte unary calls", "giong-grpc", "tonic",
+         259.0, 172.8, "259.0k", "172.8k", "1.5×", "calls/s", "bench/grpc.sh"),
+        ("PostgreSQL, one row by key", "giong-postgres", "tokio-postgres + deadpool",
+         311.4, 93.8, "311.4k", "93.8k", "3.3×", "statements/s", "bench/postgres.sh"),
+        ("MySQL, one row by key", "giong-mysql", "SQLx",
+         150.7, 29.3, "150.7k", "29.3k", "5.1×", "statements/s", "bench/mysql.sh"),
+        ("Redis `GET`", "giong-redis", "redis-rs",
+         640, 492, "640k", "492k", "1.3×", "commands/s, at half the CPU", "bench/redis.sh"),
+        ("File reads, 4 KiB at an offset", "giong::fs", "tokio::fs",
+         1328, 163, "1.33M", "163k", "8×", "reads/s", "bench/fs.sh"),
+        ("Memory per idle connection", "giong-http", "Axum",
+         2.0, 20.4, "2.0 KiB", "20.4 KiB", "10× less", "lower is better", "bench/memory.sh", "lower"),
+    ],
+    losses=[
+        "Over **one shared PostgreSQL connection** giong-postgres is 7–9% behind tokio-postgres "
+        "(47.7k against 51.4k statements/s by key).",
+        "**Large uploads**: 4.4 GB/s against Tokio's 7.6 for 1 MB bodies, 3.0 against 3.5 for 64 KB.",
+        "**Short requests mixed with long computations** on two cores: p99 1.29 ms against "
+        "Tokio's 0.78, because Tokio moves waiting work to another core and giong does not.",
+        "**One core** in the benchmark lab: 157k requests/s against tuned Monoio's 177k.",
+    ],
+    foot=("One core per side on a 4-vCPU cloud VM unless the table says otherwise. Method, raw data "
+          "and every other row in docs/BENCHMARKS.md."),
+)
+
+# ---------------------------------------------------------------- home: build
+# bench/build.sh, bench/results/build/cloud-4vcpu/summary.md: the same three-route
+# service on giong-web 1.3.0 and on axum + tokio + tower-http.
+BUILD = dict(
+    h2="Light enough to build in seconds",
+    lede=("giong's stack is its own crates, with no macros in the runtime or the framework. The "
+          "same small JSON service, with request ids, logging, compression and a timeout, built "
+          "on giong-web and on axum with tower-http:"),
+    rows=[  # (what, giong, axum, giong value, axum value) -- lower is better on every row
+        ("Crates in the build", "22", "83", 22, 83),
+        ("Clean debug build", "7.4 s", "18.8 s", 7.4, 18.8),
+        ("Rebuild after a one-line edit", "0.56 s", "0.87 s", 0.56, 0.87),
+        ("`target/` after a debug build", "181 MB", "403 MB", 181, 403),
+        ("Clean release build", "11.4 s", "33.9 s", 11.4, 33.9),
+        ("Release binary, stripped", "1.45 MB", "3.60 MB", 1.45, 3.60),
+    ],
+    foot=("4-vCPU cloud VM, Rust 1.97, mean of two rounds; times ±10%, sizes exact. A larger service "
+          "has not been measured."),
+    src="bench/results/build/cloud-4vcpu/summary.md",
+    # The terminal types this: the measured service, built from a checkout of the
+    # repository. The build time is the second round's.
+    term=[
+        ("note", "# the service the table measures"),
+        ("cmd", "cd bench/build-giong && cargo build"),
+        ("out", "   Compiling giong v1.3.0"),
+        ("out", "   Compiling giong-web v1.3.0"),
+        ("out", "   Compiling ghello v0.1.0"),
+        ("ok", "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.37s"),
+        ("cmd", "cargo run &"),
+        ("cmd", "curl localhost:8080/hello/agent"),
+        ("out", "Hello, agent!"),
+    ],
+)
+
+# ---------------------------------------------------------------- home: what is next
+NEXT = dict(
+    h2="What comes next",
+    lede=("Planned, not shipped: the roadmap has every item and what marks it done. The site "
+          "describes released versions; these are where the next ones are going."),
+)
+
 # ---------------------------------------------------------------- code
 CODE = [
     dict(
@@ -472,12 +553,13 @@ CHARTS = [
         title="File reads on one core",
         sub="4 KiB at a random offset, one task, operations per second · higher is better",
         max=1500,
-        rows=[("std", 1395, "1.40M", 1342, 1464), ("giong", 1014, "1.01M", 868, 1153),
-              ("tokio1", 184, "184k", 171, 188), ("tokio4", 33, "33k", 32, 34)],
-        note=("5.5 times Tokio, where every read is a hand-off to another thread and back; on giong "
-              "it is one entry in a batch. A blocking `std` call is 28% faster for cached data. What "
-              "giong buys is a worker that never waits when the data is not cached, which this "
-              "benchmark does not measure."),
+        rows=[("giong", 1328, "1.33M", 1282, 1346), ("std", 1313, "1.31M", 1153, 1449),
+              ("tokio1", 163, "163k", 159, 173), ("tokio4", 38, "38k", 35, 39)],
+        note=("8 times Tokio, where every read is a hand-off to another thread and back, and level "
+              "with a blocking `std` call. giong first copies from the page cache with "
+              "`preadv2(RWF_NOWAIT)`, one system call that never waits for the disk, and goes "
+              "through the ring only when the data is not cached, so a worker never waits on the "
+              "disk. This benchmark reads cached data only."),
         src=["bench/fs.sh"],
     ),
     dict(
@@ -628,7 +710,7 @@ FAQ = [
     ("Is it faster than Tokio?",
      "Sometimes, and the benchmarks page says where. Small responses at 50 connections are a tie. "
      "giong makes about 0.03 system calls per request against 2.05, spends the least CPU per "
-     "request at 5,000 connections, and reads files 5.5 times faster than Tokio on one core. On "
+     "request at 5,000 connections, and reads files 8 times faster than Tokio on one core. On "
      "bare metal with 8 workers it served 2.45M requests/s against raw Tokio's 2.16M."),
     ("How do I report a security problem?",
      "Privately, through GitHub's private vulnerability reporting (the Security link at the "
