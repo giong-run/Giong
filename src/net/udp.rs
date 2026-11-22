@@ -43,12 +43,18 @@ const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
 /// A control message's header (`struct cmsghdr`): 16 bytes on 64-bit Linux,
-/// where `cmsg_len` is a `size_t`, and 12 on macOS, where it is a
-/// `socklen_t`.
+/// where `cmsg_len` is a `size_t` (a `socklen_t` and 4 bytes of padding in
+/// musl's), and 12 on macOS, where it is a `socklen_t`.
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
-/// What control messages are aligned to (`CMSG_ALIGN`): `size_t` on Linux,
-/// 4 bytes on macOS. Both are the alignment of the header itself.
+/// What control messages are aligned to (`CMSG_ALIGN`): a `long` on Linux,
+/// the kernel's rule whatever the C library (musl's header, whose
+/// `cmsg_len` is a padded `socklen_t`, is aligned to 4 bytes only), and 4
+/// bytes on macOS.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+const CMSG_ALIGN: usize = mem::size_of::<libc::c_long>();
+#[cfg(not(target_os = "linux"))]
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_ALIGN: usize = mem::align_of::<libc::cmsghdr>();
 // The data of a message starts right after its header (`CMSG_DATA`), which
@@ -62,6 +68,9 @@ const fn cmsg_align(len: usize) -> usize {
 const CMSG_INT_SPACE: usize = cmsg_align(CMSG_HDR + 4);
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_PKTINFO6_SPACE: usize = cmsg_align(CMSG_HDR + mem::size_of::<libc::in6_pktinfo>());
+// The kernel's sizes on 64-bit Linux (see `CONTROL_SPACE`), with glibc or musl.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+const _: () = assert!(CMSG_INT_SPACE == 24 && CMSG_PKTINFO6_SPACE == 40);
 /// Largest payload a GRO receive can hand over: 64 KiB of coalesced
 /// datagrams.
 #[cfg(feature = "unstable-udp-offload")]
