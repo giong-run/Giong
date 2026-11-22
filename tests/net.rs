@@ -1313,52 +1313,58 @@ fn recv_into_appends_without_recv_first() {
     });
 }
 
-/// macOS has no per-send flag against `SIGPIPE`, so every stream must carry
-/// `SO_NOSIGPIPE`: a process that does not ignore the signal (a library in
-/// a C or Swift program, a Rust program built to keep it) would otherwise
-/// die when a client goes away while the server writes. Connections a
-/// listener accepts included.
+/// macOS only, in a module of its own: the simulator's copy of this file
+/// wraps top-level tests for every platform.
 #[cfg(target_os = "macos")]
-#[test]
-fn accepted_and_connected_streams_never_raise_sigpipe() {
-    use std::os::fd::AsRawFd;
+mod macos {
+    use super::*;
 
-    fn no_sigpipe(fd: std::os::fd::RawFd) -> bool {
-        let mut on: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: reads an int option into a local of the right size.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_NOSIGPIPE,
-                (&mut on as *mut libc::c_int).cast(),
-                &mut len,
-            )
-        };
-        assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
-        on != 0
+    /// macOS has no per-send flag against `SIGPIPE`, so every stream must carry
+    /// `SO_NOSIGPIPE`: a process that does not ignore the signal (a library in
+    /// a C or Swift program, a Rust program built to keep it) would otherwise
+    /// die when a client goes away while the server writes. Connections a
+    /// listener accepts included.
+    #[test]
+    fn accepted_and_connected_streams_never_raise_sigpipe() {
+        use std::os::fd::AsRawFd;
+
+        fn no_sigpipe(fd: std::os::fd::RawFd) -> bool {
+            let mut on: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: reads an int option into a local of the right size.
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&mut on as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+            on != 0
+        }
+
+        giong::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = giong::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            assert!(no_sigpipe(client.as_raw_fd()), "a connected stream");
+            assert!(no_sigpipe(server.as_raw_fd()), "an accepted stream");
+
+            let dir = std::env::temp_dir().join(format!("giong-nosigpipe-{}", std::process::id()));
+            drop(std::fs::remove_file(&dir));
+            let listener = giong::net::UnixListener::bind(&dir).unwrap();
+            let path = dir.clone();
+            let client =
+                giong::spawn(async move { giong::net::UnixStream::connect(&path).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            assert!(no_sigpipe(client.as_raw_fd()), "a connected Unix stream");
+            assert!(no_sigpipe(server.as_raw_fd()), "an accepted Unix stream");
+            drop(std::fs::remove_file(&dir));
+        });
     }
-
-    giong::block_on(async {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = giong::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let server = listener.accept().await.unwrap();
-        let client = client.await.unwrap();
-        assert!(no_sigpipe(client.as_raw_fd()), "a connected stream");
-        assert!(no_sigpipe(server.as_raw_fd()), "an accepted stream");
-
-        let dir = std::env::temp_dir().join(format!("giong-nosigpipe-{}", std::process::id()));
-        drop(std::fs::remove_file(&dir));
-        let listener = giong::net::UnixListener::bind(&dir).unwrap();
-        let path = dir.clone();
-        let client =
-            giong::spawn(async move { giong::net::UnixStream::connect(&path).await.unwrap() });
-        let server = listener.accept().await.unwrap();
-        let client = client.await.unwrap();
-        assert!(no_sigpipe(client.as_raw_fd()), "a connected Unix stream");
-        assert!(no_sigpipe(server.as_raw_fd()), "an accepted Unix stream");
-        drop(std::fs::remove_file(&dir));
-    });
 }
