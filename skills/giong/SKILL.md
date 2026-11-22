@@ -133,6 +133,28 @@ fn main() -> std::io::Result<()> {
 
 `cargo add giong giong-web serde --features serde/derive`, then `cargo run --release`.
 
+## The giong command
+
+`cargo install giong-cli` installs `giong`: one command per job, the same on every
+project. Every command takes `--json` and reports each problem with a `GIONG-E50xx` code,
+the cause and the fix.
+
+| You want | Run |
+|---|---|
+| Start a project | `giong new api --template web --db postgres` (templates `web`, `grpc`, `worker`; `--db postgres`, `mysql`, `redis`, comma-separated; `--tls`) |
+| Teach this project to your agent | `giong ai init` (`giong new` does it) |
+| Work on it | `giong dev` |
+| Is my machine right? | `giong doctor` |
+| What is wrong with my code? | `giong check --json`, then `giong fix` |
+| What does this error mean? | `giong explain GIONG-E0102` |
+| Run the tests | `giong test` (on io_uring, then on epoll; reads `.env`) |
+| A database | `giong db up`, `giong db migrate` |
+
+`giong new` writes a project that builds and passes its tests: the service, an end to end
+test, migrations, `.env.example`, a Dockerfile, a CI workflow and fast dev builds. Extend it
+rather than starting from an empty `main.rs`. `giong fix` applies only fixes that need no
+judgement (the compiler's, clippy's, and `giong check`'s own); what is left needs a decision.
+
 ## Testing
 
 - `giong::block_on(async { .. })` in a plain `#[test]`.
@@ -170,4 +192,4 @@ Log `giong::driver_choice()` at start-up to see which driver each worker got and
 1. Nothing blocks a worker. 2. Every wait has a deadline. 3. No `RefCell` borrow across an
 `.await`. 4. Pools, clients and routers are per worker. 5. Errors matched by code. 6.
 Transactions on `pool.get()`. 7. No Tokio-runtime crate on a worker. 8. Tests pass with
-`GIONG_DRIVER=epoll` too.
+`GIONG_DRIVER=epoll` too. 9. `giong check --json` reports nothing new.
