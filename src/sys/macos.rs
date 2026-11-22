@@ -580,6 +580,16 @@ pub(crate) unsafe fn sendmmsg(
     count as isize
 }
 
+/// Lowers the calling thread's CPU priority (compute lane threads). The nice
+/// value belongs to the whole process on macOS, so `setpriority` would slow
+/// the workers too: the thread takes the utility quality-of-service class
+/// instead, which the scheduler serves after the workers' default class.
+/// A failure leaves the thread at its old priority, which is safe.
+pub(crate) fn lower_thread_priority(_nice: i32) {
+    // SAFETY: plain call about the calling thread.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

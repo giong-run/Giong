@@ -313,3 +313,12 @@ pub(crate) unsafe fn sendmmsg(
 ) -> isize {
     libc::sendmmsg(fd, msgs, count as libc::c_uint, flags) as isize
 }
+
+/// Lowers the calling thread's CPU priority to nice `nice` (compute lane
+/// threads). On Linux each thread has its own nice value, and `who == 0` is
+/// the calling thread. Raising it needs no privilege; a failure leaves the
+/// thread at its old priority, which is safe.
+pub(crate) fn lower_thread_priority(nice: i32) {
+    // SAFETY: plain syscall with integer arguments.
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+}

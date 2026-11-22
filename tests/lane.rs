@@ -18,6 +18,16 @@ fn nice() -> i32 {
     unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
 }
 
+/// The calling thread's quality-of-service class.
+#[cfg(target_os = "macos")]
+fn qos_class() -> u32 {
+    let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+    let mut relative = 0;
+    // SAFETY: valid pointers for the two outputs.
+    unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut relative) };
+    class as u32
+}
+
 #[test]
 fn a_lane_handle_can_be_sent_to_other_threads() {
     fn assert_send_sync<T: Send + Sync + Unpin>() {}
@@ -45,7 +55,16 @@ fn a_compute_closure_runs_below_the_workers_priority() {
             .await
             .unwrap();
         assert_eq!(name, "giong-lane-cpu");
+        #[cfg(target_os = "linux")]
         assert_eq!(prio, nice() + 10);
+        // The nice value is the process's on macOS: the compute thread takes
+        // a lower QoS class and leaves the workers' priority alone.
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(prio, nice(), "the workers keep their priority");
+            let qos = giong::spawn_compute(qos_class).await.unwrap();
+            assert_eq!(qos, libc::qos_class_t::QOS_CLASS_UTILITY as u32);
+        }
     });
 }
 

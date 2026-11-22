@@ -33,7 +33,9 @@ pub(crate) struct PoolConfig {
     /// How long a thread waits for work before it ends.
     pub(crate) idle: Duration,
     /// The nice value its threads take on start (0 leaves it alone). On
-    /// Linux the nice value belongs to each thread.
+    /// Linux the nice value belongs to each thread; on macOS, where it
+    /// belongs to the process, the threads take a lower quality-of-service
+    /// class instead (see `sys::lower_thread_priority`).
     pub(crate) nice: i32,
     /// Stack size of its threads; `None` for the standard library's default.
     pub(crate) stack_size: Option<usize>,
@@ -274,13 +276,7 @@ impl Pool {
 
     fn work(self: Arc<Self>) {
         if self.cfg.nice != 0 {
-            // SAFETY: plain syscall with integer arguments. `who == 0` is the
-            // calling thread on Linux, where each thread has its own nice
-            // value. Raising it needs no privilege; failure leaves the
-            // thread at its old priority, which is safe.
-            unsafe {
-                libc::setpriority(libc::PRIO_PROCESS, 0, self.cfg.nice);
-            }
+            crate::sys::lower_thread_priority(self.cfg.nice);
         }
         let mut state = lock(&self.state);
         loop {
