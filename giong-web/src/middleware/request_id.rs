@@ -14,12 +14,13 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// request in the log.
 ///
 /// Ids are 32 lowercase hexadecimal digits, 128 bits like a UUID: 16 chosen
-/// at random when the process starts, 4 numbering the thread that made it
-/// (each thread takes the next number on its first id, so that ids made on
-/// different threads differ, a giong worker's as any other's) and 12
-/// counting that thread's ids. Two processes share the random part with
-/// even odds only after some five billion starts, a thread's counter takes
-/// years to wrap, and the thread numbers wrap after 65,536 threads. Making one takes no lock and no
+/// at random when the process starts and 16 counting the process's ids, so
+/// that no two ids of one process are the same, whatever thread or runtime
+/// made them. Each thread reserves 65,536 numbers of the count at a time,
+/// so the count is shared without a lock: two threads' ids interleave in
+/// blocks rather than in the order they were made. Two processes share the
+/// random part with even odds only after some five billion starts, and the
+/// count does not wrap in practice. Making one takes no lock and no
 /// system call. The length and the digits are part of the format, changed
 /// only in a breaking release; what the parts mean is for reading a log,
 /// not for parsing.
@@ -94,33 +95,37 @@ impl<S: 'static> Middleware<S> for RequestId {
     }
 }
 
-/// The number the next thread to make an id takes.
-static THREADS: AtomicU64 = AtomicU64::new(0);
+/// How many numbers of the count a thread reserves at a time.
+const BLOCK: u64 = 1 << 16;
+
+/// The first number of the next block a thread reserves.
+static NEXT_BLOCK: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// This thread's number (taken on its first id) and its last count.
-    static COUNTER: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    /// The next number this thread gives and the end of its block (both 0
+    /// before its first id, which reserves one).
+    static COUNTER: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
-/// A new id: process prefix, thread, counter.
+/// A new id: process prefix, then the process's count.
 pub(crate) fn generate() -> IdBuf {
     static PREFIX: OnceLock<u64> = OnceLock::new();
     let prefix = *PREFIX.get_or_init(prefix);
-    // A number of the thread's own rather than its worker index: two
-    // runtimes in one process each have a worker 0, and threads off a
-    // worker would all share one number.
-    let (thread, count) = COUNTER.with(|c| {
-        let (thread, n) = c
-            .get()
-            .unwrap_or_else(|| (THREADS.fetch_add(1, Ordering::Relaxed), 0));
-        let n = n.wrapping_add(1);
-        c.set(Some((thread, n)));
-        (thread, n)
+    // One count for the process, not one per thread or worker: two
+    // runtimes in one process each have a worker 0, and per-thread counters
+    // all start at the same number.
+    let count = COUNTER.with(|c| {
+        let (mut next, mut end) = c.get();
+        if next == end {
+            next = NEXT_BLOCK.fetch_add(BLOCK, Ordering::Relaxed);
+            end = next + BLOCK;
+        }
+        c.set((next + 1, end));
+        next
     });
     let mut digits = [0u8; 32];
     hex(&mut digits[..16], prefix);
-    hex(&mut digits[16..20], thread);
-    hex(&mut digits[20..], count);
+    hex(&mut digits[16..], count);
     // Hexadecimal digits are always a valid id.
     IdBuf::new(std::str::from_utf8(&digits).unwrap_or("0")).expect("hex digits")
 }
@@ -160,8 +165,11 @@ mod tests {
             .bytes()
             .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
         assert_ne!(a.as_str(), b.as_str());
-        // The same process and thread: the same 64 random bits and thread.
-        assert_eq!(a.as_str()[..20], b.as_str()[..20]);
+        // The same process: the same 64 random bits; the same thread: the
+        // next number.
+        assert_eq!(a.as_str()[..16], b.as_str()[..16]);
+        let count = |id: &IdBuf| u64::from_str_radix(&id.as_str()[16..], 16).unwrap();
+        assert_eq!(count(&b), count(&a) + 1);
     }
 
     /// Threads that are not giong workers, and the workers of two runtimes
