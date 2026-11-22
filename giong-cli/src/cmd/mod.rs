@@ -9,6 +9,7 @@ use crate::args::{distance, Args, Flag};
 use crate::code::Code;
 use crate::report::{Failure, Report};
 
+pub mod clean;
 pub mod doctor;
 pub mod explain;
 pub mod help;
@@ -35,6 +36,7 @@ pub const COMMANDS: &[&Command] = &[
     // `image`, `openapi`, `record`.
     &doctor::COMMAND,
     &explain::COMMAND,
+    &clean::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];

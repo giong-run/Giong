@@ -519,9 +519,11 @@ fn find_line(text: &str, word: &str) -> (u32, u32) {
     (1, 1)
 }
 
-/// Bytes in files under `dir` (not following symbolic links).
+/// Bytes in files under `dir` (not following symbolic links; a file with
+/// several hard links, as cargo makes for the binaries it copies up, counts once).
 pub fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
+    let mut seen = std::collections::HashSet::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
@@ -533,12 +535,23 @@ pub fn dir_size(dir: &Path) -> u64 {
             };
             if meta.is_dir() {
                 stack.push(e.path());
-            } else if meta.is_file() {
+            } else if meta.is_file() && first_link(&meta, &mut seen) {
                 total += meta.len();
             }
         }
     }
     total
+}
+
+#[cfg(unix)]
+fn first_link(meta: &std::fs::Metadata, seen: &mut std::collections::HashSet<(u64, u64)>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() < 2 || seen.insert((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn first_link(_: &std::fs::Metadata, _: &mut std::collections::HashSet<(u64, u64)>) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -626,6 +639,11 @@ mod tests {
         std::fs::write(d.join("x"), [0u8; 10]).unwrap();
         std::fs::write(d.join("a/b/y"), [0u8; 5]).unwrap();
         assert_eq!(dir_size(&d), 15);
+        #[cfg(unix)]
+        {
+            std::fs::hard_link(d.join("x"), d.join("a/x2")).unwrap();
+            assert_eq!(dir_size(&d), 15, "a hard link counts once");
+        }
         std::fs::remove_dir_all(&d).unwrap();
         assert_eq!(dir_size(&d), 0);
     }
