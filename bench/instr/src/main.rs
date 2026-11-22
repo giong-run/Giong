@@ -159,6 +159,7 @@ fn main() {
                 .block_on((case.run)(case.name, conns))
                 .expect("start the runtime");
         }
+        Some("idle-client") => cases::idle_client(&args[1..]),
         _ => usage(),
     }
 }
