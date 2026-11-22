@@ -288,6 +288,11 @@ Max processes             unlimited            unlimited            processes
     #[cfg(unix)]
     #[test]
     fn a_tool_that_timed_out_is_not_waited_for_again() {
+        // CI's docker job has no sleep(1) on the PATH.
+        if !exists("sleep", &["0"]) {
+            eprintln!("skipped: no sleep here");
+            return;
+        }
         let mut cmd = Command::new("sleep");
         cmd.arg("5");
         assert!(matches!(
