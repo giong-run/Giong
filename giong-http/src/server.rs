@@ -658,8 +658,11 @@ impl Server {
     /// connections: idle connections, from one client or from many
     /// browsers, cannot keep new clients out. The idle connection ends as
     /// if its client had closed it (HTTP/2 sends `GOAWAY`), and clients
-    /// open a new one when they need it. A connection receiving or
-    /// answering a request is never closed for this. If none is idle, the
+    /// open a new one when they need it. A request the client sent just as
+    /// its connection was closed is lost, as with any keep-alive close, and
+    /// clients retry it on a new connection only if it is idempotent (`GET`,
+    /// `PUT`, `DELETE`...). A connection receiving or answering a request is
+    /// never closed for this. If none is idle, the
     /// server stops accepting until a connection closes, and new clients
     /// wait in the kernel's listen queue instead of being refused, so the
     /// server does not run out of file descriptors because of the number
