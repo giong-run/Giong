@@ -2104,7 +2104,10 @@ mod tests {
         assert!(text.starts_with("GIONG-E0010: "), "{text}");
         assert!(text.contains("memory for its rings"), "{text}");
         assert!(text.contains("(RLIMIT_MEMLOCK, 8 MiB)"), "{text}");
-        assert!(text.contains("Cannot allocate memory"), "{text}");
+        // The C library's words for ENOMEM: glibc's "Cannot allocate memory",
+        // musl's "Out of memory".
+        let words = io::Error::from_raw_os_error(libc::ENOMEM).to_string();
+        assert!(text.contains(&words), "{text}");
         for fix in [
             "LimitMEMLOCK=infinity",
             "--ulimit memlock=-1",
