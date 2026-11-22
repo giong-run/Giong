@@ -273,7 +273,6 @@ fn an_explicit_target_dir_is_respected() {
 /// cargo writes it only into a directory it creates. `giong clean` must not
 /// answer "no build directory found" for the project's own build directory.
 #[test]
-#[ignore = "known bug: a pre-created CARGO_TARGET_DIR is skipped silently (review comment on the CLI skeleton PR)"]
 fn a_target_dir_made_before_the_first_build_is_not_skipped_silently() {
     let dir = TempDir::new("clean-precreated");
     let elsewhere = TempDir::new("clean-precreated-target");
@@ -310,7 +309,13 @@ fn all_removes_the_build_directory_and_nothing_else() {
         .dir(dir.path())
         .run()
         .report("clean");
-    assert!(!dir.join("target").exists(), "{v:#}");
+    // Emptied, keeping only cargo's tag, so the directory stays recognised.
+    let left: Vec<PathBuf> = files_under(&dir.join("target"));
+    assert!(
+        left.iter()
+            .all(|p| p.file_name().is_some_and(|n| n == "CACHEDIR.TAG")),
+        "--all left {left:?}: {v:#}"
+    );
     assert!(dir.join("Cargo.toml").exists() && dir.join("src/main.rs").exists());
 }
 
@@ -344,7 +349,6 @@ fn bad_days_are_usage_errors() {
 /// A huge but valid number of days must neither panic (debug) nor wrap
 /// around to a few hours (release) and remove what was built yesterday.
 #[test]
-#[ignore = "known bug: days * 86_400 overflows (review comment on the CLI skeleton PR)"]
 fn huge_days_do_not_overflow() {
     let dir = TempDir::new("clean-days-huge");
     new_package(&dir, "huge", "");
@@ -372,7 +376,6 @@ fn huge_days_do_not_overflow() {
 /// rewrites), not at the unit directory's own time, which cargo leaves as it
 /// was when the unit was first built.
 #[test]
-#[ignore = "known bug: --days uses the fingerprint directory's mtime and removes units rebuilt today (review comment on the CLI skeleton PR)"]
 fn days_keeps_units_rebuilt_today() {
     let dir = TempDir::new("clean-days-today");
     new_package(&dir, "today", "");
@@ -403,7 +406,6 @@ fn days_keeps_units_rebuilt_today() {
 /// ruff, borg, backup exclusions), not cargo's own. A directory that is not
 /// a cargo build must never be removed, with or without `--all`.
 #[test]
-#[ignore = "known bug: any CACHEDIR.TAG counts as cargo's; --all deletes .pytest_cache and backup-excluded folders (review comment on the CLI skeleton PR)"]
 fn other_programs_cache_directories_are_never_removed() {
     let root = TempDir::new("clean-foreign-tag");
     let sig = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by pytest.\n";
@@ -437,7 +439,6 @@ fn other_programs_cache_directories_are_never_removed() {
 /// The same build directory named twice (or a directory and one inside it)
 /// is one directory: the bytes freed are counted once.
 #[test]
-#[ignore = "known bug: overlapping arguments count the same directory several times (review comment on the CLI skeleton PR)"]
 fn the_same_directory_named_twice_is_counted_once() {
     let dir = TempDir::new("clean-twice");
     new_package(&dir, "twice", "");

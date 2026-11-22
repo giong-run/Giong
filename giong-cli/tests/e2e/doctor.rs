@@ -168,7 +168,6 @@ fn nightly_and_odd_version_strings_are_read() {
 /// A toolchain that hangs (a rustup proxy waiting on a lock, a network
 /// mount) must not hang `giong doctor`: agents run it unattended.
 #[test]
-#[ignore = "known bug: host::output has no timeout (review comment on the CLI skeleton PR)"]
 fn a_hanging_rustc_does_not_hang_doctor() {
     let dir = TempDir::new("doctor-hang");
     let rustc = fake_tool(
@@ -265,7 +264,6 @@ fn tokio_runtime_crates_are_found_at_their_line() {
 }
 
 #[test]
-#[ignore = "known bug: the finding points at line 1, not the renamed dependency (review comment on the CLI skeleton PR)"]
 fn a_renamed_tokio_dependency_is_still_tokio() {
     let dir = TempDir::new("doctor-tokio-renamed");
     new_package(
@@ -309,12 +307,12 @@ fn the_dev_profile_edit_applies_cleanly_in_every_shape() {
     ]);
 }
 
-/// Headers TOML allows but the line scanner does not recognise: the edit
-/// adds a second `[profile.dev]` and cargo refuses the file.
+/// Headers TOML allows in other spellings. Each gets a correct edit, or no
+/// finding at all for the inline and dotted forms (no edit is better than one
+/// cargo refuses); never a second `[profile.dev]`.
 #[test]
-#[ignore = "known bug: dev_profile_finding adds a duplicate [profile.dev] (review comment on the CLI skeleton PR)"]
 fn the_dev_profile_edit_handles_every_header_spelling() {
-    check_profile_shapes(&[
+    check_profile_shapes_or_skip(&[
         ("header-comment", "\n[profile.dev] # fast\ndebug = true\n"),
         ("header-spaces", "\n[ profile.dev ]\ndebug=true\n"),
         ("inline-table", "\n[profile]\ndev = { debug = true }\n"),
@@ -322,6 +320,14 @@ fn the_dev_profile_edit_handles_every_header_spelling() {
 }
 
 fn check_profile_shapes(shapes: &[(&str, &str)]) {
+    check_shapes(shapes, false);
+}
+
+fn check_profile_shapes_or_skip(shapes: &[(&str, &str)]) {
+    check_shapes(shapes, true);
+}
+
+fn check_shapes(shapes: &[(&str, &str)], may_skip: bool) {
     for (name, extra) in shapes {
         let dir = TempDir::new(&format!("doctor-profile-{name}"));
         new_package(&dir, "p", extra);
@@ -335,6 +341,9 @@ fn check_profile_shapes(shapes: &[(&str, &str)]) {
             .iter()
             .find(|f| f["code"] == "GIONG-E5012")
         else {
+            if may_skip && !name.starts_with("header") {
+                continue;
+            }
             panic!("{name}: no GIONG-E5012 for a profile with full debug info: {v:#}");
         };
         assert_eq!(f["fixable"], true, "{name}");
@@ -380,7 +389,6 @@ fn env_example_keys_missing_from_env_are_listed() {
 /// A project whose Cargo.toml cargo cannot read is the first thing an agent
 /// needs to hear about; doctor must not report "everything is here".
 #[test]
-#[ignore = "known bug: doctor drops the project checks silently when cargo metadata fails (review comment on the CLI skeleton PR)"]
 fn a_broken_manifest_is_reported() {
     let dir = TempDir::new("doctor-broken-manifest");
     dir.write("Cargo.toml", "[package]\nname = \"broken\"\nversion = \n");

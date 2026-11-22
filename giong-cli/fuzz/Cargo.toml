@@ -1,0 +1,39 @@
+[package]
+name = "giong-cli-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+# Its own workspace, like the other fuzz crates: needs nightly and cargo-fuzz.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "args"
+path = "fuzz_targets/args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dotenv"
+path = "fuzz_targets/dotenv.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_parsers"
+path = "fuzz_targets/host_parsers.rs"
+test = false
+doc = false
+bench = false

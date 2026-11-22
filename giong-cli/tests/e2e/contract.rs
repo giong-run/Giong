@@ -224,7 +224,6 @@ fn bare_giong_version_and_json_placement() {
 /// home directories). The command must answer with a code, not a panic.
 #[cfg(unix)]
 #[test]
-#[ignore = "known bug: main uses std::env::args, which panics on non-UTF-8 (review comment on the CLI skeleton PR)"]
 fn an_argument_that_is_not_utf8_is_not_a_panic() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -238,8 +237,13 @@ fn an_argument_that_is_not_utf8_is_not_a_panic() {
         "giong panicked on a non-UTF-8 argument\n{}",
         out.dump()
     );
-    let v = out.report("clean");
-    assert!(v.get("error").is_some(), "{}", out.dump());
+    // The command line cannot be read, so the document may name the
+    // program instead of the command.
+    let v = crate::schema::parse_single_document(&out.stdout).unwrap();
+    let cmd = v["command"].as_str().unwrap_or("").to_string();
+    assert!(cmd == "clean" || cmd == "giong", "{}", out.dump());
+    out.report(&cmd);
+    assert_eq!(v["error"]["code"], "GIONG-E5000", "{}", out.dump());
 }
 
 #[test]
