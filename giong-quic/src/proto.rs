@@ -9,7 +9,8 @@
 //! `Send`; only its own worker touches it.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -98,6 +99,8 @@ struct Conn {
     /// Handed over early (0-RTT) and its handshake not over yet: the
     /// client's address is not validated (counted in `State::unvalidated`).
     unvalidated: bool,
+    /// The deadline of this connection's live entry in `State::timers`.
+    armed: Option<Instant>,
 }
 
 /// A stream as a handle knows it.
@@ -169,6 +172,16 @@ struct State {
     sends: Vec<Send>,
     segments: usize,
     spare: Vec<Vec<u8>>,
+    /// When connections next want `handle_timeout`, earliest first, by
+    /// slot. A wake of the driver then costs what the connections it
+    /// touches cost, not a look at every connection the endpoint holds:
+    /// with 3,000 idle connections on one worker, two scans of them per
+    /// wake made a stream round trip 30 times as expensive.
+    ///
+    /// An entry is live while its connection's `armed` names its
+    /// deadline; others are left behind when a deadline moves, and are
+    /// skipped when they come up (see [`State::arm`]).
+    timers: BinaryHeap<Reverse<(Instant, usize)>>,
 }
 
 impl Conn {
@@ -286,6 +299,7 @@ impl State {
             closing,
             saw_early: false,
             unvalidated: false,
+            armed: None,
         });
         if let Some(c) = &mut self.conns[slot] {
             // The first datagram may hold 0-RTT packets after the Initial.
@@ -415,24 +429,68 @@ impl State {
     /// Returns the next deadline.
     fn process(&mut self, now: Instant) -> Option<Instant> {
         self.wake = false;
-        for i in 0..self.conns.len() {
-            if let Some(c) = &mut self.conns[i] {
-                if c.c.poll_timeout().is_some_and(|t| t <= now) {
-                    let closing = c.closing.clone();
-                    Closable::building_for(&closing, || c.c.handle_timeout(now));
-                    self.mark(i);
-                }
+        while let Some(&Reverse((at, i))) = self.timers.peek() {
+            if at > now {
+                break;
+            }
+            self.timers.pop();
+            let Some(Some(c)) = self.conns.get_mut(i) else {
+                continue;
+            };
+            if c.armed != Some(at) {
+                // Left behind by a deadline that moved, or by the slot's
+                // previous connection.
+                continue;
+            }
+            c.armed = None;
+            #[cfg(test)]
+            tests::LOOKS.with(|n| n.set(n.get() + 1));
+            if c.c.poll_timeout().is_some_and(|t| t <= now) {
+                let closing = c.closing.clone();
+                Closable::building_for(&closing, || c.c.handle_timeout(now));
+                self.mark(i);
+            } else {
+                // The deadline moved later since it was armed.
+                self.arm(i);
             }
         }
         self.wake = false;
         while let Some(i) = self.dirty.pop() {
             self.process_one(i, now);
         }
-        self.conns
-            .iter_mut()
-            .flatten()
-            .filter_map(|c| c.c.poll_timeout())
-            .min()
+        self.timers.peek().map(|&Reverse((at, _))| at)
+    }
+
+    /// Puts the deadline of the connection in slot `i` in `timers`, after
+    /// anything that may have changed it: everything that touches a
+    /// connection marks it, and [`process_one`](Self::process_one) arms
+    /// it. A deadline later than the armed one waits for that entry to
+    /// come up, which arms the connection again; so a busy connection
+    /// leaves an entry behind only when its deadline comes earlier. The
+    /// heap is rebuilt from the live entries when those left behind
+    /// outnumber them.
+    fn arm(&mut self, i: usize) {
+        let Some(Some(c)) = self.conns.get_mut(i) else {
+            return;
+        };
+        #[cfg(test)]
+        tests::LOOKS.with(|n| n.set(n.get() + 1));
+        let Some(at) = c.c.poll_timeout() else {
+            return;
+        };
+        if c.armed.is_some_and(|armed| armed <= at) {
+            return;
+        }
+        c.armed = Some(at);
+        self.timers.push(Reverse((at, i)));
+        if self.timers.len() > 2 * self.conns.len() + 64 {
+            self.timers = self
+                .conns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| Some(Reverse((c.as_ref()?.armed?, i))))
+                .collect();
+        }
     }
 
     fn process_one(&mut self, i: usize, now: Instant) {
@@ -556,7 +614,9 @@ impl State {
             }
             self.conns[i] = None;
             self.free.push(i);
+            return;
         }
+        self.arm(i);
     }
 }
 
@@ -841,6 +901,7 @@ pub(crate) fn bind(
             sends: Vec::new(),
             segments,
             spare: Vec::new(),
+            timers: BinaryHeap::new(),
         }),
     });
     giong::spawn(drive(sh.clone(), route));
@@ -1390,6 +1451,80 @@ fn handshake_end(d: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{add_waker, handshake_end, Arc, Waker};
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        /// How many times the drivers of this thread asked a connection
+        /// for its next deadline.
+        pub(super) static LOOKS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn a_busy_connection_costs_no_look_at_the_idle_ones() {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![der.clone()], key.into())
+            .unwrap();
+        server_tls.alpn_protocols = vec![b"t".to_vec()];
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let mut client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_tls.alpn_protocols = vec![b"t".to_vec()];
+        giong::Builder::new()
+            .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+            .block_on(async move {
+                let server = crate::Endpoint::server(
+                    "127.0.0.1:0".parse().unwrap(),
+                    crate::ServerConfig::new(server_tls).unwrap(),
+                )
+                .unwrap();
+                let addr = server.local_addr().unwrap();
+                giong::spawn(async move {
+                    while let Some(conn) = server.accept().await {
+                        giong::spawn(async move {
+                            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                                let data = recv.read_to_end(64).await.unwrap();
+                                send.write_all(&data).await.unwrap();
+                                send.finish().unwrap();
+                            }
+                        });
+                    }
+                });
+                let client = crate::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                let config = crate::ClientConfig::new(client_tls).unwrap();
+                let mut idle = Vec::new();
+                for _ in 0..100 {
+                    idle.push(client.connect(addr, "localhost", &config).await.unwrap());
+                }
+                let busy = client.connect(addr, "localhost", &config).await.unwrap();
+                giong::time::sleep(Duration::from_millis(100)).await;
+                let before = LOOKS.with(Cell::get);
+                for _ in 0..100 {
+                    let (mut send, mut recv) = busy.open_bi().await.unwrap();
+                    send.write_all(b"ping").await.unwrap();
+                    send.finish().unwrap();
+                    assert_eq!(recv.read_to_end(64).await.unwrap(), b"ping");
+                }
+                // Both endpoints, 101 connections each: looking at all of
+                // them at every wake of the drivers was over 400 looks a
+                // round trip.
+                let looks = (LOOKS.with(Cell::get) - before) / 100;
+                assert!(looks < 40, "{looks} looks at deadlines a round trip");
+                drop(idle);
+            })
+            .unwrap();
+    }
 
     fn long(ty: u8, payload: usize) -> Vec<u8> {
         let mut p = vec![0xc0 | ty << 4, 0, 0, 0, 1, 4, 1, 2, 3, 4, 0];
