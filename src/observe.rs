@@ -62,6 +62,16 @@ pub type Location = &'static panic::Location<'static>;
 /// Set in [`Counters::idle_ns`] while the worker is asleep.
 const ASLEEP: u64 = 1 << 63;
 
+/// Set in [`Counters::idle_ns`], with [`ASLEEP`] clear, while the worker
+/// starts a sleep: it is reading the clock for it. Totals stay below 2^62
+/// (146 years), so this bit is free in them.
+const OPENING: u64 = 1 << 62;
+
+/// How long a reader waits for a worker that is starting a sleep to say
+/// when it began. Two instructions apart, unless the worker's thread was
+/// preempted in between.
+const OPENING_WAIT: Duration = Duration::from_millis(20);
+
 /// Nanoseconds on a clock that is the same for every thread of the process,
 /// below 2^63 (292 years): what a sleep in progress is measured on, by the
 /// worker that sleeps and by the threads that read its pulse.
@@ -90,6 +100,101 @@ pub(crate) struct Counters {
     polling: AtomicPtr<panic::Location<'static>>,
     /// 0 until the worker has a driver, then 1 for io_uring, 2 for epoll.
     driver: AtomicU8,
+    /// Holds a sleep between its clock reading and its announcement, so a
+    /// test can read the counters there. A field, not a static, so that the
+    /// workers of other tests are not touched.
+    #[cfg(test)]
+    gap: Gap,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Gap {
+    hold: std::sync::atomic::AtomicBool,
+    inside: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl Gap {
+    /// Waits while `hold` is set, with `inside` set meanwhile.
+    fn wait(&self) {
+        if !self.hold.load(Ordering::SeqCst) {
+            return;
+        }
+        self.inside.store(true, Ordering::SeqCst);
+        while self.hold.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        self.inside.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A reading taken while the worker has its sleep's clock reading but
+    /// has not stored it yet: the next reading must not count the sleep
+    /// from before it. `Handle::pulse` gave 200.33 ms of idle time in a
+    /// window of 200.24 ms this way on a Windows runner (tests/observe.rs).
+    #[test]
+    #[cfg_attr(miri, ignore = "timing: compares idle time with the clock")]
+    fn idle_time_between_two_readings_never_passes_the_time_between_them() {
+        let counters = Arc::new(Counters::new());
+        counters.gap.hold.store(true, Ordering::SeqCst);
+        let worker = {
+            let counters = counters.clone();
+            std::thread::spawn(move || counters.sleeping())
+        };
+        while !counters.gap.inside.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // The worker has read the clock for its sleep, and that reading is
+        // now well in the past.
+        std::thread::sleep(Duration::from_millis(5));
+        let release = {
+            let counters = counters.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                counters.gap.hold.store(false, Ordering::SeqCst);
+            })
+        };
+        let t = Instant::now();
+        let before = counters.idle_ns();
+        std::thread::sleep(Duration::from_millis(30));
+        let after = counters.idle_ns();
+        let window = t.elapsed();
+        release.join().unwrap();
+        worker.join().unwrap();
+        let idle = Duration::from_nanos(after - before);
+        assert!(idle <= window, "{idle:?} of idle time in {window:?}");
+        assert!(idle >= Duration::from_millis(20), "{idle:?}");
+    }
+
+    /// A worker held up between its clock reading and its announcement for
+    /// longer than readers wait gives the total without that sleep, rather
+    /// than keeping the reader.
+    #[test]
+    #[cfg_attr(miri, ignore = "timing")]
+    fn a_reader_does_not_wait_long_for_a_held_up_worker() {
+        let counters = Arc::new(Counters::new());
+        counters.gap.hold.store(true, Ordering::SeqCst);
+        let worker = {
+            let counters = counters.clone();
+            std::thread::spawn(move || counters.sleeping())
+        };
+        while !counters.gap.inside.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let t = Instant::now();
+        assert_eq!(counters.idle_ns(), 0);
+        assert!(t.elapsed() < OPENING_WAIT * 10, "{:?}", t.elapsed());
+        counters.gap.hold.store(false, Ordering::SeqCst);
+        worker.join().unwrap();
+        // Released, the sleep counts from its clock reading.
+        assert!(counters.idle_ns() > 0);
+    }
 }
 
 impl Counters {
@@ -102,6 +207,8 @@ impl Counters {
             spawned: AtomicU64::new(0),
             polling: AtomicPtr::new(ptr::null_mut()),
             driver: AtomicU8::new(0),
+            #[cfg(test)]
+            gap: Gap::default(),
         }
     }
 
@@ -146,10 +253,22 @@ impl Counters {
     /// [`woke`](Self::woke), readers count the sleep in progress as idle
     /// time: a worker that sleeps for minutes is idle for those minutes, not
     /// only once it wakes.
+    ///
+    /// The sleep begins at a clock reading that readers cannot see until it
+    /// is stored. A reader in between would take the total without the
+    /// sleep, and a later reading would then count it from before the
+    /// first: more idle time between two readings than time passed. So
+    /// [`OPENING`] goes up first, and readers wait for the reading.
     pub(crate) fn sleeping(&self) {
         let total = self.idle_ns.load(Ordering::Relaxed);
+        // Before the clock is read: a reader that does not see it yet is
+        // ahead of the reading.
+        self.idle_ns.store(total | OPENING, Ordering::SeqCst);
+        let now = clock_ns();
+        #[cfg(test)]
+        self.gap.wait();
         self.idle_ns
-            .store(total.wrapping_sub(clock_ns()) | ASLEEP, Ordering::Relaxed);
+            .store(total.wrapping_sub(now) | ASLEEP, Ordering::Release);
     }
 
     /// The sleep announced with [`sleeping`](Self::sleeping) is over.
@@ -168,7 +287,7 @@ impl Counters {
     /// nanoseconds more than the next one; the caller keeps the highest
     /// value it has given out (`WorkerShared::idle_seen`).
     fn idle_ns(&self) -> u64 {
-        let mut value = self.idle_ns.load(Ordering::Relaxed);
+        let mut value = self.settled(self.idle_ns.load(Ordering::Acquire));
         // Read the clock during the sleep the value describes, not after
         // it: the value is read again after the clock, and when it has
         // changed the worker woke (or slept again) in between. It changes
@@ -179,17 +298,37 @@ impl Counters {
                 return value;
             }
             let now = clock_ns();
-            let again = self.idle_ns.load(Ordering::Relaxed);
+            let again = self.idle_ns.load(Ordering::Acquire);
             if again == value {
                 return value.wrapping_add(now) & !ASLEEP;
             }
-            value = again;
+            value = self.settled(again);
         }
         if value & ASLEEP == 0 {
             value
         } else {
             value.wrapping_add(clock_ns()) & !ASLEEP
         }
+    }
+
+    /// `value`, or, while it says that a sleep is starting, what the
+    /// worker stores once it has the sleep's clock reading. A worker held
+    /// up past [`OPENING_WAIT`] gets the total without that sleep.
+    fn settled(&self, mut value: u64) -> u64 {
+        let mut started = None;
+        let mut spins = 0u32;
+        while value & (ASLEEP | OPENING) == OPENING {
+            if spins < 64 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else if started.get_or_insert_with(Instant::now).elapsed() < OPENING_WAIT {
+                std::thread::yield_now();
+            } else {
+                return value & !OPENING;
+            }
+            value = self.idle_ns.load(Ordering::Acquire);
+        }
+        value
     }
 
     /// A task spawned at `location` is about to be polled.
