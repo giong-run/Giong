@@ -568,3 +568,32 @@ fn tasks_waiting_while_the_server_is_down_share_one_connect_attempt() {
         let _: Value = pool.query(&cmd("PING")).await.unwrap();
     });
 }
+
+#[test]
+fn a_pool_whose_server_stays_down_spaces_its_connect_attempts() {
+    run(|s| async move {
+        let port = closed_port();
+        let pool = Pool::new(s.tcp().port(port), 4);
+        let mut calls = 0u64;
+        let end = giong::time::Instant::now() + Duration::from_millis(400);
+        // One task calling over and over, as a request handler does.
+        while giong::time::Instant::now() < end {
+            let e = pool.query::<Value>(&cmd("PING")).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+            calls += 1;
+            giong::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Each call used to make an attempt of its own. Pauses of 10 ms
+        // doubling (less up to half) allow at most 8 in 400 ms.
+        let attempts = pool.stats().connect_errors;
+        assert!(
+            (2..=8).contains(&attempts) && calls >= 100,
+            "{attempts} connect attempts for {calls} calls"
+        );
+        // A pause ends: the next call tries again (and only one does).
+        giong::time::sleep(Duration::from_millis(1050)).await;
+        pool.query::<Value>(&cmd("PING")).await.unwrap_err();
+        pool.query::<Value>(&cmd("PING")).await.unwrap_err();
+        assert_eq!(pool.stats().connect_errors, attempts + 1);
+    });
+}

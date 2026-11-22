@@ -218,6 +218,12 @@ struct State {
     /// since: the error. Meanwhile one attempt runs at a time, and the tasks
     /// that waited through it get its error.
     failing: Option<Error>,
+    /// Attempts to open a connection that failed in a row.
+    failures_in_row: u32,
+    /// While opening connections fails and none is open, calls fail at once
+    /// with `failing` until then, rather than try again (see
+    /// [`connect_backoff`]).
+    retry_at: Option<Instant>,
     opened: u64,
     connect_errors: u64,
     timeouts: u64,
@@ -244,6 +250,23 @@ impl Member {
     fn is_free(&self) -> bool {
         idle(self)
     }
+}
+
+/// How long calls fail at once after `failures` attempts to open a
+/// connection failed in a row with none open: 10 ms doubling to 1 s, less a
+/// random part of up to half, so that the pools of many workers and
+/// processes do not try again together.
+fn connect_backoff(failures: u32) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let full = Duration::from_millis(10)
+        .saturating_mul(1 << failures.saturating_sub(1).min(7))
+        .min(Duration::from_secs(1));
+    // Not for secrets: only spreads the attempts. The standard library
+    // seeds each RandomState differently.
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    full - (full / 2).mul_f64((seed % 1024) as f64 / 1024.0)
 }
 
 impl State {
@@ -405,7 +428,12 @@ impl Pool {
     /// When opening one fails, the pool opens one at a time until one
     /// succeeds, and tasks that waited through a failed attempt, with no
     /// connection open to wait for, get its error at once: while the server
-    /// is down, a burst of calls makes one attempt, not one each.
+    /// is down, a burst of calls makes one attempt, not one each. With no
+    /// connection open, calls after a failed attempt also get its error at
+    /// once for a pause that starts at 10 ms and doubles with each failure
+    /// in a row up to 1 s (less a random part of up to half, so that many
+    /// pools do not try together); the first call after the pause tries
+    /// again, and the first success ends it.
     ///
     /// Size it from the server's `max_connections`: the pools of all workers
     /// of all processes together must stay below it.
@@ -782,6 +810,15 @@ impl Pool {
                         return Err(e);
                     }
                 }
+                if none_open && st.connecting == 0 {
+                    if let (Some(e), Some(at)) = (&st.failing, st.retry_at) {
+                        if Instant::now() < at {
+                            let e = e.clone();
+                            drop(st);
+                            return Err(e);
+                        }
+                    }
+                }
                 // One clock read for both.
                 let now = Instant::now();
                 st.sweep(now, self.inner.idle_timeout);
@@ -797,12 +834,17 @@ impl Pool {
                         Ok(client) => {
                             st.opened += 1;
                             st.failing = None;
+                            st.failures_in_row = 0;
+                            st.retry_at = None;
                             self.start_reaper(&mut st);
                             Ok(Err(client))
                         }
                         Err(e) => {
                             st.connect_errors += 1;
                             st.failing = Some(e.clone());
+                            st.failures_in_row = st.failures_in_row.saturating_add(1);
+                            st.retry_at =
+                                Some(Instant::now() + connect_backoff(st.failures_in_row));
                             Err(e)
                         }
                     };
