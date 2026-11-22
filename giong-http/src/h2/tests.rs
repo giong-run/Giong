@@ -883,7 +883,7 @@ fn settings_frames_full_of_window_sizes_cost_one_pass_over_the_streams() {
         frame::write_settings(&mut out, &entries);
     }
     frame::write_ping(&mut out, false, b"measured");
-    let start = Instant::now();
+    let before = super::server::WINDOW_MOVES.load(Ordering::SeqCst);
     c.write(&out);
     loop {
         let f = c.frame().expect("the connection stays open");
@@ -891,9 +891,10 @@ fn settings_frames_full_of_window_sizes_cost_one_pass_over_the_streams() {
             break;
         }
     }
-    // About 0.1 s in a debug build; 8 s before.
-    let took = start.elapsed();
-    assert!(took < Duration::from_secs(2), "{took:?}");
+    // One move of each stream per frame: 60,000 (other tests running at the
+    // same time add a few). It was 163,800,000, 8 s in a debug build.
+    let moves = super::server::WINDOW_MOVES.load(Ordering::SeqCst) - before;
+    assert!((60_000..1_000_000).contains(&moves), "{moves}");
     // Every stream gets the window to end.
     let mut out = Vec::new();
     frame::write_settings(&mut out, &[(frame::INITIAL_WINDOW_SIZE, 65_535)]);

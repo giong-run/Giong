@@ -75,6 +75,11 @@ use crate::response::{Body, FileBody, Response};
 use crate::server::{catching, drop_quietly, give_buffer, take_buffer, Config, Handler, Transport};
 use crate::trailers::Trailers;
 
+/// Stream windows moved by SETTINGS frames, in every session: what
+/// `h2::tests` counts to see that a frame moves them once.
+#[cfg(test)]
+pub(crate) static WINDOW_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The smallest window a stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`
 /// is half the body budget divided among the streams, within this and the
 /// protocol's default).
@@ -1400,6 +1405,8 @@ impl Session {
                     return Err(flow_control("a stream window grew above 2^31-1"));
                 }
                 st.send_window += delta;
+                #[cfg(test)]
+                WINDOW_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.enqueue(slot);
             }
         }
