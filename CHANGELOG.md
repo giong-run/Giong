@@ -10,6 +10,12 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [1.2.0] - 2026-11-22
 
+macOS support: a kqueue driver, tested on macOS 15 and macOS 26 on Apple Silicon (Intel Macs
+and macOS 14 or older are not tested), with the whole test suite, ThreadSanitizer and 2-hour
+soaks passing there. A stream write or connect that meets `ENOBUFS` on macOS now waits for
+buffers instead of failing at once. Nothing changes on Linux, nothing is removed or changed in
+meaning, and upgrading from 1.1 needs no code changes.
+
 ### Added
 
 - **giong**: on macOS, a stream write or connect that gets `ENOBUFS` (no network buffer
@@ -20,7 +26,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   socket, and TLS streams wait the same way. After 2 s the error is the new
   `GIONG-E0028` (`Code::NetworkBuffersExhausted`, kind `OutOfMemory`), with the kernel's
   error as its source. Datagram sends keep the kernel's `ENOBUFS`. Nothing changes on
-  Linux.
+  Linux ([#205](https://github.com/giong-run/Giong/pull/205)).
 - **giong**: macOS support: a kqueue driver for the readiness loop (`DriverKind::Kqueue`,
   chosen by default on macOS), with each worker woken through an `EVFILT_USER` event of
   its own queue. The workers of a TCP or UDP address share one socket, bound without
