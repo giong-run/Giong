@@ -1,27 +1,27 @@
 name: Windows runtime
 
 # giong itself on real Windows: the completion port driver in the runtime,
-# with the parts of the test suite that are ported so far. Lives on the
-# Windows branch until the port is complete and joins the main workflow.
+# with the parts of the test suite that are ported so far. A draft, and a pull
+# request that changes none of the code built here, skip the tests (job `plan`,
+# scripts/ci-scope.py --relevant); the merge queue always runs them, and
+# `windows-checks` is the one name to require for them.
 on:
   pull_request:
-    paths:
-      - src/**
-      - tests/**
-      - Cargo.toml
-      - Cargo.lock
-      - .github/workflows/windows-runtime.yml
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-runtime-${{ github.ref }}
+  group: windows-runtime-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # CI's stable compiler (see ci.yml).
+  RUST_STABLE: "1.100.0"
   # The suites that build for Windows today.
   SUITES: >-
     --lib --test executor --test channels --test time --test shutdown
@@ -29,7 +29,28 @@ env:
     --test multi --test balance --test dns --test fs --test soak
 
 jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.plan.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft && '--draft' || '' }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"; else : > "$RUNNER_TEMP/files.txt"; fi
+          python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain \
+            --relevant src/ tests/ Cargo.toml Cargo.lock scripts/ci-scope.py .github/workflows/windows-runtime.yml \
+            < "$RUNNER_TEMP/files.txt" | tee -a "$GITHUB_OUTPUT"
+
   runtime:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -43,7 +64,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
           components: clippy
       - run: cargo clippy -p giong --lib --locked -- -D warnings
       - run: cargo test -p giong --locked --no-fail-fast $SUITES
@@ -64,6 +85,8 @@ jobs:
           echo "30 runs passed" >> "$GITHUB_STEP_SUMMARY"
 
   msrv:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
@@ -72,3 +95,20 @@ jobs:
         with:
           toolchain: "1.80"
       - run: cargo check -p giong --locked
+
+  # Every job above passed, or `plan` chose to skip them. One name to require.
+  windows-checks:
+    needs: [plan, runtime, msrv]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+          HEAVY: ${{ needs.plan.outputs.heavy }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$HEAVY" = false ]; then
+              jq -e '.plan.result == "success" and all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" > /dev/null
+          else
+              jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" > /dev/null
+          fi
