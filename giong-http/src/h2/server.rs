@@ -396,6 +396,9 @@ pub(crate) struct Session {
     peer_window: i64,
     peer_frame: usize,
     conn_send: i64,
+    /// The client closed its side: it can send no more window, so a
+    /// response its flow control holds back can never go out.
+    peer_closed: bool,
     conn_recv: i64,
     conn_unacked: u32,
     /// Body bytes the streams hold, and how many they may.
@@ -472,6 +475,7 @@ impl Session {
             peer_window: i64::from(frame::DEFAULT_WINDOW),
             peer_frame: frame::DEFAULT_FRAME_SIZE,
             conn_send: i64::from(frame::DEFAULT_WINDOW),
+            peer_closed: false,
             conn_recv: i64::from(CONN_WINDOW),
             conn_unacked: 0,
             held: 0,
@@ -684,8 +688,11 @@ impl Session {
 
     /// The client closed its side of the connection: no frame comes any
     /// more. Streams still waiting for their request are dropped; the
-    /// others are answered, then the connection ends.
+    /// others are answered, then the connection ends. An answer that
+    /// flow control holds back is reset as soon as it is (see
+    /// `blocked_limit`).
     pub(crate) fn on_eof(&mut self) {
+        self.peer_closed = true;
         self.go_away();
         self.block = None;
         let waiting: Vec<usize> = self
@@ -2082,11 +2089,22 @@ impl Session {
                     at(deadline);
                 }
                 if let Some(since) = st.blocked_since {
-                    at(since + self.cfg.write_timeout);
+                    at(since + self.blocked_limit());
                 }
             }
         }
         next
+    }
+
+    /// How long a response may wait for the client's flow control:
+    /// `write_timeout`, or nothing once the client closed its side, since
+    /// it can no longer open the window.
+    fn blocked_limit(&self) -> Duration {
+        if self.peer_closed {
+            Duration::ZERO
+        } else {
+            self.cfg.write_timeout
+        }
     }
 
     /// Handles what timed out by `now`.
@@ -2107,7 +2125,7 @@ impl Session {
             self.go_away();
             return;
         }
-        let write_timeout = self.cfg.write_timeout;
+        let write_timeout = self.blocked_limit();
         let slots: Vec<usize> = self.ids.iter().map(|&(_, slot)| slot).collect();
         for slot in slots {
             let Some(st) = self.stream(slot) else {

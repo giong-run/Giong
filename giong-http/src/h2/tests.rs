@@ -1290,6 +1290,32 @@ fn malformed_requests_are_reset_and_the_connection_goes_on() {
 }
 
 #[test]
+fn after_the_client_closes_answers_its_window_holds_back_are_reset() {
+    // A write timeout longer than the client's read timeout: only a reset
+    // that does not wait for it gets through.
+    let server = TestServer::start(Server::new().write_timeout(Duration::from_secs(600)));
+    // Its window holds the answer back; then the client closes its side,
+    // after which it can send no more window: the stream is reset at once
+    // instead of after the write timeout, and the connection ends.
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    let id = c.get("/bytes?n=5000");
+    c.frames_within(Duration::from_millis(100));
+    c.stream.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(
+        c.reply(id).unwrap_err(),
+        Ended::Reset(Reason::Cancel as u32)
+    );
+    while c.frame().is_some() {}
+
+    // An answer the window lets through still arrives after a half-close.
+    let mut c = server.client();
+    let id = c.get("/bytes?n=5000");
+    c.stream.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(c.reply(id).unwrap().body, pattern(5000));
+}
+
+#[test]
 fn a_client_that_stops_reading_loses_its_stream() {
     let server = TestServer::start(Server::new().write_timeout(Duration::from_millis(200)));
     let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
