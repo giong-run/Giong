@@ -10,7 +10,10 @@
 //!
 //! Arming costs three system calls, so a wait for the same deadline as the
 //! last one, whose packet has not come yet, keeps the alarm as it is: a
-//! busy server parks again and again before its next I/O timeout.
+//! busy server parks again and again before its next I/O timeout. So does
+//! a wait for a slightly later deadline, as when each read pushes its
+//! timeout forward: the alarm then rings a little early, once, and the
+//! event loop waits again for what is left.
 //!
 //! The calls live in ntdll and are looked up when the driver starts. Where
 //! one is missing (Wine, Windows before 10 1803 for the timer flag), the
@@ -56,6 +59,11 @@ pub(super) const KEY: usize = 1;
 /// apart. An alarm kept for a deadline this much earlier or later rings
 /// at most this much off.
 const SAME_DEADLINE: Duration = Duration::from_micros(50);
+
+/// An alarm armed for an earlier deadline is kept while it rings no more
+/// than this share of the wait early: one spare wake-up per wait at most,
+/// in place of arming again each time the deadline moves.
+const EARLY_SHARE: u32 = 16;
 
 /// What [`Alarm::set`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +146,7 @@ impl Alarm {
         let now = Instant::now();
         let at = now.checked_add(after);
         if let (Some(armed), Some(at)) = (self.armed.get(), at) {
-            if armed.max(at) - armed.min(at) <= SAME_DEADLINE {
+            if keeps(armed, at, now) {
                 return if armed > now { Set::Armed } else { Set::No };
             }
         }
@@ -192,6 +200,18 @@ impl Alarm {
     }
 }
 
+/// Whether an alarm `armed` for a time serves a wait, at `now`, until `at`.
+/// It may ring a little late only within [`SAME_DEADLINE`]; early, within
+/// that or a share of the wait, since an early ring only has the event
+/// loop wait again.
+fn keeps(armed: Instant, at: Instant, now: Instant) -> bool {
+    if armed > at {
+        return armed - at <= SAME_DEADLINE;
+    }
+    let early = at - armed;
+    early <= SAME_DEADLINE || early <= at.saturating_duration_since(now) / EARLY_SHARE
+}
+
 impl Alarm {
     /// The port reported the alarm's packet: the next `set` arms again.
     pub(super) fn rang(&self) {
@@ -229,8 +249,31 @@ mod tests {
         (ok != 0 && n == 1).then_some(entry.lpCompletionKey)
     }
 
-    /// A wait for the deadline the alarm is already armed for keeps it; a
-    /// wait for another deadline, or after the packet came, arms again.
+    #[test]
+    fn an_alarm_is_kept_only_if_it_rings_close_or_a_little_early() {
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let us = Duration::from_micros;
+        let at = now + ms(1_600);
+        // The same deadline, a few microseconds either way.
+        assert!(keeps(at, at, now));
+        assert!(keeps(at + us(50), at, now));
+        assert!(keeps(at - us(50), at, now));
+        // Later than the wait asks: never more than the tolerance.
+        assert!(!keeps(at + us(51), at, now));
+        assert!(!keeps(at + ms(1), at, now));
+        // Earlier: up to a sixteenth of the wait, 100 ms of 1.6 s.
+        assert!(keeps(at - ms(100), at, now));
+        assert!(!keeps(at - ms(101), at, now));
+        // A short wait keeps only the tolerance.
+        let soon = now + ms(1);
+        assert!(keeps(soon - us(50), soon, now));
+        assert!(!keeps(soon - us(100), soon, now));
+    }
+
+    /// A wait for the deadline the alarm is already armed for, or a little
+    /// later, keeps it; a wait for an earlier deadline, or after the packet
+    /// came, arms again.
     #[test]
     fn the_same_deadline_keeps_the_alarm() {
         let Some(alarm) = Alarm::new() else {
@@ -248,6 +291,15 @@ mod tests {
             assert_eq!(alarm.set(port, deadline - Instant::now()), Set::Armed);
         }
         assert_eq!(alarm.arms.get(), 1, "the same deadline set the timer again");
+        // A deadline a little later, as a read timeout pushed forward,
+        // keeps it too: the alarm rings a millisecond early.
+        let later = deadline + Duration::from_millis(1);
+        assert_eq!(alarm.set(port, later - Instant::now()), Set::Armed);
+        assert_eq!(
+            alarm.arms.get(),
+            1,
+            "a slightly later deadline set the timer again"
+        );
         assert_eq!(next_key(port, 1_000), Some(KEY));
         assert!(start.elapsed() >= Duration::from_millis(40));
         alarm.rang();
