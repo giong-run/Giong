@@ -1,6 +1,7 @@
-# The macOS prototype (1.2): the kqueue driver and the portability layer,
-# tested on Apple Silicon runners. This workflow lives on the prototype
-# branch only; nothing of it lands on main before 1.0.0.
+# The kqueue driver and the portability layer, tested on Apple Silicon
+# runners. A draft pull request, and one that changes no code, skip the tests
+# (scripts/ci-scope.py, as in ci.yml); the merge queue always runs them, and
+# `macos-checks` is the one name to require for them.
 #
 # Every test binary runs on its own under a time limit (.github/macos-tests.sh),
 # so one run shows the whole picture: passed, failed, ignored and hung tests
@@ -10,21 +11,50 @@ name: macOS
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: macos-${{ github.ref }}
+  group: macos-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
+  # The stable compiler of every job that does not name one (MSRV, nightly and
+  # instr name their own). Pinned, not `stable`, so that a new Rust release
+  # (new lints, a new target/ layout) cannot turn main red overnight and so that
+  # scripts/preflight.sh runs the same compiler locally. Raise it in a pull
+  # request of its own when a Rust release comes out.
+  RUST_STABLE: "1.100.0"
   CARGO_TERM_COLOR: never
   RUST_BACKTRACE: "1"
 
 jobs:
+  # Whether the tests below run: not for a draft or for a pull request that
+  # changes no code (scripts/ci-scope.py says which files count as code).
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.plan.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft && '--draft' || '' }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"; else : > "$RUNNER_TEMP/files.txt"; fi
+          python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain < "$RUNNER_TEMP/files.txt" | tee -a "$GITHUB_OUTPUT"
+
   test:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +67,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
           components: clippy
       - run: sw_vers && uname -a && sysctl -n hw.ncpu
       - name: Clippy (every crate, every target)
@@ -74,6 +104,8 @@ jobs:
   # the wake-up, the blocking pool and the shared listening socket are the
   # parts that differ from Linux.
   tsan:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -92,3 +124,20 @@ jobs:
       - run: >
           cargo test -Zbuild-std --target aarch64-apple-darwin -p giong --all-features --tests
           -- --skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned
+
+  # Every job above passed, or `plan` chose to skip them. One name to require.
+  macos-checks:
+    needs: [plan, test, tsan]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+          HEAVY: ${{ needs.plan.outputs.heavy }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          if [ "$HEAVY" = false ]; then
+              jq -e '.plan.result == "success" and all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" > /dev/null
+          else
+              jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" > /dev/null
+          fi
