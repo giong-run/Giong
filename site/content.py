@@ -585,6 +585,14 @@ BENCH_METHOD = ("One core per server, loopback, medians of five interleaved roun
                 "highest. giong is not faster than everything at everything: the charts say where "
                 "the design pays off and where it does not.")
 
+# The big numbers at the top of the benchmarks page, each from a chart or caveat below it.
+BENCH_FIGS = [
+    ("0.03", "system calls per request on `/json`; raw Tokio makes 2.05"),
+    ("2.45M", "requests/s with 8 workers on bare metal; tuned Monoio 2.44M, raw Tokio 2.16M"),
+    ("4.42 µs", "CPU per request at 5,000 connections, the lowest measured"),
+    ("1 tie", "small responses at 50 connections: level with tuned Monoio and raw Tokio"),
+]
+
 CAVEATS = [
     "**One machine.** Everything is loopback inside a 4-vCPU virtual machine, where the load "
     "generator competes for the same few cores. The 14-core run in the README (1 to 10 workers, "

@@ -1071,3 +1071,33 @@ a.nx:hover { border-color: var(--ember); transform: translateY(-2px); }
 @media (max-width: 560px) {
   .rm-figs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 1.25rem; }
 }
+
+/* ---------- every page head: the ember glow and big numbers ---------- */
+.page-head { position: relative; overflow: hidden; isolation: isolate; }
+.page-head::before { content: ""; position: absolute; inset: -40% -15% auto auto; width: 48rem; height: 48rem; pointer-events: none; z-index: -1;
+  background: radial-gradient(closest-side, rgba(255, 106, 43, 0.12), transparent 70%); }
+.page-head h1 em { font-style: normal; color: var(--ember); }
+.page-head .rm-figs { margin-top: 0.5rem; }
+.rm-head::before { display: none; }
+
+/* ---------- crates: head to head under each crate ---------- */
+.crate-vs { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 1rem; }
+.crate-vs li { display: inline-flex; align-items: baseline; gap: 0.5rem; padding: 0.4rem 0.75rem; border-radius: 999px;
+  border: 1px solid rgba(255, 106, 43, 0.35); background: var(--ember-wash); font-size: 0.8125rem; color: var(--fg-2); }
+.crate-vs b { font: 800 1rem/1 var(--display); letter-spacing: -0.02em; color: var(--ember); }
+
+/* ---------- 404 ---------- */
+.lost { position: relative; overflow: hidden; isolation: isolate; }
+.lost-ring { position: absolute; right: max(-6rem, calc((100vw - var(--wrap)) / 2 - 4rem)); top: 50%; width: min(34rem, 70vw); transform: translateY(-50%); opacity: 0.9; z-index: -1; animation: lost-spin 60s linear infinite; }
+.lost-ring .seg { fill: var(--seg-off); }
+.lost .wrap { position: relative; }
+@keyframes lost-spin { to { transform: translateY(-50%) rotate(360deg); } }
+@media (max-width: 720px) { .lost-ring { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .lost-ring { animation: none; } }
+.crate ul.crate-vs { display: flex; }
+.crate .crate-vs li { padding: 0.4rem 0.75rem; }
+.crate .crate-vs li::before { display: none; }
+/* the documentation: the same glow behind each page's title */
+.doc-head { position: relative; isolation: isolate; }
+.doc-head::before { content: ""; position: absolute; left: -6rem; top: -8rem; width: 34rem; height: 26rem; pointer-events: none; z-index: -1;
+  background: radial-gradient(closest-side, rgba(255, 106, 43, 0.10), transparent 70%); }

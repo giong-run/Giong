@@ -12,4 +12,7 @@
   proposed milestones. giong.run's home page shows each crate head to head with the Tokio
   crate it replaces, with the losses next to the wins, the build numbers and what comes
   next; the roadmap page draws every milestone on one track, gives each one ahead a card,
-  and no longer calls a milestone shipped before its release is out.
+  and no longer calls a milestone shipped before its release is out. Every other page
+  follows: big measured numbers at the top of the crates, benchmarks and releases pages,
+  the head-to-head table and the build numbers on the benchmarks page, each crate's
+  result against the crate it replaces on the crates page, and a 404 page of its own.

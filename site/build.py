@@ -605,10 +605,17 @@ def json_ld(page, title, desc, url):
     return f'<script type="application/ld+json">{text}</script>'
 
 
-def page_head(eyebrow, h1, lede, meta=""):
+def figures(figs):
+    """Big numbers in a row, the first in ember: [(value, what it counts), ...]."""
+    return ('<div class="rm-figs">' + "".join(
+        f'<div class="rm-fig"><b>{v}</b><span>{ilm(d)}</span></div>' for v, d in figs) + "</div>")
+
+
+def page_head(eyebrow, h1, lede, meta="", figs=None):
     meta_html = f'<p class="page-meta">{meta}</p>' if meta else ""
+    figs_html = figures(figs) if figs else ""
     return (f'<section class="page-head"><div class="wrap"><p class="eyebrow">{eyebrow}</p>'
-            f'<h1>{h1}</h1><p class="lede">{ilm(lede)}</p>{meta_html}</div></section>')
+            f'<h1>{h1}</h1><p class="lede">{ilm(lede)}</p>{figs_html}{meta_html}</div></section>')
 
 
 def source_note(files):
@@ -1437,6 +1444,16 @@ def docs():
             page_md)
 
 
+def crate_versus(name):
+    """The head-to-head rows of a crate, from the home page's table."""
+    rows = []
+    for r in C.SCOREBOARD["rows"]:
+        job, ours, theirs, verdict = r[0], r[1], r[2], r[7]
+        if name in [o.split("::")[0] for o in ours.split(" + ")]:
+            rows.append(f'<li><b>{verdict}</b><span>against {ilm(theirs)} · {ilm(job)}</span></li>')
+    return f'<ul class="crate-vs">{"".join(rows)}</ul>' if rows else ""
+
+
 def crates():
     sections = []
     for c in CRATES:
@@ -1453,6 +1470,7 @@ def crates():
             f'{copy_cmd("add-" + c["name"], "cargo add " + c["name"])}</div>'
             f'<div class="crate-main"><p class="crate-lede">{ilm(c["lede"])}</p>'
             + (f'<ul>{items}</ul>' if items else "")
+            + crate_versus(c["name"])
             + f'<p class="crate-facts">{" · ".join(facts)}</p></div></article>')
     for c in COMING:
         sections.append(
@@ -1461,9 +1479,13 @@ def crates():
             f'<div class="crate-main"><p class="crate-lede">{ilm(c["short"])}</p>'
             f'<p class="crate-facts"><a href="{link("roadmap")}">See the roadmap</a></p></div></article>')
     total_lines = sum(c["lines"] for c in CRATES)
-    body = f'''{page_head("crates", "The crates",
-                          f"{len(CRATES)} crates that share one version number, {VERSION}. The runtime at the bottom, and the layers a service needs on top of it, each written for giong rather than wrapped around a Tokio crate.",
-                          f"{about(total_lines)} lines of Rust and {TOTAL_TESTS:,} tests in all · line counts are read from the sources when the site is built")}
+    figs = [(str(len(CRATES)), "crates on one version number"),
+            (about(total_lines).replace("about ", "~"), "lines of Rust, counted from the sources"),
+            (f"{TOTAL_TESTS:,}", "tests"),
+            ("3", "dependencies of the runtime crate at most, on any system")]
+    body = f'''{page_head("crates", f"{len(CRATES)} crates, <em>one version</em>",
+                          f"Version {VERSION} of each. The runtime at the bottom, and the layers a service needs on top of it, each written for giong rather than wrapped around a Tokio crate, and each measured against the crate it replaces.",
+                          "Line counts are read from the sources when the site is built.", figs)}
 <section class="band band-tight"><div class="wrap">{stack(detail=True)}</div></section>
 <section class="band band-alt"><div class="wrap crate-list">{"".join(sections)}</div></section>'''
     return frame("crates", "Crates", "The giong crates: the runtime, HTTP and TLS, PostgreSQL, MySQL "
@@ -1483,9 +1505,10 @@ def benchmarks():
         + "</tr>" for row in C.COMPARE)
     scripts = sorted({s for c in C.CHARTS for s in c["src"]} | {"bench/web.sh", "bench/workers.sh"})
     runs = "".join(f'<a href="{BLOB}{s}"><code>{s}</code></a>' for s in scripts)
-    body = f'''{page_head("benchmarks", "Benchmarks", C.BENCH_METHOD,
-                          f'Full tables and raw output: {tables} · <a href="{TREE}bench/results">bench/results/</a>')}
-<section class="band band-tight"><div class="wrap">
+    body = f'''{page_head("benchmarks", "Measured, <em>losses included</em>", C.BENCH_METHOD,
+                          f'Full tables and raw output: {tables} · <a href="{TREE}bench/results">bench/results/</a>', C.BENCH_FIGS)}
+{scoreboard()}
+<section class="band band-alt"><div class="wrap">
   <div class="bench-intro">
     <div class="head-text">
       <p class="eyebrow">method</p>
@@ -1500,18 +1523,19 @@ def benchmarks():
   </div>
   <div class="charts">{charts}</div>
 </div></section>
-<section class="band band-alt" id="caveats"><div class="wrap caveats">
+{build_band()}
+<section class="band" id="caveats"><div class="wrap caveats">
   <h2>What these numbers do not show</h2>
   <ul>{caveats}</ul>
 </div></section>
-<section class="band" id="compare"><div class="wrap">
+<section class="band band-alt" id="compare"><div class="wrap">
   {head_block("compare", "Compared with Monoio and Glommio",
               "The other io_uring runtimes for Rust, as they stood when the benchmarks ran. Monoio and Glommio are mature projects with wider ecosystems; this table is about how each one is built, not a ranking.")}
   <div class="table-scroll" tabindex="0" role="region" aria-label="Comparison with Monoio and Glommio">
     <table class="cmp"><thead><tr>{cmp_head}</tr></thead><tbody>{cmp_rows}</tbody></table>
   </div>
 </div></section>
-<section class="band band-alt" id="reproduce"><div class="wrap">
+<section class="band" id="reproduce"><div class="wrap">
   {head_block("reproduce", "Run them yourself",
               "Each script builds the servers, runs the load generator and writes its summary to `bench/results/`. Run them on a quiet Linux machine; they take minutes, not seconds.")}
   <div class="runs">{runs}</div>
@@ -1687,16 +1711,15 @@ def roadmap():
                   f'<div class="prose">{doc_md(a_rest, heading_ids=False)}</div>') if a_rest else ""
     published = [r for r in RELEASES if r["version"] != "Unreleased" and r["date"]]
     first = published[-1] if published else None
-    figures = [(str(len(shipped)), "milestones shipped"),
+    figs = [(str(len(shipped)), "milestones shipped"),
                (str(len(published)), "releases" + (f", the first on {nice_date(first['date'])}" if first else "")),
                (str(len(CRATES)), "crates on one version"),
                (str(len(upcoming)), "milestones ahead")]
-    figs = "".join(f'<div class="rm-fig"><b>{v}</b><span>{d}</span></div>' for v, d in figures)
     body = f'''<section class="page-head rm-head"><div class="wrap">
   <p class="eyebrow">roadmap</p>
   <h1>The road to the <em>best Rust runtime</em></h1>
   <p class="lede">Every milestone so far and every one planned, in order and with no dates: a milestone is done when its exit criteria are met, and a release ships only what is done.</p>
-  <div class="rm-figs">{figs}</div>
+  {figures(figs)}
   <p class="page-meta">{source_note(["ROADMAP.md"])}</p>
 </div>
 {journey}
@@ -1749,9 +1772,16 @@ def releases():
             + (f'<p class="rel-name">{html.escape(name)}</p>' if name else "")
             + f'<p class="rel-meta">{" · ".join(meta)}</p></header>{notes}</article>')
         side.append(f'<a href="#{r["id"]}">{title}<span>{nice_date(r["date"]) if r["date"] else "main"}</span></a>')
-    body = f'''{page_head("releases", "Releases",
-                          "What changed in each version, newest first. Every crate shares the version number. While it starts with 0, a minor release may break the API.",
-                          source_note(["CHANGELOG.md"]) + f' · <a href="{REPO}/releases.atom">feed</a>')}
+    published = [r for r in RELEASES if r["version"] != "Unreleased" and r["date"]]
+    since_1 = [r for r in published if re.match(r"^1\.\d+\.\d+$", r["version"]) and r["version"] != "1.0.0"]
+    figs = [(str(len(published)), "releases" + (f", the first on {nice_date(published[-1]['date'])}" if published else ""))]
+    if LATEST:
+        name = milestone_name(LATEST["version"])
+        figs.append((LATEST["version"], "the newest" + (f", “{html.escape(name)}”" if name else "")))
+    figs.append((str(len(since_1)), "releases since 1.0.0, and none needs a code change to upgrade"))
+    body = f'''{page_head("releases", "Every release, <em>newest first</em>",
+                          "What changed in each version. Every crate shares the version number. Since 1.0 a release only adds: the API is frozen, and `cargo-semver-checks` guards it on every change.",
+                          source_note(["CHANGELOG.md"]) + f' · <a href="{REPO}/releases.atom">feed</a>', figs)}
 <div class="wrap doc-grid">
   <nav class="toc" aria-label="Versions"><p>Versions</p><div class="toc-links">{"".join(side)}</div></nav>
   <div class="releases">{"".join(items)}</div>
@@ -1762,9 +1792,10 @@ def releases():
 
 def not_found():
     body = f'''<section class="lost"><div class="wrap">
+  <svg class="lost-ring" viewBox="0 0 400 400" aria-hidden="true">{ring(lit=0)}</svg>
   <p class="eyebrow">404</p>
   <h1>Nothing here, <em>not even one syscall.</em></h1>
-  <p class="lede">The page you asked for does not exist.</p>
+  <p class="lede">The page you asked for does not exist. Thánh Gióng lay silent for three years before he rose; this page is not coming back.</p>
   <div class="cta"><a class="btn btn-main" href="{link("home")}">Back to giong.run</a><a class="btn" href="{link("docs")}">Docs</a></div>
 </div></section>'''
     return frame("404", "Not found", "This page does not exist.", body, "404").replace(
