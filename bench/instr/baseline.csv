@@ -13,7 +13,9 @@
 # The instruction and allocation rows of http1, http1-client, h2, h2-streams,
 # https and web are from scripts/instr.py update on a 4-vCPU cloud VM (Linux
 # 6.18, the same rustc) after the client, HPACK and header-buffer changes of
-# changelog.d/http-request-cost.md; the other rows matched main there.
+# changelog.d/http-request-cost.md; the other rows matched main there. The
+# allocation rows of idle-h2 and idle-https are from this change's CI run
+# (two fewer allocations per idle HTTP/2 and HTTPS connection).
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1397.4,1
 io_uring,spawn,allocations,1.000,1
@@ -54,10 +56,10 @@ io_uring,idle-http1,rss_bytes,2222.1,10
 io_uring,idle-http1,allocations,3.030,1
 io_uring,idle-h2,heap_bytes,4493.3,1
 io_uring,idle-h2,rss_bytes,4849.7,10
-io_uring,idle-h2,allocations,27.040,1
+io_uring,idle-h2,allocations,25.040,1
 io_uring,idle-https,heap_bytes,10801.0,1
 io_uring,idle-https,rss_bytes,11225.1,10
-io_uring,idle-https,allocations,123.120,1
+io_uring,idle-https,allocations,121.140,1
 epoll,spawn,instructions,1122.4,1
 epoll,spawn,allocations,1.000,1
 epoll,yield,instructions,358.7,1
@@ -97,7 +99,7 @@ epoll,idle-http1,rss_bytes,2218.0,10
 epoll,idle-http1,allocations,4.020,1
 epoll,idle-h2,heap_bytes,4509.9,1
 epoll,idle-h2,rss_bytes,4804.6,10
-epoll,idle-h2,allocations,27.040,1
+epoll,idle-h2,allocations,25.040,1
 epoll,idle-https,heap_bytes,10804.3,1
 epoll,idle-https,rss_bytes,11106.3,10
-epoll,idle-https,allocations,123.080,1
+epoll,idle-https,allocations,121.100,1
