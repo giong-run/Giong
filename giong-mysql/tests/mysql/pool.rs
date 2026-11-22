@@ -818,7 +818,8 @@ fn a_cancel_token_stops_working_once_its_connection_goes_back() {
             token.cancel().await
         };
         let (row, cancelled) = futures_join(slow, cancel).await;
-        // SLEEP returns 1 when it is interrupted.
+        // SLEEP returns 0 when it runs to its end (MySQL returns 1, and
+        // MariaDB fails with 1317, when it is interrupted).
         assert_eq!(
             row.unwrap().get::<i64>(0).unwrap(),
             0,
@@ -836,7 +837,11 @@ fn a_cancel_token_stops_working_once_its_connection_goes_back() {
         };
         let (row, cancelled) = futures_join(slow, cancel).await;
         cancelled.unwrap();
-        assert_eq!(row.unwrap().get::<i64>(0).unwrap(), 1, "interrupted");
+        // Interrupted: MySQL's SLEEP returns 1, MariaDB's fails with 1317.
+        match row {
+            Ok(row) => assert_eq!(row.get::<i64>(0).unwrap(), 1, "interrupted"),
+            Err(e) => assert_eq!(e.server_code(), Some(1317), "{e}"),
+        }
     });
 }
 
