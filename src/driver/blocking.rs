@@ -15,8 +15,9 @@
 //!
 //! When every thread is busy, jobs wait their turn. If no job finishes for
 //! [`STALL`] while jobs wait, the busy threads are taken to be stuck, and a
-//! thread starts for each waiting job, up to [`LIMIT`] threads in all:
-//! [`MAX_THREADS`] stuck jobs then hold up nothing but themselves.
+//! thread starts for each waiting job, at most doubling the pool per stall
+//! and up to [`LIMIT`] threads in all: [`MAX_THREADS`] stuck jobs then hold
+//! up nothing but themselves.
 
 use std::collections::VecDeque;
 #[cfg(unix)]
@@ -171,9 +172,12 @@ fn watch(pool: &'static Pool) {
             return;
         }
         if state.done == seen {
-            // A thread for each job that no idle thread will take: the
-            // jobs behind the stuck ones then wait one stall, not one each.
+            // A thread for each job that no idle thread will take, so that
+            // a few jobs behind stuck ones wait one stall, not one each; at
+            // most as many as run already, so that a long queue on a slow
+            // but working disk grows the pool by doubling, not in one step.
             let more = (state.jobs.len().saturating_sub(state.idle))
+                .min(state.threads.max(1))
                 .min(LIMIT.saturating_sub(state.threads));
             state.threads += more;
             drop(state);

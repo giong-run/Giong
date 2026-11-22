@@ -1798,15 +1798,19 @@ mod tests {
         let target = path.clone();
         crate::Builder::new()
             .block_on(async move {
-                let removal = crate::time::timeout(
-                    Duration::from_millis(50),
-                    crate::fs::remove_file(&target),
-                )
-                .await;
+                // Polled once, so that it is queued, then dropped at once:
+                // a timed wait could outlast the pool's stall check, which
+                // starts a thread for a job queued behind stuck ones.
+                let mut removal = Box::pin(crate::fs::remove_file(&target));
+                use std::future::Future;
+                let polled =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(removal.as_mut().poll(cx)))
+                        .await;
                 assert!(
-                    removal.is_err(),
-                    "the removal ran with every thread busy: {removal:?}"
+                    polled.is_pending(),
+                    "the removal ran with every thread busy: {polled:?}"
                 );
+                drop(removal);
                 std::fs::write(&target, b"second").unwrap();
                 drop(release);
                 // Time for the queued job to be taken, had it not been cancelled.
