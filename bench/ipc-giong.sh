@@ -26,7 +26,7 @@ run() { # round spin transport mode count
   echo "$1,$2,$row" >>"$CSV"
 }
 for r in $(seq "$ROUNDS"); do
-  for t in ipc unix; do
+  for t in ipc ipc-in-place unix; do
     run "$r" 0 "$t" ping 100000
     run "$r" 50 "$t" ping 500000
     run "$r" 0 "$t" stream 10000000

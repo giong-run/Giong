@@ -156,6 +156,14 @@ impl Ring {
         self.dir
     }
 
+    /// Where the bytes of the first message sent on a fresh ring lie, for
+    /// tests that play a peer writing into the ring.
+    #[cfg(test)]
+    pub(crate) fn first_message_for_test(&self) -> *mut u8 {
+        // SAFETY: the data area is longer than a record header.
+        unsafe { self.data.add(HEAD) }
+    }
+
     pub(crate) fn dir(&self) -> &Dir {
         // SAFETY: valid while the mapping lives (see `new`); every field is
         // an atomic, so the peer writing it at the same time is fine.
