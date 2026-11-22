@@ -10,10 +10,10 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", "giong-quic/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", "giong-quic/", "giong-cli/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
 
 [workspace]
-members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "giong-quic", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
+members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "giong-quic", "giong-cli", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
 exclude = ["bench", "sim"]
 
 [dependencies]
