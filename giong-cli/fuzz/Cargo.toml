@@ -37,3 +37,9 @@ path = "fuzz_targets/host_parsers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "lint"
+path = "fuzz_targets/lint.rs"
+test = false
+doc = false

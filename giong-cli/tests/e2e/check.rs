@@ -210,3 +210,21 @@ fn one_problem_is_reported_once() {
     let at_18: Vec<&Value> = findings(&v).iter().filter(|f| f["line"] == 18).collect();
     assert_eq!(at_18.len(), 1, "{at_18:#?}\n{}", out.dump());
 }
+
+/// A file in the middle of an edit (unbalanced braces, half a statement) is
+/// what `giong check` meets most often while someone types: it reports what
+/// the compiler says and never panics. Found by the `lint` fuzz target.
+#[test]
+#[ignore = "known bug: giong check panics in lint.rs (byte range starts at 67 but ends at 49) on a half-typed async fn"]
+fn a_half_typed_file_does_not_panic() {
+    if !has_command("check") {
+        return;
+    }
+    let dir = project(
+        "check-half-typed",
+        "u:D;\n\nasync frig {\n g{\n let _n = vln((Durat8`)dy\n}\n\nac.borrow_mut();OG\n/",
+    );
+    let (out, v) = check(dir.path(), &["--no-clippy"]);
+    assert!(!out.stderr.contains("panicked"), "{}", out.dump());
+    assert_eq!(v["ok"], false, "{}", out.dump());
+}

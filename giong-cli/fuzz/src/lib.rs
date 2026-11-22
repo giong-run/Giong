@@ -15,3 +15,7 @@ pub mod args;
 pub mod dotenv;
 #[path = "../../src/host.rs"]
 pub mod host;
+#[path = "../../src/watch.rs"]
+pub mod watch;
+#[path = "../../src/lint.rs"]
+pub mod lint;
