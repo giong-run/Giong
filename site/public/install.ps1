@@ -9,6 +9,8 @@
 #
 #   $env:GIONG_VERSION = "1.5.0"   a given version instead of the latest
 #   $env:GIONG_INSTALL = "C:\x"    where the binary goes
+#   $env:GIONG_DOWNLOAD_URL         a mirror of the release downloads: archives
+#                                   are fetched from <it>/v<version>/
 
 # Everything sits in a function: `irm ... | iex` typed into an open PowerShell
 # runs the script in that session, where `exit` would close the window.
@@ -37,7 +39,8 @@ function Install-Giong {
     }
     $version = $tag.TrimStart("v")
     $name = "giong-$version-$target"
-    $base = "https://github.com/$repo/releases/download/$tag"
+    $mirror = if ($env:GIONG_DOWNLOAD_URL) { $env:GIONG_DOWNLOAD_URL.TrimEnd("/") } else { "https://github.com/$repo/releases/download" }
+    $base = "$mirror/$tag"
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid())
     New-Item -ItemType Directory -Path $work | Out-Null
     try {

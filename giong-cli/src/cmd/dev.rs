@@ -189,7 +189,13 @@ struct Dev {
     log: Arc<Mutex<File>>,
     current: Option<Service>,
     retiring: Vec<Retiring>,
+    /// Builds started after the first one that served.
     restarts: u64,
+    /// A build has started once.
+    served: bool,
+    /// Every start attempted: names each service's giong-mcp socket, so a new
+    /// build never takes the socket of the one still serving.
+    starts: u64,
     started_at: u64,
     build: BuildState,
     report: Report,
@@ -266,6 +272,8 @@ impl Dev {
             current: None,
             retiring: Vec::new(),
             restarts: 0,
+            starts: 0,
+            served: false,
             started_at: unix_ms(),
             build: BuildState::default(),
             report: Report::new("dev"),
@@ -566,7 +574,10 @@ impl Dev {
                 if let Some(old) = self.current.replace(service) {
                     self.retire(old);
                 }
-                self.restarts += 1;
+                if self.served {
+                    self.restarts += 1;
+                }
+                self.served = true;
                 self.write_state();
                 let took = changed_at.elapsed();
                 let addrs: Vec<String> = self.listen.iter().map(|a| a.to_string()).collect();
@@ -614,7 +625,8 @@ impl Dev {
 
     fn start(&mut self, exe: &Path, shared: bool) -> Result<Service, Finding> {
         let state_dir = self.project.root.join(".giong");
-        let mcp = state_dir.join(format!("mcp-{}-{}.sock", std::process::id(), self.restarts));
+        self.starts += 1;
+        let mcp = state_dir.join(format!("mcp-{}-{}.sock", std::process::id(), self.starts));
         let _ = fs::remove_file(&mcp);
         let mut cmd = Process::new(exe);
         cmd.args(&self.service_args)
