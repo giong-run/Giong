@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::ops::Range;
 use std::pin::pin;
@@ -561,6 +562,31 @@ fn reason_name(code: u32) -> String {
     }
 }
 
+/// Hashes the stream ids that key [`State::streams`]. The client picks
+/// them itself (odd, counting up), so no server can choose ids that
+/// collide; SipHash, the default, costs about a hundred instructions a
+/// lookup, and a request makes seven. Multiplying by an odd constant keeps
+/// distinct ids distinct in the low bits, and mixes them into the high
+/// bits the table also uses.
+#[derive(Default)]
+struct IdHash(u64);
+
+impl Hasher for IdHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ u64::from(n)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 /// The protocol state of a connection, without I/O: frames in, frames out.
 struct State {
     encoder: Encoder,
@@ -568,7 +594,7 @@ struct State {
     /// Frames to write.
     out: Vec<u8>,
     next_id: u32,
-    streams: HashMap<u32, StreamState>,
+    streams: HashMap<u32, StreamState, BuildHasherDefault<IdHash>>,
     /// Streams with request body to send, served in turn.
     sending: VecDeque<u32>,
     /// Streams whose streamed request body has sent its last piece and
@@ -608,7 +634,7 @@ impl State {
             decoder: Decoder::new(TABLE_SIZE),
             out: Vec::new(),
             next_id: 1,
-            streams: HashMap::new(),
+            streams: HashMap::default(),
             sending: VecDeque::new(),
             pulling: Vec::new(),
             peer_max_streams: INITIAL_MAX_STREAMS,

@@ -52,12 +52,12 @@ instructions per request.
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,624 | 4,510 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 4,138 | 4,832 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 196 | 248 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,416 | 10,276 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 30,939 | 31,990 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 43,563 | 44,449 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 373,372 | 374,185 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 43,175 | 44,191 |
-| `web` | a giong-web router with a path parameter, raw client | 13,381 | 14,254 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,109 | 9,974 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 23,037 | 24,081 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 32,106 | 33,010 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 258,218 | 259,106 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 35,112 | 36,136 |
+| `web` | a giong-web router with a path parameter, raw client | 13,178 | 14,038 |
 | `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
 | `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,224 | 10,838 |
 | `mysql-query` | giong-mysql query, one parameter, one row, fake server | 14,137 | 14,751 |

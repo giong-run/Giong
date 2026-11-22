@@ -44,10 +44,23 @@ pub(crate) fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
 }
 
 fn is_token(b: u8) -> bool {
-    matches!(b,
-        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
-        b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+    TOKEN[b as usize]
 }
+
+/// `tchar` (RFC 9110 section 5.6.2) for every byte. A table lookup costs a
+/// third of the comparisons the pattern compiles to, on every byte of every
+/// header name the server and the client parse.
+const TOKEN: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        table[b] = matches!(b as u8,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
+            b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+        b += 1;
+    }
+    table
+};
 
 pub(crate) fn is_token_str(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|&b| is_token(b))

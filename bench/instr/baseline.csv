@@ -10,6 +10,10 @@
 # bench/results/instr/raw.csv. Refresh: bench/instr/README.md.
 # Every row is a median of the CI run of #208 (GitHub runner, the kernel and
 # CPU named above), which moved the idle clients to a child process.
+# The instruction and allocation rows of http1, http1-client, h2, h2-streams,
+# https and web are from scripts/instr.py update on a 4-vCPU cloud VM (Linux
+# 6.18, the same rustc) after the client and HPACK changes of
+# changelog.d/http-request-cost.md; the other rows matched main there.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1397.4,1
 io_uring,spawn,allocations,1.000,1
@@ -27,17 +31,17 @@ io_uring,udp-echo,instructions,4130.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,191.7,1
 io_uring,file-read,allocations,0.000,1
-io_uring,http1,instructions,9420.6,1
+io_uring,http1,instructions,9108.6,1
 io_uring,http1,allocations,3.000,1
-io_uring,http1-client,instructions,30851.4,1
-io_uring,http1-client,allocations,33.008,1
-io_uring,h2,instructions,43481.3,1
-io_uring,h2,allocations,48.001,1
-io_uring,h2-streams,instructions,372328.2,0.5
-io_uring,h2-streams,allocations,476.005,0.5
-io_uring,https,instructions,42927.2,1
-io_uring,https,allocations,39.035,1
-io_uring,web,instructions,13414.4,1
+io_uring,http1-client,instructions,23037.3,1
+io_uring,http1-client,allocations,15.008,1
+io_uring,h2,instructions,32106.1,1
+io_uring,h2,allocations,31.000,1
+io_uring,h2-streams,instructions,258218.0,0.5
+io_uring,h2-streams,allocations,306.005,0.5
+io_uring,https,instructions,35112.4,1
+io_uring,https,allocations,21.035,1
+io_uring,web,instructions,13178.4,1
 io_uring,web,allocations,5.000,1
 io_uring,redis-get,instructions,8350.1,1
 io_uring,redis-get,allocations,2.000,1
@@ -70,17 +74,17 @@ epoll,udp-echo,instructions,4842.7,1
 epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,243.6,3
 epoll,file-read,allocations,0.016,1
-epoll,http1,instructions,10291.4,1
+epoll,http1,instructions,9973.5,1
 epoll,http1,allocations,3.000,1
-epoll,http1-client,instructions,31888.6,1
-epoll,http1-client,allocations,33.000,1
-epoll,h2,instructions,44386.0,1
-epoll,h2,allocations,48.000,1
-epoll,h2-streams,instructions,373140.8,0.5
-epoll,h2-streams,allocations,476.004,0.5
-epoll,https,instructions,43944.8,1
-epoll,https,allocations,39.000,1
-epoll,web,instructions,14285.5,1
+epoll,http1-client,instructions,24080.6,1
+epoll,http1-client,allocations,15.000,1
+epoll,h2,instructions,33009.9,1
+epoll,h2,allocations,31.001,1
+epoll,h2-streams,instructions,259106.1,0.5
+epoll,h2-streams,allocations,306.004,0.5
+epoll,https,instructions,36135.9,1
+epoll,https,allocations,21.000,1
+epoll,web,instructions,14037.6,1
 epoll,web,allocations,5.000,1
 epoll,redis-get,instructions,8920.7,1
 epoll,redis-get,allocations,2.000,1
