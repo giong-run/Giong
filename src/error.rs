@@ -157,16 +157,6 @@ codes! {
     /// already wait for a compute thread. The closure was dropped without
     /// running.
     ComputeBusy = 14, WouldBlock, "the compute lane is full";
-    /// A `try_` call of a [`Budget`](crate::budget::Budget) refused work:
-    /// the budget is at one of its [`Limits`](crate::budget::Limits) (tasks,
-    /// memory or compute closures), or other calls already wait for room.
-    /// The work was dropped without running.
-    BudgetFull = 80, WouldBlock, "the budget is at its limit";
-    /// [`Budget::reserve`](crate::budget::Budget::reserve) or
-    /// [`try_reserve`](crate::budget::Budget::try_reserve) asked for more
-    /// bytes than the budget's whole memory limit, so it could never be
-    /// granted.
-    BudgetTooSmall = 81, InvalidInput, "a reservation larger than the budget";
 
     // -------------------------------------------------------------- macOS
     /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
@@ -178,6 +168,18 @@ codes! {
     /// kernel's error is the [`source`](std::error::Error::source), so
     /// `raw_os_error` stays reachable.
     NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
+
+    // ------------------------------------------------------------ budgets
+    /// A `try_` call of a [`Budget`](crate::budget::Budget) refused work:
+    /// the budget is at one of its [`Limits`](crate::budget::Limits) (tasks,
+    /// memory or compute closures), or other calls already wait for room.
+    /// The work was dropped without running.
+    BudgetFull = 80, WouldBlock, "the budget is at its limit";
+    /// [`Budget::reserve`](crate::budget::Budget::reserve) or
+    /// [`try_reserve`](crate::budget::Budget::try_reserve) asked for more
+    /// bytes than the budget's whole memory limit, so it could never be
+    /// granted.
+    BudgetTooSmall = 81, InvalidInput, "a reservation larger than the budget";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
