@@ -140,6 +140,11 @@ pub enum Refusal {
     Status(u16, &'static str),
 }
 
+/// A byte of an HTTP token (RFC 9110 §5.6.2).
+fn is_token(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 /// Reads one request. `Err(None)` when the client went away.
 pub fn read_request(stream: &mut impl Read) -> Result<Req, Option<Refusal>> {
     let mut buf = Vec::with_capacity(2048);
@@ -176,12 +181,50 @@ pub fn read_request(stream: &mut impl Read) -> Result<Req, Option<Refusal>> {
     if !version.starts_with("HTTP/1.") || parts.next().is_some() || !target.starts_with('/') {
         return Err(Some(Refusal::Status(400, "not an HTTP/1.1 request")));
     }
+    // A target is visible ASCII only (RFC 9112 §3.2): no control bytes,
+    // spaces or bytes past ASCII.
+    if !target.bytes().all(|b| (0x21..0x7f).contains(&b)) {
+        return Err(Some(Refusal::Status(
+            400,
+            "the request target has bytes it may not have",
+        )));
+    }
     let mut headers = Vec::new();
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             return Err(Some(Refusal::Status(400, "a header line without a colon")));
         };
-        headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        // A field name is a token with no space before the colon; a value
+        // has no control bytes but tab (so no bare CR or LF either).
+        if k.is_empty() || !k.bytes().all(is_token) {
+            return Err(Some(Refusal::Status(
+                400,
+                "a header name that is not a token",
+            )));
+        }
+        if v.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return Err(Some(Refusal::Status(
+                400,
+                "a header value with control bytes",
+            )));
+        }
+        headers.push((k.to_ascii_lowercase(), v.trim().to_string()));
+    }
+    // Fields the checks read once: two of them is a request built to
+    // confuse (RFC 9112 §3.2 for Host).
+    for name in [
+        "host",
+        "content-length",
+        "origin",
+        "sec-fetch-site",
+        "x-giong-dashboard",
+    ] {
+        if headers.iter().filter(|(k, _)| k == name).count() > 1 {
+            return Err(Some(Refusal::Status(
+                400,
+                "a header that may appear once is repeated",
+            )));
+        }
     }
     if headers.iter().any(|(k, _)| k == "transfer-encoding") {
         return Err(Some(Refusal::Status(
@@ -362,6 +405,37 @@ mod tests {
                 .collect(),
             ..Req::default()
         }
+    }
+
+    #[test]
+    fn requests_built_to_confuse_are_refused() {
+        let bad = |raw: &str| match req(raw) {
+            Err(Some(Refusal::Status(400, _))) => {}
+            other => panic!("{raw:?}: {:?}", other.map(|r| r.headers)),
+        };
+        // Two Host fields, however they are spelled or filled.
+        bad("GET / HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nHost: evil.example\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nhost:\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHOST: 127.0.0.1:7700\r\nHost: 127.0.0.1:7700\r\n\r\n");
+        bad("GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nX-Giong-Dashboard: 1\r\nX-Giong-Dashboard: 1\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nOrigin: http://127.0.0.1:7700\r\nOrigin: http://evil.example\r\n\r\n");
+        bad("POST /api/send HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab");
+        // Control bytes in the target, bare LF or CR in the head, a space
+        // before the colon, a name that is not a token.
+        bad("GET /a\x00b HTTP/1.1\r\nHost: 127.0.0.1:7700\r\n\r\n");
+        bad("GET /a\x07 HTTP/1.1\r\nHost: 127.0.0.1:7700\r\n\r\n");
+        bad("GET /\u{e9} HTTP/1.1\r\nHost: 127.0.0.1:7700\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHost: 127.0.0.1:7700\nX-Evil: 1\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHost: 127.0.0.1:7700\rX-Evil: 1\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHost : 127.0.0.1:7700\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHo(st: 127.0.0.1:7700\r\n\r\n");
+        bad("GET / HTTP/1.1\r\n: x\r\nHost: 127.0.0.1:7700\r\n\r\n");
+        bad("GET / HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nX-A: a\x00b\r\n\r\n");
+        // A tab in a value and an encoded target are fine.
+        let r =
+            req("GET /a%20b?q=%00 HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nX-A: a\tb\r\n\r\n").unwrap();
+        assert_eq!(r.header("x-a"), Some("a\tb"));
+        assert!(admit(&r, 7700).is_ok());
     }
 
     #[test]
