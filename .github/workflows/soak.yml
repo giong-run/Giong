@@ -65,6 +65,10 @@ jobs:
           toolchain: stable
       - name: Soak
         shell: bash
+        # Line tables, so that the stack of a handle left over names
+        # giong's functions too.
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
         run: |
           GIONG_SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) \
             cargo test -p giong --release --locked --test soak -- --ignored --nocapture

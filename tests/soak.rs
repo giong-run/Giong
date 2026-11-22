@@ -675,16 +675,6 @@ fn new_handles(before: &BTreeMap<usize, String>) -> String {
     format!("[{}]{threads}", new.join(", "))
 }
 
-/// What each handle open now and not in `before` is.
-#[cfg(windows)]
-fn handles_new(before: &BTreeMap<usize, String>) -> Vec<String> {
-    open_handles()
-        .into_iter()
-        .filter(|(n, what)| before.get(n) != Some(what))
-        .map(|(_, what)| what)
-        .collect()
-}
-
 /// The threads of this process, by id and name (unnamed: `-`).
 #[cfg(windows)]
 fn live_threads() -> Vec<String> {
@@ -842,36 +832,37 @@ fn soak() {
 
     // 3. Descriptors: nothing left once the runtime is gone, and no growth
     //    during the run beyond the connections that happen to be open.
-    let fds_after = settled_fds(fds_before);
+    // The watcher stops first: its thread holds handles of its own.
     #[cfg(windows)]
     let traced = origins.map(origins::Watcher::finish);
+    let fds_after = settled_fds(fds_before);
     #[allow(unused_mut)]
     let mut new = new_handles(&handles_before);
+    // Winsock makes a few events for itself the first time some paths run
+    // (one in the WSASocketW that sets up a protocol, one in a closesocket
+    // that has to wait), on whichever thread gets there first, and keeps
+    // them for the life of the process. Soaks of one to two and a half
+    // hours each ended with one of them and nothing else, whatever their
+    // length and connection count: made once, not per socket. Up to two
+    // events whose traced open came from inside ws2_32 or mswsock are
+    // allowed; an event giong made, one opened where the trace cannot
+    // tell, or any other handle left behind still fails here.
     #[cfg(windows)]
-    if let Some(origins) = traced {
-        let events: Vec<usize> = open_handles()
-            .into_iter()
-            .filter(|(n, what)| what.starts_with("Event") && handles_before.get(n) != Some(what))
-            .map(|(n, _)| n)
-            .collect();
-        new += &origins.report(&events);
-    }
-    eprintln!("soak: {fds_after} descriptors open, {fds_before} before the soak; new since: {new}");
-    // Soaks of one to two and a half hours on Windows each ended with one
-    // Event more, whatever their length: one-time state, which no giong
-    // thread held (only the test's own threads were alive). giong makes
-    // only manual-reset events, and every owner of its handles is checked
-    // use by use in tests/handles.rs. So up to two auto-reset events, which
-    // system libraries make once and keep (as a critical section does for
-    // its waits, the first time two threads contend for it), are allowed;
-    // a file, socket, thread, manual-reset event or any other handle left
-    // behind still fails here.
-    #[cfg(windows)]
-    let system = handles_new(&handles_before)
-        .iter()
-        .filter(|what| what.as_str() == "Event (auto-reset)")
-        .count()
-        .min(2);
+    let system = match traced {
+        Some(origins) => {
+            let events: Vec<usize> = open_handles()
+                .into_iter()
+                .filter(|(n, what)| {
+                    what.starts_with("Event") && handles_before.get(n) != Some(what)
+                })
+                .map(|(n, _)| n)
+                .collect();
+            let (report, winsock) = origins.report(&events);
+            new += &report;
+            winsock.min(2)
+        }
+        None => 0,
+    };
     #[cfg(unix)]
     let system = 0;
     assert!(
@@ -1369,8 +1360,11 @@ mod origins {
 
     impl Traced {
         /// Where each of `handles` was opened.
-        pub(super) fn report(&self, handles: &[usize]) -> String {
+        /// Where each of `handles` was opened, and how many of them Winsock
+        /// made for itself.
+        pub(super) fn report(&self, handles: &[usize]) -> (String, usize) {
             let opens = &self.0;
+            let mut winsock = 0;
             // How many events the watcher traced, to tell a trace that works
             // from one that saw nothing.
             let mut out = format!("; {} new events traced", opens.len());
@@ -1380,9 +1374,14 @@ mod origins {
                 match opens.get(handle) {
                     None => out += &format!("\n  {handle:#x}: no open seen in the trace"),
                     Some(open) => {
+                        let by_winsock = made_by_winsock(&open.stack);
+                        winsock += usize::from(by_winsock);
                         out += &format!(
-                            "\n  {handle:#x}: opened on thread {} ({}), seen {:?} into the soak:",
-                            open.thread, open.thread_name, open.seen_after
+                            "\n  {handle:#x}: opened on thread {} ({}), seen {:?} into the soak{}:",
+                            open.thread,
+                            open.thread_name,
+                            open.seen_after,
+                            if by_winsock { ", by Winsock" } else { "" }
                         );
                         for &addr in &open.stack {
                             out += &format!("\n    {}", symbol(addr));
@@ -1390,26 +1389,45 @@ mod origins {
                     }
                 }
             }
-            out
+            (out, winsock)
         }
     }
 
-    /// `module!symbol+offset` for a return address, as far as known.
-    fn symbol(addr: usize) -> String {
+    /// Whether the code that asked for the handle is Winsock's: the first
+    /// caller outside the kernel and the layers every open goes through
+    /// (ntdll, kernelbase, kernel32) is ws2_32 or mswsock.
+    fn made_by_winsock(stack: &[usize]) -> bool {
+        stack
+            .iter()
+            .filter(|&&addr| addr < 0xffff_8000_0000_0000)
+            .map(|&addr| module_of(addr).to_ascii_lowercase())
+            .find(|m| !matches!(m.as_str(), "ntdll.dll" | "kernelbase.dll" | "kernel32.dll"))
+            .is_some_and(|m| m == "ws2_32.dll" || m == "mswsock.dll")
+    }
+
+    /// The file name of the module `addr` is in (`?` if none).
+    fn module_of(addr: usize) -> String {
         let mut module = 0isize;
         let mut name = [0u16; 260];
         // SAFETY: GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (4) with
         // UNCHANGED_REFCOUNT (2) only looks the module up; the name goes
         // into a local of the length given.
-        let module_name = unsafe {
-            if GetModuleHandleExW(6, addr, &mut module) != 0 {
-                let n = GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize;
-                let path = String::from_utf16_lossy(&name[..n]);
-                path.rsplit('\\').next().unwrap_or("").to_string()
-            } else {
-                "?".into()
+        unsafe {
+            if GetModuleHandleExW(6, addr, &mut module) == 0 {
+                return "?".into();
             }
-        };
+            let n = GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize;
+            let path = String::from_utf16_lossy(&name[..n]);
+            path.rsplit('\\').next().unwrap_or("").to_string()
+        }
+    }
+
+    /// `module!symbol+offset` for a return address, as far as known.
+    fn symbol(addr: usize) -> String {
+        let module_name = module_of(addr);
+        let mut module = 0isize;
+        // SAFETY: as in `module_of`: only looks the module up.
+        unsafe { GetModuleHandleExW(6, addr, &mut module) };
         // SYMBOL_INFOW: 88 bytes of fields, then the name (MaxNameLen chars).
         let mut info = vec![0u64; (88 + 2 * 512) / 8 + 1];
         let mut displacement = 0u64;
