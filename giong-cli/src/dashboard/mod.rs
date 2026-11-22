@@ -7,7 +7,7 @@
 //!   `Logger` and `Record` lines are JSON).
 //! - Routes, workers, tasks, connection pools and warnings: the service's
 //!   giong-mcp, as `giong routes` and `giong top` read it.
-//! - "Send a request": the service's own port, through [`web_client`].
+//! - "Send a request": the service's own port, through [`crate::web_client`].
 //!
 //! Nothing is added to the service: it pays nothing for the dashboard.
 //!

@@ -133,7 +133,7 @@ pub fn diagnostic(m: &Value, dir: &Path) -> Option<(Finding, String)> {
     } else if lint.starts_with("clippy::") {
         Code::LINT
     } else {
-        Code::BUILD_FAILED
+        Code::COMPILER_WARNING
     };
     let rendered = m["rendered"].as_str().unwrap_or(&text).to_string();
     let plain = strip_ansi(&rendered);
@@ -241,7 +241,7 @@ mod tests {
         });
         let (f, rendered) = diagnostic(&m, Path::new("/p")).unwrap();
         assert_eq!(f.severity, Severity::Warning);
-        assert_eq!(f.code, Code::BUILD_FAILED);
+        assert_eq!(f.code, Code::COMPILER_WARNING);
         assert_eq!(f.title, "unused variable: `x` [unused_variables]");
         assert!(f.detail.starts_with("warning: unused variable"));
         assert_eq!(f.place.as_ref().unwrap().line, 2);

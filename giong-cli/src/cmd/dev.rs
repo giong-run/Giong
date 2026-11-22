@@ -1136,7 +1136,7 @@ fn terminate(child: &Child) {
 }
 
 /// Whether a process is alive (`kill -0`).
-fn alive(pid: u64) -> bool {
+pub(crate) fn alive(pid: u64) -> bool {
     if cfg!(unix) {
         Process::new("kill")
             .args(["-0", &pid.to_string()])

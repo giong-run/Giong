@@ -10,6 +10,7 @@ use crate::code::Code;
 use crate::report::{Failure, Report};
 
 pub mod bench;
+pub mod check;
 pub mod clean;
 pub mod dashboard;
 pub mod db;
@@ -18,6 +19,7 @@ pub mod doctor;
 pub mod env;
 pub mod explain;
 pub mod help;
+pub mod mcp;
 pub mod openapi;
 pub mod record;
 pub mod routes;
@@ -44,6 +46,7 @@ pub const COMMANDS: &[&Command] = &[
     // Thread B adds `new`, `ai`, `fix` here; thread C `db`, `top`, `bench`,
     // `image`, `openapi`, `record`.
     &dev::COMMAND,
+    &check::COMMAND,
     &doctor::COMMAND,
     &bench::COMMAND,
     &db::COMMAND,
@@ -55,6 +58,7 @@ pub const COMMANDS: &[&Command] = &[
     &record::COMMAND,
     &dashboard::COMMAND,
     &top::COMMAND,
+    &mcp::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];

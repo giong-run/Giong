@@ -16,6 +16,7 @@ mod dashboard;
 mod dotenv;
 mod hist;
 mod host;
+mod lint;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
 mod loadgen;

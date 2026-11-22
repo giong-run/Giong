@@ -66,6 +66,7 @@ codes! {
     WATCH_LIMIT = 5020, "WatchLimit", "too many files to watch";
     NO_LINKER = 5021, "NoLinker", "no linker found";
     DEV_RUNNING = 5022, "DevRunning", "giong dev already serves this project";
+    COMPILER_WARNING = 5023, "CompilerWarning", "the compiler has a warning";
     NO_CONTAINER_RUNTIME = 5040, "NoContainerRuntime", "neither Docker nor Podman answers";
     DB_NOT_READY = 5041, "DbNotReady", "the database does not answer queries";
     DB_URL = 5042, "DbUrl", "no usable database URL";
