@@ -223,6 +223,21 @@ pub(crate) fn without_outer_build(cmd: &mut std::process::Command) {
     }
 }
 
+/// For the tests that build a small project: `false`, with a note, where no
+/// cargo can be started (CI's docker job runs the test binaries in a plain
+/// container, without a toolchain).
+#[cfg(test)]
+pub(crate) fn cargo_here() -> bool {
+    let ok = cargo()
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipped: no cargo here to build the test project with");
+    }
+    ok
+}
+
 /// Stops cargo and everything it started.
 fn stop_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
@@ -598,6 +613,9 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     /// epoll: the failure is reported for that driver alone.
     #[test]
     fn runs_a_real_suite() {
+        if !cargo_here() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("giong-test-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -630,6 +648,9 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     /// test binary with it.
     #[test]
     fn stops_a_hung_suite() {
+        if !cargo_here() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("giong-test-hang-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();

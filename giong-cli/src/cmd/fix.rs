@@ -700,6 +700,9 @@ mod tests {
     /// own loop (clippy's JSON, then the edits) leaves it clean and compiling.
     #[test]
     fn fixes_a_real_project() {
+        if !crate::cmd::test::cargo_here() {
+            return;
+        }
         let dir = scratch("real");
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(
