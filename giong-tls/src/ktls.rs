@@ -48,6 +48,14 @@ use rustls::{
 
 use crate::{coded, tls_error, Engine, TlsStream};
 
+/// The error the kernel's TLS returns while it waits for new keys after a
+/// KeyUpdate. Kernel TLS is Linux's; elsewhere setting it up always fails
+/// and the value is never seen, so it is one no system call returns.
+#[cfg(target_os = "linux")]
+const EKEYEXPIRED: i32 = libc::EKEYEXPIRED;
+#[cfg(target_os = "macos")]
+const EKEYEXPIRED: i32 = -1;
+
 /// Whether TLS connections hand their records to the kernel after the
 /// handshake: see [`TlsAcceptor::ktls`](crate::TlsAcceptor::ktls).
 ///
@@ -546,7 +554,7 @@ fn send_record_now(fd: RawFd, record_type: u8, data: &[u8]) -> io::Result<bool> 
         // SAFETY: `msg` points at `iov`, `data` and `control`, which live
         // until the call returns, with their true lengths; the kernel only
         // reads `data`.
-        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | crate::NO_SIGNAL) };
         if n >= 0 {
             return if n as usize == data.len() {
                 Ok(true)
@@ -1726,7 +1734,7 @@ fn kernel_error(e: io::Error) -> io::Error {
             "the peer sent a TLS record larger than TLS allows (record_overflow)",
             "check that the other side speaks TLS on this port.",
         ),
-        Some(libc::EKEYEXPIRED) => coded(
+        Some(EKEYEXPIRED) => coded(
             Code::KtlsKeyUpdate,
             "the kernel waits for new TLS keys after the peer's KeyUpdate",
             "this is a bug in giong-tls; please report it at \
@@ -1807,14 +1815,14 @@ impl TlsStream {
                 }
                 Err(e) => match e.raw_os_error() {
                     // Twice in a row, the kernel did not take the keys.
-                    Some(libc::EKEYEXPIRED) if !resumed => match self.resume_receiving() {
+                    Some(EKEYEXPIRED) if !resumed => match self.resume_receiving() {
                         Ok(()) => {
                             resumed = true;
                             continue;
                         }
                         Err(r) => Control::Fail(r, None),
                     },
-                    Some(libc::EBADMSG | libc::EMSGSIZE | libc::EKEYEXPIRED) => {
+                    Some(libc::EBADMSG | libc::EMSGSIZE | EKEYEXPIRED) => {
                         Control::Fail(kernel_error(e), None)
                     }
                     _ => return Err(e),

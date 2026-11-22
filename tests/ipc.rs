@@ -1,5 +1,7 @@
 //! Messages between processes over shared memory (`giong::ipc`).
 
+#![cfg(target_os = "linux")]
+
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;

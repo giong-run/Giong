@@ -108,13 +108,15 @@ impl<T: 'static> Future for Op<T> {
                         }
                     }
                 };
-                if res == -libc::EAGAIN && this.io.is_some_and(|io| io.waits_when_not_ready()) {
+                if res == -crate::sys::errno::EAGAIN
+                    && this.io.is_some_and(|io| io.waits_when_not_ready())
+                {
                     // io_uring on a non-blocking socket: it gave up waiting
                     // (Linux 6.0 and 6.1 do after a second `EAGAIN`). Nothing
                     // was transferred; submitting again waits afresh.
                     continue;
                 }
-                if res == -libc::EOPNOTSUPP {
+                if res == -crate::sys::errno::EOPNOTSUPP {
                     if let Some(copying) = this.io.and_then(|io| io.copying()) {
                         // A zero-copy send the socket refuses (kernel TLS):
                         // nothing was sent, so the same bytes go again with

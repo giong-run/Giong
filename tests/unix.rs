@@ -197,11 +197,18 @@ fn works_with_the_standard_library_on_the_other_side() {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let data = payload(300_000, 9);
+        // Read while writing: the echo stops reading when what it sent back
+        // is not taken, and how much the two sockets hold in between differs
+        // by system (a few kilobytes on macOS).
+        let mut reading = stream.try_clone().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut back = Vec::new();
+            reading.read_to_end(&mut back).unwrap();
+            back
+        });
         stream.write_all(&data).unwrap();
         stream.shutdown(Shutdown::Write).unwrap();
-        let mut back = Vec::new();
-        stream.read_to_end(&mut back).unwrap();
-        assert!(back == data);
+        assert!(reader.join().unwrap() == data);
     });
     giong::block_on(async {
         // A listener made by the standard library, handed to giong.
@@ -241,8 +248,18 @@ fn the_end_of_the_stream_is_seen_after_data_that_was_waiting() {
             // little enough to wait in a socket nobody reads yet.
             let data = payload(40 * BUFFER, 11);
             let (mut peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
-            peer.write_all(&data).unwrap();
-            peer.shutdown(Shutdown::Write).unwrap();
+            let sent = data.clone();
+            let writer = std::thread::spawn(move || {
+                peer.write_all(&sent).unwrap();
+                peer.shutdown(Shutdown::Write).unwrap();
+                peer
+            });
+            // Linux holds all of it in the socket, so it is all there with
+            // the shutdown before the first receive, as the kernel's fault
+            // needs. A macOS socket holds a few kilobytes: there the writer
+            // goes on while this reads.
+            #[cfg(target_os = "linux")]
+            let peer = writer.join().unwrap();
             let stream = UnixStream::from_std(ours);
             let mut received = Vec::new();
             loop {
@@ -256,6 +273,8 @@ fn the_end_of_the_stream_is_seen_after_data_that_was_waiting() {
                 received.extend_from_slice(&piece);
             }
             assert!(received == data);
+            #[cfg(not(target_os = "linux"))]
+            let peer = writer.join().unwrap();
             // Open until here: closing it would have woken the receive.
             drop(peer);
         })
@@ -266,7 +285,9 @@ fn the_end_of_the_stream_is_seen_after_data_that_was_waiting() {
 fn many_connections_at_once() {
     let path = SocketPath::new("many");
     giong::block_on(async {
-        const CONNS: usize = 300;
+        // macOS refuses a connection once 128 wait on the listener
+        // (`kern.ipc.somaxconn`); Linux makes the connect wait instead.
+        const CONNS: usize = if cfg!(target_os = "macos") { 100 } else { 300 };
         let listener = UnixListener::bind(&path.0).unwrap();
         giong::spawn(async move {
             loop {

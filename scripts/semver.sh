@@ -14,5 +14,15 @@ cd "$(dirname "$0")/.."
 
 baseline="${BASELINE:-$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD)}"
 echo "== cargo-semver-checks against $baseline"
-# rest-api is the example service, not published.
-cargo semver-checks --workspace --exclude rest-api --baseline-rev "$baseline" --all-features
+# rest-api is the example service, not published. A crate the baseline does
+# not have (first published in this release) has nothing to be checked against.
+exclude=(--exclude rest-api)
+baseline_lock="$(git show "$baseline:Cargo.lock")"
+for name in $(cargo metadata --no-deps --format-version 1 \
+    | jq -r '.packages[] | select(.publish != []) | .name'); do
+  if ! grep -qx "name = \"$name\"" <<<"$baseline_lock"; then
+    echo "   $name is new since $baseline: not checked"
+    exclude+=(--exclude "$name")
+  fi
+done
+cargo semver-checks --workspace "${exclude[@]}" --baseline-rev "$baseline" --all-features

@@ -68,8 +68,8 @@ to type.
   The API was settled in 0.7 ([review](docs/reviews/2026-11-api-freeze.md)), and
   `cargo-semver-checks` runs on every pull request.
 - **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
-  io_uring is blocked. macOS (for development) and Windows come after 1.0
-  ([ROADMAP.md](ROADMAP.md)).
+  io_uring is blocked. macOS runs on a kqueue driver (tested on macOS 15 and 26, Apple
+  Silicon); Windows comes later ([ROADMAP.md](ROADMAP.md)).
 
 ## Let your agent look inside the running service
 
@@ -183,9 +183,11 @@ connection, the same as the others.
   Compose and Kubernetes.
 - Rust 1.80 or newer. How this minimum, the kernel minimums and the API move during 1.x:
   [docs/STABILITY.md](docs/STABILITY.md).
-- giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
-  `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
-  are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
+- macOS works with a kqueue driver. It is tested on macOS 15 and 26 on Apple Silicon (the
+  GitHub runners); Intel Macs and older versions of macOS are not tested.
+- giong does **not** build on Windows. Use WSL2 (`uname -r`; run `wsl --update` for a 6.x
+  kernel), a Linux virtual machine, or Docker. Windows is planned
+  ([ROADMAP.md](ROADMAP.md)).
 
 ## Quick start
 
@@ -366,7 +368,7 @@ For each job a service has, try these in order and take the first that fits:
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 3.3 times tokio-postgres + deadpool at its best on one row by key, 2.5 times on 100 rows; 7–9% behind tokio-postgres on one shared connection ([PostgreSQL](#postgresql)) |
 | MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 5.1 times SQLx at its best on one row by key, 3.7 times on 100 rows ([MySQL](#mysql)) |
 | Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.1 to 1.8 times redis-rs on small commands, 1.25 to 2.5 times on 8 KiB values, at half its CPU per command or less ([Redis](#redis)) |
-| Messages between processes on one host | `giong::ipc` | `tokio::net::UnixStream` | Shared memory: 6.7 times giong's own `UnixStream` on round trips with spinning workers (1.00 against 6.73 µs) and 8.3 times without; 2.0 to 2.1 times on streams of small messages, at half the CPU; not measured against Tokio ([results](bench/results/ipc-giong/README.md)) |
+| Messages between processes on one host (Linux) | `giong::ipc` | `tokio::net::UnixStream` | Shared memory: 6.7 times giong's own `UnixStream` on round trips with spinning workers (1.00 against 6.73 µs) and 8.3 times without; 2.0 to 2.1 times on streams of small messages, at half the CPU; not measured against Tokio ([results](bench/results/ipc-giong/README.md)) |
 | Files | `giong::fs` | `tokio::fs` | 8 times Tokio on reads at an offset, 3.2 to 4.1 times on whole small files ([File I/O](#file-io)) |
 | Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | `localhost` from `/etc/hosts`: 171 ns against Tokio's 28.6 µs ([Core primitives](#core-primitives)); DNS over the network not measured |
 | Tasks, timers, channels | `giong::spawn`, `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::spawn`, `tokio::time`, `tokio::sync` | 1.3 to 2.6 times Tokio; Monoio and Glommio are ahead on spawning and channels within one thread ([Core primitives](#core-primitives)) |
@@ -1060,9 +1062,10 @@ cost 1% more instructions, or an idle connection 1% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,114 tests across the nine crates and the example API (`cargo test --workspace
+1,114 tests across the nine crates of 1.0 and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
-driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
+driver without a failure (giong-proto, giong-grpc-build and giong-grpc, new in 1.1, add
+9, 4 and 65 more), plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and
 TLS's main suites are below; the database clients, giong-web, giong-mcp, giong-compat and
 the example API describe theirs in their READMEs.
@@ -1071,7 +1074,7 @@ the example API describe theirs in their READMEs.
 |---|---|
 | `tests/executor.rs` (16) | spawn and join, panics, abort, teardown, runtimes run back to back; I/O completes while another task keeps yielding; giong called outside a runtime, or `block_on` inside one, panics with its code |
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
-| `tests/net.rs` (27) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
+| `tests/net.rs` (30) | echo, 8 MB each way without a wrong byte, EOF, 6 MB in turns of `recv` and receives straight into the reader's buffer without a byte out of place, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/udp.rs` (25) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, many tasks receiving on one socket each woken for a datagram of its own, a receiver that gave up not taking the next datagram, a task that only sends letting the others run, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
 | `tests/fs.rs` (25) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll), one stuck operation not holding up the others, offsets above `i64::MAX` and open options that cannot work refused with their codes, a pipe on standard input left blocking |
@@ -1275,6 +1278,9 @@ giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub,
 giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
 giong-mcp/      the MCP server for agents: Streamable HTTP, tools over giong::observe
 giong-compat/   Compat: the Tokio and futures-io I/O traits for giong's streams
+giong-proto/    Protocol Buffers as views over the receive buffer (new in 1.1)
+giong-grpc-build/ code generation from .proto files at build time, no protoc (new in 1.1)
+giong-grpc/     gRPC servers and clients on giong-http's HTTP/2, health and reflection (new in 1.1)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs; rest-api/, a complete REST API (PostgreSQL, a Redis cache, HTTPS)
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, dns, channels, observe, soak, ...
 bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, rest-api.sh, compat.sh, the programs compared against, results/

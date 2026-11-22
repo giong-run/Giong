@@ -378,6 +378,78 @@ fn a_kept_alive_connection_closing_as_the_request_goes_is_retried_only_when_safe
 }
 
 #[test]
+fn a_streamed_body_already_taken_is_not_sent_again() {
+    giong::block_on(async {
+        // The connection answers one request, then takes the head and body
+        // of the next one and closes without an answer. That request was a
+        // PUT, safe to repeat, but its streamed body is gone: sending it
+        // again would send a body it does not have.
+        let later = Rc::new(Cell::new(0));
+        let seen = later.clone();
+        let base = scripted(move |n, stream| {
+            let seen = seen.clone();
+            async move {
+                let mut buf = Vec::new();
+                if n > 0 {
+                    seen.set(seen.get() + 1);
+                }
+                read_request(&stream, &mut buf).await;
+                write(&stream, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+                read_request(&stream, &mut buf).await;
+                sleep(Duration::from_millis(100)).await;
+            }
+        });
+        let client = Client::new();
+        client.put(&base).send().await.unwrap();
+        let (request, body) = client.put(&base).streamed_body();
+        let sender = giong::spawn(async move {
+            body.send("hello").await.unwrap();
+        });
+        let e = request.send().await.unwrap_err();
+        let _ = sender.await;
+        assert!(e.to_string().contains("not sent again by itself"), "{e}");
+        assert_eq!(later.get(), 0, "the request went out again");
+    });
+}
+
+#[test]
+fn the_longest_timeouts_mean_no_timeout() {
+    giong::block_on(async {
+        // Duration::MAX everywhere, on both sides and both protocols: no
+        // timeout, not an overflow of the clock.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = Server::new()
+            .idle_timeout(Duration::MAX)
+            .request_timeout(Duration::MAX)
+            .write_timeout(Duration::MAX)
+            .shutdown_linger(Duration::MAX);
+        giong::spawn(async move {
+            server
+                .serve(listener, |_| async { Response::text("ok") })
+                .await
+        });
+        for h2 in [false, true] {
+            let client = Client::builder()
+                .timeout(Duration::MAX)
+                .connect_timeout(Duration::MAX)
+                .idle_timeout(Duration::MAX)
+                .http2_prior_knowledge(h2)
+                .build();
+            for _ in 0..2 {
+                let response = client
+                    .get(&base)
+                    .timeout(Duration::MAX)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.text().unwrap(), "ok");
+            }
+        }
+    });
+}
+
+#[test]
 fn a_dropped_request_closes_its_connection() {
     giong::block_on(async {
         let base = serve(|req: Request| async move {
@@ -636,6 +708,11 @@ fn a_server_that_does_not_answer_hits_the_timeout() {
             .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
             .unwrap();
         let port = refusing.local_addr().unwrap().as_socket().unwrap().port();
+        // macOS drops a SYN to a socket that is bound but not listening
+        // (Linux answers with a reset), so there the port is given back: a
+        // closed port is refused.
+        #[cfg(target_os = "macos")]
+        drop(refusing);
         let e = client
             .get(&format!("http://127.0.0.1:{port}/"))
             .send()

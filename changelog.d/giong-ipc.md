@@ -1,6 +1,6 @@
 ### Added
 
-- **giong**: `giong::ipc`, message channels between two processes on one host, over
+- **giong**: `giong::ipc`, message channels between two processes on one Linux host, over
   shared memory ([#189](https://github.com/giong-run/Giong/pull/189)). `IpcListener::bind`
   and `ipc::connect` meet on a Unix socket path, hand over a sealed memfd and four
   eventfds, and give each side a `Sender` and a `Receiver`. Messages are bounded (a quarter

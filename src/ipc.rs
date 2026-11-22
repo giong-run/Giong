@@ -6,8 +6,11 @@
 //! are busy no system call is made at all; a side that runs out of messages
 //! (or of room) sleeps on an eventfd and is woken only when the other side
 //! sees it sleeping. Compared with a Unix socket, this removes the kernel
-//! from the data path: see `docs/reviews/2026-11-breakthrough.md` for
+//! from the data path: see `bench/results/ipc-giong/README.md` for
 //! measurements.
+//!
+//! Linux only: the channel is built on `memfd` and eventfds, so the module
+//! is not compiled on macOS.
 //!
 //! ```no_run
 //! # giong::block_on(async {
