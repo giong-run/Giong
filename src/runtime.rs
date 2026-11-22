@@ -1047,9 +1047,9 @@ impl Builder {
     /// [`DriverKind::Epoll`] it never uses io_uring.
     ///
     /// When no driver is named here, the `GIONG_DRIVER` environment variable
-    /// can name one (`io_uring` or `epoll` on Linux, `kqueue` on macOS), so
-    /// that a deployment can choose without a rebuild. Any other value makes
-    /// [`build`](Self::build) fail with `GIONG-E0004`.
+    /// can name one (`io_uring` or `epoll` on Linux, `kqueue` on macOS, `iocp`
+    /// on Windows), so that a deployment can choose without a rebuild. Any
+    /// other value makes [`build`](Self::build) fail with `GIONG-E0004`.
     ///
     /// A driver this operating system does not have, named either way, makes
     /// `build` fail too: io_uring with `GIONG-E0001`, the others with
