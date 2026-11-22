@@ -531,14 +531,14 @@ struct Block {
 
 /// A header block, decoded and checked.
 #[derive(Default)]
-struct Decoded {
-    status: Option<u16>,
-    bytes: Vec<u8>,
-    fields: Vec<(Range<usize>, Range<usize>)>,
+pub(super) struct Decoded {
+    pub(super) status: Option<u16>,
+    pub(super) bytes: Vec<u8>,
+    pub(super) fields: Vec<(Range<usize>, Range<usize>)>,
     /// Decoded size, counted as for `SETTINGS_MAX_HEADER_LIST_SIZE`.
-    size: usize,
-    content_length: Option<u64>,
-    malformed: Option<&'static str>,
+    pub(super) size: usize,
+    pub(super) content_length: Option<u64>,
+    pub(super) malformed: Option<&'static str>,
 }
 
 /// A connection error: what the GOAWAY says, and the message requests get.
@@ -1670,8 +1670,9 @@ impl State {
     }
 }
 
-/// Checks one decoded field of a response head and keeps it.
-fn check_field(d: &mut Decoded, max: usize, name: &[u8], value: &[u8]) {
+/// Checks one decoded field of a response head and keeps it. HTTP/3 holds
+/// response fields to the same rules (RFC 9114, section 4.2).
+pub(super) fn check_field(d: &mut Decoded, max: usize, name: &[u8], value: &[u8]) {
     d.size += name.len() + value.len() + 32;
     if d.malformed.is_some() {
         return;

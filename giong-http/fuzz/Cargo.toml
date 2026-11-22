@@ -10,7 +10,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 giong = { path = "../.." }
-giong-http = { path = "..", features = ["client"] }
+giong-http = { path = "..", features = ["client", "unstable-http3"] }
+# The h3_server and h3_client targets: QUIC over loopback.
+giong-quic = { path = "../../giong-quic" }
+rcgen = "0.13"
+rustls = { version = "0.23.33", default-features = false, features = ["ring", "std"] }
 
 # Its own workspace, like the benchmark crates: needs nightly and cargo-fuzz.
 [workspace]
@@ -87,3 +91,24 @@ bench = false
 
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "h3"
+path = "fuzz_targets/h3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_server"
+path = "fuzz_targets/h3_server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h3_client"
+path = "fuzz_targets/h3_client.rs"
+test = false
+doc = false
+bench = false

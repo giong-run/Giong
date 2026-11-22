@@ -25,6 +25,9 @@ pub(crate) struct Head {
     /// The request came over HTTP/2 (the head was rebuilt from its
     /// header fields; see `h2::request`).
     pub(crate) h2: bool,
+    /// With `h2`: the request came over HTTP/3, whose field rules are those
+    /// of HTTP/2 (RFC 9114, section 4.2).
+    pub(crate) h3: bool,
 }
 
 /// Position just past the `\r\n\r\n` that ends a head, searching from `from`.
@@ -184,6 +187,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
         keep_alive: false,
         expect_continue: false,
         h2: false,
+        h3: false,
     };
     let mut hosts = 0;
     let mut host: Option<&[u8]> = None;

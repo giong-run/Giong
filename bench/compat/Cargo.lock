@@ -38,7 +38,7 @@ checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
 name = "giong"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "giong-compat"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "futures-io",
  "giong",
