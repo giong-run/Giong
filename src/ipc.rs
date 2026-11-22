@@ -1287,6 +1287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sendmsg or recvmsg")]
     fn a_received_message_nobody_took_closes_its_descriptors() {
         let (read, msg) = receive_a_write_end();
         assert!(!at_end(&read));
@@ -1295,6 +1296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sendmsg or recvmsg")]
     fn descriptors_taken_from_a_message_outlive_it_and_close_once() {
         let (read, mut msg) = receive_a_write_end();
         let fds = msg.take_fds();

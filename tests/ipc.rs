@@ -598,39 +598,51 @@ fn dropping_the_listener_ends_the_handshakes_under_way() {
 // ------------------------------------------------- descriptors and exec
 
 /// The child half of the close-on-exec test: accepts one channel, then
-/// fails if any descriptor past stdio would be inherited by an exec'd
-/// program. In a process of its own, so that no other test's descriptors
-/// are in the list.
+/// fails if a descriptor it opened would be inherited by an exec'd program.
+/// In a process of its own, so that no other test's descriptors are in the
+/// list.
 #[test]
 #[ignore = "run by a_new_channel_leaks_no_descriptor_into_exec in a child process"]
 fn child_lists_inheritable_descriptors() {
     let Ok(path) = std::env::var("GIONG_IPC_CLOEXEC_PATH") else {
         return;
     };
+    // Descriptors this process was started with (a CI runner hands some
+    // down) are not the channel's: only the ones opened since count.
+    let before = inheritable_descriptors();
     giong::block_on(async move {
         let listener = IpcListener::bind(&path, 4096).unwrap();
         let client = giong::spawn(async move { ipc::connect(&path, 4096).await });
         let accepted = listener.accept().await.unwrap();
         let connected = client.await.unwrap().unwrap();
-        let mut open = Vec::new();
-        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
-            let fd: RawFd = entry
-                .unwrap()
-                .file_name()
-                .to_str()
-                .unwrap()
-                .parse()
-                .unwrap();
-            // SAFETY: F_GETFD only reads the flags; a closed descriptor
-            // (the directory's own) returns -1.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            if fd > 2 && flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
-                open.push(fd);
-            }
-        }
+        let open: Vec<RawFd> = inheritable_descriptors()
+            .into_iter()
+            .filter(|fd| !before.contains(fd))
+            .collect();
         drop((accepted, connected));
         assert!(open.is_empty(), "inherited by exec: {open:?}");
     });
+}
+
+/// The descriptors past stdio that an exec'd program would inherit.
+fn inheritable_descriptors() -> Vec<RawFd> {
+    let mut open = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let fd: RawFd = entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: F_GETFD only reads the flags; a closed descriptor (the
+        // directory's own) returns -1.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if fd > 2 && flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            open.push(fd);
+        }
+    }
+    open
 }
 
 #[test]
