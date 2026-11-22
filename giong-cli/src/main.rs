@@ -13,13 +13,16 @@ mod cmd;
 mod code;
 mod dashboard;
 mod dotenv;
+mod hist;
 mod host;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
+mod loadgen;
 mod project;
 mod record;
 mod report;
 mod service;
+mod sha256;
 mod web_client;
 
 use std::process::ExitCode;

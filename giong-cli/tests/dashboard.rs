@@ -365,7 +365,7 @@ fn a_stopped_service_is_reported_not_fatal() {
     .unwrap();
     let d = dashboard(&dir);
     let s = get(&d.1, "/api/state");
-    assert_eq!(s["service_error"]["code"], "GIONG-E5050", "{s}");
+    assert_eq!(s["service_error"]["code"], "GIONG-E5057", "{s}");
     assert!(get(&d.1, "/api/routes")["error"]["code"].is_string());
     let l = get(&d.1, "/api/log");
     assert!(l["log"].is_null(), "{l}");

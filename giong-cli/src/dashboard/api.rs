@@ -271,10 +271,7 @@ pub type Lines = Vec<(u64, String)>;
 
 /// Reads complete lines of the log from `start`, at most [`LOG_CHUNK`]
 /// bytes; gives the lines with their byte offsets and where to go on.
-pub fn read_lines(
-    path: &Path,
-    after: Option<u64>,
-) -> std::io::Result<(u64, u64, Lines)> {
+pub fn read_lines(path: &Path, after: Option<u64>) -> std::io::Result<(u64, u64, Lines)> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     // Unknown or past the end (giong dev truncated it on a new start):

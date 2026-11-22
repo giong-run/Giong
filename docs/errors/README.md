@@ -269,13 +269,28 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
 | [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
 | [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
-| [GIONG-E5050](E5050.md) | `NoService` | no running service to ask |
-| [GIONG-E5051](E5051.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
-| [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |
+| [GIONG-E5040](E5040.md) | `NoContainerRuntime` | neither Docker nor Podman answers |
+| [GIONG-E5041](E5041.md) | `DbNotReady` | the database does not answer queries |
+| [GIONG-E5042](E5042.md) | `DbUrl` | no usable database URL |
+| [GIONG-E5043](E5043.md) | `MigrationChanged` | an applied migration was changed |
+| [GIONG-E5044](E5044.md) | `MigrationFailed` | a migration failed |
+| [GIONG-E5045](E5045.md) | `MigrationName` | a migration file is not valid |
+| [GIONG-E5046](E5046.md) | `DbClientMissing` | no database client to run the SQL |
+| [GIONG-E5047](E5047.md) | `MigrationUnknown` | the database has a migration the project does not |
+| [GIONG-E5048](E5048.md) | `DbNotManaged` | the database was not started by giong db up |
+| [GIONG-E5049](E5049.md) | `DbStartFailed` | the database container could not start |
 | [GIONG-E5053](E5053.md) | `DashboardPortInUse` | the dashboard's port is in use |
 | [GIONG-E5054](E5054.md) | `DashboardFailed` | the dashboard could not do what the page asked |
 | [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
 | [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
+| [GIONG-E5057](E5057.md) | `NoService` | no running service to ask |
+| [GIONG-E5058](E5058.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
+| [GIONG-E5059](E5059.md) | `McpToolError` | the service's giong-mcp refused a call |
+| [GIONG-E5060](E5060.md) | `BenchTarget` | the service to measure cannot be reached |
+| [GIONG-E5061](E5061.md) | `BenchAgainst` | the build to compare against cannot be made |
+| [GIONG-E5062](E5062.md) | `BenchGeneratorBehind` | the load generator fell behind its schedule |
+| [GIONG-E5063](E5063.md) | `BenchErrors` | requests failed during the benchmark |
+| [GIONG-E5064](E5064.md) | `BenchRegression` | the change is slower than the build it is compared with |
 | [GIONG-E5065](E5065.md) | `NoRecording` | no recorded requests to use |
 | [GIONG-E5066](E5066.md) | `RecordedCaseFailed` | a recorded case answers differently |
 | [GIONG-E5067](E5067.md) | `RecordingInvalid` | a recording cannot be read or used |

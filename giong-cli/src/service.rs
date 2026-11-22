@@ -4,7 +4,8 @@
 //! Where the service is, first match wins:
 //!
 //! 1. `--mcp <address>`: `127.0.0.1:7777` or `unix:/path/to/socket`, with the
-//!    token in `GIONG_MCP_TOKEN` when it listens on TCP;
+//!    token in `GIONG_MCP_TOKEN` (required on TCP, checked on a Unix socket
+//!    too when the service has one);
 //! 2. `GIONG_MCP` (and `GIONG_MCP_TOKEN`), as the service itself reads them;
 //! 3. `.giong/dev.json` in the project, which `giong dev` writes for the run it
 //!    is serving (`mcp_socket`, `mcp_token`).
@@ -15,7 +16,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -23,7 +24,8 @@ use crate::code::Code;
 use crate::project::find_manifest_dir;
 use crate::report::Failure;
 
-/// How long a call may take: `profile` takes up to 10 s.
+/// How long a call may take in all, connecting included: `profile` takes up
+/// to 10 s.
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long connecting may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -235,28 +237,45 @@ impl Service {
              MCP-Protocol-Version: 2025-06-18\r\nContent-Length: {}\r\n",
             body.len()
         );
-        if let (Endpoint::Tcp(_), Some(t)) = (&self.endpoint, &self.token) {
+        // On every transport: giong-mcp checks a token it was given on a
+        // Unix socket too.
+        if let Some(t) = &self.token {
             head.push_str(&format!("Authorization: Bearer {t}\r\n"));
         }
         head.push_str("\r\n");
+        let deadline = Instant::now() + CALL_TIMEOUT;
         let raw = match &self.endpoint {
             Endpoint::Tcp(addr) => {
-                let target: SocketAddr = addr
+                let targets: Vec<SocketAddr> = addr
                     .to_socket_addrs()
                     .map_err(|e| self.unreachable(e))?
-                    .next()
-                    .ok_or_else(|| self.unreachable("the address resolves to nothing"))?;
-                let mut s = TcpStream::connect_timeout(&target, CONNECT_TIMEOUT)
-                    .map_err(|e| self.unreachable(e))?;
-                exchange(&mut s, &head, body).map_err(|e| self.unreachable(e))?
+                    .collect();
+                if targets.is_empty() {
+                    return Err(self.unreachable("the address resolves to nothing"));
+                }
+                // Every address it resolves to (localhost: ::1, then 127.0.0.1).
+                let mut last = None;
+                let mut stream = None;
+                for t in &targets {
+                    match TcpStream::connect_timeout(t, CONNECT_TIMEOUT) {
+                        Ok(s) => {
+                            stream = Some(s);
+                            break;
+                        }
+                        Err(e) => last = Some(e),
+                    }
+                }
+                let Some(mut s) = stream else {
+                    return Err(self.unreachable(
+                        last.map_or_else(|| "no address".to_string(), |e| e.to_string()),
+                    ));
+                };
+                exchange(&mut s, &head, body, deadline).map_err(|e| self.unreachable(e))?
             }
             #[cfg(unix)]
             Endpoint::Unix(path) => {
-                let mut s = std::os::unix::net::UnixStream::connect(path)
-                    .map_err(|e| self.unreachable(e))?;
-                s.set_read_timeout(Some(CALL_TIMEOUT))
-                    .map_err(|e| self.unreachable(e))?;
-                exchange(&mut s, &head, body).map_err(|e| self.unreachable(e))?
+                let mut s = connect_unix(path).map_err(|e| self.unreachable(e))?;
+                exchange(&mut s, &head, body, deadline).map_err(|e| self.unreachable(e))?
             }
             #[cfg(not(unix))]
             Endpoint::Unix(_) => {
@@ -273,7 +292,8 @@ impl Service {
                     "the service's giong-mcp at {} refused the token (401)",
                     self.endpoint
                 ),
-                "set GIONG_MCP_TOKEN to the token the service was started with",
+                "set GIONG_MCP_TOKEN to the token the service was started with (on a Unix socket \
+                 too, when the service has one)",
             )),
             other => Err(self.unreachable(format!(
                 "HTTP {other}: {}",
@@ -312,14 +332,66 @@ impl Stream for std::os::unix::net::UnixStream {
     }
 }
 
-fn exchange<S: Stream>(s: &mut S, head: &str, body: &str) -> std::io::Result<Vec<u8>> {
-    s.timeouts(CALL_TIMEOUT)?;
-    s.write_all(head.as_bytes())?;
-    s.write_all(body.as_bytes())?;
+/// A Unix socket connection, given up on after [`CONNECT_TIMEOUT`] (std has
+/// no timeout for it: a socket whose backlog is full blocks the connect).
+#[cfg(unix)]
+fn connect_unix(path: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(p));
+    });
+    rx.recv_timeout(CONNECT_TIMEOUT).unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("connecting timed out after {} s", CONNECT_TIMEOUT.as_secs()),
+        ))
+    })
+}
+
+/// The time left before `deadline`, or a "timed out" error.
+fn left(deadline: Instant) -> std::io::Result<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        return Err(timed_out());
+    }
+    Ok(deadline - now)
+}
+
+fn timed_out() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("no whole answer within {} s", CALL_TIMEOUT.as_secs()),
+    )
+}
+
+/// Sends the request and reads the answer, all within `deadline`: a server
+/// that never answers, or trickles bytes, fails with "timed out", not an
+/// OS error number.
+fn exchange<S: Stream>(
+    s: &mut S,
+    head: &str,
+    body: &str,
+    deadline: Instant,
+) -> std::io::Result<Vec<u8>> {
+    let timeout = |e: std::io::Error| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            timed_out()
+        } else {
+            e
+        }
+    };
+    s.timeouts(left(deadline)?)?;
+    s.write_all(head.as_bytes()).map_err(timeout)?;
+    s.write_all(body.as_bytes()).map_err(timeout)?;
     let mut out = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        let n = s.read(&mut chunk)?;
+        s.timeouts(left(deadline)?)?;
+        let n = s.read(&mut chunk).map_err(timeout)?;
         if n == 0 {
             break;
         }
@@ -414,6 +486,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_server_that_trickles_or_stays_silent_times_out() {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (i, s) in l.incoming().enumerate() {
+                let mut s = s.unwrap();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    // The first stays silent; the second sends a byte every
+                    // 100 ms forever, which per-read timeouts never catch.
+                    if i == 0 {
+                        std::thread::sleep(Duration::from_secs(5));
+                    } else {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n");
+                        while s.write_all(b"x").is_ok() {
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                });
+            }
+        });
+        for _ in 0..2 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(600);
+            let e = exchange(&mut s, "POST / HTTP/1.1\r\n\r\n", "", deadline).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+            assert!(e.to_string().contains("no whole answer within"), "{e}");
+            assert!(start.elapsed() < Duration::from_secs(3));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_token_goes_over_a_unix_socket_too() {
+        let dir = std::env::temp_dir().join(format!("giongcli-unix-token-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("mcp.sock");
+        let _ = std::fs::remove_file(&sock);
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !String::from_utf8_lossy(&got).contains("\"jsonrpc\"") {
+                let n = s.read(&mut buf).unwrap();
+                got.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"ok":true}}}"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            String::from_utf8_lossy(&got).into_owned()
+        });
+        let svc = Service {
+            endpoint: Endpoint::Unix(sock.clone()),
+            token: Some("a-token-of-16-chars".into()),
+            found_in: "--mcp".into(),
+        };
+        assert_eq!(
+            svc.call("overview", json!({})).unwrap(),
+            json!({"ok": true})
+        );
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("Authorization: Bearer a-token-of-16-chars\r\n"),
+            "{request}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn endpoints_parse() {
         assert_eq!(
             Endpoint::parse("127.0.0.1:7777").unwrap(),
@@ -426,10 +574,7 @@ mod tests {
         assert_eq!(Endpoint::parse("unix:").unwrap_err().code, Code::USAGE);
         assert_eq!(Endpoint::parse("7777").unwrap_err().code, Code::USAGE);
         assert_eq!(Endpoint::parse("").unwrap_err().code, Code::USAGE);
-        assert_eq!(
-            Endpoint::parse("unix:/x").unwrap().to_string(),
-            "unix:/x"
-        );
+        assert_eq!(Endpoint::parse("unix:/x").unwrap().to_string(), "unix:/x");
     }
 
     #[test]
@@ -447,14 +592,23 @@ mod tests {
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nab").is_err());
         assert!(parse_response(b"garbage").is_err());
         assert!(parse_response(b"SSH-2.0\r\n\r\n").is_err());
-        assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").is_err());
-        assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab").is_err());
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").is_err()
+        );
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab")
+                .is_err()
+        );
     }
 
     #[test]
     fn completeness_needs_the_whole_body() {
-        assert!(!response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"));
-        assert!(response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"));
+        assert!(!response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"
+        ));
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"
+        ));
         assert!(!response_complete(b"HTTP/1.1 200 OK\r\n"));
     }
 
