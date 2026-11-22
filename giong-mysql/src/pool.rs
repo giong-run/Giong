@@ -88,7 +88,9 @@ const STALLED: Duration = Duration::from_millis(5);
 /// TRANSACTION`, `COMMIT`, `ROLLBACK`, `LOCK TABLES`, `SET` (but `SET
 /// GLOBAL`), `USE`, temporary tables, `GET_LOCK`, assignments to user
 /// variables and `CALL` (a stored procedure may do any of these) before
-/// sending anything ([`ErrorKind::Statement`]).
+/// sending anything ([`ErrorKind::Statement`]). The check reads the
+/// statement, not code the server runs on its behalf: a stored function or
+/// trigger that changes the session is not refused (see the reset above).
 /// [`batch_execute`](Self::batch_execute) may carry a whole transaction
 /// (`START TRANSACTION; ...; COMMIT`); if a batch leaves one open, or
 /// autocommit off, its connection is closed, which rolls it back, and the
