@@ -260,7 +260,7 @@ pub fn call(name: &str, args: &Value) -> Result<Value, String> {
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let doc: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
         json!({"command": command.name, "ok": false,
-               "error": {"message": String::from_utf8_lossy(&out.stderr).trim()}})
+               "error": {"message": crate::build::strip_ansi(String::from_utf8_lossy(&out.stderr).trim())}})
     });
     // Exit status 2: the command could not do its job (a tool error);
     // 1: it ran and found errors (a result like any other).
