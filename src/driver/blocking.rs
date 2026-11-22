@@ -14,9 +14,9 @@
 //! the worker's eventfd.
 //!
 //! When every thread is busy, jobs wait their turn. If no job finishes for
-//! [`STALL`] while jobs wait, the busy threads are taken to be stuck, and one
-//! more thread starts, up to [`LIMIT`]: [`MAX_THREADS`] stuck jobs then hold
-//! up nothing but themselves.
+//! [`STALL`] while jobs wait, the busy threads are taken to be stuck, and a
+//! thread starts for each waiting job, up to [`LIMIT`] threads in all:
+//! [`MAX_THREADS`] stuck jobs then hold up nothing but themselves.
 
 use std::collections::VecDeque;
 #[cfg(unix)]
@@ -159,7 +159,8 @@ fn work(pool: &'static Pool) {
 
 /// Runs while jobs wait with every thread busy. A [`STALL`] in which no job
 /// finished means the busy threads are stuck (a FIFO with no writer, a hung
-/// network filesystem): one more thread starts, so the jobs behind them run.
+/// network filesystem): a thread starts for each waiting job, so the jobs
+/// behind them run.
 fn watch(pool: &'static Pool) {
     let mut seen = lock(&pool.state).done;
     loop {
@@ -169,14 +170,16 @@ fn watch(pool: &'static Pool) {
             state.watching = false;
             return;
         }
-        if state.done == seen && state.idle == 0 && state.threads < LIMIT {
-            state.threads += 1;
+        if state.done == seen {
+            // A thread for each job that no idle thread will take: the
+            // jobs behind the stuck ones then wait one stall, not one each.
+            let more = (state.jobs.len().saturating_sub(state.idle))
+                .min(LIMIT.saturating_sub(state.threads));
+            state.threads += more;
             drop(state);
-            let started = start(pool);
+            let started = (0..more).take_while(|_| start(pool)).count();
             state = lock(&pool.state);
-            if !started {
-                state.threads -= 1;
-            }
+            state.threads -= more - started;
         }
         seen = state.done;
     }
@@ -265,7 +268,10 @@ impl Cancel {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+// Not on Windows, where `iocp`'s tests keep every thread busy too: run at
+// once, the two would take each other's threads, and the threads this test
+// adds would leave that one an idle thread it does not expect.
+#[cfg(all(test, unix, not(miri)))]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
