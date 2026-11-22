@@ -414,9 +414,13 @@ impl Response {
     fn push_header(&mut self, name: &str, value: &str) {
         let managed = ["content-length", "transfer-encoding", "connection", "date"];
         if !managed.iter().any(|m| name.eq_ignore_ascii_case(m)) {
+            let value = value.trim();
+            // One allocation for the field: four `extend`s into an empty
+            // buffer grow it three times.
+            self.headers.reserve(name.len() + value.len() + 4);
             self.headers.extend_from_slice(name.as_bytes());
             self.headers.extend_from_slice(b": ");
-            self.headers.extend_from_slice(value.trim().as_bytes());
+            self.headers.extend_from_slice(value.as_bytes());
             self.headers.extend_from_slice(b"\r\n");
         }
     }
