@@ -41,6 +41,13 @@ impl TempDir {
         // Canonical, so paths the command prints compare equal (macOS's
         // /var -> /private/var, Windows' short names).
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        // Windows' canonical form is the verbatim `\\?\C:\...`, which no
+        // command prints; keep the plain drive form.
+        #[cfg(windows)]
+        let path = match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+            _ => path,
+        };
         TempDir { path }
     }
 

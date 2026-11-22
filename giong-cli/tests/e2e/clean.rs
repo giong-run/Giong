@@ -11,8 +11,29 @@ use crate::harness::{giong, new_package, TempDir};
 
 fn cargo() -> std::process::Command {
     let mut c = std::process::Command::new(std::env::var_os("CARGO").unwrap_or("cargo".into()));
-    c.env_remove("CARGO_TARGET_DIR").env_remove("RUSTFLAGS");
+    c.env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTFLAGS")
+        // CI sets CARGO_TERM_COLOR=always; these tests read cargo's words.
+        .env("CARGO_TERM_COLOR", "never");
     c
+}
+
+/// A directory opened so its times can be set (Windows needs write access
+/// and the backup-semantics flag to open a directory at all).
+fn open_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+    }
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)
+    }
 }
 
 fn build(dir: &Path) -> String {
@@ -165,7 +186,7 @@ fn set_old(path: &Path, days: u64) {
             .collect();
         dirs.push(path.to_path_buf());
         for d in dirs.into_iter().rev() {
-            if let Ok(f) = std::fs::File::open(&d) {
+            if let Ok(f) = open_dir(&d) {
                 let _ = f.set_modified(t);
             }
         }
@@ -459,8 +480,9 @@ fn days_keeps_units_rebuilt_today() {
     build(dir.path());
     for unit in unit_dirs(&dir.join("target/debug")) {
         // Only the directory: as if the unit was first built 60 days ago.
-        let f = std::fs::File::open(unit).unwrap();
-        let _ = f.set_modified(SystemTime::now() - Duration::from_secs(60 * 86_400));
+        let _ = open_dir(&unit)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(60 * 86_400));
     }
     dir.write(
         "src/main.rs",

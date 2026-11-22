@@ -19,7 +19,10 @@ fn workspace() -> PathBuf {
 
 fn cargo() -> Command {
     let mut c = Command::new(std::env::var_os("CARGO").unwrap_or("cargo".into()));
-    c.env_remove("CARGO_TARGET_DIR").env_remove("RUSTFLAGS");
+    c.env_remove("CARGO_TARGET_DIR")
+        .env_remove("RUSTFLAGS")
+        // CI sets CARGO_TERM_COLOR=always; these tests read cargo's words.
+        .env("CARGO_TERM_COLOR", "never");
     c
 }
 
