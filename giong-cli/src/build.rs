@@ -74,7 +74,9 @@ pub fn run(dir: &Path, subcommand: &str, args: &[String]) -> Result<Outcome, Fai
         out.findings.push(
             Finding::new(Code::CARGO_FAILED, Severity::Error, strip_ansi(&msg))
                 .detail(strip_ansi(&out.stderr_tail.join("\n")))
-                .fix("fix what cargo reports (run the same cargo command by hand to see all of it)"),
+                .fix(
+                    "fix what cargo reports (run the same cargo command by hand to see all of it)",
+                ),
         );
     }
     Ok(out)
@@ -119,7 +121,10 @@ pub fn diagnostic(m: &Value, dir: &Path) -> Option<(Finding, String)> {
         _ => return None,
     };
     let text = m["message"].as_str().unwrap_or("").to_string();
-    if text.starts_with("aborting due to") || text.ends_with("warnings emitted") || text.ends_with("warning emitted") {
+    if text.starts_with("aborting due to")
+        || text.ends_with("warnings emitted")
+        || text.ends_with("warning emitted")
+    {
         return None;
     }
     let lint = m["code"]["code"].as_str().unwrap_or("");
@@ -139,7 +144,9 @@ pub fn diagnostic(m: &Value, dir: &Path) -> Option<(Finding, String)> {
     };
     let mut f = Finding::new(code, severity, title).detail(plain.trim_end().to_string());
     f = f.fix(if lint.starts_with('E') {
-        format!("rustc --explain {lint} explains it; the compiler's message above says what to change")
+        format!(
+            "rustc --explain {lint} explains it; the compiler's message above says what to change"
+        )
     } else if lint.starts_with("clippy::") {
         format!(
             "follow clippy's suggestion (https://rust-lang.github.io/rust-clippy/master/#{})",
@@ -256,7 +263,10 @@ mod tests {
         assert_eq!(out.findings.len(), 2);
         assert_eq!(out.findings[0].title, "mismatched types [E0308]");
         assert!(out.findings[0].fix.contains("rustc --explain E0308"));
-        assert_eq!(out.executables, [(PathBuf::from("/p/target/debug/app"), "app".to_string())]);
+        assert_eq!(
+            out.executables,
+            [(PathBuf::from("/p/target/debug/app"), "app".to_string())]
+        );
     }
 
     #[test]
@@ -270,6 +280,9 @@ mod tests {
 
     #[test]
     fn ansi_is_stripped() {
-        assert_eq!(strip_ansi("\u{1b}[1m\u{1b}[31merror\u{1b}[0m: x"), "error: x");
+        assert_eq!(
+            strip_ansi("\u{1b}[1m\u{1b}[31merror\u{1b}[0m: x"),
+            "error: x"
+        );
     }
 }

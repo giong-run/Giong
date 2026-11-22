@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 mod args;
+mod build;
 mod cmd;
 mod code;
 mod dotenv;
@@ -17,6 +18,7 @@ mod host;
 mod pages;
 mod project;
 mod report;
+mod watch;
 
 use std::process::ExitCode;
 

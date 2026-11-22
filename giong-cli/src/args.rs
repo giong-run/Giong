@@ -89,7 +89,7 @@ pub fn command_of(argv: &[String]) -> Option<&str> {
     argv.iter()
         .map(String::as_str)
         .take_while(|a| *a != "--")
-        .find(|a| !a.starts_with('-'))
+        .find(|a| !a.starts_with('-') || *a == "-")
 }
 
 /// Parses `argv` (without the program name) for a command that accepts

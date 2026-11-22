@@ -13,7 +13,15 @@ use std::time::SystemTime;
 
 /// Directory names never watched.
 pub const SKIP: &[&str] = &[
-    "target", ".git", ".hg", ".svn", ".giong", "node_modules", ".idea", ".vscode", ".direnv",
+    "target",
+    ".git",
+    ".hg",
+    ".svn",
+    ".giong",
+    "node_modules",
+    ".idea",
+    ".vscode",
+    ".direnv",
 ];
 
 /// The most files watched; past it the rest are ignored (and said so).
@@ -142,23 +150,25 @@ mod tests {
         fs::write(d.join("nested-target/CACHEDIR.TAG"), "x").unwrap();
         fs::write(d.join("src/main.rs"), "fn main() {}").unwrap();
         fs::write(d.join(".env"), "A=1").unwrap();
-        let a = Snapshot::take(&[d.clone()]);
+        let a = Snapshot::take(std::slice::from_ref(&d));
         assert_eq!(a.files.len(), 2, "{:?}", a.files.keys());
         // Build output and editor files change nothing.
         fs::write(d.join("target/debug/app"), "bin").unwrap();
         fs::write(d.join("src/.main.rs.swp"), "swap").unwrap();
         fs::write(d.join("src/main.rs~"), "backup").unwrap();
-        assert!(Snapshot::take(&[d.clone()]).changed_since(&a).is_empty());
+        assert!(Snapshot::take(std::slice::from_ref(&d))
+            .changed_since(&a)
+            .is_empty());
         // A different length is a change even within one time tick.
         fs::write(d.join(".env"), "A=12").unwrap();
-        let b = Snapshot::take(&[d.clone()]);
+        let b = Snapshot::take(std::slice::from_ref(&d));
         let changed = b.changed_since(&a);
         assert_eq!(changed, [d.join(".env")]);
         assert_eq!(classify(&changed), Some(Change::Env));
         // New and removed files.
         fs::write(d.join("src/lib.rs"), "").unwrap();
         fs::remove_file(d.join("src/main.rs")).unwrap();
-        let c = Snapshot::take(&[d.clone()]);
+        let c = Snapshot::take(std::slice::from_ref(&d));
         let changed = c.changed_since(&b);
         assert_eq!(changed, [d.join("src/lib.rs"), d.join("src/main.rs")]);
         assert_eq!(classify(&changed), Some(Change::Code));
