@@ -477,7 +477,12 @@ giong already sizes and pins its workers by itself (CPU affinity and container q
 spreads connections between them; it does not retune itself while running, which would
 make behaviour hard to predict, but giong-mcp suggests settings from what it measures.
 
-## 1.1 — gRPC
+## 1.1 — gRPC (done)
+
+Released as 1.1.0 on 2026-11-21. Shipped: giong-grpc, giong-proto and giong-grpc-build,
+health and reflection, interop with grpc-go, trailers and streamed request bodies, and
+`Client::preconnect` and `ping_idle_http2` from issue #154. The open items below move to a
+later 1.x.
 
 gRPC on `giong-http`'s HTTP/2 server and client, in a new crate, `giong-grpc`, on a
 protobuf of its own, and a simulation driver that tests every service deterministically.
@@ -517,21 +522,27 @@ protobuf of its own, and a simulation driver that tests every service determinis
 **Exit criteria:** the interoperability test cases pass against grpc-go as client and as
 server, and a benchmark compares unary and streaming calls with tonic.
 
-## 1.2 — macOS
+## 1.2 — macOS (done)
+
+Released as 1.2.0 on 2026-11-22. Shipped: the kqueue driver, what macOS does differently
+(`docs/design/portability.md`), keychain trust roots and the system's DNS servers, CI on
+Apple Silicon, and `ENOBUFS` handled by waiting. Shutdown signals use a handler and a
+pipe rather than `EVFILT_SIGNAL` (the portability document says why). The worker guard
+and overload protection move to a later 1.x.
 
 giong builds and runs on macOS, for developing and testing services on a Mac. Production
 stays on Linux. Two safeguards for code written in a hurry, on every system, ship with it.
 
-- [ ] A kqueue driver behind the same operations as io_uring and epoll: readiness like
+- [x] A kqueue driver behind the same operations as io_uring and epoll: readiness like
       epoll, file operations on the pool of blocking threads, `EVFILT_USER` for wake-ups
       from other threads and `EVFILT_SIGNAL` for shutdown signals.
-- [ ] What macOS does differently: workers share one listening socket where
+- [x] What macOS does differently: workers share one listening socket where
       `SO_REUSEPORT` does not spread connections, CPU pinning is skipped (macOS has no hard
       affinity), and `sendfile` and `fallocate` use their macOS counterparts.
-- [ ] Trust roots for `giong-tls` from the keychain, and DNS servers from the system
+- [x] Trust roots for `giong-tls` from the keychain, and DNS servers from the system
       configuration. Kernel TLS stays Linux only: `Ktls::Auto` keeps connections in the
       process.
-- [ ] CI on Apple Silicon: the test suite and the examples.
+- [x] CI on Apple Silicon: the test suite and the examples.
 - [ ] A worker guard: code that blocks a worker (a blocking call, a long loop) is reported
       while it happens, with where it was spawned and its stack, a coded error and the fix
       (`spawn_blocking`, or a yield in the loop).
@@ -543,7 +554,13 @@ stays on Linux. Two safeguards for code written in a hurry, on every system, shi
 **Exit criteria:** the test suite passes on macOS in CI, and the examples run there
 unchanged.
 
-## 1.3 — HTTP/3
+## 1.3 — HTTP/3 (done)
+
+Released as 1.3.0 on 2026-11-22. Shipped behind the `unstable-http3` and
+`unstable-udp-offload` features: giong-quic on quinn-proto's engine (the fallback this
+milestone planned for), GSO, GRO, ECN and the local address of a datagram, HTTP/3 and QPACK
+in the server and the client with `Alt-Svc`, and h3spec in CI. The native QUIC engine,
+automatic HTTPS, browsers in CI and the bare-metal benchmark move to a later 1.x.
 
 HTTP/3 (RFC 9114) over QUIC (RFC 9000) in `giong-http`'s server and client, for the same
 handlers.
@@ -574,12 +591,18 @@ handlers.
 **Exit criteria:** browsers load pages from a giong server over HTTP/3, the interop
 runner's core test cases pass, and the bare-metal benchmark is published with its method.
 
-## 1.4 — Windows
+## 1.4 — Windows (done)
+
+Released as 1.4.0. Shipped: the IOCP driver for the `giong` crate (tasks, timers, channels,
+TCP, UDP, files, DNS from the network adapters, Ctrl+C and the other console events), the
+workers of an address sharing one socket, and CI and soaks on Windows Server 2022 and 2025.
+The other crates on Windows, trust roots from the certificate store, processor groups,
+registered I/O and the published benchmark against Tokio move to later 1.x releases.
 
 giong builds and runs on Windows, for services that have to run there. Linux stays the
 platform it is tuned for.
 
-- [ ] An IOCP driver. I/O completion ports complete operations the way io_uring does, so
+- [x] An IOCP driver. I/O completion ports complete operations the way io_uring does, so
       buffers handed over and handed back fit as they are: `AcceptEx`, `ConnectEx`,
       `WSARecv`, `WSASend`, `TransmitFile` and overlapped file I/O, with `CancelIoEx` and
       each buffer kept until the kernel has let go of it. A zero-byte receive keeps idle

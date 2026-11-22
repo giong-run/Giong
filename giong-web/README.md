@@ -278,7 +278,7 @@ With middleware:
 
 - **1.3 times axum on small JSON answers, 1.8 times on the list of users, 1.9 to 2.3 times with middleware.** The routes, the parameters and serde cost giong-web about 5% against giong-http's bare handler on `/json`. giong-http's `/users` is faster because it writes its JSON by hand, without serde or the 200 small strings the handler builds; giong-web and axum run the same handler.
 - **`/compute` is the handler's time,** the same for both within noise (giong-web's range 3.66–4.01k, axum's 3.58–4.07k). Its p99 is higher on giong-web (22.9 against 18.5 ms), as it is on giong-http (24.2 ms). Our guess, not measured: a worker runs every ready request before it reads its sockets again, so when each costs 250 µs of CPU, some wait for a whole batch.
-- **Pipelined requests** (16 per write): axum stays at 18k, as in the [main benchmark](../README.md#throughput-at-50-connections); we have not looked into why. giong-http reads a pipeline and answers it as a batch.
+- **Pipelined requests** (16 per write): axum stays at 18k, as in the [main benchmark](../docs/BENCHMARKS.md#throughput-at-50-connections); we have not looked into why. giong-http reads a pipeline and answers it as a batch.
 - Resident memory after the run: 6.6 MB for giong-web, 5.2 MB for axum.
 
 HTTPS and a database behind the handlers are measured with the [example REST API](../examples/rest-api/README.md#performance). Not measured yet: several cores, and middleware one at a time. Results are in `bench/results/web/`.
