@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod explain;
 pub mod fix;
 pub mod help;
+pub mod mcp;
 pub mod new;
 pub mod test;
 pub mod version;
@@ -49,6 +50,7 @@ pub const COMMANDS: &[&Command] = &[
     &test::COMMAND,
     &explain::COMMAND,
     &clean::COMMAND,
+    &mcp::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];

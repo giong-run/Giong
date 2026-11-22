@@ -19,3 +19,12 @@
   giong's own checks of the source in one report: blocking calls in async code
   (`GIONG-E5006`), listeners bound to a host name (`GIONG-E5007`), `RefCell` borrows held
   across an `.await` (`GIONG-E5008`). Machine-applicable fixes come as edits.
+- **giong-cli**: `giong mcp` serves every command as a tool to coding agents over MCP on
+  standard input and output, each answering with the command's JSON document, plus
+  `dev_status` for a running `giong dev`.
+- **giong-cli**: every release attaches the `giong` command prebuilt for Linux (static,
+  x86_64 and aarch64), macOS (Apple silicon and Intel) and Windows (x86_64), each with its
+  SHA-256. `curl -fsSL https://giong.run/install.sh | sh` (or
+  `powershell -c "irm https://giong.run/install.ps1 | iex"` on Windows) installs it in
+  `~/.giong/bin` without root, checks the checksum, and builds it with `cargo install`
+  where no binary is published.
