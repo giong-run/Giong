@@ -626,6 +626,7 @@ impl Pool {
                 (new, self.expiry())
             }
         };
+        client.begin_lease();
         Ok(PooledClient {
             client: Some(client),
             expires,
@@ -976,6 +977,7 @@ impl DerefMut for PooledClient {
 impl Drop for PooledClient {
     fn drop(&mut self) {
         let client = self.client.take().expect("present until dropped");
+        client.end_lease();
         {
             let mut st = self.pool.inner.state.borrow_mut();
             st.taken -= 1;
