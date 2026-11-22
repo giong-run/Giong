@@ -171,6 +171,14 @@ pub mod mpsc {
         /// Receives the next value, or `None` once every sender is gone and
         /// the channel is empty.
         ///
+        /// A value that is ready at once costs the task one unit of its
+        /// budget (128 per turn), as socket operations do: after that `recv`
+        /// yields to the worker's other tasks first, so a channel kept full
+        /// cannot starve them. To drain what is queued without yielding, use
+        /// [`try_recv`](Self::try_recv). Do not poll it from another executor
+        /// inside a giong task: once the budget is spent, that executor would
+        /// poll it forever.
+        ///
         /// Cancel safe: if the future is dropped, no value is lost; the next
         /// call returns it.
         pub async fn recv(&mut self) -> Option<T> {

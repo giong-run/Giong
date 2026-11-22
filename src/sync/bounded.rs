@@ -210,6 +210,10 @@ impl<T> Sender<T> {
     /// Sends `value`, waiting while the channel is full. Fails, handing the
     /// value back, if the receiver is gone.
     ///
+    /// A send that finds room at once costs the task one unit of its budget,
+    /// as [`Receiver::recv`] does, and yields to the worker's other tasks
+    /// once the budget is spent; [`try_send`](Self::try_send) never yields.
+    ///
     /// Cancel safe: if the future is dropped, the value is dropped with it and
     /// nothing was sent; a slot it had been promised goes to the next sender.
     pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
@@ -331,6 +335,14 @@ impl<T> Drop for Sender<T> {
 impl<T> Receiver<T> {
     /// Receives the next value, or `None` once every sender is gone and the
     /// channel is empty.
+    ///
+    /// A value that is ready at once costs the task one unit of its budget
+    /// (128 per turn), as socket operations do: after that `recv` yields to
+    /// the worker's other tasks first, so a channel kept full cannot starve
+    /// them. To drain what is queued without yielding, use
+    /// [`try_recv`](Self::try_recv). Do not poll it from another executor
+    /// inside a giong task: once the budget is spent, that executor would
+    /// poll it forever.
     ///
     /// Cancel safe: if the future is dropped, no value is lost; the next call
     /// returns it.
