@@ -138,9 +138,12 @@ impl<S> Req<S> {
     ///   as `/` does (so `..\` is refused, a one-segment parameter holds no
     ///   `\`, and a value starting with `\` or `\\server` is refused); a `:`
     ///   (`C:\`, `C:x`, a file's `:stream`); a segment that is `.` or `..`
-    ///   once Windows drops the spaces at its end; and the name of a device
-    ///   (`CON`, `NUL`, `COM1`, `nul.txt`...), which Windows opens instead
-    ///   of a file.
+    ///   once Windows drops the spaces at its end; a name that ends in `.`
+    ///   or a space, which Windows drops, opening another file (`.env.` is
+    ///   `.env`); and the name of a device (`CON`, `NUL`, `COM1`, `COM¹`,
+    ///   `nul.txt`...), which Windows opens instead of a file. A value such
+    ///   as a time (`10:00`) or a URN is therefore refused on Windows: read
+    ///   it with [`param_raw`](Self::param_raw) and parse it yourself.
     ///
     /// So a catch-all can be joined to a directory as it is:
     ///
@@ -419,7 +422,7 @@ fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(),
     // value without them may still name a device (`con`, `nul`...).
     let marked = text
         .bytes()
-        .any(|b| matches!(b, b'.' | b'/' | 0) || (windows && matches!(b, b'\\' | b':')));
+        .any(|b| matches!(b, b'.' | b'/' | 0) || (windows && matches!(b, b'\\' | b':' | b' ')));
     if !marked && !(windows && names_a_device(text)) {
         return Ok(());
     }
@@ -447,12 +450,12 @@ fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(),
             "the value starts with `/`, which would make it an absolute path"
         });
     }
-    for segment in text.split(separator) {
+    for written in text.split(separator) {
         // Windows drops the spaces at the end of a name: `.. ` is `..`.
         let segment = if windows {
-            segment.trim_end_matches(' ')
+            written.trim_end_matches(' ')
         } else {
-            segment
+            written
         };
         match segment {
             "." => return Err("a `.` segment is not allowed"),
@@ -463,6 +466,14 @@ fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(),
                      allowed",
                 )
             }
+            // Windows drops the dots and spaces at the end of a name, so
+            // `secret.txt ` opens `secret.txt` and `a/...` opens `a`.
+            _ if windows && written.ends_with(['.', ' ']) => {
+                return Err(
+                    "a name that ends in `.` or a space is not allowed: Windows drops them and \
+                     opens another file",
+                )
+            }
             _ => {}
         }
     }
@@ -470,23 +481,27 @@ fn check_path_value_on(text: &str, catch_all: bool, windows: bool) -> Result<(),
 }
 
 /// Whether Windows opens `name` (one segment) as a device rather than a
-/// file: `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`,
-/// `CONIN$` and `CONOUT$`, in any case, with any extension (`nul.txt`) and
-/// spaces at the end.
+/// file: `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`
+/// (and with the superscript digits `¹`, `²`, `³`), `CONIN$` and
+/// `CONOUT$`, in any case, with any extension (`nul.txt`) and spaces at the
+/// end.
 fn names_a_device(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
-    let b = stem.as_bytes();
-    match b.len() {
-        3 => ["CON", "PRN", "AUX", "NUL"]
-            .iter()
-            .any(|d| stem.eq_ignore_ascii_case(d)),
-        4 => {
-            (b[..3].eq_ignore_ascii_case(b"COM") || b[..3].eq_ignore_ascii_case(b"LPT"))
-                && matches!(b[3], b'1'..=b'9')
-        }
-        6 | 7 => stem.eq_ignore_ascii_case("CONIN$") || stem.eq_ignore_ascii_case("CONOUT$"),
-        _ => false,
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+        .iter()
+        .any(|d| stem.eq_ignore_ascii_case(d))
+    {
+        return true;
     }
+    let Some((prefix, rest)) = stem.split_at_checked(3) else {
+        return false;
+    };
+    let mut digit = rest.chars();
+    (prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT"))
+        && matches!(
+            (digit.next(), digit.next()),
+            (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+        )
 }
 
 /// Parses a parameter value, with the parser's own words for the failure.
@@ -571,6 +586,19 @@ mod tests {
             ("Lpt9.log", false, "device"),
             ("conout$", false, "device"),
             ("aux ", false, "device"),
+            // Superscript digits name devices too.
+            ("COM\u{b9}", false, "device"),
+            ("lpt\u{b2}.txt", false, "device"),
+            ("a/COM\u{b3}", true, "device"),
+            // Windows drops a name's trailing dots and spaces, so these open
+            // another file (`a/.env`, `secret.txt`) or the directory itself.
+            ("a/.env.", true, "ends in"),
+            ("secret.txt ", false, "ends in"),
+            ("secret ", false, "ends in"),
+            ("a./b", true, "ends in"),
+            ("...", false, "ends in"),
+            ("a/...", true, "ends in"),
+            ("a/.../b", true, "ends in"),
         ] {
             let e = check_path_value_on(value, catch_all, true)
                 .expect_err(&format!("{value:?} must be refused on Windows"));
@@ -578,8 +606,9 @@ mod tests {
         }
         for value in [
             "a/b.txt",
-            "...",
-            "a/.../b",
+            ".env",
+            "a/.hidden/b",
+            "COM\u{b9}x",
             "console.log",
             "com10",
             "a.b/c d",
