@@ -56,6 +56,11 @@ For people and for AI agents alike, the one path:
 5. **Deploy anywhere Linux runs.** In Docker it works with no settings; allowing io_uring
    makes it faster ([Run in Docker](#run-in-docker)).
 
+Then read [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md): the shape of a service, state,
+timeouts, databases, deployment and tests, each rule with its reason. A coding agent gets the
+same as a skill: [skills/giong](skills/giong/SKILL.md), or download it from
+[giong.run/docs/agent-skill](https://giong.run/docs/agent-skill/).
+
 [AGENTS.md](AGENTS.md) and [giong.run/llms.txt](https://giong.run/llms.txt) tell a model
 the facts it gets wrong; the API reference is on [docs.rs](https://docs.rs/giong).
 

@@ -687,6 +687,110 @@ pre.code .t { color: var(--code-type); }
 .lost { padding-block: clamp(5rem, 14vw, 9rem); }
 .lost .wrap { display: grid; gap: 1.5rem; justify-items: start; }
 
+/* ---------- documentation pages ---------- */
+.docs-layout { display: grid; grid-template-columns: 13.5rem minmax(0, 1fr) 12rem; gap: clamp(1.75rem, 3.5vw, 3rem); padding-block: clamp(1.75rem, 3.5vw, 2.75rem) var(--band); align-items: start; }
+.side { position: sticky; top: calc(var(--hdr-h) + 1.25rem + env(safe-area-inset-top, 0px)); max-height: calc(100vh - var(--hdr-h) - 2.5rem); overflow-y: auto; scrollbar-width: thin; font-size: 0.875rem; }
+.side-menu > summary { display: none; }
+.side-links { display: grid; gap: 1.1rem; }
+.side-group { display: grid; gap: 0.05rem; }
+.side-group p { font: 500 0.6875rem/1.4 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); padding-bottom: 0.35rem; }
+.side-group a { text-decoration: none; color: var(--fg-2); padding: 0.3rem 0.6rem; border-radius: 6px; overflow-wrap: anywhere; }
+.side-group a:hover { color: var(--fg); background: var(--ink-2); }
+.side-group a[aria-current] { color: var(--fg); background: var(--ember-wash); box-shadow: inset 2px 0 0 var(--ember); font-weight: 600; }
+.doc-page { min-width: 0; max-width: 50rem; display: grid; gap: 2rem; }
+.doc-page > .doc { gap: 2.75rem; max-width: none; }
+.doc-head { display: grid; gap: 0.9rem; padding-bottom: 1.75rem; border-bottom: 1px solid var(--line); }
+.doc-head h1 { color: var(--fg); font-size: clamp(2rem, 4vw, 2.85rem); letter-spacing: -0.03em; line-height: 1.08; overflow-wrap: anywhere; }
+.doc-head .lede { font-size: 1.0625rem; max-width: 42em; }
+.doc-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1.25rem; }
+.doc-meta .crate-links { font-size: 0.875rem; color: var(--fg-3); }
+.doc-meta .crate-links a { color: var(--fg-2); }
+.doc-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.act { display: inline-flex; align-items: center; gap: 0.45rem; font: 500 0.8125rem/1 var(--body); color: var(--fg); text-decoration: none; cursor: pointer; background: var(--ink-2); border: 1px solid var(--line-2); border-radius: 999px; padding: 0.55rem 0.9rem; }
+.act svg { width: 1rem; height: 1rem; flex: none; color: var(--fg-3); }
+.act:hover { border-color: var(--ember); }
+.act:hover svg, .act.done svg { color: var(--ember-ink); }
+.act.done { border-color: var(--ember-ink); color: var(--ember-ink); }
+.md-sec { position: relative; display: grid; gap: 1rem; min-width: 0; scroll-margin-top: calc(var(--hdr-h) + 1rem); }
+.md-sec > h2:first-of-type, .md-sec > section > h2 { padding-right: 5.5rem; }
+.sec-copy { position: absolute; top: 0.35rem; right: 0; display: inline-flex; align-items: center; gap: 0.35rem; font: 500 0.75rem/1 var(--mono); color: var(--fg-3); cursor: pointer; background: transparent; border: 1px solid var(--line); border-radius: 999px; padding: 0.4rem 0.65rem; opacity: 0.75; transition: opacity 0.15s, border-color 0.15s; }
+.sec-copy svg { width: 0.9rem; height: 0.9rem; }
+.md-sec:hover .sec-copy, .sec-copy:focus-visible { opacity: 1; }
+.sec-copy:hover { color: var(--fg); border-color: var(--line-2); }
+.sec-copy.done { color: var(--ember-ink); border-color: var(--ember-ink); opacity: 1; }
+.doc-toc { font-size: 0.8125rem; }
+.doc-toc a { padding-block: 0.28rem; }
+.doc-group { display: grid; gap: 0.6rem; }
+.doc-group h3 { font: 500 0.75rem/1.4 var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); margin-top: 0.4rem; }
+.doc-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
+.doc-card { display: grid; gap: 0.3rem; align-content: start; padding: 0.85rem 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--ink-2); text-decoration: none; min-width: 0; }
+.doc-card:hover { border-color: var(--ember); }
+.doc-card b { font: 600 0.9063rem/1.3 var(--mono); overflow-wrap: anywhere; }
+.doc-card b::after { content: " →"; color: var(--fg-3); font-family: var(--body); }
+.doc-card span { font-size: 0.8438rem; line-height: 1.45; color: var(--fg-3); }
+
+/* Markdown made into a page: the READMEs and guides. */
+.doc-page { font-size: 1rem; line-height: 1.7; color: var(--fg-2); }
+.doc-page .md-intro, .doc-page .md-sec { display: grid; gap: 1rem; min-width: 0; }
+.doc-page > *, .doc-page .md-intro > *, .doc-page .md-sec > *, .doc-page .code-copy, .doc-page blockquote > * { min-width: 0; }
+.doc-page pre.code { max-width: 100%; overflow-x: auto; }
+.doc-page h2 { font-size: clamp(1.45rem, 2.4vw, 1.85rem); color: var(--fg); margin-top: 0.75rem; scroll-margin-top: calc(var(--hdr-h) + 1rem); }
+.doc-page h3 { font-size: 1.1875rem; color: var(--fg); margin-top: 0.85rem; scroll-margin-top: calc(var(--hdr-h) + 1rem); }
+.doc-page h4 { font-size: 1rem; color: var(--fg); margin-top: 0.5rem; }
+.doc-page p, .doc-page li { max-width: 46em; }
+.doc-page li { min-width: 0; }
+.doc-page a { color: var(--fg); text-decoration-color: var(--line-2); text-underline-offset: 0.18em; }
+.doc-page a:hover { text-decoration-color: var(--ember); }
+.doc-page strong { color: var(--fg); font-weight: 600; }
+.doc-page li > pre.code, .doc-page li > .code-copy { margin-block: 0.6rem; }
+.doc-page li > p { margin-top: 0.4rem; }
+.doc-page blockquote { border-left: 3px solid var(--ember); background: var(--ember-wash); padding: 0.85rem 1.1rem; border-radius: 0 var(--radius) var(--radius) 0; display: grid; gap: 0.6rem; }
+.doc-page pre.code { font-size: 0.8125rem; }
+.doc-page .code-copy pre.code { padding-right: 4.5rem; }
+.doc-page .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+.doc-page table { width: 100%; border-collapse: collapse; font-size: 0.875rem; line-height: 1.5; }
+.doc-page th, .doc-page td { text-align: left; vertical-align: top; padding: 0.55rem 0.8rem; border-top: 1px solid var(--line); }
+.doc-page thead th { border-top: 0; background: var(--ink-2); color: var(--fg); font-weight: 600; white-space: nowrap; }
+.doc-page td code { overflow-wrap: normal; white-space: nowrap; }
+.doc-page hr { border: 0; border-top: 1px solid var(--line); margin-block: 1rem; }
+.doc-page img { max-width: 100%; height: auto; }
+
+/* The agent skill. */
+.skill { display: grid; gap: 1.5rem; }
+.skill-cta { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.skill-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
+.skill-grid > div { display: grid; gap: 0.6rem; align-content: start; min-width: 0; padding: 1rem 1.1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--ink-2); }
+.skill-grid h3 { margin: 0; font-size: 1rem; }
+.skill-grid p { font-size: 0.9063rem; line-height: 1.55; }
+.skill-grid > div:nth-child(-n+2) { grid-column: 1 / -1; }
+.skill-grid pre.code { font-size: 0.75rem; white-space: pre; overflow-x: auto; }
+.hint { font-size: 0.8438rem; color: var(--fg-3); }
+
+@media (max-width: 1180px) {
+  .docs-layout { grid-template-columns: 13rem minmax(0, 1fr); }
+  .docs-layout > .doc-toc { display: none; }
+}
+@media (max-width: 860px) {
+  .docs-layout { grid-template-columns: minmax(0, 1fr); gap: 1.25rem; padding-top: 1rem; }
+  .side { position: static; max-height: none; overflow: visible; }
+  .side-menu { border: 1px solid var(--line); border-radius: var(--radius); background: var(--ink-2); }
+  .side-menu > summary { display: flex; justify-content: space-between; align-items: center; cursor: pointer; list-style: none; padding: 0.75rem 1rem; font-weight: 600; font-size: 0.9375rem; }
+  .side-menu > summary::-webkit-details-marker { display: none; }
+  .side-menu > summary::after { content: "+"; font: 500 1.1rem/1 var(--mono); color: var(--ember-ink); }
+  .side-menu[open] > summary::after { content: "−"; }
+  .side-menu .side-links { padding: 0.25rem 0.6rem 1rem; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 0.75rem; }
+  .side-group a { padding: 0.35rem 0.5rem; }
+}
+@media (max-width: 640px) {
+  .doc-cards, .skill-grid { grid-template-columns: minmax(0, 1fr); }
+  .side-menu .side-links { grid-template-columns: minmax(0, 1fr); }
+  .sec-copy span { display: none; }
+  .sec-copy { padding: 0.45rem; }
+  .md-sec > h2:first-of-type { padding-right: 2.5rem; }
+  .act { padding: 0.55rem 0.8rem; }
+  .doc-page pre.code { font-size: 0.75rem; }
+}
+
 /* ---------- narrower screens ---------- */
 @media (max-width: 1100px) {
   .charts-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }

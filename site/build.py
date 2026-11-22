@@ -25,6 +25,7 @@ import math
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -55,6 +56,8 @@ def read(rel):
 
 VERSION = release.workspace_version()
 TAG = "v" + VERSION
+# What the site says about platforms follows the released version (content.apply_version).
+C.apply_version(tuple(int(x) for x in VERSION.split("-")[0].split(".")[:2]))
 MINOR = ".".join(VERSION.split(".")[:2])
 # The documentation as released: what `cargo add` installs is what the tag
 # holds, while main may already describe the next version.
@@ -221,9 +224,9 @@ ERROR_COUNT = sum(len(g["rows"]) for g in ERRORS)
 
 # ================================================================ helpers
 def link(page, anchor=""):
-    """The address of one of the site's own pages."""
+    """The address of one of the site's own pages. Documentation pages are "docs/<slug>"."""
     if PREVIEW:
-        base = "index.html" if page == "home" else f"{page}.html"
+        base = "index.html" if page == "home" else f"{page.replace('/', '-')}.html"
     else:
         base = "/" if page == "home" else f"/{page}/"
     return base + (f"#{anchor}" if anchor else "")
@@ -233,7 +236,7 @@ def page_file(page):
     """Where a page is written: docs/index.html, so that /docs/ works on any static host."""
     if page == "home":
         return "index.html"
-    return f"{page}.html" if PREVIEW else f"{page}/index.html"
+    return f"{page.replace('/', '-')}.html" if PREVIEW else f"{page}/index.html"
 
 
 def asset(path):
@@ -345,10 +348,19 @@ ICONS = {
              'stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>'),
     "rss": ('<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3a16 16 0 0 1 16 16h-3A13 13 0 0 0 5 6Z'
             'm0 6a10 10 0 0 1 10 10h-3a7 7 0 0 0-7-7Zm1.5 6.5a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z"/></svg>'),
+    "copy": ('<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" '
+             'stroke-linejoin="round"><rect x="8.5" y="8.5" width="12" height="12" rx="2.2"/>'
+             '<path d="M15.5 8.5V5.7a2.2 2.2 0 0 0-2.2-2.2H5.7a2.2 2.2 0 0 0-2.2 2.2v7.6a2.2 2.2 0 0 0 2.2 2.2h2.8"/></svg>'),
+    "spark": ('<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" '
+              'stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/>'
+              '<path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z"/></svg>'),
+    "file": ('<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" '
+             'stroke-linejoin="round" stroke-linecap="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10'
+             'a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>'),
 }
 
 NAV = [("docs", "Docs"), ("crates", "Crates"), ("benchmarks", "Benchmarks"),
-       ("roadmap", "Roadmap"), ("releases", "Releases")]
+       ("roadmap", "Roadmap"), ("releases", "Releases"), ("docs/agent-skill", "Agent skill")]
 
 
 def head_block(eyebrow, h2, lede="", more=None):
@@ -435,8 +447,9 @@ def code_window(samples, ident="code"):
             f'<div class="panels">{panels}</div></div>')
 
 
-def crate_links(c):
-    links = [("docs.rs", f"https://docs.rs/{c['name']}"),
+def crate_links(c, guide=False):
+    links = [("guide", link(doc_page_name(c["name"])))] if guide and any(e[0] == c["name"] for e in DOCS) else []
+    links += [("docs.rs", f"https://docs.rs/{c['name']}"),
              ("crates.io", f"https://crates.io/crates/{c['name']}"),
              ("source", REPO if c["dir"] == "." else TREE + c["dir"])]
     return " · ".join(f'<a href="{u}">{label}</a>' for label, u in links)
@@ -446,7 +459,8 @@ def crate_links(c):
 def frame(page, title, desc, body, path=""):
     canonical = SITE + path
     current = ' aria-current="page"'
-    nav = "".join(f'<a href="{link(p)}"{current if p == page else ""}>{label}</a>' for p, label in NAV)
+    nav = "".join(f'<a href="{link(p)}"{current if p == page or (p == "docs" and page.startswith("docs/") and page not in dict(NAV)) else ""}>{label}</a>'
+                  for p, label in NAV if p != "docs/agent-skill" or SKILL_MD is not None)
     mark = (f'<picture><source media="(prefers-color-scheme: light)" srcset="{asset("assets/giong-mark-light.svg")}">'
             f'<img src="{asset("assets/giong-mark.svg")}" alt="" width="28" height="28"></picture>')
     release_url = link("releases", LATEST["id"]) if LATEST else link("releases")
@@ -477,7 +491,7 @@ def frame(page, title, desc, body, path=""):
     <div class="ftr-grid">
       <div class="ftr-brand">
         <a class="brand" href="{link("home")}" aria-label="giong, home">{mark_sm}<span>giong</span></a>
-        <p>A thread-per-core async runtime for Rust on Linux, built directly on io_uring.</p>
+        <p>A thread-per-core async runtime for Rust, built on io_uring and made for the code agents write.</p>
         <p class="ftr-social">
           <a class="icon-btn" href="{REPO}" aria-label="GitHub">{ICONS["github"]}</a>
           <a class="icon-btn" href="{X_URL}" aria-label="X">{ICONS["x"]}</a>
@@ -490,6 +504,7 @@ def frame(page, title, desc, body, path=""):
         <a href="{link("docs", "examples")}">Examples</a>
         <a href="{docs_rs}">API reference</a>
         <a href="{link("docs", "errors")}">Error codes</a>
+        {footer_docs()}
         <a href="{asset("llms.txt")}">llms.txt</a>
       </nav>
       <nav class="ftr-col" aria-label="Project">
@@ -548,7 +563,7 @@ def frame(page, title, desc, body, path=""):
 <link rel="stylesheet" href="{asset("styles.css")}">
 <script>(function(d){{d.classList.add("js");try{{var t=localStorage.getItem("giong-theme");if(t==="light"||t==="dark")d.setAttribute("data-theme",t)}}catch(e){{}}}})(document.documentElement)</script>
 </head>
-<body class="page-{page}">
+<body class="page-{page.replace('/', '-')}">
 <a class="skip" href="#main">Skip to content</a>
 {header}
 <main id="main">
@@ -565,11 +580,11 @@ def json_ld(page, title, desc, url):
     author = {"@type": "Person", "name": AUTHOR, "url": AUTHOR_URL}
     graph = [{
         "@type": "SoftwareSourceCode", "name": "giong", "description": C.HERO["lede"], "url": SITE,
-        "codeRepository": REPO, "programmingLanguage": "Rust", "runtimePlatform": "Linux 6.0+",
+        "codeRepository": REPO, "programmingLanguage": "Rust", "runtimePlatform": C.RUNTIME_PLATFORM,
         "version": VERSION, "author": author, "maintainer": author,
         "license": ["https://opensource.org/licenses/MIT", "https://www.apache.org/licenses/LICENSE-2.0"],
         "image": SITE + "assets/social-preview.png",
-        "keywords": "io_uring, async runtime, thread-per-core, Rust, Linux",
+        "keywords": "io_uring, async runtime, thread-per-core, Rust, Linux, AI agents",
     }] if page == "home" else [{"@type": "WebPage", "name": title, "description": desc, "url": url}]
     if page == "docs":
         graph.append({"@type": "FAQPage", "mainEntity": [
@@ -778,7 +793,266 @@ def docs_rs_link(name="giong"):
     return f"https://docs.rs/{name}"
 
 
+# ================================================================ documentation pages
+# One page per crate, made from its README, and the pages in content.py DOC_PAGES. All
+# are read from the release tag (released()), so the site documents what `cargo add`
+# installs, and a page appears once a release has its file. Every page also exists as
+# Markdown (docs/<slug>.md) for agents, and every section has a copy button.
+SKILL_MD = released("skills/giong/SKILL.md")
+
+
+def doc_entries():
+    """[(slug, title, path, src_dir, group, lede, crate)] for every page the release has."""
+    out = [("get-started", "Get started", None, None, "Start", "", None)]
+    for slug, title, path, group, lede in C.DOC_PAGES:
+        if group == "Start" and released(path) is not None:
+            out.append((slug, title, path, str(Path(path).parent), group, lede, None))
+    if SKILL_MD is not None:
+        out.append(("agent-skill", "Agent skill", "skills/giong/SKILL.md", "skills/giong", "Start",
+                    C.SKILL["lede"], None))
+    layer_group = {"runtime": "Runtime", "protocols": "Protocols", "clients": "Clients",
+                   "framework": "Framework", "tooling": "Tooling"}
+    for c in CRATES:
+        path = "README.md" if c["dir"] == "." else f"{c['dir']}/README.md"
+        if released(path) is None or released(release.manifest(c["dir"])) is None:
+            continue
+        out.append((c["name"], c["name"], path, c["dir"], layer_group.get(c["layer"], "Tooling"),
+                    c.get("lede", c["short"]), c))
+    for slug, title, path, group, lede in C.DOC_PAGES:
+        if group != "Start" and released(path) is not None:
+            out.append((slug, title, path, str(Path(path).parent), group, lede, None))
+    return out
+
+
+DOCS = doc_entries()
+DOC_BY_PATH = {e[2]: e for e in DOCS if e[2]}
+
+
+def doc_page_name(slug):
+    return "docs" if slug == "get-started" else f"docs/{slug}"
+
+
+def md_file(slug):
+    return f"docs/{'index' if slug == 'get-started' else slug}.md"
+
+
+def doc_link(url, src_dir):
+    """A link inside a documentation page: to another page of the site when the target
+    is one, else to the repository at the release tag."""
+    if re.match(r"^[a-z]+:", url) or url.startswith("#"):
+        return url
+    target, _, anchor = url.partition("#")
+    path = (Path(src_dir) / target).as_posix() if src_dir not in ("", ".", None) else target
+    path = re.sub(r"(^|/)\./", r"\1", path)
+    while "/../" in path or path.startswith("../"):
+        new = re.sub(r"[^/]+/\.\./", "", path, count=1)
+        if new == path:
+            break
+        path = new
+    if path.endswith("/") and path + "README.md" in DOC_BY_PATH:
+        path += "README.md"
+    if path in DOC_BY_PATH:
+        return link(doc_page_name(DOC_BY_PATH[path][0]), anchor)
+    return (REL_TREE if path.endswith("/") else REL_BLOB) + path + (f"#{anchor}" if anchor else "")
+
+
+def highlight(lang, text):
+    if lang.startswith("rust") or lang in ("rs",):
+        return rust(text)
+    if lang in ("sh", "bash", "shell", "console", "dockerfile", "toml", "yaml", "yml", ""):
+        return shell(text) if lang in ("sh", "bash", "shell", "console") else html.escape(text, quote=False)
+    return html.escape(text, quote=False)
+
+
+def clean_md(src):
+    """A repository document as a page shows it: no front matter (a skill's), no HTML
+    blocks (the README's logo and badges), no `# Title` (the page has its own)."""
+    src = src.replace("\r\n", "\n")
+    if src.startswith("---\n"):
+        end = src.find("\n---\n", 4)
+        if end > 0:
+            src = src[end + 5:]
+    out, fence, skip, titled = [], None, False, False
+    for line in src.split("\n"):
+        m = re.match(r"^\s*(```+|~~~+)", line)
+        if m:
+            fence = None if fence and m.group(1).startswith(fence) else (fence or m.group(1))
+        elif fence is None:
+            if skip:
+                skip = line.strip() != ""
+                continue
+            if re.match(r"^<[A-Za-z!]", line):
+                skip = True
+                continue
+            if not titled and re.match(r"^#\s", line):
+                titled = True
+                continue
+        out.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip() + "\n"
+
+
+def split_sections(src):
+    """(intro, [(heading, markdown)]) split at `## ` headings outside code fences."""
+    intro, secs, cur, fence = [], [], None, None
+    for line in src.split("\n"):
+        m = re.match(r"^\s*(```+|~~~+)", line)
+        if m:
+            fence = None if fence and m.group(1).startswith(fence) else (fence or m.group(1))
+        if fence is None and not m and line.startswith("## "):
+            cur = [line[3:].strip(), [line]]
+            secs.append(cur)
+            continue
+        (cur[1] if cur else intro).append(line)
+    return "\n".join(intro).strip(), [(h, "\n".join(b).strip()) for h, b in secs]
+
+
+def md_script(ident, text):
+    """Raw Markdown kept in the page for the copy buttons."""
+    safe = text.replace("</", "<\\/")
+    return f'<script type="text/markdown" id="{ident}">{safe}</script>'
+
+
+def doc_sidebar(current):
+    groups = {}
+    for e in DOCS:
+        groups.setdefault(e[4], []).append(e)
+    parts = []
+    for g in C.DOC_GROUPS:
+        items = groups.get(g)
+        if not items:
+            continue
+        links = "".join(
+            f'<a href="{link(doc_page_name(e[0]))}"{" aria-current=page" if e[0] == current else ""}>'
+            f'{html.escape(e[1])}</a>' for e in items)
+        parts.append(f'<div class="side-group"><p>{g}</p>{links}</div>')
+    inner = "".join(parts)
+    return (f'<nav class="side" aria-label="Documentation"><details class="side-menu" open>'
+            f'<summary>Documentation</summary><div class="side-links">{inner}</div></details></nav>')
+
+
+def doc_actions(slug, title, prompt_id, page_md_id):
+    md_href = asset(md_file(slug))
+    return (f'<div class="doc-actions">'
+            f'<button class="act" type="button" data-md="{page_md_id}" data-done="copied" '
+            f'title="Copy this page as Markdown, for a coding agent">{ICONS["copy"]}<span>Copy for agent</span></button>'
+            f'<button class="act" type="button" data-md="{prompt_id}" data-done="copied" '
+            f'title="Copy a ready prompt with the rules and this page">{ICONS["spark"]}<span>Copy prompt</span></button>'
+            f'<a class="act" href="{md_href}" title="This page as plain Markdown">{ICONS["file"]}<span>.md</span></a></div>')
+
+
+def prompt_for(title, url, body):
+    return C.PROMPT.format(version=VERSION, title=title, url=url) + body
+
+
+def doc_page(entry):
+    slug, title, path, src_dir, group, lede, crate = entry
+    raw = released(path)
+    src = clean_md(raw)
+    intro, secs = split_sections(src)
+    page_url = SITE + ("docs/" if slug == "get-started" else f"docs/{slug}/")
+    md_url = SITE + md_file(slug)
+    render = lambda text: md.render(text, link=lambda u: doc_link(u, src_dir), code=highlight)
+    sections, toc, scripts = [], [], []
+    for n, (heading, body) in enumerate(secs):
+        ident = md.slug(heading)
+        sid = f"md-{n}"
+        scripts.append(md_script(sid, f"<!-- giong {VERSION}, {page_url}#{ident} -->\n\n{body}"))
+        sections.append(
+            f'<section class="md-sec"><button class="sec-copy" type="button" data-md="{sid}" data-done="copied" '
+            f'title="Copy this section as Markdown">{ICONS["copy"]}<span>Copy</span></button>{render(body)}</section>')
+        toc.append(f'<a href="#{ident}">{md.inline(heading)}</a>')
+    page_md = f"# {title}\n\n> giong {VERSION} · {page_url} · source: {REL_BLOB}{path}\n\n" + absolute_links(src, src_dir)
+    scripts.append(md_script("md-page", page_md))
+    scripts.append(md_script("md-prompt", prompt_for(title, md_url, page_md)))
+    meta = ""
+    if crate:
+        meta = (f'<div class="doc-meta">{copy_cmd("add-" + crate["name"], "cargo add " + crate["name"])}'
+                f'<p class="crate-links">{crate_links(crate)}</p></div>')
+    lede_html = f'<p class="lede">{ilm(lede)}</p>' if lede else ""
+    intro_html = f'<div class="md-intro">{render(intro)}</div>' if intro else ""
+    toc_html = (f'<nav class="toc doc-toc" aria-label="On this page"><p>On this page</p>'
+                f'<div class="toc-links">{"".join(toc)}</div></nav>') if toc else ""
+    extra = skill_install() if slug == "agent-skill" else ""
+    body = f'''<div class="wrap docs-layout">
+  {doc_sidebar(slug)}
+  <article class="doc-page prose">
+    <header class="doc-head"><p class="eyebrow">{group}</p><h1>{html.escape(title)}</h1>{lede_html}
+      {doc_actions(slug, title, "md-prompt", "md-page")}{meta}</header>
+    {extra}{intro_html}{"".join(sections)}
+    <p class="src-note">giong {VERSION} · from <a href="{REL_BLOB}{path}">{path}</a> at {TAG}</p>
+    {"".join(scripts)}
+  </article>
+  {toc_html}
+</div>'''
+    desc = re.sub(r"[`*]", "", lede or title)[:300]
+    return frame(doc_page_name(slug), title, desc, body, f"docs/{slug}/"), page_md
+
+
+def skill_install():
+    s = C.SKILL
+    files = ["SKILL.md", "references/best-practices.md", "references/deployment.md",
+             "references/errors.md"] + [f"references/{e[0]}.md" for e in DOCS if e[6]]
+    tree = "giong/\n" + "\n".join(f"  {f}" for f in files)
+    return f'''<section class="skill">
+  <div class="skill-cta">
+    <a class="btn btn-main" href="{asset("skills/giong.zip")}" download>Download giong.zip</a>
+    <button class="btn" type="button" data-md="md-skill" data-done="copied">Copy SKILL.md</button>
+    <button class="btn" type="button" data-md="md-skill-prompt" data-done="copied">Copy prompt</button>
+  </div>
+  <div class="skill-grid">
+    <div><h3>Claude Code, for every project</h3>
+      <div class="code-copy"><pre class="code" tabindex="0"><code id="skill-user">{shell(s["claude_user"])}</code></pre>
+      <button class="copy" type="button" data-copy="skill-user" data-done="copied">copy</button></div></div>
+    <div><h3>Claude Code, for one repository</h3>
+      <div class="code-copy"><pre class="code" tabindex="0"><code id="skill-project">{shell(s["claude_project"])}</code></pre>
+      <button class="copy" type="button" data-copy="skill-project" data-done="copied">copy</button></div>
+      <p class="hint">Commit <code>.claude/skills/giong/</code> so every agent on the repository has it.</p></div>
+    <div><h3>Other agents</h3><p>{ilm(s["other"])}</p></div>
+    <div><h3>What is inside</h3><pre class="code sm"><code>{html.escape(tree)}</code></pre>
+      <p class="hint">Built from giong {VERSION}; download it again after an upgrade.</p></div>
+  </div>
+  {md_script("md-skill", SKILL_MD)}
+  {md_script("md-skill-prompt", s["prompt"])}
+  <h2 id="the-skill">The skill</h2>
+</section>'''
+
+
+def skill_zip():
+    """The skill as a zip: SKILL.md and the release's documentation as references."""
+    import io
+    import zipfile
+    files = {"giong/SKILL.md": SKILL_MD.replace("\n# giong\n", f"\n# giong\n\nBuilt from giong {VERSION} ({TAG}).\n", 1)}
+    for slug, path, d in [("best-practices", "docs/BEST_PRACTICES.md", "docs"),
+                          ("deployment", "docs/DEPLOYMENT.md", "docs"),
+                          ("errors", "docs/errors/README.md", "docs/errors")]:
+        text = released(path)
+        if text is not None:
+            files[f"giong/references/{slug}.md"] = absolute_links(text, d)
+    for e in DOCS:
+        if e[6]:
+            files[f"giong/references/{e[0]}.md"] = absolute_links(released(e[2]), e[3])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name in sorted(files):
+            info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            z.writestr(info, files[name].encode("utf-8"))
+    return buf.getvalue()
+
+
+def footer_docs():
+    names = {e[0]: e[1] for e in DOCS}
+    return "".join(f'<a href="{link(doc_page_name(s))}">{names[s]}</a>'
+                   for s in ("best-practices", "agent-skill") if s in names)
+
+
+def plain(text):
+    """Hand-written content.py text as Markdown with absolute links."""
+    return absolute_links(text, "")
+
+
 def docs():
+    """Get started: the first page of the documentation, with the index of every other."""
     reqs = "".join(f"<div><dt>{a}</dt><dd>{ilm(b)}</dd></div>" for a, b in C.REQS)
     http = next(s for s in C.CODE if s["crate"] == "giong-http")
     examples = "".join(
@@ -786,11 +1060,25 @@ def docs():
         f'<p>{ilm(desc)}</p><pre class="code sm"><code>{html.escape(cmd)}'
         + (f'\n<span class="c">{html.escape(then)}</span>' if then else "")
         + "</code></pre></article>" for name, desc, cmd, then in C.EXAMPLES)
-    folder, desc, cmd = C.SERVICE
-    examples += (f'<article class="ex"><h3><a href="{TREE}examples/{folder}">examples/{folder}/</a></h3>'
-                 f'<p>{ilm(desc)}</p><pre class="code sm"><code>{html.escape(cmd)}</code></pre></article>')
+    folder, sdesc, scmd = C.SERVICE
+    examples = (f'<article class="ex"><h3><a href="{TREE}examples/{folder}">examples/{folder}/</a></h3>'
+                f'<p>{ilm(sdesc)}</p><pre class="code sm"><code>{html.escape(scmd)}</code></pre></article>') + examples
+    groups = {}
+    for e in DOCS:
+        if e[0] != "get-started":
+            groups.setdefault(e[4], []).append(e)
+
+    def card_text(e):
+        text = (e[6] or {}).get("short") or e[5]
+        return ilm(text)
+
+    index = "".join(
+        f'<div class="doc-group"><h3>{g}</h3><div class="doc-cards">'
+        + "".join(f'<a class="doc-card" href="{link(doc_page_name(e[0]))}"><b>{html.escape(e[1])}</b>'
+                  f'<span>{card_text(e)}</span></a>' for e in groups[g])
+        + "</div></div>" for g in C.DOC_GROUPS if g in groups)
     api = "".join(
-        f'<a class="api" href="https://docs.rs/{c["name"]}"><b>{c["name"]}</b><span>{ilm(c["short"])}</span></a>'
+        f'<a class="api" href="https://docs.rs/{c["name"]}/{VERSION}"><b>{c["name"]}</b><span>{ilm(c["short"])}</span></a>'
         for c in CRATES)
     errs = "".join(
         f'<details class="errs"{" open" if n == 0 else ""}><summary><b>{html.escape(g["name"])}</b>'
@@ -802,70 +1090,103 @@ def docs():
     limits = "".join(f'<article class="limit"><h3>{h}</h3><p>{ilm(p)}</p></article>' for h, p in C.LIMITS)
     elsewhere = "".join(f"<p>{ilm(p)}</p>" for p in C.ELSEWHERE)
     faq = "".join(f'<details class="qa"><summary>{q}</summary><p>{ilm(a)}</p></details>' for q, a in C.FAQ)
-    toc = [("requirements", "Requirements"), ("install", "Install"), ("first", "A first server"),
-           ("how", "A request's path"), ("examples", "Examples"), ("api", "API reference"), ("errors", "Error codes"),
-           ("limits", "Limits"), ("faq", "Questions"), ("contribute", "Work on giong")]
-    toc_html = "".join(f'<a href="#{a}">{label}</a>' for a, label in toc)
-    body = f'''{page_head("docs", "Get started with giong",
-                          "Requirements, a first server, and where everything else is documented. The API reference for each crate is on docs.rs.")}
-<div class="wrap doc-grid">
-  <nav class="toc" aria-label="On this page"><p>On this page</p><div class="toc-links">{toc_html}</div></nav>
-  <div class="doc">
-    <section id="requirements"><h2>Requirements</h2><dl class="reqs">{reqs}</dl></section>
-    <section id="install"><h2>Install</h2>
-      <p>The crates are on crates.io. Add the runtime and the layers you need; <code>giong-http</code>
-      takes <code>--features tls</code> for HTTPS and <code>--features client</code> for its client.</p>
-      <div class="code-copy"><pre class="code" tabindex="0"><code id="install-cmd">cargo add giong
-cargo add giong-http          # or giong-web for routing, middleware and JSON</code></pre>
-      <button class="copy" type="button" data-copy="install-cmd" data-done="copied">copy</button></div>
-    </section>
-    <section id="first"><h2>A first server</h2>
-      <p>Put this in <code>src/main.rs</code>. Every worker binds its own <code>SO_REUSEPORT</code>
-      listener on the same port, and the kernel spreads connections across cores.</p>
-      <pre class="code" tabindex="0"><code>{rust(http["src"])}</code></pre>
-      <p>Then run it:</p>
-      <pre class="code" tabindex="0"><code>{shell(C.RUN_SH)}</code></pre>
-    </section>
-    <section id="how"><h2>What happens to a request</h2>
-      <p>One connection, from the kernel to your handler and back. Everything stays on the worker
-      that accepted it, and every trip into the kernel that a turn of its loop needs, for all of
-      its connections, goes in the same <code>io_uring_enter</code>.</p>
-      <figure class="fig ill-wrap">{art.request()}
-        <figcaption>The worker on core 2 owns this connection for its whole life. Its query to
-        PostgreSQL is one more entry in the same ring, pipelined with the other tasks' queries.</figcaption>
-      </figure>
-    </section>
-    <section id="examples"><h2>Examples</h2>
-      <p>Each one runs from a clone of the repository; the crates' READMEs have more.
-      <a href="{TREE}examples">examples/</a></p>
-      <div class="examples">{examples}</div>
-    </section>
-    <section id="api"><h2>API reference</h2>
-      <p>Every public item is documented, with an example where it helps.</p>
-      <div class="apis">{api}</div>
-    </section>
-    <section id="errors"><h2>Error codes</h2>
-      <p>Every error giong raises starts with a code, says what went wrong and how to fix it, and
-      links to its page. {ERROR_COUNT} codes so far. Match on <code>giong::error::code(&amp;err)</code>,
-      never on the message.</p>
-      <pre class="code sm"><code>{html.escape(C.AGENTS["error"].replace("{version}", VERSION))}</code></pre>
-      {errs}
-      <p class="src-note">{source_note(["docs/errors/README.md"])}</p>
-    </section>
-    <section id="limits"><h2>When giong is the wrong choice</h2>
-      <div class="limits">{limits}</div>
-      <div class="elsewhere"><h3>Pick something else when</h3>{elsewhere}</div>
-    </section>
-    <section id="faq"><h2>Questions people ask</h2><div class="faq">{faq}</div></section>
-    <section id="contribute"><h2>Work on giong</h2>
-      <p>Read <a href="{BLOB}CONTRIBUTING.md">CONTRIBUTING.md</a> first; coding agents have
-      <a href="{BLOB}AGENTS.md">AGENTS.md</a>. Open an issue before anything larger than a fix.</p>
-      <pre class="code" tabindex="0"><code>{shell(C.FROM_SOURCE_SH)}</code></pre>
-    </section>
-  </div>
-</div>'''
-    return frame("docs", "Get started", "How to install giong, write a first server, and find the "
-                 "API reference, the error codes and the limits.", body, "docs/")
+    install = "cargo add giong\ncargo add giong-web serde --features serde/derive   # routing, middleware, JSON"
+    err_sample = C.AGENTS["error"].replace("{version}", VERSION)
+    doc_list_md = "".join(
+        f"\n### {g}\n\n" + "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
+                                   for e in groups[g])
+        for g in C.DOC_GROUPS if g in groups)
+    run_sh, src_sh = C.RUN_SH, C.FROM_SOURCE_SH
+    # (id, heading, html, markdown): every section is shown and copied the same way.
+    secs = [
+        ("requirements", "Requirements", f'<dl class="reqs">{reqs}</dl>',
+         "".join(f"- **{a}**: {plain(b)}\n" for a, b in C.REQS)),
+        ("install", "Install",
+         "<p>The crates are on crates.io and share one version number. Add the runtime and the "
+         "layers you need; <code>giong-http</code> takes <code>--features tls</code> for HTTPS and "
+         "<code>--features client</code> for its client.</p>"
+         f'<div class="code-copy"><pre class="code" tabindex="0"><code id="install-cmd">{shell(install)}</code></pre>'
+         '<button class="copy" type="button" data-copy="install-cmd" data-done="copied">copy</button></div>',
+         f"The crates are on crates.io and share one version number, {VERSION}.\n\n```sh\n{install}\n```\n"),
+        ("first", "A first server",
+         "<p>Put this in <code>src/main.rs</code>. Every worker binds its own <code>SO_REUSEPORT</code> "
+         "listener on the same port, and the kernel spreads connections across cores.</p>"
+         f'<pre class="code" tabindex="0"><code>{rust(http["src"])}</code></pre>'
+         f'<p>Then run it:</p><pre class="code" tabindex="0"><code>{shell(run_sh)}</code></pre>',
+         f"`src/main.rs`:\n\n```rust\n{http['src'].strip()}\n```\n\n```sh\n{run_sh}\n```\n"),
+        ("how", "What happens to a request",
+         "<p>One connection, from the kernel to your handler and back. Everything stays on the worker "
+         "that accepted it, and every trip into the kernel that a turn of its loop needs, for all of "
+         "its connections, goes in the same <code>io_uring_enter</code>.</p>"
+         f'<figure class="fig ill-wrap">{art.request()}<figcaption>The worker on core 2 owns this '
+         "connection for its whole life. Its query to PostgreSQL is one more entry in the same ring, "
+         "pipelined with the other tasks' queries.</figcaption></figure>",
+         "One connection stays on the worker that accepted it for its whole life. Every trip into "
+         "the kernel that a turn of the worker's loop needs, for all of its connections, goes in the "
+         "same `io_uring_enter`; a database query is one more entry in that ring.\n"),
+        ("browse", "The documentation",
+         f"<p>A page for every crate, made from its README at {TAG}, and the guides. Each page has "
+         "<b>Copy for agent</b> (the page as Markdown), <b>Copy prompt</b> (the page with the rules "
+         "an agent needs) and a <code>.md</code> link; each section has its own copy button.</p>"
+         + index,
+         f"Every page is also Markdown, for agents:\n{doc_list_md}"),
+        ("examples", "Examples",
+         f'<p>Each one runs from a clone of the repository. <a href="{TREE}examples">examples/</a></p>'
+         f'<div class="examples">{examples}</div>',
+         f"- [examples/{folder}]({REL_TREE}examples/{folder}): {plain(sdesc)} `{scmd}`\n"
+         + "".join(f"- [examples/{n}.rs]({REL_BLOB}examples/{n}.rs): {plain(d)} `{c}`\n"
+                   for n, d, c, _ in C.EXAMPLES)),
+        ("api", "API reference",
+         f'<p>Every public item is documented on docs.rs, with an example where it helps.</p><div class="apis">{api}</div>',
+         "".join(f"- [{c['name']}](https://docs.rs/{c['name']}/{VERSION}): {plain(c['short'])}\n" for c in CRATES)),
+        ("errors", "Error codes",
+         "<p>Every error giong raises starts with a code, says what went wrong and how to fix it, and "
+         f"links to its page. {ERROR_COUNT} codes so far. Match on <code>giong::error::code(&amp;err)</code>, "
+         f'never on the message.</p><pre class="code sm"><code>{html.escape(err_sample)}</code></pre>{errs}'
+         f'<p class="src-note">{source_note(["docs/errors/README.md"])}</p>',
+         "Every error giong raises starts with a code, says what went wrong and how to fix it, and links "
+         f"to its page. Match on `giong::error::code(&err)`, never on the message.\n\n```text\n{err_sample}\n```\n\n"
+         f"All {ERROR_COUNT} codes: {SITE}docs/errors.md\n"),
+        ("limits", "When giong is the wrong choice",
+         f'<div class="limits">{limits}</div><div class="elsewhere"><h3>Pick something else when</h3>{elsewhere}</div>',
+         "".join(f"- **{h}**: {plain(p)}\n" for h, p in C.LIMITS) + "\n"
+         + "".join(f"- {plain(p)}\n" for p in C.ELSEWHERE)),
+        ("faq", "Questions people ask", f'<div class="faq">{faq}</div>',
+         "".join(f"**{q}**\n\n{plain(a)}\n\n" for q, a in C.FAQ)),
+        ("contribute", "Work on giong",
+         f'<p>Read <a href="{BLOB}CONTRIBUTING.md">CONTRIBUTING.md</a> first; coding agents have '
+         f'<a href="{BLOB}AGENTS.md">AGENTS.md</a>. Open an issue before anything larger than a fix.</p>'
+         f'<pre class="code" tabindex="0"><code>{shell(src_sh)}</code></pre>',
+         f"Read {BLOB}CONTRIBUTING.md first; coding agents have {BLOB}AGENTS.md.\n\n```sh\n{src_sh}\n```\n"),
+    ]
+    page_url = SITE + "docs/"
+    lede = ("Requirements, a first server, and every page of the documentation: a page for each crate, "
+            "the best practices, the agent skill. The API reference for each crate is on docs.rs.")
+    sections, scripts, page_parts = [], [], []
+    for n, (ident, heading, inner, smd) in enumerate(secs):
+        sid = f"md-{n}"
+        text = f"## {heading}\n\n{smd.strip()}\n"
+        page_parts.append(text)
+        scripts.append(md_script(sid, f"<!-- giong {VERSION}, {page_url}#{ident} -->\n\n{text}"))
+        sections.append(
+            f'<section class="md-sec" id="{ident}"><button class="sec-copy" type="button" data-md="{sid}" '
+            f'data-done="copied" title="Copy this section as Markdown">{ICONS["copy"]}<span>Copy</span></button>'
+            f'<h2>{heading}</h2>{inner}</section>')
+    page_md = (f"# Get started with giong\n\n> giong {VERSION} · {page_url}\n\n{lede}\n\n"
+               + "\n".join(page_parts))
+    scripts.append(md_script("md-page", page_md))
+    scripts.append(md_script("md-prompt", prompt_for("giong", SITE + md_file("get-started"), page_md)))
+    toc_html = "".join(f'<a href="#{i}">{h}</a>' for i, h, _, _ in secs)
+    body = (f'<div class="wrap docs-layout">{doc_sidebar("get-started")}'
+            f'<article class="doc-page"><header class="doc-head"><p class="eyebrow">docs · {TAG}</p>'
+            f'<h1>Get started with giong</h1><p class="lede">{ilm(lede)}</p>'
+            f'{doc_actions("get-started", "giong", "md-prompt", "md-page")}</header>'
+            f'<div class="doc">{"".join(sections)}</div>{"".join(scripts)}</article>'
+            f'<nav class="toc doc-toc" aria-label="On this page"><p>On this page</p>'
+            f'<div class="toc-links">{toc_html}</div></nav></div>')
+    return (frame("docs", "Get started", "How to install giong, write a first server, and find the "
+                  "documentation of every crate, the best practices and the agent skill.", body, "docs/"),
+            page_md)
 
 
 def crates():
@@ -880,7 +1201,7 @@ def crates():
         sections.append(
             f'<article class="crate" id="{c["name"]}"><div class="crate-side"><h2>{c["name"]}</h2>'
             f'<p class="crate-layer">{dict(C.LAYERS).get(c["layer"], "More")}</p>'
-            f'<p class="crate-links">{crate_links(c)}</p>'
+            f'<p class="crate-links">{crate_links(c, guide=True)}</p>'
             f'{copy_cmd("add-" + c["name"], "cargo add " + c["name"])}</div>'
             f'<div class="crate-main"><p class="crate-lede">{ilm(c["lede"])}</p>'
             + (f'<ul>{items}</ul>' if items else "")
@@ -902,6 +1223,8 @@ def crates():
 
 
 def benchmarks():
+    tables = (f'<a href="{link("docs/benchmark-tables")}">benchmark tables</a>'
+                    if any(e[0] == "benchmark-tables" for e in DOCS) else f'<a href="{REPO}#benchmarks">README</a>')
     charts = "".join(chart(c) for c in C.CHARTS)
     caveats = "".join(f"<li>{ilm(c)}</li>" for c in C.CAVEATS)
     cmp_head = "".join(f'<th scope="col"{" class=is-giong" if n == 1 else ""}>{h}</th>'
@@ -913,7 +1236,7 @@ def benchmarks():
     scripts = sorted({s for c in C.CHARTS for s in c["src"]} | {"bench/web.sh", "bench/workers.sh"})
     runs = "".join(f'<a href="{BLOB}{s}"><code>{s}</code></a>' for s in scripts)
     body = f'''{page_head("benchmarks", "Benchmarks", C.BENCH_METHOD,
-                          f'Full tables and raw output: <a href="{REPO}#benchmarks">README</a> · <a href="{TREE}bench/results">bench/results/</a>')}
+                          f'Full tables and raw output: {tables} · <a href="{TREE}bench/results">bench/results/</a>')}
 <section class="band band-tight"><div class="wrap">
   <div class="bench-intro">
     <div class="head-text">
@@ -1138,7 +1461,8 @@ PAGES = ["home", "docs", "crates", "benchmarks", "roadmap", "releases"]
 
 
 def sitemap():
-    urls = "".join(f"  <url><loc>{SITE}{'' if p == 'home' else p + '/'}</loc></url>\n" for p in PAGES)
+    pages = PAGES + [doc_page_name(e[0]) for e in DOCS if e[0] != "get-started"]
+    urls = "".join(f"  <url><loc>{SITE}{'' if p == 'home' else p + '/'}</loc></url>\n" for p in pages)
     return ('<?xml version="1.0" encoding="UTF-8"?>\n'
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + urls + '</urlset>\n')
 
@@ -1159,8 +1483,6 @@ def llms():
         return m.group(1) if m else ""
     api = "".join(f"- [{name} API](https://docs.rs/{name}/{VERSION}): {description(d)}\n"
                   for name, d in crates)
-    readmes = "".join(f"- [{name} README]({REL_BLOB}{'' if d == '.' else d + '/'}README.md)\n"
-                      for name, d in crates if d != ".")
     examples = "".join(f"- [examples/{name}.rs]({REL_BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
                        for name, desc, _, _ in C.EXAMPLES if released(f"examples/{name}.rs") is not None)
     folder, desc, _ = C.SERVICE
@@ -1179,21 +1501,43 @@ def llms():
              "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
              "  connection from `pool.get().await?`; it comes back with its session reset.\n"
              ) if "giong-postgres" in names else ""
+    have = {e[0] for e in DOCS}
+    platforms = C.PLATFORM_LINE + (
+        " On Linux giong runs on epoll by itself where io_uring is blocked (Docker's default "
+        "seccomp profile, gVisor) or the kernel is older." if C.PLATFORM_LINE.startswith("Linux first") else
+        " It runs on epoll where io_uring is blocked (Docker's default seccomp profile, gVisor) or "
+        "the kernel is older. It does not build on macOS or Windows yet.")
+    platforms = textwrap.fill(platforms, 88, subsequent_indent="  ")
+    more_crates = ""
+    if "giong-grpc" in names:
+        more_crates += " gRPC: `giong-grpc` (code from `giong-grpc-build`, no `protoc`), not tonic; Protocol Buffers: `giong-proto`, not prost;"
+    if "giong-quic" in names:
+        more_crates += " HTTP/3: `giong-http` feature `unstable-http3` (Rust 1.85, may change), not quinn or h3;"
+    bench_ref = (f"{SITE}docs/benchmark-tables.md" if "benchmark-tables" in have
+                 else "the README's Benchmarks section")
+    guides = ""
+    if "best-practices" in have:
+        guides += f"- [Best practices]({SITE}docs/best-practices.md): how to build, deploy and test a service on giong\n"
+    if "agent-skill" in have:
+        guides += (f"- [Agent skill]({SITE}skills/giong.zip): a skill for coding agents (SKILL.md and these "
+                   f"docs as references); [SKILL.md]({SITE}skills/giong/SKILL.md)\n")
+    pages = "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
+                    for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors"))
+    extra_protocols = ", HTTP/3" if "giong-quic" in names else ""
+    grpc = ", gRPC" if "giong-grpc" in names else ""
     return f"""# giong
 
-> An async runtime for Rust services on Linux, built for code that AI agents write: a
-> strict API meant to stay on major version 1 for many years, errors with a stable code,
-> the cause and the fix, and its own crates for a whole service (HTTP, TLS, PostgreSQL,
-> MySQL, Redis, DNS) with no Tokio underneath. Thread per core on io_uring: every worker
-> owns its ring, tasks and buffers; tasks never move between threads, so futures need not
-> be `Send`. Version {VERSION}; every link below is to the documentation of that release,
-> which is what `cargo add` installs.
+> An async runtime for Rust services, built for code that AI agents write: a strict API
+> meant to stay on major version 1 for many years, errors with a stable code, the cause
+> and the fix, and its own crates for a whole service (HTTP{extra_protocols}, TLS{grpc},
+> PostgreSQL, MySQL, Redis, DNS) with no Tokio underneath. Thread per core on io_uring:
+> every worker owns its ring, tasks and buffers; tasks never move between threads, so
+> futures need not be `Send`. Version {VERSION}; every link below is to the documentation
+> of that release, which is what `cargo add` installs.
 
 Facts that are easy to get wrong:
 
-- Linux only: io_uring on 6.0 or newer, and an epoll driver where io_uring is blocked
-  (Docker's default seccomp profile, gVisor) or the kernel is older. It does not build on
-  macOS or Windows yet.
+- {platforms}
 - Buffers are passed by value and handed back, because the kernel uses them after the call:
   `stream.write_all(buf).await` returns `(io::Result<()>, buf)`.
 - `recv` is cancel safe: a `timeout` around it loses no data. A dropped `write_all` may
@@ -1219,11 +1563,11 @@ Facts that are easy to get wrong:
   hyper or axum; routing, JSON and middleware: `giong-web`, not axum; HTTP client:
   `giong-http` with feature `client`, not reqwest; TLS: `giong-tls`; PostgreSQL:
   `giong-postgres`, not sqlx or tokio-postgres; MySQL: `giong-mysql`; Redis: `giong-redis`,
-  not redis-rs; files: `giong::fs`; names: `giong::net::lookup_host`; timers: `giong::time`.
+  not redis-rs;{more_crates} files: `giong::fs`; names: `giong::net::lookup_host`; timers: `giong::time`.
   Measured against those Tokio crates on Tokio, one core each, they serve 1.2 to 4.7 times
   the requests, statements or commands, and file reads at an offset 5.5 to 8 times; over one
   PostgreSQL connection shared by every task giong-postgres is behind tokio-postgres,
-  so use a `Pool` (the README's Benchmarks section has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
+  so use a `Pool` ({bench_ref} has each table and the exceptions). Next, crates that need no runtime (serde, rustls, Tokio's `sync`) work as
   they are. Only for a protocol giong has no crate for (WebSocket, for one), a crate generic
   over a Tokio or futures-io stream (tokio-tungstenite, h2, tokio-rustls, hyper's `conn`)
   runs through `giong_compat::Compat::new(stream)`, which adds a copy per byte written and
@@ -1241,12 +1585,10 @@ Facts that are easy to get wrong:
 
 ## Docs
 
-{api}- [Get started]({SITE}docs/): requirements, a first server, examples, limits
-- [README]({REL_BLOB}README.md): design, benchmarks with their method, limitations
-{readmes}- [Error codes]({REL_BLOB}docs/errors/README.md): what each `GIONG-E` code means and how to fix it
-- [Deployment]({REL_BLOB}docs/DEPLOYMENT.md): io_uring in containers, limits, kernels
+{api}- [Get started]({SITE}docs/index.md): requirements, a first server, examples, limits
+{guides}{pages}- [Error codes]({SITE}docs/errors.md): what each `GIONG-E` code means and how to fix it
 - [CHANGELOG.md]({REL_BLOB}CHANGELOG.md): what changed in each release
-- [Everything above in one file]({SITE}llms-full.txt): the READMEs and error pages of {TAG}
+- [Everything above in one file]({SITE}llms-full.txt): the READMEs, best practices and error pages of {TAG}
 
 ## Examples
 
@@ -1282,6 +1624,7 @@ def llms_full():
     and every error page of the release, in one file, for a model that reads it whole."""
     docs = [("README.md", ".")]
     docs += [(f"{d}/README.md", d) for _, d in released_crates() if d != "."]
+    docs.insert(1, ("docs/BEST_PRACTICES.md", "docs"))
     docs += [(f"examples/{C.SERVICE[0]}/README.md", f"examples/{C.SERVICE[0]}")]
     docs += [("docs/DEPLOYMENT.md", "docs"), ("docs/errors/README.md", "docs/errors")]
     index = released("docs/errors/README.md") or ""
@@ -1289,7 +1632,7 @@ def llms_full():
              for page in dict.fromkeys(re.findall(r"\]\((E\d{4}\.md)\)", index))]
     parts = [f"""# giong {VERSION}: the documentation in one file
 
-> The README of every crate and of the example service, the deployment notes and every
+> The README of every crate and of the example service, the best practices, the deployment notes and every
 > error code page of giong {VERSION}, as released in {TAG}. Links point at the same
 > release. The short index is {SITE}llms.txt.
 """]
@@ -1303,7 +1646,8 @@ def llms_full():
 
 def check_links(out, files):
     """Every link between the site's own pages, and every anchor in one, must exist."""
-    ids = {name: set(re.findall(r'\sid="([^"]+)"', text)) for name, text in files.items()}
+    ids = {name: set(re.findall(r'\sid="([^"]+)"', text)) for name, text in files.items()
+           if isinstance(text, str)}
     problems = []
     for name, text in files.items():
         if not name.endswith(".html"):
@@ -1330,9 +1674,10 @@ def check_links(out, files):
 
 def build(out):
     out.mkdir(parents=True, exist_ok=True)
+    docs_html, docs_md = docs()
     files = {
         page_file("home"): home(),
-        page_file("docs"): docs(),
+        page_file("docs"): docs_html,
         page_file("crates"): crates(),
         page_file("benchmarks"): benchmarks(),
         page_file("roadmap"): roadmap(),
@@ -1342,9 +1687,22 @@ def build(out):
         "robots.txt": f"User-agent: *\nAllow: /\nSitemap: {SITE}sitemap.xml\n",
         "llms.txt": llms(),
         "llms-full.txt": llms_full(),
+        md_file("get-started"): docs_md,
     }
+    # A page per crate and guide, each also as Markdown for agents.
+    for e in DOCS:
+        if e[0] != "get-started":
+            page_html, page_md = doc_page(e)
+            files[page_file(doc_page_name(e[0]))] = page_html
+            files[md_file(e[0])] = page_md
+    if SKILL_MD is not None:
+        files["skills/giong/SKILL.md"] = SKILL_MD
+        files["skills/giong.zip"] = skill_zip()
     for name, text in files.items():
         (out / name).parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(text, bytes):
+            (out / name).write_bytes(text)
+            continue
         with open(out / name, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
     missing = [n for n in CRATE_DIRS if n not in C.CRATES]

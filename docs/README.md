@@ -7,6 +7,7 @@ from the root one. The API reference is on [docs.rs](https://docs.rs/giong).
 
 | Page | For |
 |---|---|
+| [BEST_PRACTICES.md](BEST_PRACTICES.md) | How to build a service on giong: the shape of a service, state, blocking, timeouts, buffers, errors, databases, HTTP clients, observing, deploying, testing, upgrading, and a checklist before you finish. |
 | [BENCHMARKS.md](BENCHMARKS.md) | Every benchmark with its method, machine and raw output: throughput, latency, memory, bare metal, HTTPS, databases, gRPC, QUIC, the benchmark lab, and what has not been measured. |
 | [STABILITY.md](STABILITY.md) | What the 1.x promise covers: the API with its documented behaviour (cancel safety included), error codes, environment variables, log format; what it leaves out; the MSRV and kernel rules. |
 | [errors/](errors/README.md) | Every `GIONG-Exxxx` code: what went wrong and how to fix it. An error message names its page. |
@@ -22,6 +23,8 @@ Elsewhere in the repository:
 - [ROADMAP.md](../ROADMAP.md): the goal, the agent-first rules, the milestones and the
   non-goals.
 - [CHANGELOG.md](../CHANGELOG.md): what changed in each release.
+- [skills/giong](../skills/giong/SKILL.md): the giong skill for coding agents that write
+  services on giong; giong.run serves it as a zip with every crate's README.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) and [AGENTS.md](../AGENTS.md): building, testing
   and changing giong, for people and for AI coding agents.
 - [bench/](../bench/): the benchmark programs and scripts; recorded output in
