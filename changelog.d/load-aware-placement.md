@@ -15,5 +15,6 @@
   rounds). Short connections sent back to back next to a hot one see a p50 2 µs higher (73
   against 71 µs, 3%) for the same p99. Nothing is added to the workers' loops: the accepting
   listener reads each worker thread's CPU time from the kernel, less the time it spent
-  spinning before a sleep (now counted), at most every 5 ms. No connection ever moves once
+  spinning before a sleep (now counted), at most every 5 ms; on macOS and Windows counts
+  decide, as before. No connection ever moves once
   it is served ([#180](https://github.com/giong-run/Giong/pull/180)).

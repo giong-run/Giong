@@ -115,6 +115,7 @@ impl Counters {
             DriverKind::IoUring => 1,
             DriverKind::Epoll => 2,
             DriverKind::Kqueue => 3,
+            DriverKind::Iocp => 4,
         };
         self.driver.store(code, Ordering::Relaxed);
     }
@@ -124,6 +125,7 @@ impl Counters {
             1 => Some(DriverKind::IoUring),
             2 => Some(DriverKind::Epoll),
             3 => Some(DriverKind::Kqueue),
+            4 => Some(DriverKind::Iocp),
             _ => None,
         }
     }
@@ -205,6 +207,7 @@ impl Counters {
 
     /// Nanoseconds spent busy-polling for work so far: CPU time the worker
     /// used without doing any work.
+    #[cfg(all(target_os = "linux", not(miri)))]
     pub(crate) fn spin_ns(&self) -> u64 {
         self.spin_ns.load(Ordering::Relaxed)
     }

@@ -26,8 +26,9 @@
 //! task polls take clearly longer than the accepting worker's ([`SLOWER`]):
 //! a new connection there waits behind long-running work at every turn,
 //! and its counts mislead (it is the busy worker the idle connections were
-//! sent away from). Where a worker's CPU time cannot be read (macOS, Miri,
-//! the simulation), every worker looks idle and counts decide, as before.
+//! sent away from). Where a worker's CPU time is not read (macOS, Windows,
+//! Miri, the simulation), every worker looks idle and counts decide, as
+//! before.
 
 use std::collections::VecDeque;
 use std::io;
@@ -38,7 +39,6 @@ use std::task::{Context, Poll, Waker};
 
 use socket2::Socket;
 
-use super::ListenSocket;
 use crate::observe::clock_ns;
 use crate::runtime::{self, lock, RuntimeShared};
 
@@ -332,7 +332,7 @@ impl Member {
     pub(crate) fn poll_accept(
         &self,
         cx: &mut Context<'_>,
-        listener: &ListenSocket,
+        mut next: impl FnMut(&mut Context<'_>) -> Poll<io::Result<Socket>>,
     ) -> Poll<io::Result<Socket>> {
         let group = &*self.group;
         {
@@ -347,7 +347,7 @@ impl Member {
             }
         }
         loop {
-            let sock = match listener.poll_accept(cx) {
+            let sock = match next(cx) {
                 Poll::Ready(Ok(sock)) => sock,
                 other => return other,
             };
