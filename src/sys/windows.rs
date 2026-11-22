@@ -148,22 +148,47 @@ pub(crate) const FILE_FLAG_OVERLAPPED: u32 =
     windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
 /// An event of the calling thread for the reads and writes below to wait
-/// on, made at the thread's first use and kept for its lifetime.
+/// on, made at the thread's first use and closed when the thread ends (the
+/// blocking pool's threads end after a while without work).
 fn thread_event() -> io::Result<HANDLE> {
-    thread_local! {
-        static EVENT: std::cell::Cell<HANDLE> = const { std::cell::Cell::new(std::ptr::null_mut()) };
-    }
     EVENT.with(|event| {
-        if event.get().is_null() {
+        if event.0.get().is_null() {
             // SAFETY: creates an unnamed manual-reset event, not signalled.
             let made = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
             if made.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            event.set(made);
+            event.0.set(made);
         }
-        Ok(event.get())
+        Ok(event.0.get())
     })
+}
+
+thread_local! {
+    static EVENT: ThreadEvent = const { ThreadEvent(std::cell::Cell::new(std::ptr::null_mut())) };
+}
+
+/// The event of [`thread_event`], closed with its thread.
+struct ThreadEvent(std::cell::Cell<HANDLE>);
+
+impl Drop for ThreadEvent {
+    fn drop(&mut self) {
+        let event = self.0.get();
+        if !event.is_null() {
+            // SAFETY: the event this thread made, which nothing waits on any
+            // more: only this thread's transfers used it.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(event) };
+            #[cfg(test)]
+            closed_events().lock().unwrap().push(event as usize);
+        }
+    }
+}
+
+/// The events closed by ending threads, for the test below.
+#[cfg(test)]
+fn closed_events() -> &'static std::sync::Mutex<Vec<usize>> {
+    static CLOSED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    &CLOSED
 }
 
 /// Runs a `ReadFile` or `WriteFile` at `offset` to its end on the calling
@@ -984,4 +1009,18 @@ pub(crate) fn dns_config() -> std::io::Result<(Vec<std::net::IpAddr>, Vec<String
 pub(crate) fn hosts_path() -> std::path::PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     std::path::Path::new(&root).join("System32\\drivers\\etc\\hosts")
+}
+
+#[cfg(test)]
+mod tests {
+    /// A thread's event for blocking transfers is closed when the thread
+    /// ends: the blocking pool starts and ends threads all the time, and an
+    /// event left behind by each was one handle more for good.
+    #[test]
+    fn a_threads_transfer_event_is_closed_when_it_ends() {
+        let event = std::thread::spawn(|| super::thread_event().unwrap() as usize)
+            .join()
+            .unwrap();
+        assert!(super::closed_events().lock().unwrap().contains(&event));
+    }
 }
