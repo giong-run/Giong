@@ -7,9 +7,18 @@ use giong::error::{self, Code};
 use giong::signal::{self, SignalKind};
 use giong::time::{sleep, timeout};
 
+/// Sends `signal` to a short-lived thread of its own. A signal sent to the
+/// whole process may land on a worker waiting in `kevent` or `io_uring_enter`,
+/// and ThreadSanitizer holds it back until that thread next calls a function
+/// it intercepts, which a waiting worker never does. `raise` and the thread's
+/// exit are intercepted, so the handler runs before `join` returns.
 fn raise(signal: i32) {
-    // SAFETY: sends a signal to this process, which has a handler for it.
-    assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+    std::thread::spawn(move || {
+        // SAFETY: sends a signal to this thread; the process has a handler.
+        assert_eq!(unsafe { libc::raise(signal) }, 0);
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
