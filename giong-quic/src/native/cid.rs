@@ -38,6 +38,17 @@ pub fn worker_of(dcid: &[u8]) -> Option<u16> {
     Some(u16::from_be_bytes([dcid[1], dcid[2]]))
 }
 
+/// The destination connection ID of a packet with a long header (RFC 9000,
+/// section 17.2): after the first byte and the version, its length and the
+/// ID.
+pub fn long_dcid(datagram: &[u8]) -> Option<&[u8]> {
+    if datagram.first()? & 0x80 == 0 {
+        return None;
+    }
+    let len = usize::from(*datagram.get(5)?);
+    datagram.get(6..6 + len)
+}
+
 /// The worker a datagram belongs to, when it is another than `me`: the
 /// one named by the connection ID of a packet with a short header.
 pub fn owner(datagram: &[u8], me: u16) -> Option<u16> {
@@ -53,6 +64,19 @@ pub fn owner(datagram: &[u8], me: u16) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_destination_id_of_a_long_header_is_read() {
+        let mut initial = vec![0xc0, 0, 0, 0, 1, 8];
+        initial.extend_from_slice(&issue(3, [9; 8]));
+        initial.extend_from_slice(&[0; 30]);
+        assert_eq!(long_dcid(&initial), Some(&initial[6..14]));
+        assert_eq!(worker_of(long_dcid(&initial).unwrap()), Some(3));
+        // A short header, or one cut before its ID ends: none.
+        assert_eq!(long_dcid(&[0x40, 1, 2, 3, 4, 5, 6]), None);
+        assert_eq!(long_dcid(&initial[..10]), None);
+        assert_eq!(long_dcid(&[]), None);
+    }
 
     #[test]
     fn the_worker_comes_back_from_the_id() {

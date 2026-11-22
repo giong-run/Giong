@@ -115,6 +115,21 @@ impl Member {
     /// as it answers any packet it does not know. A datagram for a worker
     /// whose queue is full is dropped, as the network drops.
     pub(crate) fn forward(&mut self, worker: u16, datagram: Forwarded) -> Option<Forwarded> {
+        self.refresh();
+        match self.peers.get(&worker) {
+            Some(peer) => match peer.try_send(datagram) {
+                Ok(()) | Err(TrySendError::Full(_)) => None,
+                Err(TrySendError::Closed(datagram)) => Some(datagram),
+            },
+            None => Some(datagram),
+        }
+    }
+}
+
+impl Member {
+    /// Looks the other endpoints of the address up again if one joined or
+    /// left since the last time.
+    fn refresh(&mut self) {
         let now = GENERATION.load(Ordering::Acquire);
         if self.seen != now {
             let groups = groups().lock().unwrap_or_else(|e| e.into_inner());
@@ -127,13 +142,37 @@ impl Member {
                 .collect();
             self.seen = now;
         }
-        match self.peers.get(&worker) {
-            Some(peer) => match peer.try_send(datagram) {
-                Ok(()) | Err(TrySendError::Full(_)) => None,
-                Err(TrySendError::Closed(datagram)) => Some(datagram),
-            },
-            None => Some(datagram),
-        }
+    }
+
+    /// The worker a packet with a long header belongs to, when it is
+    /// another than this one, where the kernel does not keep a client's
+    /// datagrams on one worker: on macOS the workers' sockets are one
+    /// socket, and each datagram goes to the worker that reads first. A
+    /// connection ID one of the workers issued names its worker; one the
+    /// client chose (its first Initial packets, and its 0-RTT ones) is
+    /// hashed to a worker of the address, the same on every worker, so
+    /// that a first flight of several datagrams meets in one place.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub(crate) fn long_owner(&mut self, datagram: &[u8]) -> Option<u16> {
+        let dcid = cid::long_dcid(datagram)?;
+        self.refresh();
+        let named =
+            cid::worker_of(dcid).filter(|w| *w == self.worker || self.peers.contains_key(w));
+        let worker = match named {
+            Some(worker) => worker,
+            None => {
+                let mut workers: Vec<u16> = self.peers.keys().copied().collect();
+                workers.push(self.worker);
+                workers.sort_unstable();
+                // FNV-1a: the same on every worker, and enough to spread
+                // the IDs clients pick at random.
+                let hash = dcid.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+                });
+                workers[(hash % workers.len() as u64) as usize]
+            }
+        };
+        (worker != self.worker).then_some(worker)
     }
 }
 
@@ -196,6 +235,7 @@ impl ConnectionIdGenerator for WorkerCids {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn short(worker: u16) -> Vec<u8> {
         let mut d = vec![0x40];
@@ -231,6 +271,52 @@ mod tests {
         // And with none left, the datagram comes back.
         drop((new, new_rx));
         assert!(sender.forward(1, datagram()).is_some());
+    }
+
+    fn long(dcid: &[u8]) -> Vec<u8> {
+        let mut d = vec![0xc0, 0, 0, 0, 1, dcid.len() as u8];
+        d.extend_from_slice(dcid);
+        d.extend_from_slice(&[0; 20]);
+        d
+    }
+
+    #[test]
+    fn long_headers_meet_on_one_worker_whichever_reads_them() {
+        let addr: SocketAddr = "127.0.0.1:7".parse().unwrap();
+        let mut members: Vec<_> = (0..3).map(|w| Member::join(addr, w)).collect();
+        // An ID one of them issued goes to its worker.
+        let issued = long(&cid::issue(2, [5; 8]));
+        let owners: Vec<_> = members
+            .iter_mut()
+            .map(|(m, _)| m.long_owner(&issued))
+            .collect();
+        assert_eq!(owners, [Some(2), Some(2), None]);
+        // One the client chose, or one that names a worker the address
+        // does not have: every worker sends it to the same one.
+        for dcid in [
+            &[0xff, 1, 2, 3, 4, 5, 6, 7][..],
+            &cid::issue(9, [1; 8]),
+            &[7; 20],
+        ] {
+            let datagram = long(dcid);
+            let picked: Vec<_> = members
+                .iter_mut()
+                .map(|(m, _)| m.long_owner(&datagram).unwrap_or(m.worker()))
+                .collect();
+            assert!(picked.iter().all(|w| *w == picked[0]), "{picked:?}");
+            assert!(picked[0] < 3);
+        }
+        // Spread over the workers, not all to one.
+        let firsts: HashSet<_> = (0..64u8)
+            .map(|i| {
+                let (m, _) = &mut members[0];
+                m.long_owner(&long(&[i, 0xee, 0, 0, 0, 0, 0, 1]))
+                    .unwrap_or(0)
+            })
+            .collect();
+        assert_eq!(firsts.len(), 3);
+        // A short header is not one of these.
+        assert_eq!(members[0].0.long_owner(&short(1)), None);
     }
 
     #[test]

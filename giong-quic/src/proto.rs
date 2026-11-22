@@ -728,6 +728,21 @@ fn deliver(
     seg: Option<usize>,
 ) {
     let me = member.worker();
+    // Where the kernel does not keep a client on one worker (macOS), the
+    // handshake's packets go where their connection is too.
+    #[cfg(not(target_os = "linux"))]
+    if let Some(worker) = member.long_owner(data) {
+        let passed = Forwarded {
+            data: data.to_vec(),
+            from,
+            ecn,
+            segment: seg,
+            local,
+        };
+        let Some(_) = member.forward(worker, passed) else {
+            return;
+        };
+    }
     let whole = seg.unwrap_or(data.len()).max(1);
     // Datagrams received as one mostly go the same way; when they do not,
     // each goes its own.
