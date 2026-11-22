@@ -302,7 +302,7 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
             words.into_iter().find_map(|w| {
                 let marker = format!("\"{w}");
                 let files = grep_files(&app.join("src"), "rs", &marker);
-                (!files.is_empty()).then(|| (*path, marker, files))
+                (!files.is_empty()).then_some((*path, marker, files))
             })
         })
         .unwrap_or_else(|| {
