@@ -207,15 +207,10 @@ fn connection(plan: &Plan, conns: usize, i: usize, start: Instant) -> Outcome {
         };
         let counted = t0 >= window;
         let req = &plan.requests[next];
-        let result = if interval.is_some() && Instant::now() >= end {
-            // Due inside the run but not sent by its end, because the service
-            // had not answered the requests before it: no answer, and no
-            // waiting a timeout for each one.
-            Err("not sent before the run ended: the service had not answered the requests before it".to_string())
-        } else {
-            let deadline = (Instant::now() + plan.timeout).min(hard_stop);
-            exchange(plan, &mut conn, &mut out, req, deadline)
-        };
+        // Every wait ends by `hard_stop`: a service that stops answering
+        // costs one timeout in all, not one per request that came due.
+        let deadline = (Instant::now() + plan.timeout).min(hard_stop);
+        let result = exchange(plan, &mut conn, &mut out, req, deadline);
         match result {
             Ok(status) => {
                 if counted {
@@ -729,8 +724,8 @@ mod tests {
 
     #[test]
     fn a_silent_server_ends_the_run_after_one_timeout() {
-        // Accepts and never answers: each connection waits one timeout for
-        // its first request, and the rest that came due fail at once.
+        // Accepts and never answers: the run ends one timeout after its end,
+        // and every request that came due counts as failed.
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

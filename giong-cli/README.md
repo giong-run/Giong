@@ -85,6 +85,50 @@ claude mcp add giong -- giong mcp
 
 Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document, plus `dev_status` for a running `giong dev`.
 
+## giong db
+
+```sh
+giong db up            # a development PostgreSQL, MySQL or Redis in Docker or Podman
+giong db new add_users # migrations/0002_add_users.sql
+giong db migrate       # apply what is new; giong db status shows what is applied
+giong db down          # stop it; --volumes also deletes the data
+```
+
+Starts the databases the project depends on in containers, with a random password, a free port and a volume, and writes `DATABASE_URL` or `REDIS_URL` into `.env` (owner-only, git-ignored). Migrations are forward-only SQL files `migrations/NNNN_name.sql`; each PostgreSQL file runs in one transaction (unless its first line is `-- giong:no-transaction`), each applied file is recorded with its SHA-256 checksum, a changed applied file is refused and a failing one names its line. With a `DATABASE_URL` of your own, `migrate` and `status` work on that database. `giong db reset --yes` empties a database `giong db up` started.
+
+## giong env
+
+```sh
+giong env [show|check|init|get <KEY>]
+```
+
+The service's configuration comes from the environment only; `.env` is for development. `show` lists every key of `.env.example`, `.env` and the environment with where its value comes from, secrets masked (`--reveal` shows them). `check` reports a key with no value at the line of `.env.example` that lists it, a key only in `.env`, and a line `.env` cannot read. `init` writes `.env` from `.env.example`; `get` prints one value for scripts.
+
+## giong top
+
+```sh
+giong top [--interval 1000] [--once] [--profile <ms>] [--tasks 20]
+```
+
+The running service seen from inside, through its giong-mcp: workers (tasks, I/O in flight, polls), memory, threads and descriptors, the tasks by the line that spawned them, pools, and warnings, such as a worker stuck in one task (`GIONG-E5055`). Redraws every second; one snapshot with `--once`, `--json` or when the output is not a terminal. Nothing is recorded while nobody watches, and nothing needs a rebuild.
+
+## giong bench
+
+```sh
+giong bench [<url>] [--rate <n>|auto|max] [--conns 50] [--duration 10]
+giong bench --against main [--rounds 5] [--max-regression 5]
+```
+
+Load at a fixed rate, with each request's latency counted from when it was due, so a stall is charged for every request behind it (no coordinated omission): p50, p99, p99.9 and the maximum. `auto` finds the most the service answers and measures at half of it; `max` measures throughput. Without a URL it builds the service in release mode and starts it on a free port with every core. `--against <ref>` builds that commit too and alternates the two builds round by round; `--max-regression` fails only when the change is slower in every round of at least three. Every round goes to `.giong/bench/<time>.csv`. The load generator shares the machine with the service: numbers to publish come from two machines.
+
+## giong image
+
+```sh
+giong image [--tag name:tag] [--add static,migrations] [--load] [--push ghcr.io/owner/name:tag]
+```
+
+An OCI image of the service without Docker or a Dockerfile: one layer with the release binary at `/app`, CA certificates and a nonroot user, no shell; static with musl when that target is installed (`rustup target add x86_64-unknown-linux-musl`), else with this machine's glibc libraries. The same source gives the same digest. `--load` hands it to Docker or Podman, `--push` to skopeo, crane, Docker or Podman.
+
 ## Error codes
 
 The command reports `GIONG-E5000` to `GIONG-E5099`; each has a page in [docs/errors](https://github.com/giong-run/Giong/blob/main/docs/errors/README.md) and in `giong explain`. Its findings can also carry the runtime's own codes, such as `GIONG-E0001` when io_uring is blocked.
