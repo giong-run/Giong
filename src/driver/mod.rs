@@ -406,8 +406,12 @@ pub(crate) enum Io {
         addr: *const SockAddr,
         addr_len: SockLen,
     },
-    /// A one-off `recvmsg(2)`.
-    RecvMsg { fd: RawSock, msg: *mut MsgHdr },
+    /// A one-off `recvmsg(2)` with `flags` (such as `MSG_CMSG_CLOEXEC`).
+    RecvMsg {
+        fd: RawSock,
+        msg: *mut MsgHdr,
+        flags: i32,
+    },
     /// A `read(2)` from a descriptor that has readiness, such as an eventfd
     /// or a pipe.
     ReadReady { fd: RawFile, buf: *mut u8, len: u32 },

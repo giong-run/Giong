@@ -594,3 +594,66 @@ fn dropping_the_listener_ends_the_handshakes_under_way() {
         assert_eq!(timeout(Duration::from_secs(2), closed).await.unwrap(), 0);
     });
 }
+
+// ------------------------------------------------- descriptors and exec
+
+/// The child half of the close-on-exec test: accepts one channel, then
+/// fails if any descriptor past stdio would be inherited by an exec'd
+/// program. In a process of its own, so that no other test's descriptors
+/// are in the list.
+#[test]
+#[ignore = "run by a_new_channel_leaks_no_descriptor_into_exec in a child process"]
+fn child_lists_inheritable_descriptors() {
+    let Ok(path) = std::env::var("GIONG_IPC_CLOEXEC_PATH") else {
+        return;
+    };
+    giong::block_on(async move {
+        let listener = IpcListener::bind(&path, 4096).unwrap();
+        let client = giong::spawn(async move { ipc::connect(&path, 4096).await });
+        let accepted = listener.accept().await.unwrap();
+        let connected = client.await.unwrap().unwrap();
+        let mut open = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let fd: RawFd = entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            // SAFETY: F_GETFD only reads the flags; a closed descriptor
+            // (the directory's own) returns -1.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fd > 2 && flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                open.push(fd);
+            }
+        }
+        drop((accepted, connected));
+        assert!(open.is_empty(), "inherited by exec: {open:?}");
+    });
+}
+
+#[test]
+fn a_new_channel_leaks_no_descriptor_into_exec() {
+    for driver in ["io_uring", "epoll"] {
+        let path = SockPath::new();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_lists_inheritable_descriptors",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GIONG_IPC_CLOEXEC_PATH", &path.0)
+            .env("GIONG_DRIVER", driver)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{driver}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

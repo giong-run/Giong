@@ -646,8 +646,8 @@ impl<P: Poller> Readiness<P> {
                     }),
                     Dir::Write,
                 ),
-                Io::RecvMsg { fd, msg } => (
-                    retry(|| libc::recvmsg(fd, msg, libc::MSG_DONTWAIT)),
+                Io::RecvMsg { fd, msg, flags } => (
+                    retry(|| libc::recvmsg(fd, msg, flags | libc::MSG_DONTWAIT)),
                     Dir::Read,
                 ),
                 // A pipe or a socket: offsets do not apply.

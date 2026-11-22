@@ -662,6 +662,7 @@ impl UdpSocket {
             // SAFETY: `msg` owns a live `Message`; the field pointer is taken
             // without making a reference.
             msg: unsafe { ptr::addr_of_mut!((*msg.as_ptr()).hdr) },
+            flags: 0,
         };
         // SAFETY: the header is in a `KernelBox` and points at its own fields
         // and at `buf`'s bytes; an `IoBufMut`'s bytes stay put when it moves.
