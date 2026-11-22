@@ -27,6 +27,21 @@ socket2 = { version = "0.6", features = ["all"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 [features]
 # UDP offloads for QUIC on UdpSocket: GSO, GRO, ECN, the local address of a
 # datagram and the source address of a send, socket buffer sizes, "don't
@@ -53,3 +68,18 @@ loom = "0.7"
 
 [dev-dependencies]
 libc = "0.2.172"
+
+# The soak test reads the process's handle count and memory; driver and
+# UDP tests ask whether they run under Wine and how a socket behaves; the
+# file tests make named pipes.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
