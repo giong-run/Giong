@@ -55,9 +55,14 @@ impl Stream {
     }
 
     pub(crate) async fn write_all(&self, buf: Vec<u8>) -> io::Result<()> {
+        self.write_all_back(buf).await.0
+    }
+
+    /// [`write_all`](Self::write_all), handing the buffer back.
+    pub(crate) async fn write_all_back(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         match self {
-            Stream::Tcp(s) => s.write_all(buf).await.0,
-            Stream::Tls(s) => s.write_all(buf).await.0,
+            Stream::Tcp(s) => s.write_all(buf).await,
+            Stream::Tls(s) => s.write_all(buf).await,
         }
     }
 

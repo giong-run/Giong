@@ -565,6 +565,15 @@ impl Stream {
             .expect("the head is read before anything asks for it")
     }
 
+    /// The head's field positions, taken once for the response the caller
+    /// builds: nothing here reads them after.
+    pub(crate) fn take_fields(&mut self) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+        self.head
+            .as_mut()
+            .map(|head| std::mem::take(&mut head.fields))
+            .unwrap_or_default()
+    }
+
     /// The response has no body whatever its fields say.
     fn bodiless(&self) -> bool {
         self.head_request || matches!(self.head().status, 204 | 304)
