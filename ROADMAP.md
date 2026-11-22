@@ -26,7 +26,7 @@ reproducible benchmark (tokio-postgres with deadpool, mysql_async and SQLx, redi
 reqwest, axum), and the README says where giong does not win.
 
 After 1.0, the 1.x releases add gRPC, macOS, HTTP/3 and Windows, then a memory limit kept
-under any load, one at a time and without breaking the 1.0 API (see the milestones after 1.0
+under any load and a developer kit, the `giong` command, one at a time and without breaking the 1.0 API (see the milestones after 1.0
 below). Alongside them, a third track fills in what a general runtime still lacks: blocking
 and compute work, processes and signals, structured concurrency, and scheduling that keeps
 a small machine efficient (see [Runtime core](#runtime-core-track-r-after-10)). Linux stays
@@ -624,7 +624,7 @@ platform it is tuned for.
 **Exit criteria:** the test suite passes on Windows in CI, and a benchmark against Tokio on
 Windows is published with its method.
 
-## 1.5 — Lean under pressure
+## 1.5 — Lean under pressure, and a developer kit
 
 Hardware, memory above all, is expensive, so a service should carry heavy load on a small
 machine and never fall over for lack of memory. giong already spends 5 to 10 times less
@@ -697,11 +697,95 @@ ledger and how quotas are shared are chosen from its results, not before.
       after A's upstream recovers, how long B takes to get back to normal. Those two
       numbers are what isolating tenants costs.
 
+### The developer kit: the `giong` command
+
+Rust is excellent for what ships and slow for the hours before: edit, compile, restart,
+lose the connection, retry. Every team assembles its own kit, and an agent has to guess
+which. giong owns the runtime, the HTTP stack, the database clients, the MCP server and a
+simulator, so its kit can do what tools working from outside a process cannot. One
+binary, `giong`, one command per job, `--json` on every command and an MCP server of its
+own, so an agent drives it as easily as a person. The whole kit ships in 1.5.0.
+
+- [ ] **The first hour:** one-command install on every system; `giong new` from templates
+      tested in CI; `giong ai init` (AGENTS.md, the skill, the MCP settings for the
+      agent); `giong doctor` for the machine; `giong check --json` with each compiler
+      error explained; `giong clean` for old build output; and `giong dev`, which restarts
+      the service on every change without dropping a request: the new process takes the
+      listening sockets, the old one finishes what it was answering.
+- [ ] **The daily loop:** `giong fix` for mechanical fixes, `giong test`, databases started
+      and migrated (`giong db`), configuration from the environment, a local dashboard
+      built on giong-mcp, and an OpenAPI description of the routes and their errors.
+- [ ] **Ship and tune:** `giong top` for a running service, `giong bench` on the benchmark
+      lab, real requests recorded as tests, and a container image built without Docker.
+
+HTTP/3 is hardened in the same release, on its way to dropping `unstable`:
+
+- [ ] QUIC under attack (handshake floods, gappy and out-of-order stream data, many tiny
+      frames, connection ID churn, 0-RTT replay) with memory shown to stay bounded; packet
+      input fuzzed; h3spec at 86 of 86; the interop runner's core cases and browsers
+      against the example server.
+
 **Exit criteria:** no out-of-memory kill in any case of the attack matrix, well-behaved
 clients mixed into it keep at least 90% of their requests per second, the limit costs at
 most 1% more instructions per request, and the cheapest-machine benchmark of 0.9 is
 published again with the limit on, against Tokio, Go and nginx, and the two-tenant test
-passes on both drivers.
+passes on both drivers. For the kit: `giong new` to a running service in one command on
+Linux and macOS, templates built and tested in CI, and `giong dev` restarting under load
+with no failed request.
+
+## 1.5.x — Debugged and proven
+
+No new features. After 1.5.0, a long pass of debugging and improving every platform, with
+fixes shipped as 1.5.x patch releases; then every claim measured again on real machines.
+Nothing for 1.6 starts before this milestone is done.
+
+- [ ] Rounds of review, each code reading and a live attack (fuzzing, fault injection,
+      soaks, hostile clients), on Linux, macOS and Windows, repeated until a whole round
+      finds no blocker. Windows and macOS get the most rounds: they are the newest.
+- [ ] What 1.1 to 1.5 left open that is a fix, not a feature, shipped as a 1.5.x patch.
+      Among them, containers: workers sharing a port under gVisor, a coded error when the
+      container's process limit stops a worker from starting, and io_uring that a sandbox
+      refuses at setup falling back to epoll.
+- [ ] Then every published number measured again on rented bare metal, with method and
+      raw data in the repository: the benchmark lab from 1 to 16 cores, the adaptive spin
+      governor (#186) that a cloud VM could not judge, and HTTP/3 between two machines over
+      a real network card, against HTTP/2 on giong and against quinn with h3 on Tokio.
+      Losses are published with the wins.
+
+**Exit criteria:** a whole review round on the three platforms finds no blocker, and the
+bare-metal results are in the repository and on giong.run.
+
+## 1.6 — HTTP/3, stable
+
+Proposed: what 1.6 and 1.7 hold is settled once 1.5.x is done, and no 1.6 work starts
+before then. HTTP/3 leaves `unstable`, and the first wave of the runtime core lands where
+its proposal is accepted.
+
+- [ ] A final review of giong-quic's API and of giong-http's HTTP/3 surface (one way per
+      task, coded errors), then `cargo-semver-checks` against 1.3.0.
+- [ ] `unstable-http3` becomes a stable `http3` feature, with the old name kept as an
+      alias, and `unstable-udp-offload` likewise once it is ready; whether giong-quic keeps
+      its own minimum Rust version (1.85) is decided here.
+- [ ] Structured concurrency from [Runtime core](#runtime-core-track-r-after-10): scopes
+      whose child tasks never outlive them, task groups, and a deadline per scope that the
+      kernel enforces on every operation inside it.
+
+**Exit criteria:** HTTP/3 needs no unstable feature, and the semver checks pass.
+
+## 1.7 — Work inside the kernel
+
+Proposed. The io_uring features that let the kernel do the work a process would, from
+[Runtime core](#runtime-core-track-r-after-10), each only with a benchmark that shows what
+it buys and no regression anywhere else.
+
+- [ ] `splice` between sockets, so a proxy moves bytes without copying them through the
+      process.
+- [ ] Wake-ups and descriptors sent between workers' rings (`MSG_RING`) instead of through
+      an eventfd.
+- [ ] Receive bundles (several buffers per completion) and registered buffers.
+
+**Exit criteria:** each item ships with its benchmark and raw data; none costs an existing
+case more than 1%.
 
 ## Runtime core (track R, after 1.0)
 
