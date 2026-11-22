@@ -22,5 +22,6 @@ mod contract;
 mod doctor;
 mod env;
 mod explain;
+mod mcp;
 mod new_ai;
 mod scenarios;

@@ -233,7 +233,6 @@ fn chunked_and_big_bodies_are_read_whole() {
 /// (or a coded failure), within the duration plus a bounded wait: the
 /// loadgen promises "warmup plus duration, plus up to `timeout`".
 #[test]
-#[ignore = "known bug: giong bench waits the 10 s timeout for every request that was due, one after another (25 due per connection: over 4 minutes for --duration 1)"]
 fn a_silent_server_does_not_hang_the_run() {
     if !has_command("bench") {
         return;

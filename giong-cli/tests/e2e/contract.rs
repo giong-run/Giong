@@ -11,9 +11,13 @@ use crate::harness::{commands, giong, TempDir, VERSION};
 /// Commands with a scenario file of their own in this directory. A command
 /// missing here is still covered by the contract tests below; the coverage
 /// test prints it so the scenario gets written.
+/// Commands that speak a protocol on stdin and stdout instead of printing a
+/// report.
+const STDIO_SERVERS: &[&str] = &["mcp"];
+
 const SCENARIOS: &[&str] = &[
     "doctor", "explain", "clean", "version", "help", "new", "dev", "ai", "fix", "test", "env",
-    "bench",
+    "bench", "mcp",
 ];
 
 /// How long a command may take outside a project before it is called hung:
@@ -133,6 +137,10 @@ fn an_unknown_flag_is_a_coded_usage_error_on_every_command() {
 #[test]
 fn every_command_outside_a_project_answers_at_once_and_writes_nothing() {
     for c in commands() {
+        if STDIO_SERVERS.contains(&c.as_str()) {
+            // Its stdout is a protocol; tests/e2e/mcp.rs holds its contract.
+            continue;
+        }
         let dir = TempDir::new(&format!("blind-{c}"));
         let home = TempDir::new(&format!("blind-home-{c}"));
         let work = dir.join("work");

@@ -79,7 +79,6 @@ fn secrets_are_masked_in_text_and_json_and_revealed_only_on_request() {
 /// Spellings of secrets common in real services. Each one here is a value
 /// an agent would otherwise copy into its context.
 #[test]
-#[ignore = "known bug: giong env shows DB_PASS, *_SK and ?password= values unmasked"]
 fn common_secret_spellings_are_masked_too() {
     if !has_command("env") {
         return;
