@@ -1,0 +1,31 @@
+[package]
+name = "giong-grpc"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "gRPC for the giong thread-per-core runtime: servers and clients over giong-http's HTTP/2, messages read as giong-proto views without copies"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://docs.rs/giong-grpc"
+keywords = ["grpc", "rpc", "protobuf", "io-uring", "async"]
+categories = ["network-programming", "asynchronous", "web-programming"]
+
+[dependencies]
+giong = { path = "..", version = "1.1.0" }
+giong-http = { path = "../giong-http", version = "1.1.0", features = ["client"] }
+giong-proto = { path = "../giong-proto", version = "1.1.0" }
+giong-tls = { path = "../giong-tls", version = "1.1.0" }
+# gzip message compression: deflate in pure Rust, already a dependency of
+# giong-http's client.
+miniz_oxide = "0.9"
+
+[dev-dependencies]
+giong-grpc-build = { path = "../giong-grpc-build" }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+# Set by `cargo fuzz` (see fuzz/).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

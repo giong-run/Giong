@@ -1,0 +1,29 @@
+giong-proto vs prost: median ns per call over all rounds (min-max), and prost/giong.
+A ratio above 1 means giong-proto is faster. 'allocations' is heap
+allocations per decode-and-read call.
+
+case               bytes op                         prost ns         giong-proto ns   ratio
+small                 34 decode                 26.0 (26-28)           27.5 (27-28)   0.94x
+small                 34 decode+read            26.3 (26-31)           27.1 (27-32)   0.97x
+small                 34 forward                14.4 (14-14)              4.1 (4-4)   3.48x
+small                 34 encode                 14.4 (14-14)           13.3 (13-13)   1.08x
+small                 34 allocations                       0                      0
+user                 187 decode              459.7 (459-462)        117.8 (118-132)   3.90x
+user                 187 decode+read         462.0 (461-463)        185.5 (184-204)   2.49x
+user                 187 forward                73.0 (70-87)              4.3 (4-5)  16.90x
+user                 187 encode                 72.2 (72-74)           50.9 (50-53)   1.42x
+user                 187 allocations                      17                      0
+item_list_100       9211 decode          16603.8 (16493-16686)     4718.0 (4696-5905)   3.52x
+item_list_100       9211 decode+read     17277.7 (16920-19846)    11884.5 (11687-15197)   1.45x
+item_list_100       9211 forward          5748.4 (5522-6894)           50.5 (49-57) 113.85x
+item_list_100       9211 encode           5649.6 (5528-5947)     2864.3 (2819-3206)   1.97x
+item_list_100       9211 allocations                     607                      0
+blob_64k           65552 decode           2972.4 (2948-3039)           16.2 (16-19) 183.31x
+blob_64k           65552 decode+read      2984.9 (2954-3059)           15.5 (15-20) 192.26x
+blob_64k           65552 forward          1502.3 (1439-1614)     1507.2 (1464-1611)   1.00x
+blob_64k           65552 encode           1489.1 (1476-1513)     1494.9 (1482-1532)   1.00x
+blob_64k           65552 allocations                       3                      0
+descriptors        53773 decode         199631.0 (197837-220090)    43780.5 (43421-50926)   4.56x
+descriptors        53773 decode+read    198559.9 (197382-233360)   100927.4 (100151-102144)   1.97x
+descriptors        53773 forward         70587.1 (70241-78944)     1203.2 (1200-1212)  58.67x
+descriptors        53773 allocations                    3688                      0

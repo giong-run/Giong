@@ -17,6 +17,10 @@
 //! machine has (`MemAvailable`). Reading those costs a few microseconds, so
 //! a worker reads them at most every 50 ms while far from the reserve, and
 //! on every accept once it is near it.
+//!
+//! macOS has no cgroups: what is left there is what the machine has, its
+//! free and inactive pages (the kernel's `host_statistics64`), the figure
+//! `vm_stat` prints and monitoring tools call "available".
 
 use std::cell::RefCell;
 use std::fs::{self, File};
@@ -116,9 +120,12 @@ pub(crate) fn auto_reserve() -> u64 {
     *AUTO.get_or_init(|| {
         let total = match cgroup() {
             Some(cgroup) => Some(cgroup.limit),
+            #[cfg(target_os = "linux")]
             None => fs::read_to_string("/proc/meminfo")
                 .ok()
                 .and_then(|text| field(&text, "MemTotal:").map(|kib| kib * 1024)),
+            #[cfg(target_os = "macos")]
+            None => mac::total(),
         };
         total.map_or(MIN_RESERVE, reserve_for)
     })
@@ -137,6 +144,7 @@ struct Watch {
     /// The files, kept open.
     usage: Option<File>,
     stat: Option<File>,
+    #[cfg(target_os = "linux")]
     meminfo: Option<File>,
     buf: Vec<u8>,
 }
@@ -202,6 +210,7 @@ impl Watch {
             low: false,
             usage,
             stat,
+            #[cfg(target_os = "linux")]
             meminfo: File::open("/proc/meminfo").ok(),
             buf: Vec::with_capacity(8 * 1024),
         }
@@ -241,9 +250,87 @@ impl Watch {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    fn machine_free(&mut self) -> Option<u64> {
+        mac::available()
+    }
+
+    #[cfg(target_os = "linux")]
     fn machine_free(&mut self) -> Option<u64> {
         let text = read_all(self.meminfo.as_ref()?, &mut self.buf).ok()?;
         field(std::str::from_utf8(text).ok()?, "MemAvailable:").map(|kib| kib * 1024)
+    }
+}
+
+/// The machine's memory on macOS, from the kernel.
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::OnceLock;
+
+    /// `HOST_VM_INFO64`.
+    const VM_INFO64: c_int = 4;
+
+    /// `vm_statistics64`, as the 32-bit words `host_statistics64` counts
+    /// in: `free_count` is word 0 and `inactive_count` word 2. Larger than
+    /// the structure of any release so far (40 words on macOS 26); the
+    /// kernel fills what it has and says how much that was.
+    #[repr(C, align(8))]
+    struct Statistics([u32; 64]);
+
+    extern "C" {
+        fn mach_host_self() -> u32;
+        fn host_statistics64(host: u32, flavor: c_int, info: *mut u32, count: *mut u32) -> c_int;
+        fn sysctlbyname(
+            name: *const c_char,
+            old: *mut c_void,
+            old_len: *mut usize,
+            new: *mut c_void,
+            new_len: usize,
+        ) -> c_int;
+        /// The kernel's page size, which `host_statistics64` counts in. It
+        /// can differ from the process's (`getpagesize`): 16 KiB against
+        /// 4 KiB for an x86_64 process under Rosetta on Apple silicon.
+        static vm_kernel_page_size: usize;
+    }
+
+    /// The memory installed (`hw.memsize`).
+    pub(super) fn total() -> Option<u64> {
+        let mut bytes: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: the name is NUL-terminated; the kernel writes at most
+        // `len` bytes, the size of `bytes`.
+        let res = unsafe {
+            sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                std::ptr::addr_of_mut!(bytes).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (res == 0 && len == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes)
+    }
+
+    /// The memory the kernel can hand out without paging to disk first: free
+    /// pages and inactive ones.
+    pub(super) fn available() -> Option<u64> {
+        // The port of the host is asked for once: every call adds a
+        // reference to it that is never given back.
+        static HOST: OnceLock<u32> = OnceLock::new();
+        // SAFETY: no arguments; returns a port name.
+        let host = *HOST.get_or_init(|| unsafe { mach_host_self() });
+        let mut stats = Statistics([0; 64]);
+        let mut count = stats.0.len() as u32;
+        // SAFETY: the kernel writes at most `count` words into `stats`.
+        let res = unsafe { host_statistics64(host, VM_INFO64, stats.0.as_mut_ptr(), &mut count) };
+        if res != 0 || count < 3 {
+            return None;
+        }
+        let pages = u64::from(stats.0[0]) + u64::from(stats.0[2]);
+        // SAFETY: a constant the system sets before the process starts.
+        let page = u64::try_from(unsafe { vm_kernel_page_size }).ok()?;
+        Some(pages * page)
     }
 }
 
@@ -289,6 +376,7 @@ fn reclaimable(stat: &str, v2: bool) -> u64 {
 }
 
 /// A `/proc/meminfo` field, in KiB.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn field(meminfo: &str, name: &str) -> Option<u64> {
     let line = meminfo.lines().find_map(|line| line.strip_prefix(name))?;
     line.trim().trim_end_matches("kB").trim().parse().ok()
@@ -372,6 +460,7 @@ mod tests {
 
     /// Reading this process's own files works, and twice from one open file
     /// gives the whole file both times.
+    #[cfg(target_os = "linux")]
     #[test]
     fn files_kept_open_read_whole_every_time() {
         let file = File::open("/proc/meminfo").unwrap();
@@ -382,5 +471,19 @@ mod tests {
         assert_eq!(first.len(), second.len());
         let mut watch = Watch::open();
         assert!(watch.free(MIN_RESERVE).is_some_and(|free| free > 0));
+    }
+
+    /// The kernel says how much memory the machine has and how much of it
+    /// is left: less than all of it, and more than nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_machine_s_memory_is_read_from_the_kernel() {
+        let total = mac::total().unwrap();
+        let available = mac::available().unwrap();
+        assert!(total >= 1 << 30, "{total}");
+        assert!(available > 0 && available < total, "{available} of {total}");
+        let mut watch = Watch::open();
+        assert!(watch.free(MIN_RESERVE).is_some());
+        assert!(auto_reserve() >= MIN_RESERVE);
     }
 }

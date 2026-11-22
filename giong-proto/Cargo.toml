@@ -1,0 +1,17 @@
+[package]
+name = "giong-proto"
+version = "1.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Protocol Buffers for giong: messages decoded as views over the receive buffer, with no copies and no allocation per field"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://docs.rs/giong-proto"
+keywords = ["protobuf", "zero-copy", "grpc", "serialization"]
+categories = ["encoding", "network-programming"]
+
+[dependencies]
+
+[package.metadata.docs.rs]
+all-features = true

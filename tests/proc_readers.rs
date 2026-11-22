@@ -10,7 +10,8 @@
 //! that nothing held.
 //!
 //! In a test binary of its own: the readers would hold the sockets of every
-//! other test too.
+//! other test too. Linux only: `/proc` is its interface.
+#![cfg(target_os = "linux")]
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -26,7 +26,8 @@
 //! task polls take clearly longer than the accepting worker's ([`SLOWER`]):
 //! a new connection there waits behind long-running work at every turn,
 //! and its counts mislead (it is the busy worker the idle connections were
-//! sent away from).
+//! sent away from). Where a worker's CPU time cannot be read (macOS, Miri,
+//! the simulation), every worker looks idle and counts decide, as before.
 
 use std::collections::VecDeque;
 use std::io;
@@ -46,6 +47,12 @@ use crate::runtime::{self, lock, RuntimeShared};
 /// as busy do not pass connections back and forth; the accepting worker is
 /// awake, which alone counts one (see `RuntimeShared::score`).
 const MARGIN: usize = 2;
+
+/// Every listener of the group is a duplicate of one socket with one queue
+/// of connections (`net/share.rs`), so each connection wakes every member,
+/// not just the one that will accept it. A member that looks awake may then
+/// only have been woken by that connection; see `busier_than_another`.
+const ONE_QUEUE: bool = cfg!(any(target_os = "macos", giong_libkqueue));
 
 /// One whole core, in the parts-per-million unit busy shares are kept in.
 const CORE: u64 = 1_000_000;
@@ -394,16 +401,40 @@ impl Member {
             // members whose polls are not clearly longer than this worker's.
             let poll_ns = |i: usize| busy.workers[i].poll_ns.load(Ordering::Relaxed);
             let limit = poll_ns(self.worker).saturating_mul(SLOWER) / 4;
-            let target = rt.least_loaded_of(None, |i| member(i) && poll_ns(i) <= limit)?;
-            return (rt.score(self.worker) > rt.score(target) + MARGIN).then_some(target);
+            let (target, other) = self.least_by_counts(|i| member(i) && poll_ns(i) <= limit)?;
+            return (rt.score(self.worker) > other + MARGIN).then_some(target);
         }
         let limit = least.saturating_add(BAND);
-        let target = rt.least_loaded_of(None, |i| member(i) && busy.expected(rt, i) <= limit)?;
+        let (target, other) =
+            self.least_by_counts(|i| member(i) && busy.expected(rt, i) <= limit)?;
         if mine > limit {
             // Clearly busier than another member, whatever the counts.
             return Some(target);
         }
-        (rt.score(self.worker) > rt.score(target) + MARGIN).then_some(target)
+        (rt.score(self.worker) > other + MARGIN).then_some(target)
+    }
+
+    /// The member among `eligible` that counts of tasks favour, and the
+    /// figure this worker's `score` must exceed by [`MARGIN`] to hand a
+    /// connection to it.
+    fn least_by_counts(&self, eligible: impl Fn(usize) -> bool) -> Option<(usize, usize)> {
+        let rt = &self.group.rt;
+        if ONE_QUEUE {
+            // The other members were woken by this very connection, so
+            // being awake says nothing about them: counting it would pick
+            // the wrong member, and let this worker keep connections until
+            // it is three ahead instead of two. Ties go to the next member
+            // after this worker.
+            let n = rt.workers();
+            (1..n)
+                .map(|k| (self.worker + k) % n)
+                .filter(|&i| eligible(i))
+                .map(|i| (i, rt.work(i)))
+                .min_by_key(|&(_, work)| work)
+        } else {
+            let target = rt.least_loaded_of(None, eligible)?;
+            Some((target, rt.score(target)))
+        }
     }
 }
 

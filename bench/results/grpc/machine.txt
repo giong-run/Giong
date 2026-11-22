@@ -1,0 +1,11 @@
+date: 2026-11-21T05:58Z
+cpu: Intel(R) Xeon(R) Processor @ 2.10GHz (cloud VM)
+cores: 4
+kernel: 6.18.44-fc-v726
+rustc: rustc 1.100.0 (0ef1bc386 2026-11-09)
+driver: io_uring
+tonic: 0.14 (prost, hyper, Tokio), release build with lto
+command: bench/grpc.sh 10 5
+pinning: server under test on CPU 0, load on CPUs 1 2 3; client under test on CPU 3, its peer on CPUs 0-2
+commit: branch feat/giong-proto
+tasks-128/: the same command with TASKS=128 SIDES=server WORKLOADS=unary10k (64 calls in flight per connection)

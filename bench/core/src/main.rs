@@ -17,6 +17,7 @@ fn cpu_ns() -> u64 {
 }
 
 /// A yield that every runtime handles the same way: wake, then pending.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn plain_yield() {
     let mut done = false;
     std::future::poll_fn(|cx| {
@@ -43,7 +44,14 @@ const XMSGS: u64 = 4_000_000;
 const CHAIN: u64 = 1_000;
 const CHAIN_ROUNDS: u64 = 400;
 const RR: u64 = 100_000;
+/// macOS keeps a closed loopback connection's port in TIME_WAIT for 30 s
+/// and has 16,384 ephemeral ports: 10,000 per run would run out of them by
+/// the second runtime (connect fails with `ETIMEDOUT`). `bench/core.sh`
+/// also waits out TIME_WAIT after each `connect` run there.
+#[cfg(target_os = "linux")]
 const CONNECTS: u64 = 10_000;
+#[cfg(not(target_os = "linux"))]
+const CONNECTS: u64 = 2_000;
 const LOOKUPS: u64 = 200_000;
 
 /// The workloads, written once and expanded inside each runtime's module,
@@ -555,6 +563,7 @@ macro_rules! generic_xchan {
 
 /// monoio with its io_uring driver; channels from local-sync, the !Send
 /// channel crate by monoio's authors.
+#[cfg(target_os = "linux")]
 mod monoio_rt {
     use super::*;
     use local_sync::{mpsc, oneshot as os};
@@ -664,6 +673,7 @@ mod monoio_rt {
 }
 
 /// glommio with its own local channels.
+#[cfg(target_os = "linux")]
 mod glommio_rt {
     use super::*;
     use glommio::channels::local_channel as lc;
@@ -772,6 +782,7 @@ mod glommio_rt {
 }
 
 /// compio with its io_uring driver; it ships no channels.
+#[cfg(target_os = "linux")]
 mod compio_rt {
     use super::*;
     pub fn block_on<F: Future>(f: F) -> F::Output {
@@ -949,8 +960,11 @@ fn main() {
         "tokio-ct" => tokio_ct::block_on(async move { tokio_ct::workload(&w).await }),
         "tokio-local" => tokio_local::block_on(async move { tokio_local::workload(&w).await }),
         "tokio-mt" => tokio_mt::block_on(async move { tokio_mt::workload(&w).await }),
+        #[cfg(target_os = "linux")]
         "monoio" => monoio_rt::block_on(async move { monoio_rt::workload(&w).await }),
+        #[cfg(target_os = "linux")]
         "glommio" => glommio_rt::run(w),
+        #[cfg(target_os = "linux")]
         "compio" => compio_rt::block_on(async move { compio_rt::workload(&w).await }),
         "smol" => smol_rt::block_on(async move { smol_rt::workload(&w).await }),
         other => panic!("unknown runtime {other}"),

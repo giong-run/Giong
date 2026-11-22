@@ -26,9 +26,11 @@ use std::time::{Duration, Instant};
 use giong::time::sleep_until;
 
 use super::conn::Stream as Socket;
+use crate::body::{Next, StreamBody};
 use crate::h2::frame::{self, Head, Reason, PREFACE};
 use crate::h2::hpack::{Decoder, Encoder, Index, TABLE_SIZE};
 use crate::parse::{is_field_value, is_token_str};
+use crate::trailers::Trailers;
 
 /// The window each stream starts with: how much of a response the server
 /// may send before the client has read any of it.
@@ -156,27 +158,128 @@ impl Connection {
         self.inner.state.borrow().has_room()
     }
 
+    /// Whether the connection can still take requests, now or once a
+    /// stream ends: it is not over, and the server has not said GOAWAY.
+    pub(crate) fn is_usable(&self) -> bool {
+        let st = self.inner.state.borrow();
+        st.dead.is_none() && st.goaway.is_none()
+    }
+
+    /// Why the connection takes no more requests, if it does not: it
+    /// ended, or the server said GOAWAY.
+    pub(crate) fn unusable_because(&self) -> Option<String> {
+        let st = self.inner.state.borrow();
+        st.dead.clone().or_else(|| {
+            st.goaway
+                .map(|_| "the server is closing the connection (GOAWAY)".to_owned())
+        })
+    }
+
+    /// How many streams were ever opened: it changes whenever a request
+    /// is sent on the connection.
+    pub(crate) fn opened(&self) -> u32 {
+        self.inner.state.borrow().next_id / 2
+    }
+
     /// Streams in progress.
     pub(crate) fn streams(&self) -> usize {
         self.inner.state.borrow().streams.len()
     }
 
+    /// Sends a PING, or returns `None` when the connection is over. The
+    /// [`Ping`] says when the server acknowledged it.
+    pub(crate) fn ping(&self) -> Option<Ping> {
+        let mut st = self.inner.state.borrow_mut();
+        let id = st.ping()?;
+        Some(Ping {
+            inner: self.inner.clone(),
+            id,
+        })
+    }
+
+    /// Ends the connection now: it takes no more requests, says GOAWAY to
+    /// the server and closes. Streams still in progress fail with
+    /// `message`.
+    pub(crate) fn retire(&self, message: &str) {
+        self.inner.state.borrow_mut().retire(message);
+    }
+
     /// Sends `request` on a new stream, or returns `None` when the
-    /// connection has no room for one.
-    pub(crate) fn send(&self, request: &Request<'_>) -> Option<Stream> {
+    /// connection has no room for one. A `source` is taken when the
+    /// request is sent: its pieces are the request body, written as they
+    /// are produced.
+    pub(crate) fn send(
+        &self,
+        request: &Request<'_>,
+        source: &mut Option<StreamBody>,
+    ) -> Option<Stream> {
         let mut st = self.inner.state.borrow_mut();
         if !st.has_room() {
             return None;
         }
-        let id = st.open(request);
+        let id = st.open(request, source.take());
         Some(Stream {
             inner: self.inner.clone(),
             id,
             head: None,
             head_request: request.head_request,
             done: false,
+            trailers: None,
         })
     }
+}
+
+/// A PING the client sent, waiting for the server's acknowledgement.
+/// Dropped, it stops waiting; an acknowledgement that arrives later is
+/// ignored.
+pub(crate) struct Ping {
+    inner: Rc<Inner>,
+    id: u64,
+}
+
+impl Ping {
+    /// Ready with `Ok` once the server acknowledged the PING, or with why
+    /// the connection ended before it did.
+    pub(crate) fn poll_acked(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), String>> {
+        let mut st = self.inner.state.borrow_mut();
+        let st = &mut *st;
+        let Some(p) = st.pings.get_mut(&self.id) else {
+            return Poll::Ready(Err(st
+                .dead
+                .clone()
+                .unwrap_or_else(|| "the connection ended".to_owned())));
+        };
+        if p.acked {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(dead) = &st.dead {
+            return Poll::Ready(Err(dead.clone()));
+        }
+        p.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for Ping {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.inner.state.try_borrow_mut() {
+            st.pings.remove(&self.id);
+            if st.pings.is_empty() {
+                // The idle timeout applies again: the connection's task
+                // works out its deadline anew.
+                st.poke();
+            }
+        }
+    }
+}
+
+/// A PING sent and not yet given up.
+struct PingState {
+    acked: bool,
+    waker: Option<Waker>,
 }
 
 /// One request and its response. Dropped before the response has ended,
@@ -189,6 +292,9 @@ pub(crate) struct Stream {
     /// The response ended and was read, or failed: the stream is gone from
     /// the connection.
     done: bool,
+    /// The trailer fields the response ended with, once it was read to
+    /// its end.
+    trailers: Option<Box<Trailers>>,
 }
 
 impl Stream {
@@ -248,8 +354,10 @@ impl Stream {
 
     /// Appends what has arrived of the body to `out`, waiting for some if
     /// nothing has: whole frames, and no more than `limit` bytes unless
-    /// one frame is larger. Returns `false`, with nothing appended, at the
-    /// end. Cancel safe: what is appended is taken off the stream.
+    /// one frame is larger; into an empty `out`, one frame (small frames
+    /// arrive joined), which is moved rather than copied. Returns `false`,
+    /// with nothing appended, at the end. Cancel safe: what is appended is
+    /// taken off the stream.
     pub(crate) async fn read(
         &mut self,
         out: &mut Vec<u8>,
@@ -260,6 +368,7 @@ impl Stream {
         }
         let id = self.id;
         let inner = self.inner.clone();
+        let mut trailers = None;
         let result = poll_fn(|cx| {
             let mut guard = inner.state.borrow_mut();
             let st = &mut *guard;
@@ -274,11 +383,13 @@ impl Stream {
                     }
                     let chunk = s.data.pop_front().expect("the front was there");
                     n += chunk.len();
-                    if out.is_empty() && out.capacity() < chunk.len() {
+                    if out.is_empty() {
+                        // The frame's buffer is handed over as it is:
+                        // joining the frames that wait would copy them.
                         *out = chunk;
-                    } else {
-                        out.extend_from_slice(&chunk);
+                        break;
                     }
+                    out.extend_from_slice(&chunk);
                 }
                 s.buffered -= n;
                 st.consumed(id, n);
@@ -288,6 +399,7 @@ impl Stream {
                 return Poll::Ready(Err(e.clone()));
             }
             if s.ended {
+                trailers = s.trailers.take();
                 return Poll::Ready(Ok(false));
             }
             s.waker = Some(cx.waker().clone());
@@ -295,6 +407,7 @@ impl Stream {
         })
         .await;
         if !matches!(result, Ok(true)) {
+            self.trailers = trailers;
             self.finish();
         }
         result
@@ -309,6 +422,24 @@ impl Stream {
         st.streams
             .get(&self.id)
             .map_or(true, |s| s.ended && s.data.is_empty() && s.error.is_none())
+    }
+
+    /// The trailer fields the response ended with: there once
+    /// [`read`](Self::read) has returned `false`, if the server sent any.
+    pub(crate) fn trailers(&self) -> Option<&Trailers> {
+        self.trailers.as_deref()
+    }
+
+    /// The source of a streamed request body, if the connection took
+    /// nothing from it: after a request the server did not process, for
+    /// sending it again.
+    pub(crate) fn unused_source(&mut self) -> Option<StreamBody> {
+        let mut st = self.inner.state.borrow_mut();
+        let s = st.streams.get_mut(&self.id)?;
+        if s.pulled {
+            return None;
+        }
+        s.source.take()
     }
 
     /// The response ended or failed, and the stream is off the connection.
@@ -342,9 +473,17 @@ impl Drop for Stream {
 
 /// The state of one stream.
 struct StreamState {
-    /// The request body, and how much of it is sent.
+    /// The request body (the current piece of a streamed one), and how
+    /// much of it is sent.
     body: Vec<u8>,
     sent: usize,
+    /// Where the next pieces of a streamed request body come from, until
+    /// it ends.
+    source: Option<StreamBody>,
+    /// Something was taken from `source`.
+    pulled: bool,
+    /// In `State::pulling`.
+    waiting: bool,
     /// Every frame of the request is written.
     request_done: bool,
     /// In `State::sending`.
@@ -367,6 +506,8 @@ struct StreamState {
     buffered: usize,
     /// END_STREAM arrived.
     ended: bool,
+    /// The trailer fields that ended the response.
+    trailers: Option<Box<Trailers>>,
     error: Option<StreamError>,
     /// The stream is closed on the wire (reset by either side).
     reset: bool,
@@ -430,6 +571,9 @@ struct State {
     streams: HashMap<u32, StreamState>,
     /// Streams with request body to send, served in turn.
     sending: VecDeque<u32>,
+    /// Streams whose streamed request body has sent its last piece and
+    /// waits for the next from its source.
+    pulling: Vec<u32>,
     peer_max_streams: u32,
     /// The server's `SETTINGS_INITIAL_WINDOW_SIZE`.
     peer_window: i64,
@@ -449,6 +593,9 @@ struct State {
     max_head_size: usize,
     /// No stream open since then.
     idle_since: Instant,
+    /// The PINGs the client sent and still waits for, by their payload.
+    pings: HashMap<u64, PingState>,
+    next_ping: u64,
     /// The connection's task: woken when there is something for it to do.
     driver: Option<Waker>,
     poked: bool,
@@ -463,6 +610,7 @@ impl State {
             next_id: 1,
             streams: HashMap::new(),
             sending: VecDeque::new(),
+            pulling: Vec::new(),
             peer_max_streams: INITIAL_MAX_STREAMS,
             peer_window: i64::from(frame::DEFAULT_WINDOW),
             peer_frame: frame::DEFAULT_FRAME_SIZE,
@@ -475,6 +623,8 @@ impl State {
             block: None,
             max_head_size,
             idle_since: Instant::now(),
+            pings: HashMap::new(),
+            next_ping: 0,
             driver: None,
             poked: false,
         }
@@ -512,6 +662,13 @@ impl State {
             && self.streams.len() < self.peer_max_streams as usize
     }
 
+    /// Nothing in progress: no stream, and no PING waiting for its
+    /// acknowledgement (a probe in flight is not idleness, and must not be
+    /// ended by the idle timeout).
+    fn is_idle(&self) -> bool {
+        self.dead.is_none() && self.streams.is_empty() && self.pings.is_empty()
+    }
+
     fn reading(&self) -> bool {
         self.dead.is_none() && self.out.len() < OUT_PAUSE
     }
@@ -520,7 +677,7 @@ impl State {
 
     /// Opens a stream for `req`, and wakes the connection's task to send
     /// it; returns its identifier.
-    fn open(&mut self, req: &Request<'_>) -> u32 {
+    fn open(&mut self, req: &Request<'_>, source: Option<StreamBody>) -> u32 {
         let id = self.next_id;
         self.next_id += 2;
         let mut block = Vec::with_capacity(64 + req.path.len());
@@ -550,15 +707,19 @@ impl State {
             e.field(name.as_bytes(), value.as_bytes(), index, &mut block);
         }
         let body = req.body.unwrap_or_default();
-        let end_stream = body.is_empty();
+        let streamed = source.is_some();
+        let end_stream = body.is_empty() && !streamed;
         frame::write_headers(&mut self.out, id, &block, end_stream, self.peer_frame);
         self.streams.insert(
             id,
             StreamState {
                 body: body.to_vec(),
                 sent: 0,
+                source,
+                pulled: false,
+                waiting: streamed,
                 request_done: end_stream,
-                queued: !end_stream,
+                queued: !end_stream && !streamed,
                 send_window: self.peer_window,
                 recv_window: i64::from(STREAM_WINDOW),
                 consumed: 0,
@@ -573,16 +734,127 @@ impl State {
                 data: VecDeque::new(),
                 buffered: 0,
                 ended: false,
+                trailers: None,
                 error: None,
                 reset: false,
                 waker: None,
             },
         );
-        if !end_stream {
+        if streamed {
+            self.pulling.push(id);
+        } else if !end_stream {
             self.sending.push_back(id);
         }
         self.poke();
         id
+    }
+
+    /// Queues a PING whose payload is a number of its own, and wakes the
+    /// connection's task to send it; returns that number, or `None` once
+    /// the connection is over.
+    fn ping(&mut self) -> Option<u64> {
+        if self.dead.is_some() {
+            return None;
+        }
+        self.next_ping += 1;
+        let id = self.next_ping;
+        frame::write_ping(&mut self.out, false, &id.to_be_bytes());
+        self.pings.insert(
+            id,
+            PingState {
+                acked: false,
+                waker: None,
+            },
+        );
+        self.poke();
+        Some(id)
+    }
+
+    /// Ends the connection on the client's side: GOAWAY, then nothing more.
+    fn retire(&mut self, message: &str) {
+        if self.dead.is_some() {
+            return;
+        }
+        frame::write_goaway(&mut self.out, 0, Reason::NoError, b"");
+        self.end(message.to_owned(), false);
+        self.poke();
+    }
+
+    /// Takes the next piece from the source of every streamed request
+    /// body that has sent its last one; `waker` is woken when a source
+    /// that had none has one. Returns whether there is something new to
+    /// write.
+    fn pull(&mut self, waker: &Waker) -> bool {
+        if self.pulling.is_empty() {
+            return false;
+        }
+        let mut progress = false;
+        let mut at = 0;
+        while at < self.pulling.len() {
+            let id = self.pulling[at];
+            let Some(s) = self.streams.get_mut(&id) else {
+                self.pulling.swap_remove(at);
+                continue;
+            };
+            let next = match &s.source {
+                Some(source) if !s.request_done => source.poll_next(waker),
+                _ => {
+                    s.waiting = false;
+                    self.pulling.swap_remove(at);
+                    continue;
+                }
+            };
+            let Poll::Ready(next) = next else {
+                at += 1;
+                continue;
+            };
+            s.pulled = true;
+            s.waiting = false;
+            self.pulling.swap_remove(at);
+            progress = true;
+            match next {
+                Next::Piece(piece) => {
+                    s.body = piece;
+                    s.sent = 0;
+                    self.enqueue(id);
+                }
+                Next::End(trailers) => {
+                    s.source = None;
+                    s.request_done = true;
+                    match trailers {
+                        Some(trailers) => {
+                            let mut block = Vec::with_capacity(64);
+                            self.encoder.begin(&mut block);
+                            for (name, value) in trailers.iter() {
+                                let index = if value.len() > 256 {
+                                    Index::No
+                                } else {
+                                    Index::Yes
+                                };
+                                self.encoder
+                                    .field(name.as_bytes(), value, index, &mut block);
+                            }
+                            frame::write_headers(&mut self.out, id, &block, true, self.peer_frame);
+                        }
+                        None => {
+                            frame::write_head(&mut self.out, 0, frame::DATA, frame::END_STREAM, id);
+                        }
+                    }
+                }
+                Next::Aborted => {
+                    self.fail_stream(
+                        id,
+                        StreamError::Reset(
+                            "the request body was aborted (RequestBody::abort), so the \
+                             request was cancelled"
+                                .into(),
+                        ),
+                        Some(Reason::Cancel),
+                    );
+                }
+            }
+        }
+        progress
     }
 
     /// `n` bytes of stream `id`'s body were read: let the server send more
@@ -653,6 +925,11 @@ impl State {
         }
         s.reset = true;
         s.body = Vec::new();
+        if s.pulled {
+            // Dropped, which tells its sender. One nothing was taken from
+            // stays until the stream is given up, to be sent again.
+            s.source = None;
+        }
         s.request_done = true;
         let dropped = mem::take(&mut s.buffered);
         s.data.clear();
@@ -684,7 +961,7 @@ impl State {
                 s.queued = false;
                 continue;
             }
-            let end = n == left;
+            let end = n == left && s.source.is_none();
             frame::write_head(
                 &mut self.out,
                 n,
@@ -701,6 +978,15 @@ impl State {
                 s.sent = 0;
                 s.request_done = true;
                 s.queued = false;
+            } else if n == left {
+                // The piece is out: the next one comes from the source.
+                s.body = Vec::new();
+                s.sent = 0;
+                s.queued = false;
+                if !s.waiting {
+                    s.waiting = true;
+                    self.pulling.push(id);
+                }
             } else {
                 self.sending.push_back(id);
             }
@@ -788,6 +1074,11 @@ impl State {
         }
         self.block = None;
         self.sending.clear();
+        for p in self.pings.values_mut() {
+            if let Some(w) = p.waker.take() {
+                w.wake();
+            }
+        }
     }
 
     fn frame(&mut self, head: Head, payload: &[u8]) -> Result<(), ConnError> {
@@ -941,6 +1232,7 @@ impl State {
             // The server answered before the whole request was sent: stop
             // sending it (RFC 9113, section 8.1).
             s.body = Vec::new();
+            s.source = None;
             s.request_done = true;
             s.reset = true;
             frame::write_rst(&mut self.out, id, Reason::NoError);
@@ -1080,6 +1372,14 @@ impl State {
                     StreamError::Protocol("trailers with a :status".into()),
                     Reason::Protocol,
                 );
+            }
+            let mut trailers = Trailers::new();
+            for (name, value) in &d.fields {
+                // Checked when the block was decoded.
+                trailers.received(&d.bytes[name.clone()], &d.bytes[value.clone()]);
+            }
+            if !trailers.is_empty() {
+                s.trailers = Some(Box::new(trailers));
             }
             self.end_of_response(id);
             return Ok(());
@@ -1252,6 +1552,21 @@ impl State {
         }
         if !head.has(frame::ACK) {
             frame::write_ping(&mut self.out, true, payload);
+            return Ok(());
+        }
+        // An acknowledgement of one of ours; any other is ignored.
+        let id = u64::from_be_bytes(payload.try_into().expect("8 bytes, checked above"));
+        if let Some(p) = self.pings.get_mut(&id) {
+            if !p.acked {
+                p.acked = true;
+                if let Some(w) = p.waker.take() {
+                    w.wake();
+                }
+                // The server answered: the connection counts as used.
+                if self.streams.is_empty() {
+                    self.idle_since = Instant::now();
+                }
+            }
         }
         Ok(())
     }
@@ -1467,7 +1782,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
             let out = (write.is_none() && !st.out.is_empty()).then(|| mem::take(&mut st.out));
             st.poked = false;
             // Once the connection is over, only the last write is waited for.
-            let idle_since = (st.dead.is_none() && st.streams.is_empty()).then_some(st.idle_since);
+            let idle_since = st.is_idle().then_some(st.idle_since);
             (out, st.dead.is_some(), st.reading(), idle_since)
         };
         if let Some(out) = out {
@@ -1502,7 +1817,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
             }
             {
                 let mut st = inner.state.borrow_mut();
-                if st.poked {
+                if st.pull(cx.waker()) || st.poked {
                     st.poked = false;
                     return Poll::Ready(Wake::Poked);
                 }
@@ -1560,10 +1875,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
                     );
                     break;
                 }
-                if st.streams.is_empty()
-                    && st.dead.is_none()
-                    && st.idle_since + settings.idle_timeout <= now
-                {
+                if st.is_idle() && st.idle_since + settings.idle_timeout <= now {
                     frame::write_goaway(&mut st.out, 0, Reason::NoError, b"");
                     st.end("the connection was idle for too long".into(), false);
                 }
@@ -1813,6 +2125,11 @@ pub(crate) mod fuzzing {
                     }
                 }
                 9 => match flags % 4 {
+                    // Now and then the acknowledgement of a PING the
+                    // client sent (theirs are numbered from 1).
+                    0 if flags & 0x20 != 0 => {
+                        frame::write_ping(&mut out, true, &u64::from(d.byte() % 4).to_be_bytes())
+                    }
                     0 => frame::write_ping(&mut out, flags & 0x10 != 0, &[d.byte(); 8]),
                     1 => {
                         frame::write_head(&mut out, 5, frame::PRIORITY, 0, stream);
@@ -1858,15 +2175,18 @@ pub(crate) mod fuzzing {
         ];
         let path = a.pick(&["/", "/a?b=c"]);
         let id = awake(st, |st| {
-            st.open(&Request {
-                method,
-                scheme: "https",
-                authority: "example.com",
-                path,
-                fields: &fields,
-                body: (!body.is_empty()).then_some(&body[..]),
-                head_request: method == "HEAD",
-            })
+            st.open(
+                &Request {
+                    method,
+                    scheme: "https",
+                    authority: "example.com",
+                    path,
+                    fields: &fields,
+                    body: (!body.is_empty()).then_some(&body[..]),
+                    head_request: method == "HEAD",
+                },
+                None,
+            )
         });
         bodies.insert(id, body.len());
     }
@@ -2047,10 +2367,9 @@ pub(crate) mod fuzzing {
                     let increment = frame::read_u32(payload);
                     assert!(increment > 0 && increment <= 0x7fff_ffff);
                 }
-                frame::PING => {
-                    assert!(head.has(frame::ACK));
-                    ping_acks += 1;
-                }
+                // The client's own PINGs, and its answers to the server's.
+                frame::PING if !head.has(frame::ACK) => assert_eq!(payload.len(), 8),
+                frame::PING => ping_acks += 1,
                 frame::SETTINGS => {
                     assert!(head.has(frame::ACK));
                     settings_acks += 1;
@@ -2083,6 +2402,7 @@ pub(crate) mod fuzzing {
         }
         let mut out = Vec::new();
         let mut pending = Vec::new();
+        let mut pings = Vec::new();
         let mut at = 0;
         let mut responses = 0;
         loop {
@@ -2119,8 +2439,26 @@ pub(crate) mod fuzzing {
                         responses += read(&mut st, id, a.pick(&[usize::MAX, 1, 16_384]));
                     }
                 }
+                5 => {
+                    if let Some(id) = awake(&mut st, State::ping) {
+                        pings.push(id);
+                    }
+                }
+                6 if a.byte() % 16 == 0 => awake(&mut st, |st| st.retire("retired")),
                 // Nobody reads for a while.
                 _ => {}
+            }
+            // A PING is acknowledged only by an ACK with its payload, and
+            // forgotten once given up.
+            for &id in &pings {
+                if let Some(p) = st.pings.get(&id) {
+                    assert!(!p.acked || id < 4, "PING {id} acknowledged");
+                }
+            }
+            if a.byte() % 4 == 0 {
+                if let Some(id) = pings.pop() {
+                    st.pings.remove(&id);
+                }
             }
             check_state(&st);
             st.fill();

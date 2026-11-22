@@ -1,0 +1,26 @@
+# giong-proto against prost: decode and encode of the same bytes.
+# Run with ../proto.sh, which writes the raw numbers to bench/results/.
+[package]
+name = "proto-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+giong-proto = { path = "../../giong-proto" }
+prost = "0.13"
+prost-types = "0.13"
+protox = "0.8"
+
+[build-dependencies]
+giong-grpc-build = { path = "../../giong-grpc-build" }
+protox = "0.8"
+prost-build = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 1

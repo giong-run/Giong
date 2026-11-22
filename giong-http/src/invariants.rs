@@ -116,6 +116,9 @@ pub fn check_chunked(input: &[u8], max: usize, mut splits: impl FnMut() -> usize
         assert!(whole.body.len() <= max);
         assert_eq!(whole.body, pieces.body);
         assert_eq!(whole.body, body);
+        // The trailer fields too, however the lines were split.
+        assert!(whole.trailers == pieces.trailers);
+        assert!(whole.trailers == streamed.trailers);
         true
     } else {
         false

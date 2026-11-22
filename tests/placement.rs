@@ -1,7 +1,9 @@
 //! Balanced listeners choosing by how busy the workers have been (CPU
 //! time), not only by counts of tasks. In a test binary of their own, so
 //! that other tests do not take the CPU time the busy worker here needs to
-//! look busy.
+//! look busy. Linux only: elsewhere workers' CPU time is not read and
+//! counts decide.
+#![cfg(target_os = "linux")]
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

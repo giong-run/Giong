@@ -15,7 +15,8 @@
 #     default): giong's Pool (statements share connections and pipeline)
 #     against deadpool-postgres with prepare_cached (a connection per
 #     statement while it runs). `client` is one connection shared by every
-#     task, which both libraries pipeline.
+#     task, which both libraries pipeline. `batch` (giong only, not run by
+#     default) is `pool` with `Config::batch_reads(true)`.
 #   * TASKS concurrent tasks issue statements back to back. 2 s of warm-up,
 #     then SECS measured. `cpu%` is the client's core; `srv%` the server's
 #     cores together (100 per core), from /proc/stat. A client below 100% was
@@ -94,6 +95,7 @@ for round in $(seq 1 "$ROUNDS"); do
   for workload in $WORKLOADS; do
     for mode in $MODES; do
       for client in $CLIENTS; do
+        [ "$mode" = batch ] && [ "$client" != giong ] && continue
         out_file="$TMP/out"
         taskset -c "$CLIENT_CPU" "postgres-$client/target/release/bench-postgres-$client" \
           "$URL" "$workload" "$mode" "$TASKS" "$SECS" >"$out_file" &
@@ -120,7 +122,7 @@ med = statistics.median
 print(f"{sys.argv[2]} tasks, pool of {sys.argv[3]}, {sys.argv[4]} rounds of {sys.argv[5]} s; median, min and max of the rounds")
 print(f"{'workload':<9}{'mode':<8}{'client':<8}{'ops/s median':>13}{'min':>9}{'max':>9}{'p50 us':>8}{'p99 us':>8}{'cpu%':>6}{'srv%':>6}")
 for w in ("point", "list"):
-    for m in ("pool", "client"):
+    for m in ("pool", "batch", "client"):
         for c in ("giong", "tokio"):
             sel = [r for r in rows if (r["workload"], r["mode"], r["client"]) == (w, m, c)]
             if not sel: continue
