@@ -1,0 +1,105 @@
+name: Install
+
+# giong.run/install.sh and install.ps1, run as a user runs them, against the
+# giong command built from this commit and packaged as release.yml packages
+# it (scripts/package-cli.sh), served from a local web server through
+# GIONG_DOWNLOAD_URL. A damaged archive must be refused. release.yml runs the
+# same scripts again against the real Release assets.
+
+on:
+  pull_request:
+    paths:
+      - "site/public/install.sh"
+      - "site/public/install.ps1"
+      - "scripts/package-cli.sh"
+      - "giong-cli/**"
+      - ".github/workflows/install.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  install:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked -p giong-cli --target ${{ matrix.target }}
+      - name: Package as a release
+        shell: bash
+        run: |
+          py=python3; command -v python3 > /dev/null || py=python
+          version=$($py scripts/release.py version)
+          echo "GIONG_VERSION=$version" >> "$GITHUB_ENV"
+          scripts/package-cli.sh ${{ matrix.target }} "$version" "dist/v$version"
+          ls -l "dist/v$version"
+          # A second copy with a checksum that does not match.
+          mkdir -p "damaged/v$version"
+          cp "dist/v$version"/* "damaged/v$version/"
+          for f in "damaged/v$version"/*.sha256; do
+            echo "0000000000000000000000000000000000000000000000000000000000000000  ${f##*/}" > "$f"
+          done
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          python3 -m http.server 8765 --bind 127.0.0.1 > /dev/null 2>&1 &
+          for i in $(seq 50); do curl -fsS -o /dev/null http://127.0.0.1:8765/dist/ && break; sleep 0.2; done
+          GIONG_DOWNLOAD_URL=http://127.0.0.1:8765/dist GIONG_INSTALL="$RUNNER_TEMP/bin" \
+            sh site/public/install.sh
+          "$RUNNER_TEMP/bin/giong" version | grep -F "giong $GIONG_VERSION"
+          if GIONG_DOWNLOAD_URL=http://127.0.0.1:8765/damaged GIONG_INSTALL="$RUNNER_TEMP/bad" \
+            sh site/public/install.sh; then
+            echo "::error::install.sh installed an archive whose checksum does not match"
+            exit 1
+          fi
+          test ! -e "$RUNNER_TEMP/bad/giong"
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Started here: a process left by an earlier step may not outlive it on Windows.
+          $server = Start-Process python -ArgumentList "-m", "http.server", "8765", "--bind", "127.0.0.1" -PassThru -WindowStyle Hidden
+          foreach ($i in 1..50) {
+            try { Invoke-WebRequest http://127.0.0.1:8765/dist/ -UseBasicParsing | Out-Null; break } catch { Start-Sleep -Milliseconds 200 }
+          }
+          $env:GIONG_DOWNLOAD_URL = "http://127.0.0.1:8765/dist"
+          $env:GIONG_INSTALL = Join-Path $env:RUNNER_TEMP "bin"
+          # As `irm https://giong.run/install.ps1 | iex` runs it.
+          Get-Content site/public/install.ps1 -Raw | Invoke-Expression
+          $out = & (Join-Path $env:GIONG_INSTALL "giong.exe") version
+          if ($out -notmatch [regex]::Escape("giong $env:GIONG_VERSION")) { throw "installed: $out" }
+          $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          if (-not ($userPath -split ";" -contains $env:GIONG_INSTALL)) { throw "not added to the user PATH: $userPath" }
+          # Run again: still one PATH entry.
+          Get-Content site/public/install.ps1 -Raw | Invoke-Expression
+          $count = @([Environment]::GetEnvironmentVariable("Path", "User") -split ";" | Where-Object { $_ -eq $env:GIONG_INSTALL }).Count
+          if ($count -ne 1) { throw "PATH holds the folder $count times" }
+          $env:GIONG_DOWNLOAD_URL = "http://127.0.0.1:8765/damaged"
+          $env:GIONG_INSTALL = Join-Path $env:RUNNER_TEMP "bad"
+          $refused = $false
+          try { Get-Content site/public/install.ps1 -Raw | Invoke-Expression } catch { $refused = $_.ToString() -match "damaged" }
+          if (-not $refused) { throw "install.ps1 installed an archive whose checksum does not match" }
+          if (Test-Path (Join-Path $env:GIONG_INSTALL "giong.exe")) { throw "the damaged giong.exe was installed" }
+          Stop-Process -Id $server.Id

@@ -294,10 +294,22 @@ pub fn counts_rings_as_locked(k: Version) -> bool {
 }
 
 fn macos(r: &mut Report) {
-    if let Some(soft) = host::output("sh", &["-c", "ulimit -n"])
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n < 10_240)
-    {
+    let limit = |flag: &str| -> Option<Option<u64>> {
+        let out = host::output("sh", &["-c", &format!("ulimit {flag}")])?;
+        match out.trim() {
+            "unlimited" => Some(None),
+            n => n.parse().ok().map(Some),
+        }
+    };
+    let (Some(soft), hard) = (limit("-Sn"), limit("-Hn")) else {
+        return;
+    };
+    // The same shape as on Linux: agents read data, not the text.
+    r.data(
+        "open_files_limit",
+        json!({"soft": soft, "hard": hard.unwrap_or(None)}),
+    );
+    if let Some(soft) = soft.filter(|&n| n < 10_240) {
         r.push(
             Finding::new(
                 Code::OPEN_FILES_LIMIT,

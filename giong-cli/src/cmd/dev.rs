@@ -15,7 +15,7 @@
 //!
 //! On a laptop it starts the service with `WORKERS=2` unless `WORKERS` is set
 //! (`--prod-like` leaves it to the service). It also sets `RUST_BACKTRACE=1`
-//! and a per-process giong-mcp socket (`GIONG_MCP=unix:.giong/mcp-*.sock`),
+//! and a per-process giong-mcp socket (`GIONG_MCP=unix:.giong/mcp-*.sock`, or under /tmp when that path is too long for a socket),
 //! unless they are set, and every variable of `.env` the environment does not
 //! set already.
 //!
@@ -176,7 +176,13 @@ struct Dev {
     log: Arc<Mutex<File>>,
     current: Option<Service>,
     retiring: Vec<Retiring>,
+    /// Builds started after the first one that served.
     restarts: u64,
+    /// A build has started once.
+    served: bool,
+    /// Every start attempted: names each service's giong-mcp socket, so a new
+    /// build never takes the socket of the one still serving.
+    starts: u64,
     started_at: u64,
     build: BuildState,
     report: Report,
@@ -249,6 +255,8 @@ impl Dev {
             current: None,
             retiring: Vec::new(),
             restarts: 0,
+            starts: 0,
+            served: false,
             started_at: unix_ms(),
             build: BuildState::default(),
             report: Report::new("dev"),
@@ -546,7 +554,10 @@ impl Dev {
                 if let Some(old) = self.current.replace(service) {
                     self.retire(old);
                 }
-                self.restarts += 1;
+                if self.served {
+                    self.restarts += 1;
+                }
+                self.served = true;
                 self.write_state();
                 let took = changed_at.elapsed();
                 let addrs: Vec<String> = self.listen.iter().map(|a| a.to_string()).collect();
@@ -594,7 +605,8 @@ impl Dev {
 
     fn start(&mut self, exe: &Path, shared: bool) -> Result<Service, Finding> {
         let state_dir = self.project.root.join(".giong");
-        let mcp = state_dir.join(format!("mcp-{}-{}.sock", std::process::id(), self.restarts));
+        self.starts += 1;
+        let mcp = mcp_socket(&state_dir, self.starts);
         let _ = fs::remove_file(&mcp);
         let mut cmd = Process::new(exe);
         cmd.args(&self.service_args)
@@ -1029,7 +1041,50 @@ impl Dev {
             let _ = r.child.wait();
         }
         let _ = fs::remove_file(self.project.root.join(".giong").join("dev.json"));
+        // The folder of short socket paths, when the project's was too long.
+        #[cfg(unix)]
+        let _ = fs::remove_dir(short_socket_dir());
     }
+}
+
+/// Where the giong-mcp socket of the `n`th start goes: `.giong/` in the
+/// project, unless that path is longer than a Unix socket address holds
+/// (104 bytes on macOS, 108 on Linux, counting the final NUL); then a folder
+/// of this process's own under /tmp, readable by this user only.
+fn mcp_socket(state_dir: &Path, n: u64) -> PathBuf {
+    let local = state_dir.join(format!("mcp-{}-{n}.sock", std::process::id()));
+    #[cfg(unix)]
+    if local.as_os_str().len() > MAX_SOCKET_PATH {
+        let dir = short_socket_dir();
+        if private_dir(&dir, state_dir) {
+            return dir.join(format!("mcp-{n}.sock"));
+        }
+    }
+    local
+}
+
+/// The longest socket path that fits everywhere (macOS: 103 bytes and a NUL).
+#[cfg(unix)]
+const MAX_SOCKET_PATH: usize = 100;
+
+#[cfg(unix)]
+fn short_socket_dir() -> PathBuf {
+    PathBuf::from(format!("/tmp/giong-dev-{}", std::process::id()))
+}
+
+/// Makes `dir` with mode 0700, or accepts it if it already is a folder of the
+/// user who owns `owner_of` with that mode (another user could have made it
+/// first, to read the service's state).
+#[cfg(unix)]
+fn private_dir(dir: &Path, owner_of: &Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if fs::DirBuilder::new().mode(0o700).create(dir).is_ok() {
+        return true;
+    }
+    let (Ok(d), Ok(o)) = (fs::symlink_metadata(dir), fs::metadata(owner_of)) else {
+        return false;
+    };
+    d.is_dir() && d.uid() == o.uid() && d.permissions().mode() & 0o077 == 0
 }
 
 fn start_failed(what: String) -> Finding {
@@ -1339,6 +1394,30 @@ fn lock_giong_version(lock: &str) -> Option<(crate::host::Version, bool)> {
 mod tests {
     use super::*;
     use crate::host::Version;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_path_too_long_moves_to_a_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("giong-dev-sock-{}", std::process::id()));
+        let short = base.join(".giong");
+        fs::create_dir_all(&short).unwrap();
+        assert_eq!(mcp_socket(&short, 1).parent(), Some(short.as_path()));
+        let long = base.join("a".repeat(120)).join(".giong");
+        fs::create_dir_all(&long).unwrap();
+        let moved = mcp_socket(&long, 2);
+        assert_eq!(moved, short_socket_dir().join("mcp-2.sock"));
+        assert!(moved.as_os_str().len() <= MAX_SOCKET_PATH);
+        let mode = fs::metadata(short_socket_dir())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // Asked again (the next start), the folder is accepted as it is.
+        assert_eq!(mcp_socket(&long, 3), short_socket_dir().join("mcp-3.sock"));
+        let _ = fs::remove_dir(short_socket_dir());
+        let _ = fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn listen_comes_from_the_flag_then_the_environment_then_env_file() {

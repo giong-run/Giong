@@ -148,10 +148,14 @@ pub fn diagnostic(m: &Value, dir: &Path) -> Option<(Finding, String)> {
             "rustc --explain {lint} explains it; the compiler's message above says what to change"
         )
     } else if lint.starts_with("clippy::") {
-        format!(
-            "follow clippy's suggestion (https://rust-lang.github.io/rust-clippy/master/#{})",
-            lint.trim_start_matches("clippy::")
-        )
+        // The link clippy itself prints names the docs of the clippy that ran.
+        let link = clippy_link(&plain).unwrap_or_else(|| {
+            format!(
+                "https://rust-lang.github.io/rust-clippy/master/#{}",
+                lint.trim_start_matches("clippy::")
+            )
+        });
+        format!("follow clippy's suggestion ({link})")
     } else {
         "the compiler's message above says what to change".to_string()
     });
@@ -173,6 +177,31 @@ pub fn diagnostic(m: &Value, dir: &Path) -> Option<(Finding, String)> {
     Some((f, rendered))
 }
 
+/// The lint's documentation link in clippy's message, for the version that ran.
+fn clippy_link(rendered: &str) -> Option<String> {
+    let at = rendered.find("https://rust-lang.github.io/rust-clippy/")?;
+    let link: String = rendered[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ')' | '>' | '`'))
+        .collect();
+    Some(link)
+}
+
+/// A file cargo names relative to the workspace, or under it. A rooted path
+/// counts as absolute everywhere: on Windows `/home/u/x.rs` has a root but no
+/// drive, and `is_absolute` alone would take it for a project file.
+fn in_project(path: &Path, dir: &Path) -> bool {
+    use std::path::Component;
+    if path.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let rooted = path
+        .components()
+        .next()
+        .is_some_and(|c| matches!(c, Component::RootDir | Component::Prefix(_)));
+    !rooted || path.starts_with(dir)
+}
+
 fn collect_edits(m: &Value, dir: &Path, edits: &mut Vec<Edit>) {
     for s in m["spans"].as_array().into_iter().flatten() {
         if s["suggestion_applicability"] == "MachineApplicable" {
@@ -183,8 +212,7 @@ fn collect_edits(m: &Value, dir: &Path, edits: &mut Vec<Edit>) {
                 s["suggested_replacement"].as_str(),
             ) {
                 // Only files of the project, never of a dependency.
-                let path = Path::new(file);
-                if path.is_absolute() && !path.starts_with(dir) {
+                if !in_project(Path::new(file), dir) {
                     continue;
                 }
                 edits.push(Edit {
@@ -276,6 +304,26 @@ mod tests {
              "suggestion_applicability": "MachineApplicable", "suggested_replacement": "y"}]});
         let (f, _) = diagnostic(&m, Path::new("/p")).unwrap();
         assert!(!f.fixable);
+    }
+
+    #[test]
+    fn clippy_links_name_the_version_that_ran() {
+        let text = "warning: x\n  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#len_zero\n";
+        assert_eq!(
+            clippy_link(text).as_deref(),
+            Some("https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#len_zero")
+        );
+        assert_eq!(clippy_link("warning: x"), None);
+    }
+
+    #[test]
+    fn only_project_files_take_edits() {
+        let p = Path::new("/p");
+        assert!(in_project(Path::new("src/main.rs"), p));
+        assert!(in_project(Path::new("/p/src/main.rs"), p));
+        assert!(!in_project(Path::new("/home/u/.cargo/registry/x.rs"), p));
+        assert!(!in_project(Path::new("../other/src/lib.rs"), p));
+        assert!(!in_project(Path::new("src/../../x.rs"), p));
     }
 
     #[test]

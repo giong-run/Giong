@@ -118,6 +118,9 @@ pub fn cargo_missing(e: std::io::Error) -> Failure {
 
 /// The first `error:` line of cargo's output, or its first line.
 pub fn first_error(stderr: &str) -> String {
+    // CARGO_TERM_COLOR=always (as CI sets) colours the output even when it
+    // is captured: `\x1b[1m\x1b[91merror`.
+    let stderr = crate::build::strip_ansi(stderr);
     stderr
         .lines()
         .find(|l| l.trim_start().starts_with("error"))
@@ -134,6 +137,11 @@ mod tests {
     #[test]
     fn manifest_dir_is_found_above() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // CI's kernel VMs run the test binaries without the source tree.
+        if !here.join("Cargo.toml").exists() {
+            eprintln!("skipped: no source tree here");
+            return;
+        }
         assert_eq!(find_manifest_dir(&here.join("src")).as_deref(), Some(here));
     }
 
@@ -145,5 +153,11 @@ mod tests {
         );
         assert_eq!(first_error("\nsomething\n"), "something");
         assert_eq!(first_error(""), "no output");
+        assert_eq!(
+            first_error(
+                "\x1b[1m\x1b[92m   Compiling\x1b[0m x v0.1.0\n\x1b[1m\x1b[91merror\x1b[0m\x1b[1m: bad thing\x1b[0m\n"
+            ),
+            "error: bad thing"
+        );
     }
 }
