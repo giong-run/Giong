@@ -164,7 +164,10 @@ fn a_chain_of_sleeps_is_not_a_tick_late_each_time() {
         }
         took.sort();
         let median = took[10];
-        assert!(took[0] >= Duration::from_millis(2), "a sleep ended early: {took:?}");
+        assert!(
+            took[0] >= Duration::from_millis(2),
+            "a sleep ended early: {took:?}"
+        );
         assert!(
             median < Duration::from_micros(2_700),
             "a 2 ms sleep took {median:?} (median of 21; all: {took:?})"

@@ -288,15 +288,17 @@ impl Timers {
     /// When the event loop must wake up next for timers: at the earliest
     /// deadline itself, not at the start of its millisecond, unless timers
     /// fired less than a tick ago (see `quiet_until`).
+    #[inline]
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
         let wheel = match self.next_expiration() {
             Some((0, slot, _)) => self.earliest[slot],
             // A slot to cascade, at the start of its millisecond.
             Some((_, _, tick)) => tick * NANOS_PER_TICK as u64,
+            None if self.due == NIL => return None,
             None => u64::MAX,
         };
-        let at = wheel.min(self.due_at);
-        (at != u64::MAX).then(|| self.start + Duration::from_nanos(at.max(self.quiet_until)))
+        let at = wheel.min(self.due_at).max(self.quiet_until);
+        Some(self.start + Duration::from_nanos(at))
     }
 
     /// Advances the wheel to `now` and returns the wakers of all due timers:
