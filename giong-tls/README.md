@@ -154,7 +154,7 @@ So `Ktls::Off` stays the default. Use `Ktls::Auto` on a server whose large respo
 
 ## Performance
 
-Measured with `bench/tls.sh` on one core, with the same rustls and `ring` on both sides (4-vCPU VM, seven rounds, [`bench/results/tls/`](../bench/results/tls/README.md)): HTTPS through `giong-http` reaches 146.6k req/s on `/json` against 81.2k for Axum + rustls, and 48.7k against 18.5k with 8 KB responses. Details and how to read the numbers are in the [main README](../README.md#https); kernel TLS has its own numbers [above](#when-it-pays-off).
+Measured with `bench/tls.sh` on one core, with the same rustls and `ring` on both sides (4-vCPU VM, seven rounds, [`bench/results/tls/`](../bench/results/tls/README.md)): HTTPS through `giong-http` reaches 146.6k req/s on `/json` against 81.2k for Axum + rustls, and 48.7k against 18.5k with 8 KB responses. Details and how to read the numbers are in [docs/BENCHMARKS.md](../docs/BENCHMARKS.md#https); kernel TLS has its own numbers [above](#when-it-pays-off).
 
 ### Handshakes
 
