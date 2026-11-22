@@ -624,27 +624,6 @@ platform it is tuned for.
 **Exit criteria:** the test suite passes on Windows in CI, and a benchmark against Tokio on
 Windows is published with its method.
 
-## 1.4.x — Debugged and proven
-
-Right after 1.4.0, every platform is debugged in depth and every claim is measured again
-on real machines. No new features: fixes ship as 1.4.x patch releases.
-
-- [ ] Rounds of review, each code reading and a live attack (fuzzing, fault injection,
-      soaks, hostile clients), on Linux, macOS and Windows, repeated until a whole round
-      finds no blocker. Windows and macOS get the most rounds: they are the newest.
-- [ ] What 1.1 to 1.4 left open that is a fix, not a feature, shipped as a 1.4.x patch.
-      First among them, containers: workers sharing a port under gVisor, a coded error
-      when the container's process limit stops a worker from starting, and io_uring that
-      a sandbox refuses at setup falling back to epoll.
-- [ ] Every published number measured again on rented bare metal, with method and raw data
-      in the repository: the benchmark lab from 1 to 16 cores, the adaptive spin governor
-      (#186) that a cloud VM could not judge, and HTTP/3 between two machines over a real network card,
-      against HTTP/2 on giong and against quinn with h3 on Tokio. Losses are published
-      with the wins.
-
-**Exit criteria:** a whole review round on the three platforms finds no blocker, and the
-bare-metal results are in the repository and on giong.run.
-
 ## 1.5 — Lean under pressure, and a developer kit
 
 Hardware, memory above all, is expensive, so a service should carry heavy load on a small
@@ -718,29 +697,26 @@ ledger and how quotas are shared are chosen from its results, not before.
       after A's upstream recovers, how long B takes to get back to normal. Those two
       numbers are what isolating tenants costs.
 
-### The developer kit: the `giong` command (1.5.x)
+### The developer kit: the `giong` command
 
 Rust is excellent for what ships and slow for the hours before: edit, compile, restart,
 lose the connection, retry. Every team assembles its own kit, and an agent has to guess
 which. giong owns the runtime, the HTTP stack, the database clients, the MCP server and a
 simulator, so its kit can do what tools working from outside a process cannot. One
 binary, `giong`, one command per job, `--json` on every command and an MCP server of its
-own, so an agent drives it as easily as a person. The library additions it needs ship in
-1.5.0; the later waves change only the command, in 1.5.1 and 1.5.2.
+own, so an agent drives it as easily as a person. The whole kit ships in 1.5.0.
 
-- [ ] **1.5.0, the first hour:** one-command install on every system; `giong new` from
-      templates tested in CI; `giong ai init` (AGENTS.md, the skill, the MCP settings for
-      the agent); `giong doctor` for the machine; `giong check --json` with each compiler
+- [ ] **The first hour:** one-command install on every system; `giong new` from templates
+      tested in CI; `giong ai init` (AGENTS.md, the skill, the MCP settings for the
+      agent); `giong doctor` for the machine; `giong check --json` with each compiler
       error explained; `giong clean` for old build output; and `giong dev`, which restarts
       the service on every change without dropping a request: the new process takes the
       listening sockets, the old one finishes what it was answering.
-- [ ] **1.5.1, the daily loop:** `giong fix` for mechanical fixes, `giong test`, databases
-      started and migrated (`giong db`), configuration from the environment, a local
-      dashboard built on giong-mcp, and an OpenAPI description of the routes and their
-      errors.
-- [ ] **1.5.2, ship and tune:** `giong top` for a running service, `giong bench` on the
-      benchmark lab, real requests recorded as tests, and a container image built without
-      Docker.
+- [ ] **The daily loop:** `giong fix` for mechanical fixes, `giong test`, databases started
+      and migrated (`giong db`), configuration from the environment, a local dashboard
+      built on giong-mcp, and an OpenAPI description of the routes and their errors.
+- [ ] **Ship and tune:** `giong top` for a running service, `giong bench` on the benchmark
+      lab, real requests recorded as tests, and a container image built without Docker.
 
 HTTP/3 is hardened in the same release, on its way to dropping `unstable`:
 
@@ -757,10 +733,33 @@ passes on both drivers. For the kit: `giong new` to a running service in one com
 Linux and macOS, templates built and tested in CI, and `giong dev` restarting under load
 with no failed request.
 
+## 1.5.x — Debugged and proven
+
+No new features. After 1.5.0, a long pass of debugging and improving every platform, with
+fixes shipped as 1.5.x patch releases; then every claim measured again on real machines.
+Nothing for 1.6 starts before this milestone is done.
+
+- [ ] Rounds of review, each code reading and a live attack (fuzzing, fault injection,
+      soaks, hostile clients), on Linux, macOS and Windows, repeated until a whole round
+      finds no blocker. Windows and macOS get the most rounds: they are the newest.
+- [ ] What 1.1 to 1.5 left open that is a fix, not a feature, shipped as a 1.5.x patch.
+      Among them, containers: workers sharing a port under gVisor, a coded error when the
+      container's process limit stops a worker from starting, and io_uring that a sandbox
+      refuses at setup falling back to epoll.
+- [ ] Then every published number measured again on rented bare metal, with method and
+      raw data in the repository: the benchmark lab from 1 to 16 cores, the adaptive spin
+      governor (#186) that a cloud VM could not judge, and HTTP/3 between two machines over
+      a real network card, against HTTP/2 on giong and against quinn with h3 on Tokio.
+      Losses are published with the wins.
+
+**Exit criteria:** a whole review round on the three platforms finds no blocker, and the
+bare-metal results are in the repository and on giong.run.
+
 ## 1.6 — HTTP/3, stable
 
-Proposed: what 1.6 and 1.7 hold is settled when 1.5 ships. HTTP/3 leaves `unstable`, and
-the first wave of the runtime core lands where its proposal is accepted.
+Proposed: what 1.6 and 1.7 hold is settled once 1.5.x is done, and no 1.6 work starts
+before then. HTTP/3 leaves `unstable`, and the first wave of the runtime core lands where
+its proposal is accepted.
 
 - [ ] A final review of giong-quic's API and of giong-http's HTTP/3 surface (one way per
       task, coded errors), then `cargo-semver-checks` against 1.3.0.

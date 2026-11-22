@@ -7,8 +7,8 @@
 
 ### Changed
 
-- **Roadmap**: 1.4.x (deep debugging on every platform and every number measured again on
-  bare metal), the developer kit (the `giong` command) in 1.5.x, and 1.6 and 1.7 as
+- **Roadmap**: the developer kit (the `giong` command) in 1.5.0, then 1.5.x (deep debugging
+  on every platform, then every number measured again on bare metal), and 1.6 and 1.7 as
   proposed milestones. giong.run's home page shows each crate head to head with the Tokio
   crate it replaces, with the losses next to the wins, the build numbers and what comes
   next; the roadmap page draws every milestone on one track, gives each one ahead a card,
