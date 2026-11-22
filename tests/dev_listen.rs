@@ -57,7 +57,7 @@ fn dev_child() {
             async move {
                 eprintln!("dev_child: worker {worker} binds {addr}");
                 let l = giong::net::TcpListener::bind(addr.as_str()).unwrap();
-                eprintln!("dev_child: worker {worker} bound");
+                eprintln!("dev_child: worker {worker} bound; {}", ready_state());
                 assert_eq!(l.local_addr().unwrap().to_string(), addr);
                 // Dropping a duplicate leaves the shared socket listening.
                 drop(giong::net::TcpListener::bind(addr.as_str()).unwrap());
@@ -71,6 +71,41 @@ fn dev_child() {
             }
         })
         .unwrap();
+}
+
+/// What the child sees of its ready descriptor and parent, printed when
+/// the test fails.
+fn ready_state() -> String {
+    let parent = std::env::var("GIONG_DEV_PARENT").unwrap_or_default();
+    let Some(fd) = std::env::var("GIONG_DEV_READY")
+        .ok()
+        .and_then(|r| r.parse::<i32>().ok())
+    else {
+        return "no GIONG_DEV_READY".into();
+    };
+    // SAFETY: plain syscalls on a descriptor number; a zero-length send
+    // carries nothing.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        let fd_err = std::io::Error::last_os_error();
+        let mut ty: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let got = libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut ty as *mut libc::c_int).cast(),
+            &mut len,
+        );
+        let ty_err = std::io::Error::last_os_error();
+        let sent = libc::send(fd, b"".as_ptr().cast(), 0, libc::MSG_DONTWAIT);
+        let send_err = std::io::Error::last_os_error();
+        format!(
+            "parent {} (GIONG_DEV_PARENT {parent}); ready fd {fd}: F_GETFD {flags} ({fd_err}), \
+             SO_TYPE {got}/{ty} ({ty_err}), empty send {sent} ({send_err})",
+            libc::getppid()
+        )
+    }
 }
 
 /// Kills the service if the test fails half way, so no copy is left behind.
@@ -112,14 +147,26 @@ fn restarts_share_the_socket_and_refuse_nothing() {
             .unwrap();
         // Two workers, each binding twice: four bytes.
         let mut got = [0u8; 4];
-        if let Err(e) = ours.read_exact(&mut got) {
+        let mut have = 0;
+        let read = loop {
+            if have == got.len() {
+                break Ok(());
+            }
+            match ours.read(&mut got[have..]) {
+                Ok(0) => break Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => have += n,
+                Err(e) => break Err(e),
+            }
+        };
+        if let Err(e) = read {
             let status = service.0.try_wait();
             let _ = service.0.kill();
             let mut err = String::new();
             let _ = service.0.stderr.take().unwrap().read_to_string(&mut err);
             panic!(
-                "round {round}: the build did not report its binds ({e}); \
-                 it had {status:?}; its standard error:\n{err}"
+                "round {round}: the build reported {have} of 4 binds ({:?}), then {e}; \
+                 it had {status:?}; its standard error:\n{err}",
+                &got[..have]
             );
         }
         assert_eq!(&got, b"\n\n\n\n", "round {round}");
