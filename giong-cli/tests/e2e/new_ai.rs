@@ -260,9 +260,13 @@ fn ai_init_is_idempotent_and_keeps_what_people_wrote() {
         mcp["mcpServers"]["other"]["command"], "other-server",
         "another MCP server was dropped: {mcp:#}"
     );
-    assert!(
-        mcp["mcpServers"].as_object().unwrap().len() >= 2,
-        "giong's server was not added: {mcp:#}"
+    // giong's own server only once `giong mcp` exists: a server entry that
+    // exits at once would break the agent's MCP connection.
+    let has_giong = mcp["mcpServers"].get("giong").is_some();
+    assert_eq!(
+        has_giong,
+        has_command("mcp"),
+        "giong's server is listed exactly when `giong mcp` exists: {mcp:#}"
     );
     let first = snapshot(dir.path());
     giong(["ai", "init", "--json"])
@@ -310,6 +314,120 @@ fn ai_init_does_not_replace_a_broken_mcp_json() {
         v.get("error").is_some() || !v["findings"].as_array().unwrap().is_empty(),
         "the broken .mcp.json was skipped without a word: {v:#}"
     );
+}
+
+/// A file giong cannot read as UTF-8 is someone's file: left byte for byte.
+#[test]
+fn ai_init_leaves_files_it_cannot_read_alone() {
+    if !has_command("ai") {
+        return;
+    }
+    let dir = TempDir::new("ai-latin1");
+    new_package(&dir, "latin", "");
+    let agents: &[u8] = b"# Mes r\xe8gles\nNe pas effacer.\n";
+    let mcp: &[u8] = b"{\"mcpServers\":{\"db\":{\"command\":\"psql\",\"note\":\"caf\xe9\"}}}";
+    std::fs::write(dir.join("AGENTS.md"), agents).unwrap();
+    std::fs::write(dir.join(".mcp.json"), mcp).unwrap();
+    let out = giong(["ai", "init", "--json"]).dir(dir.path()).run();
+    out.report("ai");
+    assert_eq!(
+        std::fs::read(dir.join("AGENTS.md")).unwrap(),
+        agents,
+        "{}",
+        out.dump()
+    );
+    assert_eq!(
+        std::fs::read(dir.join(".mcp.json")).unwrap(),
+        mcp,
+        "{}",
+        out.dump()
+    );
+}
+
+/// `CLAUDE.md -> AGENTS.md` is a common setup: one file, written once, the
+/// same on every later run, and never importing itself.
+#[cfg(unix)]
+#[test]
+fn ai_init_with_claude_md_linked_to_agents_md() {
+    if !has_command("ai") {
+        return;
+    }
+    let dir = TempDir::new("ai-symlink");
+    new_package(&dir, "linked", "");
+    dir.write("AGENTS.md", "# My rules\nKeep this.\n");
+    std::os::unix::fs::symlink("AGENTS.md", dir.join("CLAUDE.md")).unwrap();
+    giong(["ai", "init"]).dir(dir.path()).run().expect_code(0);
+    let first = dir.read("AGENTS.md");
+    assert!(first.starts_with("# My rules\nKeep this.\n"), "{first}");
+    assert!(first.contains("giong:begin"), "no giong block: {first}");
+    assert!(
+        !first.contains("@AGENTS.md"),
+        "AGENTS.md imports itself: {first}"
+    );
+    for _ in 0..2 {
+        giong(["ai", "init"]).dir(dir.path()).run().expect_code(0);
+        assert_eq!(dir.read("AGENTS.md"), first, "not idempotent");
+    }
+    assert!(std::fs::symlink_metadata(dir.join("CLAUDE.md"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// Every `giong <command>` the agent files name is a command this build has:
+/// an agent told to run a missing command wastes a turn on E5000.
+#[test]
+fn agent_files_name_only_commands_that_exist() {
+    if !has_command("ai") {
+        return;
+    }
+    let dir = TempDir::new("ai-commands");
+    new_package(&dir, "cmds", "");
+    giong(["ai", "init"]).dir(dir.path()).run().expect_code(0);
+    let have = crate::harness::commands();
+    let mut text = String::new();
+    for f in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".mcp.json",
+        ".cursor/rules/giong.mdc",
+    ] {
+        if let Ok(t) = std::fs::read_to_string(dir.join(f)) {
+            text.push_str(&t);
+        }
+    }
+    let mut missing = Vec::new();
+    for (i, _) in text.match_indices("giong ") {
+        let word: String = text[i + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase())
+            .collect();
+        // Prose like "giong is" is not a command; a known command word is.
+        if word.len() > 1 && !have.contains(&word) && looks_like_command(&text, i) {
+            missing.push(word);
+        }
+    }
+    let mcp: Value = std::fs::read_to_string(dir.join(".mcp.json"))
+        .map(|t| serde_json::from_str(&t).unwrap())
+        .unwrap_or(Value::Null);
+    if let Some(args) = mcp["mcpServers"]["giong"]["args"].as_array() {
+        let w = args[0].as_str().unwrap().to_string();
+        if !have.contains(&w) {
+            missing.push(w);
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "the agent files name missing commands {missing:?}\n{text}"
+    );
+}
+
+/// `giong x` inside backticks or at the start of a code line.
+fn looks_like_command(text: &str, i: usize) -> bool {
+    let before = &text[..i];
+    before.ends_with('`') || before.ends_with("\n") || before.ends_with("$ ")
 }
 
 /// `giong fix` applies the compiler's machine-applicable suggestion, writes
