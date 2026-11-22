@@ -175,33 +175,28 @@ pub mod mpsc {
         /// call returns it.
         pub async fn recv(&mut self) -> Option<T> {
             poll_fn(|cx| {
+                let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
+                if taken.is_empty() {
+                    let mut state = self.shared.lock();
+                    if state.queue.is_empty() {
+                        if state.senders == 0 {
+                            return Poll::Ready(None);
+                        }
+                        match &state.rx_waker {
+                            Some(w) if w.will_wake(cx.waker()) => {}
+                            _ => state.rx_waker = Some(cx.waker().clone()),
+                        }
+                        return Poll::Pending;
+                    }
+                    std::mem::swap(&mut state.queue, taken);
+                }
                 // A value that is ready at once counts against the task's
                 // budget: a receiver that other threads keep fed must still
                 // let the worker's other tasks and its event loop run.
-                if !crate::driver::spend_budget() {
-                    cx.waker().wake_by_ref();
+                if !crate::driver::spend_or_yield(cx) {
                     return Poll::Pending;
                 }
-                let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
-                if let Some(value) = taken.pop_front() {
-                    return Poll::Ready(Some(value));
-                }
-                let mut state = self.shared.lock();
-                if !state.queue.is_empty() {
-                    std::mem::swap(&mut state.queue, taken);
-                    drop(state);
-                    return Poll::Ready(taken.pop_front());
-                }
-                if state.senders == 0 {
-                    return Poll::Ready(None);
-                }
-                match &state.rx_waker {
-                    Some(w) if w.will_wake(cx.waker()) => {}
-                    _ => state.rx_waker = Some(cx.waker().clone()),
-                }
-                drop(state);
-                crate::driver::give_back_budget();
-                Poll::Pending
+                Poll::Ready(taken.pop_front())
             })
             .await
         }

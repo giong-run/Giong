@@ -34,7 +34,15 @@ impl<T> State<T> {
 
     /// Gives free slots to the senders that have waited longest. Returns the
     /// wakers to call once the lock is released.
+    #[inline]
     fn grant(&mut self, wake: &mut Vec<Waker>) {
+        // Nobody waiting, the common case: nothing to do, without a call.
+        if !self.order.is_empty() {
+            self.grant_waiting(wake);
+        }
+    }
+
+    fn grant_waiting(&mut self, wake: &mut Vec<Waker>) {
         while self.room() {
             let Some(id) = self.order.pop_front() else {
                 return;
@@ -55,7 +63,15 @@ impl<T> Shared<T> {
     }
 }
 
+#[inline]
 fn wake_all(wakers: Vec<Waker>) {
+    // Usually empty: then there is nothing to free or call either.
+    if !wakers.is_empty() {
+        wake_each(wakers);
+    }
+}
+
+fn wake_each(wakers: Vec<Waker>) {
     for waker in wakers {
         waker.wake();
     }
@@ -203,15 +219,6 @@ impl<T> Sender<T> {
             id: None,
         };
         let waker = poll_fn(|cx| {
-            // A first poll that finds room sends at once, and counts against
-            // the task's budget, so a sender that a receiver on another
-            // thread keeps draining still yields. A sender that waited for
-            // its slot has yielded already.
-            let first = waiting.id.is_none();
-            if first && !crate::driver::spend_budget() {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
             let mut state = self.shared.lock();
             if !state.rx_alive {
                 let value = value.take().expect("polled after completion");
@@ -229,6 +236,13 @@ impl<T> Sender<T> {
                 },
             };
             if admitted {
+                // A first poll that finds room sends at once, and counts
+                // against the task's budget, so that a sender whose receiver
+                // on another thread keeps up still yields. A sender that
+                // waited for its slot has yielded already.
+                if waiting.id.is_none() && !crate::driver::spend_or_yield(cx) {
+                    return Poll::Pending;
+                }
                 waiting.id = None;
                 state
                     .queue
@@ -247,10 +261,6 @@ impl<T> Sender<T> {
                 None => {
                     state.wakers.insert(id, cx.waker().clone());
                 }
-            }
-            drop(state);
-            if first {
-                crate::driver::give_back_budget();
             }
             Poll::Pending
         })
@@ -327,16 +337,16 @@ impl<T> Receiver<T> {
     pub async fn recv(&mut self) -> Option<T> {
         let mut wake = Vec::new();
         let value = poll_fn(|cx| {
-            // A value that is ready at once counts against the task's budget,
-            // as in the unbounded channel.
-            if !crate::driver::spend_budget() {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
             let mut state = self.shared.lock();
-            if let Some(value) = state.queue.pop_front() {
+            if !state.queue.is_empty() {
+                // A value that is ready at once counts against the task's
+                // budget, as in the unbounded channel.
+                if !crate::driver::spend_or_yield(cx) {
+                    return Poll::Pending;
+                }
+                let value = state.queue.pop_front();
                 state.grant(&mut wake);
-                return Poll::Ready(Some(value));
+                return Poll::Ready(value);
             }
             if state.senders == 0 {
                 return Poll::Ready(None);
@@ -345,8 +355,6 @@ impl<T> Receiver<T> {
                 Some(w) if w.will_wake(cx.waker()) => {}
                 _ => state.rx_waker = Some(cx.waker().clone()),
             }
-            drop(state);
-            crate::driver::give_back_budget();
             Poll::Pending
         })
         .await;
