@@ -130,7 +130,12 @@ fn dashboard(dir: &Path) -> Dash {
         .read_line(&mut first)
         .unwrap();
     let v: Value = serde_json::from_str(&first).unwrap_or_else(|e| panic!("{e}: {first}"));
-    let url = v["url"].as_str().unwrap();
+    // The report every command prints with --json, before the server blocks.
+    assert_eq!(v["command"], "dashboard", "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["findings"], json!([]), "{v}");
+    assert!(v["version"].is_string(), "{v}");
+    let url = v["data"]["url"].as_str().unwrap();
     let addr = url
         .trim_start_matches("http://")
         .trim_end_matches('/')

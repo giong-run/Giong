@@ -78,14 +78,16 @@ fn run(args: &Args) -> Result<Report, Failure> {
         }
     })?;
     let url = d.url();
+    let mut r = Report::new("dashboard");
+    r.data("url", json!(url));
     if args.json() {
-        // One line agents can read before the server blocks.
-        println!("{}", json!({"command": "dashboard", "url": url}));
+        // The one document, printed before the server blocks, so an agent
+        // reads the address while the page is up.
+        println!("{}", r.to_json());
     } else {
         eprintln!("giong dashboard: {url} (Ctrl-C stops it)");
     }
     d.serve();
-    let mut r = Report::new("dashboard");
-    r.data("url", json!(url));
-    Ok(r)
+    // Already printed: a second document would break `--json`.
+    Ok(r.quiet())
 }
