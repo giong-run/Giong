@@ -865,6 +865,7 @@ fn soak() {
     };
     #[cfg(unix)]
     let system = 0;
+    eprintln!("soak: {fds_after} descriptors open, {fds_before} before the soak; new since: {new}");
     assert!(
         fds_after <= fds_before + system,
         "descriptors leaked: {fds_after} open, {fds_before} before the soak; new since: {new}"
