@@ -118,8 +118,12 @@ instead of into the current pull request.
 - **Merged**: GitHub deletes the branch of a merged pull request
   (`delete_branch_on_merge`). Check it did.
 - **Superseded or abandoned**: close the pull request with a comment naming what replaces
-  it, then delete its branch. GitHub keeps the commits at `refs/pull/<n>/head` and can
-  restore the branch from the pull request page, so nothing is lost.
+  it. Its branch is deleted by the Hygiene workflow, which deletes only branches whose tip
+  is the head of a closed or merged pull request (GitHub keeps it at `refs/pull/<n>/head`
+  and can restore the branch from the pull request page) or is already in `main`, and
+  never `main`, `release/*`, a branch an open pull request uses, or one listed in
+  `.github/hygiene-keep.txt`. It runs every Monday; start it after closing pull requests
+  (Actions, Hygiene, Run workflow, or the `workflow_dispatch` API).
 - **A branch with no pull request** is work in progress for at most a day: open a draft
   pull request for it, or list it in `.github/hygiene-keep.txt` with the reason it stays.
 - **A draft that waits** says in its description what it waits for (a release, another
@@ -129,7 +133,7 @@ instead of into the current pull request.
   the repository, by a change that has merged) is closed with a comment linking what
   answered it and stating any part left undone, which goes to the backlog. An issue that
   is not being worked on says what it waits for.
-- **Every Monday** the Hygiene workflow (`scripts/hygiene.py`) puts the branches with no
+- **Every Monday** the Hygiene workflow (`scripts/hygiene.py`) deletes those branches and puts the branches with no
   open pull request, the pull requests untouched for a week and the issues untouched for
   two into the issue labelled `hygiene`. Whoever owns an entry deals with it that week; the issue closes itself when
   nothing is left.

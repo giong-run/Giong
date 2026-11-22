@@ -126,7 +126,13 @@ pub fn closed_port() -> (std::os::fd::OwnedFd, u16) {
     // SAFETY: socket, bind and getsockname on a socket this function owns,
     // with a sockaddr_in of the size given.
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        // (Close-on-exec matters only where a server is started while the
+        // socket lives; macOS has no flag for it at creation.)
+        #[cfg(target_os = "linux")]
+        let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+        #[cfg(target_os = "macos")]
+        let kind = libc::SOCK_STREAM;
+        let fd = libc::socket(libc::AF_INET, kind, 0);
         assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
         let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
@@ -312,7 +318,11 @@ fn launch(
     let (started_tx, started) = std::sync::mpsc::channel();
     let (exited_tx, exited) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        #[cfg(target_os = "linux")]
         use std::os::unix::process::CommandExt;
+        // Linux only: elsewhere a killed test binary leaves the server
+        // running until the test's own cleanup or the CI job ends.
+        #[cfg(target_os = "linux")]
         // SAFETY: prctl is async-signal-safe and touches only this process.
         unsafe {
             cmd.pre_exec(|| {

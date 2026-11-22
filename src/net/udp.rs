@@ -92,7 +92,12 @@ impl Message {
 }
 
 fn parse_addr(name: &[u8]) -> Option<SocketAddr> {
+    // Linux's `sa_family` is a `u16`; the BSDs, macOS among them, start
+    // with a `u8` length and a `u8` family.
+    #[cfg(target_os = "linux")]
     let family = i32::from(u16::from_ne_bytes([*name.first()?, *name.get(1)?]));
+    #[cfg(target_os = "macos")]
+    let family = i32::from(*name.get(1)?);
     let port = u16::from_be_bytes([*name.get(2)?, *name.get(3)?]);
     match family {
         libc::AF_INET => {
@@ -121,7 +126,7 @@ pub struct Datagram {
 impl Datagram {
     /// Splits what a multishot `recvmsg` wrote into a buffer.
     fn parse(buf: RecvBuf) -> io::Result<(Self, SocketAddr)> {
-        let malformed = || unexpected("io_uring returned a malformed datagram");
+        let malformed = || unexpected("the driver returned a malformed datagram");
         if buf.len() < OVERHEAD {
             return Err(malformed());
         }
@@ -219,6 +224,16 @@ impl UdpSocket {
     /// share a port between processes on purpose, create the sockets
     /// yourself and pass them to [`from_std`](Self::from_std).
     ///
+    /// On macOS every worker can bind the address too, and no other process
+    /// can: the sockets of one address in a process are duplicates of one
+    /// socket bound without `SO_REUSEPORT`, so each datagram goes to the
+    /// worker that reads first, and [`connect`](Self::connect) on one of
+    /// them connects them all (bind a port of its own for a connected
+    /// socket). giong also raises the
+    /// socket's send buffer there to 65,535 bytes when it is smaller (the
+    /// system's default refuses datagrams over 9,216 bytes), so a datagram
+    /// of any length UDP allows can be sent, as on Linux.
+    ///
     /// Port 0 asks the kernel for a port of the socket's own, which no other
     /// socket can share.
     ///
@@ -245,20 +260,36 @@ impl UdpSocket {
         let (sock, held) = share::bind(share::Proto::Udp, addr, share, || {
             Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
         })?;
+        // macOS refuses a datagram longer than the socket's send buffer,
+        // 9216 bytes unless changed (`net.inet.udp.maxdgram`): raised to the
+        // longest datagram UDP has, so the limit is the protocol's, as on
+        // Linux. A failure leaves the system's limit.
+        #[cfg(target_os = "macos")]
+        if sock.send_buffer_size().is_ok_and(|size| size < 65_535) {
+            drop(sock.set_send_buffer_size(65_535));
+        }
         let mut socket = Self::from_socket(sock);
         socket.held = held;
         Ok(socket)
     }
 
     /// Wraps a socket created by the standard library, with the options it
-    /// was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(socket: std::net::UdpSocket) -> Self {
         // SAFETY: we take over the descriptor that `socket` owned.
         Self::from_socket(unsafe { Socket::from_raw_fd(socket.into_raw_fd()) })
     }
 
     fn from_socket(sock: Socket) -> Self {
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
@@ -482,7 +513,7 @@ impl UdpSocket {
                 // SAFETY: `msg` owns a live `Message`; the field pointer is
                 // taken without making a reference.
                 msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
-                flags: libc::MSG_NOSIGNAL as u32,
+                flags: crate::sys::MSG_NOSIGNAL as u32,
                 zero_copy: false,
             };
             // SAFETY: the header is in a `KernelBox` and points at its own
@@ -535,7 +566,7 @@ impl UdpSocket {
             fd: self.sock.as_raw_fd(),
             buf: buf.as_ptr(),
             len,
-            flags: libc::MSG_NOSIGNAL,
+            flags: crate::sys::MSG_NOSIGNAL,
             zero_copy: false,
         };
         // SAFETY: an `IoBuf`'s bytes stay put when it moves.

@@ -1,0 +1,41 @@
+{
+ "conns": 64,
+ "threads": 3,
+ "rate": 0,
+ "duration_s": 6,
+ "requests": 741342,
+ "rps": 123557.0,
+ "errors": 0,
+ "connect_errors": 0,
+ "unfinished": 49,
+ "non_2xx": 0,
+ "mb_in_per_s": 18.62,
+ "latency": {
+  "count": 741342,
+  "p50_us": 517.1,
+  "p90_us": 620.5,
+  "p99_us": 870.4,
+  "p999_us": 1609.7,
+  "p9999_us": 2908.2,
+  "max_us": 3981.8
+ },
+ "paths": [
+  {
+   "path": "/json",
+   "requests": 741342,
+   "latency": {
+    "count": 741342,
+    "p50_us": 517.1,
+    "p90_us": 620.5,
+    "p99_us": 870.4,
+    "p999_us": 1609.7,
+    "p9999_us": 2908.2,
+    "max_us": 3981.8
+   }
+  }
+ ],
+ "server_cpu_s": 5.96,
+ "server_rss_kib": 3832,
+ "server_hwm_kib": 3832,
+ "cpu_us_per_req": 8.039
+}

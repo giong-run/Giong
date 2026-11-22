@@ -47,6 +47,12 @@ when it is no longer raised.
 | [GIONG-E0018](E0018.md) | `ActivatedSocket` | the inherited socket cannot be used that way |
 | [GIONG-E0019](E0019.md) | `ChildProcess` | cannot watch the child process |
 
+## macOS
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E0028](E0028.md) | `NetworkBuffersExhausted` | the system ran out of network buffers |
+
 ## Network and name resolution
 
 | Code | `Code::` | Meaning |
@@ -96,6 +102,7 @@ when it is no longer raised.
 | [GIONG-E1119](E1119.md) | `HttpInvalidResponse` | invalid HTTP response |
 | [GIONG-E1120](E1120.md) | `HttpServerBusy` | request refused: the server's memory budget for requests is full |
 | [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
+| [GIONG-E1122](E1122.md) | `HttpInvalidTrailer` | invalid HTTP trailer field |
 
 ## giong-web
 
@@ -198,3 +205,35 @@ when it is no longer raised.
 | [GIONG-E3209](E3209.md) | `RedisPoolTimeout` | Redis pool wait timed out |
 | [GIONG-E3210](E3210.md) | `RedisProtocol` | Redis protocol error |
 | [GIONG-E3211](E3211.md) | `RedisTimeout` | Redis reply timed out |
+
+## giong-proto
+
+A prototype for giong 1.1, not published yet; its codes are `giong_proto::ErrorKind` until it joins `giong::error::Code`.
+
+| Code | `ErrorKind::` | Meaning |
+|---|---|---|
+| [GIONG-E4001](E4001.md) | `ErrorKind::Truncated` | the message ends in the middle of a field |
+| [GIONG-E4002](E4002.md) | `ErrorKind::BadVarint` | malformed varint |
+| [GIONG-E4003](E4003.md) | `ErrorKind::BadTag` | invalid field tag |
+| [GIONG-E4004](E4004.md) | `ErrorKind::BadGroup` | unbalanced group |
+| [GIONG-E4005](E4005.md) | `ErrorKind::BadUtf8` | string field is not UTF-8 |
+| [GIONG-E4006](E4006.md) | `ErrorKind::TooDeep` | messages nested too deeply |
+| [GIONG-E4007](E4007.md) | `ErrorKind::BadPacked` | malformed packed field |
+| [GIONG-E4008](E4008.md) | `ErrorKind::TooLarge` | message larger than 2 GiB |
+
+## giong-grpc
+
+New in giong 1.1. A call that fails ends with a gRPC status; the statuses giong-grpc raises itself carry one of these codes at the start of their message and in `Status::error_code`.
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E4101](E4101.md) | `GrpcInvalidMetadata` | invalid gRPC metadata |
+| [GIONG-E4102](E4102.md) | `GrpcMessageTooLarge` | gRPC message too large |
+| [GIONG-E4103](E4103.md) | `GrpcProtocol` | gRPC protocol error |
+| [GIONG-E4104](E4104.md) | `GrpcEncoding` | unsupported gRPC message encoding |
+| [GIONG-E4105](E4105.md) | `GrpcDecode` | gRPC message is not valid protobuf |
+| [GIONG-E4106](E4106.md) | `GrpcTransport` | gRPC connection failed |
+| [GIONG-E4107](E4107.md) | `GrpcEndpoint` | invalid gRPC endpoint |
+| [GIONG-E4108](E4108.md) | `GrpcDeadline` | gRPC deadline exceeded |
+| [GIONG-E4109](E4109.md) | `GrpcCancelled` | gRPC call cancelled |
+| [GIONG-E4110](E4110.md) | `GrpcUnimplemented` | gRPC method not found |

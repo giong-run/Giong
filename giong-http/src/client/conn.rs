@@ -18,8 +18,10 @@ use super::error::{Error, ErrorKind};
 use super::head::{parse_head, Framing, Head};
 use super::proxy::{Route, Server};
 use super::ClientBuilder;
+use crate::body::{Next, StreamBody};
 use crate::chunked::{Decoder, Progress};
 use crate::parse::find_head_end;
+use crate::trailers::Trailers;
 
 /// The socket under a connection.
 pub(crate) enum Stream {
@@ -137,6 +139,8 @@ pub(crate) struct Body {
     /// The connection can carry another request, as far as known.
     reusable: bool,
     done: bool,
+    /// The trailer fields a chunked body ended with.
+    trailers: Option<Box<Trailers>>,
 }
 
 enum Kind {
@@ -273,7 +277,12 @@ impl Conn {
             // Data, the end of the stream, or an error.
             return true;
         }
+        // The peer's FIN: POLLRDHUP on Linux. macOS has no such flag; there
+        // the receive polled above already sees a FIN that has arrived.
+        #[cfg(target_os = "linux")]
         let mut events = libc::POLLRDHUP;
+        #[cfg(target_os = "macos")]
+        let mut events = libc::POLLHUP;
         if let Stream::Tcp(_) = self.stream {
             // Bytes the socket holds that have not been received yet. Over
             // TLS they may be session tickets, which are no response.
@@ -307,6 +316,85 @@ impl Conn {
             )));
         }
         read_answer(self, head_request, max_head_size, what).await
+    }
+
+    /// Sends a request whose body is produced piece by piece: `head`, then
+    /// each piece of `body` as a chunk as it comes, then the trailer
+    /// fields; then reads the head of the response. `pulled` is set once
+    /// something was taken from `body`.
+    pub(crate) async fn send_streamed(
+        &mut self,
+        head: Vec<u8>,
+        body: &StreamBody,
+        pulled: &mut bool,
+        head_request: bool,
+        max_head_size: usize,
+        what: &str,
+    ) -> Result<Answer, Failure> {
+        let mut out = head;
+        loop {
+            if let Err(e) = self.stream.write_all(out).await {
+                let error = Error::io(
+                    ErrorKind::Closed,
+                    format!("{what}: sending the request failed"),
+                    e,
+                );
+                if !*pulled {
+                    return Err(Failure::NothingReceived(error));
+                }
+                // The server may have answered (413, 401...) and closed
+                // without reading the rest: its answer says more.
+                return match read_answer(self, head_request, max_head_size, what).await {
+                    Ok(mut answer) => {
+                        answer.body.reusable = false;
+                        Ok(answer)
+                    }
+                    Err(_) => Err(Failure::Other(error)),
+                };
+            }
+            let next = body.next().await;
+            *pulled = true;
+            out = Vec::new();
+            match next {
+                Next::Piece(piece) => {
+                    out.reserve(piece.len() + 20);
+                    out.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                    out.extend_from_slice(&piece);
+                    out.extend_from_slice(b"\r\n");
+                }
+                Next::End(trailers) => {
+                    out.extend_from_slice(b"0\r\n");
+                    if let Some(trailers) = trailers {
+                        trailers.write_lines(&mut out);
+                    }
+                    out.extend_from_slice(b"\r\n");
+                    if let Err(e) = self.stream.write_all(out).await {
+                        let error = Error::io(
+                            ErrorKind::Closed,
+                            format!("{what}: sending the request failed"),
+                            e,
+                        );
+                        return match read_answer(self, head_request, max_head_size, what).await {
+                            Ok(mut answer) => {
+                                answer.body.reusable = false;
+                                Ok(answer)
+                            }
+                            Err(_) => Err(Failure::Other(error)),
+                        };
+                    }
+                    return read_answer(self, head_request, max_head_size, what).await;
+                }
+                Next::Aborted => {
+                    return Err(Failure::Other(Error::new(
+                        ErrorKind::Closed,
+                        format!(
+                            "{what}: the request body was aborted (RequestBody::abort), so \
+                             the connection was closed without the end of the request"
+                        ),
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -383,6 +471,7 @@ pub(crate) async fn read_answer(
         pos,
         reusable: !head.close,
         done: false,
+        trailers: None,
     };
     Ok(Answer { head, body })
 }
@@ -531,6 +620,11 @@ impl Body {
         self.done
     }
 
+    /// The trailer fields a chunked body ended with, once it is done.
+    pub(crate) fn trailers(&self) -> Option<&Trailers> {
+        self.trailers.as_deref()
+    }
+
     /// Whether the connection can carry another request: the body was
     /// read to its end, the server did not ask to close, and nothing came
     /// after the body.
@@ -623,6 +717,7 @@ impl Body {
                         self.buf.truncate(self.head);
                         self.pos = self.head;
                         self.done = true;
+                        self.trailers = decoder.trailers.take().filter(|t| !t.is_empty());
                         let any = !decoder.body.is_empty();
                         out.append(&mut decoder.body);
                         return Ok(any);

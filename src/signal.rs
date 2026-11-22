@@ -155,7 +155,7 @@ extern "C" fn on_signal(signal: libc::c_int) {
     if signal == libc::SIGINT || signal == libc::SIGTERM {
         // Builder::shutdown_on_signals keeps working while giong's handler
         // is installed for these.
-        crate::runtime::on_shutdown_signal(signal);
+        crate::sys::on_shutdown_signal(signal);
     }
     // SAFETY: as above.
     unsafe { *errno = saved };

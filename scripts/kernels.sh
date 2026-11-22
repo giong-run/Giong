@@ -72,6 +72,10 @@ import json, sys
 for line in sys.stdin:
     msg = json.loads(line)
     if msg.get("reason") == "compiler-artifact" and msg.get("executable") and msg["profile"]["test"]:
+        # giong-grpc/tests/generated.rs compares files of the source tree,
+        # which the guests do not have, and does not depend on the kernel.
+        if msg["target"]["name"] == "generated" and "giong-grpc" in msg["package_id"]:
+            continue
         print(msg["executable"])
 '
 )

@@ -8,6 +8,9 @@
 //! By default giong then runs on its epoll driver, says so once on stderr
 //! and in `driver_choice`; a runtime that insists on io_uring fails with an
 //! error that says why and what to do.
+//!
+//! Linux only: seccomp, capabilities and io_uring do not exist elsewhere.
+#![cfg(target_os = "linux")]
 
 use std::process::Command;
 

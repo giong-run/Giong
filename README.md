@@ -68,8 +68,8 @@ to type.
   The API was settled in 0.7 ([review](docs/reviews/2026-11-api-freeze.md)), and
   `cargo-semver-checks` runs on every pull request.
 - **Linux first.** Tuned and measured on Linux with io_uring, with an epoll driver wherever
-  io_uring is blocked. macOS (for development) and Windows come after 1.0
-  ([ROADMAP.md](ROADMAP.md)).
+  io_uring is blocked. macOS runs on a kqueue driver (tested on macOS 15 and 26, Apple
+  Silicon); Windows comes later ([ROADMAP.md](ROADMAP.md)).
 
 ## Let your agent look inside the running service
 
@@ -183,9 +183,11 @@ connection, the same as the others.
   Compose and Kubernetes.
 - Rust 1.80 or newer. How this minimum, the kernel minimums and the API move during 1.x:
   [docs/STABILITY.md](docs/STABILITY.md).
-- giong does **not** build on Windows or macOS. On Windows use WSL2 (`uname -r`; run
-  `wsl --update` for a 6.x kernel), a Linux virtual machine, or Docker. macOS and Windows
-  are planned for after 1.0 ([ROADMAP.md](ROADMAP.md)).
+- macOS works with a kqueue driver. It is tested on macOS 15 and 26 on Apple Silicon (the
+  GitHub runners); Intel Macs and older versions of macOS are not tested.
+- giong does **not** build on Windows. Use WSL2 (`uname -r`; run `wsl --update` for a 6.x
+  kernel), a Linux virtual machine, or Docker. Windows is planned
+  ([ROADMAP.md](ROADMAP.md)).
 
 ## Quick start
 
@@ -1065,9 +1067,10 @@ cost 1% more instructions, or an idle connection 1% more heap ([bench/instr](ben
 
 ## Testing and safety
 
-1,114 tests across the nine crates and the example API (`cargo test --workspace
+1,114 tests across the nine crates of 1.0 and the example API (`cargo test --workspace
 --all-features`), run in release mode on all three io_uring setups and on the epoll
-driver without a failure, plus the 34 Rust samples of the READMEs, compiled (and run
+driver without a failure (giong-proto, giong-grpc-build and giong-grpc, new in 1.1, add
+9, 4 and 65 more), plus the 34 Rust samples of the READMEs, compiled (and run
 where they need no server) as doctests of the example API. The runtime's, HTTP's and
 TLS's main suites are below; the database clients, giong-web, giong-mcp, giong-compat and
 the example API describe theirs in their READMEs.
@@ -1076,7 +1079,7 @@ the example API describe theirs in their READMEs.
 |---|---|
 | `tests/executor.rs` (16) | spawn and join, panics, abort, teardown, runtimes run back to back; I/O completes while another task keeps yielding; giong called outside a runtime, or `block_on` inside one, panics with its code |
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
-| `tests/net.rs` (27) | echo, 8 MB each way without a wrong byte, EOF, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
+| `tests/net.rs` (30) | echo, 8 MB each way without a wrong byte, EOF, 6 MB in turns of `recv` and receives straight into the reader's buffer without a byte out of place, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
 | `tests/unix_fds.rs` (12) | Unix datagrams keep their boundaries and senders, abstract names, peer credentials; a pipe and a TCP listener passed to another socket keep working, 253 descriptors in one message, mistakes refused with `GIONG-E0017`; **a dropped receive never leaks a descriptor**, and a dropped send keeps its own copies |
 | `tests/process.rs` (15), `tests/signal.rs` (8), `tests/activation.rs` (3) | output and exit codes, 1 MiB through `cat` both ways at once, kill and signals through the pidfd, **a dropped wait loses nothing and a dropped child is reaped**, pipes, the process's own stdin and stdout (also from a regular file); every listener sees a signal, deliveries coalesce, `SIGCHLD`, a `SIGTERM` listener together with `shutdown_on_signals`; sockets inherited as systemd passes them |
@@ -1282,6 +1285,9 @@ giong-redis/    the Redis client crate (RESP3, pipelining across tasks, Pub/Sub,
 giong-web/      routing, middleware and JSON on giong-http (Router, App, Req, Error, middleware/)
 giong-mcp/      the MCP server for agents: Streamable HTTP, tools over giong::observe
 giong-compat/   Compat: the Tokio and futures-io I/O traits for giong's streams
+giong-proto/    Protocol Buffers as views over the receive buffer (new in 1.1)
+giong-grpc-build/ code generation from .proto files at build time, no protoc (new in 1.1)
+giong-grpc/     gRPC servers and clients on giong-http's HTTP/2, health and reflection (new in 1.1)
 examples/       echo.rs, http.rs, udp_echo.rs, cat.rs; rest-api/, a complete REST API (PostgreSQL, a Redis cache, HTTPS)
 tests/          executor, time, net, unix, udp, fs, cancel, multi, shutdown, spin, driver, blocked, dns, channels, observe, soak, ...
 bench/          run.sh, scale.sh, workers.sh, syscalls.sh, tls.sh, fs.sh, postgres.sh, mysql.sh, redis.sh, http-client.sh, web.sh, rest-api.sh, compat.sh, the programs compared against, results/
