@@ -1066,23 +1066,66 @@ fn run(workers: usize, secs: u64) -> Run {
 /// address's thread) stays; what each runtime opens goes with it. Five
 /// lives of a runtime: after the first, the count stays where the first
 /// left it. The soak's final check relies on this.
+///
+/// On Windows, Winsock makes an event or two for itself the first time
+/// some paths run (see the soak's final check), and that first time can
+/// fall in any life: a later life once ended one handle up
+/// ([#294](https://github.com/giong-run/Giong/issues/294)). So lives 2 to 5
+/// run with handle tracing, and up to two new events whose open the trace
+/// places inside ws2_32 or mswsock are allowed, as in the soak. Anything
+/// else still fails, with where each new event was opened.
 #[test]
 fn the_descriptor_count_is_flat_over_runtime_lives() {
     let before = open_fds();
     runtime_life();
     let first = settled_fds(open_fds());
+    #[allow(unused_mut)]
     let mut counts = vec![before, first];
+    // Taken before tracing starts: with tracing on, looking at a value
+    // that is no handle raises an exception.
+    #[cfg(windows)]
+    let handles_first = open_handles();
+    #[cfg(windows)]
+    let origins = origins::watch();
+    // The watcher's own thread holds handles while it runs.
+    #[cfg(windows)]
+    let watching = open_fds().saturating_sub(first);
+    #[cfg(unix)]
+    let watching = 0;
     for _ in 0..4 {
         runtime_life();
-        counts.push(settled_fds(first));
+        counts.push(settled_fds(first + watching).saturating_sub(watching));
     }
+    #[cfg(windows)]
+    let traced = origins.map(origins::Watcher::finish);
+    #[allow(unused_mut)]
+    let mut new = String::new();
+    #[cfg(windows)]
+    let system = match traced {
+        Some(origins) => {
+            let last = settled_fds(first);
+            let now = open_handles();
+            let events: Vec<usize> = now
+                .iter()
+                .filter(|(n, what)| what.starts_with("Event") && handles_first.get(n) != Some(what))
+                .map(|(n, _)| *n)
+                .collect();
+            let (report, winsock) = origins.report(&events);
+            let since = new_handles(&handles_first);
+            new = format!("; after tracing: {last}; new since the first life: {since}{report}");
+            winsock.min(2)
+        }
+        None => 0,
+    };
+    #[cfg(unix)]
+    let system = 0;
     eprintln!(
-        "descriptors: {before} before, then after each life: {:?}",
+        "descriptors: {before} before, then after each life: {:?}{new}",
         &counts[1..]
     );
     assert!(
-        counts[2..].iter().all(|&n| n <= first),
-        "descriptors grew over runtime lives: {before} before, then {:?}",
+        counts[2..].iter().all(|&n| n <= first + system),
+        "descriptors grew over runtime lives: {before} before, then {:?}{new}",
         &counts[1..]
     );
 }
