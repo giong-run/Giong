@@ -816,8 +816,12 @@ fn shutdown_finishes_requests_in_progress_and_closes_idle_connections() {
     assert_eq!(idle.reply().text(), "done");
 
     let mut busy = server.client();
+    let sent = Instant::now();
     busy.send("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
     std::thread::sleep(Duration::from_millis(100));
+    // A loaded machine sleeps longer, and the request is that much nearer
+    // its end when the server is told to stop.
+    let waited = sent.elapsed();
 
     let stopped_after = server.stop();
 
@@ -829,8 +833,8 @@ fn shutdown_finishes_requests_in_progress_and_closes_idle_connections() {
     idle.expect_closed();
     // The runtime waited for the slow request, not for the 20 s grace period.
     assert!(
-        stopped_after >= Duration::from_millis(250),
-        "{stopped_after:?}"
+        waited + stopped_after >= Duration::from_millis(350),
+        "{stopped_after:?} after {waited:?}"
     );
     assert!(stopped_after < Duration::from_secs(10), "{stopped_after:?}");
     assert!(TcpStream::connect(server.addr).is_err());

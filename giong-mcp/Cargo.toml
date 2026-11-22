@@ -19,6 +19,10 @@ giong-http = { path = "../giong-http", version = "1.1.0" }
 # feature.
 serde_json = "1"
 
+# `proc_pidinfo`, for the process figures that Linux has in /proc.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.172"
+
 [dev-dependencies]
 giong-http = { path = "../giong-http", version = "1.1.0", features = ["client"] }
 

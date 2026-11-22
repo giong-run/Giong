@@ -688,8 +688,10 @@ impl Server {
     /// container's memory limit or systemd's `MemoryMax`: `memory.max`, or
     /// `memory.high` if lower, less what the cgroup uses apart from the
     /// page cache the kernel can reclaim) and what the machine has
-    /// (`MemAvailable` in `/proc/meminfo`). A worker reads it at most every
-    /// 50 ms while far from the limit and on every accept close to it.
+    /// (`MemAvailable` in `/proc/meminfo`; on macOS, which has no cgroups,
+    /// the free and inactive pages the kernel reports). A worker reads it at
+    /// most every 50 ms while far from the limit and on every accept close
+    /// to it.
     ///
     /// The default is a tenth of the cgroup's memory limit, or of the
     /// machine's memory without one, but at least 16 MiB, at most 256 MiB,

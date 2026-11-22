@@ -277,7 +277,12 @@ impl Conn {
             // Data, the end of the stream, or an error.
             return true;
         }
+        // The peer's FIN: POLLRDHUP on Linux. macOS has no such flag; there
+        // the receive polled above already sees a FIN that has arrived.
+        #[cfg(target_os = "linux")]
         let mut events = libc::POLLRDHUP;
+        #[cfg(target_os = "macos")]
+        let mut events = libc::POLLHUP;
         if let Stream::Tcp(_) = self.stream {
             // Bytes the socket holds that have not been received yet. Over
             // TLS they may be session tickets, which are no response.

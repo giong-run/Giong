@@ -23,6 +23,7 @@ use crate::value::Value;
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const USER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The largest reply accepted during the handshake.
@@ -159,7 +160,11 @@ fn tune(tcp: &TcpStream) -> io::Result<()> {
             .with_interval(KEEPALIVE_INTERVAL)
             .with_retries(KEEPALIVE_RETRIES),
     )?;
-    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))
+    // Only Linux has TCP_USER_TIMEOUT; elsewhere the keepalive probes alone
+    // notice a vanished server.
+    #[cfg(target_os = "linux")]
+    sock.set_tcp_user_timeout(Some(USER_TIMEOUT))?;
+    Ok(())
 }
 
 /// Opens a connection and logs in, within the connect timeout.
