@@ -195,6 +195,11 @@ fn set_old(path: &Path, days: u64) {
 
 #[test]
 fn units_of_another_compiler_go_and_the_next_build_compiles_nothing() {
+    if !crate::harness::toolchain(
+        "units_of_another_compiler_go_and_the_next_build_compiles_nothing",
+    ) {
+        return;
+    }
     let dir = TempDir::new("clean-real");
     new_package(&dir, "cleanme", "");
     build(dir.path());
@@ -248,6 +253,9 @@ fn units_of_another_compiler_go_and_the_next_build_compiles_nothing() {
 
 #[test]
 fn stale_incremental_data_goes_and_fresh_stays() {
+    if !crate::harness::toolchain("stale_incremental_data_goes_and_fresh_stays") {
+        return;
+    }
     let dir = TempDir::new("clean-incr");
     new_package(&dir, "incr", "");
     build(dir.path());
@@ -278,6 +286,9 @@ fn stale_incremental_data_goes_and_fresh_stays() {
 
 #[test]
 fn only_tagged_directories_are_touched_when_scanning() {
+    if !crate::harness::toolchain("only_tagged_directories_are_touched_when_scanning") {
+        return;
+    }
     let root = TempDir::new("clean-scan");
     // A real project...
     let proj = root.join("a");
@@ -312,6 +323,9 @@ fn only_tagged_directories_are_touched_when_scanning() {
 #[cfg(unix)]
 #[test]
 fn a_symlink_inside_target_is_removed_not_followed() {
+    if !crate::harness::toolchain("a_symlink_inside_target_is_removed_not_followed") {
+        return;
+    }
     let dir = TempDir::new("clean-symlink");
     new_package(&dir, "linky", "");
     build(dir.path());
@@ -342,6 +356,9 @@ fn a_symlink_inside_target_is_removed_not_followed() {
 
 #[test]
 fn an_explicit_target_dir_is_respected() {
+    if !crate::harness::toolchain("an_explicit_target_dir_is_respected") {
+        return;
+    }
     let dir = TempDir::new("clean-ctd");
     let base = TempDir::new("clean-ctd-target");
     // Not created beforehand: cargo writes its CACHEDIR.TAG only into a
@@ -372,6 +389,11 @@ fn an_explicit_target_dir_is_respected() {
 /// answer "no build directory found" for the project's own build directory.
 #[test]
 fn a_target_dir_made_before_the_first_build_is_not_skipped_silently() {
+    if !crate::harness::toolchain(
+        "a_target_dir_made_before_the_first_build_is_not_skipped_silently",
+    ) {
+        return;
+    }
     let dir = TempDir::new("clean-precreated");
     let elsewhere = TempDir::new("clean-precreated-target");
     new_package(&dir, "pre", "");
@@ -400,6 +422,9 @@ fn a_target_dir_made_before_the_first_build_is_not_skipped_silently() {
 
 #[test]
 fn all_removes_the_build_directory_and_nothing_else() {
+    if !crate::harness::toolchain("all_removes_the_build_directory_and_nothing_else") {
+        return;
+    }
     let dir = TempDir::new("clean-all");
     new_package(&dir, "everything", "");
     build(dir.path());
@@ -419,6 +444,9 @@ fn all_removes_the_build_directory_and_nothing_else() {
 
 #[test]
 fn no_build_directory_is_not_an_error() {
+    if !crate::harness::toolchain("no_build_directory_is_not_an_error") {
+        return;
+    }
     let dir = TempDir::new("clean-none");
     new_package(&dir, "nothing", "");
     let out = giong(["clean", "--json"]).dir(dir.path()).run();
@@ -429,6 +457,9 @@ fn no_build_directory_is_not_an_error() {
 
 #[test]
 fn bad_days_are_usage_errors() {
+    if !crate::harness::toolchain("bad_days_are_usage_errors") {
+        return;
+    }
     let dir = TempDir::new("clean-days");
     new_package(&dir, "days", "");
     build(dir.path());
@@ -448,6 +479,9 @@ fn bad_days_are_usage_errors() {
 /// around to a few hours (release) and remove what was built yesterday.
 #[test]
 fn huge_days_do_not_overflow() {
+    if !crate::harness::toolchain("huge_days_do_not_overflow") {
+        return;
+    }
     let dir = TempDir::new("clean-days-huge");
     new_package(&dir, "huge", "");
     build(dir.path());
@@ -475,6 +509,9 @@ fn huge_days_do_not_overflow() {
 /// was when the unit was first built.
 #[test]
 fn days_keeps_units_rebuilt_today() {
+    if !crate::harness::toolchain("days_keeps_units_rebuilt_today") {
+        return;
+    }
     let dir = TempDir::new("clean-days-today");
     new_package(&dir, "today", "");
     build(dir.path());
@@ -505,6 +542,9 @@ fn days_keeps_units_rebuilt_today() {
 /// a cargo build must never be removed, with or without `--all`.
 #[test]
 fn other_programs_cache_directories_are_never_removed() {
+    if !crate::harness::toolchain("other_programs_cache_directories_are_never_removed") {
+        return;
+    }
     let root = TempDir::new("clean-foreign-tag");
     let sig = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by pytest.\n";
     root.write("py/.pytest_cache/CACHEDIR.TAG", sig);
@@ -538,6 +578,9 @@ fn other_programs_cache_directories_are_never_removed() {
 /// is one directory: the bytes freed are counted once.
 #[test]
 fn the_same_directory_named_twice_is_counted_once() {
+    if !crate::harness::toolchain("the_same_directory_named_twice_is_counted_once") {
+        return;
+    }
     let dir = TempDir::new("clean-twice");
     new_package(&dir, "twice", "");
     build(dir.path());

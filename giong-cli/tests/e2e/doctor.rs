@@ -74,6 +74,9 @@ fn cargo_reads(root: &std::path::Path) {
 
 #[test]
 fn a_healthy_package_has_no_error_and_reports_its_facts() {
+    if !crate::harness::toolchain("a_healthy_package_has_no_error_and_reports_its_facts") {
+        return;
+    }
     let dir = TempDir::new("doctor-ok");
     new_package(
         &dir,
@@ -241,6 +244,9 @@ fn a_low_open_files_limit_is_caught() {
 
 #[test]
 fn tokio_runtime_crates_are_found_at_their_line() {
+    if !crate::harness::toolchain("tokio_runtime_crates_are_found_at_their_line") {
+        return;
+    }
     let dir = TempDir::new("doctor-tokio");
     new_package(
         &dir,
@@ -271,6 +277,9 @@ fn tokio_runtime_crates_are_found_at_their_line() {
 
 #[test]
 fn a_renamed_tokio_dependency_is_still_tokio() {
+    if !crate::harness::toolchain("a_renamed_tokio_dependency_is_still_tokio") {
+        return;
+    }
     let dir = TempDir::new("doctor-tokio-renamed");
     new_package(
         &dir,
@@ -289,6 +298,9 @@ fn a_renamed_tokio_dependency_is_still_tokio() {
 /// cargo reads, and doctor is then satisfied.
 #[test]
 fn the_dev_profile_edit_applies_cleanly_in_every_shape() {
+    if !crate::harness::toolchain("the_dev_profile_edit_applies_cleanly_in_every_shape") {
+        return;
+    }
     check_profile_shapes(&[
         ("none", ""),
         ("no-newline", "\n[dependencies]"),
@@ -318,6 +330,9 @@ fn the_dev_profile_edit_applies_cleanly_in_every_shape() {
 /// cargo refuses); never a second `[profile.dev]`.
 #[test]
 fn the_dev_profile_edit_handles_every_header_spelling() {
+    if !crate::harness::toolchain("the_dev_profile_edit_handles_every_header_spelling") {
+        return;
+    }
     check_profile_shapes_or_skip(&[
         ("header-comment", "\n[profile.dev] # fast\ndebug = true\n"),
         ("header-spaces", "\n[ profile.dev ]\ndebug=true\n"),
@@ -369,6 +384,9 @@ fn check_shapes(shapes: &[(&str, &str)], may_skip: bool) {
 
 #[test]
 fn env_example_keys_missing_from_env_are_listed() {
+    if !crate::harness::toolchain("env_example_keys_missing_from_env_are_listed") {
+        return;
+    }
     let dir = TempDir::new("doctor-env");
     new_package(&dir, "envy", "");
     dir.write(

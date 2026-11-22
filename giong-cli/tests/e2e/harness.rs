@@ -418,3 +418,24 @@ pub fn grep_files(dir: &Path, ext: &str, needle: &str) -> Vec<PathBuf> {
     out.sort();
     out
 }
+
+/// Whether cargo and rustc run here. CI also runs this binary in a bare
+/// container (ci.yml's docker job: no cargo, rustc or git), where the tests
+/// that build a project skip with a note.
+pub fn toolchain(test: &str) -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let has = *HAS.get_or_init(|| {
+        ["cargo", "rustc"].iter().all(|t| {
+            Command::new(t)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    });
+    if !has {
+        eprintln!("SKIP: {test} needs cargo and rustc, which are not on PATH");
+    }
+    has
+}

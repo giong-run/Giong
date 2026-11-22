@@ -81,6 +81,11 @@ fn lines_of(v: &Value, code: &str) -> Vec<u64> {
 
 #[test]
 fn giongs_checks_find_what_blocks_a_worker_and_nothing_in_comments_or_sync_code() {
+    if !crate::harness::toolchain(
+        "giongs_checks_find_what_blocks_a_worker_and_nothing_in_comments_or_sync_code",
+    ) {
+        return;
+    }
     if !has_command("check") {
         return;
     }
@@ -99,6 +104,9 @@ fn giongs_checks_find_what_blocks_a_worker_and_nothing_in_comments_or_sync_code(
 /// the project still builds with the edits of each finding applied.
 #[test]
 fn edits_replace_the_right_bytes_and_the_result_builds() {
+    if !crate::harness::toolchain("edits_replace_the_right_bytes_and_the_result_builds") {
+        return;
+    }
     if !has_command("check") {
         return;
     }
@@ -171,6 +179,9 @@ fn edits_replace_the_right_bytes_and_the_result_builds() {
 
 #[test]
 fn a_compile_error_is_an_error_at_its_place() {
+    if !crate::harness::toolchain("a_compile_error_is_an_error_at_its_place") {
+        return;
+    }
     if !has_command("check") {
         return;
     }
@@ -188,6 +199,9 @@ fn a_compile_error_is_an_error_at_its_place() {
 
 #[test]
 fn a_clean_project_is_ok() {
+    if !crate::harness::toolchain("a_clean_project_is_ok") {
+        return;
+    }
     if !has_command("check") {
         return;
     }
@@ -201,6 +215,9 @@ fn a_clean_project_is_ok() {
 /// giong's E5008 describe the same borrow.
 #[test]
 fn one_problem_is_reported_once() {
+    if !crate::harness::toolchain("one_problem_is_reported_once") {
+        return;
+    }
     if !has_command("check") {
         return;
     }
@@ -215,6 +232,9 @@ fn one_problem_is_reported_once() {
 /// the compiler says and never panics. Found by the `lint` fuzz target.
 #[test]
 fn a_half_typed_file_does_not_panic() {
+    if !crate::harness::toolchain("a_half_typed_file_does_not_panic") {
+        return;
+    }
     if !has_command("check") {
         return;
     }
