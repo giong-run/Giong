@@ -677,13 +677,15 @@ mod tests {
     #[test]
     fn text_matching_stays_fast_on_bad_input() {
         // Many `{{any}}` against a long text that fails at the end: the
-        // memo keeps this polynomial.
+        // memo keeps this polynomial (milliseconds here). Without it the
+        // search is about 4000^12 steps and never ends, so the bound can be
+        // generous enough for ThreadSanitizer and slow machines.
         let template = "{{any}}a".repeat(12) + "!";
-        let text = "a".repeat(20_000);
+        let text = "a".repeat(4_000);
         let start = std::time::Instant::now();
         assert!(match_text(&template, &text, &mut Vars::new()).is_err());
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < std::time::Duration::from_secs(60),
             "{:?}",
             start.elapsed()
         );
