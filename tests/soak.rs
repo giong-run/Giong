@@ -563,12 +563,6 @@ fn open_handles() -> BTreeMap<usize, String> {
 /// well below the bound searched.
 #[cfg(windows)]
 fn open_handles() -> BTreeMap<usize, String> {
-    open_handles_below(0x4_0000)
-}
-
-/// [`open_handles`], among the values below `bound`.
-#[cfg(windows)]
-fn open_handles_below(bound: usize) -> BTreeMap<usize, String> {
     #[repr(C)]
     struct UnicodeString {
         length: u16,
@@ -588,7 +582,7 @@ fn open_handles_below(bound: usize) -> BTreeMap<usize, String> {
     const OBJECT_TYPE_INFORMATION: u32 = 2;
     let mut buf = vec![0u64; 256];
     let mut handles = BTreeMap::new();
-    for handle in (4..bound).step_by(4) {
+    for handle in (4..0x4_0000usize).step_by(4) {
         let mut returned = 0;
         // SAFETY: a buffer of the length given, which the call fills with an
         // OBJECT_TYPE_INFORMATION; asking for the type never blocks, unlike
@@ -815,7 +809,7 @@ fn soak() {
     #[cfg(windows)]
     eprintln!("soak: threads before: {}", live_threads().join(", "));
     #[cfg(windows)]
-    let origins = origins::watch(&handles_before);
+    let origins = origins::watch();
     let (counters, samples, idle) = run(workers, secs);
 
     let c = &counters;
@@ -849,10 +843,12 @@ fn soak() {
     // 3. Descriptors: nothing left once the runtime is gone, and no growth
     //    during the run beyond the connections that happen to be open.
     let fds_after = settled_fds(fds_before);
+    #[cfg(windows)]
+    let traced = origins.map(origins::Watcher::finish);
     #[allow(unused_mut)]
     let mut new = new_handles(&handles_before);
     #[cfg(windows)]
-    if let Some(origins) = origins {
+    if let Some(origins) = traced {
         let events: Vec<usize> = open_handles()
             .into_iter()
             .filter(|(n, what)| what.starts_with("Event") && handles_before.get(n) != Some(what))
@@ -1107,7 +1103,7 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
 /// every event left over.
 #[cfg(windows)]
 mod origins {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -1124,6 +1120,12 @@ mod origins {
     #[link(name = "ntdll")]
     extern "system" {
         fn NtSetInformationProcess(process: isize, class: u32, info: *const u32, len: u32) -> i32;
+        fn NtQuerySystemInformation(
+            class: u32,
+            info: *mut u64,
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
         fn NtQueryInformationProcess(
             process: isize,
             class: u32,
@@ -1141,6 +1143,8 @@ mod origins {
 
     #[link(name = "kernel32")]
     extern "system" {
+        fn CreateEventW(attributes: usize, manual: i32, initial: i32, name: usize) -> isize;
+        fn CloseHandle(handle: isize) -> i32;
         fn GetModuleHandleExW(flags: u32, addr: usize, module: *mut isize) -> i32;
         fn GetModuleFileNameW(module: isize, name: *mut u16, len: u32) -> u32;
     }
@@ -1162,7 +1166,13 @@ mod origins {
 
     /// Turns tracing on and starts watching for events not in `before`.
     /// `None` if Windows refuses the tracing (the check then goes without).
-    pub(super) fn watch(before: &BTreeMap<usize, String>) -> Option<Watcher> {
+    pub(super) fn watch() -> Option<Watcher> {
+        // With tracing on, a use of a value that is no handle raises
+        // STATUS_INVALID_HANDLE, so the watcher never touches handles: it
+        // finds events in the system's handle list, by the type number an
+        // event of its own has there.
+        let event_type = event_type()?;
+        let before: HashSet<usize> = own_handles(event_type).into_iter().collect();
         // PROCESS_HANDLE_TRACING_ENABLE_EX: no flags, the largest ring.
         let enable = [0u32, 0x2_0000];
         // SAFETY: this process's pseudo handle and a struct of the size given.
@@ -1174,7 +1184,6 @@ mod origins {
             );
             return None;
         }
-        let before = before.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let opens = Arc::new(Mutex::new(HashMap::new()));
         let thread = {
@@ -1185,8 +1194,8 @@ mod origins {
                     let start = Instant::now();
                     let mut buf = vec![0u64; 1 << 19];
                     while !stop.load(Ordering::Relaxed) {
-                        for (handle, what) in super::open_handles_below(0x1_0000) {
-                            if !what.starts_with("Event") || before.get(&handle) == Some(&what) {
+                        for handle in own_handles(event_type) {
+                            if before.contains(&handle) {
                                 continue;
                             }
                             if let Some(open) = latest_open(handle, &mut buf, start) {
@@ -1203,6 +1212,77 @@ mod origins {
             opens,
             thread: Some(thread),
         })
+    }
+
+    /// The process's handles in the system's handle list
+    /// (SystemExtendedHandleInformation), with each one's type number.
+    fn own_handle_types() -> Vec<(usize, u16)> {
+        const ENTRY: usize = 40;
+        let pid = std::process::id() as usize;
+        let mut buf = vec![0u64; 1 << 18];
+        loop {
+            let mut returned = 0u32;
+            // SAFETY: a buffer of the length given, which the call fills
+            // with a count and SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entries.
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    64,
+                    buf.as_mut_ptr(),
+                    (buf.len() * 8) as u32,
+                    &mut returned,
+                )
+            };
+            if status == STATUS_INFO_LENGTH_MISMATCH && buf.len() < 1 << 26 {
+                let len = buf.len() * 2;
+                buf.resize(len, 0);
+                continue;
+            }
+            if status < 0 {
+                return Vec::new();
+            }
+            // SAFETY: the buffer's own bytes.
+            let bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 8) };
+            let word = |at: usize| usize::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+            let count = word(0).min((bytes.len() - 16) / ENTRY);
+            return (0..count)
+                .map(|i| 16 + i * ENTRY)
+                .filter(|&at| word(at + 8) == pid)
+                .map(|at| {
+                    (
+                        word(at + 16),
+                        u16::from_ne_bytes([bytes[at + 30], bytes[at + 31]]),
+                    )
+                })
+                .collect();
+        }
+    }
+
+    /// The process's handles of type number `kind`.
+    fn own_handles(kind: u16) -> Vec<usize> {
+        own_handle_types()
+            .into_iter()
+            .filter(|&(_, t)| t == kind)
+            .map(|(h, _)| h)
+            .collect()
+    }
+
+    /// The type number of events, from one made for the purpose.
+    fn event_type() -> Option<u16> {
+        // SAFETY: makes an unnamed event and closes it once looked up.
+        let event = unsafe { CreateEventW(0, 1, 0, 0) };
+        let kind = own_handle_types()
+            .into_iter()
+            .find(|&(h, _)| h == event as usize)
+            .map(|(_, t)| t);
+        // SAFETY: the event made above.
+        unsafe { CloseHandle(event) };
+        if kind.is_none() {
+            eprintln!(
+                "soak: the system's handle list is not readable; events left over are not traced"
+            );
+        }
+        kind
     }
 
     /// The latest open of `handle` still in the trace, or `None` if the ring
@@ -1265,14 +1345,32 @@ mod origins {
             .unwrap_or_else(|| "gone".into())
     }
 
+    /// What the watcher saw, once it stopped.
+    pub(super) struct Traced(HashMap<usize, Open>);
+
     impl Watcher {
-        /// Stops watching, and says where each of `handles` was opened.
-        pub(super) fn report(mut self, handles: &[usize]) -> String {
+        /// Stops watching, and turns tracing off: the handles can then be
+        /// looked at one by one again.
+        pub(super) fn finish(mut self) -> Traced {
             self.stop.store(true, Ordering::Relaxed);
             if let Some(thread) = self.thread.take() {
                 thread.join().unwrap();
             }
-            let opens = self.opens.lock().unwrap();
+            // SAFETY: no struct: turns this process's tracing off.
+            let status =
+                unsafe { NtSetInformationProcess(-1, PROCESS_HANDLE_TRACING, std::ptr::null(), 0) };
+            assert!(
+                status >= 0,
+                "handle tracing could not be turned off: {status:#x}"
+            );
+            Traced(std::mem::take(&mut *self.opens.lock().unwrap()))
+        }
+    }
+
+    impl Traced {
+        /// Where each of `handles` was opened.
+        pub(super) fn report(&self, handles: &[usize]) -> String {
+            let opens = &self.0;
             // How many events the watcher traced, to tell a trace that works
             // from one that saw nothing.
             let mut out = format!("; {} new events traced", opens.len());
