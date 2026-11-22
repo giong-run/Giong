@@ -122,7 +122,7 @@ run on the epoll driver with the same API.
 
 ## Versions of the crates
 
-The nine crates are released together and carry the same version. A crate that depends on
+The twelve crates are released together and carry the same version. A crate that depends on
 another depends on the same minor or newer. New crates (`giong-quic`, `giong-grpc` and the
 others on the roadmap) join at the current version when they are first published.
 

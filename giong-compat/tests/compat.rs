@@ -472,7 +472,8 @@ fn wrapping_a_tcp_stream_turns_off_nagle() {
             )
         };
         assert_eq!(rc, 0);
-        assert_eq!(on, 1, "TCP_NODELAY is off");
+        // Linux reports 1; macOS reports the flag bit (4). Non-zero is on.
+        assert_ne!(on, 0, "TCP_NODELAY is off");
         drop(c);
     });
 }

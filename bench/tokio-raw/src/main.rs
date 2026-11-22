@@ -5,6 +5,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn fib(n: u32) -> u64 { if n < 2 { n as u64 } else { fib(n - 1) + fib(n - 2) } }
 
+/// The most a connection may hold of a request not complete yet: a 1 MiB
+/// body (bench/lab) and its head.
+const MAX_PENDING: usize = (1 << 20) + 64 * 1024;
+
 fn find_head_end(b: &[u8]) -> Option<usize> { b.windows(4).position(|w| w == b"\r\n\r\n") }
 
 fn content_length(head: &[u8]) -> usize {
@@ -38,7 +42,8 @@ fn wait_ms(path: &[u8]) -> Option<u64> {
         .unwrap_or(0))
 }
 
-fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
+/// `received` is the length of the request's body.
+fn respond(path: &[u8], received: usize, out: &mut Vec<u8>, body: &mut Vec<u8>) {
     body.clear();
     let (route, query) = match path.iter().position(|&c| c == b'?') {
         Some(i) => (&path[..i], &path[i + 1..]),
@@ -56,6 +61,10 @@ fn respond(path: &[u8], out: &mut Vec<u8>, body: &mut Vec<u8>) {
             body.push(b']');
         }
         b"/compute" => { let _ = write!(body, r#"{{"result":{}}}"#, fib(black_box(query_n(query)))); }
+        // The benchmark lab's payloads (bench/lab): an answer of `n` bytes,
+        // and a request body of any size, counted.
+        b"/bytes" => body.resize(query_n(query) as usize, b'x'),
+        b"/upload" => { let _ = write!(body, r#"{{"received":{received}}}"#); }
         b"/wait" => body.extend_from_slice(br#"{"message":"Hello, World!"}"#),
         _ => {
             out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
@@ -77,24 +86,29 @@ async fn main() {
             let mut rbuf: Vec<u8> = Vec::with_capacity(8192);
             let mut wbuf: Vec<u8> = Vec::with_capacity(8192);
             let mut body: Vec<u8> = Vec::with_capacity(16384);
+            // The length of an incomplete request whose head is in, so that
+            // a large body is not searched again for every read.
+            let mut need = 0;
             loop {
                 if rbuf.capacity() - rbuf.len() < 2048 { rbuf.reserve(8192); }
                 match s.read_buf(&mut rbuf).await { Ok(0) | Err(_) => return, Ok(_) => {} }
+                if rbuf.len() < need { continue; }
+                need = 0;
                 let mut off = 0;
                 while let Some(end) = find_head_end(&rbuf[off..]) {
                     let head = &rbuf[off..off + end];
                     let total = end + 4 + content_length(head);
-                    if rbuf.len() - off < total { break; }
+                    if rbuf.len() - off < total { need = total; break; }
                     // `/wait?ms=N` answers after N milliseconds, like a handler
                     // waiting for a database or another service (bench/memory.sh).
                     if let Some(ms) = wait_ms(path_of(head)) {
                         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     }
-                    respond(path_of(&rbuf[off..off + end]), &mut wbuf, &mut body);
+                    respond(path_of(&rbuf[off..off + end]), total - end - 4, &mut wbuf, &mut body);
                     off += total;
                 }
                 rbuf.drain(..off);
-                if rbuf.len() > 64 * 1024 { return; }
+                if rbuf.len() > MAX_PENDING { return; }
                 if !wbuf.is_empty() {
                     if s.write_all(&wbuf).await.is_err() { return; }
                     wbuf.clear();

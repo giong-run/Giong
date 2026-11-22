@@ -1,0 +1,5 @@
+fn main() {
+    // Parses the .proto in Rust (no protoc) and writes $OUT_DIR/giong_proto.rs:
+    // the messages, the `Greeter` trait, `GreeterServer` and `GreeterClient`.
+    giong_grpc_build::compile(&["proto/greeter.proto"], &["proto"]).unwrap();
+}

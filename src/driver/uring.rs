@@ -249,6 +249,8 @@ pub(crate) struct Uring {
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
     wake_fd: RawFd,
+    /// Owns `wake_fd`; other threads ring it through [`Uring::waker`].
+    wake: std::sync::Arc<crate::sys::Bell>,
     wake_buf: Box<u64>,
     wake_armed: bool,
     closing: bool,
@@ -971,8 +973,14 @@ fn buffer_ring_error(release: &str, e: io::Error) -> io::Error {
 }
 
 impl Uring {
-    pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
+    pub(crate) fn waker(&self) -> super::WakeHandle {
+        super::WakeHandle::Bell(self.wake.clone())
+    }
+
+    pub(crate) fn new(entries: u32, pool: Rc<BufPool>) -> io::Result<Self> {
         let ring = build_ring(entries)?;
+        // The worker's wake-up: an eventfd the ring reads.
+        let wake = std::sync::Arc::new(crate::sys::Bell::new_worker()?);
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
@@ -1021,7 +1029,8 @@ impl Uring {
             recv_copied: 0,
             turn: 0,
             graveyard: Vec::new(),
-            wake_fd,
+            wake_fd: wake.read_fd(),
+            wake,
             wake_buf: Box::new(0),
             wake_armed: false,
             closing: false,
@@ -1149,7 +1158,17 @@ impl Uring {
                     .build(),
                 RingId::Whole,
             ),
-            MultiIo::Recv { fd } => (
+            // One buffer, taken only once the data is there: the rest stays
+            // in the socket for the reader's own buffer. The completion has
+            // no `IORING_CQE_F_MORE`, so the next poll arms again.
+            MultiIo::Recv { fd, once: true } => (
+                opcode::Recv::new(types::Fd(fd), std::ptr::null_mut(), 0)
+                    .buf_group(stream_ring.group())
+                    .build()
+                    .flags(squeue::Flags::BUFFER_SELECT),
+                stream_ring,
+            ),
+            MultiIo::Recv { fd, once: false } => (
                 opcode::RecvMulti::new(types::Fd(fd), stream_ring.group()).build(),
                 stream_ring,
             ),
