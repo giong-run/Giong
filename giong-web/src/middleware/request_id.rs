@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::req::IdBuf;
@@ -13,10 +14,12 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// request in the log.
 ///
 /// Ids are 32 lowercase hexadecimal digits, 128 bits like a UUID: 16 chosen
-/// at random when the process starts, 4 for the worker (`ffff` off a giong
-/// worker) and 12 counting that worker's requests. Two processes share the
-/// random part with even odds only after some five billion starts, and a
-/// worker's counter takes years to wrap. Making one takes no lock and no
+/// at random when the process starts, 4 numbering the thread that made it
+/// (each thread takes the next number on its first id, so that ids made on
+/// different threads differ, a giong worker's as any other's) and 12
+/// counting that thread's ids. Two processes share the random part with
+/// even odds only after some five billion starts, a thread's counter takes
+/// years to wrap, and the thread numbers wrap after 65,536 threads. Making one takes no lock and no
 /// system call. The length and the digits are part of the format, changed
 /// only in a breaking release; what the parts mean is for reading a log,
 /// not for parsing.
@@ -91,23 +94,32 @@ impl<S: 'static> Middleware<S> for RequestId {
     }
 }
 
+/// The number the next thread to make an id takes.
+static THREADS: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    static COUNTER: Cell<u64> = const { Cell::new(0) };
+    /// This thread's number (taken on its first id) and its last count.
+    static COUNTER: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
 }
 
-/// A new id: process prefix, worker, counter.
+/// A new id: process prefix, thread, counter.
 pub(crate) fn generate() -> IdBuf {
     static PREFIX: OnceLock<u64> = OnceLock::new();
     let prefix = *PREFIX.get_or_init(prefix);
-    let worker = giong::try_worker_id().map_or(0xffff, |w| w as u64 & 0xffff);
-    let count = COUNTER.with(|c| {
-        let n = c.get().wrapping_add(1);
-        c.set(n);
-        n
+    // A number of the thread's own rather than its worker index: two
+    // runtimes in one process each have a worker 0, and threads off a
+    // worker would all share one number.
+    let (thread, count) = COUNTER.with(|c| {
+        let (thread, n) = c
+            .get()
+            .unwrap_or_else(|| (THREADS.fetch_add(1, Ordering::Relaxed), 0));
+        let n = n.wrapping_add(1);
+        c.set(Some((thread, n)));
+        (thread, n)
     });
     let mut digits = [0u8; 32];
     hex(&mut digits[..16], prefix);
-    hex(&mut digits[16..20], worker);
+    hex(&mut digits[16..20], thread);
     hex(&mut digits[20..], count);
     // Hexadecimal digits are always a valid id.
     IdBuf::new(std::str::from_utf8(&digits).unwrap_or("0")).expect("hex digits")
@@ -148,9 +160,32 @@ mod tests {
             .bytes()
             .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
         assert_ne!(a.as_str(), b.as_str());
-        // The same process and thread: the same 64 random bits and worker.
+        // The same process and thread: the same 64 random bits and thread.
         assert_eq!(a.as_str()[..20], b.as_str()[..20]);
-        assert_eq!(&a.as_str()[16..20], "ffff", "not on a giong worker");
+    }
+
+    /// Threads that are not giong workers, and the workers of two runtimes
+    /// (each has a worker 0), make ids of their own.
+    #[test]
+    fn ids_made_on_different_threads_differ() {
+        let ids: Vec<IdBuf> = (0..8)
+            .map(|_| std::thread::spawn(generate))
+            .chain((0..4).map(|_| {
+                std::thread::spawn(|| {
+                    giong::Builder::new()
+                        .workers(1)
+                        .block_on(async { generate() })
+                        .unwrap()
+                })
+            }))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let mut seen: Vec<&str> = ids.iter().map(IdBuf::as_str).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ids.len(), "{seen:?}");
     }
 
     #[test]
