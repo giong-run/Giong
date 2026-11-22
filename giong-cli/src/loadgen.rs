@@ -165,6 +165,8 @@ fn connection(plan: &Plan, conns: usize, i: usize, start: Instant) -> Outcome {
     let mut out = Outcome::default();
     let window = start + plan.warmup;
     let end = window + plan.duration;
+    // Nothing waits past this: every read and connect is cut short here.
+    let hard_stop = end + plan.timeout;
     let interval = plan
         .rate
         .map(|r| Duration::from_secs_f64(conns as f64 / r.max(1e-9)));
@@ -205,7 +207,15 @@ fn connection(plan: &Plan, conns: usize, i: usize, start: Instant) -> Outcome {
         };
         let counted = t0 >= window;
         let req = &plan.requests[next];
-        let result = exchange(plan, &mut conn, &mut out, req);
+        let result = if interval.is_some() && Instant::now() >= end {
+            // Due inside the run but not sent by its end, because the service
+            // had not answered the requests before it: no answer, and no
+            // waiting a timeout for each one.
+            Err("not sent before the run ended: the service had not answered the requests before it".to_string())
+        } else {
+            let deadline = (Instant::now() + plan.timeout).min(hard_stop);
+            exchange(plan, &mut conn, &mut out, req, deadline)
+        };
         match result {
             Ok(status) => {
                 if counted {
@@ -246,20 +256,23 @@ fn exchange(
     conn: &mut Option<Conn>,
     out: &mut Outcome,
     req: &Request,
+    deadline: Instant,
 ) -> Result<u16, String> {
     for attempt in 0..2 {
         let reused = conn.is_some();
         if conn.is_none() {
-            let stream = TcpStream::connect_timeout(&plan.addr, plan.timeout)
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!("no answer within {:?}", plan.timeout));
+            }
+            let stream = TcpStream::connect_timeout(&plan.addr, left)
                 .map_err(|e| format!("cannot connect to {}: {e}", plan.addr))?;
             let _ = stream.set_nodelay(true);
-            let _ = stream.set_read_timeout(Some(plan.timeout));
-            let _ = stream.set_write_timeout(Some(plan.timeout));
             out.connects += 1;
             *conn = Some(Conn::new(stream));
         }
         let c = conn.as_mut().expect("connected above");
-        match c.exchange(req) {
+        match c.exchange(req, deadline) {
             Ok((status, keep)) => {
                 if !keep {
                     *conn = None;
@@ -321,6 +334,8 @@ struct Conn {
     /// Unread bytes are `buf[pos..end]`.
     pos: usize,
     end: usize,
+    /// When the answer being read must be in.
+    deadline: Instant,
 }
 
 impl Conn {
@@ -330,7 +345,20 @@ impl Conn {
             buf: vec![0; 16 * 1024],
             pos: 0,
             end: 0,
+            deadline: Instant::now(),
         }
+    }
+
+    /// The time left before the deadline, as a socket timeout.
+    fn left(&self) -> io::Result<Duration> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the deadline passed",
+            ));
+        }
+        Ok(left)
     }
 
     /// Reads more; `Ok(0)` at the end of the stream.
@@ -348,6 +376,9 @@ impl Conn {
             }
         }
         loop {
+            // Each read gets what is left of the whole answer's time, so a
+            // server that trickles bytes cannot stretch it.
+            self.stream.set_read_timeout(Some(self.left()?))?;
             match self.stream.read(&mut self.buf[self.end..]) {
                 Ok(n) => {
                     self.end += n;
@@ -361,9 +392,11 @@ impl Conn {
 
     /// Sends the request and reads one answer (skipping 1xx ones): its status
     /// and whether the connection stays open.
-    fn exchange(&mut self, req: &Request) -> Result<(u16, bool), Fail> {
+    fn exchange(&mut self, req: &Request, deadline: Instant) -> Result<(u16, bool), Fail> {
         self.pos = 0;
         self.end = 0;
+        self.deadline = deadline;
+        self.stream.set_write_timeout(Some(self.left()?))?;
         self.stream.write_all(&req.bytes)?;
         let mut first = true;
         loop {
@@ -692,6 +725,65 @@ mod tests {
         assert_eq!(o.answered(), 0);
         assert!(o.failed > 0);
         assert!(o.first_error.unwrap().contains("cannot connect"));
+    }
+
+    #[test]
+    fn a_silent_server_ends_the_run_after_one_timeout() {
+        // Accepts and never answers: each connection waits one timeout for
+        // its first request, and the rest that came due fail at once.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let keep = held.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                keep.lock().unwrap().push(s);
+            }
+        });
+        let mut p = plan(addr, Some(50.0));
+        p.conns = 2;
+        p.warmup = Duration::ZERO;
+        p.duration = Duration::from_secs(1);
+        p.timeout = Duration::from_millis(500);
+        let start = Instant::now();
+        let o = run(&p);
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(o.answered(), 0);
+        assert_eq!(o.failed, 50, "every request that was due counts");
+        // A server that trickles one byte at a time is cut off the same way.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { return };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    let _ = s.read(&mut buf);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n");
+                    while s.write_all(b"x").is_ok() {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                });
+            }
+        });
+        let mut p = plan(addr, None);
+        p.conns = 1;
+        p.warmup = Duration::ZERO;
+        p.duration = Duration::from_millis(300);
+        p.timeout = Duration::from_millis(400);
+        let start = Instant::now();
+        let o = run(&p);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(o.answered(), 0);
+        assert!(o.failed >= 1);
     }
 
     #[test]

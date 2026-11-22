@@ -41,7 +41,7 @@ pub const COMMAND: Cmd = Cmd {
         Flag {
             name: "rate",
             kind: Kind::Value,
-            help: "requests per second in total, auto (half of the most the service answers, found first), or max (as fast as it answers)",
+            help: "requests per second in total, auto (half of the most the service answers, found first), or max (as fast as it answers; 0 means max too)",
         },
         Flag {
             name: "conns",
