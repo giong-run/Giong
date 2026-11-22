@@ -125,6 +125,8 @@ impl Error {
 
     /// The same error with `advice` after its message and source.
     pub(crate) fn advise(self, advice: impl Into<String>) -> Self {
+        // A shared (cloned) error keeps its source's kind and text only:
+        // the original's `source()` chain and `raw_os_error()` are lost.
         let inner = Arc::try_unwrap(self.0).unwrap_or_else(|shared| Inner {
             kind: shared.kind,
             message: shared.message.clone(),
