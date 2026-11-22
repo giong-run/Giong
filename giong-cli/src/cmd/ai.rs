@@ -458,12 +458,26 @@ fn unreadable(rel: &str, why: &str) -> Change {
     )
 }
 
-/// Whether two paths name the same file (a link to the other, or a hard link).
+/// Whether two paths name the same file (a link to the other, or a hard
+/// link), also when the link points at a file that does not exist yet.
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
+    if let (Ok(a), Ok(b)) = (fs::canonicalize(a), fs::canonicalize(b)) {
+        return a == b;
     }
+    let links_to = |link: &Path, target: &Path| {
+        let Ok(to) = fs::read_link(link) else {
+            return false;
+        };
+        let to = link.parent().map_or(to.clone(), |dir| dir.join(&to));
+        match (
+            to.parent().map(fs::canonicalize),
+            target.parent().map(fs::canonicalize),
+        ) {
+            (Some(Ok(d1)), Some(Ok(d2))) => d1 == d2 && to.file_name() == target.file_name(),
+            _ => false,
+        }
+    };
+    links_to(a, b) || links_to(b, a)
 }
 
 /// The changes for a project root, without writing anything.
@@ -722,15 +736,23 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn claude_md_linked_to_agents_md() {
-        for (link, target) in [("CLAUDE.md", "AGENTS.md"), ("AGENTS.md", "CLAUDE.md")] {
+        for (link, target, exists) in [
+            ("CLAUDE.md", "AGENTS.md", true),
+            ("AGENTS.md", "CLAUDE.md", true),
+            // A link to a file that is not there yet.
+            ("CLAUDE.md", "AGENTS.md", false),
+        ] {
             let dir = scratch("link");
-            fs::write(dir.join(target), "# Rules\n").unwrap();
+            if exists {
+                fs::write(dir.join(target), "# Rules\n").unwrap();
+            }
             std::os::unix::fs::symlink(target, dir.join(link)).unwrap();
             every(&dir);
             let text = read(&dir, "AGENTS.md");
             assert!(text.contains("## Gióng"), "{link}: {text}");
             assert!(!text.contains("@AGENTS.md"), "{link}: {text}");
             assert_eq!(text.matches(BEGIN).count(), 1, "{link}: {text}");
+            assert!(!text.contains("# CLAUDE.md"), "{link}: {text}");
             for _ in 0..2 {
                 let again = every(&dir);
                 assert!(again.written.is_empty(), "{link}: {:?}", again.written);
