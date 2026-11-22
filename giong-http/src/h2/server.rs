@@ -1092,11 +1092,11 @@ impl Session {
                     return self.reset_closed(id, Reason::Protocol);
                 }
                 if self.ids.len() >= self.cfg.max_concurrent_streams as usize {
-                    return self.reset_closed(id, Reason::RefusedStream);
+                    return self.refuse_new(id);
                 }
                 if !end_stream && !self.settings_acked && self.early_bodies_full() {
                     // Not processed: the client sends it again later.
-                    return self.reset_closed(id, Reason::RefusedStream);
+                    return self.refuse_new(id);
                 }
                 match built {
                     Built::Malformed(_) => self.reset_closed(id, Reason::Protocol),
@@ -1518,6 +1518,21 @@ impl Session {
         self.reserve_out();
         frame::write_rst(&mut self.out, id, Reason::RefusedStream);
         self.remove(slot, Failure::Abandoned, true);
+    }
+
+    /// Refuses a new stream with `REFUSED_STREAM`: over the stream limit,
+    /// or a body the worker has no room for yet. Until the client has our
+    /// SETTINGS it cannot know the limit, and a first flight of many
+    /// streams is within the protocol (RFC 9113, section 6.5.2): such a
+    /// refusal counts as a frame that does no work, not as a reset.
+    fn refuse_new(&mut self, id: u32) -> Result<(), ConnError> {
+        if self.settings_acked {
+            return self.reset_closed(id, Reason::RefusedStream);
+        }
+        self.reserve_out();
+        frame::write_rst(&mut self.out, id, Reason::RefusedStream);
+        self.remember_closed(id, true);
+        self.cheap()
     }
 
     /// Resets a stream that has no slot (refused, or closed already).
