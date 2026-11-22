@@ -301,8 +301,10 @@ impl Config {
     /// of connections: processes × workers × pool size × this capacity must
     /// stay below it, with room for the other applications on the server.
     /// 64 allows 255 connections. When the server's limit is reached anyway
-    /// (error 1461), the connection closes its statements that are not in
-    /// use and prepares again, once.
+    /// (error 1461), the connection's prepares take turns: each closes the
+    /// statements the connection is not using and tries again, pausing
+    /// between tries, and fails once no prepare on the connection has
+    /// succeeded for a second.
     pub fn statement_cache_capacity(mut self, statements: usize) -> Self {
         self.statement_cache = statements;
         self

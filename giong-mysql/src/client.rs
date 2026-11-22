@@ -183,6 +183,112 @@ struct Conn {
     shared: Cell<bool>,
     /// Woken when nothing is in flight any more, or the connection fails.
     idle_wakers: RefCell<Vec<Waker>>,
+    /// Prepares take turns while the server is at its
+    /// `max_prepared_stmt_count`.
+    turn: Turn,
+    /// When a prepare last succeeded in its turn.
+    turn_progress: Cell<Option<giong::time::Instant>>,
+}
+
+/// How long prepares at the server's `max_prepared_stmt_count` keep trying
+/// while none of them on the connection succeeds.
+const LIMIT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest pause between prepares tried at the limit.
+const LIMIT_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// A turn that tasks take one at a time, first come first served.
+#[derive(Default)]
+struct Turn {
+    /// Tasks holding the turn or waiting for it.
+    users: Cell<usize>,
+    held: Cell<bool>,
+    next_id: Cell<u64>,
+    /// The tasks waiting, oldest first.
+    queue: RefCell<VecDeque<(u64, Option<Waker>)>>,
+}
+
+impl Turn {
+    /// Someone holds the turn or waits for it.
+    fn busy(&self) -> bool {
+        self.users.get() > 0
+    }
+
+    async fn take(&self) -> TurnHeld<'_> {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.users.set(self.users.get() + 1);
+        let mut waiting = TurnWait {
+            turn: self,
+            id,
+            done: false,
+        };
+        poll_fn(|cx| {
+            let mut queue = self.queue.borrow_mut();
+            let first = queue.front().map_or(true, |(front, _)| *front == id);
+            if !self.held.get() && first {
+                if !queue.is_empty() {
+                    queue.pop_front();
+                }
+                self.held.set(true);
+                waiting.done = true;
+                return Poll::Ready(());
+            }
+            match queue.iter_mut().find(|(other, _)| *other == id) {
+                Some((_, waker)) => *waker = Some(cx.waker().clone()),
+                None => queue.push_back((id, Some(cx.waker().clone()))),
+            }
+            Poll::Pending
+        })
+        .await;
+        TurnHeld { turn: self }
+    }
+
+    /// Wakes the oldest task waiting, when nobody holds the turn.
+    fn wake_next(&self) {
+        if self.held.get() {
+            return;
+        }
+        if let Some((_, waker)) = self.queue.borrow_mut().front_mut() {
+            if let Some(w) = waker.take() {
+                w.wake();
+            }
+        }
+    }
+}
+
+/// A task waiting for the turn; leaves the queue when given up.
+struct TurnWait<'a> {
+    turn: &'a Turn,
+    id: u64,
+    done: bool,
+}
+
+impl Drop for TurnWait<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.turn.users.set(self.turn.users.get() - 1);
+        self.turn
+            .queue
+            .borrow_mut()
+            .retain(|(id, _)| *id != self.id);
+        self.turn.wake_next();
+    }
+}
+
+/// The turn, while a task holds it.
+struct TurnHeld<'a> {
+    turn: &'a Turn,
+}
+
+impl Drop for TurnHeld<'_> {
+    fn drop(&mut self) {
+        self.turn.held.set(false);
+        self.turn.users.set(self.turn.users.get() - 1);
+        self.turn.wake_next();
+    }
 }
 
 struct State {
@@ -441,6 +547,8 @@ impl Client {
             tx: Cell::new(Tx::None),
             shared: Cell::new(false),
             idle_wakers: RefCell::new(Vec::new()),
+            turn: Turn::default(),
+            turn_progress: Cell::new(None),
             state: RefCell::new(State {
                 out: Vec::new(),
                 writer: None,
@@ -977,9 +1085,14 @@ impl Conn {
     /// already in flight, or prepared now.
     ///
     /// When the server holds as many prepared statements as it allows, for
-    /// all its clients together, the statements this connection is not using
-    /// are closed and the prepare tried once more.
+    /// all its clients together, prepares on this connection take turns:
+    /// each closes the statements the connection is not using and tries
+    /// again, pausing between tries, until it gets its statement or no
+    /// prepare on the connection has succeeded for [`LIMIT_PATIENCE`].
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
+        if self.turn.busy() && !self.is_cached(sql) {
+            return self.statement_at_limit(sql, None).await;
+        }
         let e = match self.statement_once(sql).await {
             Err(e) if e.server_code() == Some(code::PREPARED_LIMIT) => e,
             other => return other,
@@ -989,26 +1102,61 @@ impl Conn {
                 .statement_limit_errors
                 .set(counters.statement_limit_errors.get() + 1);
         }
-        let closed = self.close_unused();
-        self.statement_once(sql).await.map_err(|again| {
-            let Some(db) = again.db().cloned() else {
-                return again;
+        self.statement_at_limit(sql, Some(e)).await
+    }
+
+    /// The statement for `sql` is prepared and in the cache.
+    fn is_cached(&self, sql: &str) -> bool {
+        matches!(
+            self.state.borrow().cache.get(sql),
+            Some(Entry::Ready { .. })
+        )
+    }
+
+    /// Prepares `sql` in its turn, while the server is at its
+    /// `max_prepared_stmt_count`; `first` is the error that showed it.
+    #[cold]
+    async fn statement_at_limit(
+        &self,
+        sql: &str,
+        mut first: Option<Error>,
+    ) -> Result<Rc<Statement>, Error> {
+        let entered = giong::time::Instant::now();
+        let _turn = self.turn.take().await;
+        let mut pause = std::time::Duration::from_millis(1);
+        let mut closed = 0;
+        loop {
+            closed += self.close_unused();
+            let again = match self.statement_once(sql).await {
+                Ok(stmt) => {
+                    self.turn_progress.set(Some(giong::time::Instant::now()));
+                    return Ok(stmt);
+                }
+                Err(again) if again.server_code() == Some(code::PREPARED_LIMIT) => again,
+                Err(other) => return Err(other),
             };
-            if db.code() != code::PREPARED_LIMIT {
-                return again;
+            let since = self.turn_progress.get().map_or(entered, |p| p.max(entered));
+            let now = giong::time::Instant::now();
+            if now + pause > since + LIMIT_PATIENCE {
+                let db = again.db().cloned().expect("a server error");
+                let first = first.take().unwrap_or(again);
+                return Err(Error::with_db(
+                    ErrorKind::Db,
+                    format!(
+                        "the server holds as many prepared statements as its \
+                         max_prepared_stmt_count allows, counting those of every client (this \
+                         connection closed the {closed} it was not using and tried again for {} \
+                         ms). Lower Config::statement_cache_capacity or the number of \
+                         connections, or raise max_prepared_stmt_count on the server (first \
+                         error: {first})",
+                        LIMIT_PATIENCE.as_millis()
+                    ),
+                    db,
+                ));
             }
-            Error::with_db(
-                ErrorKind::Db,
-                format!(
-                    "the server holds as many prepared statements as its max_prepared_stmt_count \
-                     allows, counting those of every client (this connection closed the {closed} \
-                     it was not using and tried again). Lower Config::statement_cache_capacity or \
-                     the number of connections, or raise max_prepared_stmt_count on the server \
-                     (first error: {e})"
-                ),
-                db,
-            )
-        })
+            giong::time::sleep(pause).await;
+            pause = (pause * 2).min(LIMIT_PAUSE);
+        }
     }
 
     /// Closes the cached statements no task is about to use; returns how
@@ -1766,5 +1914,52 @@ impl std::fmt::Debug for CancelToken {
             .field("server", &self.config.target())
             .field("connection_id", &self.connection_id)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_turn_goes_in_order_and_skips_tasks_that_gave_up() {
+        giong::block_on(async {
+            let turn = Rc::new(Turn::default());
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let first = turn.take().await;
+            let task = |n: u32| {
+                let (turn, order) = (turn.clone(), order.clone());
+                giong::spawn(async move {
+                    let _held = turn.take().await;
+                    order.borrow_mut().push(n);
+                    giong::yield_now().await;
+                })
+            };
+            let one = task(1);
+            let two = task(2);
+            let three = task(3);
+            giong::yield_now().await;
+            assert_eq!(turn.users.get(), 4);
+            // A task that gives up its place leaves the queue.
+            two.abort();
+            giong::yield_now().await;
+            assert_eq!(turn.users.get(), 3);
+            drop(first);
+            one.await.unwrap();
+            three.await.unwrap();
+            assert_eq!(*order.borrow(), [1, 3]);
+            assert!(!turn.busy());
+            // The first task waiting gives up while the turn is free: the
+            // next one gets it.
+            let held = turn.take().await;
+            let gone = task(4);
+            let next = task(5);
+            giong::yield_now().await;
+            drop(held);
+            gone.abort();
+            next.await.unwrap();
+            assert_eq!(*order.borrow(), [1, 3, 5]);
+            assert!(!turn.busy());
+        });
     }
 }
