@@ -813,12 +813,35 @@ fn a_stuck_file_operation_does_not_hold_up_the_others() {
 
 #[cfg(unix)]
 #[test]
-#[cfg_attr(miri, ignore = "Miri has no mkfifo")]
+#[cfg_attr(miri, ignore = "Miri has no mkfifo, nor starts a process")]
 fn a_full_pool_of_stuck_file_operations_does_not_hold_up_the_others() {
     // On epoll, file operations run on the process's blocking threads, at
     // most 64 of them. With 64 opens of FIFOs that have no writer, every
     // thread was stuck and every other file operation of the process waited
     // behind them for good.
+    //
+    // Runs in a child process: the pool is the process's, and the other
+    // tests of this file expect a thread to take their jobs at once.
+    const CHILD: &str = "GIONG_FULL_POOL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_full_pool_of_stuck_file_operations_does_not_hold_up_the_others",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
     const OPENS: usize = 64;
     let dir = TempDir::new("pool-stuck");
     let paths: Vec<PathBuf> = (0..OPENS).map(|i| dir.path(&i.to_string())).collect();
