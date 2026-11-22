@@ -1,0 +1,41 @@
+g dev clean=FAIL cargo build --profile dev
+6.428053697 touch=FAIL cargo build --profile dev
+.189109236 edit=FAIL cargo build --profile dev
+.210679525 target_MB=113 bin_bytes=NA
+g fastdev clean=FAIL cargo build --profile fastdev
+5.941367201 touch=FAIL cargo build --profile fastdev
+.233414001 edit=FAIL cargo build --profile fastdev
+.167043288 target_MB=97 bin_bytes=NA
+stat: cannot statx 'target/release/ghello': No such file or directory
+g release clean=FAIL cargo build --release
+9.355530195 bin_bytes= target_MB=57
+g release edit=FAIL cargo build --release
+.156296875
+stat: cannot statx 'target/small/ghello': No such file or directory
+g small clean=FAIL cargo build --profile small
+7.930641219 bin_bytes=
+cp: cannot stat 'target/release/ghello': No such file or directory
+a dev clean=19.467722080 touch=.666471844 edit=.904868025 target_MB=403 bin_bytes=48031632
+a fastdev clean=19.983888599 touch=.520848324 edit=.684203266 target_MB=318 bin_bytes=23314392
+a release clean=34.265978121 bin_bytes=4556280 target_MB=190
+a release edit=3.474338786
+a small clean=27.041253134 bin_bytes=2766824
+a release-stripped bin_bytes=3603648
+g dev clean=7.464935219 touch=.313923963 edit=.558505248 target_MB=181 bin_bytes=23899568
+g fastdev clean=6.909683201 touch=.281068846 edit=.453784729 target_MB=140 bin_bytes=11837088
+g release clean=11.460681658 bin_bytes=1926688 target_MB=68
+g release edit=2.428777850
+g small clean=9.569389157 bin_bytes=1065488
+g release-stripped bin_bytes=1446384
+a dev clean=18.042104773 touch=.515724926 edit=.837093739 target_MB=403 bin_bytes=48031632
+a fastdev clean=16.966299985 touch=.466339430 edit=.620809739 target_MB=318 bin_bytes=23314392
+a release clean=33.465586814 bin_bytes=4556280 target_MB=190
+a release edit=3.516468731
+a small clean=25.291113587 bin_bytes=2766824
+a release-stripped bin_bytes=3603648
+g dev clean=7.366318131 touch=.344112781 edit=.558988745 target_MB=181 bin_bytes=23899568
+g fastdev clean=6.924138306 touch=.264459278 edit=.405952853 target_MB=140 bin_bytes=11837088
+g release clean=11.242044553 bin_bytes=1926688 target_MB=68
+g release edit=2.378710618
+g small clean=9.004572346 bin_bytes=1065488
+g release-stripped bin_bytes=1446384
