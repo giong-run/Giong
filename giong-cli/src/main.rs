@@ -18,6 +18,7 @@ mod pages;
 mod project;
 mod report;
 mod service;
+mod sha256;
 
 use std::process::ExitCode;
 

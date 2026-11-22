@@ -56,6 +56,16 @@ codes! {
     MCP_UNREACHABLE = 5019, "McpUnreachable", "the service's giong-mcp does not answer";
     WATCH_LIMIT = 5020, "WatchLimit", "too many files to watch";
     NO_LINKER = 5021, "NoLinker", "no linker found";
+    NO_CONTAINER_RUNTIME = 5040, "NoContainerRuntime", "neither Docker nor Podman answers";
+    DB_NOT_READY = 5041, "DbNotReady", "the database does not answer queries";
+    DB_URL = 5042, "DbUrl", "no usable database URL";
+    MIGRATION_CHANGED = 5043, "MigrationChanged", "an applied migration was changed";
+    MIGRATION_FAILED = 5044, "MigrationFailed", "a migration failed";
+    MIGRATION_NAME = 5045, "MigrationName", "a migration file is not valid";
+    DB_CLIENT_MISSING = 5046, "DbClientMissing", "no database client to run the SQL";
+    MIGRATION_UNKNOWN = 5047, "MigrationUnknown", "the database has a migration the project does not";
+    DB_NOT_MANAGED = 5048, "DbNotManaged", "the database was not started by giong db up";
+    DB_START_FAILED = 5049, "DbStartFailed", "the database container could not start";
     NO_SERVICE = 5050, "NoService", "no running service to ask";
     MCP_NO_TOOL = 5051, "McpNoTool", "the service's giong-mcp lacks a tool";
     MCP_TOOL_ERROR = 5052, "McpToolError", "the service's giong-mcp refused a call";

@@ -426,10 +426,7 @@ mod tests {
         assert_eq!(Endpoint::parse("unix:").unwrap_err().code, Code::USAGE);
         assert_eq!(Endpoint::parse("7777").unwrap_err().code, Code::USAGE);
         assert_eq!(Endpoint::parse("").unwrap_err().code, Code::USAGE);
-        assert_eq!(
-            Endpoint::parse("unix:/x").unwrap().to_string(),
-            "unix:/x"
-        );
+        assert_eq!(Endpoint::parse("unix:/x").unwrap().to_string(), "unix:/x");
     }
 
     #[test]
@@ -447,14 +444,23 @@ mod tests {
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nab").is_err());
         assert!(parse_response(b"garbage").is_err());
         assert!(parse_response(b"SSH-2.0\r\n\r\n").is_err());
-        assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").is_err());
-        assert!(parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab").is_err());
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").is_err()
+        );
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab")
+                .is_err()
+        );
     }
 
     #[test]
     fn completeness_needs_the_whole_body() {
-        assert!(!response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"));
-        assert!(response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"));
+        assert!(!response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"
+        ));
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"
+        ));
         assert!(!response_complete(b"HTTP/1.1 200 OK\r\n"));
     }
 

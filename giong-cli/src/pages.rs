@@ -2758,6 +2758,157 @@ Rust needs a system linker (`cc` on Linux and macOS, the MSVC build tools on Win
 
 [All error codes](README.md)
 "#),
+    (5040, r#"# GIONG-E5040: neither Docker nor Podman answers
+
+Raised by the `giong` command (giong-cli): `giong db` up and down. In JSON output: `"code": "GIONG-E5040"`.
+
+## What happened
+
+`giong db up` starts the development database in a container, and neither `docker info` nor `podman info` succeeded: neither is installed, or its daemon or virtual machine is not running. `GIONG_CONTAINER_RUNTIME` names the one to use when both are installed.
+
+## How to fix it
+
+- Install and start Docker (Docker Desktop or OrbStack on a Mac) or Podman (`podman machine start` on a Mac or Windows).
+- Or run the database yourself and put its URL in `DATABASE_URL` (or `REDIS_URL`): `giong db migrate` and `giong db status` then use it through the locally installed client.
+
+[All error codes](README.md)
+"#),
+    (5041, r#"# GIONG-E5041: the database does not answer queries
+
+Raised by the `giong` command (giong-cli): `giong db` up, status and migrate. In JSON output: `"code": "GIONG-E5041"`.
+
+## What happened
+
+The database did not answer a query in time, or refused the connection: it is still starting (MySQL's first start takes several seconds), it stopped, or the URL's user, password or database is wrong. The message ends with what the database client said.
+
+## How to fix it
+
+- `giong db up --timeout 300` waits longer; `docker logs <container>` shows what the database is doing.
+- Check `DATABASE_URL` against the database; `giong db status` shows what giong started and where.
+
+[All error codes](README.md)
+"#),
+    (5042, r#"# GIONG-E5042: no usable database URL
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and status. In JSON output: `"code": "GIONG-E5042"`.
+
+## What happened
+
+`giong db` found no database to use: `giong db up` started none in this project and `DATABASE_URL` (or `REDIS_URL`) is set neither in the environment nor in `.env`, or it is set to something that is not a `postgres://`, `mysql://` or `redis://` URL.
+
+## How to fix it
+
+- Run `giong db up`, which writes the URL into `.env`.
+- Or set `DATABASE_URL=postgres://user:password@host:5432/db` (or `mysql://...:3306/db`).
+
+[All error codes](README.md)
+"#),
+    (5043, r#"# GIONG-E5043: an applied migration was changed
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and status. In JSON output: `"code": "GIONG-E5043"`.
+
+## What happened
+
+A file in `migrations/` was edited after it was applied: its SHA-256 checksum differs from the one recorded in `giong_migrations`. The database does not have the change, and applying it again could fail or duplicate data, so `giong db migrate` applies nothing until it is resolved.
+
+## How to fix it
+
+- Undo the edit (`git checkout migrations/<file>`) and put the new SQL in a new migration: `giong db new <name>`.
+- In development, `giong db reset --yes` drops the database giong started and applies every migration from the start.
+
+[All error codes](README.md)
+"#),
+    (5044, r#"# GIONG-E5044: a migration failed
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and reset. In JSON output: `"code": "GIONG-E5044"`.
+
+## What happened
+
+The database refused a statement of a migration. The finding points at the file and line, with the database's message. On PostgreSQL each file runs in one transaction, so nothing of the failed file was applied and it is not recorded; later files were not run. On MySQL (which commits DDL statement by statement) and for PostgreSQL files marked `-- giong:no-transaction`, the statements before the failing one stay applied.
+
+## How to fix it
+
+- Fix the SQL and run `giong db migrate` again.
+- On MySQL or a no-transaction file, make the statements safe to run twice (`CREATE TABLE IF NOT EXISTS`, `DROP ... IF EXISTS`) or undo the applied ones by hand first.
+
+[All error codes](README.md)
+"#),
+    (5045, r#"# GIONG-E5045: a migration file is not valid
+
+Raised by the `giong` command (giong-cli): `giong db` new, migrate and status. In JSON output: `"code": "GIONG-E5045"`.
+
+## What happened
+
+A `.sql` file in `migrations/` is not named `NNNN_name.sql` (at least four digits, an underscore, then lower-case letters, digits or `_`), two files share a version number, or a file is not UTF-8. Other files (a README) are ignored.
+
+## How to fix it
+
+- Rename the file, for example `0003_add_index.sql`; `giong db new <name>` writes the next number for you.
+- Two branches that each added a migration with the same number: give the newer one the next free number.
+
+[All error codes](README.md)
+"#),
+    (5046, r#"# GIONG-E5046: no database client to run the SQL
+
+Raised by the `giong` command (giong-cli): `giong db` migrate, status and reset. In JSON output: `"code": "GIONG-E5046"`.
+
+## What happened
+
+`giong db` runs SQL through the database's own client. For a database `giong db up` started it uses the client inside the container; for any other `DATABASE_URL` it needs `psql` or `mysql` installed here, and it is not.
+
+## How to fix it
+
+- Install the client: `postgresql-client` (`brew install libpq` on a Mac) or `mysql-client` / `mariadb-client`.
+- Or let `giong db up` start the development database.
+
+[All error codes](README.md)
+"#),
+    (5047, r#"# GIONG-E5047: the database has a migration the project does not
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and status. In JSON output: `"code": "GIONG-E5047"`.
+
+## What happened
+
+`giong_migrations` records a version for which `migrations/` has no file: it was applied from another branch, or its file was deleted or renumbered. A warning: the other migrations still apply.
+
+## How to fix it
+
+- Switch to the branch that has it, or restore the file.
+- In development, `giong db reset --yes` starts the database over from the files you have.
+
+[All error codes](README.md)
+"#),
+    (5048, r#"# GIONG-E5048: the database was not started by giong db up
+
+Raised by the `giong` command (giong-cli): `giong db` reset. In JSON output: `"code": "GIONG-E5048"`.
+
+## What happened
+
+`giong db reset` drops and recreates the database, so it acts only on a database `giong db up` started in this project (listed in `.giong/db.json`), never on one given by `DATABASE_URL`, which could be shared or in production.
+
+## How to fix it
+
+- Start the development database with `giong db up` and reset that.
+- To empty another database, do it yourself with its own tools, deliberately.
+
+[All error codes](README.md)
+"#),
+    (5049, r#"# GIONG-E5049: the database container could not start
+
+Raised by the `giong` command (giong-cli): `giong db` up and down. In JSON output: `"code": "GIONG-E5049"`.
+
+## What happened
+
+Docker or Podman could not create, start or remove the database container, or the container stopped while starting. The message carries the runtime's or the database's own words: a port taken by another program, an image that cannot be pulled, or a data volume written by another major version of the engine.
+
+## How to fix it
+
+- A taken port: `giong db down`, then `giong db up` picks a free one (or `--port`).
+- An image: check `--image` and the network, or `docker pull` it first.
+- A volume from another version: `giong db down --volumes` deletes the data and starts fresh.
+
+[All error codes](README.md)
+"#),
     (5050, r#"# GIONG-E5050: no running service to ask
 
 Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5050"`.

@@ -21,7 +21,8 @@ use crate::service::{self, Service};
 pub const COMMAND: Command = Command {
     name: "top",
     summary: "watch a running service: workers, tasks by spawn line, pools, stuck workers",
-    usage: "giong top [--interval <ms>] [--once] [--profile <ms>] [--tasks <n>] [--mcp <address>]\n\n\
+    usage:
+        "giong top [--interval <ms>] [--once] [--profile <ms>] [--tasks <n>] [--mcp <address>]\n\n\
             Shows the running service's workers (state, driver, busy share, polls per second, \
             tasks, I/O in flight), its tasks grouped by the line that spawned them, its \
             database pools and its warnings, refreshed every second, until Ctrl-C. A worker \
@@ -147,9 +148,22 @@ pub fn render(s: &Snapshot, width: usize) -> String {
     out.push('\n');
     out.push_str(&format!(
         "{:>3} {:<8} {:<9} {:>5} {:>9} {:>6} {:>4} {:>6} {:>6} {:>8}  {}\n",
-        "W", "STATE", "DRIVER", "BUSY", "POLLS/S", "TASKS", "RUN", "TIMERS", "IO", "BUFFERS", "BLOCKED"
+        "W",
+        "STATE",
+        "DRIVER",
+        "BUSY",
+        "POLLS/S",
+        "TASKS",
+        "RUN",
+        "TIMERS",
+        "IO",
+        "BUFFERS",
+        "BLOCKED"
     ));
-    let overview_workers = s.overview["workers"].as_array().cloned().unwrap_or_default();
+    let overview_workers = s.overview["workers"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     for w in s.workers["workers"].as_array().into_iter().flatten() {
         let i = w["worker"].as_u64().unwrap_or(0) as usize;
         let ov = overview_workers.get(i).cloned().unwrap_or(Value::Null);
@@ -259,18 +273,26 @@ pub fn findings(overview: &Value) -> Vec<Finding> {
         .filter_map(Value::as_str)
         .map(|w| {
             if w.contains("inside one poll") || w.contains("blocks the thread") {
-                Finding::new(Code::WORKER_BLOCKED, Severity::Error, "a worker is stuck in one task")
-                    .detail(w)
-                    .fix(
-                        "find the blocking call or long loop in the task named (std::fs, \
+                Finding::new(
+                    Code::WORKER_BLOCKED,
+                    Severity::Error,
+                    "a worker is stuck in one task",
+                )
+                .detail(w)
+                .fix(
+                    "find the blocking call or long loop in the task named (std::fs, \
                          std::thread::sleep, std::net, a lock, a computation without .await): \
                          use giong::fs, giong::time::sleep or giong::net instead, move the work \
                          to a thread of its own, or yield with giong::yield_now().await",
-                    )
+                )
             } else {
-                Finding::new(Code::SERVICE_WARNING, Severity::Warning, "the service reports a warning")
-                    .detail(w)
-                    .fix("read the warning; giong-mcp's README explains each kind")
+                Finding::new(
+                    Code::SERVICE_WARNING,
+                    Severity::Warning,
+                    "the service reports a warning",
+                )
+                .detail(w)
+                .fix("read the warning; giong-mcp's README explains each kind")
             }
         })
         .collect()
@@ -341,7 +363,10 @@ fn run(args: &Args) -> Result<Report, Failure> {
             Err(f) if !first => {
                 // The service stopped (or restarted under giong dev): say so
                 // and keep trying, as top does for a process that is gone.
-                let _ = write!(out, "\x1b[H\x1b[2J{f}\n\nretrying every {interval} ms (Ctrl-C to stop)\n");
+                let _ = write!(
+                    out,
+                    "\x1b[H\x1b[2J{f}\n\nretrying every {interval} ms (Ctrl-C to stop)\n"
+                );
                 let _ = out.flush();
                 std::thread::sleep(Duration::from_millis(interval));
                 continue;
@@ -408,7 +433,10 @@ mod tests {
         assert!(s.contains("2300 ms in src/main.rs:40:9"), "{s}");
         assert!(s.contains("TASKS 4 live at 2 spawn locations"), "{s}");
         assert!(s.contains("giong-http/src/server.rs:200:13"), "{s}");
-        assert!(s.contains("postgres pool db:5432/app: idle 3, open 4"), "{s}");
+        assert!(
+            s.contains("postgres pool db:5432/app: idle 3, open 4"),
+            "{s}"
+        );
         assert!(s.contains("    120 "), "{s}");
         assert!(s.contains("PROFILE over 1000 ms"), "{s}");
         assert!(s.contains("50.0%"), "{s}");

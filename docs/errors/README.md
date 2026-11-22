@@ -269,6 +269,16 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
 | [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
 | [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
+| [GIONG-E5040](E5040.md) | `NoContainerRuntime` | neither Docker nor Podman answers |
+| [GIONG-E5041](E5041.md) | `DbNotReady` | the database does not answer queries |
+| [GIONG-E5042](E5042.md) | `DbUrl` | no usable database URL |
+| [GIONG-E5043](E5043.md) | `MigrationChanged` | an applied migration was changed |
+| [GIONG-E5044](E5044.md) | `MigrationFailed` | a migration failed |
+| [GIONG-E5045](E5045.md) | `MigrationName` | a migration file is not valid |
+| [GIONG-E5046](E5046.md) | `DbClientMissing` | no database client to run the SQL |
+| [GIONG-E5047](E5047.md) | `MigrationUnknown` | the database has a migration the project does not |
+| [GIONG-E5048](E5048.md) | `DbNotManaged` | the database was not started by giong db up |
+| [GIONG-E5049](E5049.md) | `DbStartFailed` | the database container could not start |
 | [GIONG-E5050](E5050.md) | `NoService` | no running service to ask |
 | [GIONG-E5051](E5051.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
 | [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |

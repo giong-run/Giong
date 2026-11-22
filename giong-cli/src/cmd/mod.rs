@@ -9,6 +9,7 @@ use crate::args::{distance, Args, Flag};
 use crate::code::Code;
 use crate::report::{Failure, Report};
 
+pub mod db;
 pub mod doctor;
 pub mod explain;
 pub mod help;
@@ -37,6 +38,7 @@ pub const COMMANDS: &[&Command] = &[
     // Thread B adds `new`, `ai`, `fix` here; thread C `db`, `top`, `bench`,
     // `image`, `openapi`, `record`.
     &doctor::COMMAND,
+    &db::COMMAND,
     &explain::COMMAND,
     &routes::COMMAND,
     &openapi::COMMAND,

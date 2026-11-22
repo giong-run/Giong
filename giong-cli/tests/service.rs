@@ -178,7 +178,10 @@ fn routes_lists_every_route_with_curl_lines() {
         put["curl"],
         "curl -i -X PUT --data-binary @file 'http://127.0.0.1:8080/files/path/example'"
     );
-    assert!(put["added_at"].as_str().unwrap().contains("tests/service.rs:"));
+    assert!(put["added_at"]
+        .as_str()
+        .unwrap()
+        .contains("tests/service.rs:"));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -258,8 +261,7 @@ fn the_service_is_found_through_giong_mcp_and_dev_json() {
     let sock = svc.mcp.strip_prefix("unix:").unwrap();
     std::fs::write(
         dir.join(".giong/dev.json"),
-        serde_json::json!({ "pid": 1, "mcp_socket": sock, "listen": ["0.0.0.0:3000"] })
-            .to_string(),
+        serde_json::json!({ "pid": 1, "mcp_socket": sock, "listen": ["0.0.0.0:3000"] }).to_string(),
     )
     .unwrap();
     let (status, r) = giong(&dir, &["routes"], &[]);
@@ -282,7 +284,12 @@ fn no_service_and_a_dead_socket_are_coded_failures() {
     let gone = dir.join("gone.sock");
     let (status, r) = giong(
         &dir,
-        &["top", "--once", "--mcp", &format!("unix:{}", gone.display())],
+        &[
+            "top",
+            "--once",
+            "--mcp",
+            &format!("unix:{}", gone.display()),
+        ],
         &[],
     );
     assert_eq!(status, 2, "{r}");
@@ -307,6 +314,9 @@ fn top_names_a_stuck_worker_and_fails() {
         .find(|f| f["code"] == "GIONG-E5055")
         .unwrap_or_else(|| panic!("no stuck-worker finding: {r}"));
     assert_eq!(f["severity"], "error");
-    assert!(f["detail"].as_str().unwrap().contains("tests/service.rs:"), "{f}");
+    assert!(
+        f["detail"].as_str().unwrap().contains("tests/service.rs:"),
+        "{f}"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
