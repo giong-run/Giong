@@ -15,3 +15,7 @@
   without building. It starts the service with `WORKERS=2` on a laptop, `.env`,
   `RUST_BACKTRACE=1` and a giong-mcp socket, and keeps `.giong/dev.json` and
   `.giong/dev.log` for other tools; `--json` prints one event per line.
+- **giong-cli**: `giong check` reports the compiler's errors and warnings, clippy's lints and
+  giong's own checks of the source in one report: blocking calls in async code
+  (`GIONG-E5006`), listeners bound to a host name (`GIONG-E5007`), `RefCell` borrows held
+  across an `.await` (`GIONG-E5008`). Machine-applicable fixes come as edits.
