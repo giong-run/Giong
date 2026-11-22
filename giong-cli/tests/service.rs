@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -46,14 +47,25 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Starts the service; with `block`, worker 1 blocks its thread in one task
-/// for 3 s, a moment after starting.
-fn service(tag: &str, tcp_token: Option<&str>) -> Service {
-    service_with(tag, tcp_token, false)
+/// A directory for a Unix socket, under `/tmp` with a short name: a socket
+/// path holds at most 104 bytes on macOS, where `$TMPDIR` alone takes ~50.
+fn socket_dir() -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = PathBuf::from(format!("/tmp/gc-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
-fn service_with(tag: &str, tcp_token: Option<&str>, block: bool) -> Service {
-    let dir = temp_dir(tag);
+/// Starts the service; with `block`, worker 1 blocks its thread in one task
+/// for 3 s, a moment after starting.
+fn service(tcp_token: Option<&str>) -> Service {
+    service_with(tcp_token, false)
+}
+
+fn service_with(tcp_token: Option<&str>, block: bool) -> Service {
+    let dir = socket_dir();
     let sock = dir.join("mcp.sock");
     let (ready_tx, ready_rx) = mpsc::channel::<String>();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -140,7 +152,7 @@ fn giong(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Value) {
 
 #[test]
 fn routes_lists_every_route_with_curl_lines() {
-    let svc = service("routes", None);
+    let svc = service(None);
     let dir = temp_dir("routes-cwd");
     let (status, r) = giong(&dir, &["routes", "--mcp", &svc.mcp], &[]);
     assert_eq!(status, 0, "{r}");
@@ -187,7 +199,7 @@ fn routes_lists_every_route_with_curl_lines() {
 
 #[test]
 fn openapi_writes_a_document_for_the_routes() {
-    let svc = service("openapi", None);
+    let svc = service(None);
     let dir = temp_dir("openapi-cwd");
     let out = dir.join("openapi.json");
     let (status, r) = giong(
@@ -220,7 +232,7 @@ fn openapi_writes_a_document_for_the_routes() {
 #[test]
 fn top_once_takes_a_snapshot_over_tcp_with_a_token() {
     let token = "0123456789abcdef0123";
-    let svc = service("top", Some(token));
+    let svc = service(Some(token));
     let dir = temp_dir("top-cwd");
     let (status, r) = giong(
         &dir,
@@ -246,7 +258,7 @@ fn top_once_takes_a_snapshot_over_tcp_with_a_token() {
 
 #[test]
 fn the_service_is_found_through_giong_mcp_and_dev_json() {
-    let svc = service("locate", None);
+    let svc = service(None);
     let dir = temp_dir("locate-cwd");
     // GIONG_MCP, as the service itself reads it.
     let (status, r) = giong(&dir, &["routes"], &[("GIONG_MCP", &svc.mcp)]);
@@ -281,7 +293,8 @@ fn no_service_and_a_dead_socket_are_coded_failures() {
     let (status, r) = giong(&dir, &["routes"], &[]);
     assert_eq!(status, 2, "{r}");
     assert_eq!(r["error"]["code"], "GIONG-E5057", "{r}");
-    let gone = dir.join("gone.sock");
+    let sockets = socket_dir();
+    let gone = sockets.join("gone.sock");
     let (status, r) = giong(
         &dir,
         &[
@@ -298,11 +311,12 @@ fn no_service_and_a_dead_socket_are_coded_failures() {
     assert_eq!(status, 2, "{r}");
     assert_eq!(r["error"]["code"], "GIONG-E5000", "{r}");
     std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&sockets).unwrap();
 }
 
 #[test]
 fn top_names_a_stuck_worker_and_fails() {
-    let svc = service_with("blocked", None, true);
+    let svc = service_with(None, true);
     let dir = temp_dir("blocked-cwd");
     thread::sleep(Duration::from_millis(700));
     let (status, r) = giong(&dir, &["top", "--once", "--mcp", &svc.mcp], &[]);
