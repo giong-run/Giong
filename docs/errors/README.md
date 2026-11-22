@@ -269,3 +269,8 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
 | [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
 | [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
+| [GIONG-E5050](E5050.md) | `NoService` | no running service to ask |
+| [GIONG-E5051](E5051.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
+| [GIONG-E5052](E5052.md) | `McpToolError` | the service's giong-mcp refused a call |
+| [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
+| [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |

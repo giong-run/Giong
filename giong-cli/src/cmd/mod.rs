@@ -13,6 +13,9 @@ pub mod clean;
 pub mod doctor;
 pub mod explain;
 pub mod help;
+pub mod openapi;
+pub mod routes;
+pub mod top;
 pub mod version;
 
 /// A command of `giong`.
@@ -37,6 +40,9 @@ pub const COMMANDS: &[&Command] = &[
     &doctor::COMMAND,
     &explain::COMMAND,
     &clean::COMMAND,
+    &routes::COMMAND,
+    &openapi::COMMAND,
+    &top::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];

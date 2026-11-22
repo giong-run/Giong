@@ -2758,4 +2758,80 @@ Rust needs a system linker (`cc` on Linux and macOS, the MSVC build tools on Win
 
 [All error codes](README.md)
 "#),
+    (5050, r#"# GIONG-E5050: no running service to ask
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5050"`.
+
+## What happened
+
+The command reads a running service through its giong-mcp server, and found none to ask: no `--mcp` flag, no `GIONG_MCP` in the environment, and no `giong dev` serving the project in the current directory (`.giong/dev.json`).
+
+## How to fix it
+
+- Start the service with `giong dev` in the project and run the command from the same project.
+- Or run the service with `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` set (16 characters or more), keep `let _mcp = giong_mcp::start_from_env(&handle);` alive in it, and pass `--mcp 127.0.0.1:7777` with the same `GIONG_MCP_TOKEN`.
+- A service listening on a Unix socket: `--mcp unix:/path/to/mcp.sock` (no token needed).
+
+[All error codes](README.md)
+"#),
+    (5051, r#"# GIONG-E5051: the service's giong-mcp lacks a tool
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi` and `giong dashboard`. In JSON output: `"code": "GIONG-E5051"`.
+
+## What happened
+
+The service's giong-mcp answered, but has no tool the command needs. The `routes` tool is there only when giong-mcp is built with its `web` feature, and only from giong-mcp 1.5.
+
+## How to fix it
+
+- Turn on the feature in the service's `Cargo.toml`: `giong-mcp = { version = "1.5", features = ["web"] }`, with giong-web 1.5 or newer, and rebuild.
+- Use a giong-mcp of the same version as the `giong` command (`giong --version`).
+
+[All error codes](README.md)
+"#),
+    (5052, r#"# GIONG-E5052: the service's giong-mcp refused a call
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5052"`.
+
+## What happened
+
+The service's giong-mcp answered the call with an error, or with an answer this command cannot read. The message says which: a refused argument, a worker that did not answer, or an answer of another version.
+
+## How to fix it
+
+- Read the message: a worker that does not answer is stuck (`giong top` shows which and in which task).
+- Use giong-mcp and the `giong` command of the same version.
+
+[All error codes](README.md)
+"#),
+    (5055, r#"# GIONG-E5055: a worker of the service is stuck in one task
+
+Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5055"`.
+
+## What happened
+
+giong-mcp saw a worker that is awake but has not moved on for a while: one task's poll has not returned. giong runs many tasks on each worker thread, so every other task on that worker (other requests, timers, pool connections) waits. The finding names the line that spawned the task; in a giong-http or giong-web service that is giong-http's connection task, which runs the request handlers.
+
+## How to fix it
+
+- Look for a blocking call in the code the task runs: `std::fs`, `std::thread::sleep`, `std::net`, a blocking client, a `Mutex` held long, or a loop that computes without `.await`.
+- Use the giong equivalent (`giong::fs`, `giong::time::sleep`, `giong::net`, giong's database and HTTP clients), move the work to a thread of its own, or let other tasks run with `giong::yield_now().await` inside long loops.
+- `giong top --profile 2000` shows where the workers spend their time.
+
+[All error codes](README.md)
+"#),
+    (5056, r#"# GIONG-E5056: the service reports a warning
+
+Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5056"`.
+
+## What happened
+
+giong-mcp's `overview` listed a warning other than a stuck worker: workers that fell back to the epoll driver because io_uring is blocked, or a process close to its open-files limit. The detail is the warning's text.
+
+## How to fix it
+
+- Read the detail. For epoll: see [GIONG-E0001](E0001.md) and `giong doctor`. For open files: raise the limit (`ulimit -n`, `LimitNOFILE=` in a systemd unit, or the container's `nofile` ulimit) or find the leak (`giong top` lists tasks by spawn line).
+
+[All error codes](README.md)
+"#),
 ];
