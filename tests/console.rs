@@ -74,8 +74,9 @@ fn a_second_ctrl_break_ends_a_process_whose_shutdown_hangs() {
             .any(|l| l.unwrap().contains("shutdown asked")),
         "the first Ctrl+Break did not ask for a shutdown"
     );
-    // The first event only asks: the process is still running.
-    std::thread::sleep(Duration::from_millis(100));
+    // The first event only asks: the process is still running. Wait past
+    // the 250 ms in which another event counts as the same press.
+    std::thread::sleep(Duration::from_millis(500));
     assert!(
         child.try_wait().unwrap().is_none(),
         "the first Ctrl+Break ended the process"
