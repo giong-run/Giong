@@ -214,6 +214,10 @@ struct State {
     /// The tasks waiting in `get`, oldest first.
     tickets: VecDeque<u64>,
     next_ticket: u64,
+    /// The last attempt to open a connection failed, and none has opened
+    /// since: the error. Meanwhile one attempt runs at a time, and the tasks
+    /// that waited through it get its error.
+    failing: Option<Error>,
     opened: u64,
     connect_errors: u64,
     timeouts: u64,
@@ -245,6 +249,12 @@ impl Member {
 impl State {
     fn open(&self) -> usize {
         self.shared.len() + self.draining.len() + self.taken + self.connecting
+    }
+
+    /// Room for one more connection: below the maximum, and, while opening
+    /// connections fails, no attempt under way.
+    fn room(&self, max: usize) -> bool {
+        self.open() < max && (self.failing.is_none() || self.connecting == 0)
     }
 
     /// Sets aside one connection for each task waiting in `get`, keeping one
@@ -391,6 +401,11 @@ impl Drop for Ticket<'_> {
 impl Pool {
     /// A pool of at most `max_size` connections to the server in `config`.
     /// Connections are opened when needed, not here.
+    ///
+    /// When opening one fails, the pool opens one at a time until one
+    /// succeeds, and tasks that waited through a failed attempt, with no
+    /// connection open to wait for, get its error at once: while the server
+    /// is down, a burst of calls makes one attempt, not one each.
     ///
     /// Size it from the server's `max_connections`: the pools of all workers
     /// of all processes together must stay below it.
@@ -600,7 +615,7 @@ impl Pool {
                         };
                     }
                 }
-                if st.open() < max {
+                if st.room(max) {
                     st.connecting += 1;
                     ticket.leave(st);
                     return Decision::Connect;
@@ -678,7 +693,7 @@ impl Pool {
     async fn shared(&self) -> Result<Lent<'_>, Error> {
         let client = self
             .acquire(|st, max, now| {
-                let room = st.open() < max;
+                let room = st.room(max);
                 // Busy means used by other tasks right now.
                 // A connection past its lifetime takes no new statement, so
                 // that it frees up and closes.
@@ -753,9 +768,20 @@ impl Pool {
         mut decide: impl FnMut(&mut State, usize, Instant) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
         let deadline = Instant::now() + self.inner.wait_timeout;
+        // Failed attempts to open a connection so far: when one fails while
+        // this task waits, and the pool has no connection open to wait for,
+        // the task fails with its error rather than try again at once.
+        let failed_before = self.inner.state.borrow().connect_errors;
+        let mut waited = false;
         loop {
             let decision = {
                 let mut st = self.inner.state.borrow_mut();
+                let none_open = st.shared.is_empty() && st.draining.is_empty() && st.taken == 0;
+                if waited && none_open && st.connect_errors != failed_before {
+                    if let Some(e) = st.failing.clone() {
+                        return Err(e);
+                    }
+                }
                 // One clock read for both.
                 let now = Instant::now();
                 st.sweep(now, self.inner.idle_timeout);
@@ -770,16 +796,19 @@ impl Pool {
                     return match result {
                         Ok(client) => {
                             st.opened += 1;
+                            st.failing = None;
                             self.start_reaper(&mut st);
                             Ok(Err(client))
                         }
                         Err(e) => {
                             st.connect_errors += 1;
+                            st.failing = Some(e.clone());
                             Err(e)
                         }
                     };
                 }
                 Decision::Wait => {
+                    waited = true;
                     self.inner.state.borrow_mut().waiting += 1;
                     let _waiting = Waiting(self);
                     let mut registered = false;

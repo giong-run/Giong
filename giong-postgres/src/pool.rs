@@ -208,7 +208,12 @@ struct State {
     reaper_waker: Option<Waker>,
     /// The pool was dropped.
     stopped: bool,
+    /// The last attempt to open a connection failed, and none has opened
+    /// since: the error. Meanwhile one attempt runs at a time, and the tasks
+    /// that waited through it get its error.
+    failing: Option<Error>,
     opened: u64,
+    /// Attempts to open a connection that failed.
     connect_errors: u64,
     timeouts: u64,
     recycled: u64,
@@ -238,8 +243,11 @@ impl Member {
 }
 
 impl State {
+    /// Room for one more connection: below the maximum, and, while opening
+    /// connections fails, no attempt under way.
     fn room(&self, max: usize) -> bool {
         self.shared.len() + self.taken + self.connecting < max
+            && (self.failing.is_none() || self.connecting == 0)
     }
 
     /// Wakes every waiting task (later, see `to_wake`), to look again.
@@ -422,6 +430,11 @@ impl Drop for Ticket<'_> {
 impl Pool {
     /// A pool of at most `max_size` connections to the server in `config`.
     /// Connections are opened when needed, not here.
+    ///
+    /// When opening one fails, the pool opens one at a time until one
+    /// succeeds, and tasks that waited through a failed attempt, with no
+    /// connection open to wait for, get its error at once: while the server
+    /// is down, a burst of calls makes one attempt, not one each.
     ///
     /// Size it from the server's `max_connections`: the pools of all workers
     /// of all processes together must stay below it.
@@ -803,9 +816,20 @@ impl Pool {
     ) -> Result<Result<T, Client>, Error> {
         let deadline = Instant::now() + self.inner.wait_timeout;
         let mut waiting: Option<Waiting<'_>> = None;
+        // Failed attempts to open a connection so far: when one fails while
+        // this task waits, and the pool has no connection open to wait for,
+        // the task fails with its error rather than try again at once.
+        let failed_before = self.inner.state.borrow().connect_errors;
         loop {
             let decision = {
                 let mut st = self.inner.state.borrow_mut();
+                let none_open = st.shared.is_empty() && st.taken == 0;
+                if waiting.is_some() && none_open && st.connect_errors != failed_before {
+                    if let Some(e) = st.failing.clone() {
+                        drop(st);
+                        return Err(e);
+                    }
+                }
                 let now = Instant::now();
                 st.sweep(now, self.inner.idle_timeout);
                 let d = decide(&mut st, now);
@@ -833,11 +857,13 @@ impl Pool {
                     return match result {
                         Ok(client) => {
                             st.opened += 1;
+                            st.failing = None;
                             self.start_reaper(&mut st);
                             Ok(Err(client))
                         }
                         Err(e) => {
                             st.connect_errors += 1;
+                            st.failing = Some(e.clone());
                             Err(e)
                         }
                     };

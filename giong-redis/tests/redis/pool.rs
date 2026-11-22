@@ -524,3 +524,47 @@ fn timeouts_too_long_for_the_clock_mean_no_limit() {
         assert_eq!(pool.stats().opened, 1);
     });
 }
+
+/// A local port nothing listens on.
+fn closed_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+#[test]
+fn tasks_waiting_while_the_server_is_down_share_one_connect_attempt() {
+    use std::cell::Cell;
+    run(|s| async move {
+        let port = closed_port();
+        let pool = Pool::new(s.tcp().port(port), 4);
+        let calls = Rc::new(Cell::new(0u64));
+        let end = giong::time::Instant::now() + Duration::from_millis(300);
+        let tasks: Vec<_> = (0..64)
+            .map(|_| {
+                let (pool, calls) = (pool.clone(), calls.clone());
+                giong::spawn(async move {
+                    while giong::time::Instant::now() < end {
+                        let e = pool.query::<Value>(&cmd("PING")).await.unwrap_err();
+                        // The server's own refusal, never a pool timeout.
+                        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+                        calls.set(calls.get() + 1);
+                        giong::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let attempts = pool.stats().connect_errors;
+        let calls = calls.get();
+        // Each task used to make an attempt of its own, on every call.
+        assert!(
+            attempts * 8 <= calls,
+            "{attempts} connect attempts for {calls} calls"
+        );
+        // And it comes back at once with the server.
+        let pool = Pool::new(s.tcp(), 4);
+        let _: Value = pool.query(&cmd("PING")).await.unwrap();
+    });
+}
