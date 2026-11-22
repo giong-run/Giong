@@ -124,6 +124,7 @@ jobs:
           { "crate": "giong-cli", "target": "args" }
           { "crate": "giong-cli", "target": "dotenv" }
           { "crate": "giong-cli", "target": "host_parsers" }
+          { "crate": "giong-cli", "target": "lint" }
           EOF
           )
           if [ "$EVENT" = pull_request ]; then

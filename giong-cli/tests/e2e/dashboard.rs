@@ -172,7 +172,6 @@ fn a_taken_port_is_a_coded_failure_at_once() {
 /// command, in the report's shape, so an agent reads the URL the way it reads
 /// every other command.
 #[test]
-#[ignore = "known bug: giong dashboard --json prints {\"command\",\"url\"}, not a report (version, ok, findings, data.url)"]
 fn the_json_line_is_a_report() {
     if !has_command("dashboard") {
         return;

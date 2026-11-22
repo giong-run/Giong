@@ -214,7 +214,6 @@ fn one_problem_is_reported_once() {
 /// what `giong check` meets most often while someone types: it reports what
 /// the compiler says and never panics. Found by the `lint` fuzz target.
 #[test]
-#[ignore = "known bug: giong check panics in lint.rs (byte range starts at 67 but ends at 49) on a half-typed async fn"]
 fn a_half_typed_file_does_not_panic() {
     if !has_command("check") {
         return;
