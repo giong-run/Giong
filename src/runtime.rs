@@ -2091,7 +2091,13 @@ mod tests {
 
     #[test]
     fn a_worker_thread_that_cannot_start_says_why() {
+        // What the kernel says: `EAGAIN` on Unix. Windows has no such
+        // number (11 is another error there), so the kind stands in for it.
+        #[cfg(unix)]
         let eagain = io::Error::from_raw_os_error(libc::EAGAIN);
+        #[cfg(windows)]
+        let eagain = io::Error::from(io::ErrorKind::WouldBlock);
+        let words = eagain.to_string();
         let e = thread_limit_error(2, 4, eagain);
         assert_eq!(code(&e), Some(Code::ThreadLimit));
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
@@ -2103,9 +2109,7 @@ mod tests {
         assert!(text.contains("--pids-limit"), "{text}");
         assert!(text.contains("Builder::workers"), "{text}");
         let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
-        assert!(source
-            .to_string()
-            .contains("Resource temporarily unavailable"));
+        assert_eq!(source.to_string(), words);
     }
 
     #[test]
