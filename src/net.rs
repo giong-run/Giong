@@ -308,6 +308,10 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
 pub(crate) struct ListenSocket {
     sock: ManuallyDrop<Socket>,
     accept: MultiSlot,
+    /// A socket handed down by `giong dev`: it stops accepting when told to
+    /// (see `inherit`).
+    #[cfg(unix)]
+    inherited: bool,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -322,8 +326,18 @@ impl ListenSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
+            #[cfg(unix)]
+            inherited: false,
             _not_send: PhantomData,
         }
+    }
+
+    /// A socket `giong dev` handed down (see `inherit`).
+    #[cfg(unix)]
+    pub(crate) fn inherited(sock: Socket) -> Self {
+        let mut listener = Self::new(sock);
+        listener.inherited = true;
+        listener
     }
 
     pub(crate) fn socket(&self) -> &Socket {
@@ -339,6 +353,10 @@ impl ListenSocket {
         runtime::with_worker(|w| {
             let key = self.accept.key(w);
             let mut driver = w.driver.borrow_mut();
+            #[cfg(unix)]
+            if self.inherited {
+                return inherit::poll_accept(&self.sock, key, &mut driver, cx);
+            }
             loop {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res) if res >= 0 => {
@@ -1266,7 +1284,7 @@ impl TcpListener {
         #[cfg(unix)]
         if let Some(sock) = inherit::take(addr)? {
             return Ok(Self {
-                inner: ListenSocket::new(sock),
+                inner: ListenSocket::inherited(sock),
                 balance: None,
                 // Not counted as this process's hold on the port: dropping a
                 // duplicate must not stop the shared socket listening.

@@ -2758,4 +2758,19 @@ Rust needs a system linker (`cc` on Linux and macOS, the MSVC build tools on Win
 
 [All error codes](README.md)
 "#),
+    (5022, r#"# GIONG-E5022: giong dev already serves this project
+
+Raised by the `giong` command (giong-cli): `giong dev`. In JSON output: `"code": "GIONG-E5022"`.
+
+## What happened
+
+Another `giong dev` is running for the same project: `.giong/dev.json` names its process, and that process is alive. Two would fight over the same port and the same build directory.
+
+## How to fix it
+
+- Use the one that runs: it rebuilds and restarts on every save. Its output is also in `.giong/dev.log`.
+- To start over, stop it first (Ctrl-C in its terminal, or `kill <pid>` with the pid the message gives).
+
+[All error codes](README.md)
+"#),
 ];

@@ -21,5 +21,10 @@ path = "src/main.rs"
 [dependencies]
 serde_json = "1"
 
+# giong dev hands its listening sockets to the service: socket2 makes them
+# inheritable for the spawn only, without `unsafe` here.
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+
 [lints.rust]
 unsafe_code = "forbid"

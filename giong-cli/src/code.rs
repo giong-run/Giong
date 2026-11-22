@@ -65,6 +65,7 @@ codes! {
     MCP_UNREACHABLE = 5019, "McpUnreachable", "the service's giong-mcp does not answer";
     WATCH_LIMIT = 5020, "WatchLimit", "too many files to watch";
     NO_LINKER = 5021, "NoLinker", "no linker found";
+    DEV_RUNNING = 5022, "DevRunning", "giong dev already serves this project";
 }
 
 impl Code {
