@@ -59,18 +59,38 @@ pub fn shared_port() -> (Socket, u16) {
     (socket, port)
 }
 
-/// A port on 127.0.0.1 for the listeners of a test to share. Windows has
-/// no `SO_REUSEPORT` to hold it with: the port is one that was free a
-/// moment ago, and the short race with another bind is accepted.
+/// A port on 127.0.0.1 for the listeners of a test to share.
+///
+/// Windows has no `SO_REUSEPORT` to hold it with, so the port is one that
+/// is free now, and each call gives another one. A port from a bind to port
+/// 0 that was given back at once is not enough: Windows can give the same
+/// one to a test running beside this one, whose listeners then join this
+/// test's (the listeners of a process share an address), and each test
+/// gets some of the other's connections and waits for the rest. That hung
+/// the balance tests once in about a hundred runs. The ports are taken
+/// below the range Windows hands out for binds to port 0 (49152 and up),
+/// and above the ones `refusing_udp_addr` takes.
 #[cfg(windows)]
 pub fn shared_port() -> (Socket, u16) {
-    let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
-    socket
-        .bind(&SocketAddr::from(([127, 0, 0, 1], 0)).into())
-        .unwrap();
-    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
-    drop(socket);
-    (Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(), port)
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let start = 20_000 + (std::process::id() as u16 % 1000) * 20 + 4_500;
+    loop {
+        // At most 39,980 + 9,000, below 49,152.
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(n < 4_500, "no free port below the ephemeral range");
+        let addr = SocketAddr::from(([127, 0, 0, 1], start + n));
+        let free = [Type::STREAM, Type::DGRAM].into_iter().all(|kind| {
+            let probe = Socket::new(Domain::IPV4, kind, None).unwrap();
+            probe.bind(&addr.into()).is_ok()
+        });
+        if free {
+            return (
+                Socket::new(Domain::IPV4, Type::STREAM, None).unwrap(),
+                start + n,
+            );
+        }
+    }
 }
 
 /// An address on 127.0.0.1 where a UDP datagram is refused (the kernel
@@ -105,8 +125,8 @@ pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
 #[cfg(windows)]
 pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
     let start = 20_000 + (std::process::id() as u16 % 1000) * 20;
-    // At most 39,980 + 9,000, below 49,152.
-    let addr = (0..9_000u16)
+    // Below the ports `shared_port` takes.
+    let addr = (0..4_500u16)
         .map(|i| SocketAddr::from(([127, 0, 0, 1], start + i)))
         .find(|addr| {
             let probe = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
