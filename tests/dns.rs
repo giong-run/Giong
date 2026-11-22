@@ -21,11 +21,16 @@ enum Reply {
     /// Answer records: (owner name, type, ttl, data).
     Records(Vec<(String, u16, u32, Vec<u8>)>),
     NxDomain,
+    /// NXDOMAIN with the zone's SOA record (its TTL and MINIMUM fields) in
+    /// the authority section, as recursive servers send it.
+    NxDomainSoa(u32, u32),
     ServFail,
     /// Over UDP: an empty answer with the truncation bit. Over TCP: these.
     Truncated(Vec<(String, u16, u32, Vec<u8>)>),
     /// No answer at all.
     Silent,
+    /// These records, sent this long after the query.
+    Late(Duration, Vec<(String, u16, u32, Vec<u8>)>),
 }
 
 /// Answers from a table keyed by (name, type); unknown names get NXDOMAIN.
@@ -94,10 +99,18 @@ impl FakeDns {
                     Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => continue,
                     Err(_) => return,
                 };
-                let Some(reply) = answer(&buf[..n], &t, &q, false) else {
+                let Some((reply, delay)) = answer(&buf[..n], &t, &q, false) else {
                     continue;
                 };
-                let _ = udp.send_to(&reply, from);
+                if delay.is_zero() {
+                    let _ = udp.send_to(&reply, from);
+                } else {
+                    let udp = udp.try_clone().unwrap();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(delay);
+                        let _ = udp.send_to(&reply, from);
+                    });
+                }
             }
         });
         let (t, q) = (table, queries.clone());
@@ -112,7 +125,7 @@ impl FakeDns {
                 if stream.read_exact(&mut query).is_err() {
                     continue;
                 }
-                if let Some(reply) = answer(&query, &t, &q, true) {
+                if let Some((reply, _)) = answer(&query, &t, &q, true) {
                     let mut framed = (reply.len() as u16).to_be_bytes().to_vec();
                     framed.extend_from_slice(&reply);
                     let _ = stream.write_all(&framed);
@@ -163,7 +176,7 @@ fn answer(
     table: &HashMap<(String, u16), Reply>,
     log: &Mutex<Vec<(String, u16)>>,
     over_tcp: bool,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, Duration)> {
     // The question: labels from offset 12, then type and class.
     let mut pos = 12;
     let mut labels = Vec::new();
@@ -193,13 +206,22 @@ fn answer(
                 Reply::NxDomain
             }
         });
+    let (mut delay, mut soa) = (Duration::ZERO, None);
     let (rcode, tc, records) = match reply {
         Reply::Records(r) => (0u16, false, r),
         Reply::NxDomain => (3, false, Vec::new()),
+        Reply::NxDomainSoa(ttl, minimum) => {
+            soa = Some((ttl, minimum));
+            (3, false, Vec::new())
+        }
         Reply::ServFail => (2, false, Vec::new()),
         Reply::Truncated(r) if over_tcp => (0, false, r),
         Reply::Truncated(_) => (0, true, Vec::new()),
         Reply::Silent => return None,
+        Reply::Late(after, r) => {
+            delay = after;
+            (0, false, r)
+        }
     };
     let mut out = query[..end].to_vec();
     let flags = 0x8180u16 | rcode | if tc { 0x0200 } else { 0 };
@@ -218,7 +240,23 @@ fn answer(
         out.extend_from_slice(&(data.len() as u16).to_be_bytes());
         out.extend_from_slice(&data);
     }
-    Some(out)
+    if let Some((ttl, minimum)) = soa {
+        out[8..10].copy_from_slice(&1u16.to_be_bytes());
+        // The zone is the query name's parent (or the root).
+        let zone = name.split_once('.').map_or("", |(_, zone)| zone);
+        out.extend_from_slice(&encode_name(zone));
+        out.extend_from_slice(&6u16.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&ttl.to_be_bytes());
+        let mut data = encode_name(&format!("ns.{zone}"));
+        data.extend_from_slice(&encode_name(&format!("admin.{zone}")));
+        for field in [1u32, 7200, 900, 86400, minimum] {
+            data.extend_from_slice(&field.to_be_bytes());
+        }
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(&data);
+    }
+    Some((out, delay))
 }
 
 fn a(name: &str, ip: [u8; 4], ttl: u32) -> (String, u16, u32, Vec<u8>) {
@@ -447,6 +485,162 @@ fn answers_are_cached_for_their_ttl() {
         // One A and one AAAA query for the cached name, three pairs otherwise.
         assert_eq!(dns.count("cached.test"), 2);
         assert_eq!(dns.count("uncached.test"), 6);
+    });
+}
+
+#[test]
+fn lookups_of_one_name_at_the_same_time_share_one_query() {
+    let dns = FakeDns::start(vec![
+        (
+            ("shared.test", A),
+            Reply::Late(
+                Duration::from_millis(50),
+                vec![a("shared.test", [192, 0, 2, 7], 300)],
+            ),
+        ),
+        (
+            ("shared.test", AAAA),
+            Reply::Late(
+                Duration::from_millis(50),
+                vec![aaaa("shared.test", "2001:db8::7", 300)],
+            ),
+        ),
+        (("gone.test", A), Reply::ServFail),
+        (("gone.test", AAAA), Reply::ServFail),
+    ]);
+    giong::block_on(async {
+        let r = Resolver::new(
+            ResolverConfig::parse("", "")
+                .nameservers([dns.addr])
+                .attempts(1),
+        );
+        let lookups: Vec<_> = (0..50)
+            .map(|_| {
+                let r = r.clone();
+                giong::spawn(async move { r.lookup_ip("shared.test").await })
+            })
+            .collect();
+        for lookup in lookups {
+            let got = lookup.await.unwrap().unwrap();
+            assert_eq!(got, ips(&["2001:db8::7", "192.0.2.7"]));
+        }
+        assert_eq!(dns.count("shared.test"), 2);
+
+        // A failure reaches every lookup that waited for it, code and all.
+        let lookups: Vec<_> = (0..10)
+            .map(|_| {
+                let r = r.clone();
+                giong::spawn(async move { r.lookup_ip("gone.test").await })
+            })
+            .collect();
+        for lookup in lookups {
+            let err = lookup.await.unwrap().unwrap_err();
+            assert_eq!(code(&err), Some(Code::DnsServerFailure), "{err}");
+            assert!(err.to_string().contains("SERVFAIL"), "{err}");
+        }
+        assert_eq!(dns.count("gone.test"), 2);
+    });
+}
+
+#[test]
+fn a_cancelled_lookup_hands_its_waiters_over() {
+    let dns = FakeDns::start(vec![(
+        ("slow.test", A),
+        Reply::Late(
+            Duration::from_millis(200),
+            vec![a("slow.test", [192, 0, 2, 8], 300)],
+        ),
+    )]);
+    giong::block_on(async {
+        let r = dns.resolver("");
+        let first = {
+            let r = r.clone();
+            giong::spawn(async move { r.lookup_ip("slow.test").await })
+        };
+        // Let the first lookup send its queries, then start one that waits
+        // on it, and cancel the first.
+        giong::time::sleep(Duration::from_millis(20)).await;
+        let second = {
+            let r = r.clone();
+            giong::spawn(async move { r.lookup_ip("slow.test").await })
+        };
+        giong::time::sleep(Duration::from_millis(20)).await;
+        first.abort();
+        let got = second.await.unwrap().unwrap();
+        assert_eq!(got, ips(&["192.0.2.8"]));
+        // The second lookup asked again.
+        assert_eq!(dns.count("slow.test"), 4);
+    });
+}
+
+#[test]
+fn a_missing_name_is_remembered_for_its_negative_ttl() {
+    let dns = FakeDns::start(vec![
+        (("typo.test", A), Reply::NxDomainSoa(300, 1)),
+        (("typo.test", AAAA), Reply::NxDomainSoa(300, 1)),
+    ]);
+    giong::block_on(async {
+        let r = dns.resolver("");
+        for _ in 0..3 {
+            let err = r.lookup_ip("typo.test").await.unwrap_err();
+            assert_eq!(code(&err), Some(Code::HostNotFound), "{err}");
+        }
+        // Asked once: the SOA record's MINIMUM (1 s) is the negative TTL.
+        assert_eq!(dns.count("typo.test"), 2);
+        giong::time::sleep(Duration::from_millis(1100)).await;
+        r.lookup_ip("typo.test").await.unwrap_err();
+        assert_eq!(dns.count("typo.test"), 4);
+
+        // Without an SOA record a miss is not cached (RFC 2308, section 5).
+        for _ in 0..3 {
+            r.lookup_ip("bare.test").await.unwrap_err();
+        }
+        assert_eq!(dns.count("bare.test"), 6);
+    });
+}
+
+#[test]
+fn a_silent_aaaa_query_does_not_hold_the_ipv4_addresses() {
+    let dns = FakeDns::start(vec![
+        (
+            ("v4.test", A),
+            Reply::Records(vec![a("v4.test", [192, 0, 2, 5], 60)]),
+        ),
+        (("v4.test", AAAA), Reply::Silent),
+    ]);
+    giong::block_on(async {
+        // The timeout is 5 s; the A records come after a short grace.
+        let start = Instant::now();
+        let got = dns.resolver("").lookup_ip("v4.test").await.unwrap();
+        assert_eq!(got, ips(&["192.0.2.5"]));
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    });
+}
+
+#[test]
+fn a_slow_server_gets_a_grace_as_long_as_its_first_answer() {
+    // Both answers are slow; the AAAA one comes 150 ms after the A one,
+    // within the grace, which is as long as the A answer took.
+    let dns = FakeDns::start(vec![
+        (
+            ("far.test", A),
+            Reply::Late(
+                Duration::from_millis(300),
+                vec![a("far.test", [192, 0, 2, 6], 60)],
+            ),
+        ),
+        (
+            ("far.test", AAAA),
+            Reply::Late(
+                Duration::from_millis(450),
+                vec![aaaa("far.test", "2001:db8::6", 60)],
+            ),
+        ),
+    ]);
+    giong::block_on(async {
+        let got = dns.resolver("").lookup_ip("far.test").await.unwrap();
+        assert_eq!(got, ips(&["2001:db8::6", "192.0.2.6"]));
     });
 }
 
