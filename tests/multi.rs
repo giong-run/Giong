@@ -48,11 +48,13 @@ fn every_worker_runs_its_main_future_on_its_own_thread() {
 fn shutdown_from_outside_wakes_every_worker() {
     let rt = giong::Builder::new().workers(3).build().unwrap();
     let handle = rt.handle();
+    // Before the thread starts: its 50 ms count from when it runs, which
+    // can be ahead of a clock read after `spawn` returns.
+    let start = Instant::now();
     let stopper = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
         handle.shutdown();
     });
-    let start = Instant::now();
     rt.run(|_| async {
         giong::shutdown_signal().await;
     })
