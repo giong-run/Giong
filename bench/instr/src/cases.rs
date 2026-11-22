@@ -487,19 +487,28 @@ async fn web(m: &Meter) {
 }
 
 /// Opens `n` idle connections to a giong-http server in this process from
-/// another thread (blocking std sockets, which own no heap memory) and
+/// a child process (`bench-instr idle-client`, blocking std sockets) and
 /// prints the server's heap and RSS growth per connection.
 ///
-/// For HTTPS the other thread does each handshake and one keep-alive
-/// request with rustls, then drops the client's TLS state and keeps only
-/// the socket (the server cannot tell, nothing is sent), so the heap that
-/// stays is the server's. The allocation count covers both ends.
+/// The clients live in another process so that this one numbers only the
+/// server's descriptors, in the order it accepts them. With the clients on a
+/// thread here, the two ends took descriptor numbers in whatever order the
+/// scheduler ran them, and the driver's table of descriptors (indexed by
+/// number) grew by different steps from run to run: the same build measured
+/// 2166 or 2211 heap bytes per idle HTTP/1.1 connection.
+///
+/// For HTTPS the child does each handshake and one keep-alive request with
+/// rustls, then drops the client's TLS state and keeps only the socket (the
+/// server cannot tell, nothing is sent). Every count here is the server's.
 async fn idle(name: &'static str, n: usize, proto: Proto) {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::io::{BufRead, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     let (listener, addr) = listen();
-    let mut tls_client = None;
+    // The test certificate, for the child, in a file of this process's own.
+    let mut cert_file = None;
     if proto == Proto::Https {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key");
         let cert = key.cert.pem();
@@ -524,60 +533,53 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
         let resp = client.get(&url).send().await.expect("a response");
         assert_eq!(resp.status(), 200);
         drop((resp, client));
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(key.cert.der().clone()).expect("the test root");
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("TLS versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        // No session cache: it would keep tickets on the client's heap.
-        config.resumption = rustls::client::Resumption::disabled();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        tls_client = Some(Arc::new(config));
+        let path = std::env::temp_dir().join(format!("bench-instr-{}.der", std::process::id()));
+        std::fs::write(&path, key.cert.der()).expect("write the test root");
+        cert_file = Some(path);
     } else {
         let _server = giong::spawn(async move { Server::new().serve(listener, json).await });
         let warm = RawClient::connect(addr, b"GET /json HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         drop(warm);
     }
-    let go = Arc::new(AtomicBool::new(false));
-    let ready = Arc::new(AtomicUsize::new(0));
+    let proto_arg = match proto {
+        Proto::Http1 => "http1",
+        Proto::Http2 => "h2",
+        Proto::Https => "https",
+    };
+    let mut child = Command::new(std::env::current_exe().expect("this program's path"))
+        .arg("idle-client")
+        .arg(proto_arg)
+        .arg(addr.to_string())
+        .arg(n.to_string())
+        .args(cert_file.iter())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the client process");
+    let mut to_child = child.stdin.take().expect("the child's stdin");
+    let from_child = child.stdout.take().expect("the child's stdout");
+    // The child says "done" once every connection is open; a thread here
+    // waits for that line so the runtime is not blocked.
     let done = Arc::new(AtomicBool::new(false));
-    let stop = Arc::new(AtomicBool::new(false));
-    let opener = {
-        let (go, ready, done, stop) = (go.clone(), ready.clone(), done.clone(), stop.clone());
+    let reader = {
+        let done = done.clone();
         std::thread::spawn(move || {
-            let mut conns = Vec::with_capacity(n);
-            while !go.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            for _ in 0..n {
-                let mut s = std::net::TcpStream::connect(addr).expect("connect");
-                match proto {
-                    Proto::Http1 => {}
-                    Proto::Http2 => h2_request(&mut s),
-                    Proto::Https => {
-                        let config = tls_client.clone().expect("the client config");
-                        tls_request(config, &mut s);
-                    }
-                }
-                conns.push(s);
-                ready.fetch_add(1, Ordering::Release);
-            }
+            let mut line = String::new();
+            std::io::BufReader::new(from_child)
+                .read_line(&mut line)
+                .expect("read from the client process");
+            assert_eq!(line.trim(), "done", "the client process failed");
             done.store(true, Ordering::Release);
-            while !stop.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            drop(conns);
         })
     };
     // Let the server settle after the warm-up connection closed.
     giong::time::sleep(Duration::from_millis(200)).await;
     let tasks0 = giong::observe::worker_stats().tasks;
     let (heap0, rss0, allocs0) = (crate::live_bytes(), crate::rss(), crate::allocations());
-    go.store(true, Ordering::Release);
+    to_child
+        .write_all(b"go\n")
+        .expect("start the client process");
+    to_child.flush().expect("start the client process");
     // Every connection has its task once the server has accepted it.
     while giong::observe::worker_stats().tasks < tasks0 + n || !done.load(Ordering::Acquire) {
         giong::time::sleep(Duration::from_millis(5)).await;
@@ -592,8 +594,67 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
         (rss1 as f64 - rss0 as f64) / n as f64,
         (allocs1 - allocs0) as f64 / n as f64,
     );
-    stop.store(true, Ordering::Release);
-    opener.join().expect("the opener thread");
+    // Closing its stdin ends the child, and its connections with it.
+    drop(to_child);
+    reader.join().expect("the reader thread");
+    child.wait().expect("the client process");
+    if let Some(path) = cert_file {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// `bench-instr idle-client <http1|h2|https> <addr> <n> [root.der]`: the
+/// client end of [`idle`], in its own process. Waits for a line on stdin,
+/// opens `n` connections (each with one request for `h2` and `https`),
+/// prints `done`, and keeps them open until stdin closes.
+pub fn idle_client(args: &[String]) {
+    use std::io::{BufRead, Write};
+    use std::sync::Arc;
+
+    let (Some(proto), Some(addr), Some(n)) = (args.first(), args.get(1), args.get(2)) else {
+        eprintln!("usage: bench-instr idle-client <http1|h2|https> <addr> <n> [root.der]");
+        std::process::exit(2)
+    };
+    let addr: std::net::SocketAddr = addr.parse().expect("an address");
+    let n: usize = n.parse().expect("a number of connections");
+    let tls = (proto == "https").then(|| {
+        let der = std::fs::read(args.get(3).expect("the test root")).expect("read the test root");
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der))
+            .expect("the test root");
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        config.resumption = rustls::client::Resumption::disabled();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Arc::new(config)
+    });
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    stdin.lock().read_line(&mut line).expect("wait for the start");
+    let mut conns = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        match proto.as_str() {
+            "http1" => {}
+            "h2" => h2_request(&mut s),
+            "https" => tls_request(tls.clone().expect("the client config"), &mut s),
+            other => panic!("unknown protocol {other}"),
+        }
+        conns.push(s);
+    }
+    let mut out = std::io::stdout();
+    writeln!(out, "done").expect("report to the parent");
+    out.flush().expect("report to the parent");
+    // Until the parent closes our stdin.
+    let mut rest = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stdin.lock(), &mut rest);
+    drop(conns);
 }
 
 /// The HTTP/2 preface, SETTINGS and one `GET /` over `sock` (prior
