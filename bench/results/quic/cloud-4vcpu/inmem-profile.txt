@@ -1,0 +1,10 @@
+# callgrind of inmem --segments 10 --size 1048576 (client and server in one thread), inclusive instruction counts; the raw callgrind file is not kept (large). Encrypt is mostly the server (sends the data), decrypt mostly the client.
+191,799,059 (100.0%)  PROGRAM TOTALS
+ 79,820,389 (41.62%)  quinn-proto-0.11.19/src/connection/mod.rs:<quinn_proto::connection::Connection>::handle_event
+ 73,882,669 (38.52%)  quinn-proto-0.11.19/src/connection/mod.rs:<quinn_proto::connection::Connection>::poll_transmit
+ 42,919,364 (22.38%)  quinn-proto-0.11.19/src/crypto/rustls.rs:<alloc::boxed::Box<dyn rustls::quic::PacketKey> as quinn_proto::crypto::PacketKey>::encrypt
+ 41,753,170 (21.77%)  quinn-proto-0.11.19/src/crypto/rustls.rs:<alloc::boxed::Box<dyn rustls::quic::PacketKey> as quinn_proto::crypto::PacketKey>::decrypt
+ 24,737,912 (12.90%)  quinn-proto-0.11.19/src/connection/mod.rs:<quinn_proto::connection::Connection>::process_decrypted_packet
+ 20,990,275 (10.94%)  ./string/../sysdeps/x86_64/multiarch/memmove-vec-unaligned-erms.S:__memcpy_avx_unaligned_erms
+  2,040,986 ( 1.06%)  quinn-proto-0.11.19/src/crypto/rustls.rs:<alloc::boxed::Box<dyn rustls::quic::HeaderProtectionKey> as quinn_proto::crypto::HeaderKey>::encrypt
+  1,975,989 ( 1.03%)  quinn-proto-0.11.19/src/crypto/rustls.rs:<alloc::boxed::Box<dyn rustls::quic::HeaderProtectionKey> as quinn_proto::crypto::HeaderKey>::decrypt

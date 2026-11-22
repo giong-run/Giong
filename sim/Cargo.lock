@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "giong-postgres"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "giong-redis"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "giong",
  "libc",
