@@ -122,8 +122,9 @@ where
     )
 }
 
-/// Runs `call` on a blocking thread.
-async fn blocking<F, T>(call: F) -> io::Result<T>
+/// Runs `call` on a blocking thread (also used by the DNS resolver to ask
+/// the network adapters).
+pub(crate) async fn blocking<F, T>(call: F) -> io::Result<T>
 where
     F: FnOnce() -> io::Result<T> + Send + 'static,
     T: Send + 'static,

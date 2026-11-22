@@ -972,28 +972,45 @@ fn file_stamps() -> Stamps {
 
 #[cfg(windows)]
 fn file_stamps() -> Stamps {
+    #[cfg(test)]
+    tests::note_stamps_thread();
     let hosts = std::fs::metadata(crate::sys::hosts_path())
         .and_then(|m| m.modified())
         .ok();
     (hosts, crate::sys::dns_config().ok())
 }
 
+/// The stamps, read where reading them cannot hold up the worker for long.
+#[cfg(unix)]
+async fn read_stamps() -> Stamps {
+    file_stamps()
+}
+
+/// The stamps, read on a blocking thread: asking the adapters
+/// (`GetNetworkParams`, `GetAdaptersAddresses`) can take a while.
+#[cfg(windows)]
+async fn read_stamps() -> Stamps {
+    crate::fs::blocking(|| Ok(file_stamps()))
+        .await
+        .unwrap_or((None, None))
+}
+
 /// The system configuration, read again.
 #[cfg(unix)]
-fn system_config(_stamps: &Stamps) -> io::Result<ResolverConfig> {
+async fn system_config(_stamps: &Stamps) -> io::Result<ResolverConfig> {
     ResolverConfig::system()
 }
 
 /// The system configuration, with what the adapters reported for `stamps`.
 #[cfg(windows)]
-fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
+async fn system_config(stamps: &Stamps) -> io::Result<ResolverConfig> {
     match &stamps.1 {
         Some((servers, search)) => {
             let hosts = read_optional(crate::sys::hosts_path())?;
             Ok(ResolverConfig::from_adapters(servers, search, &hosts))
         }
-        // Asked again, for the error.
-        None => ResolverConfig::system(),
+        // Asked again on a blocking thread, for the error.
+        None => crate::fs::blocking(ResolverConfig::system).await,
     }
 }
 
@@ -1043,38 +1060,47 @@ fn interface_index(name: &str) -> Option<u32> {
 /// The current thread's resolver for the system configuration, reloaded when
 /// `/etc/resolv.conf` or `/etc/hosts` change (checked every few seconds; on
 /// Windows, the hosts file and what the adapters report).
-pub(crate) fn system_resolver() -> io::Result<Resolver> {
-    SYSTEM.with(|slot| {
+pub(crate) async fn system_resolver() -> io::Result<Resolver> {
+    let now = Instant::now();
+    let fresh = SYSTEM.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|sys| now.duration_since(sys.checked) < RELOAD_CHECK)
+            .map(|sys| sys.resolver.clone())
+    });
+    if let Some(resolver) = fresh {
+        return Ok(resolver);
+    }
+    // Read once per check: on Windows, asking the adapters is not cheap,
+    // and the stamps hold what they said.
+    let stamps = read_stamps().await;
+    let kept = SYSTEM.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let now = Instant::now();
-        if let Some(sys) = slot.as_ref() {
-            if now.duration_since(sys.checked) < RELOAD_CHECK {
-                return Ok(sys.resolver.clone());
-            }
+        let sys = slot.as_mut()?;
+        sys.checked = now;
+        if stamps == sys.stamps {
+            return Some(sys.resolver.clone());
         }
-        // Read once per check: on Windows, asking the adapters is not
-        // cheap, and the stamps hold what they said.
-        let stamps = file_stamps();
-        if let Some(sys) = slot.as_mut() {
-            sys.checked = now;
-            if stamps == sys.stamps {
-                return Ok(sys.resolver.clone());
-            }
-            // The adapters could not be asked this time: what they said
-            // last still holds, and they are asked again at the next check.
-            #[cfg(windows)]
-            if stamps.1.is_none() {
-                return Ok(sys.resolver.clone());
-            }
+        // The adapters could not be asked this time: what they said last
+        // still holds, and they are asked again at the next check.
+        #[cfg(windows)]
+        if stamps.1.is_none() {
+            return Some(sys.resolver.clone());
         }
-        let resolver = Resolver::new(system_config(&stamps)?);
-        *slot = Some(SystemResolver {
+        None
+    });
+    if let Some(resolver) = kept {
+        return Ok(resolver);
+    }
+    let resolver = Resolver::new(system_config(&stamps).await?);
+    SYSTEM.with(|slot| {
+        *slot.borrow_mut() = Some(SystemResolver {
             resolver: resolver.clone(),
             checked: now,
             stamps,
         });
-        Ok(resolver)
-    })
+    });
+    Ok(resolver)
 }
 
 /// What the fuzz targets call (see `crate::fuzzing`).
@@ -1130,6 +1156,37 @@ pub(crate) mod fuzzing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The threads that read the system stamps, for the test below.
+    #[cfg(windows)]
+    static STAMP_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
+
+    #[cfg(windows)]
+    pub(super) fn note_stamps_thread() {
+        STAMP_THREADS
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+    }
+
+    #[test]
+    fn windows_asks_the_adapters_on_a_blocking_thread() {
+        // One name on every platform, for the simulation's index; the body
+        // is Windows'.
+        #[cfg(windows)]
+        crate::block_on(async {
+            SYSTEM.with(|slot| *slot.borrow_mut() = None);
+            let worker = std::thread::current().id();
+            drop(system_resolver().await);
+            let threads = STAMP_THREADS.lock().unwrap();
+            assert!(!threads.is_empty());
+            assert!(
+                !threads.contains(&worker),
+                "the adapters were asked on the worker"
+            );
+        });
+    }
 
     /// A response to `query` with the given flags and answer records.
     fn response(
