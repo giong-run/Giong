@@ -137,6 +137,11 @@ mod tests {
     #[test]
     fn manifest_dir_is_found_above() {
         let here = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // CI's kernel VMs run the test binaries without the source tree.
+        if !here.join("Cargo.toml").exists() {
+            eprintln!("skipped: no source tree here");
+            return;
+        }
         assert_eq!(find_manifest_dir(&here.join("src")).as_deref(), Some(here));
     }
 
