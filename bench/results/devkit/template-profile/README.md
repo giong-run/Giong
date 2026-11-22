@@ -18,9 +18,9 @@ profile. Three rounds, interleaved; the table gives the median. Machine and comm
 
 | | Cargo's default | `giong new` profile | change |
 |---|---:|---:|---:|
-| clean debug build | 18.04 s | 14.72 s | -18% |
-| target directory | 652 MB | 309 MB | -53% |
-| rebuild after a one-line change | 0.76 s | 0.59 s | -22% |
+| clean debug build | 15.33 s | 12.61 s | -18% |
+| target directory | 640 MB | 296 MB | -54% |
+| rebuild after a one-line change | 0.57 s | 0.44 s | -23% |
 
 What it costs: a debugger shows the project's own lines and no variable values in
 dependency frames; panics and backtraces keep file and line for the project's code.

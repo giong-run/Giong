@@ -5,7 +5,7 @@
   worker per core with graceful shutdown and giong-mcp, an end to end test, migrations,
   `.env.example`, a Dockerfile, a GitHub Actions workflow with the database services, and
   fast dev builds (`debug = "line-tables-only"`: on a PostgreSQL, Redis and TLS service a clean
-  debug build takes 14.7 s instead of 18.0 s, the target directory 309 MB instead of 652 MB,
+  debug build takes 12.6 s instead of 15.3 s, the target directory 296 MB instead of 640 MB,
   `bench/results/devkit/template-profile/`). `web` is a users API on PostgreSQL or MySQL
   (with Redis as a cache), counters on Redis, or a plain JSON service; `grpc` a service from a
   `.proto` (no `protoc`); `worker` jobs claimed from a table (`FOR UPDATE SKIP LOCKED`, with
