@@ -280,6 +280,9 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # Runners are shared by every pull request and the merge queue: a pull
+      # request takes four at a time here, the merge queue all of them.
+      max-parallel: ${{ needs.plan.outputs.scope == 'full' && 13 || 4 }}
       matrix:
         include:
           - { server: postgres 14, crate: giong-postgres, postgres: "14" }
@@ -694,6 +697,8 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
+      # Four at a time on a pull request, all six in the merge queue (see servers).
+      max-parallel: ${{ needs.plan.outputs.scope == 'full' && 6 || 4 }}
       matrix:
         include:
           # ktls: the guest loads the tls module and the kernel TLS tests

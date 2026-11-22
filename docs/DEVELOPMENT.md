@@ -46,9 +46,17 @@ The job `plan` (`scripts/ci-scope.py`) chooses what a run does; `scripts/preflig
 | The run | What runs | Expected time |
 |---|---|---|
 | Pull request that changes no file a build or test reads: `site/`, `changelog.d/`, `bench/results/`, `assets/`, `skills/`, prose | `lint` (fmt, clippy, docs, `release.py check`, which builds the site) and `msrv` | 2 min |
-| Draft pull request | the above, default features, the release build, one round of the tests on io_uring | 14 min, a tenth of the runner time |
-| Pull request ready for review | every job once: each suite one round on every tier, two ThreadSanitizer runs, the kernels, Miri, Kani, instr, the server versions, macOS | 16 to 18 min |
-| Merge queue, a push to `main` that no queue run tested, a dispatch | every job with every repetition: five rounds per tier, three ThreadSanitizer runs | 24 min |
+| Draft pull request | the above, default features, the release build, one round of the tests on io_uring; the Fuzz, gRPC, Proto and macOS workflows skip drafts | 16 min, 1,000 runner-seconds (a twelfth of a full run) |
+| Pull request ready for review | every job once: each suite one round on every tier, two ThreadSanitizer runs, the kernels and server versions four at a time, Miri, Kani, instr, macOS | 17 min of jobs, 8,400 runner-seconds (two thirds of a full run) |
+| Merge queue, a push to `main` that no queue run tested, a dispatch | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, every matrix entry at once | 24 min, 12,200 runner-seconds |
+
+The times are those of the pull request that introduced the tiers (#218) and of the queue
+runs before it. **Runners are the scarce resource**: the organisation gets 60 Linux jobs at
+a time, shared by every pull request and the merge queue, and GitHub has no priority
+between them. A full run asks for 46 jobs, so two pull requests running full sets starve
+the queue (the 1.4.0 release waited behind 60 queued runs). Every tier above exists to
+give runners back: a draft takes a twelfth, a ready pull request two thirds and its two
+largest matrices four jobs at a time, and a push that cancels a run frees its jobs.
 
 Prose counts as code where code reads it: `docs/errors/` (tests check every page) and
 every Markdown file a crate pulls in with `include_str!` (its code blocks are doc tests),

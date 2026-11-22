@@ -6,7 +6,10 @@ name: gRPC
 # run in CI with the rest of the workspace.
 
 on:
+  # A draft skips these jobs (they are not required checks); marking it ready
+  # for review runs them.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "giong-grpc/**"
       - "giong-grpc-build/**"
@@ -36,6 +39,7 @@ env:
 
 jobs:
   interop:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
