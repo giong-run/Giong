@@ -562,8 +562,10 @@ impl Server {
         self
     }
 
-    /// How long a client may take to accept a batch of responses before the
-    /// connection is dropped (default: 30 s).
+    /// How long a client may go without taking any of what the server sends
+    /// before the connection is dropped (default: 30 s). It counts from the
+    /// last progress, so a large response to a slow client may take longer
+    /// in all, as long as the client keeps reading.
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
         self.cfg.write_timeout = crate::bounded(timeout);
         self
@@ -1087,6 +1089,53 @@ impl Drop for Slot {
             waker.wake();
         }
     }
+}
+
+/// Runs `write` until it completes, or until it has made no progress for
+/// `idle`: then `None`, and the write is dropped.
+///
+/// A transport's write only completes, so its progress is seen from outside:
+/// a write future that returns `Pending` waits for the socket, and is polled
+/// again when the socket took bytes (a send completed, or the socket became
+/// writable). So every poll after the first that the timer did not cause is
+/// progress. Something else waking the connection's task counts as progress
+/// too, which can only make the wait longer, by `idle` at most for each
+/// such wake. A write done at its first poll arms no timer.
+async fn until_stalled<F: Future>(idle: Duration, write: F) -> Option<F::Output> {
+    let mut write = pin!(write);
+    // The timer, from the first wait on, and when the write last moved.
+    let mut stall: Option<(giong::time::Sleep, Instant)> = None;
+    poll_fn(|cx| {
+        if let Poll::Ready(done) = write.as_mut().poll(cx) {
+            return Poll::Ready(Some(done));
+        }
+        let Some((timer, moved)) = stall.as_mut() else {
+            // The write waits for the first time: count from now.
+            let now = Instant::now();
+            let mut timer = giong::time::sleep_until(now + idle);
+            if Pin::new(&mut timer).poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            stall = Some((timer, now));
+            return Poll::Pending;
+        };
+        let now = Instant::now();
+        if now < timer.deadline() {
+            // Woken before the timer: the write moved.
+            *moved = now;
+            return Poll::Pending;
+        }
+        // The timer's deadline passed: the write is stalled, unless it moved
+        // since the timer was armed.
+        if *moved + idle > now {
+            timer.reset(*moved + idle);
+            if Pin::new(timer).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+        }
+        Poll::Ready(None)
+    })
+    .await
 }
 
 /// Refused connections a worker may still be answering at once; past this
@@ -2081,21 +2130,22 @@ impl<T: Transport> Conn<T> {
             return Ok(());
         }
         let out = mem::take(&mut self.out);
+        // The write timeout counts from the write's last progress, as on
+        // HTTP/2 and HTTP/3: a large body to a slow client may take longer
+        // than the timeout in all, as long as the client keeps taking it.
+        let idle = self.cfg.write_timeout;
         let wrote = match mem::take(&mut self.body) {
-            Body::Empty => timeout(self.cfg.write_timeout, self.stream.write_all(out)).await,
+            Body::Empty => until_stalled(idle, self.stream.write_all(out)).await,
             Body::File(f) => {
                 let write = self
                     .stream
                     .write_all_with_file(out, &f.file, f.offset, f.len);
-                timeout(self.cfg.write_timeout, write).await
+                until_stalled(idle, write).await
             }
-            body => {
-                let write = self.stream.write_all_with_body(out, body);
-                timeout(self.cfg.write_timeout, write).await
-            }
+            body => until_stalled(idle, self.stream.write_all_with_body(out, body)).await,
         };
         match wrote {
-            Ok((Ok(()), mut out)) => {
+            Some((Ok(()), mut out)) => {
                 out.clear();
                 self.out = out;
                 Ok(())
