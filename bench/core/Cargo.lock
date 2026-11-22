@@ -215,6 +215,7 @@ dependencies = [
  "monoio",
  "smol",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -751,6 +752,7 @@ dependencies = [
  "io-uring 0.7.16",
  "libc",
  "socket2 0.6.5",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

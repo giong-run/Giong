@@ -204,7 +204,7 @@ pub async fn lookup_host<A: ToSocketAddrs>(addr: A) -> io::Result<Vec<SocketAddr
     match addr.target()? {
         Target::Resolved(addrs) => Ok(addrs),
         Target::Host(host, port) => {
-            let resolver = dns::system_resolver()?;
+            let resolver = dns::system_resolver().await?;
             let ips = resolver.lookup_ip(host).await?;
             Ok(ips
                 .into_iter()
