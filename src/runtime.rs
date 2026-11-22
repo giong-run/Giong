@@ -396,11 +396,20 @@ struct Deferred {
 
 impl Deferred {
     fn is_empty(&self) -> bool {
+        // Destructured so that a field added later cannot be left out: the
+        // pattern stops compiling until it is named here.
+        let Deferred {
+            multis,
+            cancels,
+            closes,
+            #[cfg(windows)]
+            sock_closes,
+        } = self;
         #[cfg(windows)]
-        if !self.sock_closes.is_empty() {
+        if !sock_closes.is_empty() {
             return false;
         }
-        self.multis.is_empty() && self.cancels.is_empty() && self.closes.is_empty()
+        multis.is_empty() && cancels.is_empty() && closes.is_empty()
     }
 }
 
