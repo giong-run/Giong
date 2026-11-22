@@ -563,6 +563,12 @@ fn open_handles() -> BTreeMap<usize, String> {
 /// well below the bound searched.
 #[cfg(windows)]
 fn open_handles() -> BTreeMap<usize, String> {
+    open_handles_below(0x4_0000)
+}
+
+/// [`open_handles`], among the values below `bound`.
+#[cfg(windows)]
+fn open_handles_below(bound: usize) -> BTreeMap<usize, String> {
     #[repr(C)]
     struct UnicodeString {
         length: u16,
@@ -582,7 +588,7 @@ fn open_handles() -> BTreeMap<usize, String> {
     const OBJECT_TYPE_INFORMATION: u32 = 2;
     let mut buf = vec![0u64; 256];
     let mut handles = BTreeMap::new();
-    for handle in (4..0x4_0000usize).step_by(4) {
+    for handle in (4..bound).step_by(4) {
         let mut returned = 0;
         // SAFETY: a buffer of the length given, which the call fills with an
         // OBJECT_TYPE_INFORMATION; asking for the type never blocks, unlike
@@ -808,6 +814,8 @@ fn soak() {
     let handles_before = open_handles();
     #[cfg(windows)]
     eprintln!("soak: threads before: {}", live_threads().join(", "));
+    #[cfg(windows)]
+    let origins = origins::watch(&handles_before);
     let (counters, samples, idle) = run(workers, secs);
 
     let c = &counters;
@@ -841,7 +849,17 @@ fn soak() {
     // 3. Descriptors: nothing left once the runtime is gone, and no growth
     //    during the run beyond the connections that happen to be open.
     let fds_after = settled_fds(fds_before);
-    let new = new_handles(&handles_before);
+    #[allow(unused_mut)]
+    let mut new = new_handles(&handles_before);
+    #[cfg(windows)]
+    if let Some(origins) = origins {
+        let events: Vec<usize> = open_handles()
+            .into_iter()
+            .filter(|(n, what)| what.starts_with("Event") && handles_before.get(n) != Some(what))
+            .map(|(n, _)| n)
+            .collect();
+        new += &origins.report(&events);
+    }
     eprintln!("soak: {fds_after} descriptors open, {fds_before} before the soak; new since: {new}");
     // Soaks of one to two and a half hours on Windows each ended with one
     // Event more, whatever their length: one-time state, which no giong
@@ -1079,4 +1097,237 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
         "descriptors grew over runtime lives: {before} before, then {:?}",
         &counts[1..]
     );
+}
+
+/// Where each event the soak sees appear was made: Windows' handle tracing
+/// records a stack for every handle opened in the process, in a ring that
+/// a long soak overwrites many times over, so a watcher thread looks for
+/// new events every second and keeps the stack of each one's latest open
+/// while it is still in the ring. A failed final check names the stack of
+/// every event left over.
+#[cfg(windows)]
+mod origins {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    const PROCESS_HANDLE_TRACING: u32 = 32;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    /// One PROCESS_HANDLE_TRACING_ENTRY: the handle, the CLIENT_ID (process
+    /// and thread), the kind of use (1: open), and 16 return addresses.
+    const ENTRY: usize = 8 + 16 + 8 + 16 * 8;
+    /// The PROCESS_HANDLE_TRACING_QUERY header before the entries.
+    const HEADER: usize = 16;
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtSetInformationProcess(process: isize, class: u32, info: *const u32, len: u32) -> i32;
+        fn NtQueryInformationProcess(
+            process: isize,
+            class: u32,
+            info: *mut u64,
+            len: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+
+    #[link(name = "dbghelp")]
+    extern "system" {
+        fn SymInitializeW(process: isize, search: *const u16, invade: i32) -> i32;
+        fn SymFromAddrW(process: isize, addr: u64, displacement: *mut u64, symbol: *mut u8) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleExW(flags: u32, addr: usize, module: *mut isize) -> i32;
+        fn GetModuleFileNameW(module: isize, name: *mut u16, len: u32) -> u32;
+    }
+
+    /// One open as the trace has it: the thread and the return addresses.
+    #[derive(Clone)]
+    pub(super) struct Open {
+        thread: usize,
+        thread_name: String,
+        seen_after: Duration,
+        stack: Vec<usize>,
+    }
+
+    pub(super) struct Watcher {
+        stop: Arc<AtomicBool>,
+        opens: Arc<Mutex<HashMap<usize, Open>>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    /// Turns tracing on and starts watching for events not in `before`.
+    /// `None` if Windows refuses the tracing (the check then goes without).
+    pub(super) fn watch(before: &BTreeMap<usize, String>) -> Option<Watcher> {
+        // PROCESS_HANDLE_TRACING_ENABLE_EX: no flags, the largest ring.
+        let enable = [0u32, 0x2_0000];
+        // SAFETY: this process's pseudo handle and a struct of the size given.
+        let status =
+            unsafe { NtSetInformationProcess(-1, PROCESS_HANDLE_TRACING, enable.as_ptr(), 8) };
+        if status < 0 {
+            eprintln!(
+                "soak: handle tracing refused ({status:#x}); events left over are not traced"
+            );
+            return None;
+        }
+        let before = before.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let opens = Arc::new(Mutex::new(HashMap::new()));
+        let thread = {
+            let (stop, opens) = (stop.clone(), opens.clone());
+            std::thread::Builder::new()
+                .name("soak-origins".into())
+                .spawn(move || {
+                    let start = Instant::now();
+                    let mut buf = vec![0u64; 1 << 19];
+                    while !stop.load(Ordering::Relaxed) {
+                        for (handle, what) in super::open_handles_below(0x1_0000) {
+                            if !what.starts_with("Event") || before.get(&handle) == Some(&what) {
+                                continue;
+                            }
+                            if let Some(open) = latest_open(handle, &mut buf, start) {
+                                opens.lock().unwrap().insert(handle, open);
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                })
+                .unwrap()
+        };
+        Some(Watcher {
+            stop,
+            opens,
+            thread: Some(thread),
+        })
+    }
+
+    /// The latest open of `handle` still in the trace, or `None` if the ring
+    /// no longer holds one.
+    fn latest_open(handle: usize, buf: &mut Vec<u64>, start: Instant) -> Option<Open> {
+        loop {
+            buf[0] = handle as u64;
+            buf[1] = 0;
+            let mut returned = 0u32;
+            // SAFETY: a PROCESS_HANDLE_TRACING_QUERY naming the handle, in a
+            // buffer of the length given, which the call fills with entries.
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    -1,
+                    PROCESS_HANDLE_TRACING,
+                    buf.as_mut_ptr(),
+                    (buf.len() * 8) as u32,
+                    &mut returned,
+                )
+            };
+            if status == STATUS_INFO_LENGTH_MISMATCH && buf.len() < 1 << 23 {
+                let len = buf.len() * 2;
+                buf.resize(len, 0);
+                continue;
+            }
+            if status < 0 {
+                return None;
+            }
+            let total = buf[1] as u32 as usize;
+            let bytes: &[u8] =
+                // SAFETY: the buffer's own bytes.
+                unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), buf.len() * 8) };
+            let word = |at: usize| usize::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+            // The newest entry comes first.
+            return (0..total.min((bytes.len() - HEADER) / ENTRY))
+                .map(|i| HEADER + i * ENTRY)
+                .find(|&at| word(at) == handle && word(at + 24) as u32 == 1)
+                .map(|at| {
+                    let thread = word(at + 16);
+                    Open {
+                        thread,
+                        thread_name: thread_name(thread),
+                        seen_after: start.elapsed(),
+                        stack: (0..16)
+                            .map(|k| word(at + 32 + k * 8))
+                            .filter(|&a| a != 0)
+                            .collect(),
+                    }
+                });
+        }
+    }
+
+    fn thread_name(id: usize) -> String {
+        super::live_threads()
+            .into_iter()
+            .find_map(|t| {
+                let (tid, name) = t.split_once(' ')?;
+                (tid.parse::<usize>().ok()? == id).then(|| name.to_string())
+            })
+            .unwrap_or_else(|| "gone".into())
+    }
+
+    impl Watcher {
+        /// Stops watching, and says where each of `handles` was opened.
+        pub(super) fn report(mut self, handles: &[usize]) -> String {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            let opens = self.opens.lock().unwrap();
+            // How many events the watcher traced, to tell a trace that works
+            // from one that saw nothing.
+            let mut out = format!("; {} new events traced", opens.len());
+            // SAFETY: loads the symbols of this process's modules, once.
+            unsafe { SymInitializeW(-1, std::ptr::null(), 1) };
+            for handle in handles {
+                match opens.get(handle) {
+                    None => out += &format!("\n  {handle:#x}: no open seen in the trace"),
+                    Some(open) => {
+                        out += &format!(
+                            "\n  {handle:#x}: opened on thread {} ({}), seen {:?} into the soak:",
+                            open.thread, open.thread_name, open.seen_after
+                        );
+                        for &addr in &open.stack {
+                            out += &format!("\n    {}", symbol(addr));
+                        }
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    /// `module!symbol+offset` for a return address, as far as known.
+    fn symbol(addr: usize) -> String {
+        let mut module = 0isize;
+        let mut name = [0u16; 260];
+        // SAFETY: GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS (4) with
+        // UNCHANGED_REFCOUNT (2) only looks the module up; the name goes
+        // into a local of the length given.
+        let module_name = unsafe {
+            if GetModuleHandleExW(6, addr, &mut module) != 0 {
+                let n = GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) as usize;
+                let path = String::from_utf16_lossy(&name[..n]);
+                path.rsplit('\\').next().unwrap_or("").to_string()
+            } else {
+                "?".into()
+            }
+        };
+        // SYMBOL_INFOW: 88 bytes of fields, then the name (MaxNameLen chars).
+        let mut info = vec![0u64; (88 + 2 * 512) / 8 + 1];
+        let mut displacement = 0u64;
+        // SAFETY: SizeOfStruct (88) and MaxNameLen (512) set, room for both.
+        let symbol = unsafe {
+            let raw = info.as_mut_ptr().cast::<u8>();
+            *(raw as *mut u32) = 88;
+            *(raw.add(80) as *mut u32) = 512;
+            if SymFromAddrW(-1, addr as u64, &mut displacement, raw) != 0 {
+                let len = *(raw.add(76) as *const u32) as usize;
+                let chars = std::slice::from_raw_parts(raw.add(84) as *const u16, len);
+                format!("{}+{displacement:#x}", String::from_utf16_lossy(chars))
+            } else {
+                format!("{:#x}", addr - module as usize)
+            }
+        };
+        format!("{module_name}!{symbol}")
+    }
 }
