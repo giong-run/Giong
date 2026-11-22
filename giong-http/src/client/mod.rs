@@ -1258,7 +1258,7 @@ impl Client {
                             lease
                                 .conn()
                                 .send(
-                                    request.clone(),
+                                    request,
                                     reused,
                                     method == "HEAD",
                                     config.max_head_size,
