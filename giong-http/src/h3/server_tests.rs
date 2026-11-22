@@ -126,7 +126,7 @@ impl Handler for App {
                 }));
                 Response::new(200).body(out)
             }
-            "/panic" => panic!("the handler panics on purpose"),
+            "/panic" => panic!("the handler panics on purpose (expected by this test)"),
             _ => Response::new(404),
         }
     }
@@ -284,6 +284,7 @@ async fn roundtrip(client: &Client, request: Vec<u8>) -> io::Result<Reply> {
 }
 
 fn run<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F) {
+    crate::quiet_panics::quiet_expected_panics();
     giong::Builder::new()
         .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
         .block_on(test())
