@@ -292,6 +292,8 @@ impl RuntimeShared {
             .ok()?
             .saturating_mul(1_000_000_000)
             .saturating_add(u64::try_from(ts.tv_nsec).ok()?);
+        #[cfg(test)]
+        let cpu = fake_cpu::read(i, started).unwrap_or(cpu);
         Some((cpu.saturating_sub(w.counters.spin_ns()), started))
     }
 
@@ -2123,6 +2125,47 @@ fn pin_to_cpu(cpu: usize) {
     sys::pin_to_cpu(cpu);
 }
 
+/// Tests only: CPU time of the workers' threads made up by a test instead
+/// of read from the kernel, so that tests of balanced listeners do not
+/// depend on how the machine schedules threads (a worker kept busy can get
+/// no CPU for tens of milliseconds on a crowded runner, and then really is
+/// idle).
+#[cfg(all(test, target_os = "linux", not(miri)))]
+pub(crate) mod fake_cpu {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// CPU time of worker `i` started at `started`, in nanoseconds.
+    type Cpu = fn(usize, u64) -> u64;
+
+    static FAKE: Mutex<Option<Cpu>> = Mutex::new(None);
+    /// Held by every test that reads workers' CPU time, faked or not.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// Until the guard is dropped, worker `i`'s thread has used
+    /// `cpu(i, started)` nanoseconds of CPU time, `started` being when it
+    /// started on `observe::clock_ns`; `None`: the real CPU time.
+    pub(crate) fn set(cpu: Option<Cpu>) -> Guard {
+        let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        *FAKE.lock().unwrap_or_else(|e| e.into_inner()) = cpu;
+        Guard { _one: one }
+    }
+
+    pub(crate) struct Guard {
+        _one: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *FAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn read(i: usize, started: u64) -> Option<u64> {
+        let fake = *FAKE.lock().unwrap_or_else(|e| e.into_inner());
+        fake.map(|cpu| cpu(i, started))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{default_workers, pin_by_default};
@@ -2150,5 +2193,62 @@ mod tests {
         // Under a quota the CPUs are shared: leave the workers to the
         // scheduler rather than stack every process on CPUs 0 and 1.
         assert!(!pin_by_default(64, Some(2)));
+    }
+
+    /// A worker's CPU time is read from its thread's clock and grows while
+    /// it works.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_working_worker_shows_cpu_time() {
+        let _real = super::fake_cpu::set(None);
+        let rt = crate::Builder::new().workers(1).build().unwrap();
+        let shared = rt.shared.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        rt.run(move |_| {
+            let (shared, seen) = (shared.clone(), s.clone());
+            async move {
+                let (before, _) = shared.busy_ns_of(0).unwrap();
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
+                let (after, _) = shared.busy_ns_of(0).unwrap();
+                *seen.lock().unwrap() = Some((before, after));
+            }
+        })
+        .unwrap();
+        let (before, after) = seen.lock().unwrap().unwrap();
+        assert!(after > before, "{before} then {after}");
+    }
+
+    /// Time spent spinning for work is taken off a worker's CPU time.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn time_spent_spinning_for_work_is_not_busy() {
+        const CPU: u64 = 1_000_000_000_000;
+        let _fake = super::fake_cpu::set(Some(|_, _| CPU));
+        let rt = crate::Builder::new()
+            .workers(1)
+            .spin_before_park(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let shared = rt.shared.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        rt.run(move |_| {
+            let (shared, seen) = (shared.clone(), s.clone());
+            async move {
+                // Nothing to do until the timer: the worker spins.
+                crate::time::sleep(std::time::Duration::from_millis(20)).await;
+                let spun = shared.workers[0].counters.spin_ns();
+                let (busy, _) = shared.busy_ns_of(0).unwrap();
+                *seen.lock().unwrap() = Some((spun, busy));
+            }
+        })
+        .unwrap();
+        let (spun, busy) = seen.lock().unwrap().unwrap();
+        assert!(spun > 0, "the worker did not spin");
+        assert_eq!(busy, CPU - spun);
     }
 }

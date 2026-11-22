@@ -559,4 +559,113 @@ mod tests {
         .unwrap();
         assert_eq!(*result.lock().unwrap(), Some((true, 0)));
     }
+
+    /// Two workers with balanced listeners: worker 0 holds 50 idle tasks
+    /// (think idle keep-alive connections), worker 1 one task that never
+    /// lets it rest (think a few hot connections). By counts of tasks worker
+    /// 1 looks far less busy; by how busy the workers have been, worker 0 is
+    /// the one with room. Every new connection must go to worker 0, whichever
+    /// listener the kernel picks for it. The workers' CPU time is made up
+    /// (worker 1 busy all the time, worker 0 never), so that the test does
+    /// not depend on how the machine schedules threads: on a crowded runner
+    /// the busy worker can get no CPU for tens of milliseconds, and then
+    /// really is idle.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_saturated_worker_with_few_tasks_loses_new_connections_to_a_quiet_one_with_many() {
+        use std::time::{Duration, Instant};
+
+        use crate::observe::clock_ns;
+
+        const CONNECTIONS: usize = 8;
+        let _fake = crate::runtime::fake_cpu::set(Some(|worker, started| {
+            if worker == 1 {
+                clock_ns().saturating_sub(started)
+            } else {
+                0
+            }
+        }));
+        let rt = crate::Builder::new().workers(2).build().unwrap();
+        let handle = rt.handle();
+        let counts = Arc::new(Mutex::new([0usize; 2]));
+        let port = Arc::new(Mutex::new(0u16));
+        let bound = Arc::new(Barrier::new(2));
+        let ready = Arc::new(Barrier::new(3));
+        let (client_ready, client_port) = (ready.clone(), port.clone());
+        let client = std::thread::spawn(move || {
+            client_ready.wait();
+            let port = *client_port.lock().unwrap();
+            (0..CONNECTIONS)
+                .map(|_| {
+                    std::thread::sleep(Duration::from_millis(7));
+                    std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        let (c, p) = (counts.clone(), port.clone());
+        rt.run(move |worker| {
+            let (counts, port, bound, ready, handle) = (
+                c.clone(),
+                p.clone(),
+                bound.clone(),
+                ready.clone(),
+                handle.clone(),
+            );
+            async move {
+                if worker == 0 {
+                    for _ in 0..50 {
+                        drop(crate::spawn(crate::shutdown_signal()));
+                    }
+                } else {
+                    drop(crate::spawn(async {
+                        while !crate::is_shutting_down() {
+                            let start = Instant::now();
+                            while start.elapsed() < Duration::from_micros(500) {
+                                std::hint::spin_loop();
+                            }
+                            crate::yield_now().await;
+                        }
+                    }));
+                }
+                crate::yield_now().await;
+                // Worker 0 picks the port, worker 1 joins it.
+                let listener = if worker == 0 {
+                    let listener = crate::net::TcpListener::bind_balanced("127.0.0.1:0").unwrap();
+                    *port.lock().unwrap() = listener.local_addr().unwrap().port();
+                    bound.wait();
+                    listener
+                } else {
+                    bound.wait();
+                    let port = *port.lock().unwrap();
+                    crate::net::TcpListener::bind_balanced(("127.0.0.1", port)).unwrap()
+                };
+                ready.wait();
+                let accept = async {
+                    loop {
+                        let stream = listener.accept().await.unwrap();
+                        let total = {
+                            let mut counts = counts.lock().unwrap();
+                            counts[worker] += 1;
+                            counts.iter().sum::<usize>()
+                        };
+                        drop(crate::spawn(async move {
+                            let _keep = stream;
+                            crate::shutdown_signal().await;
+                        }));
+                        if total == CONNECTIONS {
+                            handle.shutdown();
+                        }
+                    }
+                };
+                crate::until_shutdown(accept).await;
+            }
+        })
+        .unwrap();
+        drop(client.join().unwrap());
+        assert_eq!(
+            *counts.lock().unwrap(),
+            [CONNECTIONS, 0],
+            "worker 1 is saturated"
+        );
+    }
 }
