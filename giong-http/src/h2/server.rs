@@ -81,6 +81,11 @@ use crate::trailers::Trailers;
 /// to serve: a client must not keep that state.
 const SETTINGS_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Stream windows moved by SETTINGS frames, in every session: what
+/// `h2::tests` counts to see that a frame moves them once.
+#[cfg(test)]
+pub(crate) static WINDOW_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The smallest window a stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`
 /// is half the body budget divided among the streams, within this and the
 /// protocol's default).
@@ -135,8 +140,8 @@ const ERROR_LINGER: Duration = Duration::from_secs(1);
 const KEEP_STREAMS: Duration = Duration::from_secs(1);
 
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
-/// request bodies, and of responses not sent yet.
-fn budget(cfg: &Config) -> u64 {
+/// request bodies, and of responses not sent yet (over HTTP/3 too).
+pub(crate) fn budget(cfg: &Config) -> u64 {
     cfg.http2_budget
         .unwrap_or_else(|| (cfg.max_body_size as u64).max(1 << 20))
 }
@@ -1361,6 +1366,13 @@ impl Session {
             self.cheap()?;
         }
         self.settings_seen = true;
+        // The stream windows move once per frame, by the last
+        // INITIAL_WINDOW_SIZE in it: a frame can hold thousands, and moving
+        // every stream for each would cost streams x entries. Taken in
+        // order, the largest one would have overflowed first: it is the one
+        // checked.
+        let mut initial = None;
+        let mut largest = i64::MIN;
         for setting in payload.chunks_exact(6) {
             let id = u16::from_be_bytes([setting[0], setting[1]]);
             let value = frame::read_u32(&setting[2..]);
@@ -1374,19 +1386,8 @@ impl Session {
                     if value > frame::MAX_WINDOW {
                         return Err(flow_control("SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1"));
                     }
-                    let delta = value - self.peer_window;
-                    self.peer_window = value;
-                    let slots: Vec<usize> = self.ids.iter().map(|&(_, slot)| slot).collect();
-                    for slot in slots {
-                        let Some(st) = self.stream(slot) else {
-                            continue;
-                        };
-                        st.send_window += delta;
-                        if st.send_window > frame::MAX_WINDOW {
-                            return Err(flow_control("a stream window grew above 2^31-1"));
-                        }
-                        self.enqueue(slot);
-                    }
+                    initial = Some(value);
+                    largest = largest.max(value);
                 }
                 frame::MAX_FRAME_SIZE => {
                     if !(frame::DEFAULT_FRAME_SIZE as u32..=frame::MAX_FRAME_SIZE_LIMIT)
@@ -1398,6 +1399,24 @@ impl Session {
                 }
                 // Advisory, or not for a server; unknown ones are ignored.
                 _ => {}
+            }
+        }
+        if let Some(value) = initial {
+            let delta = value - self.peer_window;
+            let largest = largest - self.peer_window;
+            self.peer_window = value;
+            let slots: Vec<usize> = self.ids.iter().map(|&(_, slot)| slot).collect();
+            for slot in slots {
+                let Some(st) = self.stream(slot) else {
+                    continue;
+                };
+                if st.send_window + largest > frame::MAX_WINDOW {
+                    return Err(flow_control("a stream window grew above 2^31-1"));
+                }
+                st.send_window += delta;
+                #[cfg(test)]
+                WINDOW_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.enqueue(slot);
             }
         }
         self.reserve_out();
