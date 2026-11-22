@@ -10,20 +10,22 @@
 # bench/results/instr/raw.csv. Refresh: bench/instr/README.md.
 # Every row is a median of the CI run of #208 (GitHub runner, the kernel and
 # CPU named above), which moved the idle clients to a child process.
+# The io_uring spawn, yield, channel, tcp-echo and udp-echo rows: re-measured for
+# #322 (3 rounds on a dev VM whose counts match the rows above to the decimal).
 driver,case,metric,value,tolerance_pct
-io_uring,spawn,instructions,1397.4,1
+io_uring,spawn,instructions,1367.4,1
 io_uring,spawn,allocations,1.000,1
-io_uring,yield,instructions,496.2,1
+io_uring,yield,instructions,481.2,1
 io_uring,yield,allocations,0.000,1
 io_uring,oneshot,instructions,278.1,1
 io_uring,oneshot,allocations,1.000,1
-io_uring,channel,instructions,1756.4,1
+io_uring,channel,instructions,1726.4,1
 io_uring,channel,allocations,0.000,1
 io_uring,timeout,instructions,98.1,1
 io_uring,timeout,allocations,0.000,1
-io_uring,tcp-echo,instructions,3629.0,1
+io_uring,tcp-echo,instructions,3582.0,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,4130.4,1
+io_uring,udp-echo,instructions,4080.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,191.7,1
 io_uring,file-read,allocations,0.000,1
