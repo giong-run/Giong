@@ -101,6 +101,13 @@
     wrap.appendChild(btn);
   });
 
+  // The version menu closes on a click outside it or Escape.
+  var ver = document.querySelector(".ver-menu");
+  if (ver) {
+    document.addEventListener("click", function (e) { if (ver.open && !ver.contains(e.target)) ver.open = false; });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") ver.open = false; });
+  }
+
   // The documentation menu starts folded on a phone.
   var side = document.querySelector(".side-menu");
   if (side && window.matchMedia("(max-width: 860px)").matches) side.open = false;
