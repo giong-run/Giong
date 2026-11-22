@@ -22,12 +22,16 @@
 //! its pool buffer in the flags (`buffer_id`), exactly as io_uring does, so
 //! the socket code above has a single path.
 
+#[cfg(any(unix, windows))]
 mod blocking;
 mod budget;
 #[cfg(target_os = "linux")]
 mod epoll;
+#[cfg(windows)]
+mod iocp;
 #[cfg(any(target_os = "macos", giong_libkqueue))]
 mod kqueue;
+#[cfg(unix)]
 mod readiness;
 #[cfg(target_os = "linux")]
 mod uring;
@@ -35,7 +39,6 @@ mod uring;
 use std::any::Any;
 use std::cell::Cell;
 use std::io;
-use std::os::fd::RawFd;
 use std::rc::Rc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,15 +70,20 @@ pub enum DriverKind {
     /// epoll driver's logic over kqueue; file operations run on a pool of
     /// blocking threads.
     Kqueue,
+    /// Completion-based I/O through one I/O completion port per worker: the
+    /// driver on Windows, and the only one there.
+    Iocp,
 }
 
 impl DriverKind {
-    /// `"io_uring"`, `"epoll"` or `"kqueue"`, as accepted by `GIONG_DRIVER`.
+    /// `"io_uring"`, `"epoll"`, `"kqueue"` or `"iocp"`, as accepted by
+    /// `GIONG_DRIVER`.
     pub const fn name(self) -> &'static str {
         match self {
             DriverKind::IoUring => "io_uring",
             DriverKind::Epoll => "epoll",
             DriverKind::Kqueue => "kqueue",
+            DriverKind::Iocp => "iocp",
         }
     }
 }
@@ -434,6 +442,7 @@ pub(crate) enum Io {
     /// `close(2)`, reporting its result.
     Close { fd: RawFile },
     /// `statx(2)` on Linux, `fstatat(2)` elsewhere (see `sys::stat_at`).
+    #[cfg(unix)]
     Statx {
         dir: RawFile,
         path: *const PathChar,
@@ -454,6 +463,29 @@ pub(crate) enum Io {
         from: *const PathChar,
         to: *const PathChar,
     },
+    /// Runs `job` on a blocking thread: the file operations Windows has no
+    /// overlapped form of (opens, metadata, renames, directory listings).
+    /// The result is what [`BlockingJob::run`] returns.
+    #[cfg(windows)]
+    Blocking { job: *mut dyn BlockingJob },
+    /// `TransmitFile`: sends `len` bytes of `file` from `offset` on the
+    /// stream socket `fd`, straight from the system's file cache.
+    #[cfg(windows)]
+    SendFile {
+        fd: RawSock,
+        file: RawFile,
+        len: u32,
+        offset: u64,
+    },
+}
+
+/// What an [`Io::Blocking`] runs. It lives in the operation's resources, so
+/// the driver keeps it until the job has reported, and only the blocking
+/// thread touches it in between.
+#[cfg(windows)]
+pub(crate) trait BlockingJob: Send {
+    /// Does the work; 0 or more on success, a negated error code on failure.
+    fn run(&mut self) -> i32;
 }
 
 impl Io {
@@ -478,8 +510,8 @@ impl Io {
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,
-            Io::Send { flags, .. } => flags & libc::MSG_DONTWAIT == 0,
-            Io::SendMsg { flags, .. } => flags & libc::MSG_DONTWAIT as u32 == 0,
+            Io::Send { flags, .. } => crate::sys::send_waits(flags),
+            Io::SendMsg { flags, .. } => crate::sys::send_waits(flags as i32),
             Io::SendTo { .. } => true,
             _ => false,
         }
@@ -532,6 +564,7 @@ pub(crate) fn event_loop_failed(call: &str, err: io::Error) -> ! {
              (EBADR): the machine ran out of memory. Give the process more memory, or run \
              fewer connections per worker."
         }
+        #[cfg(unix)]
         Some(libc::ENOMEM) => {
             "the kernel is out of memory. Give the process more memory, or run fewer \
              connections per worker."
@@ -581,6 +614,8 @@ pub(crate) enum Driver {
     Epoll(readiness::Readiness<epoll::Epoll>),
     #[cfg(any(target_os = "macos", giong_libkqueue))]
     Kqueue(readiness::Readiness<kqueue::Kqueue>),
+    #[cfg(windows)]
+    Iocp(iocp::Iocp),
 }
 
 /// Expands to a `match` on a [`Driver`] that runs the same expression for
@@ -594,6 +629,8 @@ macro_rules! each {
             Driver::Epoll($d) => $body,
             #[cfg(any(target_os = "macos", giong_libkqueue))]
             Driver::Kqueue($d) => $body,
+            #[cfg(windows)]
+            Driver::Iocp($d) => $body,
         }
     };
 }
@@ -615,6 +652,11 @@ macro_rules! split {
                 let _ = &$d;
                 $ready
             }
+            #[cfg(windows)]
+            Driver::Iocp($d) => {
+                let _ = &$d;
+                $ready
+            }
         }
     };
 }
@@ -632,10 +674,10 @@ fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
         }
         match io::Error::last_os_error()
             .raw_os_error()
-            .unwrap_or(libc::EIO)
+            .unwrap_or(crate::sys::errno::EIO)
         {
-            libc::EINTR => {}
-            libc::EAGAIN => {
+            crate::sys::errno::EINTR => {}
+            crate::sys::errno::EAGAIN => {
                 // Full: the operation the caller submits instead waits for
                 // room, and takes its own unit of the budget.
                 budget::give_back_budget();
@@ -654,7 +696,8 @@ fn send_now(mut send: impl FnMut() -> isize) -> Option<i32> {
 /// nothing is cached, the file system cannot do it, the call failed in any
 /// other way (the driver's operation then reports the error as before), or
 /// the task's budget is spent, so a loop over cached reads still yields.
-pub(crate) fn read_cached(fd: RawFd, buf: *mut u8, len: u32, offset: u64) -> Option<i32> {
+#[cfg(unix)]
+pub(crate) fn read_cached(fd: RawFile, buf: *mut u8, len: u32, offset: u64) -> Option<i32> {
     // Miri cannot run `preadv2`: every read goes through the driver there.
     if cfg!(miri) || len == 0 || offset > i64::MAX as u64 || !budget::spend_budget() {
         return None;
@@ -684,12 +727,13 @@ pub(crate) fn kind_from_env() -> io::Result<Option<DriverKind>> {
             "io_uring" | "io-uring" | "uring" => Ok(Some(DriverKind::IoUring)),
             "epoll" => Ok(Some(DriverKind::Epoll)),
             "kqueue" => Ok(Some(DriverKind::Kqueue)),
+            "iocp" => Ok(Some(DriverKind::Iocp)),
             other => Err(crate::error::raise(
                 Code::InvalidConfig,
                 format!("GIONG_DRIVER is {other:?}, which is not a driver"),
-                "set GIONG_DRIVER to io_uring or epoll (Linux) or kqueue (macOS), or unset it \
-                 to use io_uring where the kernel allows it, epoll elsewhere on Linux, and \
-                 kqueue on macOS.",
+                "set GIONG_DRIVER to io_uring or epoll (Linux), kqueue (macOS) or iocp \
+                 (Windows), or unset it to use io_uring where the kernel allows it, epoll \
+                 elsewhere on Linux, kqueue on macOS and iocp on Windows.",
             )),
         },
     }
@@ -736,6 +780,7 @@ fn exists(kind: DriverKind) -> bool {
     match kind {
         DriverKind::IoUring | DriverKind::Epoll => cfg!(target_os = "linux"),
         DriverKind::Kqueue => cfg!(any(target_os = "macos", giong_libkqueue)),
+        DriverKind::Iocp => cfg!(windows),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -763,8 +808,8 @@ fn unsupported(kind: DriverKind) -> io::Error {
     crate::error::raise(
         code,
         format!("the {kind} driver does not exist on this operating system"),
-        "name io_uring or epoll on Linux and kqueue on macOS (Builder::driver or \
-         GIONG_DRIVER), or name none to let giong choose.",
+        "name io_uring or epoll on Linux, kqueue on macOS and iocp on Windows \
+         (Builder::driver or GIONG_DRIVER), or name none to let giong choose.",
     )
 }
 
@@ -789,6 +834,10 @@ pub(crate) enum WakeHandle {
     /// The user event of a kqueue.
     #[cfg(any(target_os = "macos", giong_libkqueue))]
     Kqueue(std::sync::Arc<kqueue::Wake>),
+    /// A completion port: a packet posted to it wakes the worker that waits
+    /// on it.
+    #[cfg(windows)]
+    Port(std::sync::Arc<iocp::Port>),
 }
 
 impl WakeHandle {
@@ -799,17 +848,23 @@ impl WakeHandle {
             WakeHandle::Bell(bell) => bell.ring(),
             #[cfg(any(target_os = "macos", giong_libkqueue))]
             WakeHandle::Kqueue(wake) => wake.ring(),
+            #[cfg(windows)]
+            WakeHandle::Port(port) => port.post(),
         }
     }
 
     /// Resets the wake-up once the driver saw it, where it does not reset
     /// itself.
+    #[cfg_attr(windows, allow(dead_code))]
     fn seen(&self) {
         match self {
             #[cfg(target_os = "linux")]
             WakeHandle::Bell(bell) => bell.drain(),
             #[cfg(any(target_os = "macos", giong_libkqueue))]
             WakeHandle::Kqueue(_) => {}
+            // A packet is gone once it is dequeued.
+            #[cfg(windows)]
+            WakeHandle::Port(_) => {}
         }
     }
 }
@@ -834,6 +889,8 @@ impl Driver {
             Some(DriverKind::Epoll) => Driver::Epoll(readiness::Readiness::new(pool)?),
             #[cfg(any(target_os = "macos", giong_libkqueue))]
             Some(DriverKind::Kqueue) => Driver::Kqueue(readiness::Readiness::new(pool)?),
+            #[cfg(windows)]
+            Some(DriverKind::Iocp) | None => Driver::Iocp(iocp::Iocp::new(pool)?),
             // Reachable for the drivers this build does not have.
             #[allow(unreachable_patterns)]
             Some(other) => return Err(unsupported(other)),
@@ -876,6 +933,8 @@ impl Driver {
             Driver::Epoll(_) => DriverKind::Epoll,
             #[cfg(any(target_os = "macos", giong_libkqueue))]
             Driver::Kqueue(_) => DriverKind::Kqueue,
+            #[cfg(windows)]
+            Driver::Iocp(_) => DriverKind::Iocp,
         }
     }
 
@@ -944,7 +1003,7 @@ impl Driver {
     #[inline(always)]
     pub(crate) fn try_send_to(
         &mut self,
-        fd: RawFd,
+        fd: RawSock,
         buf: &[u8],
         addr: &socket2::SockAddr,
     ) -> Option<i32> {
@@ -953,11 +1012,10 @@ impl Driver {
         }
         // SAFETY: `buf` and `addr` are valid for the call; non-blocking.
         send_now(|| unsafe {
-            libc::sendto(
+            crate::sys::send_to_nowait(
                 fd,
-                buf.as_ptr().cast(),
+                buf.as_ptr(),
                 buf.len(),
-                crate::sys::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
                 addr.as_ptr().cast(),
                 addr.len(),
             )
@@ -966,19 +1024,12 @@ impl Driver {
 
     /// [`try_send_to`](Self::try_send_to) for a connected socket: `send(2)`.
     #[inline(always)]
-    pub(crate) fn try_send(&mut self, fd: RawFd, buf: &[u8]) -> Option<i32> {
+    pub(crate) fn try_send(&mut self, fd: RawSock, buf: &[u8]) -> Option<i32> {
         if self.has_queued_submissions() {
             return None;
         }
         // SAFETY: `buf` is valid for the call; non-blocking.
-        send_now(|| unsafe {
-            libc::send(
-                fd,
-                buf.as_ptr().cast(),
-                buf.len(),
-                crate::sys::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
-            )
-        })
+        send_now(|| unsafe { crate::sys::send_nowait(fd, buf.as_ptr(), buf.len()) })
     }
 
     /// `true` if [`Io::SendTo`] can be submitted: always with epoll, from
@@ -996,6 +1047,19 @@ impl Driver {
         each!(self, d => d.poll_multi(key, waker))
     }
 
+    /// Lets a multishot operation run out (see `Iocp::finish_multi`).
+    #[cfg(windows)]
+    pub(crate) fn finish_multi(&mut self, key: usize) {
+        each!(self, d => d.finish_multi(key))
+    }
+
+    /// Takes a connection an accept has completed with and nobody has
+    /// collected yet (see `Iocp::take_accepted`).
+    #[cfg(windows)]
+    pub(crate) fn take_accepted(&mut self, key: usize) -> Option<i32> {
+        each!(self, d => d.take_accepted(key))
+    }
+
     /// Stops a multishot receive that is waiting in the kernel, so that the
     /// reader's next poll starts it again (io_uring; the epoll driver reads
     /// when the socket is readable and misses nothing).
@@ -1008,7 +1072,7 @@ impl Driver {
     /// [`try_send_to`](Self::try_send_to) for a prepared message (control
     /// data such as `UDP_SEGMENT`): `sendmsg(2)`.
     #[cfg(feature = "unstable-udp-offload")]
-    pub(crate) fn try_sendmsg(&mut self, fd: RawFd, msg: *const libc::msghdr) -> Option<i32> {
+    pub(crate) fn try_sendmsg(&mut self, fd: RawSock, msg: *const MsgHdr) -> Option<i32> {
         if self.has_queued_submissions() {
             return None;
         }
@@ -1040,8 +1104,17 @@ impl Driver {
     }
 
     /// Closes a descriptor the caller gives up.
-    pub(crate) fn close_fd(&mut self, fd: RawFd) {
+    pub(crate) fn close_fd(&mut self, fd: RawFile) {
         each!(self, d => d.close_fd(fd))
+    }
+
+    /// Closes a socket the caller gives up: a descriptor like any other on
+    /// Unix, a handle of its own kind on Windows.
+    pub(crate) fn close_sock(&mut self, fd: RawSock) {
+        #[cfg(unix)]
+        self.close_fd(fd);
+        #[cfg(windows)]
+        each!(self, d => d.close_sock(fd))
     }
 
     /// `true` if operations wait to be handed to the kernel (io_uring's
@@ -1138,9 +1211,12 @@ mod tests {
             );
             assert!(lost.contains("ran out of memory"), "{lost}");
         }
-        let oom = message(libc::ENOMEM);
-        assert!(oom.contains("out of memory"), "{oom}");
-        let other = message(libc::EINVAL);
+        #[cfg(unix)]
+        {
+            let oom = message(libc::ENOMEM);
+            assert!(oom.contains("out of memory"), "{oom}");
+        }
+        let other = message(22);
         assert!(other.contains("report it"), "{other}");
     }
 }
