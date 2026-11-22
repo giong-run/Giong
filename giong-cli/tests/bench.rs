@@ -11,14 +11,29 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+/// The variables of the cargo running these tests that would change how
+/// the test project builds: under `scripts/check.sh tsan` they ask for a
+/// sanitizer and `-Zbuild-std`, which a plain `cargo build` cannot give.
+const OUTER_BUILD: &[&str] = &[
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_BUILD_TARGET",
+    "CARGO_TARGET_DIR",
+    "TSAN_OPTIONS",
+];
+
 fn giong(cwd: &Path, args: &[&str]) -> (i32, Value) {
-    let out = Command::new(env!("CARGO_BIN_EXE_giong"))
-        .args(args)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_giong"));
+    cmd.args(args)
         .arg("--json")
         .current_dir(cwd)
-        .env_remove("WORKERS")
-        .output()
-        .unwrap();
+        .env_remove("WORKERS");
+    for k in OUTER_BUILD {
+        cmd.env_remove(k);
+    }
+    let out = cmd.output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     let v = serde_json::from_str(&text).unwrap_or_else(|e| {
         panic!(

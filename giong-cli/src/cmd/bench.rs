@@ -468,6 +468,11 @@ pub(crate) fn build_release(
     } else {
         Stdio::inherit()
     });
+    if quiet {
+        // Plain text, so the first error line can be found and quoted
+        // (CARGO_TERM_COLOR=always would colour it).
+        cmd.arg("--color=never");
+    }
     if let Some(b) = bin {
         cmd.args(["--bin", b]);
     }

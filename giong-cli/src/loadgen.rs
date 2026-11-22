@@ -331,6 +331,8 @@ struct Conn {
     end: usize,
     /// When the answer being read must be in.
     deadline: Instant,
+    /// Whether a read timeout has been set on this connection before.
+    timed: bool,
 }
 
 impl Conn {
@@ -341,6 +343,7 @@ impl Conn {
             pos: 0,
             end: 0,
             deadline: Instant::now(),
+            timed: false,
         }
     }
 
@@ -373,7 +376,17 @@ impl Conn {
         loop {
             // Each read gets what is left of the whole answer's time, so a
             // server that trickles bytes cannot stretch it.
-            self.stream.set_read_timeout(Some(self.left()?))?;
+            let left = self.left()?;
+            if let Err(e) = self.stream.set_read_timeout(Some(left)) {
+                // macOS refuses a timeout on a socket the peer has closed
+                // (EINVAL). One was set before on this connection, so the
+                // read below is still bounded, and it returns at once: the
+                // end of the stream or the reset.
+                if !(self.timed && e.raw_os_error().is_some()) {
+                    return Err(e);
+                }
+            }
+            self.timed = true;
             match self.stream.read(&mut self.buf[self.end..]) {
                 Ok(n) => {
                     self.end += n;
@@ -391,7 +404,15 @@ impl Conn {
         self.pos = 0;
         self.end = 0;
         self.deadline = deadline;
-        self.stream.set_write_timeout(Some(self.left()?))?;
+        if let Err(e) = self.stream.set_write_timeout(Some(self.left()?)) {
+            // On macOS, a connection the peer has closed refuses the timeout
+            // (EINVAL): closed, like a write would find it.
+            return Err(if self.timed && e.raw_os_error().is_some() {
+                Fail::Closed
+            } else {
+                Fail::Io(e)
+            });
+        }
         self.stream.write_all(&req.bytes)?;
         let mut first = true;
         loop {
