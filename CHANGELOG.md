@@ -10,6 +10,14 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [1.4.0] - 2026-11-22
 
+Windows: giong runs on Windows through a completion-port driver, with TCP, UDP, files,
+timers, DNS and signals, tested on Windows Server 2022 and 2025 with soaks of up to two and a
+half hours. The other crates come to Windows later. Three security fixes: path parameters in
+giong-web on Windows, the cost of an HTTP/2 SETTINGS frame, and the memory an HTTP/3
+connection could make the server hold. Documentation gets a site of its own on giong.run, a
+best-practices guide and a skill for coding agents. Nothing is removed or changed in
+meaning, and upgrading from 1.3 needs no code changes.
+
 ### Added
 
 - **Documentation**: [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md), how to build, deploy
