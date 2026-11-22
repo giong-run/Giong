@@ -1160,8 +1160,11 @@ def docs():
          f"Read {BLOB}CONTRIBUTING.md first; coding agents have {BLOB}AGENTS.md.\n\n```sh\n{src_sh}\n```\n"),
     ]
     page_url = SITE + "docs/"
-    lede = ("Requirements, a first server, and every page of the documentation: a page for each crate, "
-            "the best practices, the agent skill. The API reference for each crate is on docs.rs.")
+    have = {e[0] for e in DOCS}
+    guides = [name for slug, name in (("best-practices", "the best practices"), ("agent-skill", "the agent skill"))
+              if slug in have]
+    lede = ("Requirements, a first server, and every page of the documentation: a page for each crate"
+            + "".join(", " + g for g in guides) + ". The API reference for each crate is on docs.rs.")
     sections, scripts, page_parts = [], [], []
     for n, (ident, heading, inner, smd) in enumerate(secs):
         sid = f"md-{n}"
