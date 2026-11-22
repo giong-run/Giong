@@ -5,6 +5,11 @@
 //! `EV_CLEAR`, which is kqueue's edge-triggered mode), and each event names
 //! one direction. Closing a descriptor removes its filters, as with epoll.
 //!
+//! A wait with a time limit does not pass that limit to `kevent`: macOS
+//! adds timer slack (coalescing) to it, so a 2 ms wait took 2 to 4 ms. It
+//! arms a one-shot `EVFILT_TIMER` with `NOTE_CRITICAL` instead, which the
+//! kernel fires on time, and blocks until an event comes.
+//!
 //! Built on Linux too with `--cfg giong_libkqueue`, against libkqueue (a
 //! kqueue written over epoll), so that this file can be tested without a
 //! Mac. That build is a test aid only.
@@ -23,8 +28,8 @@ use super::readiness::{Poller, MAX_EVENTS, WAKE};
 #[cfg(target_os = "macos")]
 mod ffi {
     pub(super) use libc::{
-        kevent, kqueue, EVFILT_READ, EVFILT_USER, EVFILT_WRITE, EV_ADD, EV_CLEAR, EV_DELETE,
-        EV_ERROR, EV_RECEIPT, NOTE_TRIGGER,
+        kevent, kqueue, EVFILT_READ, EVFILT_TIMER, EVFILT_USER, EVFILT_WRITE, EV_ADD, EV_CLEAR,
+        EV_DELETE, EV_ERROR, EV_ONESHOT, EV_RECEIPT, NOTE_CRITICAL, NOTE_NSECONDS, NOTE_TRIGGER,
     };
     pub(super) type Kevent = libc::kevent;
 }
@@ -44,10 +49,15 @@ mod ffi {
     }
     pub(super) const EVFILT_READ: i16 = -1;
     pub(super) const EVFILT_WRITE: i16 = -2;
+    pub(super) const EVFILT_TIMER: i16 = -7;
     pub(super) const EVFILT_USER: i16 = -11;
     pub(super) const NOTE_TRIGGER: u32 = 0x0100_0000;
+    pub(super) const NOTE_NSECONDS: u32 = 0x0004;
+    /// macOS only: libkqueue has no timer slack to turn off.
+    pub(super) const NOTE_CRITICAL: u32 = 0;
     pub(super) const EV_ADD: u16 = 0x0001;
     pub(super) const EV_DELETE: u16 = 0x0002;
+    pub(super) const EV_ONESHOT: u16 = 0x0010;
     pub(super) const EV_CLEAR: u16 = 0x0020;
     pub(super) const EV_RECEIPT: u16 = 0x0040;
     pub(super) const EV_ERROR: u16 = 0x4000;
@@ -82,10 +92,18 @@ pub(crate) struct Kqueue {
     /// driver: the queue is closed when the last of them is gone.
     kq: Arc<OwnedFd>,
     events: Vec<Kevent>,
+    /// The wait timer is armed: it has neither fired nor been deleted.
+    timer_armed: bool,
+    /// The kernel refused the wait timer once; waits pass their limit to
+    /// `kevent` from then on, slack and all.
+    timer_refused: bool,
 }
 
 /// The identifier of the worker's wake-up among the queue's user events.
 const WAKE_IDENT: usize = 0;
+
+/// The identifier of the wait timer among the queue's timers.
+const TIMER_IDENT: usize = 0;
 
 /// Wakes the worker that waits on a kqueue: triggers the queue's user event
 /// (`EVFILT_USER`), which needs no descriptor of its own and no draining.
@@ -185,6 +203,8 @@ impl Poller for Kqueue {
         Ok(Self {
             kq,
             events: Vec::with_capacity(MAX_EVENTS),
+            timer_armed: false,
+            timer_refused: false,
         })
     }
 
@@ -268,20 +288,53 @@ impl Poller for Kqueue {
 
     fn wait(&mut self, timeout: Option<Duration>) -> usize {
         self.events.clear();
-        let ts = timeout.map(|d| libc::timespec {
+        // A limit above zero arms the wait timer and blocks; no limit
+        // takes back a timer an earlier wait left armed, or it would end
+        // this one for nothing; a zero limit (a look) leaves it be.
+        let mut timer = None;
+        let mut limit = timeout;
+        match timeout {
+            Some(d) if !d.is_zero() && !self.timer_refused => {
+                let mut ev = change(
+                    TIMER_IDENT as RawFd,
+                    EVFILT_TIMER as i16,
+                    (EV_ADD | EV_ONESHOT) as u16,
+                    0,
+                );
+                ev.fflags = (NOTE_NSECONDS | NOTE_CRITICAL) as _;
+                ev.data = d.as_nanos().min(libc::intptr_t::MAX as u128) as _;
+                timer = Some(ev);
+                limit = None;
+            }
+            None if self.timer_armed => {
+                timer = Some(change(
+                    TIMER_IDENT as RawFd,
+                    EVFILT_TIMER as i16,
+                    EV_DELETE as u16,
+                    0,
+                ));
+            }
+            _ => {}
+        }
+        let ts = limit.map(|d| libc::timespec {
             tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
             tv_nsec: d.subsec_nanos() as libc::c_long,
         });
         let ts_ptr = ts
             .as_ref()
             .map_or(std::ptr::null(), |t| t as *const libc::timespec);
-        // SAFETY: the event list has room for MAX_EVENTS events; `ts_ptr` is
-        // null or points at a live timespec.
+        let (changes, nchanges) = match &timer {
+            Some(ev) => (ev as *const Kevent, 1),
+            None => (std::ptr::null(), 0),
+        };
+        // SAFETY: the change list is null or one live change; the event
+        // list has room for MAX_EVENTS events; `ts_ptr` is null or points
+        // at a live timespec.
         let res = unsafe {
             kevent(
                 self.kq.as_raw_fd(),
-                std::ptr::null(),
-                0,
+                changes,
+                nchanges,
                 self.events.as_mut_ptr(),
                 MAX_EVENTS as libc::c_int,
                 ts_ptr,
@@ -290,13 +343,40 @@ impl Poller for Kqueue {
         if res < 0 {
             let e = io::Error::last_os_error();
             if e.raw_os_error() == Some(libc::EINTR) {
+                // The change list is applied before signals are looked at.
+                if let Some(ev) = &timer {
+                    self.timer_armed = ev.flags as u16 & EV_ADD as u16 != 0;
+                }
                 return 0;
             }
             super::event_loop_failed("kevent", e);
         }
-        let n = res as usize;
+        if let Some(ev) = &timer {
+            self.timer_armed = ev.flags as u16 & EV_ADD as u16 != 0;
+        }
+        let mut n = res as usize;
         // SAFETY: the kernel initialised `n <= MAX_EVENTS` events.
         unsafe { self.events.set_len(n) };
+        // The wait timer's own events are not for the caller: it firing
+        // is the wait's time running out, and a change it refused comes
+        // back as an event too.
+        let mut i = 0;
+        while i < n {
+            let ev = &self.events[i];
+            if ev.filter as i16 == EVFILT_TIMER as i16 && ev.ident as usize == TIMER_IDENT {
+                if ev.flags as u16 & EV_ERROR as u16 != 0 {
+                    // Refused: added never (ENOMEM), or already gone.
+                    if self.timer_armed {
+                        self.timer_refused = true;
+                    }
+                }
+                self.timer_armed = false;
+                self.events.swap_remove(i);
+                n -= 1;
+            } else {
+                i += 1;
+            }
+        }
         n
     }
 
@@ -315,5 +395,69 @@ impl Poller for Kqueue {
             filter == EVFILT_READ as i16,
             filter == EVFILT_WRITE as i16,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// A timed wait with nothing to report lasts its limit and reports no
+    /// event: the wait timer's own event is not passed on.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
+    fn a_timed_wait_lasts_its_limit_and_reports_nothing() {
+        let mut kq = Kqueue::new().unwrap();
+        let limit = Duration::from_millis(20);
+        for _ in 0..3 {
+            let start = Instant::now();
+            assert_eq!(kq.wait(Some(limit)), 0);
+            assert!(start.elapsed() >= limit, "{:?}", start.elapsed());
+            assert!(!kq.timer_armed);
+        }
+        assert!(!kq.timer_refused);
+    }
+
+    /// A timed wait that an event ends early leaves its timer armed. A
+    /// later wait without a limit takes it back: the old timer does not
+    /// end that wait.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
+    fn a_timer_left_armed_does_not_end_a_later_wait() {
+        let mut kq = Kqueue::new().unwrap();
+        let wake = kq.waker().unwrap();
+        wake.ring();
+        assert_eq!(kq.wait(Some(Duration::from_millis(30))), 1);
+        assert_eq!(kq.event(0).0, WAKE);
+        assert!(kq.timer_armed);
+        let ringer = {
+            let wake = wake.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                wake.ring();
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(kq.wait(None), 1);
+        assert_eq!(kq.event(0).0, WAKE);
+        assert!(
+            start.elapsed() >= Duration::from_millis(150),
+            "the old timer ended the wait after {:?}",
+            start.elapsed()
+        );
+        assert!(!kq.timer_armed);
+        ringer.join().unwrap();
+    }
+
+    /// A look (a zero limit) never waits and arms no timer.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
+    fn a_look_arms_no_timer() {
+        let mut kq = Kqueue::new().unwrap();
+        let start = Instant::now();
+        assert_eq!(kq.wait(Some(Duration::ZERO)), 0);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!kq.timer_armed);
     }
 }
