@@ -186,7 +186,6 @@ fn bad_input_gets_a_json_rpc_error_and_the_session_goes_on() {
 /// `giong mcp` speaks JSON-RPC on stdout, so `--json` cannot apply: it is a
 /// usage error, not a silent exit 0 with nothing printed.
 #[test]
-#[ignore = "known bug: giong mcp --json exits 0 and prints nothing (want a GIONG-E5000 document)"]
 fn json_is_refused_with_a_usage_error() {
     if !has_command("mcp") {
         return;

@@ -200,7 +200,6 @@ fn a_clean_project_is_ok() {
 /// One problem, one finding: clippy's `await_holding_refcell_ref` and
 /// giong's E5008 describe the same borrow.
 #[test]
-#[ignore = "known bug: giong check reports a RefCell borrow across .await twice (clippy::await_holding_refcell_ref and GIONG-E5008)"]
 fn one_problem_is_reported_once() {
     if !has_command("check") {
         return;
