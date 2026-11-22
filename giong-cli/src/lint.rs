@@ -179,7 +179,9 @@ pub fn check_file(text: &str, shown: &str) -> Vec<Finding> {
             let Some(name) = binding_name(&stmt[4..]) else {
                 continue;
             };
-            let block_end = enclosing_block_end(m, at, *end);
+            // From the `;`: in half-typed code a `}` inside unclosed
+            // parentheses can close the block between `at` and the `;`.
+            let block_end = enclosing_block_end(m, semi, *end);
             let after = &masked[semi..block_end];
             let await_at = after.find(".await");
             let drop_at = after.find(&format!("drop({name})"));
@@ -518,6 +520,37 @@ mod tests {
             .iter()
             .map(|f| (f.code.number(), f.place.as_ref().unwrap().line))
             .collect()
+    }
+
+    #[test]
+    fn half_typed_code_does_not_panic() {
+        // Found by the lint fuzz target: a `}` inside unclosed parentheses.
+        let src =
+            "u:D;\n\nasync frig {\n g{\n let _n = vln((Durat8`)dy\n}\n\nac.borrow_mut();OG\n/";
+        check_file(src, "src/main.rs");
+        // Every prefix and every one-byte deletion of a file with all three
+        // checks in it, as an editor shows them while someone types.
+        let full = "use std::cell::RefCell;\nasync fn f(c: &RefCell<u8>) {\n    let g = c.borrow_mut();\n    \
+                    std::thread::sleep(d);\n    giong::net::TcpListener::bind(\"localhost:80\");\n    \
+                    x.await;\n    drop(g);\n    let s = \"é\"; /* ü */ let h = async { y.await };\n}\n";
+        let mut cut = full.char_indices().map(|(i, _)| i).collect::<Vec<_>>();
+        cut.push(full.len());
+        for &end in &cut {
+            check_file(&full[..end], "src/main.rs");
+        }
+        for w in cut.windows(2) {
+            let mut s = full[..w[0]].to_string();
+            s.push_str(&full[w[1]..]);
+            for f in check_file(&s, "src/main.rs") {
+                for e in &f.edits {
+                    assert!(
+                        s.is_char_boundary(e.start)
+                            && s.is_char_boundary(e.end)
+                            && e.start <= e.end
+                    );
+                }
+            }
+        }
     }
 
     #[test]

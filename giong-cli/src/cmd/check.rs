@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use super::Command;
 use crate::args::{Args, Flag, Kind};
 use crate::build;
+use crate::code::Code;
 use crate::host;
 use crate::lint;
 use crate::project::Project;
@@ -46,6 +47,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
         &args.rest,
     )?;
     let source = source_findings(&project);
+    let cargo_findings = drop_covered(cargo_findings, &source);
     let compiler = cargo_findings.len();
     for f in cargo_findings.into_iter().chain(source.iter().cloned()) {
         r.push(f);
@@ -96,8 +98,10 @@ fn run(args: &Args) -> Result<Report, Failure> {
 /// nothing: what `giong fix` applies (it runs clippy itself).
 /// `cargo_args` go to cargo (`--features x`).
 pub fn findings(project: &Project, cargo_args: &[String]) -> Result<Vec<Finding>, Failure> {
-    let (mut out, _) = cargo_findings(project, "check", cargo_args)?;
-    out.extend(source_findings(project));
+    let (cargo, _) = cargo_findings(project, "check", cargo_args)?;
+    let source = source_findings(project);
+    let mut out = drop_covered(cargo, &source);
+    out.extend(source);
     Ok(out)
 }
 
@@ -123,6 +127,32 @@ fn cargo_findings(
     Ok((findings, outcome.took))
 }
 
+/// Clippy's lints that one of giong's checks reports at the same line, with
+/// more to say: each problem is reported once.
+const COVERED: &[(&str, Code)] = &[(
+    "[clippy::await_holding_refcell_ref]",
+    Code::BORROW_ACROSS_AWAIT,
+)];
+
+fn drop_covered(cargo: Vec<Finding>, source: &[Finding]) -> Vec<Finding> {
+    let line = |f: &Finding| {
+        f.place
+            .as_ref()
+            .map(|p| (p.file.replace('\\', "/"), p.line))
+    };
+    cargo
+        .into_iter()
+        .filter(|c| {
+            !COVERED.iter().any(|(lint, code)| {
+                c.title.ends_with(lint)
+                    && source
+                        .iter()
+                        .any(|s| s.code == *code && line(s).is_some() && line(s) == line(c))
+            })
+        })
+        .collect()
+}
+
 /// giong's checks over every package's source.
 fn source_findings(project: &Project) -> Vec<Finding> {
     let dirs: Vec<PathBuf> = project
@@ -140,7 +170,11 @@ fn source_findings(project: &Project) -> Vec<Finding> {
             .unwrap_or(&file)
             .display()
             .to_string();
-        out.extend(lint::check_file(&text, &shown));
+        // A bug in a check must not cost the whole report (and the JSON
+        // document an agent waits for): that file's own checks are dropped.
+        if let Ok(found) = std::panic::catch_unwind(|| lint::check_file(&text, &shown)) {
+            out.extend(found);
+        }
     }
     out
 }
@@ -154,4 +188,26 @@ fn dev_build(root: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(root.join(".giong").join("dev.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     Some(json!({"build": v["build"], "service_pid": v["service_pid"], "listen": v["listen"]}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_problem_giong_explains_is_reported_once() {
+        let clippy = |line| {
+            Finding::new(
+                Code::LINT,
+                Severity::Warning,
+                "this `RefCell` reference is held across an await point [clippy::await_holding_refcell_ref]",
+            )
+            .at("src/main.rs", line, 13)
+        };
+        let ours =
+            Finding::new(Code::BORROW_ACROSS_AWAIT, Severity::Error, "b").at("src/main.rs", 7, 13);
+        let kept = drop_covered(vec![clippy(7), clippy(9)], &[ours]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].place.as_ref().unwrap().line, 9);
+    }
 }

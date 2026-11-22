@@ -214,29 +214,10 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: |
-          name="giong-$VERSION-$TARGET"
-          mkdir "$name"
-          cp LICENSE* README.md "$name"/ 2> /dev/null || true
-          if [ "$RUNNER_OS" = Windows ]; then
-            cp "target/$TARGET/release/giong.exe" "$name/"
-            "$name/giong.exe" version
-            archive="$name.zip"
-            7z a -tzip "$archive" "$name" > /dev/null
-            sha=$(sha256sum "$archive" | cut -d' ' -f1)
-          else
-            cp "target/$TARGET/release/giong" "$name/"
-            # The x86_64 macOS build is cross-compiled on an arm64 runner,
-            # which runs it through Rosetta when installed; skip it otherwise.
-            "$name/giong" version || [ "$TARGET" = x86_64-apple-darwin ]
-            archive="$name.tar.gz"
-            tar -czf "$archive" "$name"
-            if command -v sha256sum > /dev/null; then
-              sha=$(sha256sum "$archive" | cut -d' ' -f1)
-            else
-              sha=$(shasum -a 256 "$archive" | cut -d' ' -f1)
-            fi
-          fi
-          echo "$sha  $archive" > "$archive.sha256"
+          # The x86_64 macOS build is cross-compiled on an arm64 runner,
+          # which runs it through Rosetta when installed; skip it otherwise.
+          "target/$TARGET/release/giong" version || [ "$TARGET" = x86_64-apple-darwin ]
+          archive=$(scripts/package-cli.sh "$TARGET" "$VERSION" dist)
           cat "$archive.sha256"
           gh release upload "$GITHUB_REF_NAME" "$archive" "$archive.sha256" \
             --clobber --repo "$GITHUB_REPOSITORY"

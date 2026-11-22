@@ -817,6 +817,11 @@ mod tests {
 
     #[test]
     fn the_probe_finds_the_compiler_hash() {
+        // CI's docker job runs the test binaries where no cargo is installed.
+        if !crate::host::exists("cargo", &["--version"]) {
+            eprintln!("skipped: no cargo here");
+            return;
+        }
         let h = current_rustc_hash(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
         assert!(h.is_some());
         // The same toolchain gives the same hash.

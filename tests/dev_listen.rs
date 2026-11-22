@@ -17,9 +17,27 @@ use giong::error::{self, Code};
 fn listening_socket() -> (socket2::Socket, SocketAddr) {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
-    let sock = socket2::Socket::from(l);
-    sock.set_cloexec(false).unwrap();
-    (sock, addr)
+    (socket2::Socket::from(l), addr)
+}
+
+/// Hands `fds` to the child only: they stay close-on-exec here, so a child
+/// that another test starts at the same moment does not inherit them (and
+/// keep the ready socket open after our child is gone).
+fn pass_fds(cmd: &mut Command, fds: Vec<i32>) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: between fork and exec the closure calls only fcntl(2), which
+    // is async-signal-safe, and allocates nothing.
+    unsafe {
+        cmd.pre_exec(move || {
+            for &fd in &fds {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        })
+    }
 }
 
 /// The service: two workers bind the inherited address and answer every
@@ -37,7 +55,9 @@ fn dev_child() {
         .run(move |worker| {
             let addr = addr.clone();
             async move {
+                eprintln!("dev_child: worker {worker} binds {addr}");
                 let l = giong::net::TcpListener::bind(addr.as_str()).unwrap();
+                eprintln!("dev_child: worker {worker} bound");
                 assert_eq!(l.local_addr().unwrap().to_string(), addr);
                 // Dropping a duplicate leaves the shared socket listening.
                 drop(giong::net::TcpListener::bind(addr.as_str()).unwrap());
@@ -74,24 +94,46 @@ fn restarts_share_the_socket_and_refuse_nothing() {
     let mut waiting: Vec<TcpStream> = Vec::new();
     for round in 0..3 {
         let (mut ours, theirs) = UnixStream::pair().unwrap();
-        socket2::SockRef::from(&theirs).set_cloexec(false).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "dev_child", "--nocapture", "--test-threads=1"])
+            .env("GIONG_DEV_TEST_ADDR", addr.to_string())
+            .env("GIONG_DEV_PARENT", std::process::id().to_string())
+            .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()))
+            .env("GIONG_DEV_READY", theirs.as_raw_fd().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         let mut service = Service(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "dev_child", "--nocapture", "--test-threads=1"])
-                .env("GIONG_DEV_TEST_ADDR", addr.to_string())
-                .env("GIONG_DEV_PARENT", std::process::id().to_string())
-                .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()))
-                .env("GIONG_DEV_READY", theirs.as_raw_fd().to_string())
-                .stdout(Stdio::null())
+            pass_fds(&mut cmd, vec![sock.as_raw_fd(), theirs.as_raw_fd()])
                 .spawn()
                 .unwrap(),
         );
         drop(theirs);
-        ours.set_read_timeout(Some(Duration::from_secs(30)))
+        ours.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         // Two workers, each binding twice: four bytes.
         let mut got = [0u8; 4];
-        ours.read_exact(&mut got).unwrap();
+        let mut have = 0;
+        let read = loop {
+            if have == got.len() {
+                break Ok(());
+            }
+            match ours.read(&mut got[have..]) {
+                Ok(0) => break Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => have += n,
+                Err(e) => break Err(e),
+            }
+        };
+        if let Err(e) = read {
+            let status = service.0.try_wait();
+            let _ = service.0.kill();
+            let mut err = String::new();
+            let _ = service.0.stderr.take().unwrap().read_to_string(&mut err);
+            panic!(
+                "round {round}: the build reported {have} of 4 binds ({:?}), then {e}; \
+                 it had {status:?}; its standard error:\n{err}",
+                &got[..have]
+            );
+        }
         assert_eq!(&got, b"\n\n\n\n", "round {round}");
         // Every connection is answered: those that waited between the
         // builds, and new ones.
@@ -113,18 +155,29 @@ fn restarts_share_the_socket_and_refuse_nothing() {
         // never accepted) answers that it holds nothing.
         ours.write_all(b"s").unwrap();
         let mut done = [0u8; 2];
-        ours.read_exact(&mut done).unwrap();
+        ours.read_exact(&mut done)
+            .unwrap_or_else(|e| panic!("round {round}: no stop reply ({e})"));
         assert_eq!(&done, b"dd", "round {round}");
         // From now on the old build takes nothing: this one waits for the
         // next build, even while the old one still runs.
         waiting.push(TcpStream::connect(addr).unwrap());
         std::thread::sleep(Duration::from_millis(50));
-        // SAFETY: kill(2) on the child we started and have not reaped.
-        assert_eq!(
-            unsafe { libc::kill(service.0.id() as i32, libc::SIGTERM) },
-            0
-        );
-        assert!(service.0.wait().unwrap().success(), "round {round}");
+        if cfg!(giong_tsan) {
+            // TSan holds a signal back until the receiving thread calls a
+            // function it intercepts, and the workers wait in raw kevent and
+            // io_uring_enter, so SIGTERM would not stop the build (the
+            // runtime's SIGTERM tests are skipped under TSan for this).
+            // What this test is about, the shared socket, holds either way.
+            service.0.kill().unwrap();
+            service.0.wait().unwrap();
+        } else {
+            // SAFETY: kill(2) on the child we started and have not reaped.
+            assert_eq!(
+                unsafe { libc::kill(service.0.id() as i32, libc::SIGTERM) },
+                0
+            );
+            assert!(service.0.wait().unwrap().success(), "round {round}");
+        }
         // Between two builds nothing accepts, but the socket kept here
         // listens: the connection waits in its queue instead of being refused.
         waiting.push(TcpStream::connect(addr).unwrap());
@@ -139,13 +192,12 @@ fn only_the_process_giong_dev_started_takes_the_sockets() {
         return;
     }
     let (sock, addr) = listening_socket();
-    let out = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "malformed_child", "--nocapture"])
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "malformed_child", "--nocapture"])
         .env("GIONG_DEV_MALFORMED", "ignored")
         .env("GIONG_DEV_PARENT", "1")
-        .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()))
-        .output()
-        .unwrap();
+        .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()));
+    let out = pass_fds(&mut cmd, vec![sock.as_raw_fd()]).output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -199,13 +251,12 @@ fn an_address_it_does_not_name_binds_as_usual() {
         return;
     }
     let (sock, addr) = listening_socket();
-    let out = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "other_child", "--nocapture"])
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "other_child", "--nocapture"])
         .env("GIONG_DEV_OTHER", "1")
         .env("GIONG_DEV_PARENT", std::process::id().to_string())
-        .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()))
-        .output()
-        .unwrap();
+        .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()));
+    let out = pass_fds(&mut cmd, vec![sock.as_raw_fd()]).output().unwrap();
     assert!(
         out.status.success(),
         "{}",

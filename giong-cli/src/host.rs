@@ -67,8 +67,28 @@ pub enum ToolError {
     TimedOut,
 }
 
+/// Programs that already took longer than [`TOOL_TIMEOUT`]: asked again, they
+/// answer `TimedOut` at once, so one hung tool (a rustc behind a stuck rustup
+/// lock) costs one timeout per command, not one per call.
+static TIMED_OUT: std::sync::Mutex<Vec<std::ffi::OsString>> = std::sync::Mutex::new(Vec::new());
+
+fn timed_out_before(program: &std::ffi::OsStr) -> bool {
+    TIMED_OUT
+        .lock()
+        .map(|t| t.iter().any(|p| p == program))
+        .unwrap_or(false)
+}
+
 /// Runs `cmd` with its output captured, stopped after [`TOOL_TIMEOUT`].
 pub fn run(cmd: &mut Command) -> Result<String, ToolError> {
+    run_within(cmd, TOOL_TIMEOUT)
+}
+
+fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError> {
+    let program = cmd.get_program().to_os_string();
+    if timed_out_before(&program) {
+        return Err(ToolError::TimedOut);
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -92,12 +112,13 @@ pub fn run(cmd: &mut Command) -> Result<String, ToolError> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
-            Ok(None) if start.elapsed() < TOOL_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(5))
-            }
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if let Ok(mut t) = TIMED_OUT.lock() {
+                    t.push(program);
+                }
                 return Err(ToolError::TimedOut);
             }
         }
@@ -262,6 +283,28 @@ Max processes             unlimited            unlimited            processes
             })
         );
         assert_eq!(parse_limit(text, "Max nice priority"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_that_timed_out_is_not_waited_for_again() {
+        // CI's docker job has no sleep(1) on the PATH.
+        if !exists("sleep", &["0"]) {
+            eprintln!("skipped: no sleep here");
+            return;
+        }
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        assert!(matches!(
+            run_within(&mut cmd, Duration::from_millis(100)),
+            Err(ToolError::TimedOut)
+        ));
+        let start = Instant::now();
+        assert!(matches!(
+            run_within(Command::new("sleep").arg("5"), Duration::from_secs(10)),
+            Err(ToolError::TimedOut)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

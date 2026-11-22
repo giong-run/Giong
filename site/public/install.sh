@@ -9,6 +9,8 @@
 #
 #   GIONG_VERSION=1.5.0   a given version instead of the latest
 #   GIONG_INSTALL=/path   where the binary goes (default ~/.giong/bin)
+#   GIONG_DOWNLOAD_URL=   a mirror of the release downloads: archives are
+#                         fetched from $GIONG_DOWNLOAD_URL/v<version>/
 
 set -eu
 
@@ -91,7 +93,8 @@ main() {
         [ -n "$tag" ] || fail "cannot find the latest release on GitHub (set GIONG_VERSION=x.y.z to pick one)"
     fi
     name="giong-${tag#v}-$t"
-    base="https://github.com/$repo/releases/download/$tag"
+    mirror="${GIONG_DOWNLOAD_URL:-https://github.com/$repo/releases/download}"
+    base="${mirror%/}/$tag"
     work=$(mktemp -d)
     trap 'rm -rf "$work"' EXIT
     if ! fetch "$base/$name.tar.gz" "$work/$name.tar.gz" 2> /dev/null; then
