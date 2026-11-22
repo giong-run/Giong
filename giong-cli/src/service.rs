@@ -390,7 +390,14 @@ fn exchange<S: Stream>(
     let mut out = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
-        s.timeouts(left(deadline)?)?;
+        if let Err(e) = s.timeouts(left(deadline)?) {
+            // macOS refuses a timeout on a socket the peer has closed
+            // (EINVAL); the one set above still bounds the read, which
+            // returns at once.
+            if e.raw_os_error().is_none() {
+                return Err(e);
+            }
+        }
         let n = s.read(&mut chunk).map_err(timeout)?;
         if n == 0 {
             break;

@@ -12,9 +12,25 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+/// The variables of the cargo running these tests that would change how
+/// the test project builds: under `scripts/check.sh tsan` they ask for a
+/// sanitizer and `-Zbuild-std`, which a plain `cargo build` cannot give.
+const OUTER_BUILD: &[&str] = &[
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_BUILD_TARGET",
+    "CARGO_TARGET_DIR",
+    "TSAN_OPTIONS",
+];
+
 fn giong(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Value) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_giong"));
     cmd.args(args).arg("--json").current_dir(cwd);
+    for k in OUTER_BUILD {
+        cmd.env_remove(k);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -104,6 +120,11 @@ fn the_archive_is_reproducible_and_complete() {
     let p = Project::new("repro");
     let date = [("SOURCE_DATE_EPOCH", "1700000000")];
     let (code, a) = giong(&p.dir, &["image", "--add", "static"], &date);
+    if cfg!(not(target_os = "linux")) && a["error"]["code"] == "GIONG-E5070" {
+        // macOS and Windows build Linux binaries only with cargo zigbuild.
+        eprintln!("skipped: this machine builds no Linux binary (cargo zigbuild is not installed)");
+        return;
+    }
     assert_eq!(code, 0, "{a}");
     assert_eq!(a["data"]["port"], 3000, "the port comes from .env.example");
     assert_eq!(a["data"]["created"], "2023-11-14T22:13:20Z");
