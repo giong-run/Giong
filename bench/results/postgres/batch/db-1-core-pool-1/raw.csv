@@ -1,0 +1,7 @@
+client,workload,mode,round,ops,p50,p99,cpu,srv
+giong,point,pool,1,61049,1139,1974,54,95
+giong,point,batch,1,198335,311,556,31,93
+giong,point,pool,2,58744,1151,1869,51,94
+giong,point,batch,2,203954,309,475,32,95
+giong,point,pool,3,53835,1201,2708,49,93
+giong,point,batch,3,197460,310,568,32,95

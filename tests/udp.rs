@@ -448,8 +448,10 @@ fn every_worker_can_bind_the_same_port() {
     // hands out for port 0: a socket of a test running at the same time,
     // bound to port 0 of any address (0.0.0.0 included), cannot take it
     // before the workers bind it.
-    const ADDR: &str = "127.0.0.2";
-    let port = port_outside_ephemeral_range([127, 0, 0, 2]).port();
+    // macOS has 127.0.0.1 only, unless more are added to the interface.
+    const LAST: u8 = if cfg!(target_os = "macos") { 1 } else { 2 };
+    let ip = std::net::Ipv4Addr::new(127, 0, 0, LAST);
+    let port = port_outside_ephemeral_range(ip.octets()).port();
     let received = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
     let rt = giong::Builder::new().workers(3).build().unwrap();
@@ -459,7 +461,7 @@ fn every_worker_can_bind_the_same_port() {
         rt.run(move |_| {
             let (r, b) = (r.clone(), b.clone());
             async move {
-                let socket = UdpSocket::bind((ADDR, port)).unwrap();
+                let socket = UdpSocket::bind((ip, port)).unwrap();
                 b.fetch_add(1, Ordering::SeqCst);
                 while let Some(Ok((got, from))) = giong::until_shutdown(socket.recv_from()).await {
                     let reply = got.to_vec();
@@ -482,7 +484,7 @@ fn every_worker_can_bind_the_same_port() {
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let message = format!("sender {i}");
-        client.send_to(message.as_bytes(), (ADDR, port)).unwrap();
+        client.send_to(message.as_bytes(), (ip, port)).unwrap();
         let mut buf = [0u8; 64];
         let (n, _) = client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], message.as_bytes());
@@ -591,6 +593,7 @@ fn runtime_teardown_with_datagrams_in_flight() {
 /// What names one socket for good: its address and its cookie, a number the
 /// kernel never gives another socket. (Descriptor numbers are reused by the
 /// tests running in parallel.)
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 struct SocketId {
     addr: std::net::SocketAddrV4,
@@ -598,6 +601,7 @@ struct SocketId {
     inode: u64,
 }
 
+#[cfg(target_os = "linux")]
 fn socket_id(socket: &UdpSocket) -> SocketId {
     use std::os::fd::AsRawFd;
     const SO_COOKIE: libc::c_int = 57;
@@ -641,6 +645,7 @@ fn socket_id(socket: &UdpSocket) -> SocketId {
 /// `port_zero_gives_every_socket_a_port_of_its_own`) can make a live socket
 /// fall between two pages, so it counts as open when any of several reads
 /// lists it.
+#[cfg(target_os = "linux")]
 fn is_open(id: SocketId) -> bool {
     static DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let diag = *DIAG.get_or_init(|| {
@@ -665,6 +670,7 @@ fn is_open(id: SocketId) -> bool {
 
 /// Whether sock_diag finds the UDP socket bound to `id.addr` with
 /// `id.cookie`. Also false when the kernel has no sock_diag for UDP.
+#[cfg(target_os = "linux")]
 fn found_by_sock_diag(id: SocketId) -> bool {
     #[repr(C)]
     struct Request {
@@ -755,6 +761,8 @@ fn found_by_sock_diag(id: SocketId) -> bool {
     }
 }
 
+// Linux only: the sockets are found through sock_diag or /proc/net/udp.
+#[cfg(target_os = "linux")]
 #[test]
 fn dropping_a_socket_closes_it() {
     giong::block_on(async {
@@ -969,7 +977,16 @@ fn a_port_held_by_another_process_is_refused() {
 /// is the obvious pick for anything else on the machine doing the same.
 fn port_outside_ephemeral_range(ip: [u8; 4]) -> std::net::SocketAddr {
     use std::hash::{BuildHasher, Hasher};
+    #[cfg(target_os = "linux")]
     let range = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+    #[cfg(target_os = "macos")]
+    let range = {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "net.inet.ip.portrange.first"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
     let low: u16 = range.split_whitespace().next().unwrap().parse().unwrap();
     assert!(
         low > 2048,

@@ -1,0 +1,23 @@
+// The service of bench/grpc.sh, served by giong-grpc and by tonic.
+syntax = "proto3";
+
+package bench.v1;
+
+service Bench {
+  // Answers with the payload and the id it was sent.
+  rpc Unary(Echo) returns (Echo);
+  // Answers each message with the same payload and id, as it arrives.
+  rpc Duplex(stream Echo) returns (stream Echo);
+  // Sends `count` messages of `size` bytes.
+  rpc Download(DownloadRequest) returns (stream Echo);
+}
+
+message Echo {
+  bytes payload = 1;
+  uint64 id = 2;
+}
+
+message DownloadRequest {
+  uint32 count = 1;
+  uint32 size = 2;
+}

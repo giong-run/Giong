@@ -1,6 +1,10 @@
 //! Buffers: the ownership-passing buffer traits used by single-shot I/O, and the
 //! kernel-shared buffer ring ("provided buffers") used by multishot receive.
 
+// The buffer rings are io_uring's: elsewhere the pool only lends buffers
+// to the readiness driver, and the ring bookkeeping goes unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -10,8 +14,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
 use std::task::Waker;
-
-use io_uring::types::BufRingEntry;
 
 use crate::error::{raise, Code};
 
@@ -219,24 +221,10 @@ struct Mapping {
 #[cfg(not(kani))]
 impl Mapping {
     fn new(len: usize) -> io::Result<Self> {
-        // SAFETY: a fresh anonymous mapping; the result is checked.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
+        let Some(ptr) = NonNull::new(crate::sys::map_pool(len)) else {
             return Err(io::Error::last_os_error());
-        }
-        Ok(Self {
-            ptr: NonNull::new(ptr as *mut u8).expect("mmap returned null"),
-            len,
-        })
+        };
+        Ok(Self { ptr, len })
     }
 }
 
@@ -262,11 +250,7 @@ impl Mapping {
 }
 
 #[cfg(not(kani))]
-fn page_size() -> usize {
-    // SAFETY: plain libc call without pointers.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    usize::try_from(size).unwrap_or(4096)
-}
+use crate::sys::page_size;
 
 /// Under Kani: a small stand-in, only the size of the padding `Ring::new`
 /// adds for Linux 6.0 (`sysconf` is a foreign function).
@@ -278,8 +262,8 @@ fn page_size() -> usize {
 #[cfg(not(kani))]
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: exactly the region mapped in `new`.
-        unsafe { libc::munmap(self.ptr.as_ptr() as *mut libc::c_void, self.len) };
+        // SAFETY: exactly the region mapped in `new`, which this value owns.
+        unsafe { crate::sys::unmap_pool(self.ptr.as_ptr(), self.len) };
     }
 }
 
@@ -351,7 +335,7 @@ impl Ring {
     }
 
     fn size(count: u16) -> usize {
-        count as usize * std::mem::size_of::<BufRingEntry>() + page_size()
+        count as usize * std::mem::size_of::<RawEntry>() + page_size()
     }
 
     fn with_map(map: Mapping) -> Self {
@@ -365,16 +349,16 @@ impl Ring {
         }
     }
 
-    fn entries(&self) -> *mut BufRingEntry {
-        self.map.ptr.as_ptr() as *mut BufRingEntry
+    fn entries(&self) -> *mut RawEntry {
+        self.map.ptr.as_ptr() as *mut RawEntry
     }
 }
 
 /// The layout of the kernel's `struct io_uring_buf`, one entry of a buffer
 /// ring, for writing an entry field by field through raw pointers. `resv` of
 /// entry 0 is the ring's tail, which the kernel reads at any time, so a
-/// reference to an entry (which `BufRingEntry`'s setters take) would claim
-/// memory the kernel shares.
+/// reference to an entry (which `io_uring::types::BufRingEntry`'s setters
+/// take) would claim memory the kernel shares.
 #[repr(C)]
 struct RawEntry {
     addr: u64,
@@ -383,7 +367,10 @@ struct RawEntry {
     resv: u16,
 }
 
-const _: () = assert!(std::mem::size_of::<RawEntry>() == std::mem::size_of::<BufRingEntry>());
+#[cfg(target_os = "linux")]
+const _: () = assert!(
+    std::mem::size_of::<RawEntry>() == std::mem::size_of::<io_uring::types::BufRingEntry>()
+);
 
 /// What the pool knows about one of its buffers.
 struct Slot {
@@ -779,7 +766,7 @@ impl BufPool {
         // fields are written through raw pointers, never through a reference
         // to the entry, and `resv` (the ring tail in entry 0) is not touched.
         unsafe {
-            let entry = ring.entries().add(idx).cast::<RawEntry>();
+            let entry = ring.entries().add(idx);
             let addr = self.mem.ptr.as_ptr().add(bid as usize * self.buf_len) as u64;
             ptr::addr_of_mut!((*entry).addr).write(addr);
             ptr::addr_of_mut!((*entry).len).write(self.buf_len as u32);
@@ -797,7 +784,7 @@ impl BufPool {
         // SAFETY: the tail lives inside the ring allocation and is only ever
         // accessed atomically (the kernel reads it concurrently).
         unsafe {
-            let tail = BufRingEntry::tail(ring.entries()) as *mut u16;
+            let tail = std::ptr::addr_of_mut!((*ring.entries()).resv);
             AtomicU16::from_ptr(tail).store(ring.tail.get(), Ordering::Release);
         }
     }
@@ -1149,7 +1136,7 @@ mod proofs {
     fn published_tail(pool: &BufPool, id: RingId) -> u16 {
         // SAFETY: the tail lives inside the ring allocation.
         unsafe {
-            let tail = BufRingEntry::tail(pool.ring(id).entries()) as *mut u16;
+            let tail = ptr::addr_of_mut!((*pool.ring(id).entries()).resv);
             AtomicU16::from_ptr(tail).load(Ordering::Acquire)
         }
     }

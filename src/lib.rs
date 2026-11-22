@@ -79,8 +79,10 @@
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("giong only supports Linux: it is built on io_uring and epoll");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!(
+    "giong supports Linux (io_uring and epoll) and, as a development platform, macOS (kqueue)"
+);
 
 mod buf;
 mod driver;
@@ -91,6 +93,7 @@ mod op;
 mod pool;
 mod runtime;
 mod slab;
+mod sys;
 
 pub mod budget;
 pub mod error;
@@ -109,6 +112,13 @@ pub use runtime::{
     block_on, driver_choice, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,
     until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,
 };
+
+/// Makes stream sends and connects fail with `ENOBUFS`, as macOS does when its
+/// network buffers run out, to test how giong waits for them. Built only with
+/// `--cfg giong_inject_enobufs`. Not part of the API.
+#[cfg(giong_inject_enobufs)]
+#[doc(hidden)]
+pub mod inject_enobufs;
 
 /// Entry points for the fuzz targets in `fuzz/`, built only by `cargo fuzz`
 /// (`--cfg fuzzing`). Not part of the API.
