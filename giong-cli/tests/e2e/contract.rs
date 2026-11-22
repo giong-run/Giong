@@ -12,7 +12,7 @@ use crate::harness::{commands, giong, TempDir, VERSION};
 /// missing here is still covered by the contract tests below; the coverage
 /// test prints it so the scenario gets written.
 const SCENARIOS: &[&str] = &[
-    "doctor", "explain", "clean", "version", "help", "new", "dev",
+    "doctor", "explain", "clean", "version", "help", "new", "dev", "ai", "fix", "test",
 ];
 
 /// How long a command may take outside a project before it is called hung:

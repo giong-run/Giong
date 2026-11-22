@@ -20,4 +20,5 @@ mod clean;
 mod contract;
 mod doctor;
 mod explain;
+mod new_ai;
 mod scenarios;

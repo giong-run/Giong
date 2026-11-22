@@ -59,6 +59,33 @@ fn patch_to_checkout(project: &Path) {
     std::fs::write(manifest, text).unwrap();
 }
 
+/// Whether `giong <command>` takes `--<flag>`.
+fn has_flag(command: &str, flag: &str) -> bool {
+    let v = giong([command, "--help", "--json"]).run().report("help");
+    v["data"]["flags"]
+        .as_array()
+        .is_some_and(|f| f.iter().any(|f| f["name"] == flag))
+}
+
+/// `giong new <name> <extra>` in `dir`, pointed at this checkout: with
+/// `--giong-path` when the command has it, else with `[patch.crates-io]`.
+fn new_project(dir: &TempDir, name: &str, extra: &[&str]) -> (crate::harness::Out, PathBuf) {
+    let mut run = giong(["new", name, "--json"]);
+    for e in extra {
+        run = run.arg(e);
+    }
+    let local = has_flag("new", "giong-path");
+    if local {
+        run = run.arg("--giong-path").arg(workspace());
+    }
+    let out = run.dir(dir.path()).timeout(Duration::from_secs(120)).run();
+    let project = dir.join(name);
+    if !local && project.join("Cargo.toml").exists() {
+        patch_to_checkout(&project);
+    }
+    (out, project)
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -104,8 +131,10 @@ impl Dev {
         let mut child = Command::new(GIONG)
             .args(["dev", "--json"])
             .current_dir(project)
+            // The templates read LISTEN; PORT for any other convention.
+            .env("LISTEN", format!("127.0.0.1:{port}"))
             .env("PORT", port.to_string())
-            .env("GIONG_DEV_LISTEN", format!("127.0.0.1:{port}"))
+            .env("WORKERS", "2")
             .env_remove("CARGO_TARGET_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -181,10 +210,9 @@ fn new_project_is_complete_and_doctor_is_happy() {
         return;
     }
     let dir = TempDir::new("scenario-new");
-    let out = giong(["new", "app", "--json"]).dir(dir.path()).run();
+    let (out, app) = new_project(&dir, "app", &[]);
     out.report("new");
     out.expect_code(0);
-    let app = dir.join("app");
     for f in [
         "Cargo.toml",
         "src/main.rs",
@@ -207,7 +235,6 @@ fn new_project_is_complete_and_doctor_is_happy() {
         main_before
     );
 
-    patch_to_checkout(&app);
     let v = giong(["doctor", "--json"])
         .dir(&app)
         .timeout(Duration::from_secs(120))
@@ -247,12 +274,8 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
         return;
     }
     let dir = TempDir::new("scenario-dev");
-    giong(["new", "app", "--json"])
-        .dir(dir.path())
-        .run()
-        .expect_code(0);
-    let app = dir.join("app");
-    patch_to_checkout(&app);
+    let (out, app) = new_project(&dir, "app", &[]);
+    out.expect_code(0);
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let mut dev = Dev::start(&app, port);
