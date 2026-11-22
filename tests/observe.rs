@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use giong::observe::{self, Source, WorkerState};
 
 fn here(file: &str) -> bool {
-    file.ends_with("tests/observe.rs")
+    // Windows writes the path with backslashes.
+    file.replace('\\', "/").ends_with("tests/observe.rs")
 }
 
 /// The longest a test blocks a worker on purpose, so that a failed check
