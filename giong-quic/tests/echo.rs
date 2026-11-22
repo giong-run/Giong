@@ -806,7 +806,10 @@ fn a_writer_waiting_for_credit_is_woken_after_its_reading_half_is_dropped() {
         .unwrap();
 }
 
+// Needs a second address of this machine: macOS has 127.0.0.1 only,
+// unless more are added to the interface.
 #[test]
+#[cfg(target_os = "linux")]
 fn a_wildcard_server_answers_from_the_address_it_was_sent_to() {
     giong::Builder::new()
         .recv_buffers(64, giong::net::GRO_RECV_BUFFER)

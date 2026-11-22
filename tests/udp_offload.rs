@@ -14,6 +14,32 @@ use giong::{Builder, DriverKind};
 
 const GRO_BUFFER: usize = giong::net::GRO_RECV_BUFFER;
 
+/// The readiness driver of this system.
+#[cfg(target_os = "linux")]
+const READINESS: DriverKind = DriverKind::Epoll;
+#[cfg(target_os = "macos")]
+const READINESS: DriverKind = DriverKind::Kqueue;
+
+/// Turns GRO on or off; `false` where the system has none (macOS), which
+/// refuses it with `ENOPROTOOPT`.
+fn gro(s: &UdpSocket, on: bool) -> bool {
+    match s.set_gro(on) {
+        Ok(()) => true,
+        Err(e) if cfg!(not(target_os = "linux")) => {
+            assert_eq!(e.raw_os_error(), Some(libc::ENOPROTOOPT), "{e}");
+            false
+        }
+        Err(e) => panic!("set_gro({on}): {e}"),
+    }
+}
+
+/// Addresses of this machine's loopback for a socket bound to every
+/// address: all of 127.0.0.0/8 on Linux, 127.0.0.1 alone on macOS.
+#[cfg(target_os = "linux")]
+const LOOPBACKS: &[u8] = &[1, 2, 77];
+#[cfg(target_os = "macos")]
+const LOOPBACKS: &[u8] = &[1];
+
 /// `true` if io_uring works here (it is blocked, for instance, under
 /// `scripts/no-io-uring.py`, in Docker with its default seccomp profile, or
 /// on a kernel without buffer rings). Where CI says it must work
@@ -36,10 +62,12 @@ fn io_uring_available() -> bool {
 }
 
 /// Runs a test on the `kind` driver; where io_uring cannot be used, its
-/// turn goes to epoll, so that every test still runs.
+/// turn goes to the readiness driver, so that every test still runs.
 fn run(fut: impl std::future::Future<Output = ()>, kind: DriverKind) {
-    let kind = if kind == DriverKind::IoUring && !io_uring_available() {
-        DriverKind::Epoll
+    let kind = if kind == DriverKind::IoUring
+        && (cfg!(not(target_os = "linux")) || !io_uring_available())
+    {
+        READINESS
     } else {
         kind
     };
@@ -55,12 +83,15 @@ fn run(fut: impl std::future::Future<Output = ()>, kind: DriverKind) {
 /// ten with GRO.
 #[test]
 fn a_segmented_send_arrives_as_its_datagrams() {
-    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+    for kind in [DriverKind::IoUring, READINESS] {
         for gro in [false, true] {
             run(
                 async move {
                     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-                    rx.set_gro(gro).unwrap();
+                    if !self::gro(&rx, gro) {
+                        eprintln!("no GRO here; skipped");
+                        return;
+                    }
                     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
                     if !tx.gso_supported() {
                         eprintln!("no UDP_SEGMENT on this kernel; skipped");
@@ -104,12 +135,15 @@ fn a_segmented_send_arrives_as_its_datagrams() {
 /// The last segment may be shorter than the others.
 #[test]
 fn a_short_last_segment_is_kept() {
-    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+    for kind in [DriverKind::IoUring, READINESS] {
         run(
             async {
                 let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-                rx.set_gro(true).unwrap();
                 let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+                if !gro(&rx, true) || !tx.gso_supported() {
+                    eprintln!("no GRO or GSO here; skipped");
+                    return;
+                }
                 let to = rx.local_addr().unwrap();
                 let (res, _) = tx.send_segments_to(vec![7u8; 2500], to, 1000, 0).await;
                 assert_eq!(res.unwrap(), 2500);
@@ -128,11 +162,41 @@ fn a_short_last_segment_is_kept() {
     }
 }
 
+/// Without GSO (macOS), a send of several segments is refused and sends
+/// nothing; one of a single segment goes as a datagram.
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn a_segmented_send_is_refused_without_gso() {
+    run(
+        async {
+            let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+            assert!(!tx.gso_supported());
+            let to = rx.local_addr().unwrap();
+            let (res, _) = tx.send_segments_to(vec![7u8; 2500], to, 1000, 0).await;
+            let err = res.expect_err("segmented without GSO");
+            assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP), "{err}");
+            let (res, _) = tx.send_segments_to(vec![8u8; 900], to, 1000, 0).await;
+            assert_eq!(res.unwrap(), 900);
+            let (dg, _) = timeout(Duration::from_secs(5), rx.recv_from())
+                .await
+                .expect("the single segment arrives")
+                .unwrap();
+            assert_eq!(
+                dg.as_slice(),
+                &[8u8; 900][..],
+                "nothing of the refused send"
+            );
+        },
+        READINESS,
+    );
+}
+
 /// The ECN bits set on a send are reported on the receive, for IPv4 and
 /// IPv6.
 #[test]
 fn ecn_bits_travel_with_the_datagram() {
-    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+    for kind in [DriverKind::IoUring, READINESS] {
         for host in ["127.0.0.1:0", "[::1]:0"] {
             run(
                 async move {
@@ -202,18 +266,20 @@ fn offload_options_are_refused_when_they_would_lose_datagrams() {
 /// to, and answers from that one: the peer sees the address it wrote to.
 #[test]
 fn a_reply_leaves_from_the_address_the_request_came_to() {
-    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+    for kind in [DriverKind::IoUring, READINESS] {
         for gro in [false, true] {
             run(
                 async move {
                     let server = UdpSocket::bind("0.0.0.0:0").unwrap();
                     server.set_recv_local_addr(true).unwrap();
                     server.set_recv_ecn(true).unwrap();
-                    server.set_gro(gro).unwrap();
+                    if !self::gro(&server, gro) {
+                        eprintln!("no GRO here; skipped");
+                        return;
+                    }
                     let port = server.local_addr().unwrap().port();
                     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-                    // All of 127.0.0.0/8 is this machine.
-                    for last in [1u8, 2, 77] {
+                    for &last in LOOPBACKS {
                         let ip = std::net::IpAddr::from([127, 0, 0, last]);
                         let (res, _) = client.send_to(b"ping".to_vec(), (ip, port).into()).await;
                         res.unwrap();
@@ -244,7 +310,7 @@ fn a_reply_leaves_from_the_address_the_request_came_to() {
 /// socket. Skipped where the machine has no IPv6 loopback.
 #[test]
 fn local_addresses_are_reported_over_ipv6_too() {
-    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+    for kind in [DriverKind::IoUring, READINESS] {
         run(
             async move {
                 let Ok(server) = UdpSocket::bind("[::]:0") else {
@@ -254,7 +320,7 @@ fn local_addresses_are_reported_over_ipv6_too() {
                 server.set_recv_local_addr(true).unwrap();
                 let port = server.local_addr().unwrap().port();
                 let v6 = std::net::IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
-                let v4 = std::net::IpAddr::from([127, 0, 0, 3]);
+                let v4 = std::net::IpAddr::from([127, 0, 0, *LOOPBACKS.last().unwrap()]);
                 for (bind, ip) in [("[::1]:0", v6), ("127.0.0.1:0", v4)] {
                     let Ok(client) = UdpSocket::bind(bind) else {
                         eprintln!("cannot bind {bind}; skipped");
@@ -297,7 +363,7 @@ fn local_addresses_are_reported_over_ipv6_too() {
 /// address) arrive. Skipped where the machine has no IPv6.
 #[test]
 fn ecn_reaches_an_ipv4_peer_of_a_dual_stack_socket() {
-    for kind in [DriverKind::IoUring, DriverKind::Epoll] {
+    for kind in [DriverKind::IoUring, READINESS] {
         run(
             async move {
                 let Ok(sender) = UdpSocket::bind("[::]:0") else {
@@ -346,10 +412,48 @@ fn a_source_address_the_machine_lacks_is_refused() {
     );
 }
 
+/// macOS: socket buffer sizes are set and read back, and "don't fragment"
+/// is `IP_DONTFRAG`.
+#[test]
+#[cfg(target_os = "macos")]
+fn buffer_sizes_and_dont_fragment() {
+    run(
+        async {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_recv_buffer_size(64 * 1024).unwrap();
+            s.set_send_buffer_size(48 * 1024).unwrap();
+            assert!(s.recv_buffer_size().unwrap() >= 64 * 1024);
+            assert!(s.send_buffer_size().unwrap() >= 48 * 1024);
+            let flag = |s: &UdpSocket| {
+                let mut v: libc::c_int = -1;
+                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                // SAFETY: `v` and `len` are valid for the kernel to write.
+                let r = unsafe {
+                    libc::getsockopt(
+                        s.as_raw_fd(),
+                        libc::IPPROTO_IP,
+                        libc::IP_DONTFRAG,
+                        std::ptr::addr_of_mut!(v).cast(),
+                        &mut len,
+                    )
+                };
+                assert_eq!(r, 0);
+                v != 0
+            };
+            s.set_dont_fragment(true).unwrap();
+            assert!(flag(&s));
+            s.set_dont_fragment(false).unwrap();
+            assert!(!flag(&s));
+        },
+        READINESS,
+    );
+}
+
 /// Socket buffer sizes are set and read back (the kernel doubles them), and
 /// "don't fragment" refuses a datagram larger than the interface's MTU
 /// instead of fragmenting it.
 #[test]
+#[cfg(target_os = "linux")]
 fn buffer_sizes_and_dont_fragment() {
     run(
         async {

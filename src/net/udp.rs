@@ -36,26 +36,32 @@ const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 
 /// Room for control messages in front of the payload when GRO or ECN is on
 /// (`unstable-udp-offload`): one `int` for `UDP_GRO`, one for `IP_TOS` or
-/// `IPV6_TCLASS` (each `CMSG_SPACE(4)` = 24 bytes on 64-bit Linux), and the
-/// address the datagram was sent to (`IP_PKTINFO`, or `IPV6_PKTINFO` which
-/// is the larger: `CMSG_SPACE(20)` = 40 bytes).
+/// `IPV6_TCLASS` (each `CMSG_SPACE(4)`: 24 bytes on 64-bit Linux, 16 on
+/// macOS), and the address the datagram was sent to (`IP_PKTINFO` or
+/// `IP_RECVDSTADDR`, or `IPV6_PKTINFO` which is the larger:
+/// `CMSG_SPACE(20)`, 40 bytes on 64-bit Linux, 32 on macOS).
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
+/// A control message's header (`struct cmsghdr`): 16 bytes on 64-bit Linux,
+/// where `cmsg_len` is a `size_t`, and 12 on macOS, where it is a
+/// `socklen_t`.
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
-// The control messages are read and written with the 64-bit layout:
-// `cmsg_len` a `size_t` in the first eight bytes, and every message aligned
-// to eight. A target where that does not hold fails to build here rather
-// than misreading what the kernel hands over.
-#[cfg(feature = "unstable-udp-offload")]
-const _: () = assert!(
-    CMSG_HDR == 16 && mem::size_of::<usize>() == 8 && mem::align_of::<libc::cmsghdr>() == 8,
-    "unstable-udp-offload reads control messages with the 64-bit layout only"
-);
+/// What control messages are aligned to (`CMSG_ALIGN`): `size_t` on Linux,
+/// 4 bytes on macOS. Both are the alignment of the header itself.
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
-const CMSG_INT_SPACE: usize = (CMSG_HDR + 4 + 7) & !7;
+const CMSG_ALIGN: usize = mem::align_of::<libc::cmsghdr>();
+// The data of a message starts right after its header (`CMSG_DATA`), which
+// holds where the header's size is a multiple of the alignment.
+const _: () = assert!(CMSG_HDR % CMSG_ALIGN == 0);
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
-const CMSG_PKTINFO6_SPACE: usize = (CMSG_HDR + mem::size_of::<libc::in6_pktinfo>() + 7) & !7;
+const fn cmsg_align(len: usize) -> usize {
+    (len + CMSG_ALIGN - 1) & !(CMSG_ALIGN - 1)
+}
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+const CMSG_INT_SPACE: usize = cmsg_align(CMSG_HDR + 4);
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+const CMSG_PKTINFO6_SPACE: usize = cmsg_align(CMSG_HDR + mem::size_of::<libc::in6_pktinfo>());
 /// Largest payload a GRO receive can hand over: 64 KiB of coalesced
 /// datagrams.
 #[cfg(feature = "unstable-udp-offload")]
@@ -103,7 +109,7 @@ struct Message {
     /// Control messages of a send (`UDP_SEGMENT`, `IP_TOS`), aligned for
     /// `cmsghdr`. Unused unless `unstable-udp-offload` sets them.
     #[cfg(feature = "unstable-udp-offload")]
-    control: [u64; CONTROL_SPACE / 8],
+    control: [u64; CONTROL_SPACE.div_ceil(8)],
 }
 
 impl Message {
@@ -145,11 +151,17 @@ impl Message {
 /// messages are skipped.
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
-    let (mut segment, mut ecn, mut local) = (0, 0, None);
+    // GRO segment sizes come on Linux only.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut segment = 0;
+    let (mut ecn, mut local) = (0, None);
     while control.len() >= CMSG_HDR {
-        let len = usize::from_ne_bytes(control[..8].try_into().expect("eight bytes"));
-        let level = i32::from_ne_bytes(control[8..12].try_into().expect("four bytes"));
-        let kind = i32::from_ne_bytes(control[12..16].try_into().expect("four bytes"));
+        // SAFETY: `control` holds at least `CMSG_HDR` bytes, read without
+        // assuming they are aligned; `cmsghdr` is plain data.
+        let hdr = unsafe { control.as_ptr().cast::<libc::cmsghdr>().read_unaligned() };
+        #[allow(clippy::unnecessary_cast)] // a `size_t` on Linux, a `socklen_t` on macOS
+        let len = hdr.cmsg_len as usize;
+        let (level, kind) = (hdr.cmsg_level, hdr.cmsg_type);
         if len < CMSG_HDR || len > control.len() {
             break;
         }
@@ -159,18 +171,38 @@ pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
                 .map(|b| i32::from_ne_bytes(b.try_into().expect("four")))
         };
         match (level, kind) {
+            #[cfg(target_os = "linux")]
             (libc::SOL_UDP, libc::UDP_GRO) => {
                 segment = int().map_or(0, |v| u16::try_from(v).unwrap_or(0));
             }
-            // IPv4 hands the TOS byte over as one byte, IPv6 the traffic
-            // class as an int.
+            // IPv4 hands the TOS byte over as one byte (as `IP_RECVTOS` on
+            // macOS), IPv6 the traffic class as an int (as one byte on some
+            // macOS versions).
             (libc::IPPROTO_IP, libc::IP_TOS) => ecn = data.first().map_or(0, |b| b & 3),
-            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => ecn = int().map_or(0, |v| (v & 3) as u8),
+            #[cfg(target_os = "macos")]
+            (libc::IPPROTO_IP, libc::IP_RECVTOS) => ecn = data.first().map_or(0, |b| b & 3),
+            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS) => {
+                ecn = match data.len() {
+                    1 => data[0] & 3,
+                    _ => int().map_or(0, |v| (v & 3) as u8),
+                };
+            }
             // `struct in_pktinfo`: interface index, the local address to
             // answer from (`ipi_spec_dst`, read here), then the header's
             // destination, which for a broadcast is not an address of ours.
+            // macOS leaves `ipi_spec_dst` empty: the destination then.
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
-                if let Some(b) = data.get(..12).map(|d| &d[4..8]) {
+                if let Some(d) = data.get(..12) {
+                    let spec: [u8; 4] = d[4..8].try_into().expect("four bytes");
+                    let dst: [u8; 4] = d[8..12].try_into().expect("four bytes");
+                    let ip = if spec == [0; 4] { dst } else { spec };
+                    local = Some(IpAddr::V4(Ipv4Addr::from(ip)));
+                }
+            }
+            // macOS: the header's destination address (`struct in_addr`).
+            #[cfg(target_os = "macos")]
+            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) => {
+                if let Some(b) = data.get(..4) {
                     let ip: [u8; 4] = b.try_into().expect("four bytes");
                     local = Some(IpAddr::V4(Ipv4Addr::from(ip)));
                 }
@@ -190,8 +222,7 @@ pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
             }
             _ => {}
         }
-        let next = (len + 7) & !7;
-        control = control.get(next..).unwrap_or(&[]);
+        control = control.get(cmsg_align(len)..).unwrap_or(&[]);
     }
     (segment, ecn, local)
 }
@@ -807,6 +838,8 @@ impl UdpSocket {
     /// of one sender, of one size, as one [`Datagram`], whose
     /// [`segment_size`](Datagram::segment_size) says where to cut it. One
     /// receive then costs what one datagram did, for up to 64 KiB of them.
+    /// Elsewhere (macOS), and on older kernels, turning it on fails with
+    /// `ENOPROTOOPT` and datagrams come one by one.
     ///
     /// Call it before the first [`recv_from`](Self::recv_from). The worker's
     /// receive buffers must hold 64 KiB of payload (see
@@ -832,7 +865,12 @@ impl UdpSocket {
                 ));
             }
         }
+        #[cfg(target_os = "linux")]
         setsockopt_int(&self.sock, libc::SOL_UDP, libc::UDP_GRO, on as libc::c_int)?;
+        #[cfg(not(target_os = "linux"))]
+        if on {
+            return Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT));
+        }
         if on {
             self.control.set(true);
         }
@@ -862,8 +900,8 @@ impl UdpSocket {
     }
 
     /// Reports the local address each datagram was sent to
-    /// ([`Datagram::local_ip`]): `IP_PKTINFO`, and `IPV6_RECVPKTINFO` on an
-    /// IPv6 socket. For a socket bound to `0.0.0.0` or `[::]` on a machine
+    /// ([`Datagram::local_ip`]): `IP_PKTINFO` (`IP_RECVDSTADDR` on macOS),
+    /// and `IPV6_RECVPKTINFO` on an IPv6 socket. For a socket bound to `0.0.0.0` or `[::]` on a machine
     /// with several addresses. Call it before the first
     /// [`recv_from`](Self::recv_from). `unstable-udp-offload`.
     #[cfg(feature = "unstable-udp-offload")]
@@ -875,7 +913,10 @@ impl UdpSocket {
             // A dual-stack socket gets IPv4 datagrams too; they are
             // reported through the IPv6 message, mapped.
         } else {
+            #[cfg(target_os = "linux")]
             setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_PKTINFO, v)?;
+            #[cfg(target_os = "macos")]
+            setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, v)?;
         }
         if on {
             self.control.set(true);
@@ -889,8 +930,29 @@ impl UdpSocket {
     /// than a link on the path is dropped there instead of being fragmented,
     /// which is what a protocol that probes the path MTU itself needs (QUIC,
     /// RFC 9000 section 14). A datagram larger than the local interface's
+    /// MTU fails with `EMSGSIZE`. macOS has no path MTU setting:
+    /// `IP_DONTFRAG` and `IPV6_DONTFRAG` there. `unstable-udp-offload`.
+    #[cfg(all(feature = "unstable-udp-offload", target_os = "macos"))]
+    pub fn set_dont_fragment(&self, on: bool) -> io::Result<()> {
+        let v = on as libc::c_int;
+        if self.local_addr()?.is_ipv6() {
+            setsockopt_int(&self.sock, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, v)?;
+            // The IPv4 side of a dual-stack socket; refused on IPv6-only.
+            let _ = setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_DONTFRAG, v);
+            Ok(())
+        } else {
+            setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_DONTFRAG, v)
+        }
+    }
+
+    /// Sends datagrams with "don't fragment" set and without the kernel's
+    /// own path MTU estimate cutting them (`IP_MTU_DISCOVER` =
+    /// `IP_PMTUDISC_PROBE`; on IPv6 also `IPV6_DONTFRAG`): a datagram larger
+    /// than a link on the path is dropped there instead of being fragmented,
+    /// which is what a protocol that probes the path MTU itself needs (QUIC,
+    /// RFC 9000 section 14). A datagram larger than the local interface's
     /// MTU fails with `EMSGSIZE`. `unstable-udp-offload`.
-    #[cfg(feature = "unstable-udp-offload")]
+    #[cfg(all(feature = "unstable-udp-offload", target_os = "linux"))]
     pub fn set_dont_fragment(&self, on: bool) -> io::Result<()> {
         let v4 = if on {
             libc::IP_PMTUDISC_PROBE
@@ -964,21 +1026,27 @@ impl UdpSocket {
 
     /// `true` if the kernel can split one send into several datagrams
     /// (`UDP_SEGMENT`, Linux 4.18+), as
-    /// [`send_segments_to`](Self::send_segments_to) asks. `unstable-udp-offload`.
+    /// [`send_segments_to`](Self::send_segments_to) asks; `false` on macOS.
+    /// `unstable-udp-offload`.
     #[cfg(feature = "unstable-udp-offload")]
     pub fn gso_supported(&self) -> bool {
-        let mut v: libc::c_int = 0;
-        let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: `v` and `len` are valid for the kernel to write.
-        unsafe {
-            libc::getsockopt(
-                self.sock.as_raw_fd(),
-                libc::SOL_UDP,
-                libc::UDP_SEGMENT,
-                ptr::addr_of_mut!(v).cast(),
-                &mut len,
-            ) == 0
+        #[cfg(target_os = "linux")]
+        {
+            let mut v: libc::c_int = 0;
+            let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: `v` and `len` are valid for the kernel to write.
+            unsafe {
+                libc::getsockopt(
+                    self.sock.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_SEGMENT,
+                    ptr::addr_of_mut!(v).cast(),
+                    &mut len,
+                ) == 0
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     /// Sends `buf` to `addr` as datagrams of `segment_size` bytes each (the
@@ -989,7 +1057,9 @@ impl UdpSocket {
     ///
     /// Linux takes at most 64 segments and 64 KiB in one send, and refuses
     /// GSO on a route without checksum offload with `EIO`; see
-    /// [`gso_supported`](Self::gso_supported). `unstable-udp-offload`.
+    /// [`gso_supported`](Self::gso_supported). Where there is no GSO
+    /// (macOS), a send of more than one segment fails with `EOPNOTSUPP` and
+    /// sends nothing. `unstable-udp-offload`.
     ///
     /// Not cancel safe: if the future is dropped, the datagrams may have
     /// been sent.
@@ -1020,6 +1090,10 @@ impl UdpSocket {
         options: &SendOptions,
     ) -> (io::Result<usize>, B) {
         let (segment_size, ecn) = (options.segment_size, options.ecn);
+        #[cfg(not(target_os = "linux"))]
+        if segment_size > 0 && segment_size < buf.len() {
+            return (Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)), buf);
+        }
         let sa = SockAddr::from(addr);
         let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&sa));
         let m = msg.as_ptr();
@@ -1033,12 +1107,16 @@ impl UdpSocket {
             let mut put = |level: i32, kind: i32, data: &[u8]| {
                 let len = CMSG_HDR + data.len();
                 let p = control.add(at);
-                p.cast::<usize>().write_unaligned(len);
-                p.add(8).cast::<i32>().write_unaligned(level);
-                p.add(12).cast::<i32>().write_unaligned(kind);
+                // All-zero is a valid `cmsghdr` (musl pads it).
+                let mut hdr: libc::cmsghdr = mem::zeroed();
+                hdr.cmsg_len = len as _;
+                hdr.cmsg_level = level;
+                hdr.cmsg_type = kind;
+                p.cast::<libc::cmsghdr>().write_unaligned(hdr);
                 ptr::copy_nonoverlapping(data.as_ptr(), p.add(CMSG_HDR), data.len());
-                at += (len + 7) & !7;
+                at += cmsg_align(len);
             };
+            #[cfg(target_os = "linux")]
             if segment_size > 0 && segment_size < buf.len() {
                 let seg = u16::try_from(segment_size).unwrap_or(u16::MAX);
                 put(libc::SOL_UDP, libc::UDP_SEGMENT, &seg.to_ne_bytes());
@@ -1046,7 +1124,7 @@ impl UdpSocket {
             if ecn & 3 != 0 {
                 let v = libc::c_int::from(ecn & 3);
                 // To an IPv4-mapped address a dual-stack socket sends IPv4,
-                // where Linux reads IP_TOS and ignores IPV6_TCLASS.
+                // where the kernel reads IP_TOS and ignores IPV6_TCLASS.
                 let mapped = matches!(addr, SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some());
                 if addr.is_ipv6() && !mapped {
                     put(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &v.to_ne_bytes());
@@ -1058,6 +1136,7 @@ impl UdpSocket {
                 (Some(IpAddr::V4(ip)), false) => {
                     // `struct in_pktinfo`: interface 0 (the route decides),
                     // `ipi_spec_dst` = the source address, `ipi_addr` unused.
+                    // macOS reads it the same way.
                     let mut info = [0u8; 12];
                     info[4..8].copy_from_slice(&ip.octets());
                     put(libc::IPPROTO_IP, libc::IP_PKTINFO, &info);
@@ -1096,7 +1175,7 @@ impl UdpSocket {
             // SAFETY: `msg` owns a live `Message`; the field pointer is taken
             // without making a reference.
             msg: unsafe { ptr::addr_of!((*msg.as_ptr()).hdr) },
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
         // SAFETY: the header is in a `KernelBox` and points at its own fields
@@ -1217,23 +1296,78 @@ mod tests {
     use socket2::SockAddr;
 
     use super::{
-        parse_addr, parse_control, Message, CMSG_HDR, CMSG_INT_SPACE, CMSG_PKTINFO6_SPACE,
-        CONTROL_SPACE,
+        cmsg_align, parse_addr, parse_control, Message, CMSG_HDR, CMSG_INT_SPACE,
+        CMSG_PKTINFO6_SPACE, CONTROL_SPACE,
     };
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    #[cfg(target_os = "linux")]
+    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv6Addr};
 
+    /// A control message as the kernel lays it out, padded to its space.
     fn cmsg(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
-        let mut v = (CMSG_HDR + data.len()).to_ne_bytes().to_vec();
-        v.extend(level.to_ne_bytes());
-        v.extend(kind.to_ne_bytes());
+        // SAFETY: all-zero is a valid `cmsghdr`.
+        let mut hdr: libc::cmsghdr = unsafe { mem::zeroed() };
+        hdr.cmsg_len = (CMSG_HDR + data.len()) as _;
+        hdr.cmsg_level = level;
+        hdr.cmsg_type = kind;
+        // SAFETY: `cmsghdr` is plain data of `CMSG_HDR` bytes.
+        let mut v = unsafe {
+            std::slice::from_raw_parts(ptr::addr_of!(hdr).cast::<u8>(), CMSG_HDR).to_vec()
+        };
         v.extend(data);
-        v.resize((v.len() + 7) & !7, 0);
+        v.resize(cmsg_align(v.len()), 0);
         v
+    }
+
+    /// Sets the `cmsg_len` of the message at the start of `v`.
+    fn set_len(v: &mut [u8], len: usize) {
+        // SAFETY: `v` holds at least one header, read unaligned.
+        let mut hdr: libc::cmsghdr = unsafe { v.as_ptr().cast::<libc::cmsghdr>().read_unaligned() };
+        hdr.cmsg_len = len as _;
+        // SAFETY: `v` holds at least one header.
+        unsafe { v.as_mut_ptr().cast::<libc::cmsghdr>().write_unaligned(hdr) };
+    }
+
+    /// macOS: the TOS byte comes as `IP_RECVTOS`, the IPv4 destination as
+    /// `IP_RECVDSTADDR` or as an `IP_PKTINFO` without `ipi_spec_dst`, and
+    /// the traffic class sometimes as one byte.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn control_messages_of_macos_are_read() {
+        let tos = cmsg(libc::IPPROTO_IP, libc::IP_RECVTOS, &[0b1011_1101]);
+        let dst = cmsg(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, &[192, 0, 2, 9]);
+        assert_eq!(tos.len(), CMSG_INT_SPACE);
+        assert_eq!(
+            parse_control(&[tos, dst].concat()),
+            (0, 1, Some(IpAddr::from([192, 0, 2, 9])))
+        );
+        let mut info = [0u8; 12];
+        info[8..12].copy_from_slice(&[10, 0, 0, 9]);
+        let info = cmsg(libc::IPPROTO_IP, libc::IP_PKTINFO, &info);
+        assert_eq!(
+            parse_control(&info),
+            (0, 0, Some(IpAddr::from([10, 0, 0, 9])))
+        );
+        let tclass = cmsg(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &[2]);
+        assert_eq!(parse_control(&tclass), (0, 2, None));
+        let mut v6 = [0u8; 20];
+        v6[..16].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let v6 = cmsg(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &v6);
+        assert_eq!(v6.len(), CMSG_PKTINFO6_SPACE);
+        assert!(2 * CMSG_INT_SPACE + v6.len() <= CONTROL_SPACE);
+        assert_eq!(
+            parse_control(&v6),
+            (0, 0, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
+        );
+        let mut bad = v6.clone();
+        set_len(&mut bad, 999);
+        assert_eq!(parse_control(&bad), (0, 0, None));
     }
 
     /// GRO and ECN control messages are read, whatever their order; a
     /// malformed or unknown one ends or is skipped, never read past.
     #[test]
+    #[cfg(target_os = "linux")]
     fn control_messages_give_segment_size_and_ecn() {
         let gro = cmsg(libc::SOL_UDP, libc::UDP_GRO, &1200i32.to_ne_bytes());
         let tos = cmsg(libc::IPPROTO_IP, libc::IP_TOS, &[0b1011_1110]);
@@ -1251,10 +1385,10 @@ mod tests {
         assert_eq!(parse_control(&[]), (0, 0, None));
         // A length past the end, or shorter than a header, stops parsing.
         let mut bad = gro.clone();
-        bad[..8].copy_from_slice(&999usize.to_ne_bytes());
+        set_len(&mut bad, 999);
         assert_eq!(parse_control(&bad), (0, 0, None));
         let mut bad = gro.clone();
-        bad[..8].copy_from_slice(&3usize.to_ne_bytes());
+        set_len(&mut bad, 3);
         assert_eq!(parse_control(&bad), (0, 0, None));
         // An unknown message is skipped; a GRO size above u16 is ignored.
         let other = cmsg(libc::SOL_SOCKET, libc::SO_TIMESTAMP, &[0; 16]);
