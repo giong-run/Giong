@@ -213,7 +213,7 @@ fn write_string(out: &mut Vec<u8>, s: &[u8]) {
     let coded = huffman::encoded_len(s);
     if coded < s.len() {
         write_int(out, 0x80, 7, coded);
-        huffman::encode(s, out);
+        huffman::encode_into(s, coded, out);
     } else {
         write_int(out, 0, 7, s.len());
         out.extend_from_slice(s);
