@@ -125,17 +125,21 @@ operation here (2% per request with ten streams and 4.5% with a hundred under `h
 fewer requests per second on bare metal), inside a 1% limit. Its counts repeat within 0.1%.
 
 Three more cases measure memory, outside valgrind: `idle-http1`, `idle-h2` and `idle-https`
-open 2,000 idle connections to a giong-http server in the process (from another thread, with
-blocking std sockets, which own no heap) and record how much the live heap and the resident
-set grew per connection. For `idle-https` that thread does each TLS handshake and one
-keep-alive request with rustls, then drops its TLS state and keeps the socket, so the heap
-that stays is the server's (the server cannot tell; nothing is sent). Its allocation count, like
-the other cases', covers both ends, handshakes included. The heap count is exact: it
+open 2,000 idle connections to a giong-http server in the process (from a child process,
+`bench-instr idle-client`, with blocking std sockets) and record how much the live heap and
+the resident set grew per connection. The clients are in another process so that the server's
+descriptors are numbered in the order it accepts them: the driver keeps a table indexed by
+descriptor number, and with the clients on a thread of the same process the two ends took
+numbers in scheduling order, so the table grew by different steps from run to run (2,166 or
+2,211 heap bytes per `idle-http1` connection from the same build, 2026-11-22). For
+`idle-https` the child does each TLS handshake and one keep-alive request with rustls, then
+drops its TLS state and keeps the socket (the server cannot tell; nothing is sent). Every count
+is the server's alone, handshakes included. The heap count is exact: it
 repeats within a byte per connection, and within 0.04% across GitHub's runners (Intel and AMD,
 two clouds; item 6 of [`conditions.txt`](../results/instr/conditions.txt)). Its limit is 1%,
 and the baseline's idle rows are taken from a CI run, not from a development machine, where
 the kernel build alone moved `idle-http1` by 1.3%. The resident set moves with the
-allocator's choices (2.7% between rounds for `idle-h2`); its limit is 10%. For `idle-h2` the thread sends the preface, SETTINGS and
+allocator's choices (2.7% between rounds for `idle-h2`); its limit is 10%. For `idle-h2` the child sends the preface, SETTINGS and
 one `GET /` on each connection and reads the answer, as `bench/h2.sh` does: until 0.9 it sent no
 request, and missed that 0.8.0 kept each connection's memory for streams for a second after a
 request (6,852 heap and 7,371 resident bytes per connection on 0.8.0 with the request, against
