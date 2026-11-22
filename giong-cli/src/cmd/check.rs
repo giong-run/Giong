@@ -170,7 +170,11 @@ fn source_findings(project: &Project) -> Vec<Finding> {
             .unwrap_or(&file)
             .display()
             .to_string();
-        out.extend(lint::check_file(&text, &shown));
+        // A bug in a check must not cost the whole report (and the JSON
+        // document an agent waits for): that file's own checks are dropped.
+        if let Ok(found) = std::panic::catch_unwind(|| lint::check_file(&text, &shown)) {
+            out.extend(found);
+        }
     }
     out
 }

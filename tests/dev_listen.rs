@@ -55,7 +55,9 @@ fn dev_child() {
         .run(move |worker| {
             let addr = addr.clone();
             async move {
+                eprintln!("dev_child: worker {worker} binds {addr}");
                 let l = giong::net::TcpListener::bind(addr.as_str()).unwrap();
+                eprintln!("dev_child: worker {worker} bound");
                 assert_eq!(l.local_addr().unwrap().to_string(), addr);
                 // Dropping a duplicate leaves the shared socket listening.
                 drop(giong::net::TcpListener::bind(addr.as_str()).unwrap());
@@ -98,7 +100,8 @@ fn restarts_share_the_socket_and_refuse_nothing() {
             .env("GIONG_DEV_PARENT", std::process::id().to_string())
             .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()))
             .env("GIONG_DEV_READY", theirs.as_raw_fd().to_string())
-            .stdout(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         let mut service = Service(
             pass_fds(&mut cmd, vec![sock.as_raw_fd(), theirs.as_raw_fd()])
                 .spawn()
@@ -109,10 +112,16 @@ fn restarts_share_the_socket_and_refuse_nothing() {
             .unwrap();
         // Two workers, each binding twice: four bytes.
         let mut got = [0u8; 4];
-        ours.read_exact(&mut got).unwrap_or_else(|e| {
+        if let Err(e) = ours.read_exact(&mut got) {
             let status = service.0.try_wait();
-            panic!("round {round}: the build did not report its binds ({e}); the build: {status:?}")
-        });
+            let _ = service.0.kill();
+            let mut err = String::new();
+            let _ = service.0.stderr.take().unwrap().read_to_string(&mut err);
+            panic!(
+                "round {round}: the build did not report its binds ({e}); \
+                 it had {status:?}; its standard error:\n{err}"
+            );
+        }
         assert_eq!(&got, b"\n\n\n\n", "round {round}");
         // Every connection is answered: those that waited between the
         // builds, and new ones.
