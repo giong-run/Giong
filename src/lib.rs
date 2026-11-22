@@ -89,6 +89,12 @@ compile_error!(
      platform, macOS (kqueue)"
 );
 
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+compile_error!(
+    "the unstable-udp-offload feature is for Linux and macOS: Windows has none of its offloads in \
+     giong yet"
+);
+
 mod buf;
 mod driver;
 mod executor;
@@ -131,4 +137,11 @@ pub mod inject_enobufs;
 #[doc(hidden)]
 pub mod fuzzing {
     pub use crate::net::dns::fuzzing::{dns_response, resolv_conf};
+
+    /// The control messages of a UDP receive (GRO segment size, ECN, the
+    /// address the datagram was sent to): must
+    /// never panic or read past the end.
+    pub fn udp_control(data: &[u8]) -> (u16, u8, Option<std::net::IpAddr>) {
+        crate::net::udp::parse_control(data)
+    }
 }

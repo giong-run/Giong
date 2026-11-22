@@ -1,0 +1,7 @@
+# quinn-proto server engine with no I/O (bench/quic/src/bin/inmem.rs), CPU 0, 2026-11-15T15:58:00Z
+inmem segments=1 size=16777216 gbit_s=6.380 srv_ns_per_kib=687.7 srv_share_pct=53.6 streams=146 last_stream_bytes=10852741
+inmem segments=10 size=16777216 gbit_s=6.856 srv_ns_per_kib=579.8 srv_share_pct=48.5 streams=157 last_stream_bytes=4788792
+inmem segments=1 size=16777216 gbit_s=5.825 srv_ns_per_kib=752.3 srv_share_pct=53.5 streams=134 last_stream_bytes=3954640
+inmem segments=10 size=16777216 gbit_s=6.336 srv_ns_per_kib=632.1 srv_share_pct=48.9 streams=145 last_stream_bytes=11489665
+inmem segments=1 size=16777216 gbit_s=5.453 srv_ns_per_kib=809.5 srv_share_pct=53.9 streams=125 last_stream_bytes=15823167
+inmem segments=10 size=16777216 gbit_s=5.071 srv_ns_per_kib=798.1 srv_share_pct=49.4 streams=117 last_stream_bytes=6524919

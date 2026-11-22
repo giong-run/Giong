@@ -593,6 +593,12 @@ impl BufPool {
         }
     }
 
+    /// The size of every buffer, in bytes.
+    #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+    pub(crate) fn buf_len(&self) -> usize {
+        self.buf_len
+    }
+
     pub(crate) fn count(&self) -> u16 {
         self.count
     }

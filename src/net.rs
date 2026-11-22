@@ -23,7 +23,7 @@ mod sendq;
 mod share;
 #[cfg(windows)]
 mod spread;
-mod udp;
+pub(crate) mod udp;
 #[cfg(unix)]
 mod unix;
 
@@ -31,6 +31,8 @@ pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
+#[cfg(feature = "unstable-udp-offload")]
+pub use udp::{SendOptions, GRO_RECV_BUFFER};
 #[cfg(unix)]
 pub use unix::{UnixListener, UnixStream};
 
