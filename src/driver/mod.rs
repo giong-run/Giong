@@ -46,7 +46,7 @@ use crate::buf::{BufPool, RecvBuf};
 use crate::error::Code;
 use crate::sys::{MsgHdr, PathChar, RawFile, RawSock, SockAddr, SockLen};
 
-pub(crate) use budget::{refill_budget, spend_budget};
+pub(crate) use budget::{count_budget, give_back_budget, refill_budget, spend_budget};
 
 /// Which I/O driver a worker uses: io_uring, the default, or epoll where
 /// io_uring is not available (see [`Builder::driver`](crate::Builder::driver)).

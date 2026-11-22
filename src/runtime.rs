@@ -543,6 +543,7 @@ impl Worker {
             *slot = Some(self.clone());
         });
         CURRENT_UID.with(|c| c.set(self.shared.uid));
+        crate::driver::count_budget(true);
 
         // Tear down on every exit path, including a panic in the main future.
         struct Teardown(Rc<Worker>);
@@ -945,6 +946,7 @@ impl Worker {
         // 4. Detach from the thread.
         let _ = WORKER.try_with(|w| w.borrow_mut().take());
         let _ = CURRENT_UID.try_with(|c| c.set(0));
+        crate::driver::count_budget(false);
     }
 }
 

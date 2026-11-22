@@ -175,6 +175,13 @@ pub mod mpsc {
         /// call returns it.
         pub async fn recv(&mut self) -> Option<T> {
             poll_fn(|cx| {
+                // A value that is ready at once counts against the task's
+                // budget: a receiver that other threads keep fed must still
+                // let the worker's other tasks and its event loop run.
+                if !crate::driver::spend_budget() {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
                 let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
                 if let Some(value) = taken.pop_front() {
                     return Poll::Ready(Some(value));
@@ -192,6 +199,8 @@ pub mod mpsc {
                     Some(w) if w.will_wake(cx.waker()) => {}
                     _ => state.rx_waker = Some(cx.waker().clone()),
                 }
+                drop(state);
+                crate::driver::give_back_budget();
                 Poll::Pending
             })
             .await
