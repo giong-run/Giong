@@ -42,9 +42,9 @@ io_uring,web,allocations,5.000,1
 io_uring,redis-get,instructions,8350.1,1
 io_uring,redis-get,allocations,2.000,1
 io_uring,postgres-query,instructions,10248.5,1
-io_uring,postgres-query,allocations,16.000,1
-io_uring,mysql-query,instructions,14128.6,1
-io_uring,mysql-query,allocations,27.000,1
+io_uring,postgres-query,allocations,14.000,1
+io_uring,mysql-query,instructions,13710.6,1
+io_uring,mysql-query,allocations,23.000,1
 io_uring,idle-http1,heap_bytes,2029.8,1
 io_uring,idle-http1,rss_bytes,2222.1,10
 io_uring,idle-http1,allocations,3.030,1
@@ -85,9 +85,9 @@ epoll,web,allocations,5.000,1
 epoll,redis-get,instructions,8920.7,1
 epoll,redis-get,allocations,2.000,1
 epoll,postgres-query,instructions,10862.7,1
-epoll,postgres-query,allocations,16.000,1
-epoll,mysql-query,instructions,14743.7,1
-epoll,mysql-query,allocations,27.000,1
+epoll,postgres-query,allocations,14.000,1
+epoll,mysql-query,instructions,14325.7,1
+epoll,mysql-query,allocations,23.000,1
 epoll,idle-http1,heap_bytes,2096.4,1
 epoll,idle-http1,rss_bytes,2218.0,10
 epoll,idle-http1,allocations,4.020,1

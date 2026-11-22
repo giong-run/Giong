@@ -279,9 +279,41 @@ enum Kind {
     Simple,
 }
 
+/// The tasks waiting for a request's answer: almost always one, which is
+/// kept without an allocation.
+#[derive(Default)]
+struct Wakers {
+    first: Option<Waker>,
+    more: Vec<Waker>,
+}
+
+impl Wakers {
+    /// Adds `waker` unless it would wake a task already here.
+    fn register(&mut self, waker: &Waker) {
+        match &self.first {
+            None => self.first = Some(waker.clone()),
+            Some(w) if w.will_wake(waker) => {}
+            Some(_) => {
+                if !self.more.iter().any(|w| w.will_wake(waker)) {
+                    self.more.push(waker.clone());
+                }
+            }
+        }
+    }
+
+    fn wake_all(&mut self) {
+        if let Some(w) = self.first.take() {
+            w.wake();
+        }
+        for w in self.more.drain(..) {
+            w.wake();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlotInner {
-    wakers: Vec<Waker>,
+    wakers: Wakers,
     /// Nobody is waiting for the result any more: rows are not kept.
     abandoned: bool,
     /// The outcome was handed to the caller.
@@ -290,7 +322,7 @@ struct SlotInner {
     params: Option<Vec<Type>>,
     columns: Option<Vec<Column>>,
     rows: RowsBuilder,
-    tag: Option<String>,
+    tag: Option<Tag>,
     /// The server confirmed the Bind: the statement started running.
     bound: bool,
     /// The transaction status in the `ReadyForQuery` that ended the request.
@@ -307,8 +339,8 @@ struct SlotInner {
 
 enum Response {
     Statement(Rc<Statement>),
-    Rows(ResultSet, Option<String>),
-    Done(Option<String>),
+    Rows(ResultSet, Option<Tag>),
+    Done(Option<Tag>),
 }
 
 impl Slot {
@@ -347,9 +379,7 @@ impl Future for Wait {
             }
             None => {}
         }
-        if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            inner.wakers.push(cx.waker().clone());
-        }
+        inner.wakers.register(cx.waker());
         Poll::Pending
     }
 }
@@ -401,12 +431,28 @@ fn is_stale(db: &DbError) -> bool {
     }
 }
 
-/// The number of rows a command tag reports: `INSERT 0 5`, `UPDATE 3`,
-/// `SELECT 7`.
-fn rows_affected(tag: Option<&str>) -> u64 {
-    tag.and_then(|t| t.rsplit(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0)
+/// What this crate uses of a command tag (`INSERT 0 5`, `ROLLBACK`), read
+/// as it arrives so that the tag itself need not be kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tag {
+    /// The rows it reports: `INSERT 0 5`, `UPDATE 3`, `SELECT 7`; 0 for a
+    /// tag without a count.
+    rows: u64,
+    /// `COMMIT` ended a failed transaction with a rollback.
+    rollback: bool,
+}
+
+impl Tag {
+    fn of(tag: &str) -> Self {
+        Self {
+            rows: tag
+                .rsplit(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+            rollback: tag == "ROLLBACK",
+        }
+    }
 }
 
 impl Client {
@@ -566,7 +612,7 @@ impl Client {
     /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let (_, tag) = self.run(sql, params, false).await?;
-        Ok(rows_affected(tag.as_deref()))
+        Ok(tag.map_or(0, |t| t.rows))
     }
 
     /// Runs SQL that may hold several statements separated by `;`, with no
@@ -744,7 +790,7 @@ impl Client {
         sql: &str,
         params: &[&dyn ToSql],
         batch: bool,
-    ) -> Result<(ResultSet, Option<String>), Error> {
+    ) -> Result<(ResultSet, Option<Tag>), Error> {
         if params.len() > MAX_PARAMS {
             return Err(Error::conversion(format!(
                 "{} parameters were given; a statement can have at most {MAX_PARAMS}",
@@ -1120,9 +1166,7 @@ impl Conn {
             let mut inner = slot.inner.borrow_mut();
             let e = inner.error.take().unwrap_or_else(|| err.clone());
             inner.outcome = Some(Err(e));
-            for w in inner.wakers.drain(..) {
-                w.wake();
-            }
+            inner.wakers.wake_all();
         }
         self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
@@ -1273,7 +1317,7 @@ impl Conn {
                 if tag == "PREPARE" {
                     self.user_prepared.set(true);
                 }
-                inner.tag = Some(tag.to_owned());
+                inner.tag = Some(Tag::of(tag));
             }
             Backend::ErrorResponse(fields) => {
                 if inner.error.is_none() {
@@ -1372,7 +1416,7 @@ impl Conn {
         let mut inner = slot.inner.borrow_mut();
         match *msg {
             Backend::CommandComplete(command) => {
-                inner.tag = Some(command.to_owned());
+                inner.tag = Some(Tag::of(command));
             }
             Backend::ErrorResponse(fields) => {
                 // Not a sign of a standby: the batch is read-only on purpose.
@@ -1522,9 +1566,7 @@ impl Conn {
             },
         };
         inner.outcome = Some(outcome);
-        for w in inner.wakers.drain(..) {
-            w.wake();
-        }
+        inner.wakers.wake_all();
     }
 
     /// Takes a cached statement out of the cache when the server says it no
@@ -1702,7 +1744,7 @@ impl Transaction<'_> {
             .conn
             .enqueue(Kind::Simple, |out| protocol::query(out, "COMMIT"))?;
         match (Wait { slot }).await? {
-            Response::Done(Some(tag)) if tag == "ROLLBACK" => Err(Error::with_sqlstate(
+            Response::Done(Some(tag)) if tag.rollback => Err(Error::with_sqlstate(
                 "25P02",
                 "the transaction was rolled back instead of committed, because a statement in \
                  it failed earlier",
@@ -1812,7 +1854,7 @@ impl std::fmt::Debug for CancelToken {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stale, rows_affected};
+    use super::{is_stale, Tag};
     use crate::error::DbError;
 
     fn db_error(fields: &[(u8, &str)]) -> DbError {
@@ -1855,10 +1897,10 @@ mod tests {
 
     #[test]
     fn command_tags_give_row_counts() {
-        assert_eq!(rows_affected(Some("INSERT 0 5")), 5);
-        assert_eq!(rows_affected(Some("UPDATE 3")), 3);
-        assert_eq!(rows_affected(Some("SELECT 12")), 12);
-        assert_eq!(rows_affected(Some("CREATE TABLE")), 0);
-        assert_eq!(rows_affected(None), 0);
+        assert_eq!(Tag::of("INSERT 0 5").rows, 5);
+        assert_eq!(Tag::of("UPDATE 3").rows, 3);
+        assert_eq!(Tag::of("SELECT 12").rows, 12);
+        assert_eq!(Tag::of("CREATE TABLE").rows, 0);
+        assert!(Tag::of("ROLLBACK").rollback && !Tag::of("COMMIT").rollback);
     }
 }

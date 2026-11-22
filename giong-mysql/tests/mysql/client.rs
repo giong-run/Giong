@@ -458,6 +458,37 @@ fn a_cached_statement_follows_schema_changes() {
         let row = client.query_one(sql, &[]).await.unwrap();
         assert_eq!(row.len(), 2);
         assert_eq!(row.columns()[1].name(), "b");
+        // A run that describes the same columns as the last one shares
+        // them; any change shows, wherever it is.
+        let names = |row: &giong_mysql::Row| -> Vec<String> {
+            row.columns().iter().map(|c| c.name().to_owned()).collect()
+        };
+        let again = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(names(&again), ["a", "b"]);
+        assert!(std::ptr::eq(row.columns(), again.columns()));
+        for (alter, want) in [
+            ("RENAME COLUMN b TO c", &["a", "c"][..]),
+            ("RENAME COLUMN a TO z", &["z", "c"][..]),
+            ("DROP COLUMN c", &["z"][..]),
+            ("ADD COLUMN d INT FIRST", &["d", "z"][..]),
+        ] {
+            client
+                .batch_execute(&format!("ALTER TABLE schema_change {alter}"))
+                .await
+                .unwrap();
+            let row = client.query_one(sql, &[]).await.unwrap();
+            assert_eq!(names(&row), want, "{alter}");
+        }
+        let row = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(row.get::<Option<i32>>(0).unwrap(), None);
+        assert_eq!(row.get::<i32>(1).unwrap(), 1);
+        // A type change with the same name shows too.
+        client
+            .batch_execute("ALTER TABLE schema_change MODIFY COLUMN z BIGINT")
+            .await
+            .unwrap();
+        let row = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
     });
 }
 
