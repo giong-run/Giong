@@ -1527,3 +1527,77 @@ fn a_busy_socket_that_goes_quiet_still_wakes_its_receiver() {
         }
     });
 }
+
+/// A socket whose receive waits for a datagram holds no receive buffer:
+/// a thousand idle receivers with 64 KiB buffers commit far less than a
+/// buffer each. The completion port driver used to wait with a heap buffer
+/// of the pool's buffer size per socket (62.5 MiB here), allocated again at
+/// every wait; it now waits with a zero-byte peek, as a stream waits with a
+/// zero-byte receive. Every receiver still gets its datagram afterwards.
+#[cfg(windows)]
+#[test]
+fn idle_receivers_hold_no_buffer_each() {
+    const SOCKETS: usize = 1000;
+    giong::Builder::new()
+        .workers(1)
+        .recv_buffers(64, 64 * 1024)
+        .block_on(async {
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let mut addrs = Vec::new();
+            let mut tasks = Vec::new();
+            // Warm up the allocator and the driver first.
+            sleep(Duration::from_millis(50)).await;
+            let before = private_kib();
+            for _ in 0..SOCKETS {
+                let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+                addrs.push(socket.local_addr().unwrap());
+                tasks.push(giong::spawn(async move {
+                    let datagram = socket.recv().await.unwrap();
+                    datagram.len()
+                }));
+            }
+            // Every receive is waiting now.
+            sleep(Duration::from_millis(200)).await;
+            let grown = private_kib().saturating_sub(before);
+            for addr in &addrs {
+                sender.send_to(b"hello", addr).unwrap();
+            }
+            for task in tasks {
+                assert_eq!(
+                    timeout(Duration::from_secs(10), task)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    5
+                );
+            }
+            assert!(
+                grown < 20 * 1024,
+                "{SOCKETS} idle receivers committed {grown} KiB"
+            );
+        })
+        .unwrap();
+}
+
+/// The memory this process has committed, in KiB.
+#[cfg(windows)]
+fn private_kib() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: all-zero is a valid value of this plain structure.
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    // SAFETY: the pseudo handle of this process, and a structure of the size
+    // given; the EX form starts with the plain one.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX).cast::<PROCESS_MEMORY_COUNTERS>(),
+            size,
+        )
+    };
+    assert!(ok != 0, "GetProcessMemoryInfo failed");
+    counters.PrivateUsage as u64 / 1024
+}
