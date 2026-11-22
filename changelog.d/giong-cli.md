@@ -19,3 +19,6 @@
   giong's own checks of the source in one report: blocking calls in async code
   (`GIONG-E5006`), listeners bound to a host name (`GIONG-E5007`), `RefCell` borrows held
   across an `.await` (`GIONG-E5008`). Machine-applicable fixes come as edits.
+- **giong-cli**: `giong mcp` serves every command as a tool to coding agents over MCP on
+  standard input and output, each answering with the command's JSON document, plus
+  `dev_status` for a running `giong dev`.

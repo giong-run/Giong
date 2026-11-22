@@ -209,6 +209,9 @@ pub struct Report {
     data: Map<String, Value>,
     /// Lines for people, printed before the findings (text mode only).
     lines: Vec<String>,
+    /// Nothing is printed at the end (a command that spoke on its own,
+    /// such as `mcp`).
+    quiet: bool,
 }
 
 impl Report {
@@ -218,7 +221,14 @@ impl Report {
             findings: Vec::new(),
             data: Map::new(),
             lines: Vec::new(),
+            quiet: false,
         }
+    }
+
+    /// A report that prints nothing when the command ends.
+    pub fn quiet(mut self) -> Report {
+        self.quiet = true;
+        self
     }
 
     pub fn push(&mut self, finding: Finding) {
@@ -294,6 +304,9 @@ impl Report {
 
     /// Prints the report and gives the exit status.
     pub fn finish(self, json: bool) -> ExitCode {
+        if self.quiet {
+            return ExitCode::SUCCESS;
+        }
         let text = if json {
             format!("{}\n", self.to_json())
         } else {

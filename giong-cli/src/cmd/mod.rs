@@ -15,6 +15,7 @@ pub mod dev;
 pub mod doctor;
 pub mod explain;
 pub mod help;
+pub mod mcp;
 pub mod version;
 
 /// A command of `giong`.
@@ -41,6 +42,7 @@ pub const COMMANDS: &[&Command] = &[
     &doctor::COMMAND,
     &explain::COMMAND,
     &clean::COMMAND,
+    &mcp::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];
