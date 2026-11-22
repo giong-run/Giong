@@ -523,7 +523,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_token_goes_over_a_unix_socket_too() {
-        let dir = std::env::temp_dir().join(format!("giongcli-unix-token-{}", std::process::id()));
+        // /tmp, not $TMPDIR: a socket path holds at most 104 bytes on macOS.
+        let dir = PathBuf::from(format!("/tmp/gc-token-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let sock = dir.join("mcp.sock");
         let _ = std::fs::remove_file(&sock);

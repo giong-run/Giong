@@ -39,23 +39,81 @@ pub const COMMAND: Command = Command {
     run,
 };
 
-/// Whether a key's value should be masked: names that say secret, and URLs
-/// that carry a password.
+/// Words in a key's name that say its value is secret (`DB_PASS`,
+/// `MYSQL_PWD`, `SESSION_SIGNING_SALT`, `API_KEY`...).
+const SECRET_WORDS: &[&str] = &[
+    "PASS",
+    "PWD",
+    "SECRET",
+    "TOKEN",
+    "KEY",
+    "PRIVATE",
+    "CREDENTIAL",
+    "AUTH",
+    "SALT",
+    "SIGNING",
+    "COOKIE",
+    "SESSION",
+];
+
+/// Query parameters of a URL whose values are secret.
+const SECRET_PARAMS: &[&str] = &[
+    "password",
+    "pass",
+    "passwd",
+    "pwd",
+    "token",
+    "secret",
+    "key",
+    "sig",
+    "signature",
+    "access_token",
+    "api_key",
+    "apikey",
+];
+
+/// Whether a key's value should be masked: names that say secret (a word
+/// above, or a `_SK` part as in `STRIPE_SK`), and URLs that carry a
+/// password or a secret query parameter.
 pub fn secret(key: &str, value: &str) -> bool {
     let k = key.to_ascii_uppercase();
-    [
-        "PASSWORD",
-        "PASSWD",
-        "SECRET",
-        "TOKEN",
-        "KEY",
-        "PRIVATE",
-        "CREDENTIAL",
-        "AUTH",
-    ]
-    .iter()
-    .any(|w| k.contains(w))
+    SECRET_WORDS.iter().any(|w| k.contains(w))
+        || k.split('_').any(|part| part == "SK")
         || url_password(value)
+        || secret_query(value).is_some()
+}
+
+/// The value with the secret query parameters of a URL masked, if it has
+/// any.
+fn secret_query(value: &str) -> Option<String> {
+    if !value.contains("://") {
+        return None;
+    }
+    let (base, query) = value.split_once('?')?;
+    let (query, fragment) = match query.split_once('#') {
+        Some((q, f)) => (q, Some(f)),
+        None => (query, None),
+    };
+    let mut hit = false;
+    let parts: Vec<String> = query
+        .split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some((k, _)) if SECRET_PARAMS.contains(&k.to_ascii_lowercase().as_str()) => {
+                hit = true;
+                format!("{k}=***")
+            }
+            _ => kv.to_string(),
+        })
+        .collect();
+    if !hit {
+        return None;
+    }
+    let mut out = format!("{base}?{}", parts.join("&"));
+    if let Some(f) = fragment {
+        out.push('#');
+        out.push_str(f);
+    }
+    Some(out)
 }
 
 fn url_password(value: &str) -> bool {
@@ -66,16 +124,22 @@ fn url_password(value: &str) -> bool {
         .is_some_and(|(cred, _)| cred.contains(':'))
 }
 
-/// The value as shown: secrets masked, URL passwords replaced.
+/// The value as shown: secrets masked (without their length), URL
+/// passwords and secret query parameters replaced.
 pub fn shown(key: &str, value: &str, reveal: bool) -> String {
     if reveal || value.is_empty() {
         return value.to_string();
     }
-    if url_password(value) {
-        return super::db::redact(value);
+    if url_password(value) || secret_query(value).is_some() {
+        let v = if url_password(value) {
+            super::db::redact(value)
+        } else {
+            value.to_string()
+        };
+        return secret_query(&v).unwrap_or(v);
     }
     if secret(key, value) {
-        return format!("*** ({} characters)", value.chars().count());
+        return "*** (set)".to_string();
     }
     value.to_string()
 }
@@ -345,7 +409,31 @@ mod tests {
         assert!(!secret("DATABASE_URL", "postgres://h/db"));
         assert!(!secret("PORT", "8080"));
         assert_eq!(shown("PORT", "8080", false), "8080");
-        assert_eq!(shown("API_TOKEN", "abcdef", false), "*** (6 characters)");
+        assert_eq!(shown("API_TOKEN", "abcdef", false), "*** (set)");
+        for k in [
+            "DB_PASS",
+            "MYSQL_PWD",
+            "STRIPE_SK",
+            "SESSION_SIGNING_SALT",
+            "COOKIE_KEY",
+        ] {
+            assert!(secret(k, "x"), "{k}");
+        }
+        assert!(!secret("TASK_LIMIT", "x"), "SK only as a whole part");
+        assert!(!secret("PORT", "x"));
+        assert_eq!(
+            shown(
+                "DSN",
+                "postgres://h/db?user=u&password=pw&sslmode=require#x",
+                false
+            ),
+            "postgres://h/db?user=u&password=***&sslmode=require#x"
+        );
+        assert_eq!(
+            shown("DSN", "postgres://u:pw@h/db?token=t", false),
+            "postgres://u:***@h/db?token=***"
+        );
+        assert_eq!(shown("URL", "https://h/p?q=1", false), "https://h/p?q=1");
         assert_eq!(shown("API_TOKEN", "abcdef", true), "abcdef");
         assert_eq!(
             shown("DATABASE_URL", "postgres://u:pw@h:1/d", false),

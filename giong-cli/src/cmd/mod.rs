@@ -12,13 +12,20 @@ use crate::report::{Failure, Report};
 pub mod bench;
 pub mod check;
 pub mod clean;
+<<<<<<< HEAD
 pub mod dashboard;
+=======
+>>>>>>> origin/claude/project-thread-np249q-cli
 pub mod db;
 pub mod dev;
 pub mod doctor;
 pub mod env;
 pub mod explain;
 pub mod help;
+<<<<<<< HEAD
+=======
+pub mod image;
+>>>>>>> origin/claude/project-thread-np249q-cli
 pub mod mcp;
 pub mod openapi;
 pub mod record;
@@ -52,12 +59,20 @@ pub const COMMANDS: &[&Command] = &[
     &db::COMMAND,
     &env::COMMAND,
     &explain::COMMAND,
+<<<<<<< HEAD
     &clean::COMMAND,
+=======
+    &image::COMMAND,
+>>>>>>> origin/claude/project-thread-np249q-cli
     &routes::COMMAND,
     &openapi::COMMAND,
     &record::COMMAND,
     &dashboard::COMMAND,
     &top::COMMAND,
+<<<<<<< HEAD
+=======
+    &clean::COMMAND,
+>>>>>>> origin/claude/project-thread-np249q-cli
     &mcp::COMMAND,
     &version::COMMAND,
     &help::COMMAND,

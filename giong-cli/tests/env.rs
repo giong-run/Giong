@@ -139,7 +139,7 @@ fn show_masks_secrets_and_names_sources() {
         key(&v, "DATABASE_URL")["value"],
         "postgres://app:***@h:5432/d"
     );
-    assert_eq!(key(&v, "API_TOKEN")["value"], "*** (7 characters)");
+    assert_eq!(key(&v, "API_TOKEN")["value"], "*** (set)");
     assert_eq!(key(&v, "API_TOKEN")["secret"], true);
     assert_eq!(key(&v, "EXTRA")["in_example"], false);
     assert!(!v.to_string().contains("hunter2"));
