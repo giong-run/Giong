@@ -27,6 +27,8 @@ __pycache__/
 # The site's pages, generated when it deploys (python3 site/build.py).
 site/public/*.html
 site/public/*/index.html
+site/public/docs/
+site/public/skills/
 site/public/llms.txt
 site/public/llms-full.txt
 site/public/robots.txt
