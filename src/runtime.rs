@@ -7,7 +7,6 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::fd::RawFd;
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
@@ -18,12 +17,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::buf::BufPool;
-use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park};
+#[cfg(unix)]
+use crate::driver::Io;
+use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::lane::{BlockingHandle, LaneConfig, LaneStats, Lanes};
 use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
+#[cfg(unix)]
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::sys;
@@ -391,7 +393,10 @@ struct Deferred {
     /// Single-shot operations whose future was dropped.
     cancels: Vec<DeferredCancel>,
     /// Descriptors given up.
-    closes: Vec<RawFd>,
+    closes: Vec<sys::RawFile>,
+    /// Sockets given up, where a socket is not a descriptor.
+    #[cfg(windows)]
+    sock_closes: Vec<sys::RawSock>,
 }
 
 impl Deferred {
@@ -759,8 +764,16 @@ impl Worker {
     /// the driver at the next turn of the event loop. The epoll driver must
     /// forget a descriptor before its number can be reused, so it is never
     /// closed behind the driver's back.
-    pub(crate) fn defer_close(&self, fd: RawFd) {
+    pub(crate) fn defer_close(&self, fd: sys::RawFile) {
         self.deferred.borrow_mut().closes.push(fd);
+    }
+
+    /// [`defer_close`](Self::defer_close) for a socket.
+    pub(crate) fn defer_close_sock(&self, sock: sys::RawSock) {
+        #[cfg(unix)]
+        self.defer_close(sock);
+        #[cfg(windows)]
+        self.deferred.borrow_mut().sock_closes.push(sock);
     }
 
     /// Drops the multishot operation `key`, whose owner went away while the
@@ -823,6 +836,10 @@ impl Worker {
         }
         for fd in deferred.closes {
             driver.close_fd(fd);
+        }
+        #[cfg(windows)]
+        for sock in deferred.sock_closes {
+            driver.close_sock(sock);
         }
         // What the cancellations freed (a budget's I/O slot may be among
         // it, and wake a task): dropped outside the driver, before the
@@ -1387,12 +1404,24 @@ impl Runtime {
             state: Mutex::new(None),
             cond: Condvar::new(),
         });
+        #[cfg(unix)]
         let signals = if self.builder.signals {
             Some(sys::SignalGuard::install()?)
         } else {
             None
         };
+        #[cfg(unix)]
         let signal_fd = signals.as_ref().map(|s| s.fd());
+        // Windows runs the handler of a console event on a thread of its
+        // own, which may do what any thread may: it asks for the shutdown
+        // itself, and no worker has to watch for it.
+        #[cfg(windows)]
+        let signals = if self.builder.signals {
+            let handle = self.handle();
+            Some(sys::SignalGuard::install(move || handle.shutdown())?)
+        } else {
+            None
+        };
 
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
         let mut threads = Vec::with_capacity(n);
@@ -1436,6 +1465,7 @@ impl Runtime {
                             // Every worker watches, so that signals are seen as
                             // long as any worker runs, not only while worker 0
                             // does.
+                            #[cfg(unix)]
                             if let Some(fd) = signal_fd {
                                 crate::spawn(watch_signals(fd));
                             }
@@ -1492,7 +1522,8 @@ impl Runtime {
 ///
 /// Ends as soon as a shutdown is requested by any other means, or the worker
 /// drains, so that it never keeps a draining worker alive.
-async fn watch_signals(fd: RawFd) {
+#[cfg(unix)]
+async fn watch_signals(fd: sys::RawFile) {
     until_shutdown(async {
         let mut buf: Vec<u8> = Vec::with_capacity(8);
         loop {

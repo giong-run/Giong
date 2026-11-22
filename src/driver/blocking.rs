@@ -1,4 +1,5 @@
-//! The blocking threads of the epoll driver.
+//! The blocking threads of the epoll driver, and of the Windows driver for
+//! the file operations Windows has no overlapped form of.
 //!
 //! A regular file is always "ready" as far as epoll is concerned, so a read
 //! that has to wait for the disk would hold up the whole worker. The epoll
@@ -13,19 +14,23 @@
 //! operations. A finished job pushes its result onto its worker's
 //! [`Completions`] and pokes the worker's eventfd.
 
+#[cfg(unix)]
 use std::io;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(unix)]
+use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::pool::{Job, Pool, PoolConfig};
+#[cfg(unix)]
 use crate::runtime::lock;
 
 /// The most blocking threads at once. Enough for disks that serve many
 /// requests in parallel (NVMe), and a bound on what a hung network
 /// filesystem can tie up.
-const MAX_THREADS: usize = 64;
+pub(super) const MAX_THREADS: usize = 64;
 
 /// How long a thread waits for work before it ends.
 const IDLE: Duration = Duration::from_secs(10);
@@ -53,6 +58,7 @@ pub(super) fn spawn(job: Job) {
 }
 
 /// Results of one worker's blocking jobs, waiting for the worker.
+#[cfg(unix)]
 pub(super) struct Completions {
     done: Mutex<Vec<(usize, i32)>>,
     /// Set while `done` is not empty, so the worker can check without the
@@ -62,6 +68,7 @@ pub(super) struct Completions {
     bell: crate::sys::Bell,
 }
 
+#[cfg(unix)]
 impl Completions {
     pub(super) fn new() -> io::Result<Arc<Self>> {
         let bell = crate::sys::Bell::new()?;

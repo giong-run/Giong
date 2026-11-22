@@ -56,6 +56,7 @@ def read(rel):
 
 VERSION = release.workspace_version()
 TAG = "v" + VERSION
+SITE_TAG = TAG          # the header always names the newest release
 # What the site says about platforms follows the released version (content.apply_version).
 C.apply_version(tuple(int(x) for x in VERSION.split("-")[0].split(".")[:2]))
 MINOR = ".".join(VERSION.split(".")[:2])
@@ -449,7 +450,7 @@ def code_window(samples, ident="code"):
 
 def crate_links(c, guide=False):
     links = [("guide", link(doc_page_name(c["name"])))] if guide and any(e[0] == c["name"] for e in DOCS) else []
-    links += [("docs.rs", f"https://docs.rs/{c['name']}"),
+    links += [("docs.rs", f"https://docs.rs/{c['name']}/{VERSION}" if DOC_PREFIX else f"https://docs.rs/{c['name']}"),
              ("crates.io", f"https://crates.io/crates/{c['name']}"),
              ("source", REPO if c["dir"] == "." else TREE + c["dir"])]
     return " · ".join(f'<a href="{u}">{label}</a>' for label, u in links)
@@ -460,7 +461,7 @@ def frame(page, title, desc, body, path=""):
     canonical = SITE + path
     current = ' aria-current="page"'
     nav = "".join(f'<a href="{link(p)}"{current if p == page or (p == "docs" and page.startswith("docs/") and page not in dict(NAV)) else ""}>{label}</a>'
-                  for p, label in NAV if p != "docs/agent-skill" or SKILL_MD is not None)
+                  for p, label in NAV if p != "docs/agent-skill" or "agent-skill" in VERSION_SLUGS[""])
     mark = (f'<picture><source media="(prefers-color-scheme: light)" srcset="{asset("assets/giong-mark-light.svg")}">'
             f'<img src="{asset("assets/giong-mark.svg")}" alt="" width="28" height="28"></picture>')
     release_url = link("releases", LATEST["id"]) if LATEST else link("releases")
@@ -469,7 +470,7 @@ def frame(page, title, desc, body, path=""):
     <a class="brand" href="{link("home")}" aria-label="giong, home">{mark}<span>giong</span></a>
     <nav class="nav" aria-label="Site">{nav}</nav>
     <div class="hdr-side">
-      <a class="ver" href="{release_url}" title="Release notes for {TAG}">{TAG}</a>
+      <a class="ver" href="{release_url}" title="Release notes for {SITE_TAG}">{SITE_TAG}</a>
       <a class="icon-btn" href="{REPO}" aria-label="giong on GitHub">{ICONS["github"]}</a>
       <a class="icon-btn hide-sm" href="{X_URL}" aria-label="giong on X">{ICONS["x"]}</a>
       <button class="icon-btn theme" type="button" aria-label="Switch between light and dark" hidden>
@@ -828,12 +829,22 @@ DOCS = doc_entries()
 DOC_BY_PATH = {e[2]: e for e in DOCS if e[2]}
 
 
-def doc_page_name(slug):
-    return "docs" if slug == "get-started" else f"docs/{slug}"
+# The version whose documentation is being built: "" for the newest release, at /docs/,
+# or an older minor version such as "1.2", at /docs/1.2/ (build_version()).
+DOC_PREFIX = ""
 
 
-def md_file(slug):
-    return f"docs/{'index' if slug == 'get-started' else slug}.md"
+def doc_page_name(slug, prefix=None):
+    base = "docs" + (f"/{DOC_PREFIX if prefix is None else prefix}" if (DOC_PREFIX if prefix is None else prefix) else "")
+    return base if slug == "get-started" else f"{base}/{slug}"
+
+
+def md_file(slug, prefix=None):
+    return f"{doc_page_name(slug, prefix)}{'/index' if slug == 'get-started' else ''}.md"
+
+
+def doc_url(slug, prefix=None):
+    return f"{SITE}{doc_page_name(slug, prefix)}/"
 
 
 def doc_link(url, src_dir):
@@ -949,7 +960,7 @@ def doc_page(entry):
     raw = released(path)
     src = clean_md(raw)
     intro, secs = split_sections(src)
-    page_url = SITE + ("docs/" if slug == "get-started" else f"docs/{slug}/")
+    page_url = doc_url(slug)
     md_url = SITE + md_file(slug)
     render = lambda text: md.render(text, link=lambda u: doc_link(u, src_dir), code=highlight)
     sections, toc, scripts = [], [], []
@@ -973,11 +984,12 @@ def doc_page(entry):
     toc_html = (f'<nav class="toc doc-toc" aria-label="On this page"><p>On this page</p>'
                 f'<div class="toc-links">{"".join(toc)}</div></nav>') if toc else ""
     extra = skill_install() if slug == "agent-skill" else ""
+    extra = version_banner(slug) + extra
     body = f'''<div class="wrap docs-layout">
   {doc_sidebar(slug)}
   <article class="doc-page prose">
     <header class="doc-head"><p class="eyebrow">{group}</p><h1>{html.escape(title)}</h1>{lede_html}
-      {doc_actions(slug, title, "md-prompt", "md-page")}{meta}</header>
+      <div class="doc-bar">{version_menu(slug)}{doc_actions(slug, title, "md-prompt", "md-page")}</div>{meta}</header>
     {extra}{intro_html}{"".join(sections)}
     <p class="src-note">giong {VERSION} · from <a href="{REL_BLOB}{path}">{path}</a> at {TAG}</p>
     {"".join(scripts)}
@@ -985,7 +997,10 @@ def doc_page(entry):
   {toc_html}
 </div>'''
     desc = re.sub(r"[`*]", "", lede or title)[:300]
-    return frame(doc_page_name(slug), title, desc, body, f"docs/{slug}/"), page_md
+    page = frame(doc_page_name(slug), title, desc, body, doc_page_name(slug) + "/")
+    if DOC_PREFIX:
+        page = page.replace('<link rel="canonical"', '<meta name="robots" content="noindex">\n<link rel="canonical"', 1)
+    return page, page_md
 
 
 def skill_install():
@@ -1040,9 +1055,135 @@ def skill_zip():
     return buf.getvalue()
 
 
+# ================================================================ older versions
+# The newest release's documentation is at /docs/; each older minor version keeps its own,
+# read from its newest patch tag, at /docs/<minor>/ (/docs/1.2/giong-web/), so code pinned
+# to an older release, and the agent writing it, read what that release does. Older pages
+# say so at the top, link the same page in the newest version, and are kept out of search
+# results and the sitemap. A checkout without tags (CI's shallow one) builds none of them.
+LATEST_DOCS = DOCS
+
+
+def old_versions():
+    """[(minor, tag)] of every older 1.x minor version, newest first, from the tags."""
+    out = git("tag", "-l", "v[0-9]*.[0-9]*.[0-9]*")
+    if out is None:
+        return []
+    best = {}
+    for tag in out.decode().split():
+        m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+        if not m:
+            continue                      # release candidates have no docs of their own
+        key = (int(m.group(1)), int(m.group(2)))
+        if key < (1, 0) or ".".join(map(str, key)) == MINOR:
+            continue
+        if key not in best or int(m.group(3)) > best[key][0]:
+            best[key] = (int(m.group(3)), tag)
+    return [(f"{k[0]}.{k[1]}", best[k][1]) for k in sorted(best, reverse=True)
+            if k < tuple(int(x) for x in MINOR.split("."))]
+
+
+OLD = old_versions()
+_VERSION_STATE = ("TAG", "VERSION", "REL_BLOB", "REL_TREE", "TAG_HERE", "DOCS", "DOC_BY_PATH",
+                  "SKILL_MD", "DOC_PREFIX")
+
+
+def use_version(minor, tag):
+    """Point the documentation builders at `tag`; returns the state to put back."""
+    g = globals()
+    saved = {k: g[k] for k in _VERSION_STATE}
+    g.update(TAG=tag, VERSION=tag[1:], REL_BLOB=f"{REPO}/blob/{tag}/", REL_TREE=f"{REPO}/tree/{tag}/",
+             TAG_HERE=True, SKILL_MD=None, DOC_PREFIX=minor)
+    g["DOCS"] = [e for e in doc_entries() if e[0] != "agent-skill"]
+    g["DOC_BY_PATH"] = {e[2]: e for e in DOCS if e[2]}
+    return saved
+
+
+def restore_version(saved):
+    globals().update(saved)
+
+
+# Which pages each version has, for the version menu: {"": newest, "1.2": ...}.
+VERSION_SLUGS = {"": {e[0] for e in DOCS}}
+for _minor, _tag in OLD:
+    _saved = use_version(_minor, _tag)
+    VERSION_SLUGS[_minor] = {e[0] for e in DOCS}
+    restore_version(_saved)
+
+
+def version_menu(slug):
+    if not OLD:
+        return ""
+    def target(prefix):
+        return link(doc_page_name(slug if slug in VERSION_SLUGS[prefix] else "get-started", prefix))
+    current = DOC_PREFIX or MINOR
+    rows = [("", f"{MINOR}", "newest")] + [(m, m, "") for m, _ in OLD]
+    links = "".join(
+        f'<a href="{target(p)}"{" aria-current=true" if (p or MINOR) == current else ""}>'
+        f'<b>{label}</b>{f"<span>{note}</span>" if note else ""}</a>' for p, label, note in rows)
+    return (f'<details class="ver-menu"><summary title="Documentation version">giong {current}</summary>'
+            f'<nav class="ver-list" aria-label="Documentation versions">{links}</nav></details>')
+
+
+def version_banner(slug):
+    if not DOC_PREFIX:
+        return ""
+    there = slug if slug in VERSION_SLUGS[""] else "get-started"
+    return (f'<p class="ver-note">This is the documentation of giong {DOC_PREFIX} ({TAG}). The newest '
+            f'release is {MINOR}: <a href="{link(doc_page_name(there, ""))}">read this page for {MINOR}</a>.</p>')
+
+
+def old_index():
+    """/docs/<minor>/: the pages an older version has."""
+    groups = {}
+    for e in DOCS:
+        if e[0] != "get-started":
+            groups.setdefault(e[4], []).append(e)
+    cards = "".join(
+        f'<div class="doc-group"><h3>{g}</h3><div class="doc-cards">'
+        + "".join(f'<a class="doc-card" href="{link(doc_page_name(e[0]))}"><b>{html.escape(e[1])}</b>'
+                  f'<span>{ilm((e[6] or {}).get("short") or e[5])}</span></a>' for e in groups[g])
+        + "</div></div>" for g in C.DOC_GROUPS if g in groups)
+    lede = (f"Every crate's README and the guides as they were released in {TAG}, for code that "
+            f"depends on giong {DOC_PREFIX}. The API reference is on docs.rs at the same version.")
+    page_md = (f"# giong {DOC_PREFIX} documentation\n\n> {TAG} · {doc_url('get-started')}\n\n{lede}\n\n"
+               + "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
+                         for e in DOCS if e[0] != "get-started"))
+    body = (f'<div class="wrap docs-layout">{doc_sidebar("get-started")}'
+            f'<article class="doc-page"><header class="doc-head"><p class="eyebrow">docs · {TAG}</p>'
+            f'<h1>giong {DOC_PREFIX} documentation</h1><p class="lede">{ilm(lede)}</p>'
+            f'<div class="doc-bar">{version_menu("get-started")}</div></header>'
+            f'{version_banner("get-started")}<div class="doc"><section class="md-sec">{cards}</section></div>'
+            f'</article></div>')
+    page = frame(doc_page_name("get-started"), f"Docs {DOC_PREFIX}",
+                 f"The giong {DOC_PREFIX} documentation: every crate and guide as released in {TAG}.",
+                 body, doc_page_name("get-started") + "/")
+    page = page.replace('<link rel="canonical"', '<meta name="robots" content="noindex">\n<link rel="canonical"', 1)
+    return page, page_md
+
+
+def old_docs():
+    """{file: text} for every older version's documentation."""
+    files = {}
+    for minor, tag in OLD:
+        saved = use_version(minor, tag)
+        try:
+            page, page_md = old_index()
+            files[page_file(doc_page_name("get-started"))] = page
+            files[md_file("get-started")] = page_md
+            for e in DOCS:
+                if e[0] != "get-started":
+                    page, page_md = doc_page(e)
+                    files[page_file(doc_page_name(e[0]))] = page
+                    files[md_file(e[0])] = page_md
+        finally:
+            restore_version(saved)
+    return files
+
+
 def footer_docs():
-    names = {e[0]: e[1] for e in DOCS}
-    return "".join(f'<a href="{link(doc_page_name(s))}">{names[s]}</a>'
+    names = {e[0]: e[1] for e in LATEST_DOCS}
+    return "".join(f'<a href="{link(doc_page_name(s, ""))}">{names[s]}</a>'
                    for s in ("best-practices", "agent-skill") if s in names)
 
 
@@ -1183,7 +1324,8 @@ def docs():
     body = (f'<div class="wrap docs-layout">{doc_sidebar("get-started")}'
             f'<article class="doc-page"><header class="doc-head"><p class="eyebrow">docs · {TAG}</p>'
             f'<h1>Get started with giong</h1><p class="lede">{ilm(lede)}</p>'
-            f'{doc_actions("get-started", "giong", "md-prompt", "md-page")}</header>'
+            f'<div class="doc-bar">{version_menu("get-started")}'
+            f'{doc_actions("get-started", "giong", "md-prompt", "md-page")}</div></header>'
             f'<div class="doc">{"".join(sections)}</div>{"".join(scripts)}</article>'
             f'<nav class="toc doc-toc" aria-label="On this page"><p>On this page</p>'
             f'<div class="toc-links">{toc_html}</div></nav></div>')
@@ -1535,6 +1677,8 @@ def llms():
                    f"docs as references); [SKILL.md]({SITE}skills/giong/SKILL.md)\n")
     pages = "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
                     for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors"))
+    older = ("- Older versions, for code pinned to them: "
+             + ", ".join(f"[{m}]({SITE}{md_file('get-started', m)})" for m, _ in OLD) + "\n") if OLD else ""
     extra_protocols = ", HTTP/3" if "giong-quic" in names else ""
     grpc = ", gRPC" if "giong-grpc" in names else ""
     return f"""# giong
@@ -1600,7 +1744,7 @@ Facts that are easy to get wrong:
 {guides}{pages}- [Error codes]({SITE}docs/errors.md): what each `GIONG-E` code means and how to fix it
 - [CHANGELOG.md]({REL_BLOB}CHANGELOG.md): what changed in each release
 - [Everything above in one file]({SITE}llms-full.txt): the READMEs, best practices and error pages of {TAG}
-
+{older}
 ## Examples
 
 {examples}
@@ -1706,6 +1850,7 @@ def build(out):
             page_html, page_md = doc_page(e)
             files[page_file(doc_page_name(e[0]))] = page_html
             files[md_file(e[0])] = page_md
+    files.update(old_docs())
     if SKILL_MD is not None:
         files["skills/giong/SKILL.md"] = SKILL_MD
         files["skills/giong.zip"] = skill_zip()

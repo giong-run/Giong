@@ -3,7 +3,7 @@
 - **giong**: blocking and compute lanes (`giong::lane`): `spawn_blocking(f)` runs a closure that
   waits (`std::fs`, C libraries, `getaddrinfo`) on a pool of up to 128 threads
   (`Builder::max_blocking_threads`); `spawn_compute(f)` runs CPU-bound work on at most one
-  thread per CPU of the process's budget (`Builder::compute_threads`), at nice +10 (the utility QoS class on macOS) so the
+  thread per CPU of the process's budget (`Builder::compute_threads`), at nice +10 (the utility QoS class on macOS, below-normal priority on Windows) so the
   workers get their core back as soon as they have work; `try_spawn_compute(f)` refuses
   with the new code `GIONG-E0014` (`Code::ComputeBusy`) once `Builder::compute_backlog`
   closures wait. All three return a `Send` `BlockingHandle<T>` that resolves to
