@@ -154,6 +154,10 @@ fn a_timeout_is_as_large_as_its_future_plus_a_timer() {
 /// so `loop { sleep(2 ms).await }` took 3 ms a turn (#228).
 #[cfg(unix)]
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "timing: measures how late sleeps end, which Miri slows down"
+)]
 fn a_chain_of_sleeps_is_not_a_tick_late_each_time() {
     giong::block_on(async {
         let mut took = Vec::new();
