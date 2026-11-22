@@ -14,7 +14,8 @@ categories = ["command-line-utilities", "development-tools"]
 [[bin]]
 name = "giong"
 path = "src/main.rs"
-# Its docs would go to target/doc/giong, where the giong crate's are.
+# Its documentation would go to target/doc/giong/, where the giong crate's
+# goes: `cargo doc --workspace` then races the two.
 doc = false
 
 # Kept small on purpose: the command is part of the first minute with giong, and
