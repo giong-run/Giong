@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use giong_quic::{ClientConfig, Endpoint, ServerConfig};
+use giong_quic::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 
 const ALPN: &[u8] = b"giong-test";
 
@@ -637,16 +637,22 @@ fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
         .recv_buffers(512, giong::net::GRO_RECV_BUFFER)
         .block_on(async {
             let (tls, ca) = server_tls();
+            // No connection may time out while the waves run: one that did
+            // would free its place, and a later one would take it. Under
+            // ThreadSanitizer the waves outlast the default 30 seconds.
+            let patient = || TransportConfig::default().idle_timeout(Duration::from_secs(600));
             // Nobody accepts on this endpoint.
             let server = Endpoint::server(
                 "127.0.0.1:0".parse().unwrap(),
-                ServerConfig::new(tls).unwrap(),
+                ServerConfig::new(tls).unwrap().transport(patient()),
             )
             .unwrap();
             let addr = server.local_addr().unwrap();
             let client =
                 std::rc::Rc::new(Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap());
-            let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca))
+                .unwrap()
+                .transport(patient());
             let (mut made, mut refused) = (Vec::new(), 0);
             // In waves, so that the client's own socket keeps up.
             for _ in 0..12 {
@@ -676,6 +682,75 @@ fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
             drop(server);
         })
         .unwrap();
+}
+
+#[test]
+fn a_client_can_count_a_connection_made_that_the_server_never_completes() {
+    // Why the bound test above gives both sides a long idle timeout: the
+    // client has the connection once the server's handshake flight is in,
+    // but the server holds it towards its bound only until its own side of
+    // the handshake times out, if the client's last flight is lost. Under
+    // ThreadSanitizer, with a hundred handshakes at once on one worker,
+    // some were lost, and after the default 30 s the server's half-open
+    // connections were gone: their places were taken by later clients
+    // (1025 and 175, once 1054).
+    giong::Builder::new()
+        .workers(1)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let brief = || TransportConfig::default().idle_timeout(Duration::from_secs(2));
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap().transport(brief()),
+            )
+            .unwrap();
+            // Only the client's first datagram (its Initial) gets through.
+            let addr = relay_first(server.local_addr().unwrap());
+            let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let cfg = ClientConfig::new(client_tls(ca))
+                .unwrap()
+                .transport(brief());
+            let conn = giong::time::timeout(
+                Duration::from_secs(5),
+                client.connect(addr, "localhost", &cfg),
+            )
+            .await
+            .expect("the client's handshake ends")
+            .expect("the client counts the connection made");
+            let accepted = giong::time::timeout(Duration::from_secs(4), server.accept()).await;
+            assert!(accepted.is_err(), "the server never completes it");
+            drop(conn);
+        })
+        .unwrap();
+}
+
+/// A relay between a client and `server` over loopback that passes on only
+/// the first datagram the client sends. Returns the address to connect to.
+fn relay_first(server: SocketAddr) -> SocketAddr {
+    let cut = Arc::new(AtomicBool::new(false));
+    let front = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let back = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+    let addr = front.local_addr().unwrap();
+    let client = Arc::new(std::sync::Mutex::new(None));
+    let (f, b, c) = (front.clone(), back.clone(), client.clone());
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok((n, from)) = f.recv_from(&mut buf) {
+            *c.lock().unwrap() = Some(from);
+            if !cut.swap(true, Ordering::Relaxed) {
+                let _ = b.send_to(&buf[..n], server);
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 65536];
+        while let Ok((n, _)) = back.recv_from(&mut buf) {
+            if let Some(to) = *client.lock().unwrap() {
+                let _ = front.send_to(&buf[..n], to);
+            }
+        }
+    });
+    addr
 }
 
 /// The first Initial datagram of a QUIC client that will never answer: what

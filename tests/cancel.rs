@@ -4,6 +4,9 @@
 //! futures dropped while the kernel still owns their buffers, and the shared
 //! receive pool running dry.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -556,6 +559,7 @@ fn open_fds(path: &std::path::Path) -> usize {
         .count()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dropped_open_closes_the_descriptor_it_produced() {
     // The result of an open is a new descriptor. When the future was
@@ -597,6 +601,7 @@ fn a_dropped_open_closes_the_descriptor_it_produced() {
     std::fs::remove_file(&path).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dropped_close_still_closes_on_the_epoll_driver() {
     // The system's readiness driver: kqueue on macOS works the same way.
