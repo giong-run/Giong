@@ -1,0 +1,282 @@
+//! Starts the service: reads the configuration from the environment,
+{{#if sql}}
+//! creates the tables, then serves on every core.
+{{#else}}
+//! then serves on every core.
+{{/if}}
+//!
+//! | Variable | Default | |
+//! |---|---|---|
+{{#if postgres}}
+//! | `DATABASE_URL` | (required) | `postgres://user:password@host/db` |
+{{/if}}
+{{#if mysql}}
+//! | `DATABASE_URL` | (required) | `mysql://user:password@host/db` |
+{{/if}}
+{{#if redis}}
+//! | `REDIS_URL` | `redis://127.0.0.1:6379` | |
+{{/if}}
+//! | `LISTEN` | `0.0.0.0:{{default_port}}` | |
+{{#if tls}}
+//! | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP |
+{{/if}}
+//! | `WORKERS` | every core | |
+{{#if sql & redis}}
+//! | `DB_POOL`, `CACHE_POOL` | `2`, `1` | connections per worker |
+//! | `CACHE_TTL_SECS` | `60` | |
+{{/if}}
+{{#if sql & !redis}}
+//! | `DB_POOL` | `2` | connections per worker |
+{{/if}}
+{{#if redis & !sql}}
+//! | `REDIS_POOL` | `1` | connections per worker |
+{{/if}}
+//! | `ACCESS_LOG` | `stdout` | or `off` |
+//! | `GIONG_MCP`, `GIONG_MCP_TOKEN` | (off) | giong-mcp, for agents: `127.0.0.1:7777` |
+
+use std::env;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use giong::net::TcpListener;
+{{#if postgres}}
+use giong_postgres::Config as DbConfig;
+{{/if}}
+{{#if mysql}}
+use giong_mysql::Config as DbConfig;
+{{/if}}
+{{#if redis & sql}}
+use giong_redis::Config as CacheConfig;
+{{/if}}
+{{#if redis & !sql}}
+use giong_redis::Config as RedisConfig;
+{{/if}}
+{{#if tls}}
+use giong_tls::{Certificates, TlsAcceptor};
+{{/if}}
+use giong_web::Server;
+{{#if sql}}
+use {{crate}}::{app, AccessLog, State, SCHEMA};
+{{#else}}
+use {{crate}}::{app, AccessLog, State};
+{{/if}}
+
+struct Settings {
+{{#if sql}}
+    db: DbConfig,
+{{/if}}
+{{#if redis & sql}}
+    cache: CacheConfig,
+{{/if}}
+{{#if redis & !sql}}
+    redis: RedisConfig,
+{{/if}}
+    listen: String,
+{{#if tls}}
+    tls: Option<TlsAcceptor>,
+{{/if}}
+    workers: Option<usize>,
+{{#if sql}}
+    db_pool: usize,
+{{/if}}
+{{#if redis & sql}}
+    cache_pool: usize,
+    cache_ttl: Duration,
+{{/if}}
+{{#if redis & !sql}}
+    redis_pool: usize,
+{{/if}}
+    access_log: bool,
+}
+
+fn var(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn number<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    match var(name) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|_| format!("{name}={v:?} is not a number")),
+    }
+}
+
+fn settings() -> Result<Settings, String> {
+{{#if postgres}}
+    let url = var("DATABASE_URL")
+        .ok_or("DATABASE_URL is not set; give postgres://user:password@host/db")?;
+    let db = DbConfig::from_url(&url).map_err(|e| format!("DATABASE_URL: {e}"))?;
+{{/if}}
+{{#if mysql}}
+    let url = var("DATABASE_URL")
+        .ok_or("DATABASE_URL is not set; give mysql://user:password@host/db")?;
+    let db = DbConfig::from_url(&url).map_err(|e| format!("DATABASE_URL: {e}"))?;
+{{/if}}
+{{#if redis & sql}}
+    let cache_url = var("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".into());
+    let cache = CacheConfig::from_url(&cache_url).map_err(|e| format!("REDIS_URL: {e}"))?;
+{{/if}}
+{{#if redis & !sql}}
+    let redis_url = var("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".into());
+    let redis = RedisConfig::from_url(&redis_url).map_err(|e| format!("REDIS_URL: {e}"))?;
+{{/if}}
+{{#if tls}}
+    let tls = match (var("TLS_CERT"), var("TLS_KEY")) {
+        (Some(cert), Some(key)) => {
+            let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
+            let acceptor = Certificates::from_pem(&read(&cert)?, &read(&key)?)
+                .and_then(|certs| TlsAcceptor::with_certificates(&certs))
+                .map_err(|e| format!("TLS_CERT/TLS_KEY: {e}"))?;
+            Some(acceptor)
+        }
+        (None, None) => None,
+        _ => return Err("set both TLS_CERT and TLS_KEY, or neither".into()),
+    };
+{{/if}}
+    let access_log = match var("ACCESS_LOG").as_deref() {
+        None | Some("stdout") => true,
+        Some("off") => false,
+        Some(other) => return Err(format!("ACCESS_LOG={other:?}: use stdout or off")),
+    };
+    Ok(Settings {
+{{#if sql}}
+        db,
+{{/if}}
+{{#if redis & sql}}
+        cache,
+{{/if}}
+{{#if redis & !sql}}
+        redis,
+{{/if}}
+        listen: var("LISTEN").unwrap_or_else(|| "0.0.0.0:{{default_port}}".into()),
+{{#if tls}}
+        tls,
+{{/if}}
+        workers: var("WORKERS").map(|_| number("WORKERS", 1)).transpose()?,
+{{#if sql}}
+        db_pool: number("DB_POOL", 2)?,
+{{/if}}
+{{#if redis & sql}}
+        cache_pool: number("CACHE_POOL", 1)?,
+        cache_ttl: Duration::from_secs(number("CACHE_TTL_SECS", 60)?),
+{{/if}}
+{{#if redis & !sql}}
+        redis_pool: number("REDIS_POOL", 1)?,
+{{/if}}
+        access_log,
+    })
+}
+
+{{#if postgres}}
+/// Creates the tables, once, before the workers start. The statements of
+/// `migrations/0001_init.sql` only create what is missing; `giong db migrate`
+/// applies that file and the ones you add after it.
+fn migrate(db: &DbConfig) -> Result<(), String> {
+    giong::block_on(async {
+        let pool = giong_postgres::Pool::new(db.clone(), 1);
+        pool.batch_execute(SCHEMA).await
+    })
+    .map_err(|e| format!("creating the tables: {e}"))
+}
+
+{{/if}}
+{{#if mysql}}
+/// Creates the tables, once, before the workers start. The statements of
+/// `migrations/0001_init.sql` only create what is missing; `giong db migrate`
+/// applies that file and the ones you add after it.
+fn migrate(db: &DbConfig) -> Result<(), String> {
+    giong::block_on(async {
+        let pool = giong_mysql::Pool::new(db.clone(), 1);
+        pool.batch_execute(SCHEMA).await
+    })
+    .map_err(|e| format!("creating the tables: {e}"))
+}
+
+{{/if}}
+fn main() -> ExitCode {
+{{#if sql}}
+    let settings = match settings().and_then(|s| migrate(&s.db).map(|()| s)) {
+{{#else}}
+    let settings = match settings() {
+{{/if}}
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{{name}}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+{{#if tls}}
+    if settings.tls.is_none() {
+        eprintln!("{{name}}: TLS_CERT and TLS_KEY are not set: serving plain HTTP");
+    }
+{{/if}}
+    let mut builder = giong::Builder::new()
+        .shutdown_on_signals(true)
+        .shutdown_grace(Duration::from_secs(10));
+    if let Some(n) = settings.workers {
+        builder = builder.workers(n);
+    }
+    let runtime = match builder.build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("{{name}}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Off unless GIONG_MCP is set: lets an agent ask the running service
+    // about its workers, tasks and pools. Keep the value alive.
+    let _mcp = giong_mcp::start_from_env(&runtime.handle());
+    let result = runtime.run(move |_worker| {
+        // Everything a worker uses is its own: pools, app, listener.
+        let state = State {
+{{#if postgres}}
+            db: giong_postgres::Pool::new(settings.db.clone(), settings.db_pool),
+{{/if}}
+{{#if mysql}}
+            db: giong_mysql::Pool::new(settings.db.clone(), settings.db_pool),
+{{/if}}
+{{#if redis & sql}}
+            cache: giong_redis::Pool::new(settings.cache.clone(), settings.cache_pool),
+            cache_ttl: settings.cache_ttl,
+{{/if}}
+{{#if redis & !sql}}
+            redis: giong_redis::Pool::new(settings.redis.clone(), settings.redis_pool),
+{{/if}}
+{{#if !db}}
+            greeting: "Hello",
+{{/if}}
+        };
+        let log = if settings.access_log {
+            AccessLog::Stdout
+        } else {
+            AccessLog::Off
+        };
+        let app = app(state, log);
+{{#if tls}}
+        let (listen, tls) = (settings.listen.clone(), settings.tls.clone());
+{{#else}}
+        let listen = settings.listen.clone();
+{{/if}}
+        async move {
+            let listener = TcpListener::bind(listen.as_str()).expect("bind LISTEN");
+            // JSON bodies are small: refuse anything past 64 KiB.
+            let server = Server::new().max_body_size(64 * 1024);
+{{#if tls}}
+            match tls {
+                Some(acceptor) => server.serve_tls(listener, acceptor, app).await,
+                None => server.serve(listener, app).await,
+            }
+{{#else}}
+            server.serve(listener, app).await;
+{{/if}}
+        }
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{{name}}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

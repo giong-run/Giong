@@ -15,6 +15,8 @@ mod code;
 mod pages;
 mod project;
 mod report;
+mod scaffold;
+mod template;
 
 use std::process::ExitCode;
 

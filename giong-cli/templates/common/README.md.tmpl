@@ -1,0 +1,86 @@
+# {{name}}
+
+{{#if web}}
+An HTTP service on [Gióng](https://giong.run), the thread-per-core async runtime for Rust.
+{{/if}}
+{{#if grpc}}
+A gRPC service on [Gióng](https://giong.run), the thread-per-core async runtime for Rust.
+{{/if}}
+{{#if worker}}
+A background worker on [Gióng](https://giong.run), the thread-per-core async runtime for Rust.
+{{/if}}
+Made with `giong new` from giong {{giong_version}}.
+
+## Work on it
+
+```sh
+{{#if db}}
+giong db up        # starts the database in Docker and writes its URL into .env
+{{/if}}
+giong dev          # builds, runs, and restarts on every change
+giong check        # compiler, clippy and giong's own checks, as one list
+giong test         # the tests, on io_uring and on epoll
+```
+
+Without the `giong` command, plain cargo works too: `cargo run`, `cargo test`
+(the tests read `.env` themselves).
+
+| Path | Holds |
+|---|---|
+{{#if web}}
+| `src/main.rs` | reads the configuration, starts one worker per core |
+| `src/lib.rs` | the app: routes and middleware, built once per worker |
+{{/if}}
+{{#if web & sql}}
+| `src/users.rs` | `/users` |
+{{/if}}
+{{#if web & redis & !sql}}
+| `src/counters.rs` | `/counters` |
+{{/if}}
+{{#if web & !db}}
+| `src/hello.rs` | `/hello` and `/echo` |
+{{/if}}
+{{#if grpc}}
+| `proto/service.proto` | the service, compiled at build time by `build.rs` (no `protoc`) |
+| `src/main.rs` | starts one gRPC server per core |
+| `src/lib.rs` | the service: one method per rpc |
+{{/if}}
+{{#if worker}}
+| `src/main.rs` | reads the configuration, starts one worker per core |
+| `src/lib.rs` | the jobs and the loop that runs them |
+{{/if}}
+{{#if sql}}
+| `migrations/` | SQL applied in order by `giong db migrate` |
+{{/if}}
+| `tests/` | the service end to end |
+| `AGENTS.md`, `CLAUDE.md`, `.cursor/`, `.claude/` | what coding agents need to know (`giong ai init`) |
+
+## Configuration
+
+Everything comes from the environment; `.env.example` lists the variables. In
+development `giong dev` and the tests read `.env`; in production nothing reads it.
+
+## Deploy
+
+```sh
+docker build -t {{name}} .
+```
+
+Docker's default seccomp profile blocks io_uring: the service then runs on giong's
+epoll driver and says so once on stderr. To run on io_uring, allow its three system
+calls:
+
+```sh
+curl -fsSLo docker-default.json \
+  https://raw.githubusercontent.com/moby/profiles/main/seccomp/default.json
+jq '.syscalls += [{"names": ["io_uring_setup", "io_uring_enter", "io_uring_register"],
+                   "action": "SCMP_ACT_ALLOW"}]' docker-default.json > giong-seccomp.json
+{{#if worker}}
+docker run --security-opt seccomp=giong-seccomp.json --ulimit memlock=-1:-1 {{name}}
+{{#else}}
+docker run --security-opt seccomp=giong-seccomp.json --ulimit memlock=-1:-1 \
+  -p {{default_port}}:{{default_port}} {{name}}
+{{/if}}
+```
+
+More in giong's [deployment notes](https://github.com/giong-run/Giong/blob/v{{giong_version}}/docs/DEPLOYMENT.md).

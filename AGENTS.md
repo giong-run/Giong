@@ -253,6 +253,14 @@ is loaded.
   `cargo test -p rest-api --doc` (and run unless it is marked `no_run`): change the sample
   with the API. A new Markdown file with Rust samples goes into `markdown` in
   `examples/rest-api/src/lib.rs`.
+- The projects `giong new` writes come from `giong-cli/templates/` (`common/` plus one
+  directory per template; `{{var}}` and `{{#if flag}}` lines, see `giong-cli/src/template.rs`).
+  `scripts/templates.sh` builds, lints and tests every combination against the checkout's
+  crates (the `templates` workflow runs it, against real PostgreSQL, MySQL and Redis), so a
+  change to an API a template uses fails there: change the template in the same pull
+  request. `examples/rest-api` is the `web` template's output (except `tests/api.rs` and the
+  doctests at the end of `src/lib.rs`): edit the template, then
+  `GIONG_CLI_REGENERATE=1 cargo test -p giong-cli rest_api`.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps

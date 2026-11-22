@@ -269,3 +269,16 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
 | [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
 | [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
+| [GIONG-E5030](E5030.md) | `BadProjectName` | the project name is not valid |
+| [GIONG-E5031](E5031.md) | `TargetNotEmpty` | the directory for the new project is not empty |
+| [GIONG-E5032](E5032.md) | `BadTemplateChoice` | the template does not offer that choice |
+| [GIONG-E5033](E5033.md) | `WriteFailed` | a file of the project could not be written |
+| [GIONG-E5034](E5034.md) | `WindowsLimited` | the project's crates do not build on Windows |
+| [GIONG-E5035](E5035.md) | `BadGiongPath` | --giong-path is not a giong checkout |
+| [GIONG-E5036](E5036.md) | `AgentFileForeign` | an agent file exists that giong did not write |
+| [GIONG-E5037](E5037.md) | `McpJsonInvalid` | .mcp.json is not valid JSON |
+| [GIONG-E5038](E5038.md) | `VersionMismatch` | the project uses another giong version than this command |
+| [GIONG-E5039](E5039.md) | `NotGiongProject` | the project does not depend on giong |
+| [GIONG-E5080](E5080.md) | `FixDirty` | the project has changes that are not committed |
+| [GIONG-E5081](E5081.md) | `FixFailed` | cargo could not apply its fixes |
+| [GIONG-E5082](E5082.md) | `FixConflict` | a fix no longer matches the code |
