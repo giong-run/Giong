@@ -13,14 +13,19 @@
 //! hello
 //! ```
 
+#[cfg(target_os = "linux")]
 use std::process::Stdio;
 
+#[cfg(target_os = "linux")]
 use giong::process::{self, Command, PipeWriter};
+#[cfg(target_os = "linux")]
 use giong::signal::{self, SignalKind};
 
 /// Lines longer than this are refused rather than buffered without end.
+#[cfg(target_os = "linux")]
 const MAX_LINE: usize = 64 * 1024;
 
+#[cfg(target_os = "linux")]
 async fn answer(out: &PipeWriter, line: &str) -> std::io::Result<()> {
     let reply = match line.strip_prefix("run ") {
         Some(command) => {
@@ -48,6 +53,12 @@ async fn answer(out: &PipeWriter, line: &str) -> std::io::Result<()> {
     out.write_all(reply.into_bytes()).await.0
 }
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("giong::process is Linux only for now");
+}
+
+#[cfg(target_os = "linux")]
 fn main() -> std::io::Result<()> {
     giong::block_on(async {
         let input = process::stdin()?;

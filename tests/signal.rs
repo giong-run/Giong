@@ -66,6 +66,7 @@ fn a_handled_signal_no_longer_ends_the_process() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn real_time_signals_work() {
     giong::block_on(async {
         let rt = libc::SIGRTMIN() + 3;
@@ -95,6 +96,7 @@ fn signals_that_cannot_be_listened_for_have_a_code() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn sigchld_arrives_when_a_child_exits() {
     giong::block_on(async {
         let mut s = signal::listen(SignalKind::CHILD).unwrap();

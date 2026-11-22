@@ -16,23 +16,29 @@
 //! behave the same way, with a non-blocking system call made when the socket
 //! is ready (see [`DriverKind`](crate::DriverKind)).
 
+#[cfg(target_os = "linux")]
 mod activation;
 mod addr;
 mod balance;
 pub(crate) mod dns;
+#[cfg(target_os = "linux")]
 mod fds;
 mod sendq;
 mod share;
 mod udp;
 mod unix;
 
+#[cfg(target_os = "linux")]
 pub use activation::{activated_sockets, ActivatedSocket};
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
+#[cfg(target_os = "linux")]
 pub use fds::{PeerCred, MAX_FDS};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
-pub use unix::{UnixDatagram, UnixListener, UnixStream};
+#[cfg(target_os = "linux")]
+pub use unix::UnixDatagram;
+pub use unix::{UnixListener, UnixStream};
 
 use std::cell::{Cell, OnceCell};
 use std::future::poll_fn;

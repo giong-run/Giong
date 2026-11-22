@@ -415,7 +415,8 @@ pub(crate) enum Io {
     /// Waits until a descriptor has something to read (`POLLIN`), such as a
     /// pidfd whose process exited, or a non-blocking pipe that returned
     /// `EAGAIN`. Completes with a non-negative value when the caller should
-    /// look again.
+    /// look again. Used by `giong::process`, Linux only for now.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Readable { fd: RawFile },
     /// A `read(2)` from a descriptor that has readiness, such as an eventfd
     /// or a pipe.
@@ -1042,6 +1043,7 @@ impl Driver {
     /// open file the process shares with others (its own stdin, stdout and
     /// stderr), where `O_NONBLOCK` would reach them too. io_uring never
     /// changes a descriptor's flags, so it has nothing to do.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn keep_blocking(&mut self, fd: RawFd) {
         split!(self, d => {
             let _ = d;
@@ -1050,6 +1052,7 @@ impl Driver {
 
     /// Forgets `fd`, which the caller hands on without closing it (to a
     /// child process, say): the epoll driver takes it out of its epoll set.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn release_fd(&mut self, fd: RawFd) {
         split!(self, d => {
             let _ = d;

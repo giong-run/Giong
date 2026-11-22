@@ -3,23 +3,31 @@
 
 use std::cell::Cell;
 use std::io;
-use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::net::Shutdown;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::net::{SocketAddr, UnixStream as StdStream};
 use std::path::Path;
 use std::task::{Context, Poll};
 
 use socket2::{Domain, SockAddr, Socket, Type};
 
-use super::fds::{self, PeerCred};
-use super::{close_socket, os_err, ListenSocket, MultiSlot, StreamSocket};
+use super::{ListenSocket, StreamSocket};
 use crate::buf::{IoBuf, IoBufMut, RecvBuf};
-use crate::driver::{Io, MultiKind};
 use crate::error::{raise, Code};
-use crate::op::Op;
-use crate::runtime;
+
+// Descriptor passing, peer credentials, abstract names and datagram
+// sockets: Linux only for now.
+#[cfg(target_os = "linux")]
+use {
+    super::fds::{self, PeerCred},
+    super::{close_socket, os_err, MultiSlot},
+    crate::driver::{Io, MultiKind},
+    crate::op::Op,
+    crate::runtime,
+    std::marker::PhantomData,
+    std::os::fd::OwnedFd,
+};
 
 /// Lets the standard library read an address of `sock`: it knows how to
 /// represent all three kinds (path, abstract, unnamed).
@@ -57,6 +65,7 @@ impl UnixListener {
     /// Listens on `addr`: a path, or on Linux an abstract name made with
     /// [`SocketAddrExt::from_abstract_name`](std::os::linux::net::SocketAddrExt::from_abstract_name),
     /// which has no file and disappears with the last socket bound to it.
+    #[cfg(target_os = "linux")]
     pub fn bind_addr(addr: &SocketAddr) -> io::Result<Self> {
         let sock = new_socket()?;
         sock.bind(&fds::sock_addr(addr)?)?;
@@ -145,6 +154,7 @@ impl UnixStream {
     /// [`UnixListener::bind_addr`]).
     ///
     /// Cancel safe, as [`connect`](Self::connect).
+    #[cfg(target_os = "linux")]
     pub async fn connect_addr(addr: &SocketAddr) -> io::Result<Self> {
         let addr = fds::sock_addr(addr)?;
         let inner = StreamSocket::connect_new(new_socket, addr).await?;
@@ -218,6 +228,7 @@ impl UnixStream {
     ///
     /// Not cancel safe: if the future is dropped, the bytes and descriptors
     /// may or may not have been sent.
+    #[cfg(target_os = "linux")]
     pub async fn send_with_fds<B: IoBuf>(
         &self,
         buf: B,
@@ -240,6 +251,7 @@ impl UnixStream {
     /// Not cancel safe: if the future is dropped, bytes the receive had
     /// already taken are lost; descriptors that came with them are closed,
     /// never leaked.
+    #[cfg(target_os = "linux")]
     pub async fn recv_with_fds<B: IoBufMut>(
         &self,
         buf: B,
@@ -261,6 +273,7 @@ impl UnixStream {
     /// The process ID, user ID and group ID of the process at the other end,
     /// as the kernel recorded them at `connect` (or `pair`): who is talking
     /// to this server.
+    #[cfg(target_os = "linux")]
     pub fn peer_cred(&self) -> io::Result<PeerCred> {
         fds::peer_cred(self.as_raw_fd())
     }
@@ -369,6 +382,7 @@ impl std::fmt::Debug for UnixStream {
 /// Receives read into a buffer of yours, as
 /// [`UnixStream::read`] does: give it room for the largest message, since
 /// the rest of a longer one is discarded.
+#[cfg(target_os = "linux")]
 pub struct UnixDatagram {
     sock: ManuallyDrop<Socket>,
     /// Never armed: `close_socket` takes one.
@@ -376,6 +390,7 @@ pub struct UnixDatagram {
     _not_send: PhantomData<*const ()>,
 }
 
+#[cfg(target_os = "linux")]
 impl UnixDatagram {
     fn wrap(sock: Socket) -> Self {
         Self {
@@ -587,6 +602,7 @@ impl UnixDatagram {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn with_std_datagram<T>(
     sock: &Socket,
     f: impl FnOnce(&std::os::unix::net::UnixDatagram) -> io::Result<T>,
@@ -599,24 +615,28 @@ fn with_std_datagram<T>(
     f(&std)
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for UnixDatagram {
     fn drop(&mut self) {
         close_socket(&mut self.sock, &self.slot);
     }
 }
 
+#[cfg(target_os = "linux")]
 impl AsRawFd for UnixDatagram {
     fn as_raw_fd(&self) -> RawFd {
         self.sock.as_raw_fd()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl AsFd for UnixDatagram {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.sock.as_fd()
     }
 }
 
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for UnixDatagram {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UnixDatagram")

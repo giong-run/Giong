@@ -84,7 +84,7 @@ impl SignalKind {
     /// sent ([`Child::signal`](crate::process::Child::signal)).
     pub const KILL: Self = Self(libc::SIGKILL);
 
-    /// The signal with this number, such as `libc::SIGRTMIN() + 1`.
+    /// The signal with this number, such as `libc::SIGRTMIN() + 1` (Linux).
     pub const fn from_raw(signal: i32) -> Self {
         Self(signal)
     }
@@ -95,7 +95,7 @@ impl SignalKind {
     }
 }
 
-/// Signal numbers go up to 64 on Linux (`SIGRTMAX`).
+/// Signal numbers go up to 64 on Linux (`SIGRTMAX`), 31 on macOS.
 const SIGNALS: usize = 65;
 
 /// Deliveries of each signal since the process started.
@@ -137,9 +137,9 @@ pub(crate) fn handled(signal: i32) -> bool {
 
 /// Async-signal-safe: atomics and `write(2)`, with `errno` preserved.
 extern "C" fn on_signal(signal: libc::c_int) {
-    // SAFETY: `__errno_location` is async-signal-safe and returns this
-    // thread's errno, which is restored before returning.
-    let errno = unsafe { libc::__errno_location() };
+    // `errno_location` is async-signal-safe and returns this thread's
+    // errno, which is restored before returning.
+    let errno = crate::sys::errno_location();
     // SAFETY: as above.
     let saved = unsafe { *errno };
     if let Some(count) = usize::try_from(signal).ok().and_then(|i| COUNTS.get(i)) {
@@ -165,14 +165,10 @@ extern "C" fn on_signal(signal: libc::c_int) {
 fn start_thread() -> io::Result<()> {
     static STARTED: OnceLock<Result<(), i32>> = OnceLock::new();
     let res = STARTED.get_or_init(|| {
-        let mut fds = [0; 2];
-        // SAFETY: a valid pointer to two descriptors.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO));
-        }
-        let [read_fd, write_fd] = fds;
+        let [read_fd, write_fd] = match crate::sys::cloexec_pipe() {
+            Ok(fds) => fds,
+            Err(e) => return Err(e.raw_os_error().unwrap_or(libc::EIO)),
+        };
         // The handler must never block: a full pipe means a wake-up is
         // queued already.
         // SAFETY: fcntl on a descriptor we own.
@@ -285,10 +281,11 @@ pub fn listen(kind: SignalKind) -> io::Result<Signals> {
         }
         _ => {}
     }
-    if signal <= 0 || signal > libc::SIGRTMAX() || signal as usize >= SIGNALS {
+    let (max, rt_min) = crate::sys::signal_range();
+    if signal <= 0 || signal > max || signal as usize >= SIGNALS {
         return Err(not_allowed(signal, "there is no such signal"));
     }
-    if signal >= 32 && signal < libc::SIGRTMIN() {
+    if signal >= 32 && signal < rt_min {
         return Err(not_allowed(
             signal,
             "the C library keeps it for its own threads",

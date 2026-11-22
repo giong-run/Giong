@@ -489,6 +489,7 @@ impl<P: Poller> Readiness<P> {
 
     /// Sends `fd`'s reads and writes to the blocking threads from now on,
     /// leaving its flags alone (see `Driver::keep_blocking`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn keep_blocking(&mut self, fd: RawFd) {
         if let Ok(i) = usize::try_from(fd) {
             if !matches!(self.fds.get(i), Some(Some(Slot::Pollable(_)))) {
@@ -499,6 +500,7 @@ impl<P: Poller> Readiness<P> {
 
     /// Forgets `fd`, which leaves this driver's care without being closed,
     /// and takes it out of the poller's set.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn release_fd(&mut self, fd: RawFd) {
         if let Ok(i) = usize::try_from(fd) {
             if matches!(self.fds.get(i), Some(Some(Slot::Pollable(_)))) {

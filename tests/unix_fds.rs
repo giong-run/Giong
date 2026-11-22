@@ -1,5 +1,10 @@
 //! Unix datagram sockets, abstract names, peer credentials, and passing
 //! descriptors between processes (`SCM_RIGHTS`).
+//!
+//! Linux only: descriptor passing, peer credentials, abstract names and
+//! `UnixDatagram` are Linux only for now.
+
+#![cfg(target_os = "linux")]
 
 use std::fs::File;
 use std::future::{poll_fn, Future};

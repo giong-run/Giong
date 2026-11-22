@@ -8,14 +8,16 @@
   dropped child is reaped (or killed first, with `kill_on_drop`). Piped stdio is
   `PipeReader` / `PipeWriter`, also from `process::pipe()`, and `process::stdin()`,
   `stdout()` and `stderr()` read and write this process's own streams without blocking the
-  worker (never made non-blocking, since the parent shares them). Needs Linux 5.3.
+  worker (never made non-blocking, since the parent shares them). Needs Linux 5.3; Linux
+  only for now.
 - **giong**: `giong::signal::listen(SignalKind)`: any signal a program may handle, as a
-  stream that every listener sees, on any thread; it works together with
+  stream that every listener sees, on any thread, on Linux and macOS; it works together with
   `Builder::shutdown_on_signals`. `GIONG-E0016` for the signals that cannot be listened for.
 - **giong**: passing open descriptors between processes over Unix sockets:
   `send_with_fds` / `recv_with_fds` on `UnixStream` and the new `UnixDatagram`. A send
   keeps its own copies of the descriptors until the kernel has read them, and a dropped
-  receive closes what it received, so nothing leaks and no wrong file is sent.
+  receive closes what it received, so nothing leaks and no wrong file is sent. Linux only
+  for now.
   `GIONG-E0017` for too many descriptors, none of the bytes to carry them, or a cut-off
   receive. Also `UnixListener::bind_addr`, `UnixStream::connect_addr` (abstract names),
   `peer_cred`, and `AsFd` for every socket.

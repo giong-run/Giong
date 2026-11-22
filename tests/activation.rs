@@ -1,6 +1,10 @@
 //! Socket activation, as systemd does it: the test starts a copy of itself
 //! with sockets on descriptors 3 and 4 and `LISTEN_*` set, through a shell
 //! that sets `LISTEN_PID` to its own process ID before it `exec`s.
+//!
+//! Linux only: socket activation is systemd's, Linux only.
+
+#![cfg(target_os = "linux")]
 
 use std::io::Read;
 use std::os::fd::AsRawFd;

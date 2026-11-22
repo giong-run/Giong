@@ -1,4 +1,8 @@
 //! Child processes, pipes, and the process's own stdin and stdout.
+//!
+//! Linux only: `giong::process` is Linux only for now (pidfds).
+
+#![cfg(target_os = "linux")]
 
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
