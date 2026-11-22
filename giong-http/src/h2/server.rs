@@ -129,8 +129,8 @@ const ERROR_LINGER: Duration = Duration::from_secs(1);
 const KEEP_STREAMS: Duration = Duration::from_secs(1);
 
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
-/// request bodies, and of responses not sent yet.
-fn budget(cfg: &Config) -> u64 {
+/// request bodies, and of responses not sent yet (over HTTP/3 too).
+pub(crate) fn budget(cfg: &Config) -> u64 {
     cfg.http2_budget
         .unwrap_or_else(|| (cfg.max_body_size as u64).max(1 << 20))
 }
