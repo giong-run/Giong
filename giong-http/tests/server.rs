@@ -485,6 +485,41 @@ fn keep_alive_follows_the_protocol_version_and_connection_header() {
 }
 
 #[test]
+fn a_successful_answer_to_connect_closes_the_connection() {
+    // After a 2xx to CONNECT, the client and every proxy on the way treat
+    // the connection as a tunnel (RFC 9110, section 9.3.6), but the server
+    // has none to give: bytes that a proxy in front passes on blindly as
+    // tunnel data must not be read as requests it never saw.
+    let server = default_server();
+    let mut c = server.client();
+    c.send(
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n\
+         GET /admin HTTP/1.1\r\nHost: t\r\n\r\n",
+    );
+    let r = c.reply();
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("connection"), Some("close"));
+    c.expect_closed();
+
+    // A refusal leaves the connection as it was.
+    let refuse = |req: Request| async move {
+        if req.method() == "CONNECT" {
+            Response::new(405)
+        } else {
+            Response::text("ok")
+        }
+    };
+    let server = TestServer::start(Server::new(), refuse);
+    let mut c = server.client();
+    c.send(
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n\
+         GET / HTTP/1.1\r\nHost: t\r\n\r\n",
+    );
+    assert_eq!(c.reply().status, 405);
+    assert_eq!(c.reply().text(), "ok");
+}
+
+#[test]
 fn head_and_bodiless_statuses_send_no_body() {
     let server = default_server();
     let mut c = server.client();

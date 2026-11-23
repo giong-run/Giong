@@ -1,6 +1,6 @@
 [package]
 name = "giong-mcp"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 rust-version = "1.80"
 description = "An MCP server that lets AI agents look inside a running giong service: workers, tasks, pools, profiles"
@@ -13,13 +13,13 @@ categories = ["development-tools::debugging", "asynchronous", "network-programmi
 exclude = ["fuzz/"]
 
 [dependencies]
-giong = { path = "..", version = "1.4.0" }
-giong-http = { path = "../giong-http", version = "1.4.0" }
+giong = { path = "..", version = "1.4.1" }
+giong-http = { path = "../giong-http", version = "1.4.1" }
 # JSON-RPC messages. Already in the workspace through giong-web's `serde`
 # feature.
 serde_json = "1"
 # The `routes` tool: the routes of the giong-web apps the workers serve.
-giong-web = { path = "../giong-web", version = "1.4.0", optional = true }
+giong-web = { path = "../giong-web", version = "1.4.1", optional = true }
 
 [features]
 # The `routes` tool, which lists the routes of the giong-web apps the
@@ -31,8 +31,8 @@ web = ["dep:giong-web"]
 libc = "0.2.172"
 
 [dev-dependencies]
-giong-http = { path = "../giong-http", version = "1.4.0", features = ["client"] }
-giong-web = { path = "../giong-web", version = "1.4.0" }
+giong-http = { path = "../giong-http", version = "1.4.1", features = ["client"] }
+giong-web = { path = "../giong-web", version = "1.4.1" }
 
 [lints.rust]
 # `fuzzing` is set by `cargo fuzz` (see fuzz/), `giong_tsan` by the

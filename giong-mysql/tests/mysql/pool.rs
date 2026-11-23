@@ -478,6 +478,9 @@ fn statements_that_change_the_session_are_refused_on_shared_connections() {
             "SELECT @v := 1",
             "PREPARE p FROM 'SELECT 1'",
             "HANDLER pool_tmp OPEN",
+            // A procedure may do any of the above, out of sight.
+            "CALL pool_p()",
+            "  /* c */ call pool_p(1, @out)",
             // Versioned comments, as dump tools write them, run as SQL.
             "/*!40103 SET time_zone = '+00:00' */",
             "/*!40101 SET NAMES latin1 */",
@@ -806,4 +809,107 @@ fn timeouts_too_long_for_the_clock_mean_no_limit() {
         pool.query_one("SELECT 1", &[]).await.unwrap();
         assert_eq!(pool.stats().opened, 1);
     });
+}
+
+#[test]
+fn a_cancel_token_stops_working_once_its_connection_goes_back() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        let conn = pool.get().await.unwrap();
+        let id = conn.connection_id();
+        let token = conn.cancel_token();
+        drop(conn);
+        // The next task to take the connection runs a statement that a
+        // stale token must not stop.
+        let conn = pool.get().await.unwrap();
+        assert_eq!(conn.connection_id(), id, "the same connection");
+        let slow = conn.query_one("SELECT SLEEP(0.5)", &[]);
+        let cancel = async {
+            sleep(Duration::from_millis(100)).await;
+            token.cancel().await
+        };
+        let (row, cancelled) = futures_join(slow, cancel).await;
+        // SLEEP returns 0 when it runs to its end (MySQL returns 1, and
+        // MariaDB fails with 1317, when it is interrupted).
+        assert_eq!(
+            row.unwrap().get::<i64>(0).unwrap(),
+            0,
+            "the statement ran to its end"
+        );
+        let e = cancelled.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::Closed, "{e}");
+        assert!(e.to_string().contains("gone back to its pool"), "{e}");
+        // A token taken now works.
+        let token = conn.cancel_token();
+        let slow = conn.query_one("SELECT SLEEP(5)", &[]);
+        let cancel = async {
+            sleep(Duration::from_millis(100)).await;
+            token.cancel().await
+        };
+        let (row, cancelled) = futures_join(slow, cancel).await;
+        cancelled.unwrap();
+        // Interrupted: MySQL's SLEEP returns 1, MariaDB's fails with 1317.
+        match row {
+            Ok(row) => assert_eq!(row.get::<i64>(0).unwrap(), 1, "interrupted"),
+            Err(e) => assert_eq!(e.server_code(), Some(1317), "{e}"),
+        }
+    });
+}
+
+#[test]
+fn a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        let conn = pool.get().await.unwrap();
+        let id = conn.connection_id();
+        let token = conn.cancel_token();
+        // The cancel passes the check and starts connecting...
+        let mut cancel = std::pin::pin!(token.cancel());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(cancel.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // ...and the connection goes back before its KILL QUERY arrives:
+        // the next task must not get that connection.
+        drop(conn);
+        let next = pool.get().await.unwrap();
+        assert_ne!(
+            next.connection_id(),
+            id,
+            "a connection a KILL is on its way to"
+        );
+        cancel.await.unwrap();
+        let row = next.query_one("SELECT SLEEP(0.2)", &[]).await.unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    });
+}
+
+/// Both futures, polled together on this task.
+async fn futures_join<A: std::future::Future, B: std::future::Future>(
+    a: A,
+    b: B,
+) -> (A::Output, B::Output) {
+    let mut a = std::pin::pin!(a);
+    let mut b = std::pin::pin!(b);
+    let (mut ra, mut rb) = (None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let std::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rb.is_none() {
+            if let std::task::Poll::Ready(v) = b.as_mut().poll(cx) {
+                rb = Some(v);
+            }
+        }
+        if ra.is_some() && rb.is_some() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    (ra.unwrap(), rb.unwrap())
 }
