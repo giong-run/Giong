@@ -276,7 +276,14 @@ pub(crate) unsafe fn recvmmsg(
     count: usize,
     flags: libc::c_int,
 ) -> isize {
-    libc::recvmmsg(fd, msgs, count as libc::c_uint, flags, std::ptr::null_mut()) as isize
+    // `flags` is an `int` in glibc's prototype and an `unsigned` in musl's.
+    libc::recvmmsg(
+        fd,
+        msgs,
+        count as libc::c_uint,
+        flags as _,
+        std::ptr::null_mut(),
+    ) as isize
 }
 
 /// The error a [`recvmmsg`] that returned some datagrams met after them,
@@ -311,7 +318,8 @@ pub(crate) unsafe fn sendmmsg(
     count: usize,
     flags: libc::c_int,
 ) -> isize {
-    libc::sendmmsg(fd, msgs, count as libc::c_uint, flags) as isize
+    // `flags`: an `int` in glibc, an `unsigned` in musl.
+    libc::sendmmsg(fd, msgs, count as libc::c_uint, flags as _) as isize
 }
 
 /// Lowers the calling thread's CPU priority to nice `nice` (compute lane

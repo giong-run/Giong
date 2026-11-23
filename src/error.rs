@@ -157,6 +157,11 @@ codes! {
     /// already wait for a compute thread. The closure was dropped without
     /// running.
     ComputeBusy = 14, WouldBlock, "the compute lane is full";
+    /// A worker thread could not be started, most often because the
+    /// process may not have more threads: a container's PID limit (`pids.max`)
+    /// or `RLIMIT_NPROC` counts each thread. The kernel's error kind
+    /// (`WouldBlock` for `EAGAIN`) is kept.
+    ThreadLimit = 20, WouldBlock, "a worker thread could not be started";
 
     // -------------------------------------------------------------- macOS
     /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
