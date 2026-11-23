@@ -395,7 +395,7 @@ impl Captures {
         self.len -= 1;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn get(&self, i: usize) -> Option<(usize, usize)> {
         (i < self.len).then(|| {
             let (s, e) = self.spans[i];
