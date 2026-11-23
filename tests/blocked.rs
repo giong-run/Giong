@@ -300,6 +300,9 @@ fn a_used_up_locked_memory_limit_is_named_and_falls_back_to_epoll() {
         stdout.contains("named code: Some(LockedMemoryLimit)"),
         "{stdout}"
     );
+    // The C library's words for ENOMEM: glibc's "Cannot allocate memory",
+    // musl's "Out of memory".
+    let words = std::io::Error::from_raw_os_error(libc::ENOMEM).to_string();
     for prefix in ["error: ", "named: "] {
         let line = stdout
             .lines()
@@ -307,7 +310,7 @@ fn a_used_up_locked_memory_limit_is_named_and_falls_back_to_epoll() {
             .unwrap_or_else(|| panic!("no {prefix} line in {stdout}"));
         assert!(line.contains("GIONG-E0010"), "{line}");
         assert!(line.contains("(RLIMIT_MEMLOCK, 0 bytes)"), "{line}");
-        assert!(line.contains("Cannot allocate memory"), "{line}");
+        assert!(line.contains(&words), "{line}");
         assert!(line.contains("LimitMEMLOCK=infinity"), "{line}");
     }
     // Two workers fell back; the process says so once.
