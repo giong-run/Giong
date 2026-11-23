@@ -57,7 +57,8 @@ pub const COMMAND: Command = Command {
             running one serving. A change to .env alone restarts without building. The service \
             gets the variables of .env, WORKERS=2 (unless set, or --prod-like), RUST_BACKTRACE=1 \
             and a giong-mcp socket. --once builds, runs the service until it exits, and stops. \
-            The listening addresses come from --listen or LISTEN (environment, then .env).",
+            The listening addresses come from --listen or LISTEN (environment, then .env); \
+            0.0.0.0 or [::] is served on loopback (127.0.0.1, ::1) unless --lan is given.",
     flags: &[
         Flag {
             name: "bin",
@@ -73,6 +74,12 @@ pub const COMMAND: Command = Command {
             name: "listen",
             kind: Kind::Value,
             help: "the addresses the service listens on, such as 127.0.0.1:8080 (comma-separated)",
+        },
+        Flag {
+            name: "lan",
+            kind: Kind::Switch,
+            help: "let other machines reach the service: keep 0.0.0.0 or [::] in LISTEN \
+                   (otherwise giong dev serves those on 127.0.0.1 or ::1)",
         },
         Flag {
             name: "workers",
@@ -169,6 +176,9 @@ struct Dev {
     grace: Duration,
     ready_timeout: Duration,
     listen: Vec<SocketAddr>,
+    /// The addresses the service is told to listen on (`LISTEN`), after
+    /// [`loopback_unless_lan`]; empty: the service's own choice.
+    addresses: Vec<SocketAddr>,
     #[cfg(unix)]
     listeners: Vec<socket2::Socket>,
     exe: Option<PathBuf>,
@@ -227,6 +237,7 @@ impl Dev {
             .map(|(v, _)| v)
             .unwrap_or_default();
         let listen = listen_addresses(args.value("listen"), &env_file)?;
+        let (listen, network) = loopback_unless_lan(listen, args.has("lan"));
         let log_path = state_dir.join("dev.log");
         let log = File::create(&log_path).map_err(|e| {
             Failure::new(
@@ -247,6 +258,7 @@ impl Dev {
             grace: secs(args, "grace", 30)?,
             ready_timeout: secs(args, "ready-timeout", 30)?,
             listen: Vec::new(),
+            addresses: listen.clone(),
             #[cfg(unix)]
             listeners: Vec::new(),
             exe: None,
@@ -262,6 +274,14 @@ impl Dev {
             report: Report::new("dev"),
             project,
         };
+        for finding in network {
+            dev.say(
+                "warning",
+                finding.title.clone(),
+                json!({"code": finding.code.to_string()}),
+            );
+            dev.report.push(finding);
+        }
         dev.bind(listen)?;
         Ok(dev)
     }
@@ -439,6 +459,16 @@ impl Dev {
         ];
         if self.release {
             cargo_args.push("--release".into());
+        }
+        // A release build has giong's socket hand-off only with its `dev`
+        // feature: on for giong dev's own builds (debug builds always have
+        // it, so --prod-like adds it too only for the same build either way).
+        #[cfg(unix)]
+        if (self.release || self.prod_like) && giong_takes_sockets(&self.project) {
+            for f in dev_features(&self.project.metadata, &self.package) {
+                cargo_args.push("--features".into());
+                cargo_args.push(f);
+            }
         }
         let outcome = match build::run(&self.project.root, "build", &cargo_args) {
             Ok(o) => o,
@@ -632,6 +662,12 @@ impl Dev {
         }
         if !set("RUST_BACKTRACE") {
             cmd.env("RUST_BACKTRACE", "1");
+        }
+        // The addresses giong dev listens on, which may differ from .env's
+        // (--listen, or loopback for 0.0.0.0): the service must bind these.
+        if !self.addresses.is_empty() {
+            let text: Vec<String> = self.addresses.iter().map(|a| a.to_string()).collect();
+            cmd.env("LISTEN", text.join(","));
         }
         let mcp_on = !set("GIONG_MCP");
         if mcp_on {
@@ -1326,6 +1362,55 @@ fn listen_addresses(
     Ok(out)
 }
 
+/// 0.0.0.0 and [::] (every network interface) become 127.0.0.1 and ::1 of
+/// the same port unless `lan`: a template's LISTEN serves a container in
+/// production, while on a laptop it would put the service under
+/// development, its giong-mcp and its debug routes on the café's network.
+/// Each address that would have been reachable from other machines gives a
+/// warning: what giong dev did, or with `lan`, that it is reachable.
+fn loopback_unless_lan(listen: Vec<SocketAddr>, lan: bool) -> (Vec<SocketAddr>, Vec<Finding>) {
+    let mut findings = Vec::new();
+    let listen = listen
+        .into_iter()
+        .map(|addr| {
+            if !addr.ip().is_unspecified() {
+                return addr;
+            }
+            let local = SocketAddr::new(
+                match addr {
+                    SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                },
+                addr.port(),
+            );
+            findings.push(if lan {
+                Finding::new(
+                    Code::LISTENS_ON_NETWORK,
+                    Severity::Warning,
+                    format!("the service listens on {addr}: other machines on the network can reach it (--lan)"),
+                )
+                .detail("its routes, its debug pages and its giong-mcp answer anyone who can reach this machine")
+                .fix(format!("drop --lan when you do not need another device: giong dev then serves it on {local}"))
+            } else {
+                Finding::new(
+                    Code::LISTENS_ON_NETWORK,
+                    Severity::Warning,
+                    format!("LISTEN is {addr}, which other machines could reach: giong dev serves it on {local}"),
+                )
+                .detail("the service gets LISTEN={local}; 0.0.0.0 and [::] are for a container in production")
+                .fix("pass --lan to keep it reachable from other devices (a phone on the same network), \
+                      or set LISTEN to 127.0.0.1:<port> in .env")
+            });
+            if lan {
+                addr
+            } else {
+                local
+            }
+        })
+        .collect();
+    (listen, findings)
+}
+
 /// A listening socket for `addr`, as the runtime makes one.
 #[cfg(unix)]
 fn listen_on(addr: SocketAddr) -> Result<socket2::Socket, Failure> {
@@ -1351,6 +1436,30 @@ fn listen_on(addr: SocketAddr) -> Result<socket2::Socket, Failure> {
     sock.bind(&addr.into()).map_err(in_use)?;
     sock.listen(1024).map_err(in_use)?;
     Ok(sock)
+}
+
+/// The `dev` features to turn on for `package`'s build: `giong/dev` when it
+/// depends on giong itself (by its own name or a rename). A package that
+/// reaches giong only through another crate gets that crate's feature from
+/// it (giong-web's `dev` turns on giong's).
+#[cfg(unix)]
+fn dev_features(metadata: &Value, package: &str) -> Vec<String> {
+    let Some(p) = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["name"] == package)
+    else {
+        return Vec::new();
+    };
+    p["dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["name"] == "giong" && d["kind"].is_null())
+        .map(|d| d["rename"].as_str().unwrap_or("giong").to_string() + "/dev")
+        .take(1)
+        .collect()
 }
 
 /// Whether the project's giong takes sockets from giong dev (1.5 and newer,
@@ -1418,6 +1527,52 @@ mod tests {
         assert_eq!(mcp_socket(&long, 3), short_socket_dir().join("mcp-3.sock"));
         let _ = fs::remove_dir(short_socket_dir());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_build_turns_on_giongs_dev_feature() {
+        let meta = json!({"packages": [
+            {"name": "svc", "dependencies": [
+                {"name": "serde", "rename": null, "kind": null},
+                {"name": "giong", "rename": null, "kind": null},
+                {"name": "giong", "rename": null, "kind": "dev"},
+            ]},
+            {"name": "renamed", "dependencies": [{"name": "giong", "rename": "rt", "kind": null}]},
+            {"name": "web-only", "dependencies": [{"name": "giong-web", "rename": null, "kind": null}]},
+        ]});
+        assert_eq!(dev_features(&meta, "svc"), ["giong/dev"]);
+        assert_eq!(dev_features(&meta, "renamed"), ["rt/dev"]);
+        assert!(dev_features(&meta, "web-only").is_empty());
+        assert!(dev_features(&meta, "nope").is_empty());
+    }
+
+    #[test]
+    fn every_interface_becomes_loopback_unless_lan() {
+        let addrs: Vec<SocketAddr> = vec![
+            "0.0.0.0:8080".parse().unwrap(),
+            "[::]:9000".parse().unwrap(),
+            "127.0.0.1:7000".parse().unwrap(),
+            "192.168.1.5:6000".parse().unwrap(),
+        ];
+        let (local, findings) = loopback_unless_lan(addrs.clone(), false);
+        assert_eq!(
+            local,
+            [
+                "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+                "[::1]:9000".parse().unwrap(),
+                "127.0.0.1:7000".parse().unwrap(),
+                "192.168.1.5:6000".parse().unwrap(),
+            ]
+        );
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.code == Code::LISTENS_ON_NETWORK
+            && f.severity == Severity::Warning
+            && f.fix.contains("--lan")));
+        let (kept, findings) = loopback_unless_lan(addrs.clone(), true);
+        assert_eq!(kept, addrs);
+        assert_eq!(findings.len(), 2);
+        assert!(findings[0].title.contains("other machines"));
     }
 
     #[test]

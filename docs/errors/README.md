@@ -272,3 +272,4 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
 | [GIONG-E5022](E5022.md) | `DevRunning` | giong dev already serves this project |
 | [GIONG-E5023](E5023.md) | `CompilerWarning` | the compiler has a warning |
+| [GIONG-E5024](E5024.md) | `ListensOnNetwork` | the service would listen on every network interface |
