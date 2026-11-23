@@ -147,3 +147,79 @@ fn a_timeout_is_as_large_as_its_future_plus_a_timer() {
     let parts = std::mem::size_of::<Big>() + std::mem::size_of::<giong::time::Sleep>();
     assert!(size <= parts + 8, "{size} bytes for {parts} bytes of parts");
 }
+
+/// A sleep started just after a timer fired ends at its deadline, not a
+/// whole millisecond later: the wheel used to round every deadline up to
+/// the next millisecond tick, and the event loop wakes just after a tick,
+/// so `loop { sleep(2 ms).await }` took 3 ms a turn (#228).
+///
+/// Checked on Linux only: macOS applies its own timer slack to `kevent`'s
+/// timeout (on CI's virtual machines a 2 ms sleep took 2.0 to 3.8 ms, median
+/// 3.0 ms), which this test cannot tell from the tick it looks for. The test
+/// is kept by name on every system, as the suite's index expects.
+#[cfg(unix)]
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "timing: measures how late sleeps end, which Miri slows down"
+)]
+fn a_chain_of_sleeps_is_not_a_tick_late_each_time() {
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("skipped: the system adds its own timer slack");
+    #[cfg(target_os = "linux")]
+    giong::block_on(async {
+        let mut took = Vec::new();
+        for _ in 0..21 {
+            let start = Instant::now();
+            sleep(Duration::from_millis(2)).await;
+            took.push(start.elapsed());
+        }
+        took.sort();
+        let median = took[10];
+        assert!(
+            took[0] >= Duration::from_millis(2),
+            "a sleep ended early: {took:?}"
+        );
+        assert!(
+            median < Duration::from_micros(2_700),
+            "a 2 ms sleep took {median:?} (median of 21; all: {took:?})"
+        );
+    });
+}
+
+/// Short sleeps end within a few milliseconds of their deadline. On Windows
+/// the completion port's own timeout ends on the system's 15.6 ms clock
+/// tick, where a 1 ms sleep took 15.6 ms; a high-resolution timer ends the
+/// wait there now. Measured on CI: about 2 ms on Linux and macOS.
+#[test]
+fn a_short_sleep_is_not_rounded_up_to_a_clock_tick() {
+    #[cfg(windows)]
+    if under_wine() {
+        // Wine has no high-resolution timer packets: the tick stays.
+        return;
+    }
+    giong::block_on(async {
+        let mut took = Vec::new();
+        for _ in 0..21 {
+            let start = Instant::now();
+            sleep(Duration::from_millis(1)).await;
+            took.push(start.elapsed());
+        }
+        took.sort();
+        let median = took[10];
+        assert!(
+            median >= Duration::from_millis(1) && median < Duration::from_millis(8),
+            "a 1 ms sleep took {median:?} (median of 21; all: {took:?})"
+        );
+    });
+}
+
+#[cfg(windows)]
+fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: looks up an export of a module every process has.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+    }
+}
