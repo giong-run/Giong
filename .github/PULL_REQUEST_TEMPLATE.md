@@ -8,7 +8,8 @@
 
 ## Checklist
 
-- [ ] `scripts/preflight.sh` passes (the gate, not `--quick`), and so does `scripts/check.sh test` when Rust changed
+- [ ] `scripts/preflight.sh` passes (the gate, not `--quick`) before this is marked ready for review, and so does `scripts/check.sh test` when Rust changed
+- [ ] Every review thread is answered: fixed, then a reply `Fixed in <commit>` (which resolves it), or a reply saying why not
 - [ ] New behaviour has tests, including what happens when an operation is dropped mid-flight
 - [ ] Every new `unsafe` block has a `// SAFETY:` comment, and `scripts/valgrind.sh` and `scripts/check.sh tsan` are clean
 - [ ] Performance claims come with before/after numbers and the method

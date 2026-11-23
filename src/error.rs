@@ -151,6 +151,11 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+    /// A worker thread could not be started, most often because the
+    /// process may not have more threads: a container's PID limit (`pids.max`)
+    /// or `RLIMIT_NPROC` counts each thread. The kernel's error kind
+    /// (`WouldBlock` for `EAGAIN`) is kept.
+    ThreadLimit = 20, WouldBlock, "a worker thread could not be started";
 
     // -------------------------------------------------------------- macOS
     /// macOS had no network buffer for a send or connect (`ENOBUFS`), for

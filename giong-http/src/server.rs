@@ -562,8 +562,10 @@ impl Server {
         self
     }
 
-    /// How long a client may take to accept a batch of responses before the
-    /// connection is dropped (default: 30 s).
+    /// How long a client may go without taking any of what the server sends
+    /// before the connection is dropped (default: 30 s). It counts from the
+    /// last progress, so a large response to a slow client may take longer
+    /// in all, as long as the client keeps reading.
     pub fn write_timeout(mut self, timeout: Duration) -> Self {
         self.cfg.write_timeout = crate::bounded(timeout);
         self
@@ -1089,6 +1091,76 @@ impl Drop for Slot {
     }
 }
 
+/// Runs `write` until it completes, or until it has made no progress for
+/// `idle`: then `None`, and the write is dropped.
+///
+/// A transport's write only completes, so its progress is seen from outside:
+/// a write future that returns `Pending` waits for the socket, and is polled
+/// again when the socket took bytes (a send completed, or the socket became
+/// writable). So every poll after the first that the timer did not cause is
+/// progress. Something else waking the connection's task counts as progress
+/// too, which can only make the wait longer, by `idle` at most for each
+/// such wake. A write done at its first poll arms no timer.
+///
+/// A future of its own, not an `async fn`: it lives in every connection's
+/// future, and an `async fn` would keep the write future twice.
+fn until_stalled<F: Future>(idle: &Duration, write: F) -> UntilStalled<'_, F> {
+    UntilStalled {
+        write,
+        idle,
+        timer: None,
+    }
+}
+
+struct UntilStalled<'a, F> {
+    /// Pinned with the `UntilStalled`: never moved out.
+    write: F,
+    /// Borrowed: one word less in every connection's future.
+    idle: &'a Duration,
+    /// From the first wait on: runs out `idle` after the write last moved.
+    timer: Option<giong::time::Sleep>,
+}
+
+impl<F: Future> Future for UntilStalled<'_, F> {
+    type Output = Option<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: `write` is structurally pinned: it is only reached through
+        // the pinned reference made here and never moved. The other fields
+        // are `Unpin`.
+        let this = unsafe { self.get_unchecked_mut() };
+        // SAFETY: `write` is structurally pinned (see above).
+        let write = unsafe { Pin::new_unchecked(&mut this.write) };
+        if let Poll::Ready(done) = write.poll(cx) {
+            return Poll::Ready(Some(done));
+        }
+        let now = Instant::now();
+        match &mut this.timer {
+            None => {
+                // The write waits for the first time: count from now.
+                let timer = this
+                    .timer
+                    .insert(giong::time::sleep_until(now + *this.idle));
+                if Pin::new(timer).poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+            }
+            Some(timer) => {
+                if now < timer.deadline() {
+                    // Woken before the timer: the write moved. Counting
+                    // from now re-arms the timer, which costs only a write
+                    // that does not complete at once.
+                    timer.reset(now + *this.idle);
+                }
+                if Pin::new(timer).poll(cx).is_ready() {
+                    return Poll::Ready(None);
+                }
+            }
+        }
+        Poll::Pending
+    }
+}
+
 /// Refused connections a worker may still be answering at once; past this
 /// they are closed without an answer, so that refusing costs no memory.
 const MAX_REFUSING: usize = 64;
@@ -1372,12 +1444,14 @@ impl<T: Transport> Conn<T> {
             // its own: a local that has been borrowed is kept in the
             // connection's future across every later `.await`, so `req` must
             // only be moved from here on.
-            let (minor, head_only, wants_keep_alive, req) = {
+            let (minor, head_only, connect, wants_keep_alive, req) = {
                 let req = req;
                 let minor = req.head.minor;
-                let head_only = req.method() == "HEAD";
+                let method = req.method();
+                let head_only = method == "HEAD";
+                let connect = method == "CONNECT";
                 let wants_keep_alive = !req.head.close && (minor == 1 || req.head.keep_alive);
-                (minor, head_only, wants_keep_alive, req)
+                (minor, head_only, connect, wants_keep_alive, req)
             };
 
             let (resp, body_read) = match streamed {
@@ -1438,8 +1512,17 @@ impl<T: Transport> Conn<T> {
             let streams = resp.is_streaming() && resp.sends_body(head_only);
             // Without chunked encoding (HTTP/1.0), a streamed body ends when
             // the connection does.
-            let keep_alive =
-                wants_keep_alive && !self.closing && body_read && !(streams && minor == 0);
+            // After a 2xx to CONNECT, the client and the proxies on the way
+            // take what follows on the connection for a tunnel (RFC 9110,
+            // section 9.3.6), which the server has none of: what a proxy in
+            // front passes on blindly must not be read as requests it never
+            // saw.
+            let tunnel = connect && (200..300).contains(&resp.status());
+            let keep_alive = wants_keep_alive
+                && !self.closing
+                && body_read
+                && !(streams && minor == 0)
+                && !tunnel;
             self.reserve_out();
             let stream = {
                 let mut resp = resp;
@@ -2081,21 +2164,22 @@ impl<T: Transport> Conn<T> {
             return Ok(());
         }
         let out = mem::take(&mut self.out);
+        // The write timeout counts from the write's last progress, as on
+        // HTTP/2 and HTTP/3: a large body to a slow client may take longer
+        // than the timeout in all, as long as the client keeps taking it.
+        let idle = &self.cfg.write_timeout;
         let wrote = match mem::take(&mut self.body) {
-            Body::Empty => timeout(self.cfg.write_timeout, self.stream.write_all(out)).await,
+            Body::Empty => until_stalled(idle, self.stream.write_all(out)).await,
             Body::File(f) => {
                 let write = self
                     .stream
                     .write_all_with_file(out, &f.file, f.offset, f.len);
-                timeout(self.cfg.write_timeout, write).await
+                until_stalled(idle, write).await
             }
-            body => {
-                let write = self.stream.write_all_with_body(out, body);
-                timeout(self.cfg.write_timeout, write).await
-            }
+            body => until_stalled(idle, self.stream.write_all_with_body(out, body)).await,
         };
         match wrote {
-            Ok((Ok(()), mut out)) => {
+            Some((Ok(()), mut out)) => {
                 out.clear();
                 self.out = out;
                 Ok(())

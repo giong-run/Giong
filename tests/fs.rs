@@ -237,6 +237,21 @@ fn offsets_above_i64_max_are_refused_on_every_driver() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri refuses pwrite on a file opened with O_APPEND")]
+fn an_appending_file_writes_at_the_end_whatever_the_offset() {
+    let dir = TempDir::new("append");
+    giong::block_on(async {
+        let path = dir.path("f");
+        fs::write(&path, "one").await.unwrap();
+        let file = File::options().append(true).open(&path).await.unwrap();
+        file.write_all_at(",two", 0).await.0.unwrap();
+        file.write_all_at(",three", 0).await.0.unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).await.unwrap(), b"one,two,three");
+    });
+}
+
+#[test]
 fn open_options_behave_like_the_standard_library() {
     let dir = TempDir::new("options");
     giong::block_on(async {
@@ -271,14 +286,6 @@ fn open_options_behave_like_the_standard_library() {
         assert_eq!(fs::read(&path).await.unwrap(), b"first");
         drop(File::create(&path).await.unwrap());
         assert!(fs::read(&path).await.unwrap().is_empty());
-
-        // Append: every write lands at the end, whatever its offset.
-        fs::write(&path, "one").await.unwrap();
-        let file = File::options().append(true).open(&path).await.unwrap();
-        file.write_all_at(",two", 0).await.0.unwrap();
-        file.write_all_at(",three", 0).await.0.unwrap();
-        drop(file);
-        assert_eq!(fs::read(&path).await.unwrap(), b"one,two,three");
 
         // Truncate.
         let file = File::options().write(true).truncate(true).open(&path).await;

@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::budget::Charge;
-use crate::parse::{is_field_value, is_token_str, same_authority, Head};
+use crate::parse::{is_field_value, is_token_str, same_authority, valid_host, Head};
 use crate::request::{BodyBytes, Request};
 use crate::trailers::Trailers;
 
@@ -188,14 +188,20 @@ impl Builder {
                     b's'
                 }
                 b"path" => {
-                    if value.is_empty() || !value.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+                    // No fragment: it is not part of a request's target.
+                    if value.is_empty()
+                        || !value
+                            .iter()
+                            .all(|&b| (0x21..=0x7e).contains(&b) && b != b'#')
+                    {
                         return self.fail("an empty or invalid :path");
                     }
                     b'p'
                 }
                 b"authority" => {
-                    // No user name or password (RFC 9113, section 8.3.1).
-                    if !value.iter().all(|&b| (0x21..=0x7e).contains(&b)) || value.contains(&b'@') {
+                    // No user name or password (RFC 9113, section 8.3.1),
+                    // nothing but a host and a port.
+                    if !valid_host(value) {
                         return self.fail("an invalid :authority");
                     }
                     b'a'
@@ -236,6 +242,9 @@ impl Builder {
             b"host" => {
                 if self.host.is_some() {
                     return self.fail("two host header fields");
+                }
+                if !valid_host(value) {
+                    return self.fail("a host header field that is not a host and a port");
                 }
                 let start = self.scratch.len() - self.lines_from + name.len() + 2;
                 self.host = Some(start..start + value.len());
@@ -635,6 +644,38 @@ mod tests {
                 "{authority} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn authority_host_and_path_hold_only_what_a_target_can() {
+        for authority in ["a/b", "[::1]evil.com", "a b", "a:8x", "a%zz"] {
+            let mut fields = BASE.to_vec();
+            fields[3] = (":authority", authority);
+            assert!(
+                matches!(build(&fields), Built::Malformed(_)),
+                ":authority {authority} was accepted"
+            );
+            let mut fields = BASE.to_vec();
+            fields.remove(3);
+            fields.push(("host", authority));
+            assert!(
+                matches!(build(&fields), Built::Malformed(_)),
+                "host {authority} was accepted"
+            );
+        }
+        for authority in [
+            "example.com:8443",
+            "[::1]:80",
+            "xn--bcher-kva.example",
+            "a_b",
+        ] {
+            let mut fields = BASE.to_vec();
+            fields[3] = (":authority", authority);
+            assert_eq!(request(&fields).header_str("host"), Some(authority));
+        }
+        let mut fields = BASE.to_vec();
+        fields[2] = (":path", "/a#b");
+        assert!(matches!(build(&fields), Built::Malformed(_)));
     }
 
     #[test]
