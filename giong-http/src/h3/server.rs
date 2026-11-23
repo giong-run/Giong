@@ -13,7 +13,7 @@
 //! announces a capacity of zero and encodes with static references and
 //! literals, which RFC 9204 allows in full.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
@@ -86,6 +86,16 @@ struct Conn {
     /// Request streams being served, and who waits for there to be none.
     active: Cell<usize>,
     idle: Cell<Option<Waker>>,
+    /// Response bytes the streams hold that QUIC has not taken yet, and how
+    /// many they may hold before handlers wait: the rule of HTTP/2 (see
+    /// `h2::budget`). Every handler of a connection runs at once, each in
+    /// its stream's task, and a client that gives no flow-control credit
+    /// would otherwise make the connection hold every answer it asked for
+    /// until the write timeout.
+    unsent: Cell<u64>,
+    unsent_budget: u64,
+    /// The tasks of handlers waiting for `unsent` to fall below the budget.
+    parked: RefCell<Vec<Waker>>,
 }
 
 impl Conn {
@@ -93,6 +103,56 @@ impl Conn {
         if !self.closed.replace(true) {
             self.quic.close(e.code as u32, e.what.as_bytes());
         }
+    }
+
+    /// Handlers wait: the connection holds as many response bytes as it
+    /// may, and the client has not taken them yet. A waiting handler is
+    /// not polled (so not started either) until the bytes are taken.
+    fn handlers_wait(&self, cx: &Context<'_>) -> bool {
+        if self.unsent.get() < self.unsent_budget {
+            return false;
+        }
+        let mut parked = self.parked.borrow_mut();
+        if !parked.iter().any(|w| w.will_wake(cx.waker())) {
+            parked.push(cx.waker().clone());
+        }
+        true
+    }
+}
+
+/// Response bytes a stream holds, counted against its connection's budget
+/// until they are handed to QUIC or the stream ends.
+struct Held<'a> {
+    conn: &'a Conn,
+    bytes: u64,
+}
+
+impl<'a> Held<'a> {
+    fn new(conn: &'a Conn) -> Self {
+        Self { conn, bytes: 0 }
+    }
+
+    fn add(&mut self, n: usize) {
+        self.bytes += n as u64;
+        self.conn.unsent.set(self.conn.unsent.get() + n as u64);
+    }
+
+    fn release(&mut self, n: usize) {
+        let n = (n as u64).min(self.bytes);
+        self.bytes -= n;
+        let conn = self.conn;
+        conn.unsent.set(conn.unsent.get() - n);
+        if conn.unsent.get() < conn.unsent_budget {
+            for waker in conn.parked.take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        self.release(usize::try_from(self.bytes).unwrap_or(usize::MAX));
     }
 }
 
@@ -286,6 +346,9 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
         goaway: Cell::new(None),
         active: Cell::new(0),
         idle: Cell::new(None),
+        unsent: Cell::new(0),
+        unsent_budget: crate::h2::budget(&cfg),
+        parked: RefCell::new(Vec::new()),
     });
     // The control stream, which stays open for as long as the connection
     // does: closing it is a connection error (section 6.2.1).
@@ -710,7 +773,13 @@ impl<F: Future<Output = Response>> Call<F> {
         Self(Some(Box::pin(future)))
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Response> {
+    /// Polls the handler, unless handlers of `conn` wait (see
+    /// [`Conn::handlers_wait`]): its answer is counted against the
+    /// connection's budget (by `respond`) before another handler is polled.
+    fn poll(&mut self, conn: &Conn, cx: &mut Context<'_>) -> Poll<Response> {
+        if conn.handlers_wait(cx) {
+            return Poll::Pending;
+        }
         let Some(future) = self.0.as_mut() else {
             return Poll::Ready(panicked());
         };
@@ -781,7 +850,7 @@ async fn exchange<H: Handler>(
             return Err(Stop::Stream(Code::MessageError));
         }
         let mut call = Call::new(handler.call(req));
-        let response = poll_fn(|cx| call.poll(cx)).await;
+        let response = poll_fn(|cx| call.poll(conn, cx)).await;
         return respond(conn, send, response, head_only).await;
     }
 
@@ -839,7 +908,7 @@ async fn exchange<H: Handler>(
         req.body = BodyBytes::InBuffer(start..req.buf.len());
         req.charge = charge;
         let mut call = Call::new(handler.call(req));
-        let response = poll_fn(|cx| call.poll(cx)).await;
+        let response = poll_fn(|cx| call.poll(conn, cx)).await;
         return respond(conn, send, response, head_only).await;
     };
 
@@ -898,7 +967,7 @@ async fn exchange<H: Handler>(
             // `100 Continue` goes out when the handler first asks for the
             // body, as over HTTP/1.1.
             let step = poll_fn(|cx| {
-                if let Poll::Ready(response) = call.poll(cx) {
+                if let Poll::Ready(response) = call.poll(conn, cx) {
                     return Poll::Ready(Some(response));
                 }
                 if !continued && pipe.poll_asked(cx.waker()) {
@@ -940,11 +1009,25 @@ async fn exchange<H: Handler>(
 /// Hands `data` to QUIC, each piece of it under the write timeout: a
 /// client that takes nothing for that long loses the stream.
 async fn write(conn: &Conn, send: &mut SendStream, data: &[u8]) -> Result<(), Stop> {
+    write_held(conn, send, data, None).await
+}
+
+/// [`write`], for bytes counted in `held`: each piece no longer counts
+/// once QUIC has it.
+async fn write_held(
+    conn: &Conn,
+    send: &mut SendStream,
+    data: &[u8],
+    mut held: Option<&mut Held<'_>>,
+) -> Result<(), Stop> {
     for piece in data.chunks(WRITE_PIECE) {
         match timeout(conn.cfg.write_timeout, send.write_all(piece)).await {
             Ok(Ok(())) => {}
             Ok(Err(_)) => return Err(Stop::Gone),
             Err(_) => return Err(Stop::Stream(Code::RequestCancelled)),
+        }
+        if let Some(held) = held.as_deref_mut() {
+            held.release(piece.len());
         }
     }
     Ok(())
@@ -1047,6 +1130,13 @@ async fn respond(
         Body::File(file) => file.len(),
         body => body.len() as u64,
     });
+    // An owned body counts against the connection's budget from now on,
+    // before any other handler is polled (`Call::poll`); a `&'static` one
+    // costs nothing, and a file or a stream only for the piece in hand.
+    let mut held = Held::new(conn);
+    if let Body::Owned(bytes) = &body {
+        held.add(bytes.len());
+    }
     let mut out = Vec::with_capacity(512);
     write_head(&mut out, &resp, length);
     if head_only || bodiless || length == Some(0) {
@@ -1063,14 +1153,16 @@ async fn respond(
                 match body.next().await {
                     Next::Piece(piece) if piece.is_empty() => {}
                     Next::Piece(piece) => {
+                        held.add(piece.len());
                         out.clear();
                         Header::write(&mut out, kind::DATA, piece.len() as u64);
                         if piece.len() <= SMALL_BODY {
                             out.extend_from_slice(&piece);
                             write(conn, send, &out).await?;
+                            held.release(piece.len());
                         } else {
                             write(conn, send, &out).await?;
-                            write(conn, send, &piece).await?;
+                            write_held(conn, send, &piece, Some(&mut held)).await?;
                         }
                     }
                     Next::End(None) => break,
@@ -1105,7 +1197,8 @@ async fn respond(
                     // cannot be read.
                     _ => return Err(Stop::Stream(Code::InternalError)),
                 };
-                write(conn, send, &buf[..n as usize]).await?;
+                held.add(n as usize);
+                write_held(conn, send, &buf[..n as usize], Some(&mut held)).await?;
                 at += n;
                 left -= n;
             }
@@ -1118,7 +1211,7 @@ async fn respond(
                 write(conn, send, &out).await?;
             } else {
                 write(conn, send, &out).await?;
-                write(conn, send, &bytes).await?;
+                write_held(conn, send, &bytes, Some(&mut held)).await?;
             }
         }
     }

@@ -85,8 +85,8 @@ struct Scope<S> {
 ///
 /// [`Req::param`] refuses a value that could leave a directory once
 /// decoded (a `.` or `..` segment, a NUL, a `/` in a one-segment
-/// parameter, a catch-all starting with `/`), so a catch-all can be joined
-/// to a directory.
+/// parameter, a catch-all starting with `/`; on Windows also `\`, `:` and
+/// device names), so a catch-all can be joined to a directory.
 ///
 /// ## Methods
 ///
