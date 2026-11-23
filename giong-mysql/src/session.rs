@@ -15,7 +15,9 @@
 //! word-at-a-time byte search.
 
 /// The first words of a statement (four at most), after blanks and
-/// comments, as written: compare them with [`Words::is`].
+/// comments, as written: compare them with [`Words::is`]. The text of a
+/// versioned comment (`/*!40101 SET NAMES utf8 */`) counts as words: the
+/// server runs it.
 pub(crate) struct Words<'a> {
     words: [&'a str; 4],
     count: usize,
@@ -29,6 +31,8 @@ impl<'a> Words<'a> {
             count: 0,
         };
         let mut i = 0;
+        // Inside a versioned comment, whose `*/` ends nothing but itself.
+        let mut versioned = false;
         while w.count < 4 && i < b.len() {
             match b[i] {
                 c if c.is_ascii_whitespace() => i += 1,
@@ -40,6 +44,21 @@ impl<'a> Words<'a> {
                     i = line_end(b, i);
                 }
                 b'#' => i = line_end(b, i),
+                // A versioned comment, `/*!` or MariaDB's `/*M!` with an
+                // optional version, holds SQL the server runs: read on
+                // inside it (even when the version is above the server's,
+                // erring on the side of "it may").
+                b'/' if b[i..].starts_with(b"/*!") || b[i..].starts_with(b"/*M!") => {
+                    i += if b[i + 2] == b'!' { 3 } else { 4 };
+                    while b.get(i).is_some_and(u8::is_ascii_digit) {
+                        i += 1;
+                    }
+                    versioned = true;
+                }
+                b'*' if versioned && b.get(i + 1) == Some(&b'/') => {
+                    i += 2;
+                    versioned = false;
+                }
                 b'/' if b.get(i + 1) == Some(&b'*') => {
                     // MySQL's block comments do not nest.
                     i = match sql[i + 2..].find("*/") {
@@ -198,6 +217,11 @@ pub(crate) fn changes_in(words: &Words, sql: &str) -> Option<&'static str> {
         Some("SQL prepared statements belong to the session")
     } else if words.is(0, &["HANDLER"]) {
         Some("a HANDLER belongs to the session")
+    } else if words.is(0, &["CALL"]) {
+        Some(
+            "CALL runs a stored procedure, which may change the session (variables, a \
+             transaction, locks) where the server does not report it",
+        )
     } else if temporary_table(words) {
         Some("a temporary table belongs to the session")
     } else {
@@ -266,6 +290,8 @@ mod tests {
             "SELECT @n := @n + 1 FROM t",
             "SELECT a INTO @v FROM t",
             "SELECT a FROM t INTO\n  @v",
+            "CALL p()",
+            "call db.p(?)",
         ] {
             assert!(may_change(sql), "{sql}");
             assert!(changes(sql).is_some(), "{sql}");
@@ -281,7 +307,6 @@ mod tests {
         // Anything but a plain read or write may change the session when
         // a connection is given back.
         for sql in [
-            "CALL p()",
             "LOCK TABLES t WRITE",
             "FLUSH TABLES WITH READ LOCK",
             "DO GET_LOCK('a', 0)",
@@ -290,6 +315,25 @@ mod tests {
         ] {
             assert!(may_change(sql), "{sql}");
         }
+        // Versioned comments hold SQL the server runs, as dump tools write.
+        for sql in [
+            "/*!40103 SET time_zone = '+00:00' */",
+            "/*!40101 SET NAMES latin1 */",
+            "/*!80000 SET autocommit = 0 */",
+            "/*! USE mysql */",
+            "/*!40101SET NAMES latin1*/",
+            "/*M!100100 SET sql_mode = '' */",
+            "/* a comment */ /*!50003 SET @x = 1 */",
+        ] {
+            assert!(may_change(sql), "{sql}");
+            assert!(changes(sql).is_some(), "{sql}");
+        }
+        assert!(Words::of("/*!40000 LOCK TABLES t WRITE */").is(0, &["LOCK"]));
+        assert!(Words::of("/*!START*/ TRANSACTION").is(1, &["TRANSACTION"]));
+        // Optimizer hints and plain comments stay comments.
+        assert!(!may_change("SELECT /*+ MAX_EXECUTION_TIME(10) */ 1"));
+        assert!(!may_change("/*+ hint */ SELECT 1"));
+        assert!(!may_change("/* SET x = 1 */ SELECT 1"));
         assert!(!Marks::of("SELECT a INTO OUTFILE '/x'").into_variable);
         assert!(!Marks::of("INSERT INTO t VALUES ('@')").into_variable);
         assert!(!Marks::of("SELECT a FROM t WHERE x = @@sql_mode").user_variable);
