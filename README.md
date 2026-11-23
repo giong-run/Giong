@@ -480,7 +480,8 @@ Five things to remember:
    buffer of your own. Do not mix the two kinds on one socket.
 4. A `File` has no cursor: every read and write names its offset. Opened with
    `append(true)`, writes go to the end whatever the offset.
-5. Timers have 1 ms resolution and never fire early.
+5. Timers fire at their deadline, to the precision of the kernel's wake-up (a 1 ms sleep
+   takes about 1.05 ms on Linux), and never early.
 
 ## Choosing crates
 
@@ -602,7 +603,7 @@ run the tasks that are ready  →  io_uring_enter (submit everything, collect ev
 | **Writes and files** | Ownership passing: `write_all(buf)` returns `(result, buf)`. TCP sends of 16 KiB and more from bytes that cannot change (`&'static`, `Rc<[u8]>`, `Arc<[u8]>`) go out without a copy on 6.2+ (`SEND_ZC`), and the write still returns as soon as they are queued. File operations are ordinary entries in the same ring. | The kernel keeps a pointer to the buffer until it is done; this API makes that sound in Rust. Files need no pool of blocking threads. |
 | **Cancellation** | When a future is dropped mid-flight, its buffer moves to the driver, a cancel is sent, and the memory is freed only when the kernel confirms. | Avoids use-after-free, the classic bug of completion-based runtimes. |
 | **Backpressure** | A reader more than an eighth of the pool behind has its multishot receive paused (TCP then slows the sender), and its backlog copied off the pool while the pool runs low. A dry pool reclaims buffers that hold data left unread for a whole turn of the event loop. An accept backlog over 1,024 pauses the accept. | One stalled connection cannot starve the rest, and a busy one that keeps up is never copied. |
-| **Timers** | A hierarchical timing wheel in user space (six levels of 64 slots, 1 ms ticks). | Arming and cancelling are O(1) and make no system call. Nearly every timer is an I/O timeout that is cancelled before it fires. |
+| **Timers** | A hierarchical timing wheel in user space (six levels of 64 slots, 1 ms ticks), with each timer's exact deadline: the worker sleeps until the earliest one. | Arming and cancelling are O(1) and make no system call. Nearly every timer is an I/O timeout that is cancelled before it fires. |
 | **Latency dial** | Optionally busy-poll the ring for a while before sleeping. | A sleeping thread must be woken by an interrupt and rescheduled, which costs tens of microseconds, more in a virtual machine. |
 | **Panics** | A panic in a task is caught and reported through its `JoinHandle`. | One bad connection does not take down the worker. |
 | **Shutdown** | With a grace period, a worker keeps running its tasks after its main future returns, until they finish or the period ends. Then: cancel everything, wait for the kernel to confirm, free. If confirmation does not come, leak on purpose. | Requests in progress are answered. Memory safety matters more than a few megabytes at exit. |
