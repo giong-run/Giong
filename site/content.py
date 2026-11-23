@@ -736,6 +736,12 @@ DOC_PAGES = [
     ("best-practices", "Best practices", "docs/BEST_PRACTICES.md", "Start",
      "How to build a service on giong that is correct the first time, fast without tuning and "
      "easy to run: the shape of a service, state, blocking, timeouts, databases, deployment, tests."),
+    ("guides/coding-agents", "Build with a coding agent", "docs/guides/coding-agents.md", "Guides",
+     "Set a project up for an agent once, then the loop it follows: one runner, checks in JSON, "
+     "tools over MCP, and the docs as Markdown."),
+    ("guides/safe-defaults", "Safe defaults of the dev kit", "docs/guides/safe-defaults.md", "Guides",
+     "What the `giong` command keeps safe by default: loopback only, a dashboard token, secrets out "
+     "of recordings, read-only agents, development code out of production."),
     ("deployment", "Deployment", "docs/DEPLOYMENT.md", "Operate",
      "io_uring in Docker, Docker Compose and Kubernetes, the locked-memory limit, kernel quirks, "
      "restarting on the same port."),
@@ -748,7 +754,7 @@ DOC_PAGES = [
      "Every `GIONG-E` code: what went wrong and how to fix it."),
 ]
 # Crate pages take their lede from CRATES; their group is their layer.
-DOC_GROUPS = ["Start", "Dev kit", "Runtime", "Protocols", "Clients", "Framework", "Tooling", "Operate"]
+DOC_GROUPS = ["Start", "Dev kit", "Guides", "Runtime", "Protocols", "Clients", "Framework", "Tooling", "Operate"]
 
 # The Dev kit section: /docs/cli/ and a page per `## giong <command>` section of
 # giong-cli/README.md (the one source; this file only orders and summarises them).
