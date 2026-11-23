@@ -217,6 +217,7 @@ struct TestServer {
 
 impl TestServer {
     fn start(server: Server) -> Self {
+        crate::quiet_panics::quiet_expected_panics();
         let app = App::default();
         let state = app.0.clone();
         let rt = giong::Builder::new()
