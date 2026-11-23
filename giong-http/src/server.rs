@@ -930,6 +930,14 @@ impl Server {
     /// later ones are refused with `H3_REQUEST_REJECTED`, which lets the
     /// client retry them elsewhere.
     ///
+    /// Responses a client does not take have the bound they have over
+    /// HTTP/2 (see [`max_concurrent_streams`](Self::max_concurrent_streams)):
+    /// handlers run while the response bytes a connection holds are within
+    /// the larger of `max_body_size` and 1 MiB, so that a client asking for
+    /// many large answers and giving no flow-control credit holds at most
+    /// that, the answer that went past it, and what QUIC itself buffers (its
+    /// connection window, 8 MiB by default).
+    ///
     /// Clients find HTTP/3 through the `Alt-Svc` header field of responses
     /// over TCP (RFC 7838): have the server that answers on TCP add it
     /// with `Response::header("alt-svc", "h3=\":443\"; ma=86400")`, with
