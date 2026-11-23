@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::mem;
 use std::ops::Deref;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::pin::pin;
 use std::sync::Arc;
@@ -283,26 +284,11 @@ impl Conn {
             // Data, the end of the stream, or an error.
             return true;
         }
-        // The peer's FIN: POLLRDHUP on Linux. macOS has no such flag; there
-        // the receive polled above already sees a FIN that has arrived.
-        #[cfg(target_os = "linux")]
-        let mut events = libc::POLLRDHUP;
-        #[cfg(target_os = "macos")]
-        let mut events = libc::POLLHUP;
-        if let Stream::Tcp(_) = self.stream {
-            // Bytes the socket holds that have not been received yet. Over
-            // TLS they may be session tickets, which are no response.
-            events |= libc::POLLIN;
-        }
-        let mut fd = libc::pollfd {
-            fd: self.stream.tcp().as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        // SAFETY: `fd` is one valid `pollfd` for a descriptor this connection
-        // owns, and a timeout of 0 makes `poll` return at once.
-        let n = unsafe { libc::poll(&mut fd, 1, 0) };
-        n != 0
+        // Bytes the socket holds that have not been received yet count over
+        // plain TCP. Over TLS they may be session tickets, which are no
+        // response.
+        let tcp = matches!(self.stream, Stream::Tcp(_));
+        peer_closed_or_sent(self.stream.tcp(), tcp)
     }
 
     /// Sends `request` and reads the head of the response to it, after
@@ -1186,4 +1172,47 @@ pub(crate) mod fuzzing {
             }
         }
     }
+}
+
+/// Whether the peer has closed `tcp` or it failed, without waiting; with
+/// `unread`, also whether bytes are waiting in it.
+#[cfg(unix)]
+fn peer_closed_or_sent(tcp: &TcpStream, unread: bool) -> bool {
+    // The peer's FIN: POLLRDHUP on Linux. macOS has no such flag; there the
+    // receive polled before this already sees a FIN that has arrived.
+    #[cfg(target_os = "linux")]
+    let mut events = libc::POLLRDHUP;
+    #[cfg(target_os = "macos")]
+    let mut events = libc::POLLHUP;
+    if unread {
+        events |= libc::POLLIN;
+    }
+    let mut fd = libc::pollfd {
+        fd: tcp.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: `fd` is one valid `pollfd` for a descriptor the connection
+    // owns, and a timeout of 0 makes `poll` return at once.
+    let n = unsafe { libc::poll(&mut fd, 1, 0) };
+    n != 0
+}
+
+/// Whether the peer has closed `tcp` or it failed, without waiting; with
+/// `unread`, also whether bytes are waiting in it. `WSAPoll` reports a
+/// closed or failed connection (`POLLHUP`, `POLLERR`) whatever is asked;
+/// as on macOS, a FIN under TLS is also seen by the receive polled first.
+#[cfg(windows)]
+fn peer_closed_or_sent(tcp: &TcpStream, unread: bool) -> bool {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSAPoll, POLLRDNORM, WSAPOLLFD};
+    let mut fd = WSAPOLLFD {
+        fd: tcp.as_raw_socket() as usize,
+        events: if unread { POLLRDNORM } else { 0 },
+        revents: 0,
+    };
+    // SAFETY: `fd` is one valid `WSAPOLLFD` for a socket the connection
+    // owns, and a timeout of 0 makes the call return at once.
+    let n = unsafe { WSAPoll(&mut fd, 1, 0) };
+    n != 0
 }

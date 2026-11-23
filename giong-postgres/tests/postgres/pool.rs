@@ -1279,7 +1279,10 @@ fn a_pool_whose_server_stays_down_spaces_its_connect_attempts() {
         let port = closed_port();
         let pool = Pool::new(s.local().host("127.0.0.1").port(port), 4);
         let mut calls = 0u64;
-        let end = giong::time::Instant::now() + Duration::from_millis(400);
+        // Windows tries a refused connect twice more, half a second apart:
+        // each attempt there takes about 2 s, so the window is longer.
+        let window = Duration::from_millis(if cfg!(windows) { 7_000 } else { 400 });
+        let end = giong::time::Instant::now() + window;
         // One task calling over and over, as a request handler does.
         while giong::time::Instant::now() < end {
             let e = pool.query("SELECT 1", &[]).await.unwrap_err();
@@ -1288,10 +1291,13 @@ fn a_pool_whose_server_stays_down_spaces_its_connect_attempts() {
             giong::time::sleep(Duration::from_millis(1)).await;
         }
         // Each call used to make an attempt of its own. Pauses of 10 ms
-        // doubling (less up to half) allow at most 8 in 400 ms.
+        // doubling (less up to half) allow at most 8 in 400 ms (and fewer
+        // still on Windows, where each attempt also takes 2 s).
+        // Fewer calls fit on Windows, where each attempt takes 2 s.
+        let min_calls = if cfg!(windows) { 20 } else { 100 };
         let attempts = pool.stats().connect_errors;
         assert!(
-            (2..=8).contains(&attempts) && calls >= 100,
+            (2..=8).contains(&attempts) && calls >= min_calls,
             "{attempts} connect attempts for {calls} calls"
         );
         // A pause ends: the next call tries again (and only one does).

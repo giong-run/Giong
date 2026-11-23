@@ -1,5 +1,5 @@
 //! The process as the system sees it: from `/proc/self` on Linux, from
-//! `proc_pidinfo` on macOS.
+//! `proc_pidinfo` on macOS, from the process's own counters on Windows.
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -114,6 +114,103 @@ fn uptime_secs() -> Option<f64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?;
     let up = now.saturating_sub(started).as_secs_f64();
+    Some((up * 10.0).round() / 10.0)
+}
+
+/// On Windows `open_fds` counts every handle (sockets, files, events,
+/// threads and the rest), and `fd_limit` is `null`: Windows sets no limit a
+/// process can reach in practice (16 million handles).
+#[cfg(windows)]
+pub(crate) fn process() -> Value {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+
+    // SAFETY: all-zero is a valid value of this plain structure.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process, and a structure of the size
+    // given.
+    let rss = (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) } != 0)
+        .then_some(counters.WorkingSetSize as u64);
+    let mut handles = 0u32;
+    // SAFETY: the pseudo handle of this process, and a local to write to.
+    let open_fds = (unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut handles) } != 0)
+        .then_some(handles);
+    json!({
+        "pid": std::process::id(),
+        "uptime_s": uptime_secs(),
+        "rss_bytes": rss,
+        "threads": threads(),
+        "open_fds": open_fds,
+        "fd_limit": Value::Null,
+    })
+}
+
+/// The threads of this process, from a snapshot of the system's threads.
+#[cfg(windows)]
+fn threads() -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    let pid = std::process::id();
+    // SAFETY: takes a snapshot of every thread; the handle is checked and
+    // closed below.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: all-zero is a valid value of this plain structure; its size
+    // field is set before use.
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+    let mut count = 0u64;
+    // SAFETY: an open snapshot, and an entry of the size its field gives.
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            count += 1;
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: the snapshot is open and closed once.
+    unsafe { CloseHandle(snapshot) };
+    (count > 0).then_some(count)
+}
+
+/// Seconds since the process started, from the creation time the system
+/// recorded for it.
+#[cfg(windows)]
+fn uptime_secs() -> Option<f64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user, mut now) = (zero, zero, zero, zero, zero);
+    // SAFETY: the pseudo handle of this process, and four locals to write.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: a local to write.
+    unsafe { GetSystemTimeAsFileTime(&mut now) };
+    // Both count 100 ns since 1601.
+    let up = ticks(now).saturating_sub(ticks(created)) as f64 / 1e7;
     Some((up * 10.0).round() / 10.0)
 }
 

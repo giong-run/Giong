@@ -4,7 +4,6 @@ use std::future::poll_fn;
 use std::io;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
-#[cfg(unix)]
 use std::net::IpAddr;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::ops::Deref;
@@ -49,8 +48,10 @@ const OVERHEAD: usize = OUT_HEADER + NAME_LEN;
 /// `IPV6_TCLASS` (each `CMSG_SPACE(4)`: 24 bytes on 64-bit Linux, 16 on
 /// macOS), and the address the datagram was sent to (`IP_PKTINFO` or
 /// `IP_RECVDSTADDR`, or `IPV6_PKTINFO` which is the larger:
-/// `CMSG_SPACE(20)`, 40 bytes on 64-bit Linux, 32 on macOS).
-#[cfg(unix)]
+/// `CMSG_SPACE(20)`, 40 bytes on 64-bit Linux, 32 on macOS). Windows sends
+/// the same three: `UDP_COALESCED_INFO` (a `DWORD`), `IP_ECN` or `IPV6_ECN`
+/// (an `int`) and `IP_PKTINFO` or `IPV6_PKTINFO`, with headers of the same
+/// size as 64-bit Linux's on 64-bit Windows.
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
 /// A control message's header (`struct cmsghdr`): 16 bytes on 64-bit Linux,
@@ -59,6 +60,13 @@ const CONTROL_SPACE: usize = 2 * CMSG_INT_SPACE + CMSG_PKTINFO6_SPACE;
 #[cfg(unix)]
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_HDR: usize = mem::size_of::<libc::cmsghdr>();
+/// Windows' `WSACMSGHDR` (`cmsg_len` a `SIZE_T`), padded to where its data
+/// starts (`WSA_CMSG_DATA`): 16 bytes on 64-bit Windows, 12 on 32-bit.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+const CMSG_HDR: usize = cmsg_align(mem::size_of::<
+    windows_sys::Win32::Networking::WinSock::CMSGHDR,
+>());
 /// What control messages are aligned to (`CMSG_ALIGN`): a `long` on Linux,
 /// the kernel's rule whatever the C library (musl's header, whose
 /// `cmsg_len` is a padded `socklen_t`, is aligned to 4 bytes only), and 4
@@ -69,24 +77,39 @@ const CMSG_ALIGN: usize = mem::size_of::<libc::c_long>();
 #[cfg(all(unix, not(target_os = "linux")))]
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_ALIGN: usize = mem::align_of::<libc::cmsghdr>();
+/// Windows aligns both a message's header and its data to the natural
+/// alignment (`WSA_CMSGHDR_ALIGN`, `WSA_CMSGDATA_ALIGN`): a pointer's size.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+const CMSG_ALIGN: usize = mem::size_of::<usize>();
 // The data of a message starts right after its header (`CMSG_DATA`), which
 // holds where the header's size is a multiple of the alignment.
-#[cfg(unix)]
 const _: () = assert!(CMSG_HDR % CMSG_ALIGN == 0);
-#[cfg(unix)]
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const fn cmsg_align(len: usize) -> usize {
     (len + CMSG_ALIGN - 1) & !(CMSG_ALIGN - 1)
 }
-#[cfg(unix)]
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_INT_SPACE: usize = cmsg_align(CMSG_HDR + 4);
 #[cfg(unix)]
 #[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
 const CMSG_PKTINFO6_SPACE: usize = cmsg_align(CMSG_HDR + mem::size_of::<libc::in6_pktinfo>());
-// The kernel's sizes on 64-bit Linux (see `CONTROL_SPACE`), with glibc or musl.
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[cfg(windows)]
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+const CMSG_PKTINFO6_SPACE: usize =
+    cmsg_align(CMSG_HDR + mem::size_of::<windows_sys::Win32::Networking::WinSock::IN6_PKTINFO>());
+// The kernel's sizes on 64-bit Linux (see `CONTROL_SPACE`), with glibc or
+// musl, and Winsock's on 64-bit Windows.
+#[cfg(all(any(target_os = "linux", windows), target_pointer_width = "64"))]
 const _: () = assert!(CMSG_INT_SPACE == 24 && CMSG_PKTINFO6_SPACE == 40);
+
+/// The room for control messages that a datagram handed from one socket to
+/// another on Windows carries (see `spread`): the layout of a receive with
+/// control messages, whatever the receiving socket asked for.
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+pub(crate) const INBOX_CONTROL: usize = CONTROL_SPACE;
+#[cfg(all(windows, not(feature = "unstable-udp-offload")))]
+pub(crate) const INBOX_CONTROL: usize = 0;
 /// Largest payload a GRO receive can hand over: 64 KiB of coalesced
 /// datagrams.
 #[cfg(feature = "unstable-udp-offload")]
@@ -110,12 +133,21 @@ static RECV_HEADER: RecvHeader = RecvHeader(crate::sys::recv_header(NAME_LEN));
 
 /// The header of a multishot receive that also takes control messages
 /// (GRO segment size, ECN bits).
-#[cfg(feature = "unstable-udp-offload")]
+#[cfg(all(unix, feature = "unstable-udp-offload"))]
 static RECV_HEADER_CONTROL: RecvHeader = {
     // SAFETY: as above.
     let mut hdr: libc::msghdr = unsafe { mem::zeroed() };
     hdr.msg_namelen = NAME_LEN as libc::socklen_t;
     hdr.msg_controllen = CONTROL_SPACE as _;
+    RecvHeader(hdr)
+};
+
+/// The same on Windows, where the driver reads the room it gives control
+/// messages from `Control.len` (see `driver::iocp`).
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+static RECV_HEADER_CONTROL: RecvHeader = {
+    let mut hdr = crate::sys::recv_header(NAME_LEN);
+    hdr.Control.len = CONTROL_SPACE as u32;
     RecvHeader(hdr)
 };
 
@@ -235,6 +267,64 @@ pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
                     let ip: [u8; 16] = b.try_into().expect("sixteen bytes");
                     let ip = Ipv6Addr::from(ip);
                     // A dual-stack socket reports IPv4 destinations mapped.
+                    local = Some(match ip.to_ipv4_mapped() {
+                        Some(v4) => IpAddr::V4(v4),
+                        None => IpAddr::V6(ip),
+                    });
+                }
+            }
+            _ => {}
+        }
+        control = control.get(cmsg_align(len)..).unwrap_or(&[]);
+    }
+    (segment, ecn, local)
+}
+
+/// The URO segment size, the ECN bits and the address the datagram was sent
+/// to, from the control messages of a receive on Windows. Unknown or
+/// malformed messages are skipped.
+#[cfg(windows)]
+#[cfg_attr(not(feature = "unstable-udp-offload"), allow(dead_code))]
+pub(crate) fn parse_control(mut control: &[u8]) -> (u16, u8, Option<IpAddr>) {
+    use windows_sys::Win32::Networking::WinSock::{
+        CMSGHDR, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_ECN, IPV6_PKTINFO, IP_ECN, IP_PKTINFO,
+        UDP_COALESCED_INFO,
+    };
+    let (mut segment, mut ecn, mut local) = (0, 0, None);
+    while control.len() >= CMSG_HDR {
+        // SAFETY: `control` holds at least `CMSG_HDR` bytes, read without
+        // assuming they are aligned; `CMSGHDR` is plain data.
+        let hdr = unsafe { control.as_ptr().cast::<CMSGHDR>().read_unaligned() };
+        let len = hdr.cmsg_len;
+        if len < CMSG_HDR || len > control.len() {
+            break;
+        }
+        let data = &control[CMSG_HDR..len];
+        let int = || {
+            data.get(..4)
+                .map(|b| u32::from_ne_bytes(b.try_into().expect("four")))
+        };
+        match (hdr.cmsg_level, hdr.cmsg_type) {
+            // URO: the size of the coalesced datagrams, a `DWORD`.
+            (IPPROTO_UDP, kind) if kind == UDP_COALESCED_INFO as i32 => {
+                segment = int().map_or(0, |v| u16::try_from(v).unwrap_or(0));
+            }
+            (IPPROTO_IP, IP_ECN) | (IPPROTO_IPV6, IPV6_ECN) => {
+                ecn = int().map_or(0, |v| (v & 3) as u8);
+            }
+            // `IN_PKTINFO`: the header's destination address, then the
+            // interface index.
+            (IPPROTO_IP, IP_PKTINFO) => {
+                if let Some(b) = data.get(..4) {
+                    let ip: [u8; 4] = b.try_into().expect("four bytes");
+                    local = Some(IpAddr::V4(Ipv4Addr::from(ip)));
+                }
+            }
+            // `IN6_PKTINFO`: as on Linux.
+            (IPPROTO_IPV6, IPV6_PKTINFO) => {
+                if let Some(b) = data.get(..20).map(|d| &d[..16]) {
+                    let ip: [u8; 16] = b.try_into().expect("sixteen bytes");
+                    let ip = Ipv6Addr::from(ip);
                     local = Some(match ip.to_ipv4_mapped() {
                         Some(v4) => IpAddr::V4(v4),
                         None => IpAddr::V6(ip),
@@ -659,7 +749,10 @@ impl UdpSocket {
         let finishing = match &self.spread {
             Some(member) => {
                 if let Poll::Ready(datagram) = member.poll_inbox(cx) {
+                    #[cfg(not(feature = "unstable-udp-offload"))]
                     return Poll::Ready(Datagram::parse(RecvBuf::heap(datagram)));
+                    #[cfg(feature = "unstable-udp-offload")]
+                    return Poll::Ready(Datagram::parse(RecvBuf::heap(datagram), INBOX_CONTROL));
                 }
                 if !member.is_first() {
                     return Poll::Pending;
@@ -795,7 +888,7 @@ impl UdpSocket {
             let payload = unsafe { std::slice::from_raw_parts(buf.as_mut_ptr(), res as usize) };
             // A datagram cut to fit `buf` is passed on marked as cut.
             let truncated = msg.hdr.dwFlags & crate::sys::MSG_TRUNC as u32 != 0;
-            if member.pass_on(name, payload, truncated) {
+            if member.pass_on(name, &[], payload, truncated) {
                 return read_inbox(member, buf).await;
             }
         }
@@ -969,8 +1062,11 @@ impl UdpSocket {
     /// of one sender, of one size, as one [`Datagram`], whose
     /// [`segment_size`](Datagram::segment_size) says where to cut it. One
     /// receive then costs what one datagram did, for up to 64 KiB of them.
-    /// Elsewhere (macOS), and on older kernels, turning it on fails with
-    /// `ENOPROTOOPT` and datagrams come one by one.
+    /// On Windows this is receive segment coalescing (URO,
+    /// `UDP_RECV_MAX_COALESCED_SIZE`), on the versions that have it (Windows
+    /// 10 22H2 does). Elsewhere (macOS, older Windows), and on older
+    /// kernels, turning it on fails with `ENOPROTOOPT` (Winsock's
+    /// `WSAENOPROTOOPT` or `WSAEINVAL`) and datagrams come one by one.
     ///
     /// Call it before the first [`recv_from`](Self::recv_from). The worker's
     /// receive buffers must hold 64 KiB of payload (see
@@ -998,9 +1094,23 @@ impl UdpSocket {
         }
         #[cfg(target_os = "linux")]
         setsockopt_int(&self.sock, libc::SOL_UDP, libc::UDP_GRO, on as libc::c_int)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         if on {
             return Err(io::Error::from_raw_os_error(libc::ENOPROTOOPT));
+        }
+        // The largest coalesced datagram, as msquic asks for; 0 turns it off.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Networking::WinSock::{
+                IPPROTO_UDP, UDP_RECV_MAX_COALESCED_SIZE,
+            };
+            let size = if on { u32::from(u16::MAX) } else { 0 };
+            setsockopt_int(
+                &self.sock,
+                IPPROTO_UDP,
+                UDP_RECV_MAX_COALESCED_SIZE,
+                size as i32,
+            )?;
         }
         if on {
             self.control.set(true);
@@ -1012,9 +1122,39 @@ impl UdpSocket {
     /// `IP_RECVTOS`, and `IPV6_RECVTCLASS` on an IPv6 socket. QUIC uses them
     /// for congestion control (RFC 9000, section 13.4). Call it before the
     /// first [`recv_from`](Self::recv_from). `unstable-udp-offload`.
+    ///
+    /// On Windows it is `IP_RECVECN` and `IPV6_RECVECN` (Windows 10 22H2
+    /// has them); versions without them refuse it (`WSAEINVAL` or
+    /// `WSAENOPROTOOPT`), and [`send_to_with`](Self::send_to_with) then
+    /// leaves the ECN bits it is asked for out of the datagrams it sends.
     #[cfg(feature = "unstable-udp-offload")]
     pub fn set_recv_ecn(&self, on: bool) -> io::Result<()> {
         self.before_recv("set_recv_ecn")?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Networking::WinSock::{
+                IPPROTO_IP, IPPROTO_IPV6, IPV6_RECVECN, IP_RECVECN,
+            };
+            let v = i32::from(on);
+            if self.local_addr()?.is_ipv6() {
+                setsockopt_int(&self.sock, IPPROTO_IPV6, IPV6_RECVECN, v)?;
+                // A dual-stack socket gets IPv4 datagrams too; refusal is
+                // fine on an IPv6-only one.
+                let _ = setsockopt_int(&self.sock, IPPROTO_IP, IP_RECVECN, v);
+            } else {
+                setsockopt_int(&self.sock, IPPROTO_IP, IP_RECVECN, v)?;
+            }
+            if on {
+                self.control.set(true);
+            }
+            Ok(())
+        }
+        #[cfg(unix)]
+        self.set_recv_ecn_unix(on)
+    }
+
+    #[cfg(all(unix, feature = "unstable-udp-offload"))]
+    fn set_recv_ecn_unix(&self, on: bool) -> io::Result<()> {
         let v = on as libc::c_int;
         if self.local_addr()?.is_ipv6() {
             setsockopt_int(&self.sock, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, v)?;
@@ -1035,10 +1175,31 @@ impl UdpSocket {
     /// and `IPV6_RECVPKTINFO` on an IPv6 socket. For a socket bound to `0.0.0.0` or `[::]` on a machine
     /// with several addresses. Call it before the first
     /// [`recv_from`](Self::recv_from). `unstable-udp-offload`.
+    ///
+    /// On Windows it is `IP_PKTINFO`, and `IPV6_PKTINFO` on an IPv6 socket
+    /// (with `IP_PKTINFO` as well, for the IPv4 datagrams of a dual-stack
+    /// one).
     #[cfg(feature = "unstable-udp-offload")]
     pub fn set_recv_local_addr(&self, on: bool) -> io::Result<()> {
         self.before_recv("set_recv_local_addr")?;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Networking::WinSock::{
+                IPPROTO_IP, IPPROTO_IPV6, IPV6_PKTINFO, IP_PKTINFO,
+            };
+            let v = i32::from(on);
+            if self.local_addr()?.is_ipv6() {
+                setsockopt_int(&self.sock, IPPROTO_IPV6, IPV6_PKTINFO, v)?;
+                // Windows reports the IPv4 datagrams of a dual-stack socket
+                // through the IPv4 message; refused on an IPv6-only one.
+                let _ = setsockopt_int(&self.sock, IPPROTO_IP, IP_PKTINFO, v);
+            } else {
+                setsockopt_int(&self.sock, IPPROTO_IP, IP_PKTINFO, v)?;
+            }
+        }
+        #[cfg(unix)]
         let v = on as libc::c_int;
+        #[cfg(unix)]
         if self.local_addr()?.is_ipv6() {
             setsockopt_int(&self.sock, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, v)?;
             // A dual-stack socket gets IPv4 datagrams too; they are
@@ -1073,6 +1234,42 @@ impl UdpSocket {
             Ok(())
         } else {
             setsockopt_int(&self.sock, libc::IPPROTO_IP, libc::IP_DONTFRAG, v)
+        }
+    }
+
+    /// Sends datagrams with "don't fragment" set and without the system's
+    /// own path MTU estimate cutting them (`IP_MTU_DISCOVER` =
+    /// `IP_PMTUDISC_PROBE` and `IP_DONTFRAGMENT`; on IPv6
+    /// `IPV6_MTU_DISCOVER` and `IPV6_DONTFRAG`): a datagram larger than a
+    /// link on the path is dropped there instead of being fragmented, which
+    /// is what a protocol that probes the path MTU itself needs (QUIC, RFC
+    /// 9000 section 14). Windows versions without `IP_MTU_DISCOVER` (before
+    /// Windows 10 version 1703) get "don't fragment" only. A datagram larger
+    /// than the local interface's MTU fails with `WSAEMSGSIZE`.
+    /// `unstable-udp-offload`.
+    #[cfg(all(feature = "unstable-udp-offload", windows))]
+    pub fn set_dont_fragment(&self, on: bool) -> io::Result<()> {
+        use windows_sys::Win32::Networking::WinSock::{
+            IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, IPV6_MTU_DISCOVER, IP_DONTFRAGMENT,
+            IP_MTU_DISCOVER, IP_PMTUDISC_NOT_SET, IP_PMTUDISC_PROBE,
+        };
+        let v = i32::from(on);
+        let mode = if on {
+            IP_PMTUDISC_PROBE
+        } else {
+            IP_PMTUDISC_NOT_SET
+        };
+        if self.local_addr()?.is_ipv6() {
+            setsockopt_int(&self.sock, IPPROTO_IPV6, IPV6_DONTFRAG, v)?;
+            let _ = setsockopt_int(&self.sock, IPPROTO_IPV6, IPV6_MTU_DISCOVER, mode);
+            // The IPv4 side of a dual-stack socket; refused on IPv6-only.
+            let _ = setsockopt_int(&self.sock, IPPROTO_IP, IP_DONTFRAGMENT, v);
+            let _ = setsockopt_int(&self.sock, IPPROTO_IP, IP_MTU_DISCOVER, mode);
+            Ok(())
+        } else {
+            setsockopt_int(&self.sock, IPPROTO_IP, IP_DONTFRAGMENT, v)?;
+            let _ = setsockopt_int(&self.sock, IPPROTO_IP, IP_MTU_DISCOVER, mode);
+            Ok(())
         }
     }
 
@@ -1156,7 +1353,8 @@ impl UdpSocket {
     }
 
     /// `true` if the kernel can split one send into several datagrams
-    /// (`UDP_SEGMENT`, Linux 4.18+), as
+    /// (`UDP_SEGMENT`, Linux 4.18+; on Windows `UDP_SEND_MSG_SIZE`, which
+    /// Windows 10 22H2 has), as
     /// [`send_segments_to`](Self::send_segments_to) asks; `false` on macOS.
     /// `unstable-udp-offload`.
     #[cfg(feature = "unstable-udp-offload")]
@@ -1176,7 +1374,11 @@ impl UdpSocket {
                 ) == 0
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            windows_gso(&self.sock)
+        }
+        #[cfg(target_os = "macos")]
         false
     }
 
@@ -1221,10 +1423,19 @@ impl UdpSocket {
         options: &SendOptions,
     ) -> (io::Result<usize>, B) {
         let (segment_size, ecn) = (options.segment_size, options.ecn);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         if segment_size > 0 && segment_size < buf.len() {
             return (Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)), buf);
         }
+        #[cfg(windows)]
+        if segment_size > 0 && segment_size < buf.len() && !windows_gso(&self.sock) {
+            let code = crate::sys::errno::EOPNOTSUPP;
+            return (Err(io::Error::from_raw_os_error(code)), buf);
+        }
+        // Windows versions without ECN refuse the message: the bits are
+        // left out (see `set_recv_ecn`).
+        #[cfg(windows)]
+        let ecn = if windows_ecn(&self.sock) { ecn } else { 0 };
         let sa = SockAddr::from(addr);
         let msg = Message::new(buf.as_ptr().cast_mut(), buf.len(), Some(&sa));
         let m = msg.as_ptr();
@@ -1235,6 +1446,7 @@ impl UdpSocket {
         unsafe {
             let control = ptr::addr_of_mut!((*m).control).cast::<u8>();
             let mut at = 0;
+            #[cfg(unix)]
             let mut put = |level: i32, kind: i32, data: &[u8]| {
                 let len = CMSG_HDR + data.len();
                 let p = control.add(at);
@@ -1247,20 +1459,52 @@ impl UdpSocket {
                 ptr::copy_nonoverlapping(data.as_ptr(), p.add(CMSG_HDR), data.len());
                 at += cmsg_align(len);
             };
+            #[cfg(windows)]
+            let mut put = |level: i32, kind: i32, data: &[u8]| {
+                use windows_sys::Win32::Networking::WinSock::CMSGHDR;
+                let len = CMSG_HDR + data.len();
+                let p = control.add(at);
+                let hdr = CMSGHDR {
+                    cmsg_len: len,
+                    cmsg_level: level,
+                    cmsg_type: kind,
+                };
+                p.cast::<CMSGHDR>().write_unaligned(hdr);
+                ptr::copy_nonoverlapping(data.as_ptr(), p.add(CMSG_HDR), data.len());
+                at += cmsg_align(len);
+            };
+            #[cfg(unix)]
+            use libc::{
+                IPPROTO_IP as IP_LEVEL, IPPROTO_IPV6 as IPV6_LEVEL, IPV6_PKTINFO as PKTINFO6,
+                IPV6_TCLASS as TCLASS, IP_PKTINFO as PKTINFO, IP_TOS as TOS,
+            };
+            #[cfg(windows)]
+            use windows_sys::Win32::Networking::WinSock::{
+                IPPROTO_IP as IP_LEVEL, IPPROTO_IPV6 as IPV6_LEVEL, IPV6_ECN as TCLASS,
+                IPV6_PKTINFO as PKTINFO6, IP_ECN as TOS, IP_PKTINFO as PKTINFO,
+            };
             #[cfg(target_os = "linux")]
             if segment_size > 0 && segment_size < buf.len() {
                 let seg = u16::try_from(segment_size).unwrap_or(u16::MAX);
                 put(libc::SOL_UDP, libc::UDP_SEGMENT, &seg.to_ne_bytes());
             }
+            // Windows takes the segment size as a `DWORD`.
+            #[cfg(windows)]
+            if segment_size > 0 && segment_size < buf.len() {
+                use windows_sys::Win32::Networking::WinSock::{IPPROTO_UDP, UDP_SEND_MSG_SIZE};
+                let seg = u32::try_from(segment_size).unwrap_or(u32::MAX);
+                put(IPPROTO_UDP, UDP_SEND_MSG_SIZE, &seg.to_ne_bytes());
+            }
             if ecn & 3 != 0 {
-                let v = libc::c_int::from(ecn & 3);
+                let v = i32::from(ecn & 3);
                 // To an IPv4-mapped address a dual-stack socket sends IPv4,
-                // where the kernel reads IP_TOS and ignores IPV6_TCLASS.
+                // where the kernel reads IP_TOS and ignores IPV6_TCLASS
+                // (Windows: IP_ECN and IPV6_ECN).
                 let mapped = matches!(addr, SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some());
                 if addr.is_ipv6() && !mapped {
-                    put(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, &v.to_ne_bytes());
+                    put(IPV6_LEVEL, TCLASS, &v.to_ne_bytes());
                 } else {
-                    put(libc::IPPROTO_IP, libc::IP_TOS, &v.to_ne_bytes());
+                    put(IP_LEVEL, TOS, &v.to_ne_bytes());
                 }
             }
             match (options.source, addr.is_ipv6()) {
@@ -1268,9 +1512,21 @@ impl UdpSocket {
                     // `struct in_pktinfo`: interface 0 (the route decides),
                     // `ipi_spec_dst` = the source address, `ipi_addr` unused.
                     // macOS reads it the same way.
-                    let mut info = [0u8; 12];
-                    info[4..8].copy_from_slice(&ip.octets());
-                    put(libc::IPPROTO_IP, libc::IP_PKTINFO, &info);
+                    #[cfg(unix)]
+                    let info = {
+                        let mut info = [0u8; 12];
+                        info[4..8].copy_from_slice(&ip.octets());
+                        info
+                    };
+                    // Windows' `IN_PKTINFO`: the source address, then
+                    // interface 0.
+                    #[cfg(windows)]
+                    let info = {
+                        let mut info = [0u8; 8];
+                        info[..4].copy_from_slice(&ip.octets());
+                        info
+                    };
+                    put(IP_LEVEL, PKTINFO, &info);
                 }
                 (Some(ip), true) => {
                     // `struct in6_pktinfo`: the source address, interface 0.
@@ -1280,14 +1536,13 @@ impl UdpSocket {
                     };
                     let mut info = [0u8; 20];
                     info[..16].copy_from_slice(&ip.octets());
-                    put(libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, &info);
+                    put(IPV6_LEVEL, PKTINFO6, &info);
                 }
                 // An IPv6 source for an IPv4 destination: the kernel picks.
                 _ => {}
             }
             if at > 0 {
-                (*m).hdr.msg_control = control.cast();
-                (*m).hdr.msg_controllen = at as _;
+                crate::sys::msg_set_control(ptr::addr_of_mut!((*m).hdr), control, at);
             }
         }
         // At once where the socket has room (see `Driver::try_send_to`).
@@ -1300,6 +1555,25 @@ impl UdpSocket {
             } else {
                 (Ok(res as usize), buf)
             };
+        }
+        // A socket that joined another's address has no completion port of
+        // its own (see `is_joined`).
+        #[cfg(windows)]
+        if self.is_joined() {
+            let res = loop {
+                // SAFETY: the header points at `msg`'s fields and `buf`'s
+                // bytes, alive until the end of this function.
+                let res = unsafe { crate::sys::sendmsg_nowait(fd, hdr) };
+                if res >= 0 {
+                    break res;
+                }
+                let err = crate::sys::neg_errno();
+                if -err != crate::sys::errno::EAGAIN {
+                    break err as isize;
+                }
+                crate::time::sleep(std::time::Duration::from_millis(1)).await;
+            };
+            return (sent_result(res), buf);
         }
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
@@ -1332,7 +1606,13 @@ impl UdpSocket {
         let Some(member) = &self.spread else {
             return false;
         };
-        if buf.len() < OVERHEAD {
+        // The room the receive gave control messages, in front of the
+        // payload.
+        #[cfg(feature = "unstable-udp-offload")]
+        let space = if self.control.get() { CONTROL_SPACE } else { 0 };
+        #[cfg(not(feature = "unstable-udp-offload"))]
+        let space = 0;
+        if buf.len() < OVERHEAD + space {
             return false;
         }
         let field = |i: usize| {
@@ -1340,8 +1620,9 @@ impl UdpSocket {
             u32::from_ne_bytes(bytes) as usize
         };
         let name = &buf[OUT_HEADER..OUT_HEADER + field(0).min(NAME_LEN)];
+        let control = &buf[OVERHEAD..OVERHEAD + field(1).min(space)];
         let truncated = field(3) as i32 & crate::sys::MSG_TRUNC != 0;
-        member.pass_on(name, &buf[OVERHEAD..], truncated)
+        member.pass_on(name, control, &buf[OVERHEAD + space..], truncated)
     }
 
     /// `true` for a socket that joined an address another socket of this
@@ -1395,7 +1676,11 @@ async fn read_inbox<B: IoBufMut>(
     mut buf: B,
 ) -> (io::Result<(usize, SocketAddr)>, B) {
     let datagram = poll_fn(|cx| member.poll_inbox(cx)).await;
-    let (datagram, from) = match Datagram::parse(RecvBuf::heap(datagram)) {
+    #[cfg(not(feature = "unstable-udp-offload"))]
+    let parsed = Datagram::parse(RecvBuf::heap(datagram));
+    #[cfg(feature = "unstable-udp-offload")]
+    let parsed = Datagram::parse(RecvBuf::heap(datagram), INBOX_CONTROL);
+    let (datagram, from) = match parsed {
         Ok(parsed) => parsed,
         Err(e) => return (Err(e), buf),
     };
@@ -1410,7 +1695,61 @@ async fn read_inbox<B: IoBufMut>(
     (Ok((len, from)), buf)
 }
 
-#[cfg(feature = "unstable-udp-offload")]
+/// `setsockopt` of an `int` (or a `DWORD`, of the same size) on Windows.
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+fn setsockopt_int(sock: &Socket, level: i32, name: i32, v: i32) -> io::Result<()> {
+    // SAFETY: `v` is a valid `int` for the system to read.
+    let r = unsafe {
+        windows_sys::Win32::Networking::WinSock::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            ptr::addr_of!(v).cast(),
+            mem::size_of::<i32>() as i32,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(-crate::sys::neg_errno()))
+    }
+}
+
+/// Whether this Windows splits a send into datagrams (`UDP_SEND_MSG_SIZE`):
+/// a property of the system, asked of the first socket and remembered.
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+fn windows_gso(sock: &Socket) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{getsockopt, IPPROTO_UDP, UDP_SEND_MSG_SIZE};
+    static GSO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GSO.get_or_init(|| {
+        let mut v = 0u32;
+        let mut len = mem::size_of::<u32>() as i32;
+        // SAFETY: `v` and `len` are valid for the system to write.
+        unsafe {
+            getsockopt(
+                sock.as_raw_fd(),
+                IPPROTO_UDP,
+                UDP_SEND_MSG_SIZE,
+                ptr::addr_of_mut!(v).cast(),
+                &mut len,
+            ) == 0
+        }
+    })
+}
+
+/// Whether this Windows reads and writes ECN bits (`IP_ECN`): it takes
+/// `IP_RECVECN` on a socket of its own. Asked once and remembered.
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+fn windows_ecn(_sock: &Socket) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{IPPROTO_IP, IP_RECVECN};
+    static ECN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ECN.get_or_init(|| {
+        Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+            .is_ok_and(|probe| setsockopt_int(&probe, IPPROTO_IP, IP_RECVECN, 1).is_ok())
+    })
+}
+
+#[cfg(all(unix, feature = "unstable-udp-offload"))]
 fn setsockopt_int(sock: &Socket, level: i32, name: i32, v: libc::c_int) -> io::Result<()> {
     // SAFETY: `v` is a valid `int` for the kernel to read.
     let r = unsafe {
@@ -1466,6 +1805,9 @@ impl SendOptions {
     }
 
     /// The two ECN bits of the IP header (0 to 3; higher bits are ignored).
+    /// Windows refuses 3 (CE, which only a router that met congestion sets)
+    /// with `WSAEINVAL`, and sends no ECN bits at all where it has no ECN
+    /// (see [`UdpSocket::set_recv_ecn`]).
     pub fn ecn(mut self, ecn: u8) -> Self {
         self.ecn = ecn & 3;
         self
@@ -1516,6 +1858,72 @@ impl std::fmt::Debug for UdpSocket {
         f.debug_struct("UdpSocket")
             .field("fd", &self.as_raw_fd())
             .finish()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{cmsg_align, parse_control, CMSG_HDR, CMSG_INT_SPACE, CONTROL_SPACE};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use windows_sys::Win32::Networking::WinSock::{
+        CMSGHDR, IPPROTO_IP, IPPROTO_IPV6, IPPROTO_UDP, IPV6_ECN, IPV6_PKTINFO, IP_ECN, IP_PKTINFO,
+        UDP_COALESCED_INFO,
+    };
+
+    /// A control message as Winsock lays it out, padded to its space.
+    fn cmsg(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
+        let hdr = CMSGHDR {
+            cmsg_len: CMSG_HDR + data.len(),
+            cmsg_level: level,
+            cmsg_type: kind,
+        };
+        let mut v = vec![0u8; CMSG_HDR];
+        // SAFETY: `v` holds `CMSG_HDR` bytes, at least a `CMSGHDR`.
+        unsafe { v.as_mut_ptr().cast::<CMSGHDR>().write_unaligned(hdr) };
+        v.extend(data);
+        v.resize(cmsg_align(v.len()), 0);
+        v
+    }
+
+    /// The URO size, the ECN bits and both kinds of destination address
+    /// are read in any order; a length past the end stops the walk.
+    #[test]
+    fn windows_control_messages_are_read() {
+        let uro = cmsg(
+            IPPROTO_UDP,
+            UDP_COALESCED_INFO as i32,
+            &1200u32.to_ne_bytes(),
+        );
+        let ecn = cmsg(IPPROTO_IP, IP_ECN, &2i32.to_ne_bytes());
+        let mut v4 = [0u8; 8];
+        v4[..4].copy_from_slice(&[192, 0, 2, 9]);
+        let v4 = cmsg(IPPROTO_IP, IP_PKTINFO, &v4);
+        assert_eq!(uro.len(), CMSG_INT_SPACE);
+        let all = [uro.clone(), ecn, v4].concat();
+        assert!(all.len() <= CONTROL_SPACE);
+        assert_eq!(
+            parse_control(&all),
+            (1200, 2, Some(IpAddr::from([192, 0, 2, 9])))
+        );
+        let tclass = cmsg(IPPROTO_IPV6, IPV6_ECN, &3i32.to_ne_bytes());
+        let mut mapped = [0u8; 20];
+        mapped[..16].copy_from_slice(&Ipv4Addr::new(10, 0, 0, 7).to_ipv6_mapped().octets());
+        let mapped = cmsg(IPPROTO_IPV6, IPV6_PKTINFO, &mapped);
+        assert_eq!(
+            parse_control(&[tclass, mapped].concat()),
+            (0, 3, Some(IpAddr::from([10, 0, 0, 7])))
+        );
+        let mut v6 = [0u8; 20];
+        v6[..16].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let v6 = cmsg(IPPROTO_IPV6, IPV6_PKTINFO, &v6);
+        assert_eq!(
+            parse_control(&v6),
+            (0, 0, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)))
+        );
+        let mut bad = uro;
+        bad[0] = 0xff;
+        assert_eq!(parse_control(&bad), (0, 0, None));
+        assert_eq!(parse_control(&[]), (0, 0, None));
     }
 }
 

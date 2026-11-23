@@ -19,6 +19,12 @@
 //! [`INBOX_BYTES`] loses the next ones, as the kernel drops datagrams for a
 //! socket that is not read fast enough. The thread ends with the last
 //! socket.
+//!
+//! With `unstable-udp-offload`, the thread receives with room for control
+//! messages (`WSARecvMsg`), and every datagram it hands out carries them
+//! (the URO segment size, the ECN bits, the local address), in the room a
+//! receive of the driver gives them ([`INBOX_CONTROL`] bytes); that room
+//! counts towards [`INBOX_BYTES`].
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -32,7 +38,7 @@ use std::thread::JoinHandle;
 
 use socket2::Socket;
 
-use super::{NAME_LEN, OUT_HEADER, OVERHEAD};
+use super::{INBOX_CONTROL, NAME_LEN, OUT_HEADER, OVERHEAD};
 use crate::runtime::lock;
 use crate::sys::{recv_from_nowait, AcceptEvents, AcceptWake, RawSock, SockAddrStorage, SockLen};
 
@@ -197,14 +203,20 @@ impl Member {
     /// another socket, which then has it, so that every datagram of one
     /// sender reaches the same socket. `name` is the sender's address as
     /// the system wrote it.
-    pub(crate) fn pass_on(&self, name: &[u8], payload: &[u8], truncated: bool) -> bool {
+    pub(crate) fn pass_on(
+        &self,
+        name: &[u8],
+        control: &[u8],
+        payload: &[u8],
+        truncated: bool,
+    ) -> bool {
         if !self.first || !self.dispatching() {
             return false;
         }
         let name = &name[..name.len().min(NAME_LEN)];
         match self.group.inbox_for(name) {
             Some(inbox) if !Arc::ptr_eq(&inbox, &self.inbox) => {
-                deliver(&inbox, name, payload, truncated);
+                deliver(&inbox, name, control, payload, truncated);
                 true
             }
             _ => false,
@@ -232,6 +244,8 @@ impl Group {
     fn dispatch(&self, events: &AcceptEvents) {
         let sock = self.master.as_raw_socket() as RawSock;
         let mut scratch = vec![0u8; DATAGRAM_MAX];
+        // Aligned for the headers of control messages.
+        let mut control = vec![0u64; INBOX_CONTROL.div_ceil(8)];
         let mut wait = None;
         loop {
             // A pause is for work the socket has that cannot be taken yet:
@@ -247,16 +261,31 @@ impl Group {
                 // SAFETY: all-zero is a valid address buffer.
                 let mut from: SockAddrStorage = unsafe { std::mem::zeroed() };
                 let mut from_len = std::mem::size_of::<SockAddrStorage>() as SockLen;
-                // SAFETY: the buffers are locals of the sizes given; the
-                // socket is open while `self` lives.
-                let n = unsafe {
-                    recv_from_nowait(
-                        sock,
-                        scratch.as_mut_ptr(),
-                        scratch.len(),
-                        &mut from,
-                        &mut from_len,
-                    )
+                let mut control_len = 0usize;
+                let n = if INBOX_CONTROL == 0 {
+                    // SAFETY: the buffers are locals of the sizes given; the
+                    // socket is open while `self` lives.
+                    unsafe {
+                        recv_from_nowait(
+                            sock,
+                            scratch.as_mut_ptr(),
+                            scratch.len(),
+                            &mut from,
+                            &mut from_len,
+                        )
+                    }
+                } else {
+                    // SAFETY: as above, with room for control messages.
+                    unsafe {
+                        recv_msg(
+                            sock,
+                            &mut scratch,
+                            control.as_mut_ptr().cast(),
+                            &mut from,
+                            &mut from_len,
+                            &mut control_len,
+                        )
+                    }
                 };
                 let (len, truncated) = if n >= 0 {
                     (n as usize, false)
@@ -284,17 +313,22 @@ impl Group {
                         (from_len.max(0) as usize).min(std::mem::size_of::<SockAddrStorage>()),
                     )
                 };
-                self.hand(name, &scratch[..len], truncated);
+                // SAFETY: `control` holds `INBOX_CONTROL` bytes, of which the
+                // receive wrote `control_len`.
+                let control = unsafe {
+                    std::slice::from_raw_parts(control.as_ptr().cast::<u8>(), control_len)
+                };
+                self.hand(name, control, &scratch[..len], truncated);
             }
         }
     }
 
     /// Gives a datagram from `name` to the socket its sender maps to, or
     /// drops it if that socket has no room or every socket is gone.
-    fn hand(&self, name: &[u8], payload: &[u8], truncated: bool) {
+    fn hand(&self, name: &[u8], control: &[u8], payload: &[u8], truncated: bool) {
         let name = &name[..name.len().min(NAME_LEN)];
         if let Some(inbox) = self.inbox_for(name) {
-            deliver(&inbox, name, payload, truncated);
+            deliver(&inbox, name, control, payload, truncated);
         }
     }
 
@@ -319,19 +353,23 @@ fn has_room(slot: &Slot, size: usize) -> bool {
     slot.open && slot.datagrams.len() < INBOX_MAX && slot.bytes + size <= INBOX_BYTES
 }
 
-/// Puts a datagram from `name` in `inbox`, unless it is full or closed.
-/// A full inbox costs no allocation: room is looked at first, and again
-/// when the copy is made (the first socket's worker hands datagrams in
-/// too, see [`Member::pass_on`]).
-fn deliver(inbox: &Inbox, name: &[u8], payload: &[u8], truncated: bool) {
-    let size = OVERHEAD + payload.len();
+/// Puts a datagram from `name` in `inbox`, unless it is full or closed,
+/// with its control messages (at most [`INBOX_CONTROL`] bytes of them) in
+/// front of the payload. A full inbox costs no allocation: room is looked
+/// at first, and again when the copy is made (the first socket's worker
+/// hands datagrams in too, see [`Member::pass_on`]).
+fn deliver(inbox: &Inbox, name: &[u8], control: &[u8], payload: &[u8], truncated: bool) {
+    // At most the room there is (none without `unstable-udp-offload`).
+    let control = control.get(..INBOX_CONTROL).unwrap_or(control);
+    let at = OVERHEAD + INBOX_CONTROL;
+    let size = at + payload.len();
     if !has_room(&lock(&inbox.slot), size) {
         return;
     }
     let mut datagram = vec![0u8; size];
     let fields = [
         name.len() as u32,
-        0,
+        control.len() as u32,
         payload.len() as u32,
         if truncated {
             crate::sys::MSG_TRUNC as u32
@@ -343,7 +381,8 @@ fn deliver(inbox: &Inbox, name: &[u8], payload: &[u8], truncated: bool) {
         datagram[i * 4..i * 4 + 4].copy_from_slice(&field.to_ne_bytes());
     }
     datagram[OUT_HEADER..OUT_HEADER + name.len()].copy_from_slice(name);
-    datagram[OVERHEAD..].copy_from_slice(payload);
+    datagram[OVERHEAD..OVERHEAD + control.len()].copy_from_slice(control);
+    datagram[at..].copy_from_slice(payload);
     let mut slot = lock(&inbox.slot);
     if !has_room(&slot, size) {
         return;
@@ -353,6 +392,63 @@ fn deliver(inbox: &Inbox, name: &[u8], payload: &[u8], truncated: bool) {
     let waiters = mem::take(&mut slot.waiters);
     drop(slot);
     waiters.into_iter().for_each(Waker::wake);
+}
+
+/// One datagram off `sock` without waiting, with its control messages:
+/// the payload into `buf`, the sender's address into `from`, and up to
+/// [`INBOX_CONTROL`] bytes of control messages at `control`, whose length
+/// goes into `control_len`. The bytes received, or -1 with the thread's
+/// last error set, as `recv_from_nowait`.
+///
+/// # Safety
+///
+/// `control` must be valid for writing [`INBOX_CONTROL`] bytes, aligned for
+/// a control message's header.
+#[cfg(feature = "unstable-udp-offload")]
+unsafe fn recv_msg(
+    sock: RawSock,
+    buf: &mut [u8],
+    control: *mut u8,
+    from: &mut SockAddrStorage,
+    from_len: &mut SockLen,
+    control_len: &mut usize,
+) -> isize {
+    use windows_sys::Win32::Networking::WinSock::{WSABUF, WSAMSG};
+    let mut piece = WSABUF {
+        len: buf.len().min(u32::MAX as usize) as u32,
+        buf: buf.as_mut_ptr(),
+    };
+    let mut msg = WSAMSG {
+        name: (from as *mut SockAddrStorage).cast(),
+        namelen: *from_len,
+        lpBuffers: &mut piece,
+        dwBufferCount: 1,
+        Control: WSABUF {
+            len: INBOX_CONTROL as u32,
+            buf: control,
+        },
+        dwFlags: 0,
+    };
+    // SAFETY: the header points at `buf`, `from` and `control`, valid for
+    // the call as the caller guarantees.
+    let n = unsafe { crate::sys::recvmsg_nowait(sock, &mut msg) };
+    *from_len = msg.namelen;
+    *control_len = (msg.Control.len as usize).min(INBOX_CONTROL);
+    n
+}
+
+/// Without `unstable-udp-offload` there is no room for control messages,
+/// and the thread never calls this.
+#[cfg(not(feature = "unstable-udp-offload"))]
+unsafe fn recv_msg(
+    _: RawSock,
+    _: &mut [u8],
+    _: *mut u8,
+    _: &mut SockAddrStorage,
+    _: &mut SockLen,
+    _: &mut usize,
+) -> isize {
+    unreachable!("no control messages without unstable-udp-offload")
 }
 
 /// FNV-1a over the sender's address (family, port, address): the same
@@ -417,14 +513,14 @@ mod tests {
         let name = [0u8; 16];
         let payload = vec![7u8; 65_507];
         for _ in 0..INBOX_MAX {
-            deliver(&inbox, &name, &payload, false);
+            deliver(&inbox, &name, &[], &payload, false);
         }
         let slot = lock(&inbox.slot);
         let held: usize = slot.datagrams.iter().map(Vec::len).sum();
         assert_eq!(held, slot.bytes);
         assert!(held <= INBOX_BYTES, "{held} bytes held");
         assert!(
-            held + OVERHEAD + payload.len() > INBOX_BYTES,
+            held + OVERHEAD + INBOX_CONTROL + payload.len() > INBOX_BYTES,
             "{held} bytes held"
         );
         assert!(
@@ -441,7 +537,7 @@ mod tests {
         let inbox = open_inbox();
         let name = [0u8; 16];
         for _ in 0..INBOX_MAX + 10 {
-            deliver(&inbox, &name, b"hi", false);
+            deliver(&inbox, &name, &[], b"hi", false);
         }
         assert_eq!(lock(&inbox.slot).datagrams.len(), INBOX_MAX);
         let taken = {
@@ -450,20 +546,37 @@ mod tests {
             slot.bytes -= datagram.len();
             datagram
         };
-        assert_eq!(taken.len(), OVERHEAD + 2);
-        deliver(&inbox, &name, b"hi", false);
+        assert_eq!(taken.len(), OVERHEAD + INBOX_CONTROL + 2);
+        deliver(&inbox, &name, &[], b"hi", false);
         let slot = lock(&inbox.slot);
         assert_eq!(slot.datagrams.len(), INBOX_MAX);
-        assert_eq!(slot.bytes, INBOX_MAX * (OVERHEAD + 2));
+        assert_eq!(slot.bytes, INBOX_MAX * (OVERHEAD + INBOX_CONTROL + 2));
     }
 
     /// A closed inbox takes nothing.
     #[test]
     fn a_closed_inbox_takes_nothing() {
         let inbox = Inbox::default();
-        deliver(&inbox, &[0u8; 16], b"hi", false);
+        deliver(&inbox, &[0u8; 16], &[], b"hi", false);
         let slot = lock(&inbox.slot);
         assert!(slot.datagrams.is_empty());
         assert_eq!(slot.bytes, 0);
+    }
+
+    /// The control messages a datagram came with travel with it, in the
+    /// room a receive of the driver gives them, and count towards the
+    /// inbox's bytes.
+    #[test]
+    fn control_messages_travel_with_the_datagram() {
+        let inbox = open_inbox();
+        let control = vec![9u8; INBOX_CONTROL];
+        deliver(&inbox, &[2, 0, 0, 80], &control, b"payload", false);
+        let slot = lock(&inbox.slot);
+        let datagram = &slot.datagrams[0];
+        assert_eq!(slot.bytes, datagram.len());
+        let field = |i: usize| u32::from_ne_bytes(datagram[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(field(1) as usize, control.len());
+        assert_eq!(&datagram[OVERHEAD..OVERHEAD + control.len()], &control[..]);
+        assert_eq!(&datagram[OVERHEAD + INBOX_CONTROL..], b"payload");
     }
 }

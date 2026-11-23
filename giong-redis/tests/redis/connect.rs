@@ -73,13 +73,22 @@ fn the_database_and_the_client_name_are_set_when_connecting() {
 fn unix_sockets_and_tls() {
     run(|server| async move {
         let k = key("transports");
-        let unix = Client::connect(&server.unix()).await.unwrap();
-        unix.set(&k, "u").await.unwrap();
-        let url = format!("redis+unix://{}?db=0", server.socket.display());
-        let unix = Client::connect(&Config::from_url(&url).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(unix.get::<String>(&k).await.unwrap(), "u");
+        // Redis for Windows (its Cygwin and MSYS2 builds) emulates Unix
+        // sockets with a file that Winsock's own Unix sockets cannot reach:
+        // over TCP there. giong's Unix sockets on Windows have their tests
+        // in giong's suite.
+        if cfg!(windows) {
+            let tcp = Client::connect(&server.tcp()).await.unwrap();
+            tcp.set(&k, "u").await.unwrap();
+        } else {
+            let unix = Client::connect(&server.unix()).await.unwrap();
+            unix.set(&k, "u").await.unwrap();
+            let url = format!("redis+unix://{}?db=0", server.socket.display());
+            let unix = Client::connect(&Config::from_url(&url).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(unix.get::<String>(&k).await.unwrap(), "u");
+        }
 
         for host in ["localhost", "127.0.0.1"] {
             let tls = Client::connect(&server.tls(host)).await.unwrap();
@@ -137,7 +146,9 @@ fn connecting_fails_fast_with_a_reason() {
             .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect);
         assert!(e.is_transient());
-        assert!(start.elapsed() < Duration::from_secs(2));
+        // Windows tries a refused connect twice more, half a second apart.
+        let fast = Duration::from_secs(if cfg!(windows) { 5 } else { 2 });
+        assert!(start.elapsed() < fast, "{:?}", start.elapsed());
 
         // A server that accepts and never answers.
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

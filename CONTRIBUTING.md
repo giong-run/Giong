@@ -34,9 +34,11 @@ name the part of the code involved (`driver`, `fs`, `net`, `http`, `tls`).
 
 ## Setting up
 
-You need **Linux with kernel 6.0 or newer** and a stable Rust toolchain. giong does not
-build on Windows or macOS; use WSL2 with a 6.x kernel, a virtual machine, or a container
-with the seccomp profile from [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In a container with
+You need **Linux with kernel 6.0 or newer** and a stable Rust toolchain to test the Linux
+drivers. Every crate also builds and passes its tests on macOS and on Windows, but changes
+are measured and gated on Linux: on a Mac or a Windows machine use WSL2 with a 6.x kernel,
+a virtual machine, or a container with the seccomp profile from
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) as well. In a container with
 Docker's default profile, which blocks io_uring, or on an older kernel, giong runs on its
 epoll driver, so the tests pass but the io_uring driver goes untested.
 

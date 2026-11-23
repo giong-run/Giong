@@ -160,6 +160,9 @@ fn path_parameters_refuse_dot_segments_nul_and_slashes() {
         ("/files/.hidden/a..b", ".hidden/a..b"),
         ("/files/dir/", "dir/"),
         ("/one/v1.2", "v1.2"),
+        // Windows drops a trailing dot when it opens a file, so there a
+        // name ending in one is refused (below).
+        #[cfg(unix)]
         ("/one/...", "..."),
     ] {
         let resp = call(&app, "GET", target);
@@ -168,6 +171,13 @@ fn path_parameters_refuse_dot_segments_nul_and_slashes() {
             (200, value),
             "{target}"
         );
+    }
+    #[cfg(windows)]
+    {
+        let resp = call(&app, "GET", "/one/...");
+        let text = body(&resp);
+        assert_eq!(resp.status(), 400, "{text}");
+        assert!(text.contains("ends in `.`"), "{text}");
     }
     // The value as sent, for the route that wants it.
     assert_eq!(body(&call(&app, "GET", "/raw/..%2Fx")), "..%2Fx");
@@ -447,7 +457,7 @@ fn mistakes_in_the_routes_panic_with_a_code_and_where() {
             .get("/users/{name}", user);
     });
     assert!(msg.starts_with("GIONG-E1202: GET /users/{name} would answer the same requests as GET /users/{id}, added at "), "{msg}");
-    assert!(msg.contains("tests/router.rs:"), "{msg}");
+    assert!(msg.contains(&format!("{}:", file!())), "{msg}");
 
     let msg = panic_message(|| {
         let api = Router::<()>::new().get("/users", me);

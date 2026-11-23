@@ -835,7 +835,13 @@ pub(crate) fn bind(
     // GRO needs 64 KiB receive buffers; without them datagrams come one by
     // one, which is correct, only slower.
     let _ = sock.set_gro(true);
-    sock.set_recv_ecn(true)?;
+    // Windows before 11 and Server 2022 has no ECN: QUIC works without it,
+    // and its ECN validation (RFC 9000, section 13.4.2) sees that none comes.
+    if let Err(e) = sock.set_recv_ecn(true) {
+        if !cfg!(windows) {
+            return Err(e);
+        }
+    }
     // On a wildcard bind, each datagram's local address, so that the answer
     // leaves from the address the peer sent to: on a machine with several
     // addresses the route may pick another, which the peer drops.
@@ -1373,9 +1379,12 @@ impl quinn_proto::congestion::Controller for ClosableController {
 /// answers `EIO` where the device has no checksum offload, `EINVAL` where
 /// the segments do not fit it.
 fn gso_refused(sent: &io::Result<usize>) -> bool {
-    const EIO: i32 = 5;
-    const EINVAL: i32 = 22;
-    matches!(sent, Err(e) if matches!(e.raw_os_error(), Some(EIO | EINVAL)))
+    #[cfg(unix)]
+    const REFUSED: [i32; 2] = [5, 22]; // EIO, EINVAL
+                                       // WSAEINVAL, and WSAEOPNOTSUPP from a route that cannot segment.
+    #[cfg(windows)]
+    const REFUSED: [i32; 2] = [10022, 10045];
+    matches!(sent, Err(e) if e.raw_os_error().is_some_and(|c| REFUSED.contains(&c)))
 }
 
 /// Where the last long-header Handshake packet of a datagram ends, when
@@ -1543,9 +1552,15 @@ mod tests {
     #[test]
     fn a_refused_segmentation_offload_is_told_from_other_errors() {
         use std::io::{Error, ErrorKind};
-        assert!(super::gso_refused(&Err(Error::from_raw_os_error(5))));
-        assert!(super::gso_refused(&Err(Error::from_raw_os_error(22))));
-        assert!(!super::gso_refused(&Err(Error::from_raw_os_error(11))));
+        #[cfg(unix)]
+        let (refused, other) = ([5, 22], 11);
+        // WSAEINVAL and WSAEOPNOTSUPP; WSAEWOULDBLOCK is something else.
+        #[cfg(windows)]
+        let (refused, other) = ([10022, 10045], 10035);
+        for code in refused {
+            assert!(super::gso_refused(&Err(Error::from_raw_os_error(code))));
+        }
+        assert!(!super::gso_refused(&Err(Error::from_raw_os_error(other))));
         assert!(!super::gso_refused(&Err(Error::from(ErrorKind::Other))));
         assert!(!super::gso_refused(&Ok(1200)));
     }

@@ -37,10 +37,26 @@ webpki-roots = { version = "1", optional = true }
 # Which of several certificates is valid for the name a client asks for.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
 
+# Sends that do not wait (`send`) and the trusted roots in the system's
+# certificate stores. Already in the tree through giong.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security_Cryptography",
+] }
+
 [dev-dependencies]
 # The tests build rustls configurations of their own.
 giong-tls = { path = ".", features = ["unstable-rustls"] }
 rcgen = "0.13"
+
+# The soak test reads the process's handle count and working set.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [lints.rust]
 # Set by `cargo fuzz` (see fuzz/).

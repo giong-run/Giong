@@ -1,6 +1,8 @@
 //! Unix domain stream sockets.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -168,14 +170,25 @@ fn one_off_reads_work_and_do_not_mix_with_recv() {
 fn bind_and_connect_errors() {
     let path = SocketPath::new("errors");
     giong::block_on(async {
-        // Nobody is listening.
+        // Nobody is listening. Windows refuses the connection rather than
+        // saying the file is missing; the system's error is passed on.
         let err = UnixStream::connect(&path.0).await.unwrap_err();
+        #[cfg(unix)]
         assert_eq!(err.kind(), ErrorKind::NotFound);
+        #[cfg(windows)]
+        assert_eq!(err.kind(), ErrorKind::ConnectionRefused);
 
         // The file is in the way, as with the standard library.
         let listener = UnixListener::bind(&path.0).unwrap();
         let err = UnixListener::bind(&path.0).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::AddrInUse);
+        // Windows says why, and how to get out of it.
+        #[cfg(windows)]
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::UnixSocketInUse),
+            "{err}"
+        );
 
         // A socket file whose listener is gone refuses connections.
         drop(listener);
@@ -185,6 +198,8 @@ fn bind_and_connect_errors() {
     });
 }
 
+// The standard library has Unix sockets on Unix only.
+#[cfg(unix)]
 #[test]
 fn works_with_the_standard_library_on_the_other_side() {
     let path = SocketPath::new("std");
@@ -225,6 +240,7 @@ fn works_with_the_standard_library_on_the_other_side() {
 /// together with the peer's `shutdown(Write)` and more than 32 buffers of it
 /// were unread: the end of the stream was never reported, and this reader
 /// hung until the peer closed.
+#[cfg(unix)]
 #[test]
 fn the_end_of_the_stream_is_seen_after_data_that_was_waiting() {
     const BUFFER: usize = 4096;
@@ -309,5 +325,106 @@ fn many_connections_at_once() {
         for client in clients {
             client.await.unwrap();
         }
+    });
+}
+
+#[test]
+fn addresses_name_the_listener_and_leave_the_client_unnamed() {
+    let path = SocketPath::new("addrs");
+    giong::block_on(async {
+        let listener = UnixListener::bind(&path.0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.as_pathname(), Some(path.0.as_path()));
+        let client = UnixStream::connect(&path.0).await.unwrap();
+        let server = listener.accept().await.unwrap();
+        assert_eq!(
+            client.peer_addr().unwrap().as_pathname(),
+            Some(path.0.as_path())
+        );
+        assert!(client.local_addr().unwrap().is_unnamed());
+        assert!(server.peer_addr().unwrap().is_unnamed());
+    });
+}
+
+#[test]
+fn a_pair_is_connected_both_ways_and_leaves_no_file() {
+    giong::block_on(async {
+        let (a, b) = UnixStream::pair().unwrap();
+        a.write_all(b"ping".to_vec()).await.0.unwrap();
+        assert_eq!(recv_exact(&b, 4).await, b"ping");
+        b.write_all(b"pong".to_vec()).await.0.unwrap();
+        assert_eq!(recv_exact(&a, 4).await, b"pong");
+        a.shutdown(Shutdown::Write).unwrap();
+        assert!(b.recv().await.unwrap().is_empty());
+        // Windows makes the pair through a listener whose file is gone.
+        #[cfg(windows)]
+        if let Some(path) = b.local_addr().unwrap().as_pathname() {
+            assert!(!path.exists(), "{path:?} was left behind");
+        }
+    });
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_refuses_paths_it_cannot_hold_with_a_code() {
+    let long = std::env::temp_dir().join("x".repeat(120));
+    giong::block_on(async {
+        let err = UnixListener::bind(&long).unwrap_err();
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::UnixPathTooLong),
+            "{err}"
+        );
+        let err = UnixStream::connect(&long).await.unwrap_err();
+        assert_eq!(
+            giong::error::code(&err),
+            Some(giong::error::Code::UnixPathTooLong),
+            "{err}"
+        );
+    });
+}
+
+/// Connects and accepts dropped mid-flight give back everything they held,
+/// on every driver (on Windows the connect is a `ConnectEx` and the accept
+/// an `AcceptEx`, both cancelled through the completion port).
+#[test]
+fn dropped_connects_and_accepts_leave_nothing_behind() {
+    let path = SocketPath::new("dropped");
+    giong::block_on(async {
+        let listener = UnixListener::bind(&path.0).unwrap();
+        // An accept nobody connects to.
+        assert!(timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err());
+        // Connects the listener never accepts, dropped wherever they are.
+        for _ in 0..50 {
+            let _ = timeout(Duration::from_micros(1), UnixStream::connect(&path.0)).await;
+        }
+        drop(listener);
+        giong::time::sleep(Duration::from_millis(50)).await;
+        let stats = giong::observe::worker_stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+        assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
+    });
+}
+
+/// As over TCP: shutting down the read half ends a `recv` that waits.
+#[test]
+fn shutting_down_the_read_half_ends_a_waiting_recv() {
+    giong::block_on(async {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let a = Rc::new(a);
+        let reader = {
+            let a = a.clone();
+            giong::spawn(async move { a.recv().await })
+        };
+        giong::time::sleep(Duration::from_millis(50)).await;
+        a.shutdown(Shutdown::Read).unwrap();
+        let got = timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the recv ended")
+            .unwrap()
+            .unwrap();
+        assert!(got.is_empty(), "the end of the stream");
     });
 }

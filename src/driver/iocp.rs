@@ -57,12 +57,13 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockname, getsockopt, ioctlsocket, recv, recvfrom, setsockopt,
     TransmitFile, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSASend, WSASendMsg,
-    WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX,
-    LPFN_WSARECVMSG, MSG_PEEK, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
-    SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_TYPE,
-    SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED, WSAECONNRESET,
-    WSAEINVAL, WSAEMSGSIZE, WSAENOTCONN, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX,
-    WSAID_CONNECTEX, WSAID_WSARECVMSG, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+    WSASendTo, WSASocketW, AF_INET6, AF_UNIX, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX,
+    LPFN_CONNECTEX, LPFN_WSARECVMSG, MSG_PEEK, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER,
+    SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET,
+    SO_TYPE, SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED,
+    WSAECONNRESET, WSAEINVAL, WSAEMSGSIZE, WSAENOTCONN, WSAEOPNOTSUPP, WSAESHUTDOWN,
+    WSAEWOULDBLOCK, WSAID_ACCEPTEX, WSAID_CONNECTEX, WSAID_WSARECVMSG, WSAMSG,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
 };
 use windows_sys::Win32::Networking::WinSock::{
     SO_PROTOCOL_INFOW, WSAPROTOCOL_INFOW, XP1_IFS_HANDLES,
@@ -225,6 +226,9 @@ struct Record {
     /// A read of a file or pipe: a pipe whose writer is gone ends it like
     /// the end of a file.
     reading: bool,
+    /// A stream receive cancelled because the socket's reading side was
+    /// shut (see [`Iocp::end_reads`]): it reports the end of the stream.
+    read_shut: bool,
     /// A blocking job's flag, which a job that has not started yet checks.
     cancel: Option<Arc<super::blocking::Cancel>>,
     accepting: Option<Box<Accepting>>,
@@ -309,6 +313,7 @@ const DATAGRAM_HEADER: usize = 16;
 unsafe fn finish_datagram(
     buf: *mut u8,
     from_len: i32,
+    control_len: u32,
     res: i32,
     room: usize,
 ) -> Result<usize, i32> {
@@ -317,7 +322,7 @@ unsafe fn finish_datagram(
         n if n == -WSAEMSGSIZE => (room, MSG_TRUNC),
         e => return Err(e),
     };
-    let fields = [from_len.max(0) as u32, 0, payload as u32, flags];
+    let fields = [from_len.max(0) as u32, control_len, payload as u32, flags];
     for (i, field) in fields.iter().enumerate() {
         ptr::copy_nonoverlapping(field.to_ne_bytes().as_ptr(), buf.add(i * 4), 4);
     }
@@ -558,6 +563,7 @@ impl Iocp {
             state,
             sending: false,
             reading: false,
+            read_shut: false,
             cancel: None,
             accepting: None,
         }))
@@ -801,7 +807,9 @@ impl Iocp {
     }
 
     /// `ConnectEx`, which wants a bound socket: one that is not bound yet
-    /// is bound to any address of the peer's family first.
+    /// is bound to any address of the peer's family first, or for a Unix
+    /// socket to the unnamed address (the family alone), which leaves no
+    /// file behind.
     ///
     /// # Safety
     ///
@@ -820,7 +828,14 @@ impl Iocp {
         // SAFETY: the caller guarantees `addr`; the wildcard addresses are
         // zeroed locals of their family's size.
         unsafe {
-            let rc = if (*addr).sa_family == AF_INET6 {
+            let rc = if (*addr).sa_family == AF_UNIX {
+                let unnamed: u16 = AF_UNIX;
+                bind(
+                    socket,
+                    (&unnamed as *const u16).cast(),
+                    mem::size_of::<u16>() as i32,
+                )
+            } else if (*addr).sa_family == AF_INET6 {
                 let mut any: SOCKADDR_IN6 = mem::zeroed();
                 any.sin6_family = AF_INET6;
                 bind(
@@ -1031,6 +1046,41 @@ impl Iocp {
         self.multi(key).last = true;
     }
 
+    /// The reading side of stream `socket` was shut. Windows leaves the
+    /// receives that wait on it waiting, where Unix ends them, so they are
+    /// cancelled here: a one-off receive then completes with the end of
+    /// the stream (`read_shut`), and the zero-byte receive of the multishot
+    /// receive wakes its readers, whose next read meets the shut side
+    /// (`WSAESHUTDOWN`) and reports the end of the stream too.
+    pub(crate) fn end_reads(&mut self, socket: SOCKET) {
+        for slot in self.ops.iter_mut() {
+            let record = match slot {
+                Slot::Single(record) => *record,
+                Slot::Multi(multi) if matches!(multi.io, Some(MultiIo::Recv { .. })) => {
+                    multi.pending
+                }
+                Slot::Multi(_) => continue,
+            };
+            if record.is_null() {
+                continue;
+            }
+            // SAFETY: the records the slots name are alive until their
+            // completion, which has not been processed yet.
+            let rec = unsafe { &mut *record };
+            let receiving = matches!(rec.after, After::Received { .. });
+            let multi_wait = matches!(rec.state, State::Multi(_));
+            if rec.handle as SOCKET != socket || !(receiving || multi_wait) {
+                continue;
+            }
+            if matches!(rec.state, State::Waiting(_)) {
+                rec.read_shut = true;
+            }
+            if matches!(rec.state, State::Waiting(_) | State::Multi(_)) {
+                Self::cancel(rec);
+            }
+        }
+    }
+
     /// The socket of an accept that completed and was not collected yet,
     /// for a listener that goes away while others share its address; no
     /// further accept is started.
@@ -1078,8 +1128,8 @@ impl Iocp {
             MultiIo::Recv { fd, .. } => self.poll_recv(key, fd, waker),
             MultiIo::RecvMsg { fd, hdr } => {
                 // SAFETY: the header of a multishot receive outlives it.
-                let name_len = unsafe { (*hdr).namelen }.max(0) as usize;
-                self.poll_recv_msg(key, fd, name_len, waker)
+                let (name_len, control) = unsafe { ((*hdr).namelen, (*hdr).Control.len) };
+                self.poll_recv_msg(key, fd, name_len.max(0) as usize, control as usize, waker)
             }
         }
     }
@@ -1110,6 +1160,11 @@ impl Iocp {
                 return MultiPoll::Item(0);
             }
             let err = wsa_error();
+            if err == WSAESHUTDOWN {
+                // The reading side was shut here (see `end_reads`): the end
+                // of the stream, as a receive on Unix reports it.
+                return MultiPoll::Item(0);
+            }
             if err != WSAEWOULDBLOCK {
                 self.disarm(key);
                 return MultiPoll::Item(-err);
@@ -1170,18 +1225,34 @@ impl Iocp {
     /// as a stream does (libuv waits the same way); a buffer per waiting
     /// receive cost every idle socket its own, and every wait an
     /// allocation.
+    ///
+    /// With `control` bytes of room for control messages (ECN, the local
+    /// address, the URO segment size), between the address field and the
+    /// payload, the read is a `WSARecvMsg`. The wait is the same peek.
     fn poll_recv_msg(
         &mut self,
         key: usize,
         socket: SOCKET,
         name_len: usize,
+        control: usize,
         waker: &Waker,
     ) -> MultiPoll {
         if let Err(e) = self.register(socket as HANDLE, true) {
             self.disarm(key);
             return MultiPoll::Item(e);
         }
-        let overhead = DATAGRAM_HEADER + name_len;
+        let recv_msg = if control > 0 {
+            match self.recv_msg_for(socket) {
+                Ok(f) => Some(f),
+                Err(code) => {
+                    self.disarm(key);
+                    return MultiPoll::Item(-code);
+                }
+            }
+        } else {
+            None
+        };
+        let overhead = DATAGRAM_HEADER + name_len + control;
         // At most twice: a wait that completes inside its call says a
         // datagram is there now.
         for _ in 0..2 {
@@ -1197,23 +1268,56 @@ impl Iocp {
             }
             let room = len - overhead;
             let mut from_len = name_len as i32;
-            // SAFETY: `buf` is a free pool buffer of `len` bytes: the payload
-            // goes behind the header and the address field, the address into
-            // its field. The socket is non-blocking.
-            let n = unsafe {
-                recvfrom(
-                    socket,
-                    buf.add(overhead),
-                    room.min(i32::MAX as usize) as i32,
-                    0,
-                    buf.add(DATAGRAM_HEADER).cast(),
-                    &mut from_len,
-                )
+            let mut control_len = 0u32;
+            let n = match recv_msg {
+                // SAFETY: `buf` is a free pool buffer of `len` bytes: the
+                // payload goes behind the header and the address field, the
+                // address into its field. The socket is non-blocking.
+                None => unsafe {
+                    recvfrom(
+                        socket,
+                        buf.add(overhead),
+                        room.min(i32::MAX as usize) as i32,
+                        0,
+                        buf.add(DATAGRAM_HEADER).cast(),
+                        &mut from_len,
+                    )
+                },
+                // SAFETY: as above, with the control messages between the
+                // address field and the payload. The header and its piece
+                // are locals: without an `OVERLAPPED` the call is over when
+                // it returns.
+                Some(recv_msg) => unsafe {
+                    let mut piece = WSABUF {
+                        len: room.min(u32::MAX as usize) as u32,
+                        buf: buf.add(overhead),
+                    };
+                    let mut msg = WSAMSG {
+                        name: buf.add(DATAGRAM_HEADER).cast(),
+                        namelen: name_len as i32,
+                        lpBuffers: &mut piece,
+                        dwBufferCount: 1,
+                        Control: WSABUF {
+                            len: control as u32,
+                            buf: buf.add(DATAGRAM_HEADER + name_len),
+                        },
+                        dwFlags: 0,
+                    };
+                    let mut got = 0u32;
+                    let rc = recv_msg(socket, &mut msg, &mut got, ptr::null_mut(), None);
+                    from_len = msg.namelen;
+                    control_len = msg.Control.len.min(control as u32);
+                    if rc == 0 {
+                        got as i32
+                    } else {
+                        -1
+                    }
+                },
             };
             let res = if n >= 0 { n } else { -wsa_error() };
             if res != -WSAEWOULDBLOCK {
                 // SAFETY: the pool buffer is longer than the header.
-                return match unsafe { finish_datagram(buf, from_len, res, room) } {
+                return match unsafe { finish_datagram(buf, from_len, control_len, res, room) } {
                     Ok(payload) => {
                         self.pool.take_next();
                         let len = (overhead + payload) as u32;
@@ -1523,6 +1627,9 @@ impl Iocp {
             if ok != 0 {
                 bytes as i32
             } else if Self::is_end(rec, err) {
+                0
+            } else if rec.read_shut && err == ERROR_OPERATION_ABORTED as i32 {
+                // Ended by `end_reads`: the reading side is shut.
                 0
             } else if !rec.socket && err == ERROR_MORE_DATA as i32 {
                 // Part of a pipe message: what came, as a stream read.

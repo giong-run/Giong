@@ -216,21 +216,7 @@ fn a_failed_send_is_reported_once_as_is_then_with_a_code() {
     giong::block_on(async {
         let (c, s) = pair().await;
         // The peer resets the connection: no lingering on close.
-        let linger = libc::linger {
-            l_onoff: 1,
-            l_linger: 0,
-        };
-        // SAFETY: a valid descriptor and a `linger` of the right size.
-        let rc = unsafe {
-            libc::setsockopt(
-                std::os::fd::AsRawFd::as_raw_fd(&s),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                (&linger as *const libc::linger).cast(),
-                std::mem::size_of::<libc::linger>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0);
+        with_socket(&s, |sock| sock.set_linger(Some(Duration::ZERO))).unwrap();
         drop(s);
         settle().await;
         let mut c = Compat::new(c);
@@ -457,23 +443,24 @@ mod futures_traits {
 fn wrapping_a_tcp_stream_turns_off_nagle() {
     giong::block_on(async {
         let (c, _s) = pair().await;
-        let mut on: libc::c_int = 0;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&c);
         let c = Compat::new(c);
-        // SAFETY: a valid descriptor, and an int-sized option buffer.
-        let rc = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_NODELAY,
-                (&mut on as *mut libc::c_int).cast(),
-                &mut len,
-            )
-        };
-        assert_eq!(rc, 0);
-        // Linux reports 1; macOS reports the flag bit (4). Non-zero is on.
-        assert_ne!(on, 0, "TCP_NODELAY is off");
+        let on = with_socket(c.get_ref(), |sock| sock.tcp_nodelay()).unwrap();
+        assert!(on, "TCP_NODELAY is off");
         drop(c);
     });
+}
+
+/// Runs `f` on the socket of `tcp`, through socket2.
+fn with_socket<R>(tcp: &giong::net::TcpStream, f: impl FnOnce(&socket2::SockRef<'_>) -> R) -> R {
+    // SAFETY: the socket belongs to `tcp`, which outlives the borrow.
+    #[cfg(unix)]
+    let raw = unsafe { std::os::fd::BorrowedFd::borrow_raw(std::os::fd::AsRawFd::as_raw_fd(tcp)) };
+    // SAFETY: as above.
+    #[cfg(windows)]
+    let raw = unsafe {
+        std::os::windows::io::BorrowedSocket::borrow_raw(
+            std::os::windows::io::AsRawSocket::as_raw_socket(tcp),
+        )
+    };
+    f(&socket2::SockRef::from(&raw))
 }

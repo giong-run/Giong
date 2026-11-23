@@ -437,10 +437,12 @@ dependencies = [
  "libc",
  "rcgen",
  "rustls",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -482,6 +484,7 @@ dependencies = [
  "rustls",
  "socket2",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -493,6 +496,8 @@ dependencies = [
  "giong-web",
  "libc",
  "serde_json",
+ "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -560,6 +565,7 @@ dependencies = [
  "rustls-pki-types",
  "rustls-webpki",
  "webpki-roots",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
