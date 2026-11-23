@@ -17,7 +17,10 @@ pub const COMMAND: Command = Command {
     name: "dashboard",
     summary: "open the local dashboard of the running service in the browser",
     usage: "giong dashboard [--port <n>] [--mcp <address>] [--base-url <url>] [--log <file>]\n\n\
-            Serves a page on http://127.0.0.1:7700 (only this machine can open it) with the \
+            Serves a page on 127.0.0.1:7700 and prints its address, \
+            http://127.0.0.1:7700/#t=<token>: the token is new on each start and the page's \
+            API refuses requests without it (GIONG-E5051), so only the person who started it can \
+            use it. The page shows the \
             service giong dev runs in this project: build state and the last error, the live \
             request log with status and time taken (bodies too when the router has giong-web's \
             Record middleware), routes with curl lines and an OpenAPI download, workers and \

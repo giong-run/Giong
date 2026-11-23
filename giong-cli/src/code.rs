@@ -77,6 +77,8 @@ codes! {
     MIGRATION_UNKNOWN = 5047, "MigrationUnknown", "the database has a migration the project does not";
     DB_NOT_MANAGED = 5048, "DbNotManaged", "the database was not started by giong db up";
     DB_START_FAILED = 5049, "DbStartFailed", "the database container could not start";
+    RECORD_SECRET = 5050, "RecordSecret", "a recorded value looks like a secret";
+    DASHBOARD_TOKEN = 5051, "DashboardToken", "the dashboard refused a request without its token";
     DASHBOARD_PORT_IN_USE = 5053, "DashboardPortInUse", "the dashboard's port is in use";
     DASHBOARD_FAILED = 5054, "DashboardFailed", "the dashboard could not do what the page asked";
     WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";

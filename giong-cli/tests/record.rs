@@ -408,3 +408,81 @@ fn usage_mistakes_are_coded() {
     );
     assert_eq!(exit, 2, "{r}");
 }
+
+/// The leak the dev kit audit found with a crafted log: a password in a
+/// POST body, an API key in a query and a card number reached
+/// tests/recorded/*.json, which is meant to be committed.
+#[test]
+fn secrets_stay_out_of_saved_cases() {
+    let dir = temp_dir("secrets");
+    let log = dir.join("secrets.log");
+    let x = |method: &str, path: &str, query: Value, body: &str| {
+        json!({
+            "event": "exchange", "method": method, "path": path, "query": query, "route": path,
+            "status": 200, "duration_us": 1,
+            "request": {"headers": [["content-type", "application/json"]], "body": body,
+                        "body_len": body.len(), "truncated": false, "streamed": false},
+            "response": {"headers": [["content-type", "application/json"]], "body": "{\"ok\":true}",
+                         "body_len": 11, "truncated": false, "streamed": false}
+        })
+        .to_string()
+    };
+    let lines = [
+        x(
+            "POST",
+            "/login",
+            Value::Null,
+            r#"{"user":"ana","password":"hunter2-SECRET"}"#,
+        ),
+        x("GET", "/search", json!("q=shoes&api_key=AK-SECRET-123"), ""),
+        x(
+            "POST",
+            "/pay",
+            Value::Null,
+            r#"{"pan":"4242424242424242","amount":10}"#,
+        ),
+    ];
+    std::fs::write(&log, lines.join("\n") + "\n").unwrap();
+    let from = log.to_str().unwrap();
+    let file = dir.join("tests/recorded/recorded.json");
+
+    // The card number is under a name that says nothing: save refuses.
+    let (exit, r) = giong(&dir, &["record", "save", "all", "--from", from], &[]);
+    assert_ne!(exit, 0, "{r}");
+    assert_eq!(r["error"]["code"], "GIONG-E5050", "{r}");
+    let what = r["error"]["message"].as_str().unwrap();
+    assert!(what.contains("request.body.pan (a card number)"), "{what}");
+    assert!(!file.exists(), "nothing is written when save refuses");
+
+    // The password and the API key are read from the environment, never
+    // written; --keep-secrets saves the test card, with a warning.
+    let (exit, r) = giong(
+        &dir,
+        &["record", "save", "all", "--from", from, "--keep-secrets"],
+        &[],
+    );
+    assert_eq!(exit, 0, "{r}");
+    assert_eq!(codes(&r), vec!["GIONG-E5050"], "{r}");
+    let env: Vec<&str> = r["data"]["env"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        env,
+        ["GIONG_RECORD_API_KEY", "GIONG_RECORD_PASSWORD"],
+        "{r}"
+    );
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        !text.contains("hunter2") && !text.contains("AK-SECRET"),
+        "{text}"
+    );
+    assert!(text.contains("{{env:GIONG_RECORD_PASSWORD}}"), "{text}");
+    assert!(
+        text.contains("api_key={{env:GIONG_RECORD_API_KEY}}"),
+        "{text}"
+    );
+    assert!(text.contains("4242424242424242"), "{text}");
+}

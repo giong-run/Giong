@@ -13,10 +13,14 @@
 //!
 //! The server listens on 127.0.0.1 only. It answers only requests whose
 //! `Host` is that loopback address (so a web page cannot reach it by DNS
-//! rebinding), and its API needs an `X-Giong-Dashboard` header, which a
-//! page of another origin cannot send without a CORS preflight the server
-//! refuses: other sites cannot read the dashboard or send requests through
-//! it.
+//! rebinding), and its API needs this start's random token in an
+//! `X-Giong-Dashboard` header. The token is in the address printed
+//! (`http://127.0.0.1:7700/#t=...`, after `#` so it is never sent in a
+//! request line, a log or a `Referer`), and the page sends it on each call.
+//! A page of another origin cannot send the header without a CORS preflight
+//! the server refuses, and another program or user on the machine does not
+//! know the token: neither can read the request log, which holds bodies, nor
+//! send requests through the dashboard.
 
 pub mod api;
 pub mod http;
@@ -24,7 +28,7 @@ pub mod http;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -53,6 +57,32 @@ pub struct Dashboard {
     listener: TcpListener,
     addr: SocketAddr,
     target: Arc<Target>,
+    token: Arc<str>,
+}
+
+/// 128 random bits as 32 hex digits: from the system's random source, or,
+/// where there is none to read, from the standard library's randomly keyed
+/// hasher (seeded by the system per process) mixed with the time.
+fn new_token() -> String {
+    let mut bytes = [0u8; 16];
+    let read = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| io::Read::read_exact(&mut f, &mut bytes))
+        .is_ok();
+    if !read {
+        use std::hash::{BuildHasher, Hasher};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        for half in bytes.chunks_mut(8) {
+            let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+            h.write_u128(now);
+            h.write_u64(CALLS.fetch_add(1, Ordering::Relaxed));
+            h.write_u32(std::process::id());
+            half.copy_from_slice(&h.finish().to_le_bytes());
+        }
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Dashboard {
@@ -64,6 +94,7 @@ impl Dashboard {
             listener,
             addr,
             target: Arc::new(target),
+            token: new_token().into(),
         })
     }
 
@@ -84,9 +115,14 @@ impl Dashboard {
         self.addr
     }
 
-    /// The address to open in a browser.
+    /// The address to open in a browser, with this start's token.
     pub fn url(&self) -> String {
-        format!("http://{}/", self.addr)
+        format!("http://{}/#t={}", self.addr, self.token)
+    }
+
+    /// The token the API needs in `X-Giong-Dashboard`.
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// Serves until the process ends.
@@ -100,12 +136,13 @@ impl Dashboard {
             }
             active.fetch_add(1, Ordering::AcqRel);
             let target = self.target.clone();
+            let token = self.token.clone();
             let counter = active.clone();
             let port = self.addr.port();
             let spawned = thread::Builder::new()
                 .name("giong-dashboard".into())
                 .spawn(move || {
-                    http::serve_connection(stream, port, &|req| api::handle(req, &target));
+                    http::serve_connection(stream, port, &token, &|req| api::handle(req, &target));
                     counter.fetch_sub(1, Ordering::AcqRel);
                 });
             if spawned.is_err() {
@@ -117,8 +154,9 @@ impl Dashboard {
 }
 
 /// Starts the dashboard for `giong dev --ui` on a background thread: binds
-/// `port` or one of the nine after it, and gives the address bound.
-pub fn spawn(root: PathBuf, port: u16) -> io::Result<SocketAddr> {
+/// `port` or one of the nine after it, and gives the address to open (with
+/// its token).
+pub fn spawn(root: PathBuf, port: u16) -> io::Result<String> {
     let d = Dashboard::bind_near(
         port,
         10,
@@ -127,9 +165,31 @@ pub fn spawn(root: PathBuf, port: u16) -> io::Result<SocketAddr> {
             ..Target::default()
         },
     )?;
-    let addr = d.local_addr();
+    let url = d.url();
     thread::Builder::new()
         .name("giong-dashboard".into())
         .spawn(move || d.serve())?;
-    Ok(addr)
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_are_long_random_and_in_the_address() {
+        let a = new_token();
+        let b = new_token();
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        let d = Dashboard::bind(0, Target::default()).unwrap();
+        assert!(
+            d.url().ends_with(&format!("/#t={}", d.token())),
+            "{}",
+            d.url()
+        );
+        let e = Dashboard::bind(0, Target::default()).unwrap();
+        assert_ne!(d.token(), e.token(), "each start has its own token");
+    }
 }

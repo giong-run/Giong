@@ -101,7 +101,7 @@ giong openapi [--out FILE] [--title TEXT] [--mcp ADDRESS] [--base-url URL]
 ```sh
 giong record list [--route TEXT] [--method M] [--status 404|4xx] [--limit N] [--from LOG]
 giong record show NUMBER
-giong record save NUMBERS|3-7|last|all [--name NAME | --out FILE] [--append | --force]
+giong record save NUMBERS|3-7|last|all [--name NAME | --out FILE] [--append | --force] [--keep-secrets]
 giong record replay [FILE...] [--base-url URL] [--timeout-ms N]
 ```
 
@@ -110,7 +110,8 @@ Turns real requests into tests. Add giong-web's `Record` middleware to the route
 - dates, UUIDs, hex ids and tokens the service made become placeholders such as `{{uuid}}` and `{{time}}`
 - an id the service made and a later request uses is captured (`{{capture:user_id}}`) and filled in again, so the cases pass against a service whose ids start elsewhere
 - values the request itself sent stay literal, and the answer refers to them by name (`"no user {{user_id}}"`)
-- redacted headers are read from `GIONG_RECORD_<HEADER>` when the cases run
+- secrets stay out of the file: redacted headers, and request fields whose names say secret (`password`, `token`, `api_key`, `client_secret`, `card_number`, `cvv` and the like) in the query, a form or a JSON body, are read from `GIONG_RECORD_<NAME>` when the cases run (`card.number` from `GIONG_RECORD_CARD_NUMBER`); such fields in answers become `{{string}}`
+- `save` refuses, with `GIONG-E5050`, to write a value that still looks like a secret: a card number (by the Luhn check), a JWT, or a value under a secret name. `--keep-secrets` saves it anyway, for test values such as the `4242 4242 4242 4242` test card
 
 `replay` sends the cases in order to the running service (or `--base-url`) and checks each answer: the status, `Content-Type`, the headers recorded and the body field by field. A difference is a `GIONG-E5066` error at the case's line with the expected and actual values, so `giong record replay` fails a CI run the way a test does. Case files are plain JSON, meant to be read, edited and committed.
 
@@ -129,7 +130,7 @@ One page in the browser for the service `giong dev` runs in this project, on `ht
 - connection pools, the service's own output, and its warnings with their error pages
 - a box to send any request to the service
 
-It reads what the service already gives, its output and its giong-mcp, so the service runs no extra code for it. Only this machine can open it: it listens on 127.0.0.1, answers only a loopback `Host`, and its API needs a header that pages of other sites cannot send, so a web page cannot read it or send requests through it. `giong dev --ui` starts it with the service.
+It reads what the service already gives, its output and its giong-mcp, so the service runs no extra code for it. Only the person who started it can use it. It listens on 127.0.0.1 and answers only a loopback `Host`. Each start makes a random token, which is part of the address printed (`http://127.0.0.1:7700/#t=...`), and the API refuses any request without it (`GIONG-E5051`). The token comes after `#`, so no request line, log or `Referer` carries it, and the page takes it out of the address bar once read. A web page cannot read the dashboard or send requests through it, and neither can another program or user on the machine, though the request log holds bodies. `giong dev --ui` starts it with the service and prints its address.
 
 ## giong db
 

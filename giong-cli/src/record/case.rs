@@ -40,6 +40,7 @@ use serde_json::{json, Map, Value};
 
 use super::exchange::Exchange;
 use super::matcher::{self, as_text, Ph};
+use super::secret::{self, is_secret_name};
 use super::{base64, shape};
 
 /// The version of the case file format.
@@ -513,9 +514,59 @@ struct Builder<'u> {
     /// so the answer's text can refer to them (`"no user {{user_id}}"`).
     in_request: bool,
     used_now: Vec<(String, String)>,
+    /// The environment variables secret request values are read from.
+    env: BTreeSet<String>,
 }
 
 impl Builder<'_> {
+    /// `{{env:GIONG_RECORD_<NAME>}}`, for a secret value under `name`.
+    fn secret_env(&mut self, name: &str) -> String {
+        let var = env_var(name);
+        let ph = format!("{{{{env:{var}}}}}");
+        self.env.insert(var);
+        ph
+    }
+
+    /// Whether a request value under `name` is read from the environment:
+    /// `Record` redacted it, or its name says secret. Empty values and
+    /// placeholders stay.
+    fn is_secret_value(name: &str, value: &str) -> bool {
+        value == REDACTED
+            || (!value.is_empty() && matcher::whole(value).is_none() && is_secret_name(name))
+    }
+
+    /// A query string or form body with its secret values made
+    /// `{{env:...}}`, other pairs as they were.
+    fn redact_pairs(&mut self, q: &str) -> String {
+        q.split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((k, v)) if Self::is_secret_value(&secret::percent_decode(k), v) => {
+                    let ph = self.secret_env(&secret::percent_decode(k));
+                    format!("{k}={ph}")
+                }
+                _ => pair.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    /// A JSON request value under a secret name: strings and numbers are
+    /// read from the environment (`card.number` from
+    /// GIONG_RECORD_CARD_NUMBER), objects and lists keep their shape.
+    fn secret_json(&mut self, name: &str, v: &Value) -> Value {
+        match v {
+            Value::Object(o) => Value::Object(
+                o.iter()
+                    .map(|(k, x)| (k.clone(), self.secret_json(&format!("{name}_{k}"), x)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(|x| self.secret_json(name, x)).collect()),
+            Value::String(s) if s.is_empty() || matcher::whole(s).is_some() => v.clone(),
+            Value::String(_) | Value::Number(_) => Value::String(self.secret_env(name)),
+            Value::Null | Value::Bool(_) => v.clone(),
+        }
+    }
+
     /// The newest candidate holding `v`, if `v` can be one.
     fn find(&self, v: &Value) -> Option<usize> {
         let useful = match v {
@@ -602,6 +653,10 @@ impl Builder<'_> {
         split_query(q)
             .into_iter()
             .map(|(k, v)| {
+                let name = secret::percent_decode(&k);
+                if Self::is_secret_value(&name, &v) {
+                    return format!("{k}={}", self.secret_env(&name));
+                }
                 let as_num = v
                     .parse::<i64>()
                     .ok()
@@ -631,10 +686,20 @@ impl Builder<'_> {
         match v {
             Value::Object(o) => Value::Object(
                 o.iter()
-                    .map(|(k, x)| (k.clone(), self.request_json(Some(k), x)))
+                    .map(|(k, x)| {
+                        let x = if is_secret_name(k) {
+                            self.secret_json(k, x)
+                        } else {
+                            self.request_json(Some(k), x)
+                        };
+                        (k.clone(), x)
+                    })
                     .collect(),
             ),
             Value::Array(a) => Value::Array(a.iter().map(|x| self.request_json(key, x)).collect()),
+            Value::String(s) if s == REDACTED => {
+                Value::String(self.secret_env(key.unwrap_or("value")))
+            }
             Value::String(s) if matcher::whole(s).is_some() || s.contains("{{") => {
                 // A literal that looks like a placeholder would be read as
                 // one: keep it, the note in `build` warns.
@@ -663,6 +728,10 @@ impl Builder<'_> {
                     .collect(),
             ),
             Value::Null | Value::Bool(_) => v.clone(),
+            Value::String(s) if key.is_some_and(is_secret_name) && matcher::whole(s).is_none() => {
+                json!("{{string}}")
+            }
+            Value::Number(_) if key.is_some_and(is_secret_name) => json!("{{number}}"),
             _ => {
                 let id_key = key.is_some_and(shape::is_id_key);
                 // A value an earlier answer gave and a request has used
@@ -760,7 +829,32 @@ impl Builder<'_> {
                 marker(self.cands.len() - 1)
             })
             .collect();
-        format!("{}{}", segs.join("/"), mask_text(rest))
+        // Secret query values (`?token=...` in a reset link) are not kept.
+        let rest = match rest.strip_prefix('?') {
+            Some(q) => {
+                let (q, frag) = q.split_once('#').map_or((q, ""), |(q, f)| (q, f));
+                let q = q
+                    .split('&')
+                    .map(|pair| match pair.split_once('=') {
+                        Some((k, v))
+                            if !v.is_empty() && is_secret_name(&secret::percent_decode(k)) =>
+                        {
+                            format!("{k}={{{{string}}}}")
+                        }
+                        _ => mask_text(pair),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("&");
+                let frag = if frag.is_empty() {
+                    String::new()
+                } else {
+                    format!("#{}", mask_text(frag))
+                };
+                format!("?{q}{frag}")
+            }
+            None => mask_text(rest),
+        };
+        format!("{}{}", segs.join("/"), rest)
     }
 }
 
@@ -903,6 +997,7 @@ pub fn build(exchanges: &[&Exchange], names: &mut BTreeSet<String>) -> Built {
         names,
         in_request: false,
         used_now: Vec::new(),
+        env: BTreeSet::new(),
     };
     let mut case_names: BTreeSet<String> = BTreeSet::new();
     for x in exchanges {
@@ -920,10 +1015,9 @@ pub fn build(exchanges: &[&Exchange], names: &mut BTreeSet<String>) -> Built {
             if DROPPED_REQUEST_HEADERS.contains(&n.as_str()) {
                 continue;
             }
-            if v == REDACTED {
-                let var = env_var(n);
-                headers.push((n.clone(), format!("{{{{env:{var}}}}}")));
-                out.env.insert(var);
+            if Builder::is_secret_value(n, v) {
+                let ph = b.secret_env(n);
+                headers.push((n.clone(), ph));
             } else {
                 headers.push((n.clone(), v.clone()));
             }
@@ -946,7 +1040,11 @@ pub fn build(exchanges: &[&Exchange], names: &mut BTreeSet<String>) -> Built {
                         .into(),
                 ));
             }
-            Body::Text(t)
+            if is_form(&x.request.headers) {
+                Body::Text(b.redact_pairs(&t))
+            } else {
+                Body::Text(t)
+            }
         } else {
             Body::Bytes(x.request.body.clone())
         };
@@ -1047,7 +1145,17 @@ pub fn build(exchanges: &[&Exchange], names: &mut BTreeSet<String>) -> Built {
     for c in &mut out.cases {
         finish(c, &b.cands);
     }
+    out.env.append(&mut b.env);
     out
+}
+
+/// Whether a request says its body is a form (`a=1&b=2`).
+pub fn is_form(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(n, v)| {
+        n.eq_ignore_ascii_case("content-type")
+            && v.to_ascii_lowercase()
+                .contains("application/x-www-form-urlencoded")
+    })
 }
 
 /// The body as JSON when it is a JSON object or list (by content type or
@@ -1244,6 +1352,80 @@ mod tests {
             json!(["authorization", "{{env:GIONG_RECORD_AUTHORIZATION}}"])
         );
         assert!(b.env.contains("GIONG_RECORD_AUTHORIZATION"));
+    }
+
+    /// The leak the dev kit audit found: a password in a JSON body, an API
+    /// key in a query and a card number reached the case file.
+    #[test]
+    fn secret_request_fields_read_the_environment() {
+        let b = built(&[line(
+            "POST",
+            "/login?api_key=AK-SECRET-123&page=2",
+            200,
+            r#"{"user":"ana","password":"hunter2-SECRET","card":{"number":"4242424242424242","cvv":123},"note":"[redacted]","empty_token":""}"#,
+            r#"{"token":"abc.def","user":{"id":7,"api_key":"AK-2"},"ok":true}"#,
+        )]);
+        let c = &b.cases[0];
+        assert_eq!(
+            c["request"]["query"],
+            "api_key={{env:GIONG_RECORD_API_KEY}}&page=2"
+        );
+        assert_eq!(
+            c["request"]["body_json"],
+            json!({
+                "user": "ana",
+                "password": "{{env:GIONG_RECORD_PASSWORD}}",
+                "card": {
+                    "number": "{{env:GIONG_RECORD_CARD_NUMBER}}",
+                    "cvv": "{{env:GIONG_RECORD_CARD_CVV}}"
+                },
+                "note": "{{env:GIONG_RECORD_NOTE}}",
+                "empty_token": ""
+            })
+        );
+        assert_eq!(c["expect"]["body_json"]["token"], "{{string}}");
+        assert_eq!(c["expect"]["body_json"]["user"]["api_key"], "{{string}}");
+        for v in [
+            "GIONG_RECORD_API_KEY",
+            "GIONG_RECORD_PASSWORD",
+            "GIONG_RECORD_CARD_NUMBER",
+            "GIONG_RECORD_CARD_CVV",
+            "GIONG_RECORD_NOTE",
+            "GIONG_RECORD_AUTHORIZATION",
+        ] {
+            assert!(b.env.contains(v), "{v}: {:?}", b.env);
+        }
+        let text = c.to_string();
+        for leak in ["hunter2", "AK-SECRET", "4242", "AK-2"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+        assert!(secret::scan(c).is_empty(), "{:?}", secret::scan(c));
+    }
+
+    #[test]
+    fn form_bodies_headers_and_locations_keep_no_secrets() {
+        let mut v: Value = serde_json::from_str(&line("POST", "/session", 303, "", "")).unwrap();
+        v["request"]["headers"] = json!([
+            ["content-type", "application/x-www-form-urlencoded"],
+            ["x-session-token", "s3cr3t"],
+            ["x-trace", "keep"]
+        ]);
+        v["request"]["body"] = json!("user=ana&pass%77ord=hunter2&remember=1");
+        v["response"]["headers"] = json!([["location", "/reset?token=T0K3N&step=2#top"]]);
+        let b = built(&[v.to_string()]);
+        let c = &b.cases[0];
+        assert_eq!(
+            c["request"]["body"],
+            "user=ana&pass%77ord={{env:GIONG_RECORD_PASSWORD}}&remember=1"
+        );
+        let h = c["request"]["headers"].to_string();
+        assert!(h.contains("{{env:GIONG_RECORD_X_SESSION_TOKEN}}"), "{h}");
+        assert!(h.contains("keep"), "{h}");
+        assert_eq!(
+            c["expect"]["headers"]["location"],
+            "/reset?token={{string}}&step=2#top"
+        );
+        assert!(!c.to_string().contains("hunter2") && !c.to_string().contains("T0K3N"));
     }
 
     #[test]

@@ -76,7 +76,8 @@ pub fn request(case: &Case, vars: &Vars, env: Env<'_>) -> Result<Outgoing, Missi
     }
     let body = match &r.body {
         Body::None | Body::Unchecked(_) => Vec::new(),
-        Body::Text(t) => fill_text(t, vars, env, false)?.into_bytes(),
+        // A form's values are percent-encoded, like a query's.
+        Body::Text(t) => fill_text(t, vars, env, super::case::is_form(&r.headers))?.into_bytes(),
         Body::Json(j) => fill_json(j, vars, env)?.to_string().into_bytes(),
         Body::Bytes(b) => b.clone(),
     };

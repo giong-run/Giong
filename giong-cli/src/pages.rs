@@ -2960,6 +2960,47 @@ Docker or Podman could not create, start or remove the database container, or th
 
 [All error codes](README.md)
 "#),
+    (5050, r#"# GIONG-E5050: a recorded value looks like a secret
+
+Raised by the `giong` command (giong-cli): `giong record save`. In JSON output: `"code": "GIONG-E5050"`. As an error, nothing was saved; as a warning (with `--keep-secrets`), the value was saved.
+
+## What happened
+
+Case files (`tests/recorded/*.json`) are tests, meant to be committed, so `save` keeps secrets out of them. Redacted headers and request fields whose names say secret (`password`, `token`, `api_key`, `client_secret`, `card_number`, `cvv`, `ssn`, ...) are written as `{{env:GIONG_RECORD_<NAME>}}` and read from the environment when replayed. After that, `save` looks at every value left. It refuses when one still looks like a secret:
+
+- a card number: 13 to 19 digits (spaces or dashes allowed between groups) starting with 2 to 6 and passing the Luhn check, under a field whose name says nothing (`"pan": "4242424242424242"`)
+- a JWT: `eyJ...` followed by two more dot-separated parts, in a body, a header or a `Location`
+- a value under a secret name that was not replaced, such as a header `x-session-token`
+
+The message names each place, as `<case>: <where> (<what>)`, for example `login_200: request.body.pan (a card number)`.
+
+## How to fix it
+
+- Leave that exchange out: `giong record list` shows the numbers, and `save 1-3,5` saves only those.
+- Record the request again with test values, then save the new exchange.
+- When the values already are test values (the `4242 4242 4242 4242` test card, a token made for tests), pass `--keep-secrets`. The values are saved, and each one is reported as a warning.
+- To check a file by hand, look for the places the message names; the rest of the file is as `save` would have written it.
+
+[All error codes](README.md)
+"#),
+    (5051, r#"# GIONG-E5051: the dashboard refused a request without its token
+
+Raised by the `giong` command (giong-cli): the dashboard of `giong dashboard` and `giong dev --ui`. The dashboard's API answers 403 with `"code": "GIONG-E5051"`.
+
+## What happened
+
+Each start of the dashboard makes a random token and prints the address with it: `http://127.0.0.1:7700/#t=<32 hex digits>`. Every request to the dashboard's API (`/api/...`) must send that token in the `X-Giong-Dashboard` header, and the page does so. A request without it, or with another start's token, is refused. This keeps the live request log (which holds bodies) and the send box away from other programs and users on the machine, and from web pages.
+
+Most often the page was opened without the printed address: by typing `127.0.0.1:7700`, from a bookmark, or in a tab left over from a dashboard that has since restarted (each start has a new token).
+
+## How to fix it
+
+- Open the address `giong dashboard` or `giong dev --ui` printed, with its `#t=...` part. The page keeps the token for reloads in that tab.
+- With `giong dashboard --json` or `giong dev --ui --json`, the address is in `data.url` or the `dashboard` event's `url`.
+- A script that calls the API sends the header: `curl -H "X-Giong-Dashboard: <token>" http://127.0.0.1:7700/api/state`.
+
+[All error codes](README.md)
+"#),
     (5053, r#"# GIONG-E5053: the dashboard's port is in use
 
 Raised by the `giong` command (giong-cli): `giong dashboard`. In JSON output: `"code": "GIONG-E5053"`.
@@ -2970,7 +3011,7 @@ Raised by the `giong` command (giong-cli): `giong dashboard`. In JSON output: `"
 
 ## How to fix it
 
-- Open the dashboard that is already running: `http://127.0.0.1:7700/`.
+- Open the dashboard that is already running, at the address it printed (`http://127.0.0.1:7700/#t=...`: the token is part of it).
 - Or pick another port: `giong dashboard --port 7710`.
 - To see what holds the port: `lsof -i :7700` (macOS, Linux) or `ss -ltnp 'sport = :7700'` (Linux).
 

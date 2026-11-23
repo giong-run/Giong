@@ -190,8 +190,20 @@ function el(tag, attrs, ...kids) {
 }
 function put(id, ...kids) { const t = $(id); t.replaceChildren(...kids.flat(Infinity).filter(Boolean)); }
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove("show"), 2600); }
+// This start's token: in the address giong printed (after #, so no request
+// carries it in its URL), kept for reloads in this tab, then taken out of
+// the address bar so a screen share or a copied link does not show it.
+const TOKEN = (() => {
+  const m = /^#(?:.*&)?t=([0-9a-f]{16,64})(?:&|$)/.exec(location.hash);
+  if (m) {
+    try { sessionStorage.setItem("giong-dashboard-token", m[1]); } catch (_) {}
+    history.replaceState(null, "", location.pathname + location.search);
+    return m[1];
+  }
+  try { return sessionStorage.getItem("giong-dashboard-token") || ""; } catch (_) { return ""; }
+})();
 async function api(path, body) {
-  const opts = { headers: { "X-Giong-Dashboard": "1" } };
+  const opts = { headers: { "X-Giong-Dashboard": TOKEN } };
   if (body !== undefined) { opts.method = "POST"; opts.body = JSON.stringify(body); opts.headers["Content-Type"] = "application/json"; }
   const r = await fetch(path, opts);
   let v = null;
@@ -239,6 +251,14 @@ let state = null;
 async function loadState() {
   let s;
   try { s = await api("/api/state"); } catch (_) { $("status").className = "pill bad"; $("status").textContent = "dashboard stopped"; return; }
+  if (s && s.error) {
+    // Most often the token: this tab was opened without the printed address.
+    const st = $("status");
+    st.className = "pill bad";
+    st.textContent = s.error.code === "GIONG-E5051" ? "open the address giong printed" : "error";
+    st.title = (s.error.message || "") + (s.error.fix ? " Fix: " + s.error.fix : "");
+    return;
+  }
   state = s;
   const st = $("status");
   const build = s.dev && s.dev.build;

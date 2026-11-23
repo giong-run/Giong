@@ -138,6 +138,18 @@ pub fn decode(s: &str, form: bool) -> String {
 pub enum Refusal {
     /// Answered with this status and text.
     Status(u16, &'static str),
+    /// An API request without this start's token: 403, coded.
+    Token,
+}
+
+/// Whether two strings are equal, in a time that does not depend on where
+/// they differ (the token compare).
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// A byte of an HTTP token (RFC 9110 §5.6.2).
@@ -279,8 +291,10 @@ pub fn read_request(stream: &mut impl Read) -> Result<Req, Option<Refusal>> {
     })
 }
 
-/// The checks that keep other web pages out: see the module page.
-pub fn admit(req: &Req, port: u16) -> Result<(), Refusal> {
+/// The checks that keep other web pages and other local programs out: see
+/// the module page. `token` is this start's, which every API request sends
+/// in `X-Giong-Dashboard`.
+pub fn admit(req: &Req, port: u16, token: &str) -> Result<(), Refusal> {
     let host = req.header("host").unwrap_or("");
     let allowed = [
         format!("127.0.0.1:{port}"),
@@ -319,11 +333,12 @@ pub fn admit(req: &Req, port: u16) -> Result<(), Refusal> {
             ))
         }
     }
-    if req.path.starts_with("/api/") && req.header("x-giong-dashboard") != Some("1") {
-        return Err(Refusal::Status(
-            403,
-            "the API needs the X-Giong-Dashboard header",
-        ));
+    if req.path.starts_with("/api/")
+        && !req
+            .header("x-giong-dashboard")
+            .is_some_and(|t| same(t, token))
+    {
+        return Err(Refusal::Token);
     }
     if req.method == "POST" && !req.path.starts_with("/api/") {
         return Err(Refusal::Status(405, "only the API takes POST"));
@@ -358,18 +373,23 @@ pub fn write_response(
 }
 
 /// Serves one connection: one request, then close.
-pub fn serve_connection(mut stream: TcpStream, port: u16, handler: &dyn Fn(&Req) -> Resp) {
+pub fn serve_connection(
+    mut stream: TcpStream,
+    port: u16,
+    token: &str,
+    handler: &dyn Fn(&Req) -> Resp,
+) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let req = match read_request(&mut stream) {
         Ok(r) => r,
         Err(None) => return,
-        Err(Some(Refusal::Status(s, why))) => {
-            let _ = write_response(&mut stream, &Resp::text(s, why), false);
+        Err(Some(r)) => {
+            let _ = write_response(&mut stream, &refusal(r), false);
             return;
         }
     };
-    let resp = match admit(&req, port) {
+    let resp = match admit(&req, port, token) {
         Ok(()) => {
             // A handler that panics answers 500 instead of leaving the page waiting.
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&req))) {
@@ -382,9 +402,21 @@ pub fn serve_connection(mut stream: TcpStream, port: u16, handler: &dyn Fn(&Req)
                 ),
             }
         }
-        Err(Refusal::Status(s, why)) => Resp::text(s, why),
+        Err(r) => refusal(r),
     };
     let _ = write_response(&mut stream, &resp, req.method == "HEAD");
+}
+
+fn refusal(r: Refusal) -> Resp {
+    match r {
+        Refusal::Status(s, why) => Resp::text(s, why),
+        Refusal::Token => Resp::error(
+            403,
+            "GIONG-E5051",
+            "the dashboard's API needs the token of the address giong printed",
+            "open the address giong dashboard or giong dev --ui printed (it ends in /#t=...)",
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -435,7 +467,7 @@ mod tests {
         let r =
             req("GET /a%20b?q=%00 HTTP/1.1\r\nHost: 127.0.0.1:7700\r\nX-A: a\tb\r\n\r\n").unwrap();
         assert_eq!(r.header("x-a"), Some("a\tb"));
-        assert!(admit(&r, 7700).is_ok());
+        assert!(admit(&r, 7700, "t").is_ok());
     }
 
     #[test]
@@ -496,33 +528,54 @@ mod tests {
 
     #[test]
     fn other_sites_are_kept_out() {
-        let ok = [("host", "127.0.0.1:7700"), ("x-giong-dashboard", "1")];
-        assert!(admit(&get("/api/state", &ok), 7700).is_ok());
-        assert!(admit(&get("/", &[("host", "localhost:7700")]), 7700).is_ok());
-        assert!(admit(&get("/", &[("host", "[::1]:7700")]), 7700).is_ok());
+        const T: &str = "5f3a9c2e8b41d70600010000000000aa";
+        let ok = [("host", "127.0.0.1:7700"), ("x-giong-dashboard", T)];
+        assert!(admit(&get("/api/state", &ok), 7700, T).is_ok());
+        assert!(admit(&get("/", &[("host", "localhost:7700")]), 7700, T).is_ok());
+        assert!(admit(&get("/", &[("host", "[::1]:7700")]), 7700, T).is_ok());
         // DNS rebinding: the page's host name is not ours.
-        assert!(admit(&get("/", &[("host", "evil.example:7700")]), 7700).is_err());
-        assert!(admit(&get("/", &[("host", "127.0.0.1:7701")]), 7700).is_err());
-        assert!(admit(&get("/", &[]), 7700).is_err());
-        // The API without the header (a plain cross-site form or img).
-        assert!(admit(&get("/api/state", &[("host", "127.0.0.1:7700")]), 7700).is_err());
+        assert!(admit(&get("/", &[("host", "evil.example:7700")]), 7700, T).is_err());
+        assert!(admit(&get("/", &[("host", "127.0.0.1:7701")]), 7700, T).is_err());
+        assert!(admit(&get("/", &[]), 7700, T).is_err());
+        // The API without the token (a plain cross-site form or img, or
+        // another program on this machine that cannot read giong's output),
+        // with the old constant, a wrong or a cut token.
+        assert_eq!(
+            admit(&get("/api/state", &[("host", "127.0.0.1:7700")]), 7700, T),
+            Err(Refusal::Token)
+        );
+        for wrong in [
+            "1",
+            "",
+            "5f3a9c2e8b41d70600010000000000ab",
+            "5f3a9c2e8b41d706",
+        ] {
+            let h = [("host", "127.0.0.1:7700"), ("x-giong-dashboard", wrong)];
+            assert_eq!(
+                admit(&get("/api/state", &h), 7700, T),
+                Err(Refusal::Token),
+                "{wrong}"
+            );
+        }
+        // The page itself needs no token: it holds no data.
+        assert!(admit(&get("/", &[("host", "127.0.0.1:7700")]), 7700, T).is_ok());
         // Another origin.
         let mut other = ok.to_vec();
         other.push(("origin", "http://evil.example"));
-        assert!(admit(&get("/api/state", &other), 7700).is_err());
+        assert!(admit(&get("/api/state", &other), 7700, T).is_err());
         let mut same = ok.to_vec();
         same.push(("origin", "http://127.0.0.1:7700"));
-        assert!(admit(&get("/api/state", &same), 7700).is_ok());
+        assert!(admit(&get("/api/state", &same), 7700, T).is_ok());
         let mut cross = ok.to_vec();
         cross.push(("sec-fetch-site", "cross-site"));
-        assert!(admit(&get("/api/state", &cross), 7700).is_err());
+        assert!(admit(&get("/api/state", &cross), 7700, T).is_err());
         // Preflights and other methods.
         let mut opt = get("/api/send", &ok);
         opt.method = "OPTIONS".into();
-        assert!(admit(&opt, 7700).is_err());
+        assert!(admit(&opt, 7700, T).is_err());
         let mut post = get("/", &[("host", "127.0.0.1:7700")]);
         post.method = "POST".into();
-        assert!(admit(&post, 7700).is_err());
+        assert!(admit(&post, 7700, T).is_err());
     }
 
     #[test]

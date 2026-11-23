@@ -20,6 +20,7 @@ use crate::record::case::{self, Case};
 use crate::record::exchange::{self, Exchange, Filter};
 use crate::record::matcher::Missing;
 use crate::record::replay::{self, Outcome};
+use crate::record::secret;
 use crate::report::{Failure, Finding, Report, Severity};
 use crate::service::{self, DevState};
 use crate::web_client::Base;
@@ -29,7 +30,7 @@ pub const COMMAND: Command = Command {
     summary: "turn recorded requests into cases and replay them against the service",
     usage: "giong record list [--route <text>] [--method <m>] [--status <404|4xx>] [--limit <n>] [--from <log>]\n\
             giong record show <number> [--from <log>]\n\
-            giong record save <numbers|3-7|last|all> [--name <name> | --out <file>] [--append | --force]\n\
+            giong record save <numbers|3-7|last|all> [--name <name> | --out <file>] [--append | --force] [--keep-secrets]\n\
             giong record replay [<file>...] [--base-url <url>] [--timeout-ms <n>]\n\n\
             The service records with giong-web's Record middleware: one `exchange` line per \
             answered request, headers and bodies included, secret headers redacted. `list` \
@@ -38,8 +39,12 @@ pub const COMMAND: Command = Command {
             the chosen ones to tests/recorded/<name>.json (default name: recorded) as cases: \
             the request, and the status, content type, Location and body expected, with dates, \
             UUIDs, tokens and ids the service made replaced by placeholders, and ids that a \
-            later request uses captured and reused. Redacted headers are read from \
-            GIONG_RECORD_<HEADER> when replayed. `replay` sends every case of the files given \
+            later request uses captured and reused. Secrets stay out of the file: redacted \
+            headers and request fields whose names say secret (password, token, api_key, \
+            card, ...) in the query, a form or a JSON body are read from \
+            GIONG_RECORD_<NAME> when replayed, and `save` refuses to write a value that \
+            still looks like one (a card number, a JWT, a value under such a name) unless \
+            --keep-secrets is given. `replay` sends every case of the files given \
             (default: tests/recorded/*.json) in order to the running service and checks each \
             answer; exit status 1 when a case fails, so it runs in CI. Replay against a fresh \
             service: cases that create things expect the state they were recorded in.",
@@ -89,6 +94,11 @@ pub const COMMAND: Command = Command {
             kind: Kind::Switch,
             help: "replace an existing file",
         },
+        Flag {
+            name: "keep-secrets",
+            kind: Kind::Switch,
+            help: "save values that look like secrets instead of refusing (case files are meant to be committed)",
+        },
         BASE_FLAG,
         Flag {
             name: "timeout-ms",
@@ -119,7 +129,15 @@ fn run(args: &Args) -> Result<Report, Failure> {
         "list" => &["from", "route", "method", "status", "limit"],
         "show" => &["from"],
         "save" => &[
-            "from", "route", "method", "status", "name", "out", "append", "force",
+            "from",
+            "route",
+            "method",
+            "status",
+            "name",
+            "out",
+            "append",
+            "force",
+            "keep-secrets",
         ],
         "replay" => &["base-url", "timeout-ms"],
         other => {
@@ -516,6 +534,49 @@ fn save(args: &Args, rest: &[String]) -> Result<Report, Failure> {
             "record them again with a larger Record::max_body (see the findings of giong record list)",
         ));
     }
+    let secrets: Vec<String> = built
+        .cases
+        .iter()
+        .flat_map(|c| {
+            let name = c["name"].as_str().unwrap_or("?").to_string();
+            secret::scan(c)
+                .into_iter()
+                .map(move |(at, what)| format!("{name}: {at} ({what})"))
+        })
+        .collect();
+    if !secrets.is_empty() {
+        if !args.has("keep-secrets") {
+            let shown: Vec<&str> = secrets.iter().take(5).map(String::as_str).collect();
+            let more = if secrets.len() > 5 {
+                format!(" and {} more", secrets.len() - 5)
+            } else {
+                String::new()
+            };
+            return Err(Failure::new(
+                Code::RECORD_SECRET,
+                format!(
+                    "nothing saved: {} value{} look{} like a secret: {}{more}",
+                    secrets.len(),
+                    if secrets.len() == 1 { "" } else { "s" },
+                    if secrets.len() == 1 { "s" } else { "" },
+                    shown.join("; ")
+                ),
+                "leave those exchanges out of the numbers given to save, or record them again \
+                 with test values; when the values already are test values (a 4242 4242 4242 \
+                 4242 test card, a token made for tests), pass --keep-secrets",
+            ));
+        }
+        for s in &secrets {
+            r.push(
+                Finding::new(
+                    Code::RECORD_SECRET,
+                    Severity::Warning,
+                    "saved a value that looks like a secret (--keep-secrets)",
+                )
+                .detail(s.clone()),
+            );
+        }
+    }
     let added = built.cases.len();
     existing.extend(built.cases);
     let text = serde_json::to_string_pretty(&case::file_json(&existing)).expect("JSON");
@@ -548,7 +609,7 @@ fn save(args: &Args, rest: &[String]) -> Result<Report, Failure> {
     ));
     if !built.env.is_empty() {
         r.line(format!(
-            "Replaying needs {} (the values were redacted when recorded).",
+            "Replaying needs {} (secret values are not saved: set them to the values to send).",
             built.env.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }

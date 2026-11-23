@@ -108,6 +108,38 @@ fn project(tag: &str) -> (PathBuf, String) {
 
 struct Dash(Child, String);
 
+/// The token of each dashboard started here, by address: the API refuses
+/// requests without it.
+static TOKENS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Splits a printed dashboard address, `http://127.0.0.1:7700/#t=<token>`,
+/// into the address and the token, remembering the token for `get` and
+/// `post`.
+fn address_of(url: &str) -> String {
+    let (base, token) = url
+        .split_once("/#t=")
+        .unwrap_or_else(|| panic!("no token in {url}"));
+    assert_eq!(token.len(), 32, "{url}");
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit()), "{url}");
+    let addr = base.trim_start_matches("http://").to_string();
+    TOKENS
+        .lock()
+        .unwrap()
+        .push((addr.clone(), token.to_string()));
+    addr
+}
+
+fn token(addr: &str) -> String {
+    TOKENS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(a, _)| a == addr)
+        .map(|(_, t)| t.clone())
+        .unwrap_or_default()
+}
+
 impl Drop for Dash {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -135,11 +167,7 @@ fn dashboard(dir: &Path) -> Dash {
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["findings"], json!([]), "{v}");
     assert!(v["version"].is_string(), "{v}");
-    let url = v["data"]["url"].as_str().unwrap();
-    let addr = url
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_string();
+    let addr = address_of(v["data"]["url"].as_str().unwrap());
     Dash(child, addr)
 }
 
@@ -161,7 +189,10 @@ fn raw(addr: &str, req: &str) -> (u16, String) {
 fn get(addr: &str, path: &str) -> Value {
     let (status, body) = raw(
         addr,
-        &format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nX-Giong-Dashboard: 1\r\n\r\n"),
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nX-Giong-Dashboard: {}\r\n\r\n",
+            token(addr)
+        ),
     );
     let v: Value =
         serde_json::from_str(&body).unwrap_or_else(|e| panic!("{path}: {status} {e}: {body}"));
@@ -177,7 +208,8 @@ fn post(addr: &str, path: &str, body: &Value) -> (u16, Value) {
     let (status, text) = raw(
         addr,
         &format!(
-            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nX-Giong-Dashboard: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}",
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nX-Giong-Dashboard: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}",
+            token(addr),
             b.len()
         ),
     );
@@ -323,11 +355,31 @@ fn other_web_pages_cannot_use_the_dashboard() {
     // A form or image from another site: no custom header.
     let (status, _) = raw(a, &format!("GET /api/state HTTP/1.1\r\nHost: {a}\r\n\r\n"));
     assert_eq!(status, 403);
-    // A fetch from another origin with the header (after a preflight the
+    // Another program or user on this machine: it can reach the port but
+    // does not know this start's token (the old constant header, a guess).
+    for guess in ["1", "00000000000000000000000000000000"] {
+        let (status, body) = raw(
+            a,
+            &format!("GET /api/log HTTP/1.1\r\nHost: {a}\r\nX-Giong-Dashboard: {guess}\r\n\r\n"),
+        );
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("GIONG-E5051"), "{body}");
+    }
+    let (status, _) = raw(
+        a,
+        &format!(
+            "POST /api/send HTTP/1.1\r\nHost: {a}\r\nX-Giong-Dashboard: 1\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+    );
+    assert_eq!(status, 403);
+    // A fetch from another origin with the token (after a preflight the
     // dashboard refuses anyway).
     let (status, _) = raw(
         a,
-        &format!("GET /api/state HTTP/1.1\r\nHost: {a}\r\nOrigin: http://evil.example\r\nX-Giong-Dashboard: 1\r\n\r\n"),
+        &format!(
+            "GET /api/state HTTP/1.1\r\nHost: {a}\r\nOrigin: http://evil.example\r\nX-Giong-Dashboard: {}\r\n\r\n",
+            token(a)
+        ),
     );
     assert_eq!(status, 403);
     // A preflight is refused, without CORS headers.
@@ -476,12 +528,7 @@ fn giong_dev_ui_serves_the_dashboard() {
     let dir = tiny_project("ui", 10);
     let (_dev, rx) = dev_once(&dir, &["--ui-port", "0"]);
     let event = next(&rx, |v| v["event"] == "dashboard");
-    let addr = event["url"]
-        .as_str()
-        .unwrap()
-        .trim_start_matches("http://")
-        .trim_end_matches('/')
-        .to_string();
+    let addr = address_of(event["url"].as_str().unwrap());
     next(&rx, |v| v["event"] == "ready");
     eventually(|| get(&addr, "/api/state")["dev"]["build"]["state"] == "ok");
     eventually(|| {

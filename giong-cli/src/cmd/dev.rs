@@ -1043,8 +1043,7 @@ impl Dev {
     /// warning: the service runs without the page.
     fn start_dashboard(&mut self, port: u16) {
         match crate::dashboard::spawn(self.project.root.clone(), port) {
-            Ok(addr) => {
-                let url = format!("http://{addr}/");
+            Ok(url) => {
                 self.say(
                     "dashboard",
                     format!("dashboard on {url}"),

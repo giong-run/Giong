@@ -7,6 +7,8 @@
 //!   ids the service made captured and reused by later requests.
 //! - [`matcher`]: checking an answer against a case's expectation.
 //! - [`replay`]: sending a case file's requests and checking the answers.
+//! - [`secret`]: names that say secret and values that look like one, kept
+//!   out of saved cases.
 //! - [`shape`] and [`base64`]: what a value looks like, and bodies `Record`
 //!   wrote as base64. These, [`exchange`] and [`matcher`] use nothing else of
 //!   the crate, so a fuzz target can include them by path.
@@ -16,4 +18,5 @@ pub mod case;
 pub mod exchange;
 pub mod matcher;
 pub mod replay;
+pub mod secret;
 pub mod shape;
