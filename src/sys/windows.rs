@@ -511,6 +511,19 @@ type OnSignal = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// number so that it can leave again.
 static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new(Vec::new());
 
+/// Console events seen since a runtime started listening with none
+/// listening before it.
+static SIGNALS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// When the first of [`SIGNALS_SEEN`] came.
+static FIRST_SIGNAL_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Events this soon after the first are the same press: Ctrl+C reaches
+/// every process of the console, and a wrapper that also passes one on
+/// (a file watcher, a dev server) makes a second arrive within
+/// milliseconds. Such an event neither asks again nor ends the process.
+const SAME_PRESS: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Called by Windows, on a thread it starts for the purpose, for Ctrl+C and
 /// Ctrl+Break, and when the console is closed or the user logs off or the
 /// system shuts down. `TRUE` says the event is handled, so the process is
@@ -522,6 +535,12 @@ static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new
 /// event at the latest. So for those the handler waits, which gives the
 /// runtimes that time to shut down; the process ends when its main thread
 /// does, or when Windows ends it.
+///
+/// Only the first event asks for a shutdown. A second one, while the
+/// shutdown has not finished, is left to the default handler, which ends
+/// the process, as a second `SIGINT` or `SIGTERM` does on Unix: a shutdown
+/// that hangs can still be stopped with a second Ctrl+C. An event less
+/// than [`SAME_PRESS`] after the first counts as the first again.
 unsafe extern "system" fn console_event(kind: u32) -> BOOL {
     let ends_process = matches!(
         kind,
@@ -530,12 +549,28 @@ unsafe extern "system" fn console_event(kind: u32) -> BOOL {
     if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT && !ends_process {
         return 0;
     }
+    let now = std::time::Instant::now();
+    let mut first_at = FIRST_SIGNAL_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first = SIGNALS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+    let again = match *first_at {
+        _ if first => {
+            *first_at = Some(now);
+            false
+        }
+        Some(at) if now.duration_since(at) < SAME_PRESS => true,
+        _ => return 0,
+    };
+    drop(first_at);
     let listeners: Vec<OnSignal> = match ON_SIGNAL.lock() {
         Ok(list) => list.iter().map(|(_, f)| f.clone()).collect(),
         Err(_) => return 0,
     };
-    for on_signal in &listeners {
-        on_signal();
+    if !again {
+        for on_signal in &listeners {
+            on_signal();
+        }
     }
     if ends_process && !listeners.is_empty() {
         // Longer than Windows waits (5 s for a closed console).
@@ -572,10 +607,16 @@ impl SignalGuard {
             return Err(std::io::Error::from_raw_os_error(code));
         }
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ON_SIGNAL
+        let mut list = ON_SIGNAL
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((id, std::sync::Arc::new(on_signal)));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Forget events from before any runtime listened. Not while another
+        // runtime listens: one whose shutdown hangs must still be stopped
+        // by the next Ctrl+C.
+        if list.is_empty() {
+            SIGNALS_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        list.push((id, std::sync::Arc::new(on_signal)));
         Ok(SignalGuard { id })
     }
 }
@@ -1063,6 +1104,58 @@ pub(crate) fn hosts_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The first Ctrl+C asks the runtimes to shut down and keeps the
+    /// process; one within the same press is handled again, a later one is
+    /// left to the default handler, which ends it. Listening again, with
+    /// nobody listening in between, starts the count over.
+    #[test]
+    fn only_the_first_console_event_is_handled() {
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let listener = |asked: &Arc<AtomicUsize>| {
+            let seen = asked.clone();
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let after_same_press = || std::thread::sleep(super::SAME_PRESS * 2);
+        let guard = super::SignalGuard::install(listener(&asked)).unwrap();
+        // SAFETY: plain calls of the handler; nothing ends the process.
+        unsafe {
+            assert_eq!(super::console_event(CTRL_C_EVENT), 1, "first is handled");
+            assert_eq!(
+                super::console_event(CTRL_C_EVENT),
+                1,
+                "the same press passed on by a wrapper is handled"
+            );
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "and asks only once");
+            after_same_press();
+            assert_eq!(
+                super::console_event(CTRL_C_EVENT),
+                0,
+                "second ends the process"
+            );
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // A second runtime that starts listening while the first one's
+        // shutdown hangs does not make the next event a first again.
+        let other = super::SignalGuard::install(listener(&asked)).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { super::console_event(CTRL_C_EVENT) }, 0);
+        drop(other);
+        drop(guard);
+
+        // With nobody listening in between, a new runtime starts afresh.
+        let _guard = super::SignalGuard::install(listener(&asked)).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { super::console_event(CTRL_C_EVENT) }, 1);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
     /// A thread's event for blocking transfers is closed when the thread
     /// ends: the blocking pool starts and ends threads all the time, and an
     /// event left behind by each was one handle more for good.
