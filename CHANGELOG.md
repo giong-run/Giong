@@ -8,6 +8,151 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-23
+
+Security fixes and serious bugs from a review of 1.4.0, and nothing new to learn. giong-http
+closes request smuggling after a 2xx to `CONNECT` and refuses malformed `Host` headers. A peer
+can no longer make a server hold memory it never reads through giong-quic's forwarded datagrams
+and DATAGRAM frames or a shared UDP port on Windows, and a forged datagram can no longer stop
+the Windows port dispatch. In the database clients, a password is no longer quoted in errors,
+SQL can no longer slip in through a MySQL session variable or a versioned comment, and a late
+cancel can no longer stop another task's query. giong also builds on musl, starts under gVisor,
+and fires timers at their deadline instead of up to a millisecond late. No API is removed or
+changed; a few inputs that were accepted by mistake are now refused, as each entry says.
+
+### Added
+
+- **giong**: `GIONG-E0020` (`Code::ThreadLimit`): when the kernel refuses a worker thread
+  with `EAGAIN`, `Runtime::run` says which one could not be started and why (a container's
+  PID limit or `RLIMIT_NPROC`), with the container's `pids.max`, instead of a bare "Resource
+  temporarily unavailable". Other errors (`ENOMEM`, say) are returned as they are.
+
+### Fixed
+
+- **giong**: workers that bind the same TCP or UDP port start under gVisor (GKE Sandbox,
+  sandboxes that run code for AI agents). gVisor records `SO_REUSEPORT` when a socket binds,
+  not when the next one does as Linux does, so every bind after the first failed with
+  `AddrInUse` and a server with several workers did not start. giong now finds out once
+  per process which way the system works, and on gVisor binds the socket that stays with
+  `SO_REUSEPORT` from the start, after checking the port with a socket bound without it.
+  Nothing changes on Linux.
+- **giong**: under gVisor with its optional io_uring (`runsc --iouring`), which refuses
+  giong's rings with `EINVAL`, falling back to epoll gives `GIONG-E0001` as the reason
+  instead of a bare "Invalid argument".
+- **giong**: the `GIONG-E0010` message names `DriverKind::IoUring` instead of
+  `crate::DriverKind::IoUring`.
+- **giong-postgres**, **giong-mysql**: a connection URL whose password holds an unescaped
+  `/` or `?` no longer has a piece of the password quoted in the error (as the port, a
+  parameter or the database name), and no longer reads as a host named after the user
+  with the rest of the password as the database name (`postgres://app:12/34@db/x`
+  connected to `app:12` and sent `34@db/x` as the database). Such a URL is refused with
+  a message that quotes none of it and says to percent-encode the password, as
+  giong-redis already did. An `@` in a URL's database name is now refused the same way;
+  write it as `%40`
+  ([#313](https://github.com/giong-run/Giong/issues/313)).
+- **giong**: a task receiving from an `mpsc` channel that another thread or worker keeps
+  fed now yields to the rest of its worker after 128 values that were ready at once, as
+  socket operations do; it used to hold the worker for as long as values kept coming, so
+  a 10 ms timer on the same worker could fire 400 ms late. The first poll of a bounded
+  `send` that finds room counts the same way
+  ([#227](https://github.com/giong-run/Giong/issues/227)).
+- **giong**: builds for musl (`x86_64-unknown-linux-musl`: Alpine and static Linux
+  binaries) again, where `recvmmsg` and `sendmmsg` take an unsigned `flags`. On musl,
+  `UdpSocket::send_to_with` with more than one option (a source address and ECN, say) no
+  longer fails with `EINVAL`, and a receive with several control messages (GRO, ECN, the
+  local address) reads all of them: control messages are aligned the kernel's way, to a
+  `long`, not to musl's 4-byte `cmsghdr`. giong-quic's servers bound to `0.0.0.0` answer
+  on Alpine. CI now lints every crate for musl and runs the tests on it, on the runner and
+  in an Alpine container.
+- **giong-mysql**: a `CancelToken` taken from a pooled connection (`Pool::get`) stops working
+  once the connection goes back to the pool: `cancel()` then fails with `ErrorKind::Closed`
+  (`GIONG-E3108`) and sends nothing. A connection that goes back while a `cancel()` from
+  its time with the task is still on its way is closed rather than lent to another task.
+  Before, a late `cancel()`, as from a watchdog timer, ran `KILL QUERY` on whatever the
+  connection ran then, a statement of another task
+  ([#237](https://github.com/giong-run/Giong/issues/237)).
+- **giong-mysql**: a `Config::session_variable` value must be one SQL expression. A value
+  with a `,` outside quotes and parentheses, a `;`, a comment or a backslash is refused when
+  connecting: `"'', autocommit = 0"` used to turn off autocommit, which the pool relies on,
+  past the check that refuses the variables giong-mysql sets itself
+  ([#329](https://github.com/giong-run/Giong/issues/329)).
+- **giong-mysql**: the pool's own methods (`query`, `execute` and the like) refuse `CALL`,
+  as they refuse `SET` and `BEGIN`: a stored procedure may change the session, start a
+  transaction or take a lock without the server saying so, and the statements of other
+  tasks sharing the connection would run in it. Call procedures on a connection from
+  `pool.get()` ([#287](https://github.com/giong-run/Giong/issues/287)).
+- **giong-mysql**: statements inside versioned comments (`/*!40101 SET NAMES latin1 */`,
+  MariaDB's `/*M!...*/`), which the server runs as SQL and dump tools write, are now
+  refused on a pool's shared connections like the same statements written plainly. Before,
+  the check skipped them as comments, and statements of other tasks pipelined behind one
+  ran in the changed session until the reset
+  ([#248](https://github.com/giong-run/Giong/issues/248)).
+- **giong-postgres**: a pooled connection that goes back to its pool while a `cancel()` from
+  its time with the task is still on its way is closed rather than lent to another task,
+  whose statement the request would have cancelled. The token's check that the connection
+  is still out came before the round trip that sends the request
+  ([#283](https://github.com/giong-run/Giong/issues/283)).
+- **giong**: a timer armed right after another one fired (the usual
+  `loop { sleep(d).await; ... }`) no longer ends a whole millisecond late: a 1 ms sleep took
+  2 ms and a 10 ms one 11 ms, because every deadline was rounded up to the next millisecond
+  tick. The timing wheel now keeps each timer's exact deadline and the worker sleeps until
+  it: a 1 ms sleep takes about 1.04 ms on io_uring and 1.08 ms on epoll, a 10 ms one about
+  10.04 ms ([#228](https://github.com/giong-run/Giong/issues/228)).
+- **giong**: on the epoll and kqueue drivers, a task waiting on a `UdpSocket` is woken when
+  another task's receive takes several datagrams from the socket at once. It used to stay
+  asleep with a datagram queued for it until the next datagram arrived or its timeout fired
+  ([#332](https://github.com/giong-run/Giong/issues/332)).
+- **giong-http**: on HTTP/1.1, `Server::write_timeout` counts from the last progress of a
+  write, as on HTTP/2 and HTTP/3, instead of from its start. A response that took longer
+  than the timeout to send in all (a 64 MiB body to a client reading at 8 MB/s, with the
+  default 30 s) was cut in the middle; it now goes out whole while the client keeps reading.
+  A client that stops reading still loses the connection one timeout after the last
+  progress. Fixes [#328](https://github.com/giong-run/Giong/issues/328).
+
+### Security
+
+- **giong-web**: on Windows, `Req::param` also refuses a path parameter whose name ends in
+  `.` or a space, which Windows drops, so that `a/.env.` or `secret.txt ` opened `a/.env`
+  or `secret.txt` past a handler's own checks on the name (and `a/...` opened `a`); a name
+  with `~` and a digit before its extension, which Windows may read as the short 8.3 name
+  of another file (`SECRE~1.TXT` for `secret-keys.txt`), past the same checks; and the
+  device names `COM0`, `LPT0` and those with superscript digits (`COM¹`, `LPT²`...). None
+  of these let a value leave the directory. A value with a `:`, such as a time or a URN,
+  is refused on Windows since the fix for drives and streams: read it with
+  `Req::param_raw` ([#243](https://github.com/giong-run/Giong/pull/243) review).
+- **giong**: on Windows, a forged datagram can no longer stop the thread that hands out the
+  connections or datagrams of an address several workers share. Before, any datagram that
+  reached its wake socket ended the thread for good, so the shared port stopped taking
+  connections; another local program could forge one. Only a real stop ends the thread now
+  ([#316](https://github.com/giong-run/Giong/issues/316)).
+- **giong**: on Windows, the datagrams waiting for one socket of a UDP port that several
+  workers share are now bounded by bytes (4 MiB) as well as by count. 4096 datagrams of up to
+  64 KiB each could hold 256 MiB for a slow worker, and a full inbox no longer allocates a
+  copy of each datagram it drops ([#324](https://github.com/giong-run/Giong/issues/324)).
+- **giong-http**: over HTTP/1.1, a 2xx answer to `CONNECT` now closes the connection. The
+  client and every proxy on the way take what follows such an answer for a tunnel, which the
+  server has none of. A proxy in front that passes `CONNECT` on could then be made to forward
+  requests it never looked at, which the server read and answered
+  ([#343](https://github.com/giong-run/Giong/issues/343)).
+- **giong-http**: the server answers 400 to a `Host` header that is not a host and a port
+  (`user@example.com`, `a/b`, `[::1]evil.com`, a raw non-ASCII name), as RFC 9112 requires,
+  and checks `:authority` and the `host` field of HTTP/2 and HTTP/3 requests the same way;
+  a request target with a fragment (`/a#b`) is refused too. A proxy in front and a handler
+  that builds URLs from `Host` could otherwise read two different hosts or paths
+  ([#318](https://github.com/giong-run/Giong/issues/318)).
+- **giong-quic**: the datagrams a server worker passes to the worker that owns their
+  connection are bounded in bytes (4 MiB per worker) as well as in number. A receive with
+  GRO is up to 64 KiB, so a worker that fell behind could hold 64 MiB, and the connection
+  IDs that steer a datagram are plaintext, so anyone could aim a flood at one worker. A
+  datagram past the bound is dropped before it is copied, and a passed datagram is now
+  copied once instead of twice. Fixes [#326](https://github.com/giong-run/Giong/issues/326).
+- **giong-quic**: connections no longer offer QUIC DATAGRAM frames (RFC 9221), which
+  giong-quic has no API to read. A peer could park up to 1.25 MB of them on every
+  connection, and each one held the whole packet it came in. One HTTP/3 client sending a
+  one-byte datagram per padded packet made the server hold over 40 MB. A DATAGRAM frame
+  now closes the connection with `PROTOCOL_VIOLATION`
+  ([#341](https://github.com/giong-run/Giong/issues/341)).
+
 ## [1.4.0] - 2026-11-22
 
 Windows: giong runs on Windows through a completion-port driver, with TCP, UDP, files,
@@ -2800,7 +2945,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/giong-run/Giong/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/giong-run/Giong/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/giong-run/Giong/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/giong-run/Giong/compare/v1.1.0...v1.2.0
