@@ -95,6 +95,7 @@ impl Server {
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const USER_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The largest packet accepted while the connection is being set up.

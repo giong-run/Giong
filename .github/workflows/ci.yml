@@ -1,7 +1,10 @@
 name: CI
 
 on:
+  # `ready_for_review`: a draft runs the short set (job `plan`), so marking it ready
+  # starts the full one.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   # A pull request in the merge queue: the same jobs, on main with the pull
   # request and those queued before it merged, before main moves.
   merge_group:
@@ -25,6 +28,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The stable compiler of every job that does not name one (MSRV, nightly and
+  # instr name their own). Pinned, not `stable`, so that a new Rust release
+  # (new lints, a new target/ layout) cannot turn main red overnight and so that
+  # scripts/preflight.sh runs the same compiler locally. Raise it in a pull
+  # request of its own when a Rust release comes out.
+  RUST_STABLE: "1.100.0"
   CARGO_TERM_COLOR: always
   # giong-postgres's tests start a throwaway PostgreSQL server from the
   # binaries the runner image ships (/usr/lib/postgresql/16/bin). Without
@@ -37,13 +46,52 @@ env:
   GIONG_REDIS_REQUIRED: "1"
 
 jobs:
+  # What this run needs (scripts/ci-scope.py). The merge queue, a dispatch and a push to
+  # main run everything, repeated. A pull request runs every job once when it is ready
+  # for review, a short set while it is a draft, and only `lint` and `msrv` when it
+  # changes nothing that is built, tested or read by a test (the site, changelog.d/,
+  # prose). Whatever a pull request ran, the merge queue runs the full set on main with
+  # the change merged before main moves: what lands is tested exactly as before.
+  # If this job fails, every job that needs it is skipped and `all-checks` fails.
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      scope: ${{ steps.plan.outputs.scope }}
+      heavy: ${{ steps.plan.outputs.heavy }}
+      rounds: ${{ steps.plan.outputs.rounds }}
+      tsan: ${{ steps.plan.outputs.tsan }}
+    steps:
+      # On a pull request the checked-out commit merges the head into the base, so its
+      # first parent is the base and the diff between the two is the pull request.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft && '--draft' || '' }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+              git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"
+          else
+              : > "$RUNNER_TEMP/files.txt"
+          fi
+          python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain < "$RUNNER_TEMP/files.txt" | tee -a "$GITHUB_OUTPUT"
+          {
+              echo "### CI plan: \`$(sed -n 's/^scope=//p' "$GITHUB_OUTPUT" | tail -n 1)\`"
+              echo
+              echo "docs: lint and msrv only. draft: lint, msrv, default features, build, tests once."
+              echo "pr: every job, each suite once. full (merge queue): every job, every repetition."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   lint:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       # Crate versions agree, README images use absolute URLs that resolve on
@@ -58,12 +106,31 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The versions and what each checks live in scripts/msrv.sh, which
+      # scripts/preflight.sh runs too.
+      - name: Install the toolchains scripts/msrv.sh names
+        run: |
+          for v in $(scripts/msrv.sh versions); do
+              rustup toolchain install "$v" --profile minimal --no-self-update
+          done
+      - run: scripts/msrv.sh
+
+  # giong as most users build it: no features at all. Every other job turns
+  # on all features, so code that only compiles, or only passes, with a
+  # feature on (unstable-udp-offload, say) would go unseen. Both drivers.
+  default-features:
+    needs: plan
+    if: needs.plan.outputs.scope != 'docs'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: 1.80.0
-      # Libraries only: the tests generate certificates with rcgen, whose
-      # dependencies need a newer compiler.
-      - run: cargo check --workspace --all-features
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy
+      - run: cargo clippy -p giong --all-targets -- -D warnings
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && cargo test -p giong
+      - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && GIONG_DRIVER=epoll cargo test -p giong
 
   # The release build of every test binary, once for the whole run: fat LTO
   # makes it the slowest step by far, and the jobs `test`, `fallback`, `docker`
@@ -71,12 +138,14 @@ jobs:
   # and then run the same cargo commands as before, which find it up to date
   # (scripts/shared-build.sh says how, and what makes that safe).
   build:
+    needs: plan
+    if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - run: scripts/shared-build.sh pack "$RUNNER_TEMP/release-build.tar.zst"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -90,12 +159,15 @@ jobs:
           overwrite: true
 
   test:
-    needs: build
+    needs: [plan, build]
     # A required check that is skipped counts as passed, and a job is skipped
-    # when one it needs fails: this one always runs, and fails by itself.
-    if: always()
+    # when one it needs fails: this one always runs, and fails by itself. It is
+    # skipped on purpose only for a pull request that `plan` found to change no code.
+    if: always() && needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
     env:
+      # Five rounds in the merge queue, one on a pull request (job `plan`).
+      ROUNDS: ${{ needs.plan.outputs.rounds || 5 }}
       # giong must choose io_uring by itself on the runner: if a runner kernel
       # ever refuses it, the run fails instead of quietly testing epoll only.
       GIONG_TEST_EXPECT_DRIVER: io_uring
@@ -108,9 +180,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
-      - name: The build must have succeeded
-        run: test "${{ needs.build.result }}" = success
+          toolchain: ${{ env.RUST_STABLE }}
+      - name: The plan and the build must have succeeded
+        run: test "${{ needs.plan.result }}" = success && test "${{ needs.build.result }}" = success
       - run: uname -r
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
@@ -145,12 +217,14 @@ jobs:
   # preface (3.5/2) runs over TLS only. h2spec is built from source at a pinned
   # commit (the Go checksum database checks the download).
   h2spec:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: stable
@@ -166,17 +240,49 @@ jobs:
           "$h2spec" --strict --port 8080 --timeout 5 \
             generic hpack http2/3.5/1 http2/4 http2/5 http2/6 http2/7 http2/8
 
+  # HTTP/3 and QUIC conformance: h3spec against giong-http's h3 example
+  # (`Server::serve_h3` on giong-quic, behind `unstable-http3`). h3spec sends
+  # what a client must not send, on the QUIC and on the HTTP/3 level, and
+  # checks that the server answers with the right error. Its release binary
+  # is checked against the hash GitHub publishes for it before it runs.
+  h3spec:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - name: Fetch h3spec
+        run: |
+          curl -fsSL --retry 3 -o h3spec https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64
+          echo "c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830  h3spec" | sha256sum -c -
+          chmod +x h3spec
+      - run: cargo build --release -p giong-http --features unstable-http3 --example h3
+      - name: Run h3spec
+        run: |
+          target/release/examples/h3 127.0.0.1:8443 &
+          sleep 2
+          ./h3spec --no-validate --timeout 5000 127.0.0.1 8443
+
   # The database crates against the other server versions they support; the
   # jobs above use the runner's PostgreSQL 16, MySQL 8.0 and Ubuntu's Redis
   # 7.0. Each entry installs one server and runs one crate's tests on it.
   servers:
     name: servers (${{ matrix.server }})
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ${{ matrix.os || 'ubuntu-24.04' }}
     # These take a few minutes. A server that does not start, or a test that
     # waits for one for ever, must not hold a runner for six hours.
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # Runners are shared by every pull request and the merge queue: a pull
+      # request takes four at a time here, the merge queue all of them.
+      max-parallel: ${{ needs.plan.outputs.scope == 'full' && 13 || 4 }}
       matrix:
         include:
           - { server: postgres 14, crate: giong-postgres, postgres: "14" }
@@ -202,7 +308,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - name: Install PostgreSQL ${{ matrix.postgres }}
         if: matrix.postgres
         # From the PostgreSQL project's apt repository; the cluster apt
@@ -327,20 +433,22 @@ jobs:
   # after the other, as four jobs side by side.
   fallback-tiers:
     name: fallback (${{ matrix.tier }})
-    needs: build
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         tier: [no-features, coop, basic, epoll]
     env:
+      ROUNDS: ${{ needs.plan.outputs.rounds }}
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
@@ -366,24 +474,28 @@ jobs:
   # The required check: every tier above passed. It always runs, because a
   # skipped required check counts as passed.
   fallback:
-    needs: fallback-tiers
+    needs: [plan, fallback-tiers]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - run: test "${{ needs.fallback-tiers.result }}" = success
+      - run: >
+          test "${{ needs.fallback-tiers.result }}" = success ||
+          { test "${{ needs.plan.result }}" = success && test "${{ needs.plan.outputs.heavy }}" = false &&
+          test "${{ needs.fallback-tiers.result }}" = skipped; }
 
   # The epoll driver where it is needed: a container with Docker's default
   # seccomp profile, which blocks io_uring. Nothing names a driver, so the
   # tests also show that giong falls back to epoll by itself. The database
   # crates' tests skip here (no servers in the image).
   docker:
-    needs: build
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
@@ -420,6 +532,28 @@ jobs:
                 "$t" -q
               done'
 
+  # The tests that share a port between workers, the runtime's own and
+  # giong-http's, in a container under gVisor (runsc): GKE Sandbox and many
+  # sandboxes for AI agents run it, and its network stack records SO_REUSEPORT
+  # at the bind, unlike Linux (scripts/gvisor.sh).
+  gvisor:
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - name: Fetch the release build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      - run: scripts/gvisor.sh
+
   # giong-http with its defaults, in a container limited to 128 MiB, under
   # hundreds of uploads that stop one byte short: it must not be OOM-killed,
   # and a well-behaved client mixed in must keep getting answers. One and four
@@ -428,14 +562,15 @@ jobs:
   # be OOM-killed, and must keep serving the ones it holds
   # (scripts/idle-connections.sh).
   slow-uploads:
-    needs: build
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - name: Fetch the release build
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
@@ -451,17 +586,18 @@ jobs:
 
   # ThreadSanitizer over every test: twice on io_uring and once on the epoll
   # driver, which hands file operations to threads of its own. Three jobs side
-  # by side, each with its own build (the standard library included).
+  # by side, each with its own build (the standard library included). A pull
+  # request runs the first io_uring run and the epoll one; the merge queue all
+  # three (job `plan`).
   tsan-runs:
     name: tsan (${{ matrix.driver }}, run ${{ matrix.run }})
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { driver: io_uring, run: 1 }
-          - { driver: io_uring, run: 2 }
-          - { driver: epoll, run: 1 }
+        include: ${{ fromJSON(needs.plan.outputs.tsan) }}
     env:
       GIONG_TEST_EXPECT_DRIVER: io_uring
       GIONG_KTLS_REQUIRED: 1
@@ -492,16 +628,21 @@ jobs:
 
   # The required check: every ThreadSanitizer job above passed.
   tsan:
-    needs: tsan-runs
+    needs: [plan, tsan-runs]
     if: always()
     runs-on: ubuntu-24.04
     steps:
-      - run: test "${{ needs.tsan-runs.result }}" = success
+      - run: >
+          test "${{ needs.tsan-runs.result }}" = success ||
+          { test "${{ needs.plan.result }}" = success && test "${{ needs.plan.outputs.heavy }}" = false &&
+          test "${{ needs.tsan-runs.result }}" = skipped; }
 
   # The unsafe code under Miri, which checks every access against Rust's
   # memory and aliasing rules: the unit tests and the tests it can run, on the
   # epoll driver (scripts/check.sh says which).
   miri:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -514,12 +655,14 @@ jobs:
   # Model-check the wake-up handshakes in src/notify.rs with loom, then run the
   # same race on the runner's real CPUs.
   loom:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - run: scripts/check.sh loom
 
   # The deterministic simulation (sim/README.md): the epoll driver on a
@@ -527,12 +670,14 @@ jobs:
   # HTTP/2, Redis, PostgreSQL and files, months of simulated uptime, and the
   # core crate's tests with and without faults. A failure prints its seed.
   sim:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
           components: rustfmt, clippy
       - run: scripts/check.sh sim
 
@@ -543,6 +688,8 @@ jobs:
   # for now; the other crates' floors are not all consistent yet, and a crate
   # joins `members` here once they are.
   minimal-versions:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -551,7 +698,7 @@ jobs:
           toolchain: nightly
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - name: Resolve the direct dependencies to their lowest versions
         run: |
           sed -i 's/^members = \[.*\]$/members = ["."]/' Cargo.toml
@@ -567,10 +714,13 @@ jobs:
   # later) giong works around to stay on io_uring. Each run checks the driver
   # giong chose by itself and the kernel bugs it had to work around.
   kernels:
-    needs: build
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
+      # Four at a time on a pull request, all six in the merge queue (see servers).
+      max-parallel: ${{ needs.plan.outputs.scope == 'full' && 6 || 4 }}
       matrix:
         include:
           # ktls: the guest loads the tls module and the kernel TLS tests
@@ -590,7 +740,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
@@ -631,6 +781,8 @@ jobs:
   # The public API keeps the semver promise against the last release: no
   # breaking change between releases (scripts/semver.sh).
   semver:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -638,7 +790,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - name: Install cargo-semver-checks
         run: cargo install --locked cargo-semver-checks --version 0.51.0
       - run: scripts/semver.sh
@@ -649,6 +801,8 @@ jobs:
   # drivers, against bench/instr/baseline.csv (scripts/instr.py). The counts
   # repeat within 0.1% on a shared runner, so a hot path made 1% slower fails.
   instr:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -680,12 +834,14 @@ jobs:
   # completion (docs/kani.md says what each proves and within which bounds).
   # Kani's version is pinned: it brings its own nightly compiler and CBMC.
   kani:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - name: Install Kani
         run: |
           cargo install --locked kani-verifier --version 0.68.0
@@ -694,17 +850,107 @@ jobs:
       # the largest alone).
       - run: KANI_JOBS=2 scripts/check.sh kani
 
+  # giong-quic by itself, as a user who depends on it alone builds it:
+  # format, lints, docs, and its tests, which run its own client against
+  # its own server and quinn against it.
+  quic:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: giong-quic
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # As in the `test` job: every runtime of the tests gets io_uring.
+      - run: ulimit -l && sudo prlimit --pid $$ --memlock=unlimited:unlimited && ulimit -l && cargo test
+
+  # musl, the C library of Alpine and of static Linux binaries: what differs
+  # from glibc is only seen by building for it (recvmmsg takes an unsigned
+  # `flags` there, for one) and by running there (strerror's words differ).
+  # Lints, then the tests on the runner, on io_uring, and in an Alpine
+  # container with Docker's default seccomp profile, on epoll. The binaries
+  # are static, so the container needs nothing installed. The database
+  # clients' tests skip: they are plain Rust over TCP, and run in `test`.
+  musl:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      GIONG_PG_REQUIRED: "0"
+      GIONG_MYSQL_REQUIRED: "0"
+      GIONG_REDIS_REQUIRED: "0"
+      # ring's C code is built with musl's compiler wrapper.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+      - run: >
+          cargo clippy --workspace --all-targets --all-features
+          --target x86_64-unknown-linux-musl -- -D warnings
+      # As in the `test` job: every runtime of the tests gets io_uring.
+      - run: >
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited &&
+          GIONG_TEST_EXPECT_DRIVER=io_uring
+          cargo test --workspace --all-features --target x86_64-unknown-linux-musl
+      - name: List the test binaries
+        run: |
+          cargo test --workspace --all-features --target x86_64-unknown-linux-musl \
+            --no-run --message-format=json |
+            python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              msg = json.loads(line)
+              if msg.get("reason") == "compiler-artifact" and msg.get("executable") and msg["profile"]["test"]:
+                  print(msg["executable"])
+          ' > target/musl-test-binaries.txt
+          wc -l target/musl-test-binaries.txt
+      - name: Run them in Alpine
+        run: |
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" \
+            -e GIONG_TEST_EXPECT_DRIVER=epoll alpine:3.22 sh -ec '
+              for t in $(cat target/musl-test-binaries.txt); do
+                echo "== $t"
+                "$t" -q
+              done'
+
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
-  # Docker, the other server versions, loom, h2spec, the lowest dependency
-  # versions, the simulation) hold a merge back as well.
+  # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
+  # versions, the simulation, gVisor, musl) hold a merge back as well. When `plan` chose a
+  # short set (a draft, or a pull request that changes no code), the jobs it left
+  # out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in the
+  # merge queue every job must.
   all-checks:
-    needs: [lint, msrv, build, test, h2spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim]
+    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl]
     if: always()
     runs-on: ubuntu-24.04
     steps:
       - env:
           NEEDS: ${{ toJSON(needs) }}
+          HEAVY: ${{ needs.plan.outputs.heavy }}
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
-          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" > /dev/null
+          if [ "$HEAVY" = false ]; then
+              jq -e '(.plan.result == "success" and .lint.result == "success" and .msrv.result == "success")
+                  and all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" > /dev/null
+          else
+              jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" > /dev/null
+          fi

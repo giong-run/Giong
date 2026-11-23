@@ -24,7 +24,7 @@ giong::block_on(async {
 ```
 
 `giong-mcp`'s `overview` shows the same for each worker. The
-[README](../README.md#two-drivers-io_uring-and-epoll) has the measured difference.
+[benchmarks](BENCHMARKS.md#io_uring-against-epoll) have the measured difference.
 
 So a container needs no special settings to run giong. Allow io_uring, as this page shows,
 when you want its speed:
@@ -335,4 +335,12 @@ giong needs nothing in the image besides the program.
 
 Runtimes that put a user-space kernel between the container and Linux, such as gVisor
 (used by GKE Sandbox), do not offer io_uring by default. giong runs on epoll there; run it
-outside such a sandbox for io_uring.
+outside such a sandbox for io_uring. gVisor's optional io_uring (`runsc --iouring`) takes
+none of the settings giong's rings need, so giong runs on epoll there too, with
+[GIONG-E0001](errors/E0001.md) as the reason.
+
+gVisor's network stack decides whether sockets may share a port when each one binds,
+where Linux decides when the next one binds. giong finds out once per process which way
+the system works, and its workers share a port either way. CI runs the tests that bind
+one port from several workers, and a four-worker server, under gVisor
+([scripts/gvisor.sh](../scripts/gvisor.sh)).

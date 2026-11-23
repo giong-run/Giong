@@ -7,24 +7,27 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::buf::BufPool;
-use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park};
+#[cfg(unix)]
+use crate::driver::Io;
+use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
+#[cfg(unix)]
 use crate::op::Op;
 use crate::slab::Slab;
+use crate::sys;
 use crate::time::Timers;
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -95,24 +98,15 @@ pub(crate) struct WorkerShared {
     /// nanoseconds, so that its readings never go down. Written by the
     /// threads that read, never by the worker, and away from `counters`.
     idle_seen: AtomicU64,
-    eventfd: OwnedFd,
+    /// Rung to wake the worker when it sleeps in the kernel: its driver's
+    /// handle, set once the driver is up (a worker cannot sleep before).
+    wake: OnceLock<crate::driver::WakeHandle>,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
 }
 
 impl WorkerShared {
     fn new() -> io::Result<Arc<Self>> {
-        // Under Miri, created non-blocking: the epoll driver makes it so with
-        // `ioctl(FIONBIO)`, and Miri has neither that nor `fcntl` on eventfds.
-        #[cfg(not(miri))]
-        let flags = libc::EFD_CLOEXEC;
-        #[cfg(miri)]
-        let flags = libc::EFD_CLOEXEC | libc::EFD_NONBLOCK;
-        // SAFETY: plain syscall; the result is checked.
-        let fd = unsafe { libc::eventfd(0, flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         Ok(Arc::new(Self {
             uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             load: Load::new(),
@@ -121,8 +115,7 @@ impl WorkerShared {
             bell: Doorbell::new(),
             closed: AtomicBool::new(false),
             idle_seen: AtomicU64::new(0),
-            // SAFETY: a fresh descriptor we own.
-            eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            wake: OnceLock::new(),
             driver_choice: OnceLock::new(),
         }))
     }
@@ -139,14 +132,8 @@ impl WorkerShared {
         // Handshake with `Doorbell::prepare_park` in `Worker::drive`: at least
         // one side always observes the other (modelled in `notify`).
         if self.bell.ring() {
-            let one: u64 = 1;
-            // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own.
-            unsafe {
-                libc::write(
-                    self.eventfd.as_raw_fd(),
-                    &one as *const u64 as *const libc::c_void,
-                    8,
-                );
+            if let Some(wake) = self.wake.get() {
+                wake.ring();
             }
         }
         true
@@ -247,6 +234,15 @@ impl RuntimeShared {
             + w.load.queued.load(Ordering::Relaxed)
             + w.load.incoming.load(Ordering::Relaxed)
             + awake
+    }
+
+    /// [`score`](Self::score) without the term for being awake: the work
+    /// worker `i` has, whatever it is doing right now.
+    pub(crate) fn work(&self, i: usize) -> usize {
+        let w = &self.workers[i];
+        w.load.tasks.load(Ordering::Relaxed)
+            + w.load.queued.load(Ordering::Relaxed)
+            + w.load.incoming.load(Ordering::Relaxed)
     }
 
     /// Counts work about to be sent to `worker` from any thread, before it
@@ -392,7 +388,10 @@ struct Deferred {
     /// Single-shot operations whose future was dropped.
     cancels: Vec<DeferredCancel>,
     /// Descriptors given up.
-    closes: Vec<RawFd>,
+    closes: Vec<sys::RawFile>,
+    /// Sockets given up, where a socket is not a descriptor.
+    #[cfg(windows)]
+    sock_closes: Vec<sys::RawSock>,
 }
 
 impl Deferred {
@@ -492,13 +491,11 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let (driver, choice) = Driver::new(
-            cfg.driver,
-            cfg.chosen_by,
-            cfg.ring_entries,
-            pool.clone(),
-            shared.eventfd.as_raw_fd(),
-        )?;
+        let (driver, choice) =
+            Driver::new(cfg.driver, cfg.chosen_by, cfg.ring_entries, pool.clone())?;
+        // A worker instance is built once, so the slots are always empty
+        // here.
+        let _ = shared.wake.set(driver.waker());
         shared.counters.set_driver(driver.kind());
         // A worker instance is built once, so the slot is always empty here.
         let _ = shared.driver_choice.set(choice);
@@ -652,6 +649,7 @@ impl Worker {
     fn drive(&self, poll_main: &mut dyn FnMut() -> bool, idle: &dyn Fn() -> bool) {
         let mut done = false;
         let mut tick: u32 = 0;
+        let readiness = matches!(self.driver_kind, DriverKind::Epoll | DriverKind::Kqueue);
         loop {
             self.shared.counters.tick();
             self.close_deferred();
@@ -664,7 +662,7 @@ impl Worker {
                 self.take_balanced_job();
             }
             self.publish_load();
-            let batch = if self.driver_kind == DriverKind::Epoll {
+            let batch = if readiness {
                 self.queue.borrow().len()
             } else {
                 0
@@ -679,12 +677,13 @@ impl Worker {
             }
 
             if !self.queue.borrow().is_empty() {
-                // More tasks are runnable. On epoll, looking for I/O costs an
-                // `epoll_wait` system call however little is ready, so with
-                // small batches (tasks handing work to each other) it waits
-                // until IO_POLL_INTERVAL polls have run since the last look,
-                // as Tokio does. io_uring reads its completions from memory.
-                if self.driver_kind == DriverKind::Epoll {
+                // More tasks are runnable. On a readiness driver, looking for
+                // I/O costs a system call (`epoll_wait`, `kevent`) however
+                // little is ready, so with small batches (tasks handing work
+                // to each other) it waits until IO_POLL_INTERVAL polls have
+                // run since the last look, as Tokio does. io_uring reads its
+                // completions from memory.
+                if readiness {
                     let polled = self.polled_since_io.get() + batch;
                     if polled < IO_POLL_INTERVAL {
                         self.polled_since_io.set(polled);
@@ -754,8 +753,16 @@ impl Worker {
     /// the driver at the next turn of the event loop. The epoll driver must
     /// forget a descriptor before its number can be reused, so it is never
     /// closed behind the driver's back.
-    pub(crate) fn defer_close(&self, fd: RawFd) {
+    pub(crate) fn defer_close(&self, fd: sys::RawFile) {
         self.deferred.borrow_mut().closes.push(fd);
+    }
+
+    /// [`defer_close`](Self::defer_close) for a socket.
+    pub(crate) fn defer_close_sock(&self, sock: sys::RawSock) {
+        #[cfg(unix)]
+        self.defer_close(sock);
+        #[cfg(windows)]
+        self.deferred.borrow_mut().sock_closes.push(sock);
     }
 
     /// Drops the multishot operation `key`, whose owner went away while the
@@ -818,6 +825,10 @@ impl Worker {
         }
         for fd in deferred.closes {
             driver.close_fd(fd);
+        }
+        #[cfg(windows)]
+        for sock in deferred.sock_closes {
+            driver.close_sock(sock);
         }
     }
 
@@ -1038,9 +1049,13 @@ impl Builder {
     /// [`DriverKind::Epoll`] it never uses io_uring.
     ///
     /// When no driver is named here, the `GIONG_DRIVER` environment variable
-    /// can name one (`io_uring` or `epoll`), so that a deployment can choose
-    /// without a rebuild. Any other value makes [`build`](Self::build) fail
-    /// with `GIONG-E0004`.
+    /// can name one (`io_uring` or `epoll` on Linux, `kqueue` on macOS, `iocp`
+    /// on Windows), so that a deployment can choose without a rebuild. Any
+    /// other value makes [`build`](Self::build) fail with `GIONG-E0004`.
+    ///
+    /// A driver this operating system does not have, named either way, makes
+    /// `build` fail too: io_uring with `GIONG-E0001`, the others with
+    /// `GIONG-E0004`.
     ///
     /// ```no_run
     /// let rt = giong::Builder::new().driver(giong::DriverKind::Epoll).build()?;
@@ -1191,6 +1206,9 @@ impl Builder {
                 None => (None, ChosenBy::Automatic),
             },
         };
+        if let Some(kind) = driver {
+            crate::driver::check_exists(kind)?;
+        }
         Ok(Config {
             driver,
             chosen_by,
@@ -1330,18 +1348,30 @@ impl Runtime {
         let pin = self
             .builder
             .pin_cores
-            .unwrap_or_else(|| pin_by_default(cpus.len(), parallelism()));
+            .unwrap_or_else(|| sys::CAN_PIN && pin_by_default(cpus.len(), parallelism()));
         let f = Arc::new(f);
         let gate = Arc::new(Gate {
             state: Mutex::new(None),
             cond: Condvar::new(),
         });
+        #[cfg(unix)]
         let signals = if self.builder.signals {
-            Some(SignalGuard::install()?)
+            Some(sys::SignalGuard::install()?)
         } else {
             None
         };
-        let signal_fd = signals.as_ref().map(|s| s.fd);
+        #[cfg(unix)]
+        let signal_fd = signals.as_ref().map(|s| s.fd());
+        // Windows runs the handler of a console event on a thread of its
+        // own, which may do what any thread may: it asks for the shutdown
+        // itself, and no worker has to watch for it.
+        #[cfg(windows)]
+        let signals = if self.builder.signals {
+            let handle = self.handle();
+            Some(sys::SignalGuard::install(move || handle.shutdown())?)
+        } else {
+            None
+        };
 
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
         let mut threads = Vec::with_capacity(n);
@@ -1385,6 +1415,7 @@ impl Runtime {
                             // Every worker watches, so that signals are seen as
                             // long as any worker runs, not only while worker 0
                             // does.
+                            #[cfg(unix)]
                             if let Some(fd) = signal_fd {
                                 crate::spawn(watch_signals(fd));
                             }
@@ -1396,7 +1427,7 @@ impl Runtime {
             match spawned {
                 Ok(t) => threads.push(t),
                 Err(e) => {
-                    spawn_err = Some(e);
+                    spawn_err = Some(thread_limit_error(index, n, e));
                     break;
                 }
             }
@@ -1473,102 +1504,44 @@ fn raise_open_files_limit() {
 #[cfg(any(not(target_os = "linux"), miri))]
 fn raise_open_files_limit() {}
 
+/// The error for a worker thread that could not be started. The kernel says
+/// only `EAGAIN` ("Resource temporarily unavailable"), which is what a
+/// container's PID limit gives: each thread counts against it.
+fn thread_limit_error(index: usize, workers: usize, e: io::Error) -> io::Error {
+    let limit = thread_limit()
+        .map(|(file, max)| format!("; {file} allows {max} threads and processes"))
+        .unwrap_or_default();
+    io::Error::new(
+        e.kind(),
+        crate::error::Error::new(
+            Code::ThreadLimit,
+            format!(
+                "could not start worker thread {} of {workers} ({e}{limit})",
+                index + 1
+            ),
+            "let the process have more threads: a container's PID limit counts each of \
+             them (docker run --pids-limit, a Kubernetes pod's PID limit, TasksMax in a \
+             systemd unit), and so does RLIMIT_NPROC (ulimit -u) for all processes of the \
+             user. Or start fewer workers (Builder::workers); giong needs one thread per \
+             worker, plus blocking threads for file operations on the epoll driver.",
+        )
+        .with_source(e),
+    )
+}
+
+/// The cgroup PID limit that applies to this process, as the file it is
+/// read from and its value, if it is not `max`. Inside a container, the
+/// container's own cgroup is the mount's root.
+fn thread_limit() -> Option<(&'static str, u64)> {
+    ["/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max"]
+        .into_iter()
+        .find_map(|file| {
+            let max = std::fs::read_to_string(file).ok()?.trim().parse().ok()?;
+            Some((file.rsplit('/').next().unwrap_or(file), max))
+        })
+}
+
 // --------------------------------------------------------------------- signals
-
-/// The eventfd the signal handler writes to. Created once per process and
-/// never closed, so the handler can never race with a close.
-static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
-/// Set while a runtime has the handlers installed.
-static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
-
-/// Async-signal-safe: only `write(2)`, with `errno` preserved.
-extern "C" fn on_signal(_signal: libc::c_int) {
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
-    if fd >= 0 {
-        let one: u64 = 1;
-        // SAFETY: `write` is async-signal-safe; `errno` is restored afterwards.
-        unsafe {
-            let errno = libc::__errno_location();
-            let saved = *errno;
-            libc::write(fd, &one as *const u64 as *const libc::c_void, 8);
-            *errno = saved;
-        }
-    }
-}
-
-/// Installs SIGINT/SIGTERM handlers that poke an eventfd; restores the
-/// previous handlers when dropped.
-///
-/// Handlers (rather than a blocked-signal `signalfd`) are used because signal
-/// masks are per thread: a `signalfd` only works if *every* thread of the
-/// process blocks the signals, which a library cannot guarantee.
-struct SignalGuard {
-    fd: RawFd,
-    old_int: libc::sigaction,
-    old_term: libc::sigaction,
-}
-
-impl SignalGuard {
-    fn install() -> io::Result<Self> {
-        if SIGNALS_IN_USE.swap(true, Ordering::SeqCst) {
-            return Err(crate::error::raise(
-                Code::SignalsTaken,
-                "another giong runtime in this process already handles SIGINT and SIGTERM",
-                "turn on Builder::shutdown_on_signals for one runtime only, or run one runtime \
-                 at a time.",
-            ));
-        }
-        // SAFETY: plain libc calls with valid arguments; results are checked.
-        unsafe {
-            let mut fd = SIGNAL_FD.load(Ordering::SeqCst);
-            if fd < 0 {
-                fd = libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
-                if fd < 0 {
-                    SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                    return Err(io::Error::last_os_error());
-                }
-                SIGNAL_FD.store(fd, Ordering::SeqCst);
-            }
-            // Forget signals that arrived while nobody was listening.
-            let mut stale: u64 = 0;
-            libc::read(fd, &mut stale as *mut u64 as *mut libc::c_void, 8);
-
-            let mut action: libc::sigaction = mem::zeroed();
-            action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            let mut old_int: libc::sigaction = mem::zeroed();
-            let mut old_term: libc::sigaction = mem::zeroed();
-            if libc::sigaction(libc::SIGINT, &action, &mut old_int) != 0 {
-                let err = io::Error::last_os_error();
-                SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                return Err(err);
-            }
-            if libc::sigaction(libc::SIGTERM, &action, &mut old_term) != 0 {
-                let err = io::Error::last_os_error();
-                libc::sigaction(libc::SIGINT, &old_int, std::ptr::null_mut());
-                SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-                return Err(err);
-            }
-            Ok(Self {
-                fd,
-                old_int,
-                old_term,
-            })
-        }
-    }
-}
-
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        // SAFETY: restores the dispositions saved in `install`.
-        unsafe {
-            libc::sigaction(libc::SIGINT, &self.old_int, std::ptr::null_mut());
-            libc::sigaction(libc::SIGTERM, &self.old_term, std::ptr::null_mut());
-        }
-        SIGNALS_IN_USE.store(false, Ordering::SeqCst);
-    }
-}
 
 /// Waits for the signal handler to poke the eventfd, then requests shutdown.
 /// Runs on every worker; whichever reads the eventfd first requests the
@@ -1576,7 +1549,8 @@ impl Drop for SignalGuard {
 ///
 /// Ends as soon as a shutdown is requested by any other means, or the worker
 /// drains, so that it never keeps a draining worker alive.
-async fn watch_signals(fd: RawFd) {
+#[cfg(unix)]
+async fn watch_signals(fd: sys::RawFile) {
     until_shutdown(async {
         let mut buf: Vec<u8> = Vec::with_capacity(8);
         loop {
@@ -1593,7 +1567,7 @@ async fn watch_signals(fd: RawFd) {
                 handle().shutdown();
                 return;
             }
-            if res != -libc::EINTR && res != -libc::EAGAIN {
+            if res != -sys::errno::EINTR && res != -sys::errno::EAGAIN {
                 return;
             }
         }
@@ -2169,33 +2143,41 @@ fn pin_by_default(allowed: usize, parallelism: Option<usize>) -> bool {
 
 /// CPUs the calling thread is allowed to run on.
 fn allowed_cpus() -> Vec<usize> {
-    // SAFETY: `set` is a valid, zeroed cpu_set_t of the size we pass.
-    unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        if libc::sched_getaffinity(0, mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            let n = thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            return (0..n).collect();
-        }
-        (0..libc::CPU_SETSIZE as usize)
-            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-            .collect()
-    }
+    sys::allowed_cpus()
 }
 
 fn pin_to_cpu(cpu: usize) {
-    // SAFETY: as above. Failure is not fatal: the worker just stays unpinned.
-    unsafe {
-        let mut set: libc::cpu_set_t = mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set);
-    }
+    sys::pin_to_cpu(cpu);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workers, pin_by_default};
+    use super::{default_workers, pin_by_default, thread_limit_error};
+    use crate::error::{code, Code};
+    use std::io;
+
+    #[test]
+    fn a_worker_thread_that_cannot_start_says_why() {
+        // What the kernel says: `EAGAIN` on Unix. Windows has no such
+        // number (11 is another error there), so the kind stands in for it.
+        #[cfg(unix)]
+        let eagain = io::Error::from_raw_os_error(libc::EAGAIN);
+        #[cfg(windows)]
+        let eagain = io::Error::from(io::ErrorKind::WouldBlock);
+        let words = eagain.to_string();
+        let e = thread_limit_error(2, 4, eagain);
+        assert_eq!(code(&e), Some(Code::ThreadLimit));
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let text = e.to_string();
+        assert!(
+            text.starts_with("GIONG-E0020: could not start worker thread 3 of 4"),
+            "{text}"
+        );
+        assert!(text.contains("--pids-limit"), "{text}");
+        assert!(text.contains("Builder::workers"), "{text}");
+        let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
+        assert_eq!(source.to_string(), words);
+    }
 
     #[test]
     fn the_default_worker_count_follows_the_cpu_quota() {

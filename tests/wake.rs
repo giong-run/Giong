@@ -33,7 +33,7 @@ fn race(spin: bool) -> u64 {
                 }
                 std::thread::yield_now();
             };
-            let mut lost = 0;
+            let (mut lost, mut late) = (0, 0);
             let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
             for i in 1..=ITERATIONS {
                 rng ^= rng << 13;
@@ -50,7 +50,26 @@ fn race(spin: bool) -> u64 {
                 let start = Instant::now();
                 while seen.load(Ordering::Acquire) < i {
                     if start.elapsed() > Duration::from_millis(200) {
+                        // Slow, or lost? Nothing else wakes the task, so a
+                        // lost wake-up never arrives by itself; a thread the
+                        // machine did not run for a while (seen on CI's
+                        // virtual Macs) does, a moment later.
+                        while seen.load(Ordering::Acquire) < i
+                            && start.elapsed() < Duration::from_secs(5)
+                        {
+                            std::thread::yield_now();
+                        }
+                        if seen.load(Ordering::Acquire) >= i {
+                            late += 1;
+                            eprintln!(
+                                "iteration {i}: the poll came after {:?}, without another \
+                                 wake-up (a stall, not a lost wake-up)",
+                                start.elapsed()
+                            );
+                            break;
+                        }
                         lost += 1;
+                        eprintln!("iteration {i}: wake-up lost");
                         // Recover, so one lost wake-up does not hang the test.
                         waker.wake_by_ref();
                         while seen.load(Ordering::Acquire) < i {
@@ -60,6 +79,9 @@ fn race(spin: bool) -> u64 {
                     }
                     std::hint::spin_loop();
                 }
+            }
+            if late > 0 {
+                eprintln!("{late} late polls, every one without another wake-up");
             }
             lost
         })

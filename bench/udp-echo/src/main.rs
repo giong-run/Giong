@@ -45,15 +45,159 @@ fn main() {
                 m => panic!("unknown mode {m}"),
             }
         }
+        Some("blast") => blast(&args[2], args[3].parse().unwrap(), args[4].parse().unwrap()),
+        Some("sink") => sink(),
         Some("client") => client(
             args[2].parse().unwrap(),
             args[3].parse().unwrap(),
             args[4].parse().unwrap(),
         ),
         _ => {
-            eprintln!("usage: bench-udp-echo server <mode> <iface> <cpu> | client <ip> <threads> <secs>")
+            eprintln!(
+                "usage: bench-udp-echo server <mode> <iface> <cpu> | client <ip> <threads> <secs>"
+            )
         }
     }
+}
+
+/// Bulk sending to one peer, the case of a QUIC or media sender: 1200-byte
+/// datagrams for `secs` seconds on one core, four ways. Prints datagrams per
+/// second and the sender's CPU time per datagram (user + system).
+///
+///   giong       send_to, one datagram per call
+///   giong-gso   send_segments_to, 40 datagrams per call (UDP_SEGMENT)
+///   tokio       send_to, one per call
+///   kernel-gso  sendmsg with UDP_SEGMENT, no runtime
+fn blast(mode: &str, dst: Ipv4Addr, secs: u64) {
+    const SIZE: usize = 1200;
+    const SEGS: usize = 40;
+    pin(1);
+    let to = std::net::SocketAddr::from((dst, PORT));
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let t0 = cpu_seconds();
+    let w0 = Instant::now();
+    let sent: u64 = match mode {
+        "giong" | "giong-gso" => {
+            let sent = Arc::new(AtomicU64::new(0));
+            let out = sent.clone();
+            let mode = mode.to_string();
+            giong::Builder::new()
+                .workers(1)
+                .pin_cores(false)
+                .build()
+                .unwrap()
+                .run(move |_| {
+                    let sent = out.clone();
+                    let mode = mode.clone();
+                    async move {
+                        let s = giong::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+                        let mut n = 0u64;
+                        match mode.as_str() {
+                            "giong" => {
+                                let mut v = vec![7u8; SIZE];
+                                while Instant::now() < deadline {
+                                    for _ in 0..64 {
+                                        let (r, b) = s.send_to(v, to).await;
+                                        v = b;
+                                        n += u64::from(r.is_ok());
+                                    }
+                                }
+                            }
+                            _ => {
+                                let mut v = vec![7u8; SIZE * SEGS];
+                                while Instant::now() < deadline {
+                                    for _ in 0..4 {
+                                        let (r, b) = s.send_segments_to(v, to, SIZE, 0).await;
+                                        v = b;
+                                        if r.is_ok() {
+                                            n += SEGS as u64;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        sent.store(n, Ordering::Relaxed);
+                    }
+                })
+                .unwrap();
+            sent.load(Ordering::Relaxed)
+        }
+        "tokio" => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let s = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await.unwrap();
+                let v = vec![7u8; SIZE];
+                let mut n = 0u64;
+                while Instant::now() < deadline {
+                    for _ in 0..64 {
+                        n += u64::from(s.send_to(&v, to).await.is_ok());
+                    }
+                }
+                n
+            })
+        }
+        "kernel-gso" => {
+            let s = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+            s.connect(to).unwrap();
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&s);
+            let seg: i32 = SIZE as i32;
+            // SAFETY: plain setsockopt.
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_UDP,
+                    libc::UDP_SEGMENT,
+                    &seg as *const _ as *const _,
+                    4,
+                )
+            };
+            let v = vec![7u8; SIZE * SEGS];
+            let mut n = 0u64;
+            while Instant::now() < deadline {
+                for _ in 0..4 {
+                    if s.send(&v).is_ok() {
+                        n += SEGS as u64;
+                    }
+                }
+            }
+            n
+        }
+        m => panic!("unknown blast mode {m}"),
+    };
+    let cpu = cpu_seconds() - t0;
+    let el = w0.elapsed().as_secs_f64();
+    println!("{:.0},{:.3}", sent as f64 / el, cpu / sent as f64 * 1e9);
+}
+
+/// User + system CPU seconds of this process.
+fn cpu_seconds() -> f64 {
+    // SAFETY: plain syscall into a zeroed struct.
+    unsafe {
+        let mut u: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut u);
+        let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 * 1e-6;
+        t(u.ru_utime) + t(u.ru_stime)
+    }
+}
+
+/// Receives and drops everything on PORT, so the sender's datagrams have a
+/// socket to go to.
+fn sink() {
+    let fd = reuseport_socket_or_plain();
+    let mut bufs = vec![[0u8; 2048]; BATCH];
+    loop {
+        recvmmsg(fd, &mut bufs);
+    }
+}
+
+fn reuseport_socket_or_plain() -> i32 {
+    let s = UdpSocket::bind(("0.0.0.0", PORT)).unwrap();
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&s);
+    std::mem::forget(s);
+    fd
 }
 
 fn pin(cpu: usize) {
@@ -233,7 +377,10 @@ fn kernel_server() {
 
 /// Echo tasks per server (`TASKS`, 16 by default), all on one socket.
 fn tasks() -> usize {
-    std::env::var("TASKS").ok().and_then(|t| t.parse().ok()).unwrap_or(16)
+    std::env::var("TASKS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(16)
 }
 
 fn giong_server() {
@@ -297,4 +444,3 @@ fn tokio_server() {
         }
     });
 }
-

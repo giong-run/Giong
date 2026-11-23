@@ -21,13 +21,19 @@ mod balance;
 pub(crate) mod dns;
 mod sendq;
 mod share;
-mod udp;
+#[cfg(windows)]
+mod spread;
+pub(crate) mod udp;
+#[cfg(unix)]
 mod unix;
 
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
+#[cfg(feature = "unstable-udp-offload")]
+pub use udp::{SendOptions, GRO_RECV_BUFFER};
+#[cfg(unix)]
 pub use unix::{UnixListener, UnixStream};
 
 use std::cell::{Cell, OnceCell};
@@ -36,6 +42,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::net::{Shutdown, SocketAddr};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -48,6 +55,8 @@ use crate::error::{raise, Code};
 use crate::kbox::KernelBox;
 use crate::op::Op;
 use crate::runtime::{self, Worker};
+#[cfg(windows)]
+use crate::sys::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 /// The most buffers one `sendmsg` takes (`IOV_MAX` on Linux); a vectored
 /// write with more sends them in several calls.
@@ -56,10 +65,115 @@ const IOV_MAX: usize = 1024;
 /// in one call anyway).
 const SENDFILE_MAX: u64 = 0x7fff_f000;
 /// Bytes `send_file` sends before it lets the worker's other tasks run.
+#[cfg(unix)]
 const SENDFILE_YIELD: u64 = 512 * 1024;
 
 pub(crate) fn os_err(res: i32) -> io::Error {
     io::Error::from_raw_os_error(-res)
+}
+
+/// [`os_err`] for the result of a stream send or connect. On macOS,
+/// `ENOBUFS` there comes after the driver waited for network buffers (see
+/// `driver/readiness/nobufs.rs`), and gets its code.
+#[inline]
+pub(crate) fn send_err(res: i32) -> io::Error {
+    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+    if res == -libc::ENOBUFS {
+        return nobufs::exhausted(os_err(res));
+    }
+    os_err(res)
+}
+
+/// The net layer's part in waiting out a shortage of network buffers on
+/// macOS: the connects the shortage broke after they began, and
+/// `sendfile(2)`. The driver retries the rest (see
+/// `driver/readiness/nobufs.rs`, whose steps these are). Datagram sends are
+/// left alone: their `ENOBUFS` is returned as the kernel's error, as on
+/// Linux, since a datagram may be dropped.
+#[cfg(any(target_os = "macos", giong_inject_enobufs))]
+pub(crate) mod nobufs {
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use socket2::Socket;
+
+    use crate::error::{Code, Error};
+
+    const GIVE_UP: Duration = Duration::from_secs(2);
+    const FIRST: Duration = Duration::from_millis(1);
+    const MOST: Duration = Duration::from_millis(32);
+
+    /// `ENOBUFS` with its code, after giong waited for buffers.
+    #[cold]
+    pub(crate) fn exhausted(err: io::Error) -> io::Error {
+        Error::new(
+            Code::NetworkBuffersExhausted,
+            "the system ran out of network buffers (ENOBUFS), and still had none after 2 s",
+            "read from every connection promptly, cap how many connections can hold unread \
+             data at once, and lower SO_RCVBUF if the program raised it; netstat -m shows how \
+             many requests for network buffers macOS denied. If it keeps happening with \
+             little in use, treat the error as transient and try again later.",
+        )
+        .with_source(err)
+        .into()
+    }
+
+    pub(crate) fn is_exhausted(err: &io::Error) -> bool {
+        crate::error::code(err) == Some(Code::NetworkBuffersExhausted)
+    }
+
+    /// Waits between tries, as the driver does, within [`GIVE_UP`] from when
+    /// it was made.
+    pub(crate) struct Backoff {
+        since: Instant,
+        step: Duration,
+    }
+
+    impl Backoff {
+        pub(crate) fn new() -> Self {
+            Self {
+                since: Instant::now(),
+                step: Duration::ZERO,
+            }
+        }
+
+        /// Waits for the next try; `false`, at once, if it would end past
+        /// [`GIVE_UP`].
+        pub(crate) async fn wait(&mut self) -> bool {
+            self.step = if self.step.is_zero() {
+                FIRST
+            } else {
+                (self.step * 2).min(MOST)
+            };
+            if self.since.elapsed() + self.step > GIVE_UP {
+                return false;
+            }
+            crate::time::sleep(self.step).await;
+            true
+        }
+
+        /// What is left of [`GIVE_UP`].
+        pub(crate) fn left(&self) -> Duration {
+            GIVE_UP.saturating_sub(self.since.elapsed())
+        }
+    }
+
+    /// A socket from `make`. `socket(2)` fails with `ENOBUFS` when macOS
+    /// has no buffer for the new socket; that error comes back with its
+    /// code, for the caller to wait and try again.
+    pub(crate) fn socket(make: impl Fn() -> io::Result<Socket>) -> io::Result<Socket> {
+        #[cfg(giong_inject_enobufs)]
+        if crate::inject_enobufs::socket() {
+            return Err(exhausted(io::Error::from_raw_os_error(libc::ENOBUFS)));
+        }
+        make().map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOBUFS) {
+                exhausted(e)
+            } else {
+                e
+            }
+        })
+    }
 }
 
 /// A multishot operation slot owned by a socket: the driver key plus the uid
@@ -183,8 +297,8 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
         // driver is borrowed, both are deferred, in this order.)
         slot.release(w);
         match w.driver.try_borrow_mut() {
-            Ok(mut driver) => driver.close_fd(fd),
-            Err(_) => w.defer_close(fd),
+            Ok(mut driver) => driver.close_sock(fd),
+            Err(_) => w.defer_close_sock(fd),
         }
     })
     .is_some();
@@ -205,6 +319,12 @@ pub(crate) struct ListenSocket {
 
 impl ListenSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option, and the connections it accepts inherit it. socket2
+        // sets it on the sockets it creates; this covers a listener that
+        // came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
@@ -229,7 +349,9 @@ impl ListenSocket {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res) if res >= 0 => {
                         // SAFETY: a fresh descriptor returned by accept.
-                        return Poll::Ready(Ok(unsafe { Socket::from_raw_fd(res) }));
+                        return Poll::Ready(Ok(unsafe {
+                            Socket::from_raw_fd(res as crate::sys::RawSock)
+                        }));
                     }
                     MultiPoll::Item(res) => return Poll::Ready(Err(os_err(res))),
                     MultiPoll::Data(_) => unreachable!("accept never receives data"),
@@ -241,6 +363,43 @@ impl ListenSocket {
                 }
             }
         })
+    }
+}
+
+#[cfg(windows)]
+impl ListenSocket {
+    /// The connection the accept this listener has in the driver still
+    /// takes, if it has one there; no further accept is started.
+    pub(crate) fn poll_last_accept(&self, cx: &mut Context<'_>) -> Poll<io::Result<Socket>> {
+        let accepting = runtime::with_worker(|w| {
+            let active = self.accept.is_active(w);
+            if active {
+                let key = self.accept.key(w);
+                w.driver.borrow_mut().finish_multi(key);
+            }
+            active
+        });
+        if accepting {
+            self.poll_accept(cx)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    /// The connection an accept of this listener completed with and nobody
+    /// collected, for a listener that goes away while others share its
+    /// address: closed with the listener, it would be lost to them.
+    pub(crate) fn take_accepted(&self) -> Option<Socket> {
+        runtime::try_with_worker(|w| {
+            if !self.accept.is_active(w) {
+                return None;
+            }
+            let key = self.accept.key(w);
+            let socket = w.driver.try_borrow_mut().ok()?.take_accepted(key)?;
+            // SAFETY: a socket the driver accepted and hands over.
+            Some(unsafe { Socket::from_raw_fd(socket as crate::sys::RawSock) })
+        })
+        .flatten()
     }
 }
 
@@ -320,10 +479,19 @@ impl Drop for SendInFlight<'_> {
 
 impl StreamSocket {
     pub(crate) fn new(sock: Socket) -> Self {
+        // macOS waits in a send to a full socket even with `MSG_DONTWAIT`
+        // (the flag only keeps a receive from waiting there), so a stream is
+        // non-blocking from the start: a send made outside the driver, as
+        // giong-compat's direct sends are, must never hold the worker. The
+        // driver would set the mode at the first operation anyway.
+        #[cfg(target_os = "macos")]
+        let nonblocking = sock.set_nonblocking(true).is_ok();
+        #[cfg(any(target_os = "linux", windows))]
+        let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
             recv: MultiSlot::new(MultiKind::Recv),
-            nonblocking: Cell::new(false),
+            nonblocking: Cell::new(nonblocking),
             zero_copy: Cell::new(true),
             zero_copy_copied: OnceCell::new(),
             sends_in_flight: Cell::new(0),
@@ -365,15 +533,21 @@ impl StreamSocket {
         if !self.unix.get() || !self.check_end.replace(false) {
             return false;
         }
-        let mut fd = libc::pollfd {
-            fd: self.sock.as_raw_fd(),
-            events: libc::POLLRDHUP,
-            revents: 0,
-        };
-        // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
-        // the socket's state.
-        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
-        ready > 0 && fd.revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0
+        #[cfg(windows)]
+        return false;
+        #[cfg(unix)]
+        {
+            let mut fd = libc::pollfd {
+                fd: self.sock.as_raw_fd(),
+                events: crate::sys::POLL_PEER_CLOSED,
+                revents: 0,
+            };
+            // SAFETY: one valid `pollfd`, and a timeout of zero: this only reads
+            // the socket's state.
+            let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+            ready > 0
+                && fd.revents & (crate::sys::POLL_PEER_CLOSED | libc::POLLHUP | libc::POLLERR) != 0
+        }
     }
 
     /// Where a send of `len` bytes from buffers that cannot change should go
@@ -400,6 +574,48 @@ impl StreamSocket {
         Some(copied.clone())
     }
 
+    /// Connects a socket made by `make` to `addr`. On macOS, a socket that
+    /// could not be made for want of network buffers is made again, and a
+    /// connect that the shortage broke after it began is made again on a new
+    /// socket. All of it stays within the 2 s the driver waits for buffers:
+    /// a connect on a new socket gets what is left of them, not 2 s of its
+    /// own.
+    pub(crate) async fn connect_new(
+        make: impl Fn() -> io::Result<Socket>,
+        addr: SockAddr,
+    ) -> io::Result<Self> {
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        {
+            let mut backoff = nobufs::Backoff::new();
+            let mut res = match nobufs::socket(&make) {
+                Ok(sock) => Self::connect(sock, addr.clone()).await,
+                Err(e) => Err(e),
+            };
+            loop {
+                match res {
+                    Err(e) if nobufs::is_exhausted(&e) && backoff.wait().await => {
+                        res = match nobufs::socket(&make) {
+                            Ok(sock) => {
+                                let connect = Self::connect(sock, addr.clone());
+                                match crate::time::timeout(backoff.left(), connect).await {
+                                    Ok(res) => res,
+                                    // Out of time while the driver waited for
+                                    // buffers (dropping the connect closed its
+                                    // socket).
+                                    Err(_) => Err(e),
+                                }
+                            }
+                            Err(again) => Err(again),
+                        };
+                    }
+                    res => return res,
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", giong_inject_enobufs)))]
+        Self::connect(make()?, addr).await
+    }
+
     /// Connects `sock` to `addr` through the driver.
     pub(crate) async fn connect(sock: Socket, addr: SockAddr) -> io::Result<Self> {
         // On the heap so the address the operation points at does not move
@@ -407,7 +623,7 @@ impl StreamSocket {
         let addr = KernelBox::new(addr);
         let io = Io::Connect {
             fd: sock.as_raw_fd(),
-            addr: addr.get().as_ptr() as *const libc::sockaddr,
+            addr: addr.get().as_ptr() as *const crate::sys::SockAddr,
             len: addr.get().len(),
         };
         // Owned as a stream from here on, so that a connect that fails, or
@@ -420,7 +636,7 @@ impl StreamSocket {
         // `KernelBox`.
         let (res, _, _addr) = unsafe { Op::new(io, addr) }.await;
         if res < 0 {
-            return Err(os_err(res));
+            return Err(send_err(res));
         }
         Ok(stream)
     }
@@ -494,7 +710,7 @@ impl StreamSocket {
             );
             return (Err(err), buf);
         }
-        let len = buf.capacity().min(u32::MAX as usize) as u32;
+        let len = buf.capacity().min(i32::MAX as usize) as u32;
         let io = Io::Recv {
             fd: self.sock.as_raw_fd(),
             buf: buf.as_mut_ptr(),
@@ -566,8 +782,9 @@ impl StreamSocket {
     }
 
     /// For [`recv_into`](Self::recv_into): what the pooled receive holds, in
-    /// order, then `Empty` once it is stopped and holds nothing. The epoll
-    /// driver receives only when asked, so it never holds anything.
+    /// order, then `Empty` once it is stopped and holds nothing. The readiness
+    /// drivers (epoll, kqueue) receive only when asked, so they never hold
+    /// anything.
     fn poll_stop_recv(&self, cx: &mut Context<'_>) -> Poll<Stopped> {
         runtime::with_worker(|w| {
             let key = self.recv.key(w);
@@ -640,32 +857,47 @@ impl StreamSocket {
         bufs: Vec<B>,
         offset: usize,
     ) -> (io::Result<usize>, Vec<B>) {
-        let mut iov: Vec<libc::iovec> = pieces_from(&bufs, offset)
-            .map(|(buf, skip)| libc::iovec {
+        let mut iov: Vec<crate::sys::IoVec> = pieces_from(&bufs, offset)
+            .map(|(buf, skip)| {
                 // SAFETY: `skip < len`, so the pointer stays within the
                 // buffer.
-                iov_base: unsafe { buf.as_ptr().add(skip) }.cast_mut().cast(),
-                iov_len: buf.len() - skip,
+                crate::sys::io_vec(unsafe { buf.as_ptr().add(skip) }, buf.len() - skip)
             })
             .collect();
+        // Windows reports a transfer's count as a signed 32-bit number: a
+        // send of more than that in one call is cut to it, a short write.
+        #[cfg(windows)]
+        {
+            let mut room = i32::MAX as usize;
+            let mut keep = 0;
+            for v in iov.iter_mut() {
+                if room == 0 {
+                    break;
+                }
+                let len = crate::sys::io_vec_parts(v).1.min(room);
+                v.len = len as u32;
+                room -= len;
+                keep += 1;
+            }
+            iov.truncate(keep);
+        }
         if iov.is_empty() {
             return (Ok(0), bufs);
         }
         let hold = self.vectored_hold(&bufs, offset, &mut iov);
         // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
         // lengths).
-        let msg: KernelBox<libc::msghdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+        let msg: KernelBox<crate::sys::MsgHdr> = KernelBox::new(unsafe { std::mem::zeroed() });
         // SAFETY: `msg` owns a live `msghdr` nothing else uses yet. The
         // iovec array is a `Vec`'s heap buffer, which moving the `Vec` does
         // not move or reborrow.
         unsafe {
-            (*msg.as_ptr()).msg_iov = iov.as_mut_ptr();
-            (*msg.as_ptr()).msg_iovlen = iov.len() as _;
+            crate::sys::msg_set_iov(msg.as_ptr(), iov.as_mut_ptr(), iov.len());
         }
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             msg: msg.as_ptr(),
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: hold.is_some(),
         };
         let in_flight = SendInFlight::new(self);
@@ -684,7 +916,7 @@ impl StreamSocket {
         let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), bufs)
+            (Err(send_err(res)), bufs)
         } else {
             (Ok(res as usize), bufs)
         }
@@ -698,14 +930,15 @@ impl StreamSocket {
         &self,
         bufs: &[B],
         offset: usize,
-        iov: &mut [libc::iovec],
+        iov: &mut [crate::sys::IoVec],
     ) -> Option<Box<ZeroCopyHold>> {
         let (mut shared, mut changing) = (0, 0);
         for ((buf, _), v) in pieces_from(bufs, offset).zip(iov.iter()) {
+            let (_, len) = crate::sys::io_vec_parts(v);
             if is_shared(buf) {
-                shared += v.iov_len;
+                shared += len;
             } else {
-                changing += v.iov_len;
+                changing += len;
             }
         }
         if changing > ZERO_COPY_SCRATCH_MAX {
@@ -719,9 +952,9 @@ impl StreamSocket {
                 Sharing::Owner(owner) => owners.push(owner),
                 Sharing::Static => {}
                 Sharing::No => {
+                    let (base, len) = crate::sys::io_vec_parts(v);
                     // SAFETY: the iovec covers initialised bytes of `buf`.
-                    let bytes =
-                        unsafe { std::slice::from_raw_parts(v.iov_base as *const u8, v.iov_len) };
+                    let bytes = unsafe { std::slice::from_raw_parts(base, len) };
                     scratch.extend_from_slice(bytes);
                 }
             }
@@ -731,8 +964,8 @@ impl StreamSocket {
         let mut at = 0;
         for ((buf, _), v) in pieces_from(bufs, offset).zip(iov.iter_mut()) {
             if !is_shared(buf) {
-                v.iov_base = scratch[at..].as_ptr().cast_mut().cast();
-                at += v.iov_len;
+                crate::sys::io_vec_set_base(v, scratch[at..].as_ptr());
+                at += crate::sys::io_vec_parts(v).1;
             }
         }
         Some(Box::new(ZeroCopyHold {
@@ -748,20 +981,15 @@ impl StreamSocket {
         buf: B,
         control: C,
     ) -> (io::Result<usize>, B, C) {
-        let iov = KernelBox::new(libc::iovec {
-            iov_base: buf.as_ptr().cast_mut().cast(),
-            iov_len: buf.len(),
-        });
+        let iov = KernelBox::new(crate::sys::io_vec(buf.as_ptr(), buf.len()));
         // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
-        let msg: KernelBox<libc::msghdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+        let msg: KernelBox<crate::sys::MsgHdr> = KernelBox::new(unsafe { std::mem::zeroed() });
         // SAFETY: `msg` owns a live `msghdr` nothing else uses yet.
         unsafe {
             let m = msg.as_ptr();
-            (*m).msg_iov = iov.as_ptr();
-            (*m).msg_iovlen = 1;
+            crate::sys::msg_set_iov(m, iov.as_ptr(), 1);
             if !control.is_empty() {
-                (*m).msg_control = control.as_ptr().cast_mut().cast();
-                (*m).msg_controllen = control.len() as _;
+                crate::sys::msg_set_control(m, control.as_ptr().cast_mut(), control.len());
             }
         }
         // Control messages go to kernel TLS, which cannot send without a
@@ -769,7 +997,7 @@ impl StreamSocket {
         let io = Io::SendMsg {
             fd: self.sock.as_raw_fd(),
             msg: msg.as_ptr(),
-            flags: libc::MSG_NOSIGNAL as u32,
+            flags: crate::sys::MSG_NOSIGNAL as u32,
             zero_copy: false,
         };
         let in_flight = SendInFlight::new(self);
@@ -782,7 +1010,7 @@ impl StreamSocket {
             unsafe { Op::new(io, (buf, control, iov, msg)) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), buf, control)
+            (Err(send_err(res)), buf, control)
         } else {
             (Ok(res as usize), buf, control)
         }
@@ -790,6 +1018,7 @@ impl StreamSocket {
 
     /// Sends `len` bytes of the file `file` from `offset` with
     /// `sendfile(2)`. See [`TcpStream::send_file`].
+    #[cfg(unix)]
     pub(crate) async fn send_file(&self, file: RawFd, offset: u64, len: u64) -> io::Result<()> {
         if offset
             .checked_add(len)
@@ -809,15 +1038,20 @@ impl StreamSocket {
         let fd = self.sock.as_raw_fd();
         let (mut offset, mut left) = (offset, len);
         let mut since_yield = 0;
+        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+        let mut backoff: Option<nobufs::Backoff> = None;
         while left > 0 {
-            let mut off = offset as libc::off_t;
             let count = left.min(SENDFILE_MAX) as usize;
-            // SAFETY: plain system call on descriptors the caller keeps open;
-            // `off` is a valid `off_t` the kernel reads and advances. The
-            // socket is non-blocking, so the call never waits.
-            let n = unsafe { libc::sendfile64(fd, file, &mut off, count) };
+            // The socket is non-blocking, so the call never waits; `offset`
+            // moves past what was sent.
+            let mut moved = offset;
+            let n = crate::sys::sendfile(fd, file, &mut moved, count);
             match n {
                 n if n > 0 => {
+                    #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                    {
+                        backoff = None;
+                    }
                     let n = n as u64;
                     offset += n;
                     left -= n;
@@ -845,8 +1079,20 @@ impl StreamSocket {
                 _ => {
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
-                        Some(libc::EINTR) => {}
-                        Some(libc::EAGAIN) => {
+                        Some(crate::sys::errno::EINTR) => {}
+                        // The pool of network buffers is empty: wait for it
+                        // as stream sends do.
+                        #[cfg(any(target_os = "macos", giong_inject_enobufs))]
+                        Some(libc::ENOBUFS) => {
+                            if !backoff
+                                .get_or_insert_with(nobufs::Backoff::new)
+                                .wait()
+                                .await
+                            {
+                                return Err(nobufs::exhausted(err));
+                            }
+                        }
+                        Some(crate::sys::errno::EAGAIN) => {
                             // SAFETY: the operation has no pointers.
                             let (res, _, ()) = unsafe { Op::new(Io::Writable { fd }, ()) }.await;
                             if res < 0 {
@@ -857,6 +1103,83 @@ impl StreamSocket {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Sends `len` bytes of `file` from `offset` with `TransmitFile`. See
+    /// [`TcpStream::send_file`].
+    #[cfg(windows)]
+    pub(crate) async fn send_file(
+        &self,
+        file: &crate::fs::File,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        use std::os::windows::io::{AsRawHandle, AsRawSocket};
+
+        if offset
+            .checked_add(len)
+            .map_or(true, |end| end > i64::MAX as u64)
+        {
+            // No file reaches that far.
+            return Err(raise(
+                Code::FileTooShort,
+                format!(
+                    "send_file was asked for {len} bytes from offset {offset}, past any file's end"
+                ),
+                "pass an offset and a length within the file: offset + len must not exceed \
+                 File::len.",
+            ));
+        }
+        let fd = self.sock.as_raw_socket() as crate::sys::RawSock;
+        let (mut offset, mut left) = (offset, len);
+        while left > 0 {
+            // `TransmitFile` is asked only for bytes the file has, so that
+            // a file that is too short sends what it has and then says so,
+            // as on Unix.
+            let there = file.len()?.saturating_sub(offset);
+            let count = left.min(there).min(SENDFILE_MAX) as u32;
+            let sent = if count == 0 {
+                0
+            } else {
+                // A dropped send is left to finish (a cancelled one would
+                // abort the connection), and closing the last handle to a
+                // file aborts the sends that read it: the caller's `File`
+                // usually goes with the future. So the send reads through a
+                // handle of its own, which the driver keeps until the
+                // completion arrives.
+                let own = file.second_handle()?;
+                let io = Io::SendFile {
+                    fd,
+                    file: own.as_raw_handle(),
+                    len: count,
+                    offset,
+                };
+                // SAFETY: the operation has no pointers; the handle it reads
+                // through lives in the operation until its completion.
+                let (res, _, own) = unsafe { Op::new(io, own) }.await;
+                drop(own);
+                if res < 0 {
+                    return Err(os_err(res));
+                }
+                res as u64
+            };
+            if sent == 0 {
+                return Err(raise(
+                    Code::FileTooShort,
+                    format!(
+                        "the file ended at byte {offset}, {left} bytes short of the {len} \
+                         send_file was asked to send"
+                    ),
+                    "take the length from the open file (File::len), and replace a file \
+                     that is being served by renaming a new one over it, not by \
+                     rewriting it; the peer has fewer bytes than announced, so close the \
+                     connection.",
+                ));
+            }
+            offset += sent;
+            left -= sent;
         }
         Ok(())
     }
@@ -873,7 +1196,7 @@ impl StreamSocket {
 
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
-        let len = (buf.len() - offset).min(u32::MAX as usize) as u32;
+        let len = (buf.len() - offset).min(i32::MAX as usize) as u32;
         let hold = self.send_hold(&buf, len as usize);
         // SAFETY: `offset <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(offset) };
@@ -882,7 +1205,7 @@ impl StreamSocket {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
             if let Some(res) = self.send_now(bytes) {
                 return if res < 0 {
-                    (Err(os_err(res)), buf)
+                    (Err(send_err(res)), buf)
                 } else {
                     (Ok(res as usize), buf)
                 };
@@ -892,7 +1215,7 @@ impl StreamSocket {
             fd: self.sock.as_raw_fd(),
             buf: ptr,
             len,
-            flags: libc::MSG_NOSIGNAL,
+            flags: crate::sys::MSG_NOSIGNAL,
             zero_copy: hold.is_some(),
         };
         let in_flight = SendInFlight::new(self);
@@ -906,7 +1229,7 @@ impl StreamSocket {
         let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
         in_flight.finish();
         if res < 0 {
-            (Err(os_err(res)), buf)
+            (Err(send_err(res)), buf)
         } else {
             (Ok(res as usize), buf)
         }
@@ -1012,6 +1335,10 @@ pub struct TcpListener {
     /// The listener's hold on its port, for one that [`bind`](Self::bind)
     /// made (see `share`).
     held: Option<share::Held>,
+    /// The listener's share of an address that several workers listen on
+    /// (see `spread`). After `inner`: the socket is closed first.
+    #[cfg(windows)]
+    spread: Option<spread::Member>,
 }
 
 impl TcpListener {
@@ -1031,6 +1358,22 @@ impl TcpListener {
     /// share a port between processes on purpose (a new version started
     /// before the old one has stopped), create the sockets yourself with
     /// `SO_REUSEPORT` set and pass them to [`from_std`](Self::from_std).
+    ///
+    /// On macOS the workers share one listening socket instead (each
+    /// listener is a duplicate of the first one bound to the address), and
+    /// take connections from its one queue as they come: whichever worker
+    /// accepts first gets the next connection. Every worker waiting in
+    /// `accept` is woken for each connection, and all but one find nothing.
+    /// The socket is bound without `SO_REUSEPORT`, so no other user's
+    /// process can bind the address while a listener lives. A process of
+    /// the same user still can bind one specific IP address of a port that
+    /// giong listens on with the wildcard address, by setting
+    /// `SO_REUSEADDR` (the BSD rule); listen on the specific address to
+    /// refuse that too.
+    ///
+    /// On Windows a port has one listening socket. The workers' listeners
+    /// share it: from the second listener on, one thread accepts the
+    /// connections and hands them to the listeners in turn.
     ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
@@ -1058,19 +1401,47 @@ impl TcpListener {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
-        // Linux 6.0.16 to 6.0.19 report success for a bind to an address in
-        // use and leave the socket unbound: `share::bind` checks the port.
-        let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
-            Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
-        })?;
-        let listener = Self {
-            inner: ListenSocket::new(sock),
-            balance: None,
-            held,
+        let bind = || -> io::Result<Self> {
+            // Linux 6.0.16 to 6.0.19 report success for a bind to an
+            // address in use and leave the socket unbound: `share::bind`
+            // checks the port.
+            let (sock, held) = share::bind(share::Proto::Tcp, addr, true, || {
+                Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            })?;
+            let listener = Self {
+                inner: ListenSocket::new(sock),
+                balance: None,
+                held,
+                #[cfg(windows)]
+                spread: None,
+            };
+            // A failure from here on drops `listener`, which gives the
+            // port up.
+            listener.inner.socket().listen(4096)?;
+            Ok(listener)
         };
-        // A failure from here on drops `listener`, which gives the port up.
-        listener.inner.socket().listen(4096)?;
-        Ok(listener)
+        #[cfg(unix)]
+        return bind();
+        // A port has one socket on Windows: a listener for an address that
+        // listeners of this process hold already joins them.
+        #[cfg(windows)]
+        {
+            let mut bound = None;
+            let (sock, _, member) = spread::bind(addr, || {
+                let listener: Self = bind()?;
+                let handle = listener.inner.socket().try_clone()?;
+                bound = Some(listener);
+                Ok((handle, ()))
+            })?;
+            let mut listener = bound.unwrap_or_else(|| Self {
+                inner: ListenSocket::new(sock),
+                balance: None,
+                held: None,
+                spread: None,
+            });
+            listener.spread = member;
+            Ok(listener)
+        }
     }
 
     /// Like [`bind`](Self::bind), and the listener shares new connections
@@ -1119,8 +1490,11 @@ impl TcpListener {
     }
 
     /// Wraps a listener created by the standard library, with the options
-    /// it was given: giong sets none, and does not check who else holds its
-    /// port.
+    /// it was given, and does not check who else holds its port. giong adds
+    /// one option on macOS, `SO_NOSIGPIPE`, and the readiness drivers (epoll
+    /// and kqueue) make the socket non-blocking when they first use it:
+    /// `O_NONBLOCK`, which every descriptor of the socket shares, such as
+    /// one from `try_clone`.
     pub fn from_std(listener: std::net::TcpListener) -> Self {
         // SAFETY: we take over the descriptor that `listener` owned.
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };
@@ -1128,6 +1502,8 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held: None,
+            #[cfg(windows)]
+            spread: None,
         }
     }
 
@@ -1146,17 +1522,22 @@ impl TcpListener {
     /// so back off (e.g. [`sleep`](crate::time::sleep)) before retrying.
     pub async fn accept(&self) -> io::Result<TcpStream> {
         let inner = match &self.balance {
-            None => self.inner.accept().await?,
-            Some(member) => {
-                poll_fn(|cx| {
-                    member
-                        .poll_accept(cx, &self.inner)
-                        .map_ok(StreamSocket::new)
-                })
-                .await?
-            }
+            None => poll_fn(|cx| self.poll_next(cx)).await?,
+            Some(member) => poll_fn(|cx| member.poll_accept(cx, |cx| self.poll_next(cx))).await?,
         };
-        Ok(TcpStream { inner })
+        Ok(TcpStream {
+            inner: StreamSocket::new(inner),
+        })
+    }
+
+    /// The next connection of this listener's socket, or of its share of
+    /// one where the workers share a socket.
+    fn poll_next(&self, cx: &mut Context<'_>) -> Poll<io::Result<Socket>> {
+        #[cfg(windows)]
+        if let Some(member) = &self.spread {
+            return member.poll_accept(cx, &self.inner);
+        }
+        self.inner.poll_accept(cx)
     }
 }
 
@@ -1166,12 +1547,30 @@ impl Drop for TcpListener {
         if let Some(held) = self.held.take() {
             held.release(self.inner.socket());
         }
+        // A connection this listener's own accept took goes to the others
+        // that share the address, with those still waiting for it.
+        #[cfg(windows)]
+        if let Some(member) = &self.spread {
+            if member.shared() {
+                if let Some(sock) = self.inner.take_accepted() {
+                    member.give_back(sock);
+                }
+            }
+        }
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for TcpListener {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
     }
 }
 
@@ -1251,8 +1650,8 @@ impl TcpStream {
 
     /// Connects to exactly this address, without name resolution.
     pub(crate) async fn connect_addr(addr: SocketAddr) -> io::Result<Self> {
-        let sock = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
-        let inner = StreamSocket::connect(sock, addr.into()).await?;
+        let make = || Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP));
+        let inner = StreamSocket::connect_new(make, addr.into()).await?;
         Ok(Self { inner })
     }
 
@@ -1260,6 +1659,11 @@ impl TcpStream {
     pub fn from_std(stream: std::net::TcpStream) -> Self {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
+        // macOS has no per-send flag against `SIGPIPE`: the socket carries
+        // the option. socket2 sets it on the sockets it creates; this covers
+        // one that came from somewhere else (`from_std`).
+        #[cfg(target_os = "macos")]
+        drop(sock.set_nosigpipe(true));
         Self {
             inner: StreamSocket::new(sock),
         }
@@ -1413,11 +1817,20 @@ impl TcpStream {
     ///   peer has gone. Rust programs ignore `SIGPIPE` unless they change
     ///   that, and then the call fails with `BrokenPipe`.
     ///
+    /// On Windows the file goes out with `TransmitFile`, from the system's
+    /// file cache and through the worker's completion port: the worker does
+    /// not wait for the disk there, and neither note above applies. The
+    /// desktop editions of Windows run two such sends at a time and queue
+    /// the others; the server editions have no such limit.
+    ///
     /// Fails with [`FileTooShort`](crate::error::Code::FileTooShort) if the
     /// file ends before `offset + len`, after sending what it had.
     ///
     /// Not cancel safe: if the future is dropped, part of the file may have
-    /// been sent. After the first call, the socket is non-blocking.
+    /// been sent, and the peer cannot tell where it stops. (On Windows the
+    /// piece being sent when the future is dropped is sent to its end; the
+    /// rest is not.) After the first call, the socket is non-blocking (on
+    /// Unix).
     ///
     /// ```no_run
     /// # use giong::net::TcpStream;
@@ -1430,7 +1843,10 @@ impl TcpStream {
     /// # }
     /// ```
     pub async fn send_file(&self, file: &crate::fs::File, offset: u64, len: u64) -> io::Result<()> {
-        self.inner.send_file(file.as_raw_fd(), offset, len).await
+        #[cfg(unix)]
+        return self.inner.send_file(file.as_raw_fd(), offset, len).await;
+        #[cfg(windows)]
+        return self.inner.send_file(file, offset, len).await;
     }
 
     /// Shuts down the read half, the write half, or both.
@@ -1454,9 +1870,17 @@ impl TcpStream {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for TcpStream {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
     }
 }
 
@@ -1469,6 +1893,7 @@ impl std::fmt::Debug for TcpStream {
 }
 
 #[cfg(test)]
+#[cfg_attr(windows, allow(unused_imports))]
 mod tests {
     use std::borrow::Cow;
 
@@ -1478,6 +1903,7 @@ mod tests {
     /// What Linux 6.0.19 leaves behind when its bind(2) returns 1 for a busy
     /// address: a socket without a port, which listen(2) would put on a free
     /// one. `check_bound` must call that `AddrInUse`.
+    #[cfg(unix)]
     #[test]
     fn a_socket_that_bind_left_unbound_counts_as_address_in_use() {
         let asked: SocketAddr = "127.0.0.1:8080".parse().unwrap();
@@ -1487,7 +1913,11 @@ mod tests {
         for addr in [asked, any_port] {
             let err = check_bound(&unbound, addr).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AddrInUse, "{addr}");
-            assert_eq!(err.raw_os_error(), Some(libc::EADDRINUSE), "{addr}");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(crate::sys::errno::EADDRINUSE),
+                "{addr}"
+            );
         }
 
         let bound = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
@@ -1504,6 +1934,7 @@ mod tests {
     /// A socket that refuses zero-copy sends, as a kernel TLS socket does
     /// with `EOPNOTSUPP`, gets the same bytes sent again with a copy and
     /// stops trying. A Unix socket refuses them the same way.
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call sendmsg")]
     fn a_refused_zero_copy_send_is_sent_again_with_a_copy() {

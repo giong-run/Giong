@@ -52,6 +52,66 @@
     });
   });
 
+  // 3b. Documentation: "Copy for agent", "Copy prompt" and each section's copy button
+  //     copy the Markdown kept in a <script type="text/markdown">; every code block in
+  //     a page made from a README gets a copy button of its own.
+  function copyText(text, btn) {
+    var label = btn.querySelector("span") || btn;
+    var was = label.textContent;
+    function done() {
+      label.textContent = btn.getAttribute("data-done") || "copied";
+      btn.classList.add("done");
+      setTimeout(function () { label.textContent = was; btn.classList.remove("done"); }, 1600);
+    }
+    function fallback() {
+      var area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try { if (document.execCommand("copy")) done(); } catch (e) { /* nothing more to try */ }
+      document.body.removeChild(area);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+    } else {
+      fallback();
+    }
+  }
+  document.querySelectorAll("[data-md]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      var src = document.getElementById(btn.getAttribute("data-md"));
+      if (src) copyText(src.textContent.replace(/<\\\//g, "</"), btn);
+    });
+  });
+  document.querySelectorAll(".prose pre.code").forEach(function (pre) {
+    if (pre.parentNode.classList.contains("code-copy")) return;
+    var wrap = document.createElement("div");
+    wrap.className = "code-copy";
+    pre.parentNode.insertBefore(wrap, pre);
+    wrap.appendChild(pre);
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "copy";
+    btn.setAttribute("data-done", "copied");
+    btn.innerHTML = "<span>copy</span>";
+    btn.addEventListener("click", function () { copyText(pre.textContent.replace(/\n$/, ""), btn); });
+    wrap.appendChild(btn);
+  });
+
+  // The version menu closes on a click outside it or Escape.
+  var ver = document.querySelector(".ver-menu");
+  if (ver) {
+    document.addEventListener("click", function (e) { if (ver.open && !ver.contains(e.target)) ver.open = false; });
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") ver.open = false; });
+  }
+
+  // The documentation menu starts folded on a phone.
+  var side = document.querySelector(".side-menu");
+  if (side && window.matchMedia("(max-width: 860px)").matches) side.open = false;
+
   // 4. Code tabs. Without JavaScript every sample is shown, one under another.
   document.querySelectorAll('[role="tablist"]').forEach(function (list) {
     var tabs = Array.prototype.slice.call(list.querySelectorAll('[role="tab"]'));
@@ -193,4 +253,63 @@
   }
   open();
   window.addEventListener("hashchange", open);
+})();
+
+/* Bars that grow when they come into view, the terminal that types the measured build,
+   and the roadmap's track scrolled to where giong is now. Without JavaScript, or for
+   readers who ask for reduced motion, everything is shown as it is. */
+(function () {
+  "use strict";
+  var still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var watch = "IntersectionObserver" in window;
+
+  var reveal = document.querySelectorAll("[data-reveal]");
+  if (!watch || still) {
+    reveal.forEach(function (el) { el.classList.add("in"); });
+  } else {
+    var seen = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("in"); seen.unobserve(e.target); }
+      });
+    }, { threshold: 0.25 });
+    reveal.forEach(function (el) { seen.observe(el); });
+  }
+
+  var term = document.getElementById("typed");
+  if (term && watch && !still) {
+    var lines = Array.prototype.slice.call(term.querySelectorAll(".tl"));
+    term.classList.add("armed");
+    var started = false;
+    var t = new IntersectionObserver(function (entries) {
+      if (!entries[0].isIntersecting || started) return;
+      started = true;
+      t.disconnect();
+      var i = 0;
+      (function next() {
+        if (i >= lines.length) return;
+        var line = lines[i++];
+        var text = line.querySelector(".tl-t");
+        line.classList.add("shown");
+        if (!text) return setTimeout(next, line.classList.contains("ok") ? 650 : 140);
+        var full = text.textContent;
+        var n = 0;
+        text.textContent = "";
+        line.classList.add("typing");
+        (function type() {
+          if (n < full.length) {
+            n += 1;
+            text.textContent = full.slice(0, n);
+            return setTimeout(type, 18 + Math.random() * 40);
+          }
+          line.classList.remove("typing");
+          setTimeout(next, 380);
+        })();
+      })();
+    }, { threshold: 0.5 });
+    t.observe(term);
+  }
+
+  var here = document.querySelector('.journey [aria-current="step"]');
+  var wrap = here && here.closest(".journey-wrap");
+  if (wrap) wrap.scrollLeft = Math.max(0, here.offsetLeft - wrap.clientWidth * 0.6);
 })();

@@ -93,6 +93,9 @@ cargo +nightly fuzz run hpack          # HTTP/2 header compression
 cargo +nightly fuzz run h2             # a whole HTTP/2 connection, the server's side
 cargo +nightly fuzz run h2_client      # the client's side of HTTP/2
 cargo +nightly fuzz run response_body  # the client's response body framing
+cargo +nightly fuzz run h3             # HTTP/3 frames and QPACK field sections
+cargo +nightly fuzz run h3_server      # a whole HTTP/3 connection, over QUIC on loopback
+cargo +nightly fuzz run h3_client      # the HTTP/3 client against a hostile server, over QUIC on loopback
 cd ../giong-postgres && cargo +nightly fuzz run messages   # also: scram, session, url
 cd ../giong-mysql && cargo +nightly fuzz run rows          # also: payload, framing, session, url
 cd ../giong-redis && cargo +nightly fuzz run replies       # also: connection, url
@@ -209,9 +212,10 @@ docs: explain how to run under WSL2
    requests in flight do not conflict. `scripts/preflight.sh` runs the checks your change
    needs before you push.
 4. Fill in the pull request template. Say how you tested the change.
-5. All checks must be green. A maintainer reviews the pull request and adds it to the
-   merge queue, which runs every check once more on `main` with the pull request merged,
-   and merges it when they pass. Pull requests are squash-merged, so the pull request
+5. All checks must be green. A draft runs a short set of checks; marking it ready for
+   review runs every check once. A maintainer reviews the pull request and adds it to the
+   merge queue, which runs every check, with every repetition, on `main` with the pull
+   request merged, and merges it when they pass. Pull requests are squash-merged, so the pull request
    title must itself be a valid commit summary; the queue takes the commit message of a
    pull request with one commit from that commit.
 

@@ -249,6 +249,8 @@ pub(crate) struct Uring {
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
     wake_fd: RawFd,
+    /// Owns `wake_fd`; other threads ring it through [`Uring::waker`].
+    wake: std::sync::Arc<crate::sys::Bell>,
     wake_buf: Box<u64>,
     wake_armed: bool,
     closing: bool,
@@ -285,8 +287,9 @@ fn build_ring(entries: u32) -> io::Result<IoUring> {
 
 /// `io_uring_setup` fails with `EPERM` when a seccomp profile blocks it (as
 /// Docker's default profile does) or the `kernel.io_uring_disabled` sysctl
-/// forbids it, and with `ENOSYS` where the kernel or a sandbox such as gVisor
-/// does not provide it. The bare errno says none of that, so say it here.
+/// forbids it, with `ENOSYS` where the kernel or a sandbox such as gVisor
+/// does not provide it, and with `EINVAL` where a sandbox provides only part
+/// of it. The bare errno says none of that, so say it here.
 fn explain_setup_error(e: io::Error) -> io::Error {
     match e.raw_os_error() {
         // The kernel's kind (PermissionDenied or Unsupported) is kept.
@@ -300,6 +303,23 @@ fn explain_setup_error(e: io::Error) -> io::Error {
                  profile blocks io_uring, sandboxes such as gVisor do not have it, and the \
                  kernel.io_uring_disabled sysctl turns it off; docs/DEPLOYMENT.md shows how to \
                  allow it in Docker and Kubernetes.",
+            )
+            .with_source(e),
+        ),
+        // Linux takes the flags and sizes of the last attempt from 5.6 on, so
+        // `EINVAL` comes from an io_uring that only imitates Linux's, such as
+        // gVisor's (`runsc --iouring`), which takes no setup flags at all.
+        Some(libc::EINVAL) => io::Error::new(
+            e.kind(),
+            Error::new(
+                Code::IoUringUnavailable,
+                format!(
+                    "giong needs io_uring, and the io_uring here refused to set up a ring \
+                     ({e}): it is not Linux's, or only part of it, as in gVisor"
+                ),
+                "let giong use its epoll driver by not asking for io_uring (Builder::driver, \
+                 GIONG_DRIVER), or run on Linux 6.0 or newer outside such a sandbox; \
+                 docs/DEPLOYMENT.md lists the places without a full io_uring.",
             )
             .with_source(e),
         ),
@@ -380,7 +400,7 @@ fn locked_memory_error(e: io::Error, what: &str, limit: u64) -> io::Error {
              against it, summed over all processes of the same user: a giong worker locks \
              about 150 KiB with the default settings, more with a larger \
              Builder::ring_entries or Builder::recv_buffers. Without \
-             .driver(crate::DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
+             .driver(DriverKind::IoUring) or GIONG_DRIVER=io_uring, giong runs such a worker \
              on its epoll driver instead; docs/DEPLOYMENT.md shows how to raise the limit.",
         )
         .with_source(e),
@@ -953,8 +973,14 @@ fn buffer_ring_error(release: &str, e: io::Error) -> io::Error {
 }
 
 impl Uring {
-    pub(crate) fn new(entries: u32, pool: Rc<BufPool>, wake_fd: RawFd) -> io::Result<Self> {
+    pub(crate) fn waker(&self) -> super::WakeHandle {
+        super::WakeHandle::Bell(self.wake.clone())
+    }
+
+    pub(crate) fn new(entries: u32, pool: Rc<BufPool>) -> io::Result<Self> {
         let ring = build_ring(entries)?;
+        // The worker's wake-up: an eventfd the ring reads.
+        let wake = std::sync::Arc::new(crate::sys::Bell::new_worker()?);
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
         // kept alive by `pool`, which outlives the ring (see `Worker` teardown).
         let workarounds = unsafe { register_buf_ring(&ring, &pool)? };
@@ -1003,7 +1029,8 @@ impl Uring {
             recv_copied: 0,
             turn: 0,
             graveyard: Vec::new(),
-            wake_fd,
+            wake_fd: wake.read_fd(),
+            wake,
             wake_buf: Box::new(0),
             wake_armed: false,
             closing: false,
@@ -2048,7 +2075,7 @@ mod tests {
     /// A blocked or missing io_uring is explained; other errors pass through.
     #[test]
     fn setup_errors_say_why_io_uring_is_missing() {
-        for errno in [libc::EPERM, libc::ENOSYS] {
+        for errno in [libc::EPERM, libc::ENOSYS, libc::EINVAL] {
             let original = io::Error::from_raw_os_error(errno);
             let kind = original.kind();
             let e = explain_setup_error(original);
@@ -2077,7 +2104,10 @@ mod tests {
         assert!(text.starts_with("GIONG-E0010: "), "{text}");
         assert!(text.contains("memory for its rings"), "{text}");
         assert!(text.contains("(RLIMIT_MEMLOCK, 8 MiB)"), "{text}");
-        assert!(text.contains("Cannot allocate memory"), "{text}");
+        // The C library's words for ENOMEM: glibc's "Cannot allocate memory",
+        // musl's "Out of memory".
+        let words = io::Error::from_raw_os_error(libc::ENOMEM).to_string();
+        assert!(text.contains(&words), "{text}");
         for fix in [
             "LimitMEMLOCK=infinity",
             "--ulimit memlock=-1",

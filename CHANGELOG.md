@@ -8,6 +8,159 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-22
+
+Windows: giong runs on Windows through a completion-port driver, with TCP, UDP, files,
+timers, DNS and signals, tested on Windows Server 2022 and 2025 with soaks of up to two and a
+half hours. The other crates come to Windows later. Three security fixes: path parameters in
+giong-web on Windows, the cost of an HTTP/2 SETTINGS frame, and the memory an HTTP/3
+connection could make the server hold. Documentation gets a site of its own on giong.run, a
+best-practices guide and a skill for coding agents. Nothing is removed or changed in
+meaning, and upgrading from 1.3 needs no code changes.
+
+### Added
+
+- **Documentation**: [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md), how to build, deploy
+  and test a service on giong, each rule with its reason; a skill for coding agents,
+  [skills/giong](skills/giong/SKILL.md); and [docs/BENCHMARKS.md](docs/BENCHMARKS.md), every
+  benchmark table, moved out of the README. giong.run has a page for every crate and guide,
+  each also as Markdown, with "Copy for agent" and "Copy prompt" buttons, and serves the
+  skill as a zip with the release's documentation
+  ([#212](https://github.com/giong-run/Giong/pull/212)).
+- **Benchmarks**: build time, disk and binary size of a small service on giong-web against
+  axum with tower-http (`bench/build.sh`, [docs/BENCHMARKS.md](docs/BENCHMARKS.md#build-time-and-size)):
+  22 crates against 83, a clean debug build in 7.4 s against 18.8 s, a stripped binary of
+  1.45 MB against 3.60 MB.
+- **giong**: Windows support. The runtime, TCP, UDP, files, timers, DNS and signals run on
+  Windows through a completion-port driver (tested on Windows Server 2022 and 2025),
+  `DriverKind::Iocp` (`GIONG_DRIVER=iocp`), the only driver there. Listeners and UDP
+  sockets of one address on several workers share one socket, as Windows has no
+  `SO_REUSEPORT`: a thread hands connections round to the listeners and datagrams to the
+  sockets by the sender's address. Files are read and written overlapped through the port,
+  other file operations and consoles go to the blocking threads, and the DNS configuration
+  comes from the network adapters. `Builder::shutdown_on_signals` listens for Ctrl+C,
+  Ctrl+Break, console close, log-off and shutdown. Not yet on Windows: Unix sockets,
+  `unstable-udp-offload` (a compile error), system trust roots, more than 64 CPUs, and the
+  crates other than giong ([#174](https://github.com/giong-run/Giong/pull/174)).
+
+### Changed
+
+- **Roadmap**: the developer kit (the `giong` command) in 1.5.0, then 1.5.x (deep debugging
+  on every platform, then every number measured again on bare metal), and 1.6 and 1.7 as
+  proposed milestones. giong.run's home page shows each crate head to head with the Tokio
+  crate it replaces, with the losses next to the wins, the build numbers and what comes
+  next; the roadmap page draws every milestone on one track, gives each one ahead a card,
+  and no longer calls a milestone shipped before its release is out. Every other page
+  follows: big measured numbers at the top of the crates, benchmarks and releases pages,
+  the head-to-head table and the build numbers on the benchmarks page, each crate's
+  result against the crate it replaces on the crates page, and a 404 page of its own.
+
+### Security
+
+- **giong-web**: on Windows, `Req::param` refuses path parameters that `Path::join` there would
+  take out of the directory: `..\` and `.\` segments (`%5C`), a `\` in a one-segment parameter,
+  values that start with `\` or `\\server` (UNC), a `:` (`C:\windows`, `C:x`, `file:stream`),
+  `.` or `..` followed by spaces, and device names (`CON`, `NUL`, `COM1`, `nul.txt`...). Before,
+  only `/` counted as a separator, so `GET /files/..%5C..%5Cwindows%5Cwin.ini` passed the check
+  that documents a catch-all as safe to join to a directory. Nothing changes on Linux and
+  macOS, where these are ordinary file names.
+- **giong-http**: an HTTP/2 SETTINGS frame moves the stream windows once, by the last
+  `SETTINGS_INITIAL_WINDOW_SIZE` it holds, instead of once per value. A frame of the largest
+  default size holds 2,730 of them: with 100 streams open, a client made each frame cost
+  273,000 stream updates, about 2 seconds of a worker per connection for the frames the flood
+  limit lets through. The check that no window passes 2^31-1 still takes the largest value in
+  the frame, as processing the values in order would
+  ([#233](https://github.com/giong-run/Giong/issues/233)).
+- **giong-http**: `Server::serve_h3` (`unstable-http3`) bounds the response bytes a
+  connection holds that the client has not taken, as HTTP/2 does: handlers wait once a
+  connection holds the larger of `max_body_size` and 1 MiB. A client that asked for many
+  large answers on one connection and gave no flow-control credit made the server hold
+  them all until the write timeout: 100 answers of 10 MB on one connection took the
+  server from 4 to 959 MiB, now 24 MiB
+  ([#231](https://github.com/giong-run/Giong/issues/231)).
+
+## [1.3.0] - 2026-11-22
+
+HTTP/3: a new crate, giong-quic, carries QUIC on giong's own UDP sockets, and giong-http
+serves and requests HTTP/3 behind the `unstable-http3` feature, on Linux and macOS. Both
+features are off by default and may still change before they are stabilised; the default
+build is unchanged. giong-quic, and with it `unstable-http3`, needs Rust 1.85: the QUIC
+engine underneath, quinn-proto, needs it from the release that fixes a remote memory
+exhaustion (GHSA-4w2j-m93h-cj5j) on. Every other crate and feature still builds with Rust
+1.80. Nothing is removed or changed in meaning, and upgrading from 1.2 needs no code
+changes.
+
+### Added
+
+- **giong**: UDP offloads behind the `unstable-udp-offload` feature: GSO and per-datagram
+  options (source address, ECN) through `UdpSocket::send_segments_to`, `send_to_with` and
+  `SendOptions`; GRO, ECN and the local address on receive through `set_gro`,
+  `set_recv_ecn`, `set_recv_local_addr` and `Datagram::segments`, `ecn` and `local_ip`.
+  GSO and GRO are Linux only: elsewhere `set_gro(true)` and a segmented send return an
+  error, and `gso_supported` says no. Off by default, at no cost to the default build
+  ([#172](https://github.com/giong-run/Giong/pull/172)).
+- **giong-quic**: a new crate, QUIC (RFC 9000) on giong: per-worker endpoints whose
+  connection IDs name their worker, so datagrams that reach the wrong worker are passed on;
+  bidirectional and unidirectional streams, 0-RTT, Retry under load, stateless resets and
+  address validation tokens shared by every worker of a configuration
+  ([#172](https://github.com/giong-run/Giong/pull/172)).
+- **giong-http**: HTTP/3 (RFC 9114) behind the `unstable-http3` feature: `Server::serve_h3`,
+  and a client that follows `Alt-Svc`, sends 0-RTT only for requests that are safe to replay,
+  and falls back to the next address when one does not answer. Trailer fields travel both
+  ways as over HTTP/2; a streamed request body goes over HTTP/1.1 or HTTP/2, and is refused
+  by a client with `http3_prior_knowledge`; `Client::preconnect` opens the QUIC connection
+  ([#172](https://github.com/giong-run/Giong/pull/172)).
+
+## [1.2.0] - 2026-11-22
+
+macOS support: a kqueue driver, tested on macOS 15 and macOS 26 on Apple Silicon (Intel Macs
+and macOS 14 or older are not tested), with the whole test suite, ThreadSanitizer and 2-hour
+soaks passing there. A stream write or connect that meets `ENOBUFS` on macOS now waits for
+buffers instead of failing at once. Nothing changes on Linux, nothing is removed or changed in
+meaning, and upgrading from 1.1 needs no code changes.
+
+### Added
+
+- **giong**: on macOS, a stream write or connect that gets `ENOBUFS` (no network buffer
+  for the call) waits for buffers, as it would on Linux, instead of failing at once: it is
+  tried again after 1 ms, then 2, 4, 8, 16 and every 32 ms, for at most 2 s, while the
+  worker runs its other tasks. A connect whose new socket could not be made for want of
+  buffers makes it again, one the shortage broke after it began starts over on a new
+  socket, and TLS streams wait the same way. After 2 s the error is the new
+  `GIONG-E0028` (`Code::NetworkBuffersExhausted`, kind `OutOfMemory`), with the kernel's
+  error as its source. Datagram sends keep the kernel's `ENOBUFS`. Nothing changes on
+  Linux ([#205](https://github.com/giong-run/Giong/pull/205)).
+- **giong**: macOS support: a kqueue driver for the readiness loop (`DriverKind::Kqueue`,
+  chosen by default on macOS), with each worker woken through an `EVFILT_USER` event of
+  its own queue. The workers of a TCP or UDP address share one socket, bound without
+  `SO_REUSEPORT`, so no other process can take the port. Every socket has `SO_NOSIGPIPE`;
+  streams are non-blocking from the start (macOS waits in a send to a full socket even with
+  `MSG_DONTWAIT`); UDP sockets that giong binds take datagrams of every length UDP allows.
+  The whole test suite passes on macOS 15 and macOS 26 (Apple Silicon), as do
+  ThreadSanitizer and the soak tests. What still differs from Linux is listed in
+  `docs/design/portability.md` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: the portability layer under the drivers (`src/sys/`, one `Poller` trait for
+  epoll and kqueue, a wake-up per driver), on which the macOS and Windows drivers are
+  built; no change on Linux ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: `ResolverConfig::system` reads the resolver macOS writes to
+  `/etc/resolv.conf` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong-tls**: `TlsConnector::with_system_roots` reads the keychain's trust settings on
+  macOS ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong-http**: `Server::min_free_memory` reads the kernel's free and inactive pages on
+  macOS ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong-mcp**: process figures come from `proc_pidinfo` on macOS
+  ([#173](https://github.com/giong-run/Giong/pull/173)).
+
+### Fixed
+
+- **giong**: `Builder::build` refuses a driver the operating system does not have:
+  io_uring with `GIONG-E0001`, the others with `GIONG-E0004`, whether named through
+  `Builder::driver` or `GIONG_DRIVER` ([#173](https://github.com/giong-run/Giong/pull/173)).
+- **giong**: `ResolverConfig::parse` (and so `ResolverConfig::system`) keeps a
+  `nameserver` with a zone, such as `fe80::1%en0`, as a scoped IPv6 address; it was skipped,
+  which could leave only the `127.0.0.1` fallback
+  ([#173](https://github.com/giong-run/Giong/pull/173)).
+
 ## [1.1.0] - 2026-11-21
 
 gRPC on giong: three new crates, giong-proto, giong-grpc-build and giong-grpc. Also HTTP
@@ -2647,7 +2800,10 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/giong-run/Giong/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/giong-run/Giong/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/giong-run/Giong/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/giong-run/Giong/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/giong-run/Giong/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/giong-run/Giong/compare/v1.0.0-rc.1...v1.0.0

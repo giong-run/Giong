@@ -109,6 +109,14 @@ impl Client {
         self.stream.write_all(bytes.as_ref()).unwrap();
     }
 
+    /// Whether the server has sent something (or closed), without waiting.
+    fn answered(&self) -> bool {
+        self.stream.set_nonblocking(true).unwrap();
+        let peeked = self.stream.peek(&mut [0u8; 1]);
+        self.stream.set_nonblocking(false).unwrap();
+        !matches!(peeked, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    }
+
     /// Reads more input; `false` at end of stream (or on a reset).
     fn fill(&mut self) -> bool {
         let mut chunk = [0u8; 16 * 1024];
@@ -606,13 +614,17 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
     c.send("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc");
     assert_eq!(c.reply().status, 408);
 
-    // A slow drip does not reset the clock.
+    // A slow drip does not reset the clock. The drip stops once the answer
+    // is there: the server discards input for only so long after it, and a
+    // line that arrives once it has closed makes its kernel answer with a
+    // reset, which macOS lets destroy the answer before it is read (seen on
+    // a slow runner, where 40 sleeps of 20 ms outlasted that time).
     let mut c = server.client();
     let start = Instant::now();
     c.send("GET / HTTP/1.1\r\n");
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(20));
-        if c.stream.write_all(b"X-Drip: 1\r\n").is_err() {
+        if c.answered() || c.stream.write_all(b"X-Drip: 1\r\n").is_err() {
             break;
         }
     }
@@ -627,11 +639,18 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
     assert!(start.elapsed() < Duration::from_secs(5));
 
     // A connection that is used stays open past the idle timeout in total.
+    // The pauses are a sixth of the idle timeout: macOS lets a sleeping
+    // thread wake late by up to the length of its sleep (a 150 ms sleep
+    // took 300 to 310 ms on GitHub's macOS runners), so half the timeout
+    // was not enough margin.
     let mut c = server.client();
-    for i in 0..4 {
-        std::thread::sleep(Duration::from_millis(150));
+    let start = Instant::now();
+    let mut i = 0;
+    while start.elapsed() < Duration::from_millis(600) {
+        std::thread::sleep(Duration::from_millis(50));
         c.send(format!("GET /{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
         assert_eq!(c.reply().status, 200);
+        i += 1;
     }
 }
 
@@ -816,8 +835,12 @@ fn shutdown_finishes_requests_in_progress_and_closes_idle_connections() {
     assert_eq!(idle.reply().text(), "done");
 
     let mut busy = server.client();
+    let sent = Instant::now();
     busy.send("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
     std::thread::sleep(Duration::from_millis(100));
+    // A loaded machine sleeps longer, and the request is that much nearer
+    // its end when the server is told to stop.
+    let waited = sent.elapsed();
 
     let stopped_after = server.stop();
 
@@ -829,8 +852,8 @@ fn shutdown_finishes_requests_in_progress_and_closes_idle_connections() {
     idle.expect_closed();
     // The runtime waited for the slow request, not for the 20 s grace period.
     assert!(
-        stopped_after >= Duration::from_millis(250),
-        "{stopped_after:?}"
+        waited + stopped_after >= Duration::from_millis(350),
+        "{stopped_after:?} after {waited:?}"
     );
     assert!(stopped_after < Duration::from_secs(10), "{stopped_after:?}");
     assert!(TcpStream::connect(server.addr).is_err());

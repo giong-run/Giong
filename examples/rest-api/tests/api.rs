@@ -35,6 +35,8 @@ fn spawn(cmd: &mut Command, uid: Option<(u32, u32)>) -> Daemon {
     if let Some((u, g)) = uid {
         cmd.uid(u).gid(g);
     }
+    // Linux only: elsewhere a killed test binary leaves the server running.
+    #[cfg(target_os = "linux")]
     // SAFETY: prctl is async-signal-safe and touches only the child.
     unsafe {
         cmd.pre_exec(|| {
