@@ -10,6 +10,17 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [1.4.1] - 2026-11-23
 
+Security fixes and serious bugs from a review of 1.4.0, and nothing new to learn. giong-http
+closes request smuggling after a 2xx to `CONNECT` and refuses malformed `Host` headers. A peer
+can no longer make a server hold memory it never reads: io_uring receives for clients that
+stop reading, giong-quic's forwarded datagrams and DATAGRAM frames, and shared UDP ports on
+Windows are all bounded, and a forged datagram can no longer stop the Windows port dispatch.
+In the database clients, a password is no longer quoted in errors, SQL can no longer slip in
+through a MySQL session variable or a versioned comment, and a late cancel can no longer stop
+another task's query. giong also builds on musl, starts under gVisor, and fires timers at
+their deadline instead of up to a millisecond late. No API is removed or changed; a few
+inputs that were accepted by mistake are now refused, as each entry says.
+
 ### Added
 
 - **giong**: `GIONG-E0020` (`Code::ThreadLimit`): when the kernel refuses a worker thread
