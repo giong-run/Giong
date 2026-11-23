@@ -1,0 +1,9 @@
+# Known flaky tests that the CI gate (scripts/ci-gate.py) reruns once, the exception the
+# project's rules make: "a single known flake that already has a fix in progress". A
+# flaky test is a bug. An entry needs an open issue with the fix on its way; once the
+# issue closes, the entry no longer counts, and the line goes in the pull request that
+# fixes it.
+#
+# ISSUE  TEST NAME (a Python regular expression, matched against the whole name libtest
+#        prints under "failures:")
+355 pool::a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way

@@ -102,6 +102,8 @@ jobs:
       # Crate versions agree, README images use absolute URLs that resolve on
       # crates.io, CHANGELOG.md is well formed and the site builds without a broken link.
       - run: python3 scripts/release.py check
+      # The CI gate's decisions (scripts/ci-gate.py), on the kinds of failure it meets.
+      - run: python3 scripts/test_ci_gate.py
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --all-features --no-deps
         env:
