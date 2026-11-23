@@ -19,13 +19,20 @@
   `.giong/dev.log` for other tools; `--json` prints one event per line. A `LISTEN` of
   `0.0.0.0` or `[::]` is served on loopback with a warning (`GIONG-E5024`) unless `--lan`
   is given, so a service under development is not on the network by accident.
+- **giong-cli**: local development as one runner per project. `giong dev --background`
+  starts `giong dev` detached from the terminal, waits until the service serves on
+  localhost and prints its address (a failed build comes back as findings, and it builds
+  again on the next save); `giong dev status` says what runs and how the last build went,
+  `--all` across projects; `giong dev logs` prints the service's last lines; `giong dev stop`
+  stops it gracefully, and the database container `giong db up` started, data kept. When a
+  port is taken, the error names the process that holds it.
 - **giong-cli**: `giong check` reports the compiler's errors and warnings, clippy's lints and
   giong's own checks of the source in one report: blocking calls in async code
   (`GIONG-E5006`), listeners bound to a host name (`GIONG-E5007`), `RefCell` borrows held
   across an `.await` (`GIONG-E5008`). Machine-applicable fixes come as edits.
 - **giong-cli**: `giong mcp` serves giong's commands as tools to coding agents over MCP on
-  standard input and output, each answering with the command's JSON document, plus
-  `dev_status` for a running `giong dev`. The tools only read unless `--allow-writes` is
+  standard input and output, each answering with the command's JSON document (`dev status`
+  and `dev logs` read; `dev --background` and `dev stop` need `--allow-writes`). The tools only read unless `--allow-writes` is
   given; `db reset`, `db down`, `clean --all`, `env get`, `--reveal` and `image --push` are
   never tools, and every tool carries MCP's read-only, destructive and idempotent hints.
 - **giong-cli**: every release attaches the `giong` command prebuilt for Linux (static,

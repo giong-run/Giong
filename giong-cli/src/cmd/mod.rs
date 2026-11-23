@@ -13,6 +13,7 @@ pub mod ai;
 pub mod check;
 pub mod clean;
 pub mod dev;
+pub mod devctl;
 pub mod doctor;
 pub mod explain;
 pub mod fix;
