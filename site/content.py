@@ -321,6 +321,28 @@ SCOREBOARD = dict(
 # ---------------------------------------------------------------- home: build
 # bench/build.sh, bench/results/build/cloud-4vcpu/summary.md: the same three-route
 # service on giong-web 1.3.0 and on axum + tokio + tower-http.
+# The home page's dev kit band, shown once a release has the giong command.
+DEVKIT = dict(
+    hero="curl -fsSL https://giong.run/install.sh | sh",
+    h2="From zero to a running service in three commands",
+    lede=("The `giong` command writes a project that builds and passes its tests, runs it on "
+          "localhost with a rebuild on every save, and answers people in text and agents in JSON."),
+    steps=[
+        ("Install", "curl -fsSL https://giong.run/install.sh | sh",
+         "One small binary for Linux, macOS and Windows; or `cargo install giong-cli --locked`."),
+        ("Start a project", "giong new api --db postgres",
+         "A JSON API with tests, migrations, CI, a Dockerfile and the files that teach coding agents."),
+        ("Work on it", "giong dev --background",
+         "Serves on 127.0.0.1 and rebuilds on every save; on Linux and macOS the new build takes "
+         "over without refusing a request."),
+    ],
+    facts=[
+        "A new project's dev profile: clean debug build 12.6 s instead of 15.3 s, `target/` 296 MB "
+        "instead of 640 MB ([method and raw data](https://github.com/giong-run/Giong/tree/main/bench/results/devkit/template-profile)).",
+        "`giong check --json`, `giong mcp` and a page per error code: agents read what went wrong and how to fix it.",
+    ],
+)
+
 BUILD = dict(
     h2="Light enough to build in seconds",
     lede=("giong's stack is its own crates, with no macros in the runtime or the framework. The "

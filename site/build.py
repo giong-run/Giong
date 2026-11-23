@@ -690,6 +690,26 @@ def build_band():
 </section>'''
 
 
+def devkit_band():
+    """The giong command on the home page, once a release has it: three steps and a fact."""
+    if not any(e[0] == "cli" for e in DOCS):
+        return ""
+    d = C.DEVKIT
+    steps = "".join(
+        f'<article class="nx nx-mini dk-step"><header class="nx-top"><span class="nx-badge">{n + 1}</span>'
+        f'<b class="nx-ver">{html.escape(title)}</b></header>{copy_cmd(f"dk-{n}", cmd)}'
+        f'<p class="nx-line">{ilm(text)}</p></article>'
+        for n, (title, cmd, text) in enumerate(d["steps"]))
+    facts = "".join(f'<li><span>{ilm(t)}</span></li>' for t in d["facts"])
+    return f'''<section class="band" id="devkit">
+  <div class="wrap">
+    {head_block("dev kit", d["h2"], d["lede"], (link("docs/cli"), "Every command"))}
+    <div class="nexts nexts-3">{steps}</div>
+    <ul class="nx-points dk-facts">{facts}</ul>
+  </div>
+</section>'''
+
+
 def next_band():
     """Where the next releases are going: the first milestones that have not shipped."""
     ahead = [m for m in MILESTONES if m["state"] != "done" and m["ver"]][:4]
@@ -762,7 +782,7 @@ def home():
         <a class="btn btn-main" href="{link("docs")}">Get started</a>
         <a class="btn" href="{link("benchmarks")}">See the benchmarks</a>
       </div>
-      {copy_cmd("hero-cmd", "cargo add giong")}
+      {copy_cmd("hero-cmd", C.DEVKIT["hero"] if any(e[0] == "cli" for e in DOCS) else "cargo add giong")}
       <p class="meta"><span>{C.RUNTIME_PLATFORM}</span><span>Rust 1.80+</span><span>MIT or Apache-2.0</span></p>
     </div>
     <figure class="tick" id="tick" data-unit1="syscall this tick" data-unitn="syscalls this tick">
@@ -786,6 +806,8 @@ def home():
 <section class="stats-band" aria-label="giong in numbers">
   <div class="wrap stats">{stats_html}</div>
 </section>
+
+{devkit_band()}
 
 {scoreboard()}
 
