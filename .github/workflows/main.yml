@@ -11,10 +11,11 @@ name: CI on main
 # did: a push that went around the queue, a run that cannot be found, or a
 # question that failed. When in doubt, the jobs run.
 #
-# A push that changes ci.yml or this file runs the jobs in any case. That run
+# A push that changes ci.yml, the workflows it calls (macos.yml,
+# windows-runtime.yml) or this file runs the jobs in any case. That run
 # puts the kernel images of the `kernels` jobs into the cache of main, where
 # every pull request finds them (what a run in the merge queue saves, no other
-# run can read), and it is the run that shows the two files still work
+# run can read), and it is the run that shows the files still work
 # together.
 
 on:
@@ -45,7 +46,8 @@ jobs:
           # among those it left out.
           workflows_changed="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" |
               jq '(.files | length) >= 300 or any(.files[]; .filename == ".github/workflows/ci.yml"
-                  or .filename == ".github/workflows/main.yml")')" || workflows_changed=unknown
+                  or .filename == ".github/workflows/main.yml" or .filename == ".github/workflows/macos.yml"
+                  or .filename == ".github/workflows/windows-runtime.yml")')" || workflows_changed=unknown
           if [ "$workflows_changed" = false ]; then
               by="$(gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
                       -f head_sha="$GITHUB_SHA" -f event=merge_group -f status=success |

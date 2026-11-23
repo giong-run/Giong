@@ -7,7 +7,6 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::fd::RawFd;
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
@@ -18,11 +17,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::buf::BufPool;
-use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Io, Park};
+#[cfg(unix)]
+use crate::driver::Io;
+use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
 use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
+#[cfg(unix)]
 use crate::op::Op;
 use crate::slab::Slab;
 use crate::sys;
@@ -386,7 +388,10 @@ struct Deferred {
     /// Single-shot operations whose future was dropped.
     cancels: Vec<DeferredCancel>,
     /// Descriptors given up.
-    closes: Vec<RawFd>,
+    closes: Vec<sys::RawFile>,
+    /// Sockets given up, where a socket is not a descriptor.
+    #[cfg(windows)]
+    sock_closes: Vec<sys::RawSock>,
 }
 
 impl Deferred {
@@ -748,8 +753,16 @@ impl Worker {
     /// the driver at the next turn of the event loop. The epoll driver must
     /// forget a descriptor before its number can be reused, so it is never
     /// closed behind the driver's back.
-    pub(crate) fn defer_close(&self, fd: RawFd) {
+    pub(crate) fn defer_close(&self, fd: sys::RawFile) {
         self.deferred.borrow_mut().closes.push(fd);
+    }
+
+    /// [`defer_close`](Self::defer_close) for a socket.
+    pub(crate) fn defer_close_sock(&self, sock: sys::RawSock) {
+        #[cfg(unix)]
+        self.defer_close(sock);
+        #[cfg(windows)]
+        self.deferred.borrow_mut().sock_closes.push(sock);
     }
 
     /// Drops the multishot operation `key`, whose owner went away while the
@@ -812,6 +825,10 @@ impl Worker {
         }
         for fd in deferred.closes {
             driver.close_fd(fd);
+        }
+        #[cfg(windows)]
+        for sock in deferred.sock_closes {
+            driver.close_sock(sock);
         }
     }
 
@@ -1030,9 +1047,9 @@ impl Builder {
     /// [`DriverKind::Epoll`] it never uses io_uring.
     ///
     /// When no driver is named here, the `GIONG_DRIVER` environment variable
-    /// can name one (`io_uring` or `epoll` on Linux, `kqueue` on macOS), so
-    /// that a deployment can choose without a rebuild. Any other value makes
-    /// [`build`](Self::build) fail with `GIONG-E0004`.
+    /// can name one (`io_uring` or `epoll` on Linux, `kqueue` on macOS, `iocp`
+    /// on Windows), so that a deployment can choose without a rebuild. Any
+    /// other value makes [`build`](Self::build) fail with `GIONG-E0004`.
     ///
     /// A driver this operating system does not have, named either way, makes
     /// `build` fail too: io_uring with `GIONG-E0001`, the others with
@@ -1310,12 +1327,24 @@ impl Runtime {
             state: Mutex::new(None),
             cond: Condvar::new(),
         });
+        #[cfg(unix)]
         let signals = if self.builder.signals {
             Some(sys::SignalGuard::install()?)
         } else {
             None
         };
+        #[cfg(unix)]
         let signal_fd = signals.as_ref().map(|s| s.fd());
+        // Windows runs the handler of a console event on a thread of its
+        // own, which may do what any thread may: it asks for the shutdown
+        // itself, and no worker has to watch for it.
+        #[cfg(windows)]
+        let signals = if self.builder.signals {
+            let handle = self.handle();
+            Some(sys::SignalGuard::install(move || handle.shutdown())?)
+        } else {
+            None
+        };
 
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
         let mut threads = Vec::with_capacity(n);
@@ -1359,6 +1388,7 @@ impl Runtime {
                             // Every worker watches, so that signals are seen as
                             // long as any worker runs, not only while worker 0
                             // does.
+                            #[cfg(unix)]
                             if let Some(fd) = signal_fd {
                                 crate::spawn(watch_signals(fd));
                             }
@@ -1370,7 +1400,11 @@ impl Runtime {
             match spawned {
                 Ok(t) => threads.push(t),
                 Err(e) => {
-                    spawn_err = Some(e);
+                    spawn_err = Some(if out_of_threads(&e) {
+                        thread_limit_error(index, n, e)
+                    } else {
+                        e
+                    });
                     break;
                 }
             }
@@ -1407,6 +1441,58 @@ impl Runtime {
     }
 }
 
+/// Whether a worker thread could not be started because the process may not
+/// have more threads: the kernel says only `EAGAIN` ("Resource temporarily
+/// unavailable"), which is what a container's PID limit and `RLIMIT_NPROC`
+/// give, as each thread counts against them. Any other error (`ENOMEM` for
+/// the thread's stack, say) is returned as it is: raising a thread limit
+/// would not help. Windows has no such limit.
+fn out_of_threads(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(libc::EAGAIN);
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The error for a worker thread that could not be started for want of
+/// threads (see [`out_of_threads`]).
+fn thread_limit_error(index: usize, workers: usize, e: io::Error) -> io::Error {
+    let limit = thread_limit()
+        .map(|(file, max)| format!("; {file} allows {max} threads and processes"))
+        .unwrap_or_default();
+    io::Error::new(
+        e.kind(),
+        crate::error::Error::new(
+            Code::ThreadLimit,
+            format!(
+                "could not start worker thread {} of {workers} ({e}{limit})",
+                index + 1
+            ),
+            "let the process have more threads: a container's PID limit counts each of \
+             them (docker run --pids-limit, a Kubernetes pod's PID limit, TasksMax in a \
+             systemd unit), and so does RLIMIT_NPROC (ulimit -u) for all processes of the \
+             user. Or start fewer workers (Builder::workers); giong needs one thread per \
+             worker, plus blocking threads for file operations on the epoll driver.",
+        )
+        .with_source(e),
+    )
+}
+
+/// The cgroup PID limit that applies to this process, as the file it is
+/// read from and its value, if it is not `max`. Inside a container, the
+/// container's own cgroup is the mount's root.
+fn thread_limit() -> Option<(&'static str, u64)> {
+    ["/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max"]
+        .into_iter()
+        .find_map(|file| {
+            let max = std::fs::read_to_string(file).ok()?.trim().parse().ok()?;
+            Some((file.rsplit('/').next().unwrap_or(file), max))
+        })
+}
+
 // --------------------------------------------------------------------- signals
 
 /// Waits for the signal handler to poke the eventfd, then requests shutdown.
@@ -1415,7 +1501,8 @@ impl Runtime {
 ///
 /// Ends as soon as a shutdown is requested by any other means, or the worker
 /// drains, so that it never keeps a draining worker alive.
-async fn watch_signals(fd: RawFd) {
+#[cfg(unix)]
+async fn watch_signals(fd: sys::RawFile) {
     until_shutdown(async {
         let mut buf: Vec<u8> = Vec::with_capacity(8);
         loop {
@@ -2017,7 +2104,42 @@ fn pin_to_cpu(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workers, pin_by_default};
+    use super::{default_workers, pin_by_default, thread_limit_error};
+    use crate::error::{code, Code};
+    use std::io;
+
+    #[test]
+    fn a_worker_thread_that_cannot_start_says_why() {
+        // What the kernel says: `EAGAIN` on Unix. Windows has no such
+        // number (11 is another error there), so the kind stands in for it.
+        #[cfg(unix)]
+        let eagain = io::Error::from_raw_os_error(libc::EAGAIN);
+        #[cfg(windows)]
+        let eagain = io::Error::from(io::ErrorKind::WouldBlock);
+        let words = eagain.to_string();
+        let e = thread_limit_error(2, 4, eagain);
+        assert_eq!(code(&e), Some(Code::ThreadLimit));
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let text = e.to_string();
+        assert!(
+            text.starts_with("GIONG-E0020: could not start worker thread 3 of 4"),
+            "{text}"
+        );
+        assert!(text.contains("--pids-limit"), "{text}");
+        assert!(text.contains("Builder::workers"), "{text}");
+        let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
+        assert_eq!(source.to_string(), words);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_eagain_is_a_thread_limit() {
+        use super::out_of_threads;
+        assert!(out_of_threads(&io::Error::from_raw_os_error(libc::EAGAIN)));
+        // No memory for the thread's stack: no thread limit to raise.
+        assert!(!out_of_threads(&io::Error::from_raw_os_error(libc::ENOMEM)));
+        assert!(!out_of_threads(&io::Error::from(io::ErrorKind::WouldBlock)));
+    }
 
     #[test]
     fn the_default_worker_count_follows_the_cpu_quota() {

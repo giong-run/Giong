@@ -109,6 +109,14 @@ impl Client {
         self.stream.write_all(bytes.as_ref()).unwrap();
     }
 
+    /// Whether the server has sent something (or closed), without waiting.
+    fn answered(&self) -> bool {
+        self.stream.set_nonblocking(true).unwrap();
+        let peeked = self.stream.peek(&mut [0u8; 1]);
+        self.stream.set_nonblocking(false).unwrap();
+        !matches!(peeked, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    }
+
     /// Reads more input; `false` at end of stream (or on a reset).
     fn fill(&mut self) -> bool {
         let mut chunk = [0u8; 16 * 1024];
@@ -477,6 +485,41 @@ fn keep_alive_follows_the_protocol_version_and_connection_header() {
 }
 
 #[test]
+fn a_successful_answer_to_connect_closes_the_connection() {
+    // After a 2xx to CONNECT, the client and every proxy on the way treat
+    // the connection as a tunnel (RFC 9110, section 9.3.6), but the server
+    // has none to give: bytes that a proxy in front passes on blindly as
+    // tunnel data must not be read as requests it never saw.
+    let server = default_server();
+    let mut c = server.client();
+    c.send(
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n\
+         GET /admin HTTP/1.1\r\nHost: t\r\n\r\n",
+    );
+    let r = c.reply();
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("connection"), Some("close"));
+    c.expect_closed();
+
+    // A refusal leaves the connection as it was.
+    let refuse = |req: Request| async move {
+        if req.method() == "CONNECT" {
+            Response::new(405)
+        } else {
+            Response::text("ok")
+        }
+    };
+    let server = TestServer::start(Server::new(), refuse);
+    let mut c = server.client();
+    c.send(
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n\
+         GET / HTTP/1.1\r\nHost: t\r\n\r\n",
+    );
+    assert_eq!(c.reply().status, 405);
+    assert_eq!(c.reply().text(), "ok");
+}
+
+#[test]
 fn head_and_bodiless_statuses_send_no_body() {
     let server = default_server();
     let mut c = server.client();
@@ -606,13 +649,17 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
     c.send("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc");
     assert_eq!(c.reply().status, 408);
 
-    // A slow drip does not reset the clock.
+    // A slow drip does not reset the clock. The drip stops once the answer
+    // is there: the server discards input for only so long after it, and a
+    // line that arrives once it has closed makes its kernel answer with a
+    // reset, which macOS lets destroy the answer before it is read (seen on
+    // a slow runner, where 40 sleeps of 20 ms outlasted that time).
     let mut c = server.client();
     let start = Instant::now();
     c.send("GET / HTTP/1.1\r\n");
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(20));
-        if c.stream.write_all(b"X-Drip: 1\r\n").is_err() {
+        if c.answered() || c.stream.write_all(b"X-Drip: 1\r\n").is_err() {
             break;
         }
     }
@@ -1302,4 +1349,67 @@ fn large_bodies_received_straight_into_the_buffer_are_charged_as_they_arrive() {
     // The first completes.
     a.send(vec![b'a'; 50_000]);
     assert_eq!(a.reply().text(), "got 200000");
+}
+
+/// The write timeout counts from the last progress of a write, not from its
+/// start: a large answer to a client that keeps reading, slowly, goes out
+/// whole even when that takes far longer than the timeout. A client that
+/// stops reading loses the connection one timeout after the last progress.
+#[test]
+fn the_write_timeout_counts_from_the_last_progress() {
+    const LEN: usize = 32 << 20;
+    async fn large(_req: Request) -> Response {
+        Response::new(200).body(vec![b'x'; LEN])
+    }
+    let server = TestServer::start(Server::new().write_timeout(Duration::from_secs(1)), large);
+    // Read the whole answer: the head, then `LEN` bytes of body.
+    let read_all = |pace: Option<Duration>| {
+        let mut c = server.client();
+        c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        let start = Instant::now();
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut paced = 0;
+        loop {
+            match c.stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+            // A pause after each 256 KiB.
+            if let Some(pace) = pace {
+                if got - paced >= buf.len() {
+                    paced = got;
+                    std::thread::sleep(pace);
+                }
+            }
+            if got > LEN {
+                break;
+            }
+        }
+        (got, start.elapsed())
+    };
+    // About 10 MB a second: some seconds for the part that does not fit in
+    // the sockets' buffers, well past the 1 s timeout. The timeout leaves
+    // room for a slow CI machine that pauses the reader now and then (a
+    // 300 ms one cut the answer on a macOS runner).
+    let (got, took) = read_all(Some(Duration::from_millis(25)));
+    assert!(
+        got > LEN,
+        "the answer was cut after {got} bytes, in {took:?}"
+    );
+    assert!(took > Duration::from_secs(2), "{took:?}");
+
+    // A client that takes nothing more after its first read is dropped.
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut got = c.stream.read(&mut buf).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    loop {
+        match c.stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    assert!(got < LEN, "a stalled client got the whole answer");
 }

@@ -9,7 +9,7 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -171,6 +171,9 @@ struct Conn {
     /// Set once the connection has failed, for [`CancelToken`]s on other
     /// threads.
     closed: Arc<AtomicBool>,
+    /// While a pool lends the connection to one task: the flag its cancel
+    /// tokens check, cleared when the connection goes back.
+    lease: RefCell<Option<Arc<Lease>>>,
     /// The default database changed since the session was last set up.
     schema_changed: Cell<bool>,
     /// Where the pool counts what happens on its connections.
@@ -564,6 +567,7 @@ impl Client {
             generation: Cell::new(0),
             dirty: Cell::new(false),
             closed: Arc::new(AtomicBool::new(false)),
+            lease: RefCell::new(None),
             schema_changed: Cell::new(false),
             counters: RefCell::new(None),
             tx: Cell::new(Tx::None),
@@ -785,13 +789,38 @@ impl Client {
 
     /// A handle that asks the server to stop whatever this connection is
     /// running, from any thread.
+    ///
+    /// A token taken from a [`PooledClient`](crate::PooledClient) stops
+    /// working when the connection goes back to the pool, so that it cannot
+    /// stop the statements of the tasks that use the connection next; and a
+    /// connection that goes back while a cancel request from such a token is
+    /// on its way is closed rather than lent to another task.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             config: self.conn.config.clone(),
             connection_id: self.conn.connection_id,
             identity: self.conn.identity.clone(),
             closed: self.conn.closed.clone(),
+            lease: self.conn.lease.borrow().clone(),
         }
+    }
+
+    /// Starts lending the connection to one task: cancel tokens taken from
+    /// now on work until [`end_lease`](Self::end_lease).
+    pub(crate) fn begin_lease(&self) {
+        *self.conn.lease.borrow_mut() = Some(Arc::new(Lease::default()));
+    }
+
+    /// Ends the lease: the cancel tokens taken during it stop working.
+    /// Returns whether a cancel request taken during it may still be on its
+    /// way to the server, in which case the connection must not be lent to
+    /// another task: the request would stop that task's statement.
+    pub(crate) fn end_lease(&self) -> bool {
+        self.conn
+            .lease
+            .borrow_mut()
+            .take()
+            .is_some_and(|lease| lease.end())
     }
 
     /// The server's version, such as `8.0.46`.
@@ -1922,6 +1951,46 @@ pub struct CancelToken {
     connection_id: u32,
     identity: Identity,
     closed: Arc<AtomicBool>,
+    /// Set for a token taken from a pooled connection: ended when the
+    /// connection goes back to the pool.
+    lease: Option<Arc<Lease>>,
+}
+
+/// A pooled connection's time with one task, shared with the cancel tokens
+/// taken during it: whether it has ended, and how many cancel requests are
+/// on their way.
+#[derive(Default)]
+pub(crate) struct Lease(AtomicU32);
+
+impl Lease {
+    /// Set once the connection has gone back to its pool.
+    const ENDED: u32 = 1 << 31;
+
+    /// Counts a cancel request on its way, unless the lease has ended.
+    fn start_cancel(&self) -> bool {
+        let mut v = self.0.load(Ordering::Acquire);
+        while v & Self::ENDED == 0 {
+            match self
+                .0
+                .compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
+        false
+    }
+
+    /// A cancel request that `start_cancel` counted got its answer.
+    fn finish_cancel(&self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Ends the lease; returns whether a cancel request is still on its way
+    /// (or was given up on the way, which counts the same).
+    fn end(&self) -> bool {
+        self.0.fetch_or(Self::ENDED, Ordering::AcqRel) & !Self::ENDED != 0
+    }
 }
 
 impl CancelToken {
@@ -1929,13 +1998,33 @@ impl CancelToken {
     /// something was stopped: the statement may have finished first. Once
     /// the connection is closed, it does nothing: its id may be reused.
     ///
+    /// Fails with [`ErrorKind::Closed`], sending nothing, when the token was
+    /// taken from a [`PooledClient`](crate::PooledClient) that has gone back
+    /// to its pool since.
+    ///
     /// Not cancel safe: if the future is dropped, the request may still reach
     /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        connect::kill_query(&self.config, &self.identity, self.connection_id).await
+        let Some(lease) = &self.lease else {
+            return connect::kill_query(&self.config, &self.identity, self.connection_id).await;
+        };
+        // Counted until the answer comes: a connection that goes back to the
+        // pool meanwhile is closed rather than lent to a task whose
+        // statement the request would stop. A request given up on the way
+        // stays counted, for the same reason.
+        if !lease.start_cancel() {
+            return Err(Error::closed(
+                "the connection this cancel token was taken from has gone back to its pool, \
+                 where other tasks use it, so nothing was sent; take a new token from the next \
+                 connection",
+            ));
+        }
+        let sent = connect::kill_query(&self.config, &self.identity, self.connection_id).await;
+        lease.finish_cancel();
+        sent
     }
 }
 
