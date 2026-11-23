@@ -29,7 +29,7 @@ use quinn_proto::{
 };
 
 use crate::error;
-use crate::route::{self, Forwarded, Member};
+use crate::route::{self, Forwarded, Inbox, Member};
 
 /// Datagrams quinn-proto may put in one GSO send. quinn uses 10.
 const GSO_SEGMENTS: usize = 10;
@@ -630,7 +630,7 @@ enum Woke {
 /// The driver task of one endpoint. A server endpoint has a `route`: its
 /// place among the endpoints of the other workers on the same address,
 /// and where the datagrams they pass on arrive.
-async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receiver<Forwarded>)>) {
+async fn drive(sh: Rc<Shared>, route: Option<(Member, Inbox)>) {
     let (mut member, mut inbox) = match route {
         Some((member, inbox)) => (Some(member), Some(inbox)),
         None => (None, None),
@@ -719,13 +719,12 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
                 let mut next = Some(first);
                 let mut n = 0;
                 while let Some(d) = next {
-                    let data = BytesMut::from(&d.data[..]);
                     sh.st
                         .borrow_mut()
-                        .handle(now, d.from, d.local, d.ecn, data, d.segment);
+                        .handle(now, d.from, d.local, d.ecn, d.data, d.segment);
                     n += 1;
                     next = match inbox.as_mut() {
-                        Some(inbox) if n < RECV_BATCH => inbox.try_recv().ok(),
+                        Some(inbox) if n < RECV_BATCH => inbox.try_recv(),
                         _ => None,
                     };
                 }
@@ -766,11 +765,10 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, giong::sync::mpsc::Receive
         // under load the connections that moved here would starve.
         if let Some(inbox) = inbox.as_mut() {
             for _ in 0..RECV_BATCH {
-                let Ok(d) = inbox.try_recv() else { break };
-                let data = BytesMut::from(&d.data[..]);
+                let Some(d) = inbox.try_recv() else { break };
                 sh.st
                     .borrow_mut()
-                    .handle(now, d.from, d.local, d.ecn, data, d.segment);
+                    .handle(now, d.from, d.local, d.ecn, d.data, d.segment);
             }
         }
     }
@@ -792,16 +790,9 @@ fn deliver(
     // handshake's packets go where their connection is too.
     #[cfg(not(target_os = "linux"))]
     if let Some(worker) = member.long_owner(data) {
-        let passed = Forwarded {
-            data: data.to_vec(),
-            from,
-            ecn,
-            segment: seg,
-            local,
-        };
-        let Some(_) = member.forward(worker, passed) else {
+        if member.forward(worker, data, from, ecn, seg, local) {
             return;
-        };
+        }
     }
     let whole = seg.unwrap_or(data.len()).max(1);
     // Datagrams received as one mostly go the same way; when they do not,
@@ -818,16 +809,9 @@ fn deliver(
     for part in data.chunks(step) {
         let mut here = Some(part);
         if let Some(worker) = crate::native::cid::owner(part, me) {
-            let passed = Forwarded {
-                data: part.to_vec(),
-                from,
-                ecn,
-                segment: seg,
-                local,
-            };
-            // Given back when no endpoint of that worker is there: the
+            // Kept here when no endpoint of that worker is there: the
             // packet is then answered as any that is not known.
-            if member.forward(worker, passed).is_none() {
+            if member.forward(worker, part, from, ecn, seg, local) {
                 here = None;
             }
         }
