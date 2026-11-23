@@ -283,7 +283,6 @@ fn a_missing_secret_is_named_before_anything_is_sent() {
 /// `{{env:...}}` placeholders or refuses with a coded error, and never echoes
 /// them on stdout.
 #[test]
-#[ignore = "known bug: record save writes request body and query secrets into the case file (security audit point 2)"]
 fn a_saved_case_holds_no_secret_from_a_body_or_a_query() {
     if !has_command("record") {
         return;

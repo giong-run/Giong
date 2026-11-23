@@ -198,7 +198,6 @@ fn the_json_line_is_a_report() {
 /// cannot read the request log (bodies included) or send requests through
 /// it. The constant `X-Giong-Dashboard` header alone is not enough.
 #[test]
-#[ignore = "known bug: the dashboard API has no random token (security audit point 1)"]
 fn the_api_needs_the_token_printed_at_start() {
     if !has_command("dashboard") {
         return;
@@ -207,6 +206,7 @@ fn the_api_needs_the_token_printed_at_start() {
     let a = start(dir.path(), free_port());
     let v: Value = serde_json::from_str(a.first_line.trim()).unwrap();
     let url_a = v["data"]["url"].as_str().unwrap().to_string();
+    let token = |u: &str| u.rsplit(['=', '/']).next().unwrap_or("").to_string();
     let bare = format!("http://127.0.0.1:{}/", a.port);
     assert_ne!(url_a, bare, "the printed URL carries no token: {url_a}");
     let host = format!("Host: 127.0.0.1:{}\r\nX-Giong-Dashboard: 1\r\n", a.port);
@@ -215,11 +215,18 @@ fn the_api_needs_the_token_printed_at_start() {
         matches!(s, 401 | 403),
         "the API answered without the token: {s} {body}"
     );
+    // The token from the printed URL lets the page in.
+    let t = token(&url_a);
+    let (s, body) = get(
+        a.port,
+        "/api/state",
+        &format!("Host: 127.0.0.1:{}\r\nX-Giong-Dashboard: {t}\r\n", a.port),
+    );
+    assert_eq!(s, 200, "the printed token was refused: {body}");
     drop(a);
     // A new start makes a new token.
     let b = start(dir.path(), free_port());
     let v: Value = serde_json::from_str(b.first_line.trim()).unwrap();
-    let token = |u: &str| u.rsplit(['=', '/']).next().unwrap_or("").to_string();
     assert_ne!(
         token(&url_a),
         token(v["data"]["url"].as_str().unwrap()),
