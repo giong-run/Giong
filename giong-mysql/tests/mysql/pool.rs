@@ -8,6 +8,7 @@ use giong::time::{sleep, timeout, Instant};
 use giong_mysql::{ErrorKind, Pool};
 
 use crate::run;
+use crate::server::SHA2_USER;
 
 #[test]
 fn shared_statements_spread_over_connections_up_to_the_maximum() {
@@ -859,14 +860,20 @@ fn a_cancel_token_stops_working_once_its_connection_goes_back() {
 #[test]
 fn a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way() {
     run(|s| async move {
-        let pool = Pool::new(s.local(), 1);
+        // Through a proxy that holds the cancel's own connection (its second)
+        // until told, so the cancel is surely on its way when the connection
+        // goes back: over the Unix socket, a slow client (TSan) could find
+        // every answer already there and finish it in one poll (#355).
+        let (port, release) = holding_proxy(s.port, 1);
+        let pool = Pool::new(s.tcp(SHA2_USER).port(port), 1);
         let conn = pool.get().await.unwrap();
         let id = conn.connection_id();
         let token = conn.cancel_token();
         // The cancel passes the check and starts connecting...
         let mut cancel = std::pin::pin!(token.cancel());
         std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(cancel.as_mut(), cx).is_pending());
+            let first = std::future::Future::poll(cancel.as_mut(), cx);
+            assert!(first.is_pending(), "{first:?}");
             std::task::Poll::Ready(())
         })
         .await;
@@ -879,10 +886,68 @@ fn a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way() {
             id,
             "a connection a KILL is on its way to"
         );
+        release.send(()).unwrap();
         cancel.await.unwrap();
         let row = next.query_one("SELECT SLEEP(0.2)", &[]).await.unwrap();
         assert_eq!(row.get::<i64>(0).unwrap(), 0);
     });
+}
+
+#[test]
+fn a_cancel_that_reaches_an_idle_connection_stops_nothing_after() {
+    run(|s| async move {
+        // A cancel answered before its connection goes back has done its
+        // work: the connection is lent again. That is safe only if a KILL
+        // QUERY that finds the connection idle is forgotten, rather than
+        // stopping the next statement, on every server.
+        let pool = Pool::new(s.local(), 1);
+        let conn = pool.get().await.unwrap();
+        let id = conn.connection_id();
+        conn.cancel_token().cancel().await.unwrap();
+        drop(conn);
+        let next = pool.get().await.unwrap();
+        assert_eq!(next.connection_id(), id, "the same connection");
+        let row = next.query_one("SELECT SLEEP(0.2)", &[]).await.unwrap();
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            0,
+            "the statement ran to its end"
+        );
+    });
+}
+
+/// A TCP proxy on 127.0.0.1 to the server's `port`. Its connection number
+/// `hold` (from 0) is accepted but forwarded only once the returned sender
+/// is used; the others are forwarded at once.
+fn holding_proxy(port: u16, hold: usize) -> (u16, std::sync::mpsc::Sender<()>) {
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap().port();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let mut released = Some(released);
+    std::thread::spawn(move || {
+        for (n, client) in listener.incoming().enumerate() {
+            let Ok(client) = client else { return };
+            let gate = if n == hold { released.take() } else { None };
+            std::thread::spawn(move || {
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                let Ok(server) = TcpStream::connect(("127.0.0.1", port)) else {
+                    return;
+                };
+                let pipe = |mut from: TcpStream, mut to: TcpStream| {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(Shutdown::Write);
+                    })
+                };
+                pipe(client.try_clone().unwrap(), server.try_clone().unwrap());
+                pipe(server, client);
+            });
+        }
+    });
+    (local, release)
 }
 
 /// Both futures, polled together on this task.
