@@ -398,8 +398,10 @@ fn run(args: &Args) -> Result<Report, Failure> {
     for step in next {
         r.line(format!("  {step}"));
     }
-    r.line(String::new());
-    r.line("Without the giong command: cargo run, cargo test.".to_string());
+    if !offer.dev_background {
+        r.line(String::new());
+        r.line("Without the giong command: cargo run, cargo test.".to_string());
+    }
     Ok(r)
 }
 

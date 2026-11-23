@@ -575,6 +575,7 @@ mod tests {
                 let text = template::render(readme, &cx).unwrap().unwrap();
                 assert_eq!(text.contains("giong dev --background"), background);
                 assert_eq!(text.contains("giong dev stop"), background);
+                assert_eq!(text.contains("`cargo run`"), !background);
                 assert_eq!(text.contains("giong dev                "), !background);
                 assert_eq!(
                     text.contains("Try the service on the address it prints"),

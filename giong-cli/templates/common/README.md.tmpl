@@ -40,8 +40,13 @@ without refusing a connection. Try the service on the address it prints.
 {{/if}}
 {{/if}}
 
+{{#if dev_background}}
+Without the `giong` command (in CI, say), `cargo test` works too: the tests read `.env`
+themselves.
+{{#else}}
 Without the `giong` command, plain cargo works too: `cargo run`, `cargo test`
 (the tests read `.env` themselves).
+{{/if}}
 
 | Path | Holds |
 |---|---|
