@@ -5,7 +5,9 @@ name: Windows benchmarks
 # runs not pinned to cores: for comparing runtimes on the same machine, not
 # for absolute numbers. Runs when the benchmarks change.
 on:
+  # A draft skips the benchmarks; marking it ready runs them.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - bench/core/**
       - bench/core.sh
@@ -18,8 +20,13 @@ concurrency:
   group: bench-windows-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # CI's stable compiler (see ci.yml).
+  RUST_STABLE: "1.100.0"
+
 jobs:
   core:
+    if: ${{ !github.event.pull_request.draft }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +40,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - run: nproc && systeminfo | grep -E "OS Name|OS Version|Processor|Total Physical"
       - name: Core benchmarks
         env:

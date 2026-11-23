@@ -4,8 +4,8 @@ A MySQL and MariaDB client and connection pool for the [giong](../README.md) run
 
 ```toml
 [dependencies]
-giong = "1.3.0"
-giong-mysql = "1.3.0"
+giong = "1.4.0"
+giong-mysql = "1.4.0"
 ```
 
 ```rust,no_run
@@ -89,7 +89,7 @@ Each connection starts its session with:
 - the statement timeout, as `max_execution_time` and `lock_wait_timeout` on MySQL, as `max_statement_time` and `lock_wait_timeout` on MariaDB;
 - `autocommit` on, and the session tracker on, which tells the pool when a statement changed the session.
 
-`Config::session_variable("sql_mode", "'STRICT_ALL_TABLES'")` sets other session variables; the ones above are refused there, except `lock_wait_timeout`. They are all set again whenever a pooled connection's session is reset.
+`Config::session_variable("sql_mode", "'STRICT_ALL_TABLES'")` sets other session variables; the ones above are refused there, except `lock_wait_timeout`. A value is one SQL expression: one holding a `;`, a comment, a backslash or a `,` outside quotes and parentheses is refused, so it cannot set a refused variable too. They are all set again whenever a pooled connection's session is reset.
 
 **TLS.** Unless `Config::tls` or `ssl-mode` says otherwise:
 
@@ -136,7 +136,7 @@ Each connection starts its session with:
 | `client.batch_execute(sql)` | Several statements separated by `;`, with no parameters and no results, stopping at the first error. For migrations and setup. |
 | `client.transaction()` | Starts a transaction and borrows the client mutably until it ends. `tx.commit()` or `tx.rollback()`; dropping the transaction rolls it back. A transaction the server ended early (deadlock, lock wait timeout with `innodb_rollback_on_timeout`, DDL), or one with a statement given up, refuses further statements, and its `commit` fails. |
 | `client.reset_session()` | Resets the session the way the pool does when a connection comes back: rolls back, releases locks, drops temporary tables and variables, and sets the session up again. For a stored function or trigger that takes a named lock or sets a user variable, which the server does not report. |
-| `client.cancel_token()` | A `CancelToken` whose `cancel()` runs `KILL QUERY` over a separate connection, stopping the statement running now. It goes to the address the connection reached and only if the server there is the same one, so behind a load balancer it cannot stop another session's statement. |
+| `client.cancel_token()` | A `CancelToken` whose `cancel()` runs `KILL QUERY` over a separate connection, stopping the statement running now. It goes to the address the connection reached and only if the server there is the same one, so behind a load balancer it cannot stop another session's statement. A token taken from a pooled connection (`pool.get()`) stops working, sending nothing, once the connection goes back to the pool, and a connection that goes back while such a request is on its way is closed rather than lent to another task. |
 | `client.server_version()`, `client.connection_id()` | What the server said when connecting; the id is the one `KILL` and `SHOW PROCESSLIST` use. |
 | `client.is_closed()`, `client.in_flight()` | Whether the connection is closed; how many requests are waiting for their answer. |
 | `row.get::<T>(column)` | A column by position or name, converted to `T` (see [Types](#types)). Borrowed types (`&str`, `&[u8]`) borrow from the row. |

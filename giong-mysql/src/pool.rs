@@ -626,6 +626,7 @@ impl Pool {
                 (new, self.expiry())
             }
         };
+        client.begin_lease();
         Ok(PooledClient {
             client: Some(client),
             expires,
@@ -976,6 +977,9 @@ impl DerefMut for PooledClient {
 impl Drop for PooledClient {
     fn drop(&mut self) {
         let client = self.client.take().expect("present until dropped");
+        // A cancel request taken during the lease may still reach the
+        // server: the connection is closed rather than lent to another task.
+        let cancelling = client.end_lease();
         {
             let mut st = self.pool.inner.state.borrow_mut();
             st.taken -= 1;
@@ -986,10 +990,12 @@ impl Drop for PooledClient {
                 client.queue_reset();
             }
             let now = Instant::now();
-            if !client.is_closed() && now >= self.expires {
+            // Otherwise closed (dropped) instead of going back.
+            let open = !client.is_closed() && !cancelling;
+            if open && now >= self.expires {
                 // Past its lifetime: closed (dropped) instead of going back.
                 st.recycled += 1;
-            } else if !client.is_closed() {
+            } else if open {
                 client.set_shared(true);
                 st.shared.push(Member {
                     client: Rc::new(client),
