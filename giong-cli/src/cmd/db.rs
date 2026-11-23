@@ -312,6 +312,21 @@ fn package_name(manifest: &str) -> Option<String> {
     None
 }
 
+/// The container's name for `engine` in the project at `root`:
+/// `giong-<package>-<engine>-<6 hex digits of the root's path>`, so two
+/// checkouts of one project never share a database. The volume adds
+/// `-data`.
+fn container_base(project: &str, root: &Path, engine: Engine) -> String {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let hash = sha256::hex(root.to_string_lossy().as_bytes());
+    format!(
+        "giong-{}-{}-{}",
+        slug(project).replace('_', "-"),
+        engine.name(),
+        &hash[..6]
+    )
+}
+
 /// A name a container, a volume and a database accept: lower case letters,
 /// digits and `_`, starting with a letter, at most 48 characters.
 pub fn slug(name: &str) -> String {
@@ -1268,12 +1283,12 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
                     None if port_free(engine.default_port()) => engine.default_port(),
                     None => any_free_port(),
                 };
-                let base = format!("giong_{}_{}", slug(project), engine.name());
+                let base = container_base(project, root, engine);
                 Started {
                     engine,
                     runtime: runtime.clone(),
-                    container: base.replace('_', "-"),
-                    volume: format!("{}-data", base.replace('_', "-")),
+                    container: base.clone(),
+                    volume: format!("{base}-data"),
                     image: args
                         .value("image")
                         .unwrap_or(engine.default_image())
@@ -1286,6 +1301,21 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
             }
         };
         let status = container_state(&runtime, &s.container);
+        // A container of this name that .giong/db.json does not list: its
+        // password is not known here, and writing a new one into .env would
+        // not match it.
+        if status.is_some() && !read_state(root).iter().any(|x| x.engine == engine) {
+            return Err(Failure::new(
+                Code::DB_START_FAILED,
+                format!(
+                    "a container named {} exists, but .giong/db.json does not list it, so its \
+                     password is not known",
+                    s.container
+                ),
+                "giong db down removes it (--volumes also deletes its data) and giong db up \
+                 starts a fresh one; to keep it, restore .giong/db.json from where it was",
+            ));
+        }
         let action = match status.as_deref() {
             Some("running") => "already running",
             Some(_) => {
@@ -1763,6 +1793,21 @@ mod tests {
         ] {
             assert_eq!(parse_migration_name(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn each_checkout_gets_its_own_container() {
+        let base = std::env::temp_dir().join(format!("giong-db-names-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let name = container_base("Rest API", &a, Engine::Postgres);
+        assert!(name.starts_with("giong-rest-api-postgres-"), "{name}");
+        assert_eq!(name.len(), "giong-rest-api-postgres-".len() + 6);
+        assert_eq!(name, container_base("Rest API", &a, Engine::Postgres));
+        assert_ne!(name, container_base("Rest API", &b, Engine::Postgres));
+        assert_ne!(name, container_base("Rest API", &a, Engine::Redis));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
