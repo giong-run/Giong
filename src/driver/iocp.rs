@@ -75,6 +75,8 @@ use windows_sys::Win32::System::IO::{
     PostQueuedCompletionStatus, OVERLAPPED, OVERLAPPED_ENTRY,
 };
 
+mod alarm;
+
 use super::budget::spend_budget;
 use super::{Io, MultiIo, MultiKind, MultiPoll, Park, Start, BUFFER_SHIFT, F_BUFFER, F_MORE};
 use crate::buf::{BufPool, RecvBuf};
@@ -374,6 +376,9 @@ pub(crate) struct Iocp {
     accept_ex: LPFN_ACCEPTEX,
     connect_ex: LPFN_CONNECTEX,
     recv_msg: LPFN_WSARECVMSG,
+    /// Ends a wait at the next timer to the microsecond, where the wait's
+    /// own timeout ends on a 15.6 ms clock tick (see [`alarm`]).
+    alarm: Option<alarm::Alarm>,
 }
 
 fn last_error() -> i32 {
@@ -425,6 +430,7 @@ impl Iocp {
             accept_ex: None,
             connect_ex: None,
             recv_msg: None,
+            alarm: alarm::Alarm::new(),
         })
     }
 
@@ -1434,17 +1440,24 @@ impl Iocp {
         let mut n = if self.ready > 0 {
             mem::take(&mut self.ready)
         } else {
-            self.collect(match mode {
+            let timeout = match mode {
                 Park::Poll => 0,
                 Park::Wait(None) => u32::MAX, // INFINITE
-                // Rounded up: waking before the deadline would spin until
-                // it. Windows may still end a wait early by its clock
-                // tick; the event loop then waits again for what is left.
-                Park::Wait(Some(d)) => d
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(u128::from(u32::MAX - 1)) as u32,
-            })
+                Park::Wait(Some(d)) => match self.alarm.as_ref().map(|a| a.set(self.port.0, d)) {
+                    Some(alarm::Set::Expired) => 0,
+                    // The alarm ends the wait on time. The timeout stays,
+                    // rounded up so that it never ends the wait first:
+                    // waking before the deadline would spin until it.
+                    // Windows may still end a wait early by its clock
+                    // tick; the event loop then waits again for what is
+                    // left.
+                    _ => d
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .min(u128::from(u32::MAX - 1)) as u32,
+                },
+            };
+            self.collect(timeout)
         };
         loop {
             for i in 0..n {
@@ -1453,6 +1466,10 @@ impl Iocp {
                 // from the wait is all it asks.
                 if !entry.lpOverlapped.is_null() {
                     self.complete(entry);
+                } else if entry.lpCompletionKey == alarm::KEY {
+                    if let Some(alarm) = &self.alarm {
+                        alarm.rang();
+                    }
                 }
             }
             if n < BATCH {
