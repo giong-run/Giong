@@ -26,6 +26,13 @@
 mod compression;
 mod cors;
 mod logger;
+// Recording is for development: a release build without the `dev` feature
+// has a `Record` that refuses to be made (record_off.rs), and none of the
+// recording code.
+#[cfg(any(debug_assertions, feature = "dev"))]
+mod record;
+#[cfg(not(any(debug_assertions, feature = "dev")))]
+#[path = "record_off.rs"]
 mod record;
 mod request_id;
 mod timeout;
