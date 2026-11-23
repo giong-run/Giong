@@ -128,7 +128,9 @@ mariadb() {
 redis_like() {
     local kind="$1" v="$2" sum="$3" cache="$4"
     local bin="$cache/bin"
-    if [ ! -x "$bin/redis-server" ]; then
+    # Built on another runner image (the cache falls back to one), the
+    # programs may not start here: then they are built again.
+    if ! "$bin/redis-server" --version > /dev/null 2>&1; then
         rm -rf "$bin"
         "$apt" install "$cache/apt" libssl-dev
         local url dir

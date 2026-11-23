@@ -342,13 +342,20 @@ jobs:
         env:
           SERVER: ${{ matrix.server }}
           SCRIPTS: ${{ hashFiles('scripts/ci-servers.sh', 'scripts/ci-apt.sh') }}
-        run: echo "key=server-${SERVER// /-}-$ImageOS-$ImageVersion-${SCRIPTS:0:16}" >> "$GITHUB_OUTPUT"
+        # Another runner image version's cache is a fallback, as in
+        # .github/actions/apt-install: what does not fit this image is
+        # downloaded again.
+        run: |
+          prefix="server-${SERVER// /-}-$ImageOS-${SCRIPTS:0:16}-"
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "key=$prefix$ImageVersion" >> "$GITHUB_OUTPUT"
       - name: "net: restore ${{ matrix.server }}"
         id: restore
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/ci-server
           key: ${{ steps.key.outputs.key }}
+          restore-keys: ${{ steps.key.outputs.prefix }}
       - name: "net: set up ${{ matrix.server }}"
         env:
           POSTGRES: ${{ matrix.postgres }}

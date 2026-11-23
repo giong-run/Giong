@@ -49,9 +49,13 @@ runs:
         echo "packages=$pkgs" >> "$GITHUB_OUTPUT"
         # The image (ImageOS, ImageVersion) fixes what is installed already,
         # and so which dependencies the files must bring; the kernel only
-        # matters for its modules package.
+        # matters for its modules package. Several image versions serve jobs
+        # at once (20261116.133.1 and .376.1 on 2026-11-23), so a job falls
+        # back to the files another version saved: scripts/ci-apt.sh installs
+        # them only if they fit this image, and downloads otherwise.
         sum="$(printf '%s\n%s\n' "$pkgs" "$SETUP" | sha256sum | cut -c1-16)"
-        echo "key=apt-${ImageOS:-unknown}-${ImageVersion:-unknown}-$sum" >> "$GITHUB_OUTPUT"
+        echo "prefix=apt-${ImageOS:-unknown}-$sum-" >> "$GITHUB_OUTPUT"
+        echo "key=apt-${ImageOS:-unknown}-$sum-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
         echo "dir=$RUNNER_TEMP/apt-cache-$sum" >> "$GITHUB_OUTPUT"
     - name: "net: restore the .deb files"
       id: restore
@@ -60,6 +64,7 @@ runs:
       with:
         path: ${{ steps.plan.outputs.dir }}
         key: ${{ steps.plan.outputs.key }}
+        restore-keys: ${{ steps.plan.outputs.prefix }}
     - name: "net: apt install ${{ steps.plan.outputs.packages }}"
       id: install
       if: steps.plan.outputs.packages != ''

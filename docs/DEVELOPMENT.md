@@ -98,8 +98,10 @@ known flake whose issue is open with a fix on its way, listed in
 rerun its failures.
 
 **Mirrors off the hot path.** Ubuntu packages come from a cache of their `.deb` files
-(`.github/actions/apt-install`, `scripts/ci-apt.sh`), keyed by the runner image, so a job
-goes to an Ubuntu mirror about once a week instead of every run. The database servers of
+(`.github/actions/apt-install`, `scripts/ci-apt.sh`), keyed by the runner image and
+falling back to another image version's files when they still install (GitHub serves
+several image versions at once), so a job goes to an Ubuntu mirror about once a week
+instead of every run. The database servers of
 the `servers` job (`scripts/ci-servers.sh`), h2spec, cargo-semver-checks and kani-verifier
 are cached the same way. A new apt package goes through the action, never a bare
 `apt-get`.
