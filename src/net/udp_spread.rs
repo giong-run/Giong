@@ -15,9 +15,10 @@
 //! - Sends go out on the one socket, from every worker, so replies come
 //!   from the port the datagrams went to.
 //!
-//! A socket whose waiting datagrams pass [`INBOX_MAX`] loses the next
-//! ones, as the kernel drops datagrams for a socket that is not read fast
-//! enough. The thread ends with the last socket.
+//! A socket whose waiting datagrams pass [`INBOX_MAX`] of them or
+//! [`INBOX_BYTES`] loses the next ones, as the kernel drops datagrams for a
+//! socket that is not read fast enough. The thread ends with the last
+//! socket.
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -38,6 +39,12 @@ use crate::sys::{recv_from_nowait, AcceptEvents, AcceptWake, RawSock, SockAddrSt
 /// Datagrams that may wait for one socket before the next ones for it are
 /// dropped.
 const INBOX_MAX: usize = 4096;
+
+/// Bytes that may wait for one socket, headers included, before the next
+/// datagrams for it are dropped. The count alone would let 4096 datagrams
+/// of up to 64 KiB each (UDP over IP fragments) hold 256 MiB for a socket
+/// whose worker is slow, where the kernel holds a socket's receive buffer.
+const INBOX_BYTES: usize = 4 << 20;
 
 /// The longest datagram UDP carries.
 const DATAGRAM_MAX: usize = 65_536;
@@ -72,6 +79,8 @@ struct Slot {
     /// Each laid out as the driver lays out a received datagram (see
     /// [`super::Datagram::parse`]).
     datagrams: VecDeque<Vec<u8>>,
+    /// The bytes of `datagrams`.
+    bytes: usize,
     /// The tasks waiting on the socket, each once.
     waiters: Vec<Waker>,
     /// `false` once the socket is gone.
@@ -207,6 +216,7 @@ impl Member {
     pub(crate) fn poll_inbox(&self, cx: &mut Context<'_>) -> Poll<Vec<u8>> {
         let mut slot = lock(&self.inbox.slot);
         if let Some(datagram) = slot.datagrams.pop_front() {
+            slot.bytes -= datagram.len();
             return Poll::Ready(datagram);
         }
         if !slot.waiters.iter().any(|w| w.will_wake(cx.waker())) {
@@ -304,9 +314,21 @@ impl Group {
     }
 }
 
+/// Whether `slot` has room for one more datagram of `size` bytes.
+fn has_room(slot: &Slot, size: usize) -> bool {
+    slot.open && slot.datagrams.len() < INBOX_MAX && slot.bytes + size <= INBOX_BYTES
+}
+
 /// Puts a datagram from `name` in `inbox`, unless it is full or closed.
+/// A full inbox costs no allocation: room is looked at first, and again
+/// when the copy is made (the first socket's worker hands datagrams in
+/// too, see [`Member::pass_on`]).
 fn deliver(inbox: &Inbox, name: &[u8], payload: &[u8], truncated: bool) {
-    let mut datagram = vec![0u8; OVERHEAD + payload.len()];
+    let size = OVERHEAD + payload.len();
+    if !has_room(&lock(&inbox.slot), size) {
+        return;
+    }
+    let mut datagram = vec![0u8; size];
     let fields = [
         name.len() as u32,
         0,
@@ -323,9 +345,10 @@ fn deliver(inbox: &Inbox, name: &[u8], payload: &[u8], truncated: bool) {
     datagram[OUT_HEADER..OUT_HEADER + name.len()].copy_from_slice(name);
     datagram[OVERHEAD..].copy_from_slice(payload);
     let mut slot = lock(&inbox.slot);
-    if !slot.open || slot.datagrams.len() >= INBOX_MAX {
+    if !has_room(&slot, size) {
         return;
     }
+    slot.bytes += size;
     slot.datagrams.push_back(datagram);
     let waiters = mem::take(&mut slot.waiters);
     drop(slot);
@@ -348,6 +371,7 @@ impl Drop for Member {
             slot.open = false;
             slot.waiters.clear();
             slot.datagrams.clear();
+            slot.bytes = 0;
         }
         // The registry first, then the state: the order `bind` takes them.
         let mut groups = lock(&GROUPS);
@@ -371,5 +395,75 @@ impl Drop for Member {
             events.stop();
             drop(thread.join());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_inbox() -> Inbox {
+        let inbox = Inbox::default();
+        lock(&inbox.slot).open = true;
+        inbox
+    }
+
+    /// Long datagrams (UDP carries up to 64 KiB, over IP fragments) fill a
+    /// socket's inbox by bytes long before the count limit: a slow worker
+    /// holds a few MiB, not 4096 times 64 KiB.
+    #[test]
+    fn an_inbox_holds_a_bounded_number_of_bytes() {
+        let inbox = open_inbox();
+        let name = [0u8; 16];
+        let payload = vec![7u8; 65_507];
+        for _ in 0..INBOX_MAX {
+            deliver(&inbox, &name, &payload, false);
+        }
+        let slot = lock(&inbox.slot);
+        let held: usize = slot.datagrams.iter().map(Vec::len).sum();
+        assert_eq!(held, slot.bytes);
+        assert!(held <= INBOX_BYTES, "{held} bytes held");
+        assert!(
+            held + OVERHEAD + payload.len() > INBOX_BYTES,
+            "{held} bytes held"
+        );
+        assert!(
+            slot.datagrams.len() < 100,
+            "{} datagrams",
+            slot.datagrams.len()
+        );
+    }
+
+    /// Short datagrams still stop at the count, and a datagram taken off
+    /// the inbox makes room for the next one.
+    #[test]
+    fn short_datagrams_stop_at_the_count_and_reading_makes_room() {
+        let inbox = open_inbox();
+        let name = [0u8; 16];
+        for _ in 0..INBOX_MAX + 10 {
+            deliver(&inbox, &name, b"hi", false);
+        }
+        assert_eq!(lock(&inbox.slot).datagrams.len(), INBOX_MAX);
+        let taken = {
+            let mut slot = lock(&inbox.slot);
+            let datagram = slot.datagrams.pop_front().unwrap();
+            slot.bytes -= datagram.len();
+            datagram
+        };
+        assert_eq!(taken.len(), OVERHEAD + 2);
+        deliver(&inbox, &name, b"hi", false);
+        let slot = lock(&inbox.slot);
+        assert_eq!(slot.datagrams.len(), INBOX_MAX);
+        assert_eq!(slot.bytes, INBOX_MAX * (OVERHEAD + 2));
+    }
+
+    /// A closed inbox takes nothing.
+    #[test]
+    fn a_closed_inbox_takes_nothing() {
+        let inbox = Inbox::default();
+        deliver(&inbox, &[0u8; 16], b"hi", false);
+        let slot = lock(&inbox.slot);
+        assert!(slot.datagrams.is_empty());
+        assert_eq!(slot.bytes, 0);
     }
 }
