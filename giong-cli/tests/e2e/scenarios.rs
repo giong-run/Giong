@@ -453,7 +453,9 @@ fn dev_warns_before_listening_on_every_interface() {
     std::thread::sleep(Duration::from_millis(500));
     let log = dev.log();
     assert!(
-        log.contains("GIONG-E5024") && log.contains(&format!("127.0.0.1:{port}")),
+        log.contains("GIONG-E5024")
+            && log.contains(&format!("127.0.0.1:{port}"))
+            && log.contains("--lan"),
         "no warning about listening on every interface:\n{log}"
     );
 }
