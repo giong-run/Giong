@@ -28,6 +28,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # A package mirror or download that stalls fails in seconds and is tried
+  # again, instead of holding a job (and the merge queue) for hours: the merge
+  # queue lost three runs to a stalled apt and curl on 2026-11-23.
+  APT_OPTS: -o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
+  CURL_RETRY: --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --speed-limit 1024 --speed-time 30
   # The stable compiler of every job that does not name one (MSRV, nightly and
   # instr name their own). Pinned, not `stable`, so that a new Rust release
   # (new lints, a new target/ layout) cannot turn main red overnight and so that
@@ -87,6 +92,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -104,6 +110,7 @@ jobs:
 
   msrv:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The versions and what each checks live in scripts/msrv.sh, which
@@ -122,6 +129,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -141,6 +149,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -165,6 +174,7 @@ jobs:
     # skipped on purpose only for a pull request that `plan` found to change no code.
     if: always() && needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     env:
       # Five rounds in the merge queue, one on a pull request (job `plan`).
       ROUNDS: ${{ needs.plan.outputs.rounds || 5 }}
@@ -198,11 +208,11 @@ jobs:
         # Ubuntu's Redis 7.0 and PgBouncer 1.22. The tests start their own
         # servers; the services apt starts are stopped.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server pgbouncer
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q redis-server pgbouncer
           sudo systemctl stop redis-server pgbouncer
       - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+        run: sudo modprobe tls || { sudo apt-get $APT_OPTS install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # Linux 6.14 to 7.2 count every io_uring ring against the
       # locked-memory limit, summed over the runner user's processes, and
       # tests run runtimes side by side: lift the limit, so that each of them
@@ -220,6 +230,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -257,7 +268,7 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
       - name: Fetch h3spec
         run: |
-          curl -fsSL --retry 3 -o h3spec https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64
+          curl -fsSL $CURL_RETRY -o h3spec https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64
           echo "c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830  h3spec" | sha256sum -c -
           chmod +x h3spec
       - run: cargo build --release -p giong-http --features unstable-http3 --example h3
@@ -314,10 +325,10 @@ jobs:
         # From the PostgreSQL project's apt repository; the cluster apt
         # creates is stopped, the tests start their own.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q postgresql-common
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q postgresql-common
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y -q postgresql-${{ matrix.postgres }}
+          sudo apt-get $APT_OPTS install -y -q postgresql-${{ matrix.postgres }}
           sudo systemctl stop postgresql
           echo "GIONG_PG_BIN=/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_ENV"
       - name: Install MySQL ${{ matrix.mysql }}
@@ -332,17 +343,17 @@ jobs:
           v=${{ matrix.mysql }}
           name=mysql-$v-linux-glibc2.17-x86_64-minimal
           cd "$RUNNER_TEMP"
-          curl -fsSL --retry 3 -o "$name.tar.xz" "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz"
+          curl -fsSL $CURL_RETRY -o "$name.tar.xz" "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz"
           echo "${{ matrix.sha256 }}  $name.tar.xz" | sha256sum -c -
           tar -xJf "$name.tar.xz"
           pool=http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses
-          curl -fsSL --retry 3 -O "$pool/libtinfo5_6.3-2_amd64.deb" -O "$pool/libncurses5_6.3-2_amd64.deb"
+          curl -fsSL $CURL_RETRY -O "$pool/libtinfo5_6.3-2_amd64.deb" -O "$pool/libncurses5_6.3-2_amd64.deb"
           printf '%s\n' \
             "d2597b5aec92a930cf549e1b429ad892595813e72ec7814685ea146a9fb715e5  libtinfo5_6.3-2_amd64.deb" \
             "d9b8efb37a056e01c46d93c7ef6977aa04ad2586978137d9a3954c15ad5d14c3  libncurses5_6.3-2_amd64.deb" \
             | sha256sum -c -
-          sudo apt-get update -q
-          sudo apt-get install -y -q libaio1t64 libnuma1 ./libtinfo5_6.3-2_amd64.deb ./libncurses5_6.3-2_amd64.deb
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q libaio1t64 libnuma1 ./libtinfo5_6.3-2_amd64.deb ./libncurses5_6.3-2_amd64.deb
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
           "$RUNNER_TEMP/$name/bin/mysqld" --version
           "$RUNNER_TEMP/$name/bin/mysql" --version
@@ -359,7 +370,7 @@ jobs:
         env:
           MARIADB: ${{ matrix.mariadb }}
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/mariadb-keyring.pgp" \
+          curl -fsSL $CURL_RETRY -o "$RUNNER_TEMP/mariadb-keyring.pgp" \
             https://mariadb.org/mariadb_release_signing_key.pgp
           fingerprint=$(gpg --show-keys --with-colons "$RUNNER_TEMP/mariadb-keyring.pgp" \
             | awk -F: '$1 == "fpr" && !seen++ { print $10 }')
@@ -371,7 +382,7 @@ jobs:
           codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
           echo "deb [signed-by=/etc/apt/keyrings/mariadb-keyring.pgp] https://deb.mariadb.org/$MARIADB/ubuntu $codename main" \
             | sudo tee /etc/apt/sources.list.d/mariadb.list
-          sudo apt-get update -q
+          sudo apt-get $APT_OPTS update -q
           mkdir -p "$RUNNER_TEMP/mariadb-debs" && cd "$RUNNER_TEMP/mariadb-debs"
           pkgs=()
           for base in mariadb-server-core mariadb-server mariadb-client-core mariadb-client \
@@ -383,14 +394,14 @@ jobs:
             done
           done
           echo "${pkgs[@]}"
-          apt-get download "${pkgs[@]}"
+          apt-get $APT_OPTS download "${pkgs[@]}"
           root="$RUNNER_TEMP/mariadb"
           for deb in *.deb; do dpkg -x "$deb" "$root"; done
           deps=$(for deb in *.deb; do dpkg-deb -f "$deb" Depends; done \
             | tr ',' '\n' | sed -e 's/([^)]*)//g' -e 's/|.*//' -e 's/:any//' -e 's/ //g' \
             | grep -v -E '^(mariadb|mysql|libmariadb|galera|default-mysql|debconf|adduser|passwd|lsb-base|init-system|perl|libdbi|libdbd|psmisc|rsync|procps|iproute2|socat|sed|\$)' \
             | sort -u)
-          sudo apt-get install -y -q --no-install-recommends $deps
+          sudo apt-get $APT_OPTS install -y -q --no-install-recommends $deps
           export LD_LIBRARY_PATH="$root/usr/lib/x86_64-linux-gnu"
           if ldd "$root"/usr/sbin/mariadbd "$root"/usr/bin/mariadb | grep 'not found'; then exit 1; fi
           "$root/usr/sbin/mariadbd" --version | tee /dev/stderr | grep -E -q "Ver $MARIADB\.[0-9]+-MariaDB"
@@ -400,9 +411,9 @@ jobs:
         if: matrix.redis
         # From source, with TLS, which the tests use.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libssl-dev
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/redis.tar.gz" \
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q libssl-dev
+          curl -fsSL $CURL_RETRY -o "$RUNNER_TEMP/redis.tar.gz" \
             "https://download.redis.io/releases/redis-${{ matrix.redis }}.tar.gz"
           echo "${{ matrix.sha256 }}  $RUNNER_TEMP/redis.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/redis.tar.gz" -C "$RUNNER_TEMP"
@@ -413,9 +424,9 @@ jobs:
         # Valkey answers to redis-server's name only once installed; the
         # tests look for that name.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libssl-dev
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/valkey.tar.gz" \
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q libssl-dev
+          curl -fsSL $CURL_RETRY -o "$RUNNER_TEMP/valkey.tar.gz" \
             "https://github.com/valkey-io/valkey/archive/refs/tags/${{ matrix.valkey }}.tar.gz"
           echo "${{ matrix.sha256 }}  $RUNNER_TEMP/valkey.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/valkey.tar.gz" -C "$RUNNER_TEMP"
@@ -436,6 +447,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -463,11 +475,11 @@ jobs:
         # Ubuntu's Redis 7.0. The tests start their own server; the
         # service apt starts is stopped.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q redis-server
           sudo systemctl stop redis-server
       - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+        run: sudo modprobe tls || { sudo apt-get $APT_OPTS install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # The locked-memory limit is lifted as in the test job.
       - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback ${{ matrix.tier }}
 
@@ -477,6 +489,7 @@ jobs:
     needs: [plan, fallback-tiers]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - run: >
           test "${{ needs.fallback-tiers.result }}" = success ||
@@ -491,6 +504,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -521,7 +535,7 @@ jobs:
       # A container cannot load kernel modules, but uses the host's: kernel
       # TLS on the epoll driver, inside the container.
       - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+        run: sudo modprobe tls || { sudo apt-get $APT_OPTS install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       - name: Run them in a container with the default seccomp profile
         run: |
           docker info --format '{{.SecurityOptions}}' | grep -q seccomp
@@ -540,6 +554,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -594,6 +609,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -614,11 +630,11 @@ jobs:
         # Ubuntu's Redis 7.0. The tests start their own server; the
         # service apt starts is stopped.
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q redis-server
           sudo systemctl stop redis-server
       - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+        run: sudo modprobe tls || { sudo apt-get $APT_OPTS install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
       # The locked-memory limit is lifted as in the test job.
       - name: ThreadSanitizer on ${{ matrix.driver }}
         run: |
@@ -631,6 +647,7 @@ jobs:
     needs: [plan, tsan-runs]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - run: >
           test "${{ needs.tsan-runs.result }}" = success ||
@@ -644,6 +661,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -658,6 +676,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -673,6 +692,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -691,6 +711,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -717,6 +738,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       # Four at a time on a pull request, all six in the merge queue (see servers).
@@ -753,8 +775,8 @@ jobs:
       - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
       - name: Install QEMU and a static busybox
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86 busybox-static cpio
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q qemu-system-x86 busybox-static cpio
       - name: Let QEMU use KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
@@ -784,6 +806,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -804,6 +827,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -813,8 +837,8 @@ jobs:
           toolchain: 1.97.0
       - name: Install valgrind
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q valgrind
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q valgrind
       - run: uname -r
       - run: scripts/instr.py check
       # The counts of this run and a baseline.csv made from them, to commit
@@ -837,6 +861,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -857,6 +882,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: giong-quic
@@ -885,6 +911,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       GIONG_PG_REQUIRED: "0"
       GIONG_MYSQL_REQUIRED: "0"
@@ -900,8 +927,8 @@ jobs:
           components: clippy
       - name: Install musl-tools
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q musl-tools
+          sudo apt-get $APT_OPTS update -q
+          sudo apt-get $APT_OPTS install -y -q musl-tools
       - run: >
           cargo clippy --workspace --all-targets --all-features
           --target x86_64-unknown-linux-musl -- -D warnings
@@ -956,6 +983,7 @@ jobs:
     needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl, macos, windows]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - env:
           NEEDS: ${{ toJSON(needs) }}
