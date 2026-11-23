@@ -497,6 +497,43 @@ fn many_tasks_receive_on_one_socket() {
 }
 
 #[test]
+fn a_waiting_task_gets_a_datagram_another_receive_took_from_the_socket() {
+    // A task waits on a socket; datagrams arrive, and before the event loop
+    // looks, another task's receives take them all out of the socket, the
+    // last of them in one system call with a datagram more than that task
+    // asks for (the epoll driver receives several at once on a busy
+    // socket). That datagram must go to the waiting task: the socket is
+    // empty by then, so no readiness event would ever wake it.
+    giong::block_on(async {
+        let (b, b_addr) = socket();
+        let b = Rc::new(b);
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let waiter = {
+            let b = b.clone();
+            giong::spawn(async move { b.recv().await.unwrap().to_vec() })
+        };
+        // Let it start waiting.
+        sleep(Duration::from_millis(20)).await;
+        for i in 0u32..4 {
+            a.send_to(&i.to_be_bytes(), b_addr).unwrap();
+        }
+        // Three receives without a turn of the event loop in between: the
+        // receive batch grows from one datagram to two on the third.
+        let mut seen = vec![false; 4];
+        for _ in 0..3 {
+            let got = b.recv().await.unwrap();
+            seen[u32::from_be_bytes(got[..].try_into().unwrap()) as usize] = true;
+        }
+        let got = timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the waiting task was never woken")
+            .unwrap();
+        seen[u32::from_be_bytes(got[..].try_into().unwrap()) as usize] = true;
+        assert!(seen.iter().all(|&s| s), "{seen:?}");
+    });
+}
+
+#[test]
 fn a_receiver_that_gave_up_does_not_take_the_next_datagram() {
     // A task stops waiting (its receive timed out); the next datagram must
     // wake the task that is waiting now, not the one that left.
