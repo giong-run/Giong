@@ -9,6 +9,9 @@ use crate::error;
 /// Transport settings of a connection (RFC 9000, section 18.2). The
 /// defaults suit a server with many connections; raise the windows for
 /// fewer, faster connections.
+///
+/// DATAGRAM frames (RFC 9221) are not offered: a peer that sends one is
+/// disconnected with `PROTOCOL_VIOLATION`.
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
     pub(crate) max_bidi_streams: u32,
@@ -75,6 +78,13 @@ impl TransportConfig {
             .send_window(u64::from(self.connection_window))
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
+            // No DATAGRAM frames (RFC 9221): giong-quic has no API to read
+            // them, and the engine's default would let a peer park 1.25 MB
+            // of them on every connection. Each one also holds the whole
+            // packet it came in, so a peer sending one byte per padded
+            // packet made a connection hold over 40 MB. Not offered, a
+            // DATAGRAM frame now closes the connection.
+            .datagram_receive_buffer_size(None)
             .congestion_controller_factory(crate::proto::Closable::factory());
         Ok(t)
     }
