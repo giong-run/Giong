@@ -27,6 +27,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # CI's stable compiler (see ci.yml).
+  RUST_STABLE: "1.100.0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -47,7 +49,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - id: version
         name: Tag matches the crate versions
         run: |
@@ -103,7 +105,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       # One crate at a time, in dependency order, skipping versions already on

@@ -68,16 +68,17 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "io-uring",
  "libc",
  "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "giong-grpc"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "giong",
  "giong-http",
@@ -96,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "giong",
  "giong-tls",
@@ -106,11 +107,11 @@ dependencies = [
 
 [[package]]
 name = "giong-proto"
-version = "1.3.0"
+version = "1.4.0"
 
 [[package]]
 name = "giong-tls"
-version = "1.3.0"
+version = "1.4.0"
 dependencies = [
  "giong",
  "libc",

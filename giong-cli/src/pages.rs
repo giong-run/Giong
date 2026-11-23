@@ -10,7 +10,7 @@ Raised by the runtime, when a worker starts. In code: `giong::error::Code::IoUri
 
 ## What happened
 
-The runtime was told to use io_uring (`Builder::driver(DriverKind::IoUring)`, or `GIONG_DRIVER=io_uring`), and `io_uring_setup` failed with `EPERM`, `EACCES` or `ENOSYS`. The kernel has io_uring but this process may not use it, or the kernel (or a sandbox in front of it) does not have it at all. Without that instruction giong would have used its epoll driver instead. The error keeps the kernel's `io::ErrorKind` (`PermissionDenied` or `Unsupported`), and the kernel's error is its `source()`.
+The runtime was told to use io_uring (`Builder::driver(DriverKind::IoUring)`, or `GIONG_DRIVER=io_uring`), and `io_uring_setup` failed with `EPERM`, `EACCES` or `ENOSYS`, or with `EINVAL` for a ring Linux sets up from 5.6 on. The kernel has io_uring but this process may not use it, the kernel (or a sandbox in front of it) does not have it at all, or the sandbox has only part of it (gVisor with `runsc --iouring` takes no setup flags). Without that instruction giong would have used its epoll driver instead. The error keeps the kernel's `io::ErrorKind` (`PermissionDenied`, `Unsupported` or `InvalidInput`), and the kernel's error is its `source()`.
 
 ## How to fix it
 
@@ -18,7 +18,7 @@ The runtime was told to use io_uring (`Builder::driver(DriverKind::IoUring)`, or
 - In Docker, the default seccomp profile blocks io_uring. Run with a profile that allows `io_uring_setup`, `io_uring_enter` and `io_uring_register` (see [DEPLOYMENT.md](../DEPLOYMENT.md)), or `--security-opt seccomp=unconfined` to confirm that this is the cause.
 - In Kubernetes, the container runtime applies the same default profile: set a `seccompProfile` of type `Localhost` that allows the three calls, as [DEPLOYMENT.md](../DEPLOYMENT.md) shows.
 - On the host, `sysctl kernel.io_uring_disabled` must be `0`, or `1` with the process in the group named by `kernel.io_uring_group`.
-- gVisor and some other sandboxes do not offer io_uring by default; run giong outside them.
+- gVisor and some other sandboxes do not offer io_uring by default, and gVisor's optional one (`runsc --iouring`) is too small for giong; run giong outside them, or on its epoll driver.
 
 [All error codes](README.md)
 "#),
@@ -65,7 +65,7 @@ A runtime setting is outside the range giong accepts, such as the number or the 
 
 - Read the message: it names the setting, the range and the value given.
 - `Builder::recv_buffers(count, size)` takes up to 32768 buffers, rounded up to a power of two, and a size from 64 bytes to 4 GiB.
-- `GIONG_DRIVER` takes `io_uring` or `epoll`; unset or empty (or `auto`) means io_uring where the kernel allows it and epoll elsewhere. It is read only when the code does not call `Builder::driver`.
+- `GIONG_DRIVER` takes `io_uring` or `epoll` on Linux, `kqueue` on macOS and `iocp` on Windows; unset or empty (or `auto`) means io_uring where the kernel allows it and epoll elsewhere on Linux, kqueue on macOS and iocp on Windows. It is read only when the code does not call `Builder::driver`. A driver the operating system does not have is refused with this code too (io_uring with `GIONG-E0001`).
 
 [All error codes](README.md)
 "#),
@@ -210,6 +210,23 @@ A future that had started an I/O operation (a read, a write, a connect, a file o
 
 - Await a giong future to completion on the worker that first polled it, within the same `block_on` or `Runtime::run`.
 - Send data between workers and threads, not futures: `Handle::spawn_on` takes a closure and builds the future on the worker that runs it, and channels (`giong::sync`) carry values.
+
+[All error codes](README.md)
+"#),
+    (20, r#"# GIONG-E0020: a worker thread could not be started
+
+Raised by the runtime, by `Runtime::run`. In code: `giong::error::Code::ThreadLimit`.
+
+## What happened
+
+giong runs each worker on a thread of its own, and starting one of them failed. The kernel says only `EAGAIN` ("Resource temporarily unavailable"), which nearly always means the process may not have more threads: every thread counts as a task against the PID limit of the process's cgroup (`pids.max`), and against `RLIMIT_NPROC` (`ulimit -u`), which is summed over all processes of the same user. Containers often set the first: `docker run --pids-limit`, the PID limit of a Kubernetes pod (`podPidsLimit` in the kubelet's settings), `TasksMax` in a systemd unit, and sandboxes that run code for AI agents. The message says which worker could not start and, where it can be read, the container's `pids.max`; the kernel's error is the `source()`, and its `io::ErrorKind` (`WouldBlock`) is kept.
+
+The workers that had started are stopped again, and `run` returns this error; nothing has run.
+
+## How to fix it
+
+- Raise the limit: `--pids-limit` with `docker run` (`pids_limit` in Docker Compose), the kubelet's `podPidsLimit`, `TasksMax=` in the systemd unit, or `ulimit -u` in the shell that starts the service. Count one thread per worker, the program's own threads, and on the epoll driver up to 64 more for file operations.
+- Or start fewer workers: `Builder::workers`. By default giong starts one per CPU the process may use, which on a large machine without a CPU limit can be more than a small PID limit allows.
 
 [All error codes](README.md)
 "#),
