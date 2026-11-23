@@ -952,13 +952,15 @@ fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
         tx.execute("INSERT INTO given_up VALUES (1)", &[])
             .await
             .unwrap();
+        // Prepared, and so cached, first: the late statement's first poll
+        // then sends its execute. (A statement given up while it was still
+        // being prepared never ran, and does not stop the commit.)
+        let sleep_insert = "INSERT INTO given_up SELECT SLEEP(?) + 2";
+        tx.execute(sleep_insert, &[&0f64]).await.unwrap();
         // It still runs on the server, after the caller stopped waiting.
-        let late = timeout(
-            Duration::from_millis(20),
-            tx.execute("INSERT INTO given_up SELECT SLEEP(0.2) + 2", &[]),
-        )
-        .await;
-        assert!(late.is_err());
+        let mut late = Box::pin(tx.execute(sleep_insert, &[&0.2f64]));
+        assert!(poll_fn(|cx| Poll::Ready(late.as_mut().poll(cx).is_pending())).await);
+        drop(late);
         let e = tx.commit().await.unwrap_err();
         assert!(e.to_string().contains("given up"), "{e}");
         assert_eq!(e.kind(), ErrorKind::Db);
