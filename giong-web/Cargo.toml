@@ -19,6 +19,11 @@ serde = ["dep:serde", "dep:serde_json"]
 tls = ["giong-http/tls"]
 # `middleware::Trace`: a `tracing` span per request.
 tracing = ["dep:tracing"]
+# `middleware::Record` in a release build (debug builds always have it).
+# Without it a release build has none of the recording code, and
+# `Record::new` panics with GIONG-E1213. `giong dev --release` and
+# `--prod-like` turn it on.
+dev = []
 
 [dependencies]
 giong = { path = "..", version = "1.3.0" }
