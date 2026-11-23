@@ -1326,10 +1326,7 @@ fn the_write_timeout_counts_from_the_last_progress() {
     async fn large(_req: Request) -> Response {
         Response::new(200).body(vec![b'x'; LEN])
     }
-    let server = TestServer::start(
-        Server::new().write_timeout(Duration::from_millis(300)),
-        large,
-    );
+    let server = TestServer::start(Server::new().write_timeout(Duration::from_secs(1)), large);
     // Read the whole answer: the head, then `LEN` bytes of body.
     let read_all = |pace: Option<Duration>| {
         let mut c = server.client();
@@ -1356,21 +1353,23 @@ fn the_write_timeout_counts_from_the_last_progress() {
         }
         (got, start.elapsed())
     };
-    // About 25 MB a second: more than a second for the part that does not
-    // fit in the sockets' buffers, past the 300 ms timeout.
-    let (got, took) = read_all(Some(Duration::from_millis(10)));
+    // About 10 MB a second: some seconds for the part that does not fit in
+    // the sockets' buffers, well past the 1 s timeout. The timeout leaves
+    // room for a slow CI machine that pauses the reader now and then (a
+    // 300 ms one cut the answer on a macOS runner).
+    let (got, took) = read_all(Some(Duration::from_millis(25)));
     assert!(
         got > LEN,
         "the answer was cut after {got} bytes, in {took:?}"
     );
-    assert!(took > Duration::from_millis(600), "{took:?}");
+    assert!(took > Duration::from_secs(2), "{took:?}");
 
     // A client that takes nothing more after its first read is dropped.
     let mut c = server.client();
     c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
     let mut buf = vec![0u8; 64 * 1024];
     let mut got = c.stream.read(&mut buf).unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_secs(3));
     loop {
         match c.stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
