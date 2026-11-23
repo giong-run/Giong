@@ -19,7 +19,12 @@
 mod addr;
 mod balance;
 pub(crate) mod dns;
-#[cfg(unix)]
+// giong dev's socket hand-off: in debug builds, or with the `dev` feature.
+// Elsewhere a stub that refuses to run under giong dev.
+#[cfg(all(unix, any(debug_assertions, feature = "dev")))]
+mod inherit;
+#[cfg(all(unix, not(any(debug_assertions, feature = "dev"))))]
+#[path = "net/inherit_off.rs"]
 mod inherit;
 mod sendq;
 mod share;
