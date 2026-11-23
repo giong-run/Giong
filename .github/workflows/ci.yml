@@ -35,6 +35,11 @@ env:
   # request of its own when a Rust release comes out.
   RUST_STABLE: "1.100.0"
   CARGO_TERM_COLOR: always
+  # Network steps outlast a bad minute on a mirror (scripts/ci-net.sh says
+  # why). cargo and rustup retry 3 times by default, crates.io and
+  # static.rust-lang.org included; a test is never retried.
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
   # giong-postgres's tests start a throwaway PostgreSQL server from the
   # binaries the runner image ships (/usr/lib/postgresql/16/bin). Without
   # this they would skip, quietly, if the binaries went missing.
@@ -108,10 +113,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The versions and what each checks live in scripts/msrv.sh, which
       # scripts/preflight.sh runs too.
-      - name: Install the toolchains scripts/msrv.sh names
+      - name: "net: install the toolchains scripts/msrv.sh names"
         run: |
           for v in $(scripts/msrv.sh versions); do
-              rustup toolchain install "$v" --profile minimal --no-self-update
+              scripts/ci-net.sh retry -n 4 -t 600 -- rustup toolchain install "$v" --profile minimal --no-self-update
           done
       - run: scripts/msrv.sh
 
@@ -187,22 +192,23 @@ jobs:
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
-      - name: Fetch the release build
+      - name: "net: fetch the release build"
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           name: release-build
           path: ${{ runner.temp }}
       - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
-      - name: Install redis-server and pgbouncer
-        # Ubuntu's Redis 7.0 and PgBouncer 1.22. The tests start their own
-        # servers; the services apt starts are stopped.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server pgbouncer
-          sudo systemctl stop redis-server pgbouncer
-      - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+      # Ubuntu's Redis 7.0 and PgBouncer 1.22, from the cache of .deb files
+      # (.github/actions/apt-install). The tests start their own servers; the
+      # services apt starts are stopped. The kernel's tls module, so the
+      # kernel TLS tests run.
+      - name: "net: install redis-server and pgbouncer, load tls"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: redis-server pgbouncer
+          stop-services: redis-server pgbouncer
+          modules: tls
       # Linux 6.14 to 7.2 count every io_uring ring against the
       # locked-memory limit, summed over the runner user's processes, and
       # tests run runtimes side by side: lift the limit, so that each of them
@@ -229,7 +235,17 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - run: go install github.com/summerwind/h2spec/cmd/h2spec@v1.5.1-0.20220625142712-af83a65f0b62
+      - name: "net: restore h2spec"
+        id: h2spec
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/go/bin/h2spec
+          key: h2spec-v1.5.1-0.20220625142712-af83a65f0b62-${{ runner.os }}
+      - name: "net: build h2spec"
+        if: steps.h2spec.outputs.cache-hit != 'true'
+        run: >
+          scripts/ci-net.sh retry -n 4 -t 600 --
+          go install github.com/summerwind/h2spec/cmd/h2spec@v1.5.1-0.20220625142712-af83a65f0b62
       - run: cargo build --release -p giong-http --features tls --example h2
       - name: Run h2spec
         run: |
@@ -255,10 +271,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_STABLE }}
-      - name: Fetch h3spec
+      - name: "net: fetch h3spec"
         run: |
-          curl -fsSL --retry 3 -o h3spec https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64
-          echo "c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830  h3spec" | sha256sum -c -
+          scripts/ci-net.sh fetch https://github.com/kazu-yamamoto/h3spec/releases/download/v0.1.15/h3spec-linux-x86_64 \
+            c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830 h3spec
           chmod +x h3spec
       - run: cargo build --release -p giong-http --features unstable-http3 --example h3
       - name: Run h3spec
@@ -309,120 +325,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_STABLE }}
-      - name: Install PostgreSQL ${{ matrix.postgres }}
-        if: matrix.postgres
-        # From the PostgreSQL project's apt repository; the cluster apt
-        # creates is stopped, the tests start their own.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q postgresql-common
-          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo apt-get install -y -q postgresql-${{ matrix.postgres }}
-          sudo systemctl stop postgresql
-          echo "GIONG_PG_BIN=/usr/lib/postgresql/${{ matrix.postgres }}/bin" >> "$GITHUB_ENV"
-      - name: Install MySQL ${{ matrix.mysql }}
-        if: matrix.mysql
-        # Oracle's generic Linux build, the minimal one (no debug binaries or
-        # test suite, about 60 MB), which Oracle makes for glibc 2.17 only.
-        # mysqld links libaio.so.1, which Ubuntu 24.04 renamed libaio.so.1t64.
-        # The mysql client, which the tests use to set the server up, links
-        # ncurses 5, which Ubuntu dropped in 24.04: it comes from Ubuntu
-        # 22.04, checked against the hashes in that release's package index.
-        run: |
-          v=${{ matrix.mysql }}
-          name=mysql-$v-linux-glibc2.17-x86_64-minimal
-          cd "$RUNNER_TEMP"
-          curl -fsSL --retry 3 -o "$name.tar.xz" "https://cdn.mysql.com/archives/mysql-${v%.*}/$name.tar.xz"
-          echo "${{ matrix.sha256 }}  $name.tar.xz" | sha256sum -c -
-          tar -xJf "$name.tar.xz"
-          pool=http://archive.ubuntu.com/ubuntu/pool/universe/n/ncurses
-          curl -fsSL --retry 3 -O "$pool/libtinfo5_6.3-2_amd64.deb" -O "$pool/libncurses5_6.3-2_amd64.deb"
-          printf '%s\n' \
-            "d2597b5aec92a930cf549e1b429ad892595813e72ec7814685ea146a9fb715e5  libtinfo5_6.3-2_amd64.deb" \
-            "d9b8efb37a056e01c46d93c7ef6977aa04ad2586978137d9a3954c15ad5d14c3  libncurses5_6.3-2_amd64.deb" \
-            | sha256sum -c -
-          sudo apt-get update -q
-          sudo apt-get install -y -q libaio1t64 libnuma1 ./libtinfo5_6.3-2_amd64.deb ./libncurses5_6.3-2_amd64.deb
-          sudo ln -sf /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/x86_64-linux-gnu/libaio.so.1
-          "$RUNNER_TEMP/$name/bin/mysqld" --version
-          "$RUNNER_TEMP/$name/bin/mysql" --version
-          echo "GIONG_MYSQL_BIN=$RUNNER_TEMP/$name/bin" >> "$GITHUB_ENV"
-      - name: Install MariaDB ${{ matrix.mariadb }}
-        if: matrix.mariadb
-        # MariaDB's own packages for this Ubuntu, from its apt repository
-        # (apt checks them against MariaDB's signing key, and the key is
-        # checked against its fingerprint), unpacked into a directory rather
-        # than installed over the runner's MySQL; what they need from Ubuntu
-        # is installed. Ubuntu has MariaDB packages of its own under the same
-        # names, so each is taken at the version MariaDB's repository has,
-        # and the server's version is checked.
+      # Each server comes from a cache that holds what it was set up from
+      # (scripts/ci-servers.sh says what, and how each download is checked):
+      # a run goes to the mirrors only for a new version, a new runner image
+      # or a change to the script.
+      - name: "net: cache key"
+        id: key
         env:
+          SERVER: ${{ matrix.server }}
+          SCRIPTS: ${{ hashFiles('scripts/ci-servers.sh', 'scripts/ci-apt.sh') }}
+        run: echo "key=server-${SERVER// /-}-$ImageOS-$ImageVersion-${SCRIPTS:0:16}" >> "$GITHUB_OUTPUT"
+      - name: "net: restore ${{ matrix.server }}"
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/ci-server
+          key: ${{ steps.key.outputs.key }}
+      - name: "net: set up ${{ matrix.server }}"
+        env:
+          POSTGRES: ${{ matrix.postgres }}
+          MYSQL: ${{ matrix.mysql }}
           MARIADB: ${{ matrix.mariadb }}
+          REDIS: ${{ matrix.redis }}
+          VALKEY: ${{ matrix.valkey }}
+          SHA256: ${{ matrix.sha256 }}
         run: |
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/mariadb-keyring.pgp" \
-            https://mariadb.org/mariadb_release_signing_key.pgp
-          fingerprint=$(gpg --show-keys --with-colons "$RUNNER_TEMP/mariadb-keyring.pgp" \
-            | awk -F: '$1 == "fpr" && !seen++ { print $10 }')
-          if [ "$fingerprint" != 177F4010FE56CA3336300305F1656F24C74CD1D8 ]; then
-            echo "MariaDB's signing key has the fingerprint $fingerprint, not the one expected"
-            exit 1
+          cache="$HOME/ci-server"
+          mkdir -p "$cache"
+          if [ -n "$POSTGRES" ]; then set -- postgres "$POSTGRES" "$cache"
+          elif [ -n "$MYSQL" ]; then set -- mysql "$MYSQL" "$SHA256" "$cache"
+          elif [ -n "$MARIADB" ]; then set -- mariadb "$MARIADB" "$cache"
+          elif [ -n "$REDIS" ]; then set -- redis "$REDIS" "$SHA256" "$cache"
+          else set -- valkey "$VALKEY" "$SHA256" "$cache"
           fi
-          sudo install -D -m 644 "$RUNNER_TEMP/mariadb-keyring.pgp" /etc/apt/keyrings/mariadb-keyring.pgp
-          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          echo "deb [signed-by=/etc/apt/keyrings/mariadb-keyring.pgp] https://deb.mariadb.org/$MARIADB/ubuntu $codename main" \
-            | sudo tee /etc/apt/sources.list.d/mariadb.list
-          sudo apt-get update -q
-          mkdir -p "$RUNNER_TEMP/mariadb-debs" && cd "$RUNNER_TEMP/mariadb-debs"
-          pkgs=()
-          for base in mariadb-server-core mariadb-server mariadb-client-core mariadb-client \
-            mariadb-common libmariadb3; do
-            # Older series name some packages with the version (mariadb-server-10.6).
-            for p in "$base" "$base-$MARIADB"; do
-              v=$(apt-cache madison "$p" 2>/dev/null | awk -F'|' '$2 ~ /maria/ && !seen++ { gsub(/ /, "", $2); print $2 }')
-              if [ -n "$v" ]; then pkgs+=("$p=$v"); fi
-            done
-          done
-          echo "${pkgs[@]}"
-          apt-get download "${pkgs[@]}"
-          root="$RUNNER_TEMP/mariadb"
-          for deb in *.deb; do dpkg -x "$deb" "$root"; done
-          deps=$(for deb in *.deb; do dpkg-deb -f "$deb" Depends; done \
-            | tr ',' '\n' | sed -e 's/([^)]*)//g' -e 's/|.*//' -e 's/:any//' -e 's/ //g' \
-            | grep -v -E '^(mariadb|mysql|libmariadb|galera|default-mysql|debconf|adduser|passwd|lsb-base|init-system|perl|libdbi|libdbd|psmisc|rsync|procps|iproute2|socat|sed|\$)' \
-            | sort -u)
-          sudo apt-get install -y -q --no-install-recommends $deps
-          export LD_LIBRARY_PATH="$root/usr/lib/x86_64-linux-gnu"
-          if ldd "$root"/usr/sbin/mariadbd "$root"/usr/bin/mariadb | grep 'not found'; then exit 1; fi
-          "$root/usr/sbin/mariadbd" --version | tee /dev/stderr | grep -E -q "Ver $MARIADB\.[0-9]+-MariaDB"
-          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
-          echo "GIONG_MYSQL_BIN=$root/usr/sbin" >> "$GITHUB_ENV"
-      - name: Build Redis ${{ matrix.redis }}
-        if: matrix.redis
-        # From source, with TLS, which the tests use.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libssl-dev
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/redis.tar.gz" \
-            "https://download.redis.io/releases/redis-${{ matrix.redis }}.tar.gz"
-          echo "${{ matrix.sha256 }}  $RUNNER_TEMP/redis.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/redis.tar.gz" -C "$RUNNER_TEMP"
-          make -C "$RUNNER_TEMP/redis-${{ matrix.redis }}" -j4 BUILD_TLS=yes > /dev/null
-          echo "GIONG_REDIS_BIN=$RUNNER_TEMP/redis-${{ matrix.redis }}/src" >> "$GITHUB_ENV"
-      - name: Build Valkey ${{ matrix.valkey }}
-        if: matrix.valkey
-        # Valkey answers to redis-server's name only once installed; the
-        # tests look for that name.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q libssl-dev
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/valkey.tar.gz" \
-            "https://github.com/valkey-io/valkey/archive/refs/tags/${{ matrix.valkey }}.tar.gz"
-          echo "${{ matrix.sha256 }}  $RUNNER_TEMP/valkey.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/valkey.tar.gz" -C "$RUNNER_TEMP"
-          src="$RUNNER_TEMP/valkey-${{ matrix.valkey }}/src"
-          make -C "$src/.." -j4 BUILD_TLS=yes > /dev/null
-          ln -sf valkey-server "$src/redis-server"
-          echo "GIONG_REDIS_BIN=$src" >> "$GITHUB_ENV"
+          scripts/ci-servers.sh "$@" >> "$GITHUB_ENV"
+      - name: "net: keep ${{ matrix.server }} for the next run"
+        if: steps.restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/ci-server
+          key: ${{ steps.key.outputs.key }}
       # The locked-memory limit is lifted as in the test job.
       - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && cargo test -p ${{ matrix.crate }} --all-features
 
@@ -452,22 +394,20 @@ jobs:
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
-      - name: Fetch the release build
+      - name: "net: fetch the release build"
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           name: release-build
           path: ${{ runner.temp }}
       - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
-      - name: Install redis-server
-        # Ubuntu's Redis 7.0. The tests start their own server; the
-        # service apt starts is stopped.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
-          sudo systemctl stop redis-server
-      - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+      # Ubuntu's Redis 7.0, as in the test job, and the kernel's tls module.
+      - name: "net: install redis-server, load tls"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: redis-server
+          stop-services: redis-server
+          modules: tls
       # The locked-memory limit is lifted as in the test job.
       - run: sudo prlimit --pid $$ --memlock=unlimited:unlimited && scripts/check.sh fallback ${{ matrix.tier }}
 
@@ -499,7 +439,7 @@ jobs:
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
-      - name: Fetch the release build
+      - name: "net: fetch the release build"
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
@@ -520,8 +460,12 @@ jobs:
           wc -l target/test-binaries.txt
       # A container cannot load kernel modules, but uses the host's: kernel
       # TLS on the epoll driver, inside the container.
-      - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+      - name: "net: load the kernel's tls module, so the kernel TLS tests run"
+        uses: ./.github/actions/apt-install
+        with:
+          modules: tls
+      - name: "net: pull ubuntu:24.04"
+        run: scripts/ci-net.sh retry -n 5 -t 300 -- docker pull -q ubuntu:24.04
       - name: Run them in a container with the default seccomp profile
         run: |
           docker info --format '{{.SecurityOptions}}' | grep -q seccomp
@@ -545,7 +489,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_STABLE }}
-      - name: Fetch the release build
+      - name: "net: fetch the release build"
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
@@ -571,7 +515,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_STABLE }}
-      - name: Fetch the release build
+      - name: "net: fetch the release build"
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
@@ -610,15 +554,13 @@ jobs:
       # ThreadSanitizer cannot map its shadow memory with the runner's default
       # address-space randomisation.
       - run: sudo sysctl vm.mmap_rnd_bits=28
-      - name: Install redis-server
-        # Ubuntu's Redis 7.0. The tests start their own server; the
-        # service apt starts is stopped.
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q redis-server
-          sudo systemctl stop redis-server
-      - name: Load the kernel's tls module, so the kernel TLS tests run
-        run: sudo modprobe tls || { sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" && sudo modprobe tls; }
+      # Ubuntu's Redis 7.0, as in the test job, and the kernel's tls module.
+      - name: "net: install redis-server, load tls"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: redis-server
+          stop-services: redis-server
+          modules: tls
       # The locked-memory limit is lifted as in the test job.
       - name: ThreadSanitizer on ${{ matrix.driver }}
         run: |
@@ -744,17 +686,17 @@ jobs:
       # The release build of the `build` job. If it cannot be had (it is kept
       # for a day, so a job run again later finds none), this job builds the
       # test binaries itself, as scripts/shared-build.sh says in a warning.
-      - name: Fetch the release build
+      - name: "net: fetch the release build"
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           name: release-build
           path: ${{ runner.temp }}
       - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
-      - name: Install QEMU and a static busybox
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q qemu-system-x86 busybox-static cpio
+      - name: "net: install QEMU and a static busybox"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: qemu-system-x86 busybox-static cpio
       - name: Let QEMU use KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
@@ -771,7 +713,7 @@ jobs:
           GIONG_TEST_EXPECT_IO_URING_FEATURES: ${{ matrix.features }}
           KTLS: ${{ matrix.ktls || '0' }}
           SOAK_SECS: ${{ matrix.soak || '' }}
-      - name: Keep the guest's log
+      - name: "net: keep the guest's log"
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -791,7 +733,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_STABLE }}
-      - name: Install cargo-semver-checks
+      - name: "net: restore cargo-semver-checks"
+        id: semver-checks
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-semver-checks
+          key: cargo-semver-checks-0.51.0-${{ env.RUST_STABLE }}-${{ runner.os }}
+      - name: "net: install cargo-semver-checks"
+        if: steps.semver-checks.outputs.cache-hit != 'true'
         run: cargo install --locked cargo-semver-checks --version 0.51.0
       - run: scripts/semver.sh
 
@@ -811,10 +760,10 @@ jobs:
           # The compiler of the baseline: bench/instr/rust-toolchain.toml
           # (scripts/instr.py refuses to run with another).
           toolchain: 1.97.0
-      - name: Install valgrind
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q valgrind
+      - name: "net: install valgrind"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: valgrind
       - run: uname -r
       - run: scripts/instr.py check
       # The counts of this run and a baseline.csv made from them, to commit
@@ -842,10 +791,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_STABLE }}
-      - name: Install Kani
-        run: |
-          cargo install --locked kani-verifier --version 0.68.0
-          cargo kani setup
+      - name: "net: restore kani-verifier"
+        id: kani-verifier
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin/kani
+            ~/.cargo/bin/cargo-kani
+          key: kani-verifier-0.68.0-${{ env.RUST_STABLE }}-${{ runner.os }}
+      - name: "net: install kani-verifier"
+        if: steps.kani-verifier.outputs.cache-hit != 'true'
+        run: cargo install --locked kani-verifier --version 0.68.0
+      # Its own nightly compiler and CBMC, from GitHub's releases.
+      - name: "net: kani setup"
+        run: scripts/ci-net.sh retry -n 4 -t 900 -- cargo kani setup
       # Two proofs at a time where they fit the runner's 16 GB (check.sh runs
       # the largest alone).
       - run: KANI_JOBS=2 scripts/check.sh kani
@@ -898,10 +857,10 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
           targets: x86_64-unknown-linux-musl
           components: clippy
-      - name: Install musl-tools
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q musl-tools
+      - name: "net: install musl-tools"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: musl-tools
       - run: >
           cargo clippy --workspace --all-targets --all-features
           --target x86_64-unknown-linux-musl -- -D warnings
@@ -922,6 +881,8 @@ jobs:
                   print(msg["executable"])
           ' > target/musl-test-binaries.txt
           wc -l target/musl-test-binaries.txt
+      - name: "net: pull alpine:3.22"
+        run: scripts/ci-net.sh retry -n 5 -t 300 -- docker pull -q alpine:3.22
       - name: Run them in Alpine
         run: |
           docker run --rm -v "$PWD:$PWD" -w "$PWD" \
