@@ -316,6 +316,9 @@ impl Poller for Kqueue {
             EV_DELETE as u16,
             0,
         ); 2];
+        // A timer event can only come from a timer armed before this call
+        // or added in it.
+        let timer_in_play = self.timer_armed;
         let mut nchanges = usize::from(self.timer_armed);
         let mut limit = timeout;
         match timeout {
@@ -374,8 +377,9 @@ impl Poller for Kqueue {
         unsafe { self.events.set_len(n) };
         // The wait timer's own events are not for the caller: it firing
         // is the wait's time running out, and a change it refused comes
-        // back as an event too.
-        let mut i = 0;
+        // back as an event too. With no timer in play (precise timers off)
+        // there is none, and the events are not looked at.
+        let mut i = if timer_in_play || adds { 0 } else { n };
         while i < n {
             let ev = &self.events[i];
             if ev.filter as i16 == EVFILT_TIMER as i16 && ev.ident as usize == TIMER_IDENT {
