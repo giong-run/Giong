@@ -42,7 +42,7 @@ io_uring,h2-streams,instructions,372328.2,0.5
 io_uring,h2-streams,allocations,476.005,0.5
 io_uring,https,instructions,42927.2,1
 io_uring,https,allocations,39.035,1
-io_uring,web,instructions,12395.4,1
+io_uring,web,instructions,12348.4,1
 io_uring,web,allocations,5.000,1
 io_uring,redis-get,instructions,8350.1,1
 io_uring,redis-get,allocations,2.000,1
@@ -85,7 +85,7 @@ epoll,h2-streams,instructions,373140.8,0.5
 epoll,h2-streams,allocations,476.004,0.5
 epoll,https,instructions,43944.8,1
 epoll,https,allocations,39.000,1
-epoll,web,instructions,13258.6,1
+epoll,web,instructions,13211.5,1
 epoll,web,allocations,5.000,1
 epoll,redis-get,instructions,8920.7,1
 epoll,redis-get,allocations,2.000,1
