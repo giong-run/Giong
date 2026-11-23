@@ -226,6 +226,7 @@ Against the Tokio crate each giong crate replaces, one core each (details and lo
 | Redis `GET` | giong-redis | redis-rs | 640k against 492k commands/s at half the CPU per command |
 | Files, 4 KiB at an offset | `giong::fs` | `tokio::fs` | 1.33M against 163k reads/s (8×); level with blocking `std` |
 | Idle connection memory | giong-http | Axum | 2.0 KiB against 20.4 KiB |
+| Building a small web service | giong-web | axum + tower-http | 22 crates against 83; clean debug build 7.4 s against 18.8 s; stripped binary 1.45 MB against 3.60 MB ([build](docs/BENCHMARKS.md#build-time-and-size)) |
 
 ## Platforms
 

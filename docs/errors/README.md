@@ -46,6 +46,7 @@ when it is no longer raised.
 | [GIONG-E0017](E0017.md) | `FdPassing` | descriptors could not be passed |
 | [GIONG-E0018](E0018.md) | `ActivatedSocket` | the inherited socket cannot be used that way |
 | [GIONG-E0019](E0019.md) | `ChildProcess` | cannot watch the child process |
+| [GIONG-E0020](E0020.md) | `ThreadLimit` | a worker thread could not be started |
 
 ## macOS
 

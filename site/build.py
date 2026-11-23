@@ -137,7 +137,7 @@ def parse_roadmap():
             continue
         boxes = re.findall(r"^\s*[-*] \[([ xX])\]", body, re.M)
         done = sum(1 for b in boxes if b != " ")
-        m = re.match(r"^(\d+(?:\.\d+)*)\s+—\s+(.+?)(?:\s+\((done)\))?$", title)
+        m = re.match(r"^(\d+(?:\.\d+)*(?:\.x)?)\s+—\s+(.+?)(?:\s+\((done)\))?$", title)
         if m:
             ver, name, flag = m.group(1), m.group(2), m.group(3)
         else:
@@ -148,19 +148,28 @@ def parse_roadmap():
             if mv:
                 ver, name = mv.group(1), "Stable"
         if flag or (boxes and done == len(boxes)):
-            state = "done"
+            # ROADMAP.md on main can call a milestone done before its release is out; the
+            # site describes released versions, so until then it is "releasing".
+            state = "releasing" if ver and ver_key(ver) > ver_key(MINOR) else "done"
         elif done:
             state = "current"
         else:
             state = "planned"
+        proposed = bool(re.match(r"^Proposed\b", body.strip()))
         milestones.append(dict(title=title, ver=ver, name=name, state=state, done=done,
-                               total=len(boxes), body=body.strip(), id=md.slug(title)))
-    if not any(m["state"] == "current" for m in milestones):
+                               total=len(boxes), body=body.strip(), id=md.slug(title),
+                               proposed=proposed))
+    if not any(m["state"] in ("current", "releasing") for m in milestones):
         for m in milestones:
             if m["state"] == "planned":
                 m["state"] = "current"
                 break
     return intro, named, milestones
+
+
+def ver_key(ver):
+    """'1.4' -> (1, 4), '1.4.x' -> (1, 4, 0.5): a patch series comes after its minor."""
+    return tuple(0.5 if p == "x" else int(p) for p in ver.split("."))
 
 
 ROADMAP_INTRO, ROADMAP_NAMED, MILESTONES = parse_roadmap()
@@ -596,10 +605,17 @@ def json_ld(page, title, desc, url):
     return f'<script type="application/ld+json">{text}</script>'
 
 
-def page_head(eyebrow, h1, lede, meta=""):
+def figures(figs):
+    """Big numbers in a row, the first in ember: [(value, what it counts), ...]."""
+    return ('<div class="rm-figs">' + "".join(
+        f'<div class="rm-fig"><b>{v}</b><span>{ilm(d)}</span></div>' for v, d in figs) + "</div>")
+
+
+def page_head(eyebrow, h1, lede, meta="", figs=None):
     meta_html = f'<p class="page-meta">{meta}</p>' if meta else ""
+    figs_html = figures(figs) if figs else ""
     return (f'<section class="page-head"><div class="wrap"><p class="eyebrow">{eyebrow}</p>'
-            f'<h1>{h1}</h1><p class="lede">{ilm(lede)}</p>{meta_html}</div></section>')
+            f'<h1>{h1}</h1><p class="lede">{ilm(lede)}</p>{figs_html}{meta_html}</div></section>')
 
 
 def source_note(files):
@@ -608,6 +624,94 @@ def source_note(files):
 
 
 # ================================================================ pages
+def scoreboard():
+    """Each giong crate against the Tokio crate it replaces: two bars per row, the
+    longer one full width, and the losses underneath."""
+    sb = C.SCOREBOARD
+    rows = []
+    for r in sb["rows"]:
+        job, ours, theirs, g, o, gl, ol, verdict, unit, src = r[:10]
+        lower = len(r) > 10 and r[10] == "lower"
+        top = max(g, o)
+        rows.append(
+            f'<li class="vs-item{" is-lower" if lower else ""}"><div class="vs-head"><h3>{ilm(job)}</h3>'
+            f'<b class="vs-x">{verdict}</b></div>'
+            f'<p class="vs-bar is-giong"><span class="vs-who">{ilm(ours)}</span>'
+            f'<span class="vs-track"><span class="vs-fill" style="--v:{100 * g / top:.1f}"></span></span>'
+            f'<span class="vs-num">{gl}</span></p>'
+            f'<p class="vs-bar"><span class="vs-who">{ilm(theirs)}</span>'
+            f'<span class="vs-track"><span class="vs-fill" style="--v:{100 * o / top:.1f}"></span></span>'
+            f'<span class="vs-num">{ol}</span></p>'
+            f'<p class="vs-unit">{ilm(unit)} · <a href="{BLOB}{src}">{src}</a></p></li>')
+    losses = "".join(f"<li>{ilm(x)}</li>" for x in sb["losses"])
+    return f'''<section class="band" id="versus">
+  <div class="wrap">
+    {head_block("head to head", sb["h2"], sb["lede"], (link("docs/benchmark-tables") if "benchmark-tables" in VERSION_SLUGS[""] else link("benchmarks"), "Every table"))}
+    <ol class="vs-grid" data-reveal>{"".join(rows)}</ol>
+    <div class="losses"><h3>Where giong loses</h3><ul>{losses}</ul></div>
+    <p class="chart-src">{ilm(sb["foot"])}</p>
+  </div>
+</section>'''
+
+
+def build_band():
+    """The measured build of a small service, typed out in a terminal, and the table."""
+    b = C.BUILD
+    lines = []
+    for kind, text in b["term"]:
+        t = html.escape(text)
+        if kind == "cmd":
+            lines.append(f'<span class="tl" data-cmd><span class="p">$</span> <span class="tl-t">{t}</span></span>')
+        elif kind == "note":
+            lines.append(f'<span class="tl c">{t}</span>')
+        elif kind == "ok":
+            lines.append(f'<span class="tl ok">{t}</span>')
+        else:
+            lines.append(f'<span class="tl">{t}</span>')
+    rows = "".join(
+        f'<li><span class="bd-what">{ilm(w)}</span>'
+        f'<span class="bd-bars"><span class="bd-bar is-giong" style="--v:{100 * gv / max(gv, av):.1f}"><i>{g}</i></span>'
+        f'<span class="bd-bar" style="--v:{100 * av / max(gv, av):.1f}"><i>{a}</i></span></span></li>'
+        for w, g, a, gv, av in b["rows"])
+    return f'''<section class="band band-alt" id="build">
+  <div class="wrap build">
+    {head_block("build", b["h2"], b["lede"])}
+    <figure class="term term-typed" id="typed">
+      <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span>a checkout of giong</span></div>
+      <pre><code>{"".join(lines)}</code></pre>
+    </figure>
+    <div class="bd">
+      <p class="bd-key"><span class="is-giong">giong-web</span><span>axum + tokio + tower-http</span><span class="bd-low">lower is better</span></p>
+      <ul class="bd-rows" data-reveal>{rows}</ul>
+      <p class="chart-src">{ilm(b["foot"])} <a href="{BLOB}{b["src"]}">{b["src"]}</a></p>
+    </div>
+  </div>
+</section>'''
+
+
+def next_band():
+    """Where the next releases are going: the first milestones that have not shipped."""
+    ahead = [m for m in MILESTONES if m["state"] != "done" and m["ver"]][:4]
+    if not ahead:
+        return ""
+    n = C.NEXT
+    cards = []
+    for m in ahead:
+        kind, badge = ms_kind(m)
+        pts = "".join(f'<li class="is-{k}">{ICONS["spark"] if k == "section" else ""}<span>{t}</span></li>'
+                      for k, t in ms_points(m, 2))
+        cards.append(
+            f'<a class="nx nx-mini is-{kind}" href="{link("roadmap", m["id"])}">'
+            f'<header class="nx-top"><span class="nx-badge">{badge}</span><b class="nx-ver">{ms_label(m)}</b></header>'
+            f'<h3>{ms_name(m)}</h3><p class="nx-line">{ms_tagline(m)}</p><ul class="nx-points">{pts}</ul></a>')
+    return f'''<section class="band" id="next">
+  <div class="wrap">
+    {head_block("roadmap", n["h2"], n["lede"], (link("roadmap"), "The whole roadmap"))}
+    <div class="nexts nexts-4">{"".join(cards)}</div>
+  </div>
+</section>'''
+
+
 def home():
     t = C.HERO
     sys_rows = {r[0]: r for r in next(c for c in C.CHARTS if c["id"] == "syscalls")["rows"] if not isinstance(r, str)}
@@ -658,7 +762,7 @@ def home():
         <a class="btn" href="{link("benchmarks")}">See the benchmarks</a>
       </div>
       {copy_cmd("hero-cmd", "cargo add giong")}
-      <p class="meta"><span>Linux 6.0+</span><span>Rust 1.80+</span><span>MIT or Apache-2.0</span></p>
+      <p class="meta"><span>{C.RUNTIME_PLATFORM}</span><span>Rust 1.80+</span><span>MIT or Apache-2.0</span></p>
     </div>
     <figure class="tick" id="tick" data-unit1="syscall this tick" data-unitn="syscalls this tick">
       <div class="tick-ring" role="img" aria-label="Illustration: the operations of one turn of the event loop enter the kernel in one system call.">
@@ -681,6 +785,10 @@ def home():
 <section class="stats-band" aria-label="giong in numbers">
   <div class="wrap stats">{stats_html}</div>
 </section>
+
+{scoreboard()}
+
+{build_band()}
 
 <section class="band" id="agents">
   <div class="wrap agents">
@@ -759,7 +867,7 @@ Error: <span class="e">{html.escape(a["error"].replace("{version}", VERSION))}</
 <section class="band band-alt" id="status">
   <div class="wrap">
     {head_block("status", "Where giong stands",
-                f"Version {MINOR} is complete enough to write real services, and it is checked hard. It is also young, Linux only, and narrow on purpose.",
+                f"Version {MINOR} is complete enough to write real services, and it is checked hard. It is also young, tuned for Linux first, and narrow on purpose.",
                 (link("docs", "limits"), "When giong is the wrong choice"))}
     <div class="status">
       <div><h3>Checked</h3><ul class="checks">{checked}</ul></div>
@@ -767,6 +875,8 @@ Error: <span class="e">{html.escape(a["error"].replace("{version}", VERSION))}</
     </div>
   </div>
 </section>
+
+{next_band()}
 
 <section class="band start-band">
   <div class="wrap start">
@@ -1334,6 +1444,16 @@ def docs():
             page_md)
 
 
+def crate_versus(name):
+    """The head-to-head rows of a crate, from the home page's table."""
+    rows = []
+    for r in C.SCOREBOARD["rows"]:
+        job, ours, theirs, verdict = r[0], r[1], r[2], r[7]
+        if name in [o.split("::")[0] for o in ours.split(" + ")]:
+            rows.append(f'<li><b>{verdict}</b><span>against {ilm(theirs)} · {ilm(job)}</span></li>')
+    return f'<ul class="crate-vs">{"".join(rows)}</ul>' if rows else ""
+
+
 def crates():
     sections = []
     for c in CRATES:
@@ -1350,6 +1470,7 @@ def crates():
             f'{copy_cmd("add-" + c["name"], "cargo add " + c["name"])}</div>'
             f'<div class="crate-main"><p class="crate-lede">{ilm(c["lede"])}</p>'
             + (f'<ul>{items}</ul>' if items else "")
+            + crate_versus(c["name"])
             + f'<p class="crate-facts">{" · ".join(facts)}</p></div></article>')
     for c in COMING:
         sections.append(
@@ -1358,9 +1479,13 @@ def crates():
             f'<div class="crate-main"><p class="crate-lede">{ilm(c["short"])}</p>'
             f'<p class="crate-facts"><a href="{link("roadmap")}">See the roadmap</a></p></div></article>')
     total_lines = sum(c["lines"] for c in CRATES)
-    body = f'''{page_head("crates", "The crates",
-                          f"{len(CRATES)} crates that share one version number, {VERSION}. The runtime at the bottom, and the layers a service needs on top of it, each written for giong rather than wrapped around a Tokio crate.",
-                          f"{about(total_lines)} lines of Rust and {TOTAL_TESTS:,} tests in all · line counts are read from the sources when the site is built")}
+    figs = [(str(len(CRATES)), "crates on one version number"),
+            (about(total_lines).replace("about ", "~"), "lines of Rust, counted from the sources"),
+            (f"{TOTAL_TESTS:,}", "tests"),
+            ("3", "dependencies of the runtime crate at most, on any system")]
+    body = f'''{page_head("crates", f"{len(CRATES)} crates, <em>one version</em>",
+                          f"Version {VERSION} of each. The runtime at the bottom, and the layers a service needs on top of it, each written for giong rather than wrapped around a Tokio crate, and each measured against the crate it replaces.",
+                          "Line counts are read from the sources when the site is built.", figs)}
 <section class="band band-tight"><div class="wrap">{stack(detail=True)}</div></section>
 <section class="band band-alt"><div class="wrap crate-list">{"".join(sections)}</div></section>'''
     return frame("crates", "Crates", "The giong crates: the runtime, HTTP and TLS, PostgreSQL, MySQL "
@@ -1380,9 +1505,10 @@ def benchmarks():
         + "</tr>" for row in C.COMPARE)
     scripts = sorted({s for c in C.CHARTS for s in c["src"]} | {"bench/web.sh", "bench/workers.sh"})
     runs = "".join(f'<a href="{BLOB}{s}"><code>{s}</code></a>' for s in scripts)
-    body = f'''{page_head("benchmarks", "Benchmarks", C.BENCH_METHOD,
-                          f'Full tables and raw output: {tables} · <a href="{TREE}bench/results">bench/results/</a>')}
-<section class="band band-tight"><div class="wrap">
+    body = f'''{page_head("benchmarks", "Measured, <em>losses included</em>", C.BENCH_METHOD,
+                          f'Full tables and raw output: {tables} · <a href="{TREE}bench/results">bench/results/</a>', C.BENCH_FIGS)}
+{scoreboard()}
+<section class="band band-alt"><div class="wrap">
   <div class="bench-intro">
     <div class="head-text">
       <p class="eyebrow">method</p>
@@ -1397,18 +1523,19 @@ def benchmarks():
   </div>
   <div class="charts">{charts}</div>
 </div></section>
-<section class="band band-alt" id="caveats"><div class="wrap caveats">
+{build_band()}
+<section class="band" id="caveats"><div class="wrap caveats">
   <h2>What these numbers do not show</h2>
   <ul>{caveats}</ul>
 </div></section>
-<section class="band" id="compare"><div class="wrap">
+<section class="band band-alt" id="compare"><div class="wrap">
   {head_block("compare", "Compared with Monoio and Glommio",
               "The other io_uring runtimes for Rust, as they stood when the benchmarks ran. Monoio and Glommio are mature projects with wider ecosystems; this table is about how each one is built, not a ranking.")}
   <div class="table-scroll" tabindex="0" role="region" aria-label="Comparison with Monoio and Glommio">
     <table class="cmp"><thead><tr>{cmp_head}</tr></thead><tbody>{cmp_rows}</tbody></table>
   </div>
 </div></section>
-<section class="band band-alt" id="reproduce"><div class="wrap">
+<section class="band" id="reproduce"><div class="wrap">
   {head_block("reproduce", "Run them yourself",
               "Each script builds the servers, runs the load generator and writes its summary to `bench/results/`. Run them on a quiet Linux machine; they take minutes, not seconds.")}
   <div class="runs">{runs}</div>
@@ -1417,48 +1544,89 @@ def benchmarks():
                  "Bun and Node.js, with the method and the caveats next to every number.", body, "benchmarks/")
 
 
-def roadmap():
-    """One featured milestone (the current one), then one line per other milestone.
+def short_date(iso):
+    try:
+        d = datetime.date.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return iso or ""
+    return f"{d.strftime('%b')} {d.day}"
 
-    However many versions the roadmap grows to, each milestone that is not the current one
-    takes a single row, folded until a reader opens it, and shipped milestones beyond the
-    newest few fold away together.
-    """
+
+def release_of(m):
+    """The first release of a numbered milestone, such as 0.5.0 for 0.5."""
+    if not m["ver"] or m["ver"].endswith(".x"):
+        return None
+    found = [r for r in RELEASES if r["version"].startswith(m["ver"] + ".") and r["date"]]
+    return found[-1] if found else None
+
+
+def ms_label(m):
+    # A track that spans several 1.x releases ("... (track R, after 1.0)") is not a crate.
+    if not m["ver"] and m["title"].endswith("after 1.0)"):
+        return "1.x"
+    return m["ver"] or "crates"
+
+
+def ms_name(m):
+    return html.escape(m["name"] if m["ver"] else m["title"].replace(" (done)", ""))
+
+
+def ms_kind(m):
+    """What a milestone that has not shipped is: (css class, badge)."""
+    if m["state"] == "releasing":
+        return "releasing", "Releasing"
+    if m["state"] == "current":
+        return "now", "Now"
+    if m.get("proposed"):
+        return "proposed", "Proposed"
+    return "planned", "Planned"
+
+
+def unlink(src):
+    """Markdown links as their text: a card's summary is also shown on other pages."""
+    return re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", src)
+
+
+def ms_tagline(m):
+    paras = split_intro(m["body"])[0].split("\n\n")
+    if m["state"] != "done" and len(paras) > 1 and paras[0].startswith("Released as"):
+        paras = paras[1:]     # not out yet: say what it is, not that it shipped
+    intro = re.sub(r"\s+", " ", unlink(paras[0])).strip()
+    intro = re.sub(r"^Proposed(?::.*?\.(?=\s+[A-Z])|\.)\s*", "", intro)
+    s = re.match(r"^(.+?[.:])(?:\s+[A-Z(`]|$)", intro)
+    return ilm(s.group(1).rstrip(":") + ("." if s.group(1).endswith(":") else "")) if s else ilm(intro)
+
+
+def ms_points(m, n=3):
+    """The first few items of a milestone as short phrases, and each of its ### sections."""
+    def lead(text):
+        text = re.sub(r"\s+", " ", unlink(text)).strip()
+        b = re.match(r"^\*\*(.+?)\*\*", text)
+        if b:
+            return b.group(1).rstrip(":.")
+        tick = False
+        for i, ch in enumerate(text):
+            if ch == "`":
+                tick = not tick
+            if not tick and i > 12 and (text.startswith((": ", " (", ", ", "; ", " — "), i)):
+                return text[:i]
+        return text if len(text) < 90 else text[:text.rfind(" ", 0, 85)] + "…"
+    top = m["body"].split("\n### ", 1)[0]
+    items = re.findall(r"^[-*] \[[ xX]\] (.+(?:\n {2,}.+)*)", top, re.M)
+    points = [("item", ilm(lead(t))) for t in items[:n]]
+    for h in re.findall(r"^### (.+)$", m["body"], re.M):
+        points.append(("section", ilm(h)))
+    return points
+
+
+def roadmap():
+    """A track of every numbered milestone, a card for each one that has not shipped, then
+    one line per shipped milestone, folded until a reader opens it."""
     shown_shipped = 4
 
     def md_html(src):
         h = doc_md(src, heading_shift=1, heading_ids=False)
         return h.replace("<p><strong>Exit criteria:</strong>", '<p class="exit"><strong>Done when:</strong>')
-
-    def split_list(src):
-        """A Markdown body that starts with a list: the list, and what follows it."""
-        lines = src.split("\n")
-        for i, line in enumerate(lines):
-            if line.strip() and not re.match(r"^(\s+|[-*] )", line):
-                return "\n".join(lines[:i]).strip(), "\n".join(lines[i:]).strip()
-        return src.strip(), ""
-
-    def tagline(m):
-        intro = split_intro(m["body"])[0].split("\n\n")[0]
-        intro = re.sub(r"\s+", " ", intro).strip()
-        s = re.match(r"^(.+?[.:])(?:\s+[A-Z(`]|$)", intro)
-        return ilm(s.group(1).rstrip(":") + ("." if s.group(1).endswith(":") else "")) if s else ilm(intro)
-
-    def release_of(m):
-        """The first release of a numbered milestone, such as 0.5.0 for 0.5."""
-        if not m["ver"]:
-            return None
-        found = [r for r in RELEASES if r["version"].startswith(m["ver"] + ".") and r["date"]]
-        return found[-1] if found else None
-
-    def label(m):
-        # A track that spans several 1.x releases ("... (track R, after 1.0)") is not a crate.
-        if not m["ver"] and m["title"].endswith("after 1.0)"):
-            return "1.x"
-        return m["ver"] or "crates"
-
-    def name(m):
-        return html.escape(m["name"] if m["ver"] else m["title"].replace(" (done)", ""))
 
     def row(m):
         rel = release_of(m) if m["state"] == "done" else None
@@ -1470,43 +1638,59 @@ def roadmap():
             meta = "details"
         notes = (f'<p class="mr-links"><a href="{link("releases", rel["id"])}">Release notes for '
                  f'{rel["version"]} <span aria-hidden="true">→</span></a></p>') if rel else ""
-        line = tagline(m)
+        line = ms_tagline(m)
         return (f'<details class="mr is-{m["state"]}" id="{m["id"]}"><summary>'
-                f'<b class="mr-ver{"" if m["ver"] else " is-word"}">{label(m)}</b>'
-                f'<span class="mr-name">{name(m)}</span><span class="mr-meta">{meta}</span>'
+                f'<b class="mr-ver{"" if m["ver"] else " is-word"}">{ms_label(m)}</b>'
+                f'<span class="mr-name">{ms_name(m)}</span><span class="mr-meta">{meta}</span>'
                 + (f'<span class="mr-line">{line}</span>' if line else "")
                 + f'</summary><div class="mr-body prose">{notes}{md_html(m["body"])}</div></details>')
 
-    current = next((m for m in MILESTONES if m["state"] == "current"), None)
+    upcoming = [m for m in MILESTONES if m["state"] != "done"]
     shipped = [m for m in MILESTONES if m["state"] == "done"][::-1]
-    planned = [m for m in MILESTONES if m["state"] == "planned"]
+    lead_m = next((m for m in upcoming if m["state"] == "releasing"), None) or \
+        next((m for m in upcoming if m["state"] == "current"), None)
 
-    now = ""
-    if current:
-        intro, rest = split_intro(current["body"])
-        gates, after = split_list(rest)
-        exit_p = next((p for p in after.split("\n\n") if p.startswith("**Exit criteria:**")), "")
-        after = after.replace(exit_p, "").strip()
-        pct = 100 * current["done"] / current["total"] if current["total"] else 0
-        progress = (f'<p class="now-progress"><span>{current["done"]} of {current["total"]} done</span>'
-                    f'<span class="ms-bar" style="--p:{pct:.0f}%"></span></p>') if current["total"] else ""
-        now = f'''<section class="band band-tight" id="now"><div class="wrap rm-col">
-  <article class="now" id="{current["id"]}">
-    <div class="now-side"><p class="eyebrow">Now</p><b class="now-ver">{label(current)}</b>{progress}</div>
-    <div class="now-main">
-      <h2>{name(current)}</h2>
-      <div class="prose">{md_html(intro)}{md_html(gates)}{md_html(exit_p) if exit_p else ""}</div>
-      {more("Read the rest of " + label(current), f'<div class="prose">{md_html(after)}</div>') if after else ""}
-    </div>
-  </article>
-</div></section>'''
+    # The track: every numbered milestone, shipped ones lit.
+    nodes = []
+    for m in MILESTONES:
+        if not m["ver"]:
+            continue
+        if m["state"] == "done":
+            rel = release_of(m)
+            cls, when = "done", (f'<time datetime="{rel["date"]}">{short_date(rel["date"])}</time>' if rel else "<i>shipped</i>")
+        else:
+            cls, badge = ms_kind(m)
+            when = f"<i>{badge.lower()}</i>"
+        here = ' aria-current="step"' if m is lead_m else ""
+        nodes.append(f'<li class="jn is-{cls}"{here}><a href="#{m["id"]}"><span class="jn-dot" aria-hidden="true"></span>'
+                     f'<b>{m["ver"]}</b><span class="jn-name">{ms_name(m)}</span>{when}</a></li>')
+    journey = (f'<div class="journey-wrap"><ol class="journey" aria-label="Milestones in order">{"".join(nodes)}</ol></div>')
 
-    later = ""
-    if planned:
-        later = f'''<section class="band band-alt" id="planned"><div class="wrap rm-col">
-  <h2 class="rm-h">Planned{" after " + label(current) if current else ""}</h2>
-  <p class="rm-sub">In the order they are planned. Open one to see its items and what marks it done.</p>
-  <div class="mrs">{"".join(row(m) for m in planned)}</div>
+    def card(m):
+        kind, badge = ms_kind(m)
+        feature = m is lead_m
+        pts = "".join(
+            f'<li class="is-{k}">{ICONS["spark"] if k == "section" else ""}<span>{t}</span></li>'
+            for k, t in ms_points(m, 4 if feature else 3))
+        pct = 100 * m["done"] / m["total"] if m["total"] else 0
+        progress = (f'<p class="nx-progress"><span class="ms-bar" style="--p:{pct:.0f}%"></span>'
+                    f'<span>{m["done"]} of {m["total"]} done</span></p>') if m["total"] and kind != "releasing" else ""
+        if kind == "releasing":
+            progress = '<p class="nx-progress is-ready"><span class="ms-bar" style="--p:100%"></span><span>done; the release is being cut</span></p>'
+        details = '<div class="prose">' + md_html(m["body"]) + '</div>'
+        return (f'<article class="nx is-{kind}{" is-feature" if feature else ""}" id="{m["id"]}">'
+                f'<header class="nx-top"><span class="nx-badge">{badge}</span><b class="nx-ver">{ms_label(m)}</b></header>'
+                f'<h3>{ms_name(m)}</h3><p class="nx-line">{ms_tagline(m)}</p>'
+                f'<ul class="nx-points">{pts}</ul>{progress}'
+                + more("Every item, and what marks it done", details, "more-box nx-more")
+                + '</article>')
+
+    nexts = ""
+    if upcoming:
+        nexts = f'''<section class="band band-alt" id="next"><div class="wrap">
+  {head_block("the road ahead", "Up next",
+              "In the order they are planned. Proposed milestones are settled when the one before them ships; nothing here is a promise of a date.")}
+  <div class="nexts">{"".join(card(m) for m in upcoming)}</div>
 </div></section>'''
 
     done_rows = "".join(row(m) for m in shipped[:shown_shipped])
@@ -1525,14 +1709,22 @@ def roadmap():
     a_count = len(re.findall(r"^\d+\. ", a_rest, re.M))
     a_more = more(f"The {a_count} principles" if a_count else "The principles",
                   f'<div class="prose">{doc_md(a_rest, heading_ids=False)}</div>') if a_rest else ""
-    status = (f'{len(shipped)} milestones shipped'
-              + (f' · now <a href="#now">{label(current)}</a>' if current else "")
-              + (f' · {len(planned)} planned' if planned else ""))
-    body = f'''{page_head("roadmap", "Where giong is going",
-                          "Milestones in order, with no dates: a milestone is done when its exit criteria are met.",
-                          status + " · " + source_note(["ROADMAP.md"]))}
-{now}
-{later}
+    published = [r for r in RELEASES if r["version"] != "Unreleased" and r["date"]]
+    first = published[-1] if published else None
+    figs = [(str(len(shipped)), "milestones shipped"),
+               (str(len(published)), "releases" + (f", the first on {nice_date(first['date'])}" if first else "")),
+               (str(len(CRATES)), "crates on one version"),
+               (str(len(upcoming)), "milestones ahead")]
+    body = f'''<section class="page-head rm-head"><div class="wrap">
+  <p class="eyebrow">roadmap</p>
+  <h1>The road to the <em>best Rust runtime</em></h1>
+  <p class="lede">Every milestone so far and every one planned, in order and with no dates: a milestone is done when its exit criteria are met, and a release ships only what is done.</p>
+  {figures(figs)}
+  <p class="page-meta">{source_note(["ROADMAP.md"])}</p>
+</div>
+{journey}
+</section>
+{nexts}
 {done}
 <section class="band band-alt"><div class="wrap goal">
   <div class="prose prose-lg"><h2 id="goal">Goal</h2>{doc_md(named.get("Goal", ""), heading_ids=False)}</div>
@@ -1542,8 +1734,8 @@ def roadmap():
   <h2>Deliberate non-goals</h2>
   <div class="prose">{doc_md(named.get("Non-goals", ""), heading_ids=False)}</div>
 </div></section>'''
-    return frame("roadmap", "Roadmap", "Where giong is going: the milestones in order, their exit "
-                 "criteria, and the deliberate non-goals.", body, "roadmap/")
+    return frame("roadmap", "Roadmap", "Where giong is going: every milestone in order, what is "
+                 "next, what marks each one done, and the deliberate non-goals.", body, "roadmap/")
 
 
 def releases():
@@ -1580,9 +1772,16 @@ def releases():
             + (f'<p class="rel-name">{html.escape(name)}</p>' if name else "")
             + f'<p class="rel-meta">{" · ".join(meta)}</p></header>{notes}</article>')
         side.append(f'<a href="#{r["id"]}">{title}<span>{nice_date(r["date"]) if r["date"] else "main"}</span></a>')
-    body = f'''{page_head("releases", "Releases",
-                          "What changed in each version, newest first. Every crate shares the version number. While it starts with 0, a minor release may break the API.",
-                          source_note(["CHANGELOG.md"]) + f' · <a href="{REPO}/releases.atom">feed</a>')}
+    published = [r for r in RELEASES if r["version"] != "Unreleased" and r["date"]]
+    since_1 = [r for r in published if re.match(r"^1\.\d+\.\d+$", r["version"]) and r["version"] != "1.0.0"]
+    figs = [(str(len(published)), "releases" + (f", the first on {nice_date(published[-1]['date'])}" if published else ""))]
+    if LATEST:
+        name = milestone_name(LATEST["version"])
+        figs.append((LATEST["version"], "the newest" + (f", “{html.escape(name)}”" if name else "")))
+    figs.append((str(len(since_1)), "releases since 1.0.0, and none needs a code change to upgrade"))
+    body = f'''{page_head("releases", "Every release, <em>newest first</em>",
+                          "What changed in each version. Every crate shares the version number. Since 1.0 a release only adds: the API is frozen, and `cargo-semver-checks` guards it on every change.",
+                          source_note(["CHANGELOG.md"]) + f' · <a href="{REPO}/releases.atom">feed</a>', figs)}
 <div class="wrap doc-grid">
   <nav class="toc" aria-label="Versions"><p>Versions</p><div class="toc-links">{"".join(side)}</div></nav>
   <div class="releases">{"".join(items)}</div>
@@ -1593,9 +1792,10 @@ def releases():
 
 def not_found():
     body = f'''<section class="lost"><div class="wrap">
+  <svg class="lost-ring" viewBox="0 0 400 400" aria-hidden="true">{ring(lit=0)}</svg>
   <p class="eyebrow">404</p>
   <h1>Nothing here, <em>not even one syscall.</em></h1>
-  <p class="lede">The page you asked for does not exist.</p>
+  <p class="lede">The page you asked for does not exist. Thánh Gióng lay silent for three years before he rose; this page is not coming back.</p>
   <div class="cta"><a class="btn btn-main" href="{link("home")}">Back to giong.run</a><a class="btn" href="{link("docs")}">Docs</a></div>
 </div></section>'''
     return frame("404", "Not found", "This page does not exist.", body, "404").replace(

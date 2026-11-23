@@ -169,6 +169,11 @@ codes! {
     /// it (Linux older than 5.3, or a seccomp profile that blocks
     /// `pidfd_open`), or something else in the process reaped it first.
     ChildProcess = 19, Other, "cannot watch the child process";
+    /// A worker thread could not be started, most often because the
+    /// process may not have more threads: a container's PID limit (`pids.max`)
+    /// or `RLIMIT_NPROC` counts each thread. The kernel's error kind
+    /// (`WouldBlock` for `EAGAIN`) is kept.
+    ThreadLimit = 20, WouldBlock, "a worker thread could not be started";
 
     // -------------------------------------------------------------- macOS
     /// macOS had no network buffer for a send or connect (`ENOBUFS`), for

@@ -742,9 +742,9 @@ pub(crate) fn kind_from_env() -> io::Result<Option<DriverKind>> {
             other => Err(crate::error::raise(
                 Code::InvalidConfig,
                 format!("GIONG_DRIVER is {other:?}, which is not a driver"),
-                "set GIONG_DRIVER to io_uring or epoll (Linux) or kqueue (macOS), or unset it \
-                 to use io_uring where the kernel allows it, epoll elsewhere on Linux, and \
-                 kqueue on macOS.",
+                "set GIONG_DRIVER to io_uring or epoll (Linux), kqueue (macOS) or iocp \
+                 (Windows), or unset it to use io_uring where the kernel allows it, epoll \
+                 elsewhere on Linux, kqueue on macOS and iocp on Windows.",
             )),
         },
     }
@@ -791,6 +791,7 @@ fn exists(kind: DriverKind) -> bool {
     match kind {
         DriverKind::IoUring | DriverKind::Epoll => cfg!(target_os = "linux"),
         DriverKind::Kqueue => cfg!(any(target_os = "macos", giong_libkqueue)),
+        DriverKind::Iocp => cfg!(windows),
         #[allow(unreachable_patterns)]
         _ => false,
     }
@@ -818,8 +819,8 @@ fn unsupported(kind: DriverKind) -> io::Error {
     crate::error::raise(
         code,
         format!("the {kind} driver does not exist on this operating system"),
-        "name io_uring or epoll on Linux and kqueue on macOS (Builder::driver or \
-         GIONG_DRIVER), or name none to let giong choose.",
+        "name io_uring or epoll on Linux, kqueue on macOS and iocp on Windows \
+         (Builder::driver or GIONG_DRIVER), or name none to let giong choose.",
     )
 }
 
