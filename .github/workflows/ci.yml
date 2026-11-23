@@ -532,6 +532,28 @@ jobs:
                 "$t" -q
               done'
 
+  # The tests that share a port between workers, the runtime's own and
+  # giong-http's, in a container under gVisor (runsc): GKE Sandbox and many
+  # sandboxes for AI agents run it, and its network stack records SO_REUSEPORT
+  # at the bind, unlike Linux (scripts/gvisor.sh).
+  gvisor:
+    needs: [plan, build]
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - name: Fetch the release build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        continue-on-error: true
+        with:
+          name: release-build
+          path: ${{ runner.temp }}
+      - run: scripts/shared-build.sh unpack "$RUNNER_TEMP/release-build.tar.zst"
+      - run: scripts/gvisor.sh
+
   # giong-http with its defaults, in a container limited to 128 MiB, under
   # hundreds of uploads that stop one byte short: it must not be OOM-killed,
   # and a well-behaved client mixed in must keep getting answers. One and four
@@ -852,15 +874,72 @@ jobs:
       # As in the `test` job: every runtime of the tests gets io_uring.
       - run: ulimit -l && sudo prlimit --pid $$ --memlock=unlimited:unlimited && ulimit -l && cargo test
 
+  # musl, the C library of Alpine and of static Linux binaries: what differs
+  # from glibc is only seen by building for it (recvmmsg takes an unsigned
+  # `flags` there, for one) and by running there (strerror's words differ).
+  # Lints, then the tests on the runner, on io_uring, and in an Alpine
+  # container with Docker's default seccomp profile, on epoll. The binaries
+  # are static, so the container needs nothing installed. The database
+  # clients' tests skip: they are plain Rust over TCP, and run in `test`.
+  musl:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      GIONG_PG_REQUIRED: "0"
+      GIONG_MYSQL_REQUIRED: "0"
+      GIONG_REDIS_REQUIRED: "0"
+      # ring's C code is built with musl's compiler wrapper.
+      CC_x86_64_unknown_linux_musl: musl-gcc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+      - run: >
+          cargo clippy --workspace --all-targets --all-features
+          --target x86_64-unknown-linux-musl -- -D warnings
+      # As in the `test` job: every runtime of the tests gets io_uring.
+      - run: >
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited &&
+          GIONG_TEST_EXPECT_DRIVER=io_uring
+          cargo test --workspace --all-features --target x86_64-unknown-linux-musl
+      - name: List the test binaries
+        run: |
+          cargo test --workspace --all-features --target x86_64-unknown-linux-musl \
+            --no-run --message-format=json |
+            python3 -c '
+          import json, sys
+          for line in sys.stdin:
+              msg = json.loads(line)
+              if msg.get("reason") == "compiler-artifact" and msg.get("executable") and msg["profile"]["test"]:
+                  print(msg["executable"])
+          ' > target/musl-test-binaries.txt
+          wc -l target/musl-test-binaries.txt
+      - name: Run them in Alpine
+        run: |
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" \
+            -e GIONG_TEST_EXPECT_DRIVER=epoll alpine:3.22 sh -ec '
+              for t in $(cat target/musl-test-binaries.txt); do
+                echo "== $t"
+                "$t" -q
+              done'
+
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
   # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
-  # versions, the simulation) hold a merge back as well. When `plan` chose a
+  # versions, the simulation, gVisor, musl) hold a merge back as well. When `plan` chose a
   # short set (a draft, or a pull request that changes no code), the jobs it left
   # out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in the
   # merge queue every job must.
   all-checks:
-    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic]
+    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl]
     if: always()
     runs-on: ubuntu-24.04
     steps:
