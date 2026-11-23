@@ -1,5 +1,8 @@
 //! The `Record` middleware: one `exchange` line per answered request, with
 //! headers and bodies, through `App::handle` and through a real server.
+//! A release build has `Record` only with the `dev` feature (record_off.rs
+//! tests the other case).
+#![cfg(any(debug_assertions, feature = "dev"))]
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -165,6 +168,51 @@ fn an_exchange_has_both_sides_with_secrets_redacted() {
         .find(|h| h[0] == "set-cookie")
         .unwrap();
     assert_eq!(set_cookie[1], "[redacted]");
+}
+
+async fn login(_req: Req) -> Result<Response, Error> {
+    Ok(Response::new(200)
+        .header("Content-Type", "application/json")
+        .body(r#"{"user":"ada","access_token":"eyJ.SECRET.sig","expires_in":3600}"#))
+}
+
+#[test]
+fn secrets_in_queries_and_bodies_are_redacted() {
+    let (sink, lines) = memory();
+    let app = Router::new()
+        .post("/login", login)
+        .layer(Record::new(sink).keep_field("cursor_token"))
+        .build(());
+    let json = r#"{"user":"ada","password":"hunter2-SECRET","card":{"number":"4242424242424242","cvv":"123"}}"#;
+    let raw = format!(
+        "POST /login?api_key=AK-SECRET-123&page=2&cursor_token=c1 HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+        json.len()
+    );
+    send(&app, raw.as_bytes());
+    let form = "user=ada&password=hunter2-SECRET";
+    let raw = format!(
+        "POST /login HTTP/1.1\r\nHost: t\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{form}",
+        form.len()
+    );
+    send(&app, raw.as_bytes());
+    let got = parse(&lines);
+    assert_eq!(got[0]["query"], "api_key=[redacted]&page=2&cursor_token=c1");
+    let body: Value = serde_json::from_str(got[0]["request"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(body["user"], "ada");
+    assert_eq!(body["password"], "[redacted]");
+    assert_eq!(body["card"], "[redacted]");
+    // body_len is the length of the body as it was sent.
+    assert_eq!(got[0]["request"]["body_len"], json.len());
+    let resp: Value = serde_json::from_str(got[0]["response"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(resp["access_token"], "[redacted]");
+    assert_eq!(resp["expires_in"], 3600);
+    assert_eq!(got[1]["request"]["body"], "user=ada&password=[redacted]");
+    let all = lines.borrow().join("\n");
+    for leaked in ["hunter2", "AK-SECRET", "4242424242424242", "eyJ.SECRET"] {
+        assert!(!all.contains(leaked), "{leaked} leaked: {all}");
+    }
 }
 
 #[test]
