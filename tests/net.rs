@@ -1279,9 +1279,10 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         });
         let c = TcpStream::connect(addr).await.unwrap();
         // Far more than the socket buffers hold: the send stays in the driver.
-        // Windows takes a send into the kernel whole, whatever its size,
-        // while the socket's buffer has room: there the first write fills
-        // the buffer and the one after it waits.
+        // Windows would take a send into the kernel whole, whatever its
+        // size, while the socket's buffer has room; giong hands it a
+        // megabyte at a time, so there too the write waits once the buffer
+        // is full.
         let mut dropped = false;
         for _ in 0..4 {
             let big = vec![b'a'; 32 << 20];
@@ -1301,6 +1302,76 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         assert!(all.ends_with(b"END"), "the last write was overtaken");
         assert!(all[..all.len() - 3].iter().all(|&b| b == b'a'));
     });
+}
+
+/// A write to a peer that has stopped reading waits for it, however large:
+/// the kernel holds about a socket buffer's worth, not the whole write. On
+/// Windows an overlapped send of 32 MiB, or 512 MiB, was taken whole while
+/// the socket's buffer had room, so `write_all` ended at once, the kernel
+/// held every byte for the stalled peer, and a write timeout counting from
+/// the last progress could never fire. Plain and vectored writes, to a peer
+/// that reads once and then nothing until told to; every byte then arrives,
+/// in order.
+#[test]
+fn a_write_to_a_peer_that_stopped_reading_waits_for_it() {
+    const BIG: usize = 64 << 20;
+    for vectored in [false, true] {
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = peer.local_addr().unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = peer.accept().unwrap();
+            let mut all = Vec::with_capacity(BIG);
+            let mut buf = vec![0u8; 64 * 1024];
+            let n = s.read(&mut buf).unwrap();
+            all.extend_from_slice(&buf[..n]);
+            wait.recv().unwrap();
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+            }
+            all
+        });
+        giong::block_on(async move {
+            let c = TcpStream::connect(addr).await.unwrap();
+            let data: Vec<u8> = (0..BIG).map(pattern).collect();
+            let started = std::time::Instant::now();
+            let res = if vectored {
+                let half = data[BIG / 2..].to_vec();
+                let bufs = vec![data[..BIG / 2].to_vec(), half];
+                let mut write = std::pin::pin!(c.write_all_vectored(bufs));
+                let early = timeout(Duration::from_secs(1), write.as_mut()).await;
+                assert!(
+                    early.is_err(),
+                    "a vectored write of {BIG} bytes ended in {:?}, the peer reading nothing",
+                    started.elapsed()
+                );
+                go.send(()).unwrap();
+                write.await.0
+            } else {
+                let mut write = std::pin::pin!(c.write_all(data));
+                let early = timeout(Duration::from_secs(1), write.as_mut()).await;
+                assert!(
+                    early.is_err(),
+                    "a write of {BIG} bytes ended in {:?}, the peer reading nothing",
+                    started.elapsed()
+                );
+                go.send(()).unwrap();
+                write.await.0
+            };
+            res.unwrap();
+            c.shutdown(Shutdown::Write).unwrap();
+        });
+        let all = reader.join().unwrap();
+        assert_eq!(all.len(), BIG, "vectored: {vectored}");
+        assert!(
+            all.iter().enumerate().all(|(i, &b)| b == pattern(i)),
+            "vectored: {vectored}: a byte out of place"
+        );
+    }
 }
 
 /// Byte `i` of the test stream: a pattern that shows any byte out of place.
