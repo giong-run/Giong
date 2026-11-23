@@ -1701,9 +1701,9 @@ impl Session {
                 .field(b"content-length", digits, Index::No, &mut block);
         }
         let mut name = mem::take(&mut self.name);
-        for (n, v) in resp.headers() {
+        for (n, v) in resp.header_fields() {
             name.clear();
-            name.extend(n.bytes().map(|b| b.to_ascii_lowercase()));
+            name.extend(n.iter().map(u8::to_ascii_lowercase));
             if matches!(
                 &name[..],
                 b"keep-alive" | b"proxy-connection" | b"upgrade" | b"te"
@@ -1717,7 +1717,7 @@ impl Session {
             } else {
                 Index::Yes
             };
-            self.encoder.field(&name, v.as_bytes(), index, &mut block);
+            self.encoder.field(&name, v, index, &mut block);
         }
         self.name = name;
         self.reserve_out();
