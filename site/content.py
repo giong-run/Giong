@@ -748,7 +748,35 @@ DOC_PAGES = [
      "Every `GIONG-E` code: what went wrong and how to fix it."),
 ]
 # Crate pages take their lede from CRATES; their group is their layer.
-DOC_GROUPS = ["Start", "Runtime", "Protocols", "Clients", "Framework", "Tooling", "Operate"]
+DOC_GROUPS = ["Start", "Dev kit", "Runtime", "Protocols", "Clients", "Framework", "Tooling", "Operate"]
+
+# The Dev kit section: /docs/cli/ and a page per `## giong <command>` section of
+# giong-cli/README.md (the one source; this file only orders and summarises them).
+CLI_LEDE = ("The `giong` command: start a project, run it with a restart on every save, check it, "
+            "test it and ship it. One small binary; every command answers people in text and "
+            "agents in JSON with `--json`.")
+CLI_ORDER = ["new", "ai", "dev", "check", "fix", "test", "doctor", "db", "env", "routes",
+             "record", "dashboard", "top", "bench", "image", "clean", "mcp", "explain"]
+CLI_COMMANDS = {
+    "new": "Start a project from a template (web, gRPC or worker) that builds, lints and passes its tests at once.",
+    "ai": "Teach the project to coding agents: `AGENTS.md`, `CLAUDE.md`, Cursor rules, the skill and `.mcp.json`.",
+    "dev": "Build, run and restart on every save without refusing a request; one runner per project, also in the background.",
+    "check": "Compiler errors, clippy and giong's own checks (blocking calls, host names, borrows across `.await`) in one report.",
+    "fix": "Apply the fixes that need no judgement, whole or not at all.",
+    "test": "Run the tests with `.env`, on io_uring and on epoll, with a time limit.",
+    "doctor": "Is this machine and this project ready: toolchain, kernel, io_uring, limits, ports, disk.",
+    "db": "A development PostgreSQL, MySQL or Redis in a container, and forward-only SQL migrations.",
+    "env": "Where each setting comes from, what is missing, secrets masked.",
+    "routes": "The routes the running service serves, and an OpenAPI 3.1 document made from them.",
+    "record": "Turn real requests into test cases, with secrets kept out of the files, and replay them.",
+    "dashboard": "One page on localhost: build state, live requests, routes, workers, pools and warnings.",
+    "top": "The running service seen from inside: workers, tasks, memory, pools, warnings.",
+    "bench": "Load at a fixed rate without coordinated omission, and compare a change against a branch.",
+    "image": "An OCI image of the service without Docker or a Dockerfile.",
+    "clean": "Free the disk old builds take, keeping what the next build needs.",
+    "mcp": "Every command as a tool for coding agents over MCP, read-only unless allowed.",
+    "explain": "The page of any giong error code, without the network.",
+}
 
 # What "Copy prompt" puts before a page. {version}, {title} and {url} are filled in.
 PROMPT = """I am building a Rust service on giong {version}, a thread-per-core async runtime with its own crates for HTTP, TLS, gRPC, databases and more, and no Tokio underneath. Use {title} as documented below.

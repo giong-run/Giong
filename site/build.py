@@ -458,7 +458,8 @@ def code_window(samples, ident="code"):
 
 
 def crate_links(c, guide=False):
-    links = [("guide", link(doc_page_name(c["name"])))] if guide and any(e[0] == c["name"] for e in DOCS) else []
+    page = "cli" if c["name"] == "giong-cli" and any(e[0] == "cli" for e in DOCS) else c["name"]
+    links = [("guide", link(doc_page_name(page)))] if guide and any(e[0] == page for e in DOCS) else []
     links += [("docs.rs", f"https://docs.rs/{c['name']}/{VERSION}" if DOC_PREFIX else f"https://docs.rs/{c['name']}"),
              ("crates.io", f"https://crates.io/crates/{c['name']}"),
              ("source", REPO if c["dir"] == "." else TREE + c["dir"])]
@@ -927,6 +928,9 @@ def doc_entries():
         path = "README.md" if c["dir"] == "." else f"{c['dir']}/README.md"
         if released(path) is None or released(release.manifest(c["dir"])) is None:
             continue
+        if c["name"] == "giong-cli" and cli_commands(released(path)):
+            out += cli_entries(path, c)
+            continue
         out.append((c["name"], c["name"], path, c["dir"], layer_group.get(c["layer"], "Tooling"),
                     c.get("lede", c["short"]), c))
     for slug, title, path, group, lede in C.DOC_PAGES:
@@ -935,6 +939,71 @@ def doc_entries():
     if any(e[0] == "errors" for e in out):
         out += error_entries()
     return out
+
+
+CLI_HEADING = re.compile(r"^## (giong ([a-z][a-z0-9-]*)(?: [a-z][a-z0-9 -]*)?)\s*$", re.M)
+
+
+def cli_commands(readme):
+    """[(command, heading)] of every `## giong <command>` section of giong-cli's README."""
+    if not readme:
+        return []
+    found = dict((m.group(2), m.group(1)) for m in CLI_HEADING.finditer(readme))
+    order = [c for c in C.CLI_ORDER if c in found] + [c for c in found if c not in C.CLI_ORDER]
+    return [(c, found[c]) for c in order]
+
+
+def cli_entries(path, crate):
+    """The Dev kit section: /docs/cli/ (the README without its command sections) and
+    /docs/cli/<command>/ for each `## giong <command>` section, so every command has its
+    own page and address while giong-cli's README stays the one source."""
+    out = [("cli", "Dev kit overview", path, crate["dir"], "Dev kit", C.CLI_LEDE, None)]
+    for cmd, heading in cli_commands(released(path)):
+        lede = C.CLI_COMMANDS.get(cmd, "")
+        out.append((f"cli/{cmd}", heading, f"{path}#{md.slug(heading)}", crate["dir"], "Dev kit", lede, None))
+    return out
+
+
+def cli_source(readme, section):
+    """One command's section of giong-cli's README as a page of its own (`### ` become
+    `## `), or with section "" the README without its command sections and with a table
+    linking every command's page."""
+    readme = readme.replace("\r\n", "\n")
+    # In-README links to a command section point at that command's page.
+    readme = re.sub(r"\]\(#(giong-[a-z0-9-]+)\)", r"](README.md#\1)", readme)
+    parts, cur, fence = [], ["", []], None
+    for line in readme.split("\n"):
+        m = re.match(r"^\s*(```+|~~~+)", line)
+        if m:
+            fence = None if fence and m.group(1).startswith(fence) else (fence or m.group(1))
+        if fence is None and not m and line.startswith("## "):
+            parts.append(cur)
+            cur = [line[3:].strip(), []]
+        cur[1].append(line)
+    parts.append(cur)
+    if section:
+        for heading, lines in parts:
+            if heading and md.slug(heading) == section:
+                body = "\n".join(lines[1:])
+                return re.sub(r"^### ", "## ", body, flags=re.M).strip() + "\n"
+        return None
+    commands = {md.slug(h) for _, h in cli_commands(readme)}
+    keep = [lines for heading, lines in parts if md.slug(heading) not in commands and heading != "License"]
+    rows = "".join(f"| [`{h}`](README.md#{md.slug(h)}) | {C.CLI_COMMANDS.get(c, '')} |\n"
+                   for c, h in cli_commands(readme))
+    table = f"## Commands\n\n| Command | What it does |\n|---|---|\n{rows}\n"
+    head, rest = "\n".join(keep[0]), "\n".join("\n".join(x) for x in keep[1:])
+    return f"{head.rstrip()}\n\n{table}{rest}\n"
+
+
+def source(path):
+    """A documentation page's Markdown at the release: a file, or `file#section` for one
+    command of giong-cli's README."""
+    file, _, section = path.partition("#")
+    raw = released(file)
+    if raw is None or file != "giong-cli/README.md" or not cli_commands(raw):
+        return raw
+    return cli_source(raw, section)
 
 
 def error_entries():
@@ -992,6 +1061,8 @@ def doc_link(url, src_dir):
         path = new
     if path.endswith("/") and path + "README.md" in DOC_BY_PATH:
         path += "README.md"
+    if anchor and f"{path}#{anchor}" in DOC_BY_PATH:
+        return link(doc_page_name(DOC_BY_PATH[f"{path}#{anchor}"][0]))
     if path in DOC_BY_PATH:
         return link(doc_page_name(DOC_BY_PATH[path][0]), anchor)
     return (REL_TREE if path.endswith("/") else REL_BLOB) + path + (f"#{anchor}" if anchor else "")
@@ -1089,7 +1160,7 @@ def prompt_for(title, url, body):
 
 def doc_page(entry):
     slug, title, path, src_dir, group, lede, crate = entry
-    raw = released(path)
+    raw = source(path)
     src = clean_md(raw)
     intro, secs = split_sections(src)
     page_url = doc_url(slug)
@@ -1986,6 +2057,13 @@ def absolute_links(text, src_dir):
             if new == path:
                 break
             path = new
+        # A document that is a page of the site: its Markdown there, one hop for an agent.
+        target, _, anchor = path.partition("#")
+        page = DOC_BY_PATH.get(path) or (DOC_BY_PATH.get(target) if not anchor else None)
+        if page is None and target.endswith("/"):
+            page = DOC_BY_PATH.get(target + "README.md") if not anchor else None
+        if page is not None:
+            return f"{m.group(1)}({SITE}{md_file(page[0])})"
         return f"{m.group(1)}({(REL_TREE if path.endswith('/') else REL_BLOB) + path})"
     return re.sub(r"(\]\s?)\(([^)\s]+)\)", fix, text)
 
