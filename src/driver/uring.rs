@@ -141,9 +141,6 @@ struct Multi {
     armed: bool,
     /// We asked the kernel to stop (backpressure); the terminal CQE is pending.
     pausing: bool,
-    /// Armed as a multishot stream receive, which takes data for as long as
-    /// the pool has buffers (not a single-buffer one).
-    multishot: bool,
     /// The owner is gone; release whatever still arrives.
     orphan: bool,
 }
@@ -233,12 +230,6 @@ pub(crate) struct Uring {
     recv_limit: usize,
     /// Received bytes moved out of the pool to the heap.
     recv_copied: u64,
-    /// Bytes of received data that wait on the heap for their readers
-    /// (`Queued::Heap`).
-    heap_queued: usize,
-    /// While set, stream receives take one buffer per arm: see
-    /// [`Uring::check_heap`].
-    heap_pressure: bool,
     /// Counts the event loop's turns (calls to `park`), wrapping. Tasks run
     /// between two turns, so data that arrived in an earlier turn than the
     /// current one has been in front of its reader at least once.
@@ -1036,8 +1027,6 @@ impl Uring {
             pooled_queued: 0,
             recv_limit,
             recv_copied: 0,
-            heap_queued: 0,
-            heap_pressure: false,
             turn: 0,
             graveyard: Vec::new(),
             wake_fd: wake.read_fd(),
@@ -1134,7 +1123,6 @@ impl Uring {
             shared: false,
             armed: false,
             pausing: false,
-            multishot: false,
             orphan: false,
         }))
     }
@@ -1163,15 +1151,6 @@ impl Uring {
     pub(crate) fn arm_multi(&mut self, key: usize, io: MultiIo) {
         let stream_ring = self.stream_ring();
         let shared = matches!(io, MultiIo::RecvMsg { .. });
-        let io = match io {
-            // Readers are not keeping up and their data is piling up on the
-            // heap: take no more than the reader asks for.
-            MultiIo::Recv { fd, once: false } if self.heap_pressure => {
-                MultiIo::Recv { fd, once: true }
-            }
-            io => io,
-        };
-        let multishot = matches!(io, MultiIo::Recv { once: false, .. });
         let (sqe, ring) = match io {
             MultiIo::Accept { fd } => (
                 opcode::AcceptMulti::new(types::Fd(fd))
@@ -1203,7 +1182,6 @@ impl Uring {
                 m.armed = true;
                 m.ring = ring;
                 m.shared = shared;
-                m.multishot = multishot;
             }
             _ => panic!("giong: arming an invalid multishot operation"),
         }
@@ -1224,10 +1202,7 @@ impl Uring {
                 let pool = self.pool.clone();
                 return MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len));
             }
-            Some(Queued::Heap(data)) => {
-                self.heap_queued -= data.len();
-                return MultiPoll::Data(RecvBuf::heap(data));
-            }
+            Some(Queued::Heap(data)) => return MultiPoll::Data(RecvBuf::heap(data)),
             None => {}
         }
         if !m.armed {
@@ -1273,10 +1248,7 @@ impl Uring {
                 let pool = self.pool.clone();
                 Some(MultiPoll::Data(RecvBuf::pooled(pool, bid, off, len)))
             }
-            Some(Queued::Heap(data)) => {
-                self.heap_queued -= data.len();
-                Some(MultiPoll::Data(RecvBuf::heap(data)))
-            }
+            Some(Queued::Heap(data)) => Some(MultiPoll::Data(RecvBuf::heap(data))),
             None => None,
         };
         if let Some(got) = got {
@@ -1323,10 +1295,8 @@ impl Uring {
         self.more_waiters.remove(&key);
         m.orphan = true;
         for item in queued {
-            match &item {
-                Queued::Piece { .. } => self.pooled_queued -= 1,
-                Queued::Heap(data) => self.heap_queued -= data.len(),
-                Queued::Raw(_) => {}
+            if let Queued::Piece { .. } = item {
+                self.pooled_queued -= 1;
             }
             Self::release(&self.pool, kind, item);
         }
@@ -1397,55 +1367,10 @@ impl Uring {
                     *item = Queued::Heap(pool.copy_out(bid, off, len));
                     pool.release(bid);
                     self.recv_copied += u64::from(len);
-                    self.heap_queued += len as usize;
                 }
             }
         }
         self.pooled_queued = kept;
-    }
-
-    /// Bounds what readers that stopped reading can make the heap hold.
-    ///
-    /// A multishot receive takes data for as long as the pool has buffers,
-    /// dozens of buffers in one burst, before its reader has run; and when
-    /// the pool runs low, [`evacuate`](Self::evacuate) copies what readers
-    /// left to the heap. A peer whose reader never reads (an HTTP client that
-    /// sends requests and never reads the answers, so that the server blocks
-    /// on writing) could thereby make every connection hold half a megabyte.
-    ///
-    /// Once more than the pool's size waits on the heap, the multishot
-    /// receives of streams are stopped and every stream receive takes one
-    /// buffer per arm, which happens only when its reader asks for data: the
-    /// rest stays in the socket, under TCP flow control. Back to multishot
-    /// once the heap holds half of that again. Only runs while data waits
-    /// on the heap.
-    #[cold]
-    fn check_heap(&mut self) {
-        let budget = self.pool.count() as usize * self.pool.buf_len();
-        if self.heap_pressure {
-            self.heap_pressure = self.heap_queued > budget / 2;
-            return;
-        }
-        if self.heap_queued <= budget {
-            return;
-        }
-        self.heap_pressure = true;
-        let mut stop = Vec::new();
-        for (key, op) in self.ops.iter_keyed_mut() {
-            if let OpState::Multi(m) = op {
-                if m.kind == MultiKind::Recv && m.armed && m.multishot && !m.pausing && !m.orphan {
-                    m.pausing = true;
-                    stop.push(key);
-                }
-            }
-        }
-        for key in stop {
-            self.push(
-                opcode::AsyncCancel::new(key as u64)
-                    .build()
-                    .user_data(UD_IGNORE),
-            );
-        }
     }
 
     /// Closes a descriptor through the ring (batched with everything else).
@@ -1681,9 +1606,6 @@ impl Uring {
             if mem::take(&mut self.starved) && self.pool.no_spare() {
                 self.evacuate();
             }
-            if self.heap_queued != 0 || self.heap_pressure {
-                self.check_heap();
-            }
             self.pool.refill();
         }
         self.cqes = batch;
@@ -1772,7 +1694,6 @@ impl Uring {
                                         ));
                                         self.pool.release(bid);
                                         self.recv_copied += u64::from(len);
-                                        self.heap_queued += len as usize;
                                     }
                                     item => {
                                         if let Queued::Piece { .. } = item {
@@ -1951,7 +1872,6 @@ impl Uring {
             }
         }
         self.pooled_queued -= pieces;
-        self.heap_queued = 0;
     }
 
     pub(crate) fn take_graveyard(&mut self) -> Vec<Box<dyn Any>> {
