@@ -159,9 +159,11 @@ fn command_rows(offer: &Offer) -> String {
 fn agents_block(version: &str, offer: &Offer) -> String {
     let rows = command_rows(offer);
     let mcp = if offer.mcp {
-        "\nThe `giong` MCP server in `.mcp.json` serves these commands to agents and, while `giong dev`\n\
-         runs the service, the service's own view of itself (workers, tasks by spawn line, pools, a\n\
-         blocked worker): ask it rather than guess why the service is slow or stuck.\n"
+        "\nThe `giong` MCP server in `.mcp.json` serves the commands that only read (`check`, `doctor`,\n\
+         `explain`, ...) as tools; `fix` and the other changes join them only under\n\
+         `giong mcp --allow-writes`. While `giong dev` runs the service, it also serves the service's\n\
+         own view of itself (workers, tasks by spawn line, pools, a blocked worker): ask it rather\n\
+         than guess why the service is slow or stuck.\n"
     } else {
         ""
     };

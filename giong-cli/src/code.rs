@@ -67,6 +67,7 @@ codes! {
     NO_LINKER = 5021, "NoLinker", "no linker found";
     DEV_RUNNING = 5022, "DevRunning", "giong dev already serves this project";
     COMPILER_WARNING = 5023, "CompilerWarning", "the compiler has a warning";
+    LISTENS_ON_NETWORK = 5024, "ListensOnNetwork", "the service would listen on every network interface";
     BAD_NAME = 5030, "BadProjectName", "the project name is not valid";
     TARGET_NOT_EMPTY = 5031, "TargetNotEmpty", "the directory for the new project is not empty";
     BAD_TEMPLATE_CHOICE = 5032, "BadTemplateChoice", "the template does not offer that choice";
