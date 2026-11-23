@@ -2,8 +2,17 @@
 //! worker's `TcpListener::bind` of such an address shares the one socket, a
 //! byte goes to `GIONG_DEV_READY` for each, and the socket outlives the
 //! process. The test starts a copy of itself with an inherited socket.
+//!
+//! The hand-off is in debug builds and with the `dev` feature; a release
+//! build without it refuses to start under giong dev (the last test).
 
 #![cfg(unix)]
+// Without the hand-off only the refusal is tested: the helpers of the rest
+// go unused.
+#![cfg_attr(
+    not(any(debug_assertions, feature = "dev")),
+    allow(unused_imports, dead_code)
+)]
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -83,6 +92,7 @@ impl Drop for Service {
     }
 }
 
+#[cfg(any(debug_assertions, feature = "dev"))]
 #[test]
 fn restarts_share_the_socket_and_refuse_nothing() {
     if std::env::var_os("GIONG_DEV_TEST_ADDR").is_some() {
@@ -245,6 +255,7 @@ fn malformed_child() {
     giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
 }
 
+#[cfg(any(debug_assertions, feature = "dev"))]
 #[test]
 fn an_address_it_does_not_name_binds_as_usual() {
     if std::env::var_os("GIONG_DEV_TEST_ADDR").is_some() {
@@ -277,4 +288,38 @@ fn other_child() {
         let l = giong::net::TcpListener::bind(format!("127.0.0.1:{port}").as_str()).unwrap();
         drop(l);
     });
+}
+
+/// A build without the hand-off, started by giong dev: the bind of a fixed
+/// port is refused with a coded error that names the cause and the fix.
+#[cfg(not(any(debug_assertions, feature = "dev")))]
+#[test]
+fn a_build_without_the_hand_off_refuses_to_run_under_giong_dev() {
+    if std::env::var_os("GIONG_DEV_TEST_ADDR").is_some() {
+        return;
+    }
+    let (sock, addr) = listening_socket();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "release_child", "--nocapture"])
+        .env("GIONG_DEV_RELEASE", addr.to_string())
+        .env("GIONG_DEV_PARENT", std::process::id().to_string())
+        .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()));
+    let out = pass_fds(&mut cmd, vec![sock.as_raw_fd()]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn release_child() {
+    let Ok(addr) = std::env::var("GIONG_DEV_RELEASE") else {
+        return;
+    };
+    let err = giong::net::TcpListener::bind(addr.as_str()).unwrap_err();
+    assert_eq!(error::code(&err), Some(Code::InvalidConfig), "{err}");
+    assert!(err.to_string().contains("--release"), "{err}");
+    // Port 0 is not giong dev's: it binds.
+    giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
 }
