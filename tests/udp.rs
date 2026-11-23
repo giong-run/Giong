@@ -600,30 +600,50 @@ fn every_worker_can_bind_the_same_port() {
     // before the workers bind it.
     // macOS has 127.0.0.1 only, unless more are added to the interface.
     const LAST: u8 = if cfg!(target_os = "macos") { 1 } else { 2 };
+    const WORKERS: usize = 3;
     let ip = std::net::Ipv4Addr::new(127, 0, 0, LAST);
     let port = port_outside_ephemeral_range(ip.octets()).port();
-    let received = Arc::new(AtomicUsize::new(0));
+    let workers: Arc<Vec<EchoWorker>> =
+        Arc::new((0..WORKERS).map(|_| EchoWorker::default()).collect());
+    let next = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
-    let rt = giong::Builder::new().workers(3).build().unwrap();
+    let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
     let handle = rt.handle();
-    let (r, b) = (received.clone(), bound.clone());
+    let (w, n, b) = (workers.clone(), next.clone(), bound.clone());
     let server = std::thread::spawn(move || {
         rt.run(move |_| {
-            let (r, b) = (r.clone(), b.clone());
+            let (w, n, b) = (w.clone(), n.clone(), b.clone());
             async move {
+                let me = &w[n.fetch_add(1, Ordering::SeqCst)];
                 let socket = UdpSocket::bind((ip, port)).unwrap();
+                #[cfg(unix)]
+                me.fd.store(
+                    std::os::fd::AsRawFd::as_raw_fd(&socket) as usize,
+                    Ordering::SeqCst,
+                );
                 b.fetch_add(1, Ordering::SeqCst);
-                while let Some(Ok((got, from))) = giong::until_shutdown(socket.recv_from()).await {
+                // Every way out of the loop is recorded, so that a sender
+                // that gets no answer can say what each worker did (#340).
+                let end = loop {
+                    let (got, from) = match giong::until_shutdown(socket.recv_from()).await {
+                        None => break "shut down".to_string(),
+                        Some(Err(e)) => break format!("recv_from failed: {e}"),
+                        Some(Ok(received)) => received,
+                    };
+                    me.received.fetch_add(1, Ordering::SeqCst);
                     let reply = got.to_vec();
                     drop(got);
-                    socket.send_to(reply, from).await.0.unwrap();
-                    r.fetch_add(1, Ordering::SeqCst);
-                }
+                    if let Err(e) = socket.send_to(reply, from).await.0 {
+                        break format!("send_to {from} failed: {e}");
+                    }
+                    me.answered.fetch_add(1, Ordering::SeqCst);
+                };
+                *me.end.lock().unwrap() = Some(end);
             }
         })
         .unwrap();
     });
-    while bound.load(Ordering::SeqCst) < 3 {
+    while bound.load(Ordering::SeqCst) < WORKERS {
         std::thread::sleep(Duration::from_millis(1));
     }
     // Many senders: the kernel picks a worker by the sender's address.
@@ -636,12 +656,91 @@ fn every_worker_can_bind_the_same_port() {
         let message = format!("sender {i}");
         client.send_to(message.as_bytes(), (ip, port)).unwrap();
         let mut buf = [0u8; 64];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], message.as_bytes());
+        match client.recv_from(&mut buf) {
+            Ok((n, _)) => assert_eq!(&buf[..n], message.as_bytes()),
+            Err(e) => panic!(
+                "sender {i}: no answer in 10 s ({e}){}",
+                echo_report(&workers, &client, (ip, port).into())
+            ),
+        }
     }
     handle.shutdown();
     server.join().unwrap();
-    assert_eq!(received.load(Ordering::SeqCst), SENDERS);
+    let ends: Vec<_> = workers
+        .iter()
+        .map(|w| w.end.lock().unwrap().clone())
+        .collect();
+    assert!(
+        ends.iter().all(|e| e.as_deref() == Some("shut down")),
+        "{ends:?}"
+    );
+    let received: usize = workers
+        .iter()
+        .map(|w| w.received.load(Ordering::SeqCst))
+        .sum();
+    assert_eq!(received, SENDERS);
+}
+
+/// What one worker of `every_worker_can_bind_the_same_port` did.
+#[derive(Default)]
+struct EchoWorker {
+    /// Its socket's descriptor (Unix), to look at what waits in it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fd: AtomicUsize,
+    received: AtomicUsize,
+    answered: AtomicUsize,
+    /// Why its loop ended, once it has.
+    end: std::sync::Mutex<Option<String>>,
+}
+
+/// After a sender of `every_worker_can_bind_the_same_port` got no answer:
+/// what each worker did and what waits in its socket, whether the answer
+/// still comes, and whether another sender is answered.
+fn echo_report(workers: &[EchoWorker], client: &std::net::UdpSocket, server: SocketAddr) -> String {
+    let state = |label: &str| {
+        let mut out = format!("\n  {label}:");
+        for (i, w) in workers.iter().enumerate() {
+            out.push_str(&format!(
+                " worker {i}: {} received, {} answered, {}",
+                w.received.load(Ordering::SeqCst),
+                w.answered.load(Ordering::SeqCst),
+                w.end.lock().unwrap().as_deref().unwrap_or("running"),
+            ));
+            // Bytes waiting in the shared socket: a datagram there that no
+            // worker takes is a lost wake-up.
+            #[cfg(unix)]
+            {
+                let mut pending: libc::c_int = -1;
+                let fd = w.fd.load(Ordering::SeqCst) as libc::c_int;
+                // SAFETY: FIONREAD on a descriptor of this process, into a
+                // valid `int`.
+                unsafe { libc::ioctl(fd, libc::FIONREAD, &mut pending) };
+                out.push_str(&format!(", {pending} bytes waiting"));
+            }
+            out.push(';');
+        }
+        out
+    };
+    let mut report = state("at the timeout");
+    let mut buf = [0u8; 64];
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    report.push_str(match client.recv_from(&mut buf) {
+        Ok(_) => "\n  the answer came within 5 s more",
+        Err(_) => "\n  no answer within 5 s more either",
+    });
+    let other = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    other
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    other.send_to(b"another sender", server).unwrap();
+    report.push_str(match other.recv_from(&mut buf) {
+        Ok(_) => "\n  another sender is answered",
+        Err(_) => "\n  another sender is not answered either",
+    });
+    report.push_str(&state("at the end"));
+    report
 }
 
 #[test]
