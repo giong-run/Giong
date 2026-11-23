@@ -1,8 +1,9 @@
 ### Added
 
-- **giong**: `GIONG-E0020` (`Code::ThreadLimit`): `Runtime::run` says which worker thread
-  could not be started and why (a container's PID limit or `RLIMIT_NPROC`), with the
-  container's `pids.max`, instead of a bare "Resource temporarily unavailable".
+- **giong**: `GIONG-E0020` (`Code::ThreadLimit`): when the kernel refuses a worker thread
+  with `EAGAIN`, `Runtime::run` says which one could not be started and why (a container's
+  PID limit or `RLIMIT_NPROC`), with the container's `pids.max`, instead of a bare "Resource
+  temporarily unavailable". Other errors (`ENOMEM`, say) are returned as they are.
 
 ### Fixed
 
