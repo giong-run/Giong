@@ -11,6 +11,7 @@ name: CLI end to end
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "giong-cli/**"
       - "docs/errors/**"
@@ -30,6 +31,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # The stable compiler every workflow pins (scripts/release.py check).
+  RUST_STABLE: "1.100.0"
 
 jobs:
   e2e:
@@ -38,7 +41,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            toolchain: stable
+            toolchain: pinned
             slow: "1"
           # Cargo before its new build-dir layout (units in .fingerprint/
           # and deps/): giong clean must handle both.
@@ -46,20 +49,22 @@ jobs:
             toolchain: "1.97.0"
             slow: "0"
           - os: macos-15
-            toolchain: stable
+            toolchain: pinned
             slow: "1"
           - os: windows-2025
-            toolchain: stable
+            toolchain: pinned
             slow: "0"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
-      GIONG_E2E_SLOW: ${{ matrix.slow }}
+      # The slow scenarios build generated projects: not on draft pull
+      # requests (docs/DEVELOPMENT.md, CI tiers), always once ready.
+      GIONG_E2E_SLOW: ${{ (matrix.slow == '1' && !github.event.pull_request.draft) && '1' || '0' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: ${{ matrix.toolchain == 'pinned' && env.RUST_STABLE || matrix.toolchain }}
       - name: Unit and end-to-end tests
         run: cargo test -p giong-cli --all-targets --no-fail-fast
       - name: Known bugs (allowed to fail)
