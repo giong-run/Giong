@@ -10,18 +10,36 @@ use crate::harness::*;
 /// Commands that are not tools: the server itself, the ones that serve until
 /// stopped (`dev`, whose state is the `dev_status` tool, and `dashboard`),
 /// and the two about giong itself.
-const NOT_TOOLS: &[&str] = &["mcp", "dev", "dashboard", "help", "version"];
+const NOT_TOOLS: &[&str] = &[
+    "mcp",
+    "dev",
+    "dashboard",
+    "help",
+    "version",
+    "new",
+    "ai",
+    "test",
+];
 
-/// Commands that change files, containers or machines: tools only with
-/// `giong mcp --allow-writes` (security audit point 3).
-const WRITE_TOOLS: &[&str] = &["new", "fix", "clean", "image", "bench"];
+/// Commands that only change files, containers or machines: tools only with
+/// `giong mcp --allow-writes` (security audit point 3). Others, like
+/// `clean`, are listed read-only and refuse their writes.
+const WRITE_TOOLS: &[&str] = &["fix", "image", "bench"];
 
 /// Sends `lines` to a fresh `giong mcp` in `dir`, closes its input, and
 /// returns every line it printed, each parsed as JSON.
 fn session(dir: &std::path::Path, lines: &[String]) -> (Out, Vec<Value>) {
+    session_with(dir, &[], lines)
+}
+
+fn session_with(dir: &std::path::Path, flags: &[&str], lines: &[String]) -> (Out, Vec<Value>) {
     let mut input = lines.join("\n");
     input.push('\n');
-    let out = giong(["mcp"])
+    let mut run = giong(["mcp"]);
+    for f in flags {
+        run = run.arg(f);
+    }
+    let out = run
         .dir(dir)
         .stdin(input.into_bytes())
         .timeout(std::time::Duration::from_secs(120))
@@ -208,7 +226,6 @@ fn json_is_refused_with_a_usage_error() {
 /// server need `--allow-writes`, and every tool says what it does with MCP's
 /// annotations.
 #[test]
-#[ignore = "known bug: giong mcp serves writing and deleting commands by default, without annotations (security audit point 3)"]
 fn the_default_tools_are_read_only_and_say_so() {
     if !has_command("mcp") {
         return;
@@ -230,14 +247,71 @@ fn the_default_tools_are_read_only_and_say_so() {
             t["annotations"]["readOnlyHint"], true,
             "`{name}` is not marked read-only: {t:#}"
         );
+        for hint in ["destructiveHint", "idempotentHint"] {
+            assert!(
+                t["annotations"][hint].is_boolean(),
+                "`{name}` has no {hint}: {t:#}"
+            );
+        }
     }
+}
+
+/// Security point 3: a write on a read-only server is refused with the way
+/// to allow it, and what destroys data is refused even with
+/// `--allow-writes`. Nothing is deleted either way.
+#[test]
+fn writes_need_allow_writes_and_destruction_is_never_a_tool() {
+    if !has_command("mcp") || !has_command("clean") {
+        return;
+    }
+    let dir = TempDir::new("mcp-writes");
+    new_package(&dir, "mcpw", "");
+    let kept = dir.write("target/debug/keep-me", "build output");
+    let refused = |m: &Value| m.get("error").is_some() || m["result"]["isError"] == true;
+
+    let (_, msgs) = session(
+        dir.path(),
+        &[
+            initialize(),
+            req(2, "tools/call", json!({"name": "clean", "arguments": {}})),
+        ],
+    );
+    let m = by_id(&msgs, 2);
+    assert!(refused(m), "a read-only server cleaned: {m:#}");
+    assert!(m.to_string().contains("--allow-writes"), "{m:#}");
+    assert!(kept.exists(), "a read-only server deleted build output");
+
+    let (_, msgs) = session_with(
+        dir.path(),
+        &["--allow-writes"],
+        &[
+            initialize(),
+            req(2, "tools/list", json!({})),
+            req(
+                3,
+                "tools/call",
+                json!({"name": "clean", "arguments": {"all": true}}),
+            ),
+        ],
+    );
+    let tools = by_id(&msgs, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let clean = tools
+        .iter()
+        .find(|t| t["name"] == "clean")
+        .expect("clean is a tool");
+    assert_eq!(clean["annotations"]["readOnlyHint"], false, "{clean:#}");
+    let m = by_id(&msgs, 3);
+    assert!(refused(m), "clean --all ran over MCP: {m:#}");
+    assert!(kept.exists(), "clean --all deleted build output over MCP");
 }
 
 /// Security point 3: what reaches the model through `giong mcp` is masked.
 /// `env get` and `--reveal` print secrets for a person at a terminal; over
 /// MCP they are refused or masked.
 #[test]
-#[ignore = "known bug: the env tool hands unmasked secrets to the model (security audit point 3)"]
 fn the_env_tool_never_hands_a_secret_to_the_model() {
     if !has_command("mcp") || !has_command("env") {
         return;

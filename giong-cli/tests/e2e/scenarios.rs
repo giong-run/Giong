@@ -406,13 +406,13 @@ fn marker_for(round: u32, original: &str) -> String {
     }
 }
 
-/// Security point 1: `giong dev` asked to listen on every interface says so,
-/// because on café or office Wi-Fi that puts the service in development, its
-/// request log and its giong-mcp port on the network. `--lan` is the way to
-/// mean it. The warning comes when the sockets are bound, before any build.
+/// Security point 1: `giong dev` asked to listen on every interface serves
+/// on loopback instead and says so (GIONG-E5024), because on café or office
+/// Wi-Fi that would put the service in development, its request log and its
+/// giong-mcp port on the network. `--lan` is the way to mean it. The warning
+/// comes when the sockets are bound, before any build.
 #[cfg(unix)]
 #[test]
-#[ignore = "known bug: giong dev binds 0.0.0.0 without a warning (security audit point 1)"]
 fn dev_warns_before_listening_on_every_interface() {
     if !has_command("new")
         || !has_command("dev")
@@ -430,15 +430,30 @@ fn dev_warns_before_listening_on_every_interface() {
         Duration::from_secs(60),
         || TcpStream::connect(("127.0.0.1", port)).is_ok(),
     );
+    // This machine's address on its outgoing interface (no packet is sent).
+    let lan = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|u| u.connect("10.255.255.255:9").map(|()| u))
+        .and_then(|u| u.local_addr())
+        .ok()
+        .map(|a| a.ip())
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    if let Some(ip) = lan {
+        let reached =
+            TcpStream::connect_timeout(&SocketAddr::new(ip, port), Duration::from_secs(2));
+        assert!(
+            reached.is_err(),
+            "giong dev answers on {ip}:{port} without --lan"
+        );
+    }
     let start = Instant::now();
-    while !dev.log().contains("--lan") && start.elapsed() < Duration::from_secs(10) {
+    while !dev.log().contains("GIONG-E5024") && start.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(100));
     }
     dev.stop();
     std::thread::sleep(Duration::from_millis(500));
     let log = dev.log();
     assert!(
-        log.contains("0.0.0.0") && log.contains("--lan"),
+        log.contains("GIONG-E5024") && log.contains(&format!("127.0.0.1:{port}")),
         "no warning about listening on every interface:\n{log}"
     );
 }
