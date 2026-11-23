@@ -1981,9 +1981,15 @@ def llms():
                    f"docs as references); [SKILL.md]({SITE}skills/giong/SKILL.md)\n")
     pages = "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
                     for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors")
-                    and e[4] != "Errors")
+                    and e[4] != "Errors" and not e[0].startswith("cli/"))
     older = ("- Older versions, for code pinned to them: "
              + ", ".join(f"[{m}]({SITE}{md_file('get-started', m)})" for m, _ in OLD) + "\n") if OLD else ""
+    cli = ""
+    if "cli" in have:
+        rows = "".join(f"| {want} | [`{cmd}`]({SITE}{md_file('cli/' + slug)}) |\n"
+                       for want, cmd, slug in C.CLI_TASKS if "cli/" + slug in have)
+        cli = (f"\n## The giong command\n\n{C.CLI_LLMS}\n\n| You want | Run |\n|---|---|\n{rows}\n"
+               f"Every command and its flags: {SITE}{md_file('cli')}\n")
     extra_protocols = ", HTTP/3" if "giong-quic" in names else ""
     grpc = ", gRPC" if "giong-grpc" in names else ""
     return f"""# giong
@@ -2043,7 +2049,7 @@ Facts that are easy to get wrong:
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
 {pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
-
+{cli}
 ## Docs
 
 {api}- [Get started]({SITE}docs/index.md): requirements, a first server, examples, limits

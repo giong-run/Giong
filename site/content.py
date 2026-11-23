@@ -774,6 +774,35 @@ CLI_START_STEPS = [
     ("check", "is what to run before calling a change done; `giong fix` applies what needs no judgement."),
 ]
 
+# llms.txt's section on the giong command, and its task table: (you want, run, page).
+CLI_LLMS = """`giong` (`curl -fsSL https://giong.run/install.sh | sh`, or `cargo install giong-cli --locked`)
+starts, runs, checks and ships a giong service. Every command takes `--json` and answers with
+one document whose findings carry a `GIONG-E` code, the place in the source, the cause and the
+fix; exit status 0 (nothing wrong), 1 (an error found) or 2 (the command could not run).
+To develop, a project has one runner: `giong dev --background` once (it returns when the service
+serves on 127.0.0.1 and rebuilds on every save), then `giong dev status --json` and
+`giong dev logs`, and `giong dev stop` at the end. Not `cargo run`, a release build, Docker or a
+second terminal. Run `giong check --json` before calling a change done."""
+CLI_TASKS = [
+    ("Start a project", "giong new api --template web --db postgres", "new"),
+    ("Teach the project to coding agents", "giong ai init", "ai"),
+    ("Run it while you work", "giong dev --background", "dev"),
+    ("What is wrong with my code?", "giong check --json", "check"),
+    ("Apply the safe fixes", "giong fix", "fix"),
+    ("Run the tests", "giong test", "test"),
+    ("Is my machine right?", "giong doctor", "doctor"),
+    ("A database and migrations", "giong db up, giong db migrate", "db"),
+    ("Which settings, from where", "giong env check", "env"),
+    ("The routes, an OpenAPI document", "giong routes, giong openapi", "routes"),
+    ("Real requests as tests", "giong record save last", "record"),
+    ("See requests, routes and workers", "giong dev --ui", "dashboard"),
+    ("Look inside the running service", "giong top", "top"),
+    ("Measure a change", "giong bench --against main", "bench"),
+    ("Ship an image", "giong image --push <registry>", "image"),
+    ("Free disk", "giong clean", "clean"),
+    ("Give an agent these tools", "giong mcp", "mcp"),
+]
+
 CLI_ORDER = ["new", "ai", "dev", "check", "fix", "test", "doctor", "db", "env", "routes",
              "record", "dashboard", "top", "bench", "image", "clean", "mcp", "explain"]
 CLI_COMMANDS = {
