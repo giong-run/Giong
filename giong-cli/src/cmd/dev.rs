@@ -278,7 +278,7 @@ impl Dev {
             dev.say(
                 "warning",
                 finding.title.clone(),
-                json!({"code": finding.code.to_string()}),
+                json!({"code": finding.code.to_string(), "detail": finding.detail, "fix": finding.fix}),
             );
             dev.report.push(finding);
         }
