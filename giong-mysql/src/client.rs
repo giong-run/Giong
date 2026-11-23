@@ -16,7 +16,7 @@ use std::task::{Context, Poll, Waker};
 use crate::config::Config;
 use crate::connect::{self, Identity, Message, ReadBuf, Startup, Stream};
 use crate::error::{DbError, Error, ErrorKind};
-use crate::protocol::{self, com, status, ColumnDef, Reader};
+use crate::protocol::{self, com, status, Reader};
 use crate::row::{Column, ResultSet, Row, RowsBuilder};
 use crate::session;
 use crate::types::{ColumnType, ToSql};
@@ -380,17 +380,52 @@ enum Phase {
     Rows,
 }
 
+/// The tasks waiting for a request's answer: almost always one, which is
+/// kept without an allocation.
+#[derive(Default)]
+struct Wakers {
+    first: Option<Waker>,
+    more: Vec<Waker>,
+}
+
+impl Wakers {
+    /// Adds `waker` unless it would wake a task already here.
+    fn register(&mut self, waker: &Waker) {
+        match &self.first {
+            None => self.first = Some(waker.clone()),
+            Some(w) if w.will_wake(waker) => {}
+            Some(_) => {
+                if !self.more.iter().any(|w| w.will_wake(waker)) {
+                    self.more.push(waker.clone());
+                }
+            }
+        }
+    }
+
+    fn wake_all(&mut self) {
+        if let Some(w) = self.first.take() {
+            w.wake();
+        }
+        for w in self.more.drain(..) {
+            w.wake();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlotInner {
     /// The sequence number the next packet of the answer must have.
     seq: u8,
     phase: Phase,
-    wakers: Vec<Waker>,
+    wakers: Wakers,
     /// Nobody is waiting for the result any more: rows are not kept.
     abandoned: bool,
     error: Option<Error>,
     prepared: Option<protocol::PrepareOk>,
     columns: Vec<Column>,
+    /// Definitions read so far that match the statement's columns from its
+    /// last run, in order, and so were not copied into `columns`.
+    matched: usize,
     /// The columns of the first result set, once it has been described.
     result_columns: Option<Rc<[Column]>>,
     rows: RowsBuilder,
@@ -466,9 +501,7 @@ impl Future for Wait {
             self.done = true;
             return Poll::Ready(outcome);
         }
-        if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            inner.wakers.push(cx.waker().clone());
-        }
+        inner.wakers.register(cx.waker());
         Poll::Pending
     }
 }
@@ -1309,9 +1342,7 @@ impl Conn {
             let mut inner = slot.inner.borrow_mut();
             let e = inner.error.take().unwrap_or_else(|| err.clone());
             inner.outcome = Some(Err(e));
-            for w in inner.wakers.drain(..) {
-                w.wake();
-            }
+            inner.wakers.wake_all();
         }
         self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
@@ -1445,6 +1476,7 @@ impl Conn {
                         )));
                     }
                     inner.columns.clear();
+                    inner.matched = 0;
                     inner.phase = Phase::Columns { left: count };
                     false
                 }
@@ -1468,14 +1500,44 @@ impl Conn {
                         "the server sent column definitions larger than max_result_size",
                     ));
                 }
-                let def: ColumnDef = protocol::column_def(payload)?;
-                inner.columns.push(Column::from_def(def));
+                let def = protocol::column_def_ref(payload)?;
+                // A statement run again describes the same columns as last
+                // time: while each definition matches them, none is copied.
+                let kept = match &slot.kind {
+                    Kind::Execute { stmt, .. } if !inner.first_done => {
+                        Some(stmt.columns.borrow().clone())
+                    }
+                    _ => None,
+                };
+                let same = inner.columns.is_empty()
+                    && kept
+                        .as_ref()
+                        .and_then(|k| k.get(inner.matched))
+                        .is_some_and(|c| c.is(&def));
+                if same {
+                    inner.matched += 1;
+                } else {
+                    if let Some(k) = &kept {
+                        let matched = std::mem::take(&mut inner.matched);
+                        inner.columns.extend(k[..matched].iter().cloned());
+                    }
+                    inner.columns.push(Column::from_def(def));
+                }
                 if left > 1 {
                     inner.phase = Phase::Columns { left: left - 1 };
                 } else {
                     inner.phase = Phase::Rows;
                     if !inner.first_done {
-                        let columns = self.share_columns(&slot.kind, &inner.columns);
+                        let columns = match kept {
+                            Some(k) if inner.columns.is_empty() && inner.matched == k.len() => k,
+                            kept => {
+                                if let Some(k) = kept {
+                                    let matched = std::mem::take(&mut inner.matched);
+                                    inner.columns.extend(k[..matched].iter().cloned());
+                                }
+                                self.share_columns(&slot.kind, &inner.columns)
+                            }
+                        };
                         inner.result_columns = Some(columns);
                     }
                 }
@@ -1706,9 +1768,7 @@ impl Conn {
             },
         };
         inner.outcome = Some(outcome);
-        for w in inner.wakers.drain(..) {
-            w.wake();
-        }
+        inner.wakers.wake_all();
     }
 
     /// Takes a cached statement out of the cache when the server no longer

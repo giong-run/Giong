@@ -59,8 +59,8 @@ instructions per request.
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 43,175 | 44,191 |
 | `web` | a giong-web router with a path parameter, raw client | 13,381 | 14,254 |
 | `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,224 | 10,838 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 14,137 | 14,751 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,241 | 10,855 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,711 | 14,326 |
 
 `udp-echo` went down with the UDP changes of 0.9 (#139, #142): 5,358 to 4,137 on io_uring and
 5,031 to 4,783 on epoll, counted with glibc's malloc as all counts were until 2026-11-20, with
