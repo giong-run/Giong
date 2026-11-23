@@ -42,24 +42,58 @@ impl FakeDns {
             .map(|((name, t), reply)| ((name.to_string(), t), reply))
             .collect();
         let table = Arc::new(table);
-        // A UDP port whose TCP twin is free too (another test may hold it).
-        // Linux 6.0.16 to 6.0.19 answer a TCP bind to a busy address with
-        // success and leave the socket unbound, and `listen` then picks
-        // another port: check where the listener really is.
-        let (udp, tcp, addr) = (0..100)
-            .find_map(|_| {
-                let udp = StdUdpSocket::bind("127.0.0.1:0").unwrap();
-                let addr = udp.local_addr().unwrap();
-                let tcp = StdTcpListener::bind(addr).ok()?;
-                (tcp.local_addr().ok()? == addr).then_some((udp, tcp, addr))
+        // A port free for both TCP and UDP (another test may hold either).
+        // Tries alternate between a fresh TCP port with its UDP twin and a
+        // fresh UDP port with its TCP twin, as each way fails in runs on
+        // Windows, which hands out ports in sequence: the TCP twin of a
+        // fresh UDP port can be one this suite's connections left in
+        // TIME_WAIT, and on a runner 100 fresh TCP ports in a row had their
+        // UDP twins refused. Sockets whose twin is busy stay open until a
+        // pair is found: closed at once, the next bind may be given the
+        // same port again.
+        let (mut busy_tcp, mut busy_udp, mut refusal) = (Vec::new(), Vec::new(), None);
+        let (udp, tcp, addr) = (0..200)
+            .find_map(|i| {
+                if i % 2 == 0 {
+                    let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
+                    let addr = tcp.local_addr().unwrap();
+                    match StdUdpSocket::bind(addr) {
+                        Ok(udp) => Some((udp, tcp, addr)),
+                        Err(err) => {
+                            refusal = Some(err);
+                            busy_tcp.push(tcp);
+                            None
+                        }
+                    }
+                } else {
+                    let udp = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+                    let addr = udp.local_addr().unwrap();
+                    match StdTcpListener::bind(addr) {
+                        Ok(tcp) => Some((udp, tcp, addr)),
+                        Err(err) => {
+                            refusal = Some(err);
+                            busy_udp.push(udp);
+                            None
+                        }
+                    }
+                }
             })
-            .expect("no free UDP and TCP port pair");
+            .unwrap_or_else(|| panic!("no free UDP and TCP port pair; last refusal: {refusal:?}"));
+        drop((busy_tcp, busy_udp));
         let queries = Arc::new(Mutex::new(Vec::new()));
 
         let (t, q) = (table.clone(), queries.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            loop {
+                let (n, from) = match udp.recv_from(&mut buf) {
+                    Ok(got) => got,
+                    // Windows reports a "port unreachable" answer to an
+                    // earlier reply (its asker had gone) on the next
+                    // receive; the server carries on.
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(_) => return,
+                };
                 let Some(reply) = answer(&buf[..n], &t, &q, false) else {
                     continue;
                 };
@@ -320,7 +354,13 @@ fn a_server_nobody_listens_on_is_a_coded_error() {
         let os = source
             .downcast_ref::<std::io::Error>()
             .expect("an io::Error");
-        assert_eq!(os.kind(), ErrorKind::ConnectionRefused);
+        // Windows reports a refused datagram as a reset.
+        let refused = if cfg!(windows) {
+            ErrorKind::ConnectionReset
+        } else {
+            ErrorKind::ConnectionRefused
+        };
+        assert_eq!(os.kind(), refused);
     });
 }
 

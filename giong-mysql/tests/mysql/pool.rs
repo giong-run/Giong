@@ -478,12 +478,20 @@ fn statements_that_change_the_session_are_refused_on_shared_connections() {
             "SELECT @v := 1",
             "PREPARE p FROM 'SELECT 1'",
             "HANDLER pool_tmp OPEN",
+            // Versioned comments, as dump tools write them, run as SQL.
+            "/*!40103 SET time_zone = '+00:00' */",
+            "/*!40101 SET NAMES latin1 */",
         ] {
             let e = pool.execute(sql, &[]).await.unwrap_err();
             assert_eq!(e.kind(), ErrorKind::Statement, "{sql:?}: {e}");
             assert!(e.to_string().contains("pool.get()"), "{e}");
             assert!(e.to_string().contains("session_variable"), "{e}");
         }
+        let e = pool
+            .execute("/*!40000 LOCK TABLES t WRITE */", &[])
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("LOCK controls a transaction"), "{e}");
         // Reading is fine, and so is changing the server for everyone.
         pool.query("SELECT @@sql_mode, @v, @@global.max_connections", &[])
             .await
