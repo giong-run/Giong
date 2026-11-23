@@ -3,13 +3,14 @@ name: Windows runtime
 # giong itself on real Windows: the completion port driver in the runtime,
 # with the parts of the test suite that are ported so far. A draft, and a pull
 # request that changes none of the code built here, skip the tests (job `plan`,
-# scripts/ci-scope.py --relevant); the merge queue always runs them, and
-# `windows-checks` is the one name to require for them.
+# scripts/ci-scope.py --relevant). Outside pull requests (the merge queue, a
+# push to main, a dispatch of CI) ci.yml calls this workflow, so that its
+# `all-checks` holds a merge back when a job here fails.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

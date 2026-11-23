@@ -9,7 +9,7 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -126,7 +126,7 @@ struct Conn {
     requests: Cell<u64>,
     /// While a pool lends the connection to one task: the flag its cancel
     /// tokens check, cleared when the connection goes back.
-    lease: RefCell<Option<Arc<AtomicBool>>>,
+    lease: RefCell<Option<Arc<Lease>>>,
     /// The server refused a write because it is a standby (it was a primary
     /// once, or DNS still points at it): a pool closes the connection rather
     /// than keep sending writes there.
@@ -666,7 +666,9 @@ impl Client {
     ///
     /// A token taken from a [`PooledClient`](crate::PooledClient) stops
     /// working when the connection goes back to the pool, so that it cannot
-    /// cancel the statements of the tasks that use the connection next.
+    /// cancel the statements of the tasks that use the connection next; and
+    /// a connection that goes back while a request from such a token is on
+    /// its way is closed rather than lent to another task.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             config: self.conn.config.without_password(),
@@ -737,14 +739,19 @@ impl Client {
     /// Starts lending the connection to one task: cancel tokens taken from
     /// now on work until [`end_lease`](Self::end_lease).
     pub(crate) fn begin_lease(&self) {
-        *self.conn.lease.borrow_mut() = Some(Arc::new(AtomicBool::new(true)));
+        *self.conn.lease.borrow_mut() = Some(Arc::new(Lease::default()));
     }
 
     /// Ends the lease: the cancel tokens taken during it stop working.
-    pub(crate) fn end_lease(&self) {
-        if let Some(lease) = self.conn.lease.borrow_mut().take() {
-            lease.store(false, Ordering::Release);
-        }
+    /// Returns whether a cancel request taken during it may still be on its
+    /// way to the server, in which case the connection must not be lent to
+    /// another task: the request would stop that task's statement.
+    pub(crate) fn end_lease(&self) -> bool {
+        self.conn
+            .lease
+            .borrow_mut()
+            .take()
+            .is_some_and(|lease| lease.end())
     }
 
     /// Whether the connection should not be used any more although it works:
@@ -1806,9 +1813,50 @@ pub struct CancelToken {
     /// need.
     config: Config,
     key: Option<(i32, i32)>,
-    /// Set for a token taken from a pooled connection: cleared when the
+    /// Set for a token taken from a pooled connection: ended when the
     /// connection goes back to the pool.
-    lease: Option<Arc<AtomicBool>>,
+    lease: Option<Arc<Lease>>,
+}
+
+/// A pooled connection's time with one task, shared with the cancel tokens
+/// taken during it: whether it has ended, and how many cancel requests are
+/// on their way.
+#[derive(Default)]
+pub(crate) struct Lease(AtomicU32);
+
+impl Lease {
+    /// Set once the connection has gone back to its pool.
+    const ENDED: u32 = 1 << 31;
+
+    /// Counts a cancel request on its way, unless the lease has ended.
+    fn start_cancel(&self) -> bool {
+        let mut v = self.0.load(Ordering::Acquire);
+        while v & Self::ENDED == 0 {
+            match self
+                .0
+                .compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
+        false
+    }
+
+    /// A cancel request that `start_cancel` counted got its answer.
+    fn finish_cancel(&self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn is_ended(&self) -> bool {
+        self.0.load(Ordering::Acquire) & Self::ENDED != 0
+    }
+
+    /// Ends the lease; returns whether a cancel request is still on its way
+    /// (or was given up on the way, which counts the same).
+    fn end(&self) -> bool {
+        self.0.fetch_or(Self::ENDED, Ordering::AcqRel) & !Self::ENDED != 0
+    }
 }
 
 impl CancelToken {
@@ -1822,16 +1870,15 @@ impl CancelToken {
     /// Not cancel safe: if the future is dropped, the request may still reach
     /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
-        if self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| !lease.load(Ordering::Acquire))
-        {
-            return Err(Error::closed(
+        let gone = || {
+            Error::closed(
                 "the connection this cancel token was taken from has gone back to its pool, \
                  where other tasks use it, so nothing was sent; take a new token from the next \
                  connection",
-            ));
+            )
+        };
+        if self.lease.as_ref().is_some_and(|lease| lease.is_ended()) {
+            return Err(gone());
         }
         let key = self.key.ok_or_else(|| {
             Error::new(
@@ -1840,7 +1887,19 @@ impl CancelToken {
                  between), so it cannot be cancelled",
             )
         })?;
-        connect::cancel(&self.config, key).await
+        let Some(lease) = &self.lease else {
+            return connect::cancel(&self.config, key).await;
+        };
+        // Counted until the answer comes: a connection that goes back to the
+        // pool meanwhile is closed rather than lent to a task whose
+        // statement the request would stop. A request given up on the way
+        // stays counted, for the same reason.
+        if !lease.start_cancel() {
+            return Err(gone());
+        }
+        let sent = connect::cancel(&self.config, key).await;
+        lease.finish_cancel();
+        sent
     }
 }
 
