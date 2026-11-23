@@ -1116,15 +1116,29 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
     #[cfg(windows)]
     let (system, last) = match traced {
         Some(origins) => {
-            let now = open_handles();
-            let events: Vec<usize> = now
-                .iter()
-                .filter(|(n, what)| what.starts_with("Event") && handles_first.get(n) != Some(what))
-                .map(|(n, _)| *n)
-                .collect();
+            // Settle before the report, which opens handles of its own
+            // while it looks up where each event was made. The count may
+            // stay up by the new events still open, at most the allowance;
+            // whether they are Winsock's is the report's to say.
+            let give_up = Instant::now() + Duration::from_secs(15);
+            let (last, events) = loop {
+                let events: Vec<usize> = open_handles()
+                    .iter()
+                    .filter(|(n, what)| {
+                        what.starts_with("Event") && handles_first.get(n) != Some(what)
+                    })
+                    .map(|(n, _)| *n)
+                    .collect();
+                let now = open_fds();
+                let settled = first + events.len().min(WINSOCK_EVENTS);
+                if now <= settled || Instant::now() > give_up {
+                    break (now, events);
+                }
+                eprintln!("soak: {now} descriptors open, {settled} once settled; waiting");
+                std::thread::sleep(Duration::from_secs(1));
+            };
             let (report, winsock) = origins.report(&events);
             let system = winsock.min(WINSOCK_EVENTS);
-            let last = settled_fds(first + system);
             let since = new_handles(&handles_first);
             new = format!("; after tracing: {last}; new since the first life: {since}{report}");
             (system, last)
