@@ -490,18 +490,22 @@ fn answers_are_cached_for_their_ttl() {
 
 #[test]
 fn lookups_of_one_name_at_the_same_time_share_one_query() {
+    // Late, so that every lookup starts while the queries are out; both
+    // 300 ms, so that the second answer has a grace as long (the first
+    // answer's time) and a slow runner waking one reply thread late does
+    // not drop a family. (With 50 ms, a macOS runner returned only AAAA.)
     let dns = FakeDns::start(vec![
         (
             ("shared.test", A),
             Reply::Late(
-                Duration::from_millis(50),
+                Duration::from_millis(300),
                 vec![a("shared.test", [192, 0, 2, 7], 300)],
             ),
         ),
         (
             ("shared.test", AAAA),
             Reply::Late(
-                Duration::from_millis(50),
+                Duration::from_millis(300),
                 vec![aaaa("shared.test", "2001:db8::7", 300)],
             ),
         ),
