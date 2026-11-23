@@ -282,6 +282,20 @@ fn redis_up_writes_redis_url() {
     // Migrations are for SQL databases.
     let (s, r) = p.giong(&["db", "migrate"]);
     assert_eq!(s, 2, "{r}");
+    // The container is named after this checkout, and without
+    // .giong/db.json its password is unknown: refused, not guessed.
+    let state = std::fs::read_to_string(p.dir.join(".giong/db.json")).unwrap();
+    let name = format!("giong-giongclitest-redis-{}-redis-", std::process::id());
+    assert!(state.contains(&name), "{state}");
+    std::fs::remove_file(p.dir.join(".giong/db.json")).unwrap();
+    let (s, r) = p.giong(&["db", "up"]);
+    assert_ne!(s, 0, "{r}");
+    assert_eq!(r["error"]["code"].as_str(), Some("GIONG-E5049"), "{r}");
+    // down finds it by its label; up then starts a fresh one.
+    let (s, r) = p.giong(&["db", "down", "--volumes"]);
+    assert_eq!(s, 0, "{r}");
+    let (s, r) = p.giong(&["db", "up"]);
+    assert_eq!(s, 0, "{r}");
 }
 
 #[test]
