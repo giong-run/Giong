@@ -275,3 +275,62 @@ fn a_missing_secret_is_named_before_anything_is_sent() {
         "a request went out without its secret"
     );
 }
+
+/// Security point 2: a case file is a test meant to be committed and
+/// replayed in CI, so no secret from a request may land in it. Headers are
+/// redacted already; a password in a JSON body, a key in a query string and a
+/// card number must not be written either. `save` either turns them into
+/// `{{env:...}}` placeholders or refuses with a coded error, and never echoes
+/// them on stdout.
+#[test]
+#[ignore = "known bug: record save writes request body and query secrets into the case file (security audit point 2)"]
+fn a_saved_case_holds_no_secret_from_a_body_or_a_query() {
+    if !has_command("record") {
+        return;
+    }
+    const SECRETS: [&str; 3] = ["hunter2-SECRET", "AK-SECRET-123", "4242424242424242"];
+    let mut login: Value = serde_json::from_str(&exchange(
+        "POST",
+        "/login",
+        json!([["content-type", "application/json"]]),
+        r#"{"user":"ana","password":"hunter2-SECRET","card":"4242424242424242"}"#,
+        200,
+        r#"{"ok":true}"#,
+    ))
+    .unwrap();
+    login["query"] = json!("api_key=AK-SECRET-123&page=2");
+    let dir = TempDir::new("record-secrets");
+    new_package(&dir, "recsec", "");
+    let log_path = dir.write("service.log", &format!("{login}\n"));
+    let cases = dir.join("cases.json");
+    let out = giong(["record", "save", "all", "--json", "--from"])
+        .arg(&log_path)
+        .arg("--out")
+        .arg(&cases)
+        .dir(dir.path())
+        .run();
+    let v = out.report("record");
+    let leaked = |text: &str| -> Vec<&str> {
+        SECRETS
+            .iter()
+            .copied()
+            .filter(|s| text.contains(s))
+            .collect()
+    };
+    assert_eq!(leaked(&out.stdout), Vec::<&str>::new(), "{}", out.dump());
+    assert_eq!(leaked(&out.stderr), Vec::<&str>::new(), "{}", out.dump());
+    if out.code() == 0 {
+        let text = std::fs::read_to_string(&cases).unwrap();
+        assert_eq!(leaked(&text), Vec::<&str>::new(), "{text}");
+        // What is not secret is kept, so the case still means something.
+        assert!(
+            text.contains("page=2") || text.contains("\"page\""),
+            "{text}"
+        );
+        assert!(text.contains("ana"), "{text}");
+    } else {
+        assert!(v["error"]["code"].is_string(), "{}", out.dump());
+        let text = std::fs::read_to_string(&cases).unwrap_or_default();
+        assert_eq!(leaked(&text), Vec::<&str>::new(), "{text}");
+    }
+}

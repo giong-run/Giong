@@ -128,11 +128,15 @@ struct Dev {
 
 impl Dev {
     fn start(project: &Path, port: u16) -> Dev {
+        Dev::start_on(project, &format!("127.0.0.1:{port}"), port)
+    }
+
+    fn start_on(project: &Path, listen: &str, port: u16) -> Dev {
         let mut child = Command::new(GIONG)
             .args(["dev", "--json"])
             .current_dir(project)
             // The templates read LISTEN; PORT for any other convention.
-            .env("LISTEN", format!("127.0.0.1:{port}"))
+            .env("LISTEN", listen)
             .env("PORT", port.to_string())
             .env("WORKERS", "2")
             .env_remove("CARGO_TARGET_DIR")
@@ -186,6 +190,17 @@ impl Dev {
 
 impl Drop for Dev {
     fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl Dev {
+    /// Ctrl+C, then a kill if it has not ended within 10 s.
+    fn stop(&mut self) {
+        // Already ended (std keeps the status), so no signal to a reused pid.
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
         #[cfg(unix)]
         {
             let _ = Command::new("kill")
@@ -389,4 +404,41 @@ fn marker_for(round: u32, original: &str) -> String {
     } else {
         format!("\"e2e reload {}", round - 1)
     }
+}
+
+/// Security point 1: `giong dev` asked to listen on every interface says so,
+/// because on café or office Wi-Fi that puts the service in development, its
+/// request log and its giong-mcp port on the network. `--lan` is the way to
+/// mean it. The warning comes when the sockets are bound, before any build.
+#[cfg(unix)]
+#[test]
+#[ignore = "known bug: giong dev binds 0.0.0.0 without a warning (security audit point 1)"]
+fn dev_warns_before_listening_on_every_interface() {
+    if !has_command("new")
+        || !has_command("dev")
+        || !crate::harness::toolchain("dev_warns_before_listening_on_every_interface")
+    {
+        return;
+    }
+    let dir = TempDir::new("scenario-dev-lan");
+    let (out, app) = new_project(&dir, "app", &[]);
+    out.expect_code(0);
+    let port = free_port();
+    let mut dev = Dev::start_on(&app, &format!("0.0.0.0:{port}"), port);
+    dev.wait_until(
+        "giong dev to bind its sockets",
+        Duration::from_secs(60),
+        || TcpStream::connect(("127.0.0.1", port)).is_ok(),
+    );
+    let start = Instant::now();
+    while !dev.log().contains("--lan") && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    dev.stop();
+    std::thread::sleep(Duration::from_millis(500));
+    let log = dev.log();
+    assert!(
+        log.contains("0.0.0.0") && log.contains("--lan"),
+        "no warning about listening on every interface:\n{log}"
+    );
 }

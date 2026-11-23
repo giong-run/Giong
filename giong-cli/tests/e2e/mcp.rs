@@ -12,6 +12,10 @@ use crate::harness::*;
 /// and the two about giong itself.
 const NOT_TOOLS: &[&str] = &["mcp", "dev", "dashboard", "help", "version"];
 
+/// Commands that change files, containers or machines: tools only with
+/// `giong mcp --allow-writes` (security audit point 3).
+const WRITE_TOOLS: &[&str] = &["new", "fix", "clean", "image", "bench"];
+
 /// Sends `lines` to a fresh `giong mcp` in `dir`, closes its input, and
 /// returns every line it printed, each parsed as JSON.
 fn session(dir: &std::path::Path, lines: &[String]) -> (Out, Vec<Value>) {
@@ -80,7 +84,7 @@ fn it_initializes_and_lists_a_tool_for_every_command() {
         .clone();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for c in commands() {
-        if !NOT_TOOLS.contains(&c.as_str()) {
+        if !NOT_TOOLS.contains(&c.as_str()) && !WRITE_TOOLS.contains(&c.as_str()) {
             assert!(
                 names.contains(&c.as_str()),
                 "`giong {c}` is not an MCP tool (tools: {names:?})"
@@ -197,4 +201,74 @@ fn json_is_refused_with_a_usage_error() {
         .run();
     let v = out.report("mcp");
     assert_eq!(v["error"]["code"], "GIONG-E5000", "{}", out.dump());
+}
+
+/// Security point 3: an agent with `giong mcp` and no person watching gets
+/// read-only tools by default. Commands that write, build images or load a
+/// server need `--allow-writes`, and every tool says what it does with MCP's
+/// annotations.
+#[test]
+#[ignore = "known bug: giong mcp serves writing and deleting commands by default, without annotations (security audit point 3)"]
+fn the_default_tools_are_read_only_and_say_so() {
+    if !has_command("mcp") {
+        return;
+    }
+    let dir = TempDir::new("mcp-readonly");
+    let (out, msgs) = session(dir.path(), &[initialize(), req(2, "tools/list", json!({}))]);
+    out.expect_code(0);
+    let tools = by_id(&msgs, 2)["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for t in &tools {
+        let name = t["name"].as_str().unwrap();
+        assert!(
+            !WRITE_TOOLS.contains(&name),
+            "`{name}` is a tool without --allow-writes"
+        );
+        assert_eq!(
+            t["annotations"]["readOnlyHint"], true,
+            "`{name}` is not marked read-only: {t:#}"
+        );
+    }
+}
+
+/// Security point 3: what reaches the model through `giong mcp` is masked.
+/// `env get` and `--reveal` print secrets for a person at a terminal; over
+/// MCP they are refused or masked.
+#[test]
+#[ignore = "known bug: the env tool hands unmasked secrets to the model (security audit point 3)"]
+fn the_env_tool_never_hands_a_secret_to_the_model() {
+    if !has_command("mcp") || !has_command("env") {
+        return;
+    }
+    let dir = TempDir::new("mcp-env");
+    new_package(&dir, "mcpenv", "");
+    dir.write(".env.example", "E2E_MCP_TOKEN=\n");
+    dir.write(".env", "E2E_MCP_TOKEN=mcp-secret-77\n");
+    let (out, msgs) = session(
+        dir.path(),
+        &[
+            initialize(),
+            req(
+                2,
+                "tools/call",
+                json!({"name": "env", "arguments": {"reveal": true}}),
+            ),
+            req(
+                3,
+                "tools/call",
+                json!({"name": "env", "arguments": {"words": ["get", "E2E_MCP_TOKEN"]}}),
+            ),
+            req(4, "tools/call", json!({"name": "env", "arguments": {}})),
+        ],
+    );
+    out.expect_code(0);
+    for id in [2, 3, 4] {
+        let m = by_id(&msgs, id).to_string();
+        assert!(
+            !m.contains("mcp-secret-77"),
+            "request {id} leaked the secret: {m}"
+        );
+    }
 }

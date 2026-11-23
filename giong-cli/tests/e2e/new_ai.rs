@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::harness::{giong, has_command, new_package, TempDir};
+use crate::harness::{giong, grep_files, has_command, new_package, TempDir};
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -517,4 +517,43 @@ fn test_reports_failures_by_name_and_loads_dotenv() {
         .run();
     out.report("test");
     out.expect_code(0);
+}
+
+/// Security point 1: a new service listens on loopback while it is being
+/// developed, so café or office Wi-Fi cannot reach it, its request log or
+/// its giong-mcp port. Only the Dockerfile, where a container needs it, may
+/// say 0.0.0.0.
+#[test]
+#[ignore = "known bug: the templates default LISTEN to 0.0.0.0 (security audit point 1)"]
+fn a_new_service_listens_on_loopback_outside_its_container() {
+    if !has_command("new") {
+        return;
+    }
+    for template in ["web", "grpc", "worker"] {
+        let dir = TempDir::new("new-loopback");
+        let out = new_local(dir.path(), "svc", &["--template", template]);
+        out.report("new");
+        out.expect_code(0);
+        let p = dir.join("svc");
+        let example = std::fs::read_to_string(p.join(".env.example")).unwrap_or_default();
+        for line in example.lines() {
+            let line = line.trim();
+            assert!(
+                line.starts_with('#') || !line.contains("0.0.0.0"),
+                "{template}: .env.example says {line:?}"
+            );
+        }
+        // Code, not the doc comment that says how to open it to the network.
+        let bad: Vec<String> = grep_files(&p.join("src"), "rs", "0.0.0.0")
+            .iter()
+            .flat_map(|f| {
+                let text = std::fs::read_to_string(f).unwrap();
+                text.lines()
+                    .filter(|l| !l.trim_start().starts_with("//") && l.contains("0.0.0.0"))
+                    .map(|l| format!("{}: {}", f.display(), l.trim()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(bad.is_empty(), "{template}: {bad:#?}");
+    }
 }
