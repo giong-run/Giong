@@ -438,3 +438,93 @@ fn batched_receives_keep_each_senders_order() {
         }
     });
 }
+
+// ------------------------------------------------------------ cooperation
+
+/// Runs `$step` (an expression that awaits and gives `true` while the channel
+/// is open) `$n` times, and gives how many steps ran before a task spawned
+/// just before the loop got to run: `$n` if it never ran during the loop.
+macro_rules! steps_before_a_spawned_task_ran {
+    ($n:expr, $step:expr) => {{
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let flag = ran.clone();
+        giong::spawn(async move { flag.set(true) });
+        let mut seen = None;
+        for i in 0..$n {
+            assert!($step, "the channel closed early");
+            if seen.is_none() && ran.get() {
+                seen = Some(i);
+            }
+        }
+        seen.unwrap_or($n)
+    }};
+}
+
+#[test]
+fn a_channel_that_never_makes_a_task_wait_still_lets_other_tasks_run() {
+    const N: usize = 10_000;
+    giong::block_on(async {
+        // Unbounded: every value is there before the loop, so no receive
+        // has to wait, and only the task's budget can make it yield.
+        let (tx, mut rx) = mpsc::unbounded();
+        for i in 0..N {
+            tx.send(i).unwrap();
+        }
+        let took = steps_before_a_spawned_task_ran!(N, rx.recv().await.is_some());
+        assert!(took < N / 10, "the other task waited for {took} receives");
+
+        // Bounded, the same.
+        let (tx, mut rx) = mpsc::bounded(N);
+        for i in 0..N {
+            tx.try_send(i).unwrap();
+        }
+        let took = steps_before_a_spawned_task_ran!(N, rx.recv().await.is_some());
+        assert!(took < N / 10, "the other task waited for {took} receives");
+        drop(tx);
+
+        // A bounded sender with room to spare does not wait either.
+        let (tx, rx) = mpsc::bounded(N);
+        let took = steps_before_a_spawned_task_ran!(N, tx.send(0).await.is_ok());
+        assert!(took < N / 10, "the other task waited for {took} sends");
+        assert_eq!(rx.len(), N);
+    });
+}
+
+#[test]
+fn receives_off_a_worker_never_run_out_of_budget() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    // A waker that does nothing, for polling by hand as another executor
+    // would. (`Waker::noop` needs a newer Rust than giong's minimum.)
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(std::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    // SAFETY: the vtable's functions ignore the data pointer.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+
+    // Also after a runtime ran on this thread and ended.
+    giong::block_on(async {});
+    const N: usize = 1_000;
+    let (tx, mut rx) = mpsc::unbounded();
+    let (btx, mut brx) = mpsc::bounded(N);
+    for i in 0..N {
+        tx.send(i).unwrap();
+        btx.try_send(i).unwrap();
+    }
+    for i in 0..N {
+        assert_eq!(pin!(rx.recv()).poll(&mut cx), Poll::Ready(Some(i)));
+        assert_eq!(pin!(brx.recv()).poll(&mut cx), Poll::Ready(Some(i)));
+    }
+    for i in 0..N {
+        assert!(matches!(
+            pin!(btx.send(i)).poll(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
+}
