@@ -287,6 +287,12 @@ fn redis_up_writes_redis_url() {
     let state = std::fs::read_to_string(p.dir.join(".giong/db.json")).unwrap();
     let name = format!("giong-giongclitest-redis-{}-redis-", std::process::id());
     assert!(state.contains(&name), "{state}");
+    // Recorded for giong dev status and stop.
+    let procs = std::fs::read_to_string(p.dir.join(".giong/processes.json")).unwrap();
+    assert!(
+        procs.contains(&name) && procs.contains("\"giong db up\""),
+        "{procs}"
+    );
     std::fs::remove_file(p.dir.join(".giong/db.json")).unwrap();
     let (s, r) = p.giong(&["db", "up"]);
     assert_ne!(s, 0, "{r}");
@@ -294,6 +300,8 @@ fn redis_up_writes_redis_url() {
     // down finds it by its label; up then starts a fresh one.
     let (s, r) = p.giong(&["db", "down", "--volumes"]);
     assert_eq!(s, 0, "{r}");
+    let procs = std::fs::read_to_string(p.dir.join(".giong/processes.json")).unwrap();
+    assert!(!procs.contains(&name), "{procs}");
     let (s, r) = p.giong(&["db", "up"]);
     assert_eq!(s, 0, "{r}");
 }

@@ -38,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::Command;
+use super::{devctl, Command};
 use crate::args::{Args, Flag, Kind};
 use crate::build;
 use crate::code::Code;
@@ -50,8 +50,18 @@ use crate::watch::{self, Change, Snapshot};
 pub const COMMAND: Command = Command {
     name: "dev",
     summary: "build and run the service, and restart it on every save without refusing a request",
-    usage: "giong dev [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--workers N] [--prod-like] \
-            [--once] [--grace S] [--ready-timeout S] [-- service arguments]\n\n\
+    usage: "giong dev [--background] [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--lan] \
+            [--workers N] [--prod-like] [--once] [--grace S] [--ready-timeout S] \
+            [-- service arguments]\n\
+            giong dev status [--all]\n\
+            giong dev logs [--lines N]\n\
+            giong dev stop [--all]\n\n\
+            One giong dev per project serves it on localhost and rebuilds on every save; there \
+            is no other way to run the service while developing (not cargo run, cargo build --release \
+            or a container). --background starts it detached from the terminal and returns once \
+            it serves, with its address; status says what runs (with --all: on this machine), \
+            logs prints the service's last lines, and stop stops it and what giong started for \
+            the project (a database container, its data kept).\n\n\
             Builds the service and runs it; on every save it builds again and swaps the new build \
             in once it accepts connections, so no request is refused. A failed build leaves the \
             running one serving. A change to .env alone restarts without building. The service \
@@ -64,6 +74,22 @@ pub const COMMAND: Command = Command {
             name: "bin",
             kind: Kind::Value,
             help: "the binary to run, when the package has several",
+        },
+        Flag {
+            name: "background",
+            kind: Kind::Switch,
+            help: "start in the background, wait until the service serves, print its address \
+                   and return (giong dev status, logs and stop follow it)",
+        },
+        Flag {
+            name: "all",
+            kind: Kind::Switch,
+            help: "with status or stop: every project where giong dev runs on this machine",
+        },
+        Flag {
+            name: "lines",
+            kind: Kind::Value,
+            help: "with logs: how many of the last lines to print (default 50)",
         },
         Flag {
             name: "release",
@@ -107,7 +133,7 @@ pub const COMMAND: Command = Command {
             help: "seconds a new build has to start accepting (default 30)",
         },
     ],
-    max_words: 0,
+    max_words: 1,
     run,
 };
 
@@ -123,6 +149,31 @@ const SETTLE_AFTER_READY: Duration = Duration::from_millis(200);
 const TAIL: usize = 40;
 
 fn run(args: &Args) -> Result<Report, Failure> {
+    match args.words.first().map(String::as_str) {
+        Some("status") => return devctl::status(args),
+        Some("logs") => return devctl::logs(args),
+        Some("stop") => return devctl::stop(args),
+        Some(word) => {
+            return Err(Failure::new(
+                Code::USAGE,
+                format!("giong dev has no word {word:?}"),
+                "the words are status, logs and stop; arguments for the service go after --",
+            ))
+        }
+        None => {}
+    }
+    if args.has("all") || args.value("lines").is_some() {
+        return Err(Failure::new(
+            Code::USAGE,
+            "--all and --lines go with a word: giong dev status --all, giong dev stop --all, \
+             giong dev logs --lines N",
+            "add the word",
+        ));
+    }
+    if args.has("background") {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        return devctl::background(args, &argv);
+    }
     let project = Project::here()?;
     let mut dev = Dev::new(project, args)?;
     let result = dev.serve();
@@ -196,9 +247,12 @@ struct Dev {
     started_at: u64,
     build: BuildState,
     report: Report,
+    /// `--background` started this runner (its events go to
+    /// `.giong/runner.log`, and it has a process group of its own).
+    background: bool,
 }
 
-fn unix_ms() -> u64 {
+pub(crate) fn unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -272,8 +326,11 @@ impl Dev {
             started_at: unix_ms(),
             build: BuildState::default(),
             report: Report::new("dev"),
+            background: std::env::var_os(devctl::BACKGROUND_VAR).is_some_and(|v| v == "1"),
             project,
         };
+        // A stop asked of a runner that had already gone.
+        let _ = fs::remove_file(state_dir.join("stop"));
         for finding in network {
             dev.say(
                 "warning",
@@ -333,6 +390,7 @@ impl Dev {
     }
 
     fn serve(&mut self) -> Result<Report, Failure> {
+        devctl::register(&self.project.root);
         let roots = vec![self.project.root.clone()];
         let mut seen = Snapshot::take(&roots);
         if seen.truncated {
@@ -351,6 +409,17 @@ impl Dev {
         if self.once {
             return self.wait_once();
         }
+        // The first build may have written Cargo.lock: not a change to build
+        // again for (a save during the build still is).
+        let after = Snapshot::take(&roots);
+        let changed = after.changed_since(&seen);
+        if !changed.is_empty()
+            && changed
+                .iter()
+                .all(|p| p.file_name().is_some_and(|n| n == "Cargo.lock"))
+        {
+            seen = after;
+        }
         self.say(
             "watching",
             format!(
@@ -361,6 +430,9 @@ impl Dev {
         );
         loop {
             std::thread::sleep(POLL);
+            if self.stop_asked() {
+                return Ok(std::mem::replace(&mut self.report, Report::new("dev")));
+            }
             self.reap();
             self.check_current();
             let now = Snapshot::take(&roots);
@@ -418,6 +490,17 @@ impl Dev {
         }
     }
 
+    /// `giong dev stop` asked this runner to stop (`.giong/stop`).
+    fn stop_asked(&self) -> bool {
+        let request = self.project.root.join(".giong").join("stop");
+        if !request.exists() {
+            return false;
+        }
+        let _ = fs::remove_file(&request);
+        self.say("stopping", "giong dev stop asked to stop".into(), json!({}));
+        true
+    }
+
     /// Builds, and restarts if the build worked.
     fn rebuild(&mut self, changed_at: Instant) {
         if self.build_once(changed_at) {
@@ -433,7 +516,17 @@ impl Dev {
             self.report.data("build", self.build_json());
             return Ok(std::mem::replace(&mut self.report, Report::new("dev")));
         };
-        let status = service.child.wait().ok();
+        let status = loop {
+            match service.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if self.stop_asked() => {
+                    self.current = Some(service);
+                    return Ok(std::mem::replace(&mut self.report, Report::new("dev")));
+                }
+                Ok(None) => std::thread::sleep(POLL),
+                Err(_) => break None,
+            }
+        };
         self.service_ended(&service, status);
         self.report.data("build", self.build_json());
         self.report
@@ -488,8 +581,13 @@ impl Dev {
                 self.build.error = Some(f.what.clone());
                 self.build.finished_at = Some(unix_ms());
                 self.write_state();
-                self.report
-                    .push(Finding::new(f.code, Severity::Error, f.what).fix(f.fix));
+                let finding = Finding::new(f.code, Severity::Error, f.what).fix(f.fix);
+                self.say(
+                    "build_failed",
+                    finding.title.clone(),
+                    json!({"findings": [finding.to_json()]}),
+                );
+                self.report.push(finding);
                 return false;
             }
         };
@@ -651,6 +749,7 @@ impl Dev {
         let _ = fs::remove_file(&mcp);
         let mut cmd = Process::new(exe);
         cmd.args(&self.service_args)
+            .env_remove(devctl::BACKGROUND_VAR)
             .current_dir(&self.project.root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1056,6 +1155,8 @@ impl Dev {
                 .map(|s| s.mcp.display().to_string()),
             "mcp_token": Value::Null,
             "listen": self.listen.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "addresses": self.addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "background": self.background,
             "log": self.log_path.display().to_string(),
             "restarts": self.restarts,
             "build": self.build_json(),
@@ -1089,6 +1190,7 @@ impl Dev {
             let _ = r.child.wait();
         }
         let _ = fs::remove_file(self.project.root.join(".giong").join("dev.json"));
+        devctl::unregister();
         // The folder of short socket paths, when the project's was too long.
         #[cfg(unix)]
         let _ = fs::remove_dir(short_socket_dir());
@@ -1200,7 +1302,7 @@ fn terminate(child: &Child) {
     }
 }
 
-/// Whether a process is alive (`kill -0`).
+/// Whether a process is alive (`kill -0`; `tasklist` on Windows).
 pub(crate) fn alive(pid: u64) -> bool {
     if cfg!(unix) {
         Process::new("kill")
@@ -1210,7 +1312,11 @@ pub(crate) fn alive(pid: u64) -> bool {
             .status()
             .is_ok_and(|s| s.success())
     } else {
-        false
+        Process::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
     }
 }
 
@@ -1225,25 +1331,44 @@ fn refuse_if_running(state_dir: &Path) -> Result<(), Failure> {
     };
     if let Some(pid) = v["pid"].as_u64() {
         if pid != u64::from(std::process::id()) && alive(pid) {
+            let urls: Vec<String> = v["addresses"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a.as_str().map(|a| format!("http://{a}")))
+                .collect();
             return Err(Failure::new(
                 Code::DEV_RUNNING,
-                format!("giong dev already serves this project (pid {pid})"),
-                format!("use that one, or stop it first: kill {pid}"),
+                format!(
+                    "giong dev already serves this project (pid {pid}{})",
+                    if urls.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", on {}", urls.join(", "))
+                    }
+                ),
+                "use that one: it rebuilds on every save (giong dev status shows it, giong dev \
+                 logs its output); to start over, giong dev stop first",
             ));
         }
     }
-    // Its giong dev is gone; the service may not be (a giong older than 1.5,
-    // or not Linux). Only stop it if it is the binary dev.json names.
-    if let (Some(pid), Some(exe)) = (v["service_pid"].as_u64(), v["exe"].as_str()) {
-        let ours = fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p == Path::new(exe));
-        if ours && alive(pid) {
-            let _ = Process::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
-        }
-    }
+    stop_leftover(&v);
     let _ = fs::remove_file(state_dir.join("dev.json"));
     Ok(())
+}
+
+/// Stops the service a killed giong dev left behind (a giong older than 1.5,
+/// or not Linux), if it is still the binary `dev.json` names; its pid.
+pub(crate) fn stop_leftover(state: &Value) -> Option<u64> {
+    let (pid, exe) = (state["service_pid"].as_u64()?, state["exe"].as_str()?);
+    let ours = fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p == Path::new(exe));
+    if ours && alive(pid) {
+        let _ = Process::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status();
+        return Some(pid);
+    }
+    None
 }
 
 /// The package and binary to run: `--bin`, else the package of the current
@@ -1408,7 +1533,7 @@ fn loopback_unless_lan(listen: Vec<SocketAddr>, lan: bool) -> (Vec<SocketAddr>, 
                     Severity::Warning,
                     format!("LISTEN is {addr}, which other machines could reach: giong dev serves it on {local}"),
                 )
-                .detail("the service gets LISTEN={local}; 0.0.0.0 and [::] are for a container in production")
+                .detail(format!("the service gets LISTEN={local}; 0.0.0.0 and [::] are for a container in production"))
                 .fix("pass --lan to keep it reachable from other devices (a phone on the same network), \
                       or set LISTEN to 127.0.0.1:<port> in .env")
             });
@@ -1431,10 +1556,13 @@ fn listen_on(addr: SocketAddr) -> Result<socket2::Socket, Failure> {
             Code::PORT_IN_USE,
             format!("{addr} cannot be bound: {e}"),
             if e.kind() == std::io::ErrorKind::AddrInUse {
-                "another program listens there (a service started by hand?): stop it, or set \
-                 another LISTEN in .env"
+                devctl::port_owner_fix(addr.port()).unwrap_or_else(|| {
+                    "another program listens there (a service started by hand?): stop it, or \
+                     set another LISTEN in .env"
+                        .to_string()
+                })
             } else {
-                "check the address: it must be one of this machine's"
+                "check the address: it must be one of this machine's".to_string()
             },
         )
     };

@@ -19,6 +19,7 @@ mod lint;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
 mod loadgen;
+mod procs;
 mod project;
 mod report;
 mod service;

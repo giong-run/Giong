@@ -14,6 +14,7 @@ pub mod check;
 pub mod clean;
 pub mod db;
 pub mod dev;
+pub mod devctl;
 pub mod doctor;
 pub mod env;
 pub mod explain;

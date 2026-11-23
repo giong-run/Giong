@@ -226,6 +226,11 @@ pub fn read_state(root: &Path) -> Vec<Started> {
     out
 }
 
+/// `.giong/processes.json`, for the message of a failed write.
+fn procs_path(root: &Path) -> PathBuf {
+    root.join(".giong").join("processes.json")
+}
+
 fn write_state(root: &Path, all: &[Started]) -> Result<(), Failure> {
     let mut m = Map::new();
     for s in all {
@@ -1385,6 +1390,17 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
         state.retain(|x| x.engine != engine);
         state.push(s.clone());
         write_state(root, &state)?;
+        // For giong dev status and giong dev stop.
+        let entry = crate::procs::Entry {
+            kind: "db".into(),
+            name: s.container.clone(),
+            engine: s.runtime.clone(),
+            started_by: "giong db up".into(),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        };
+        crate::procs::add(root, entry).map_err(|e| io_failure(&procs_path(root), e))?;
         let took = wait_ready(&s, timeout)?;
         set_env(root, engine.env_key(), &s.url())?;
         rep.line(format!(
@@ -1508,6 +1524,11 @@ fn down(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failure> {
     let Some(rt) =
         runtime.filter(|_| !containers.is_empty() || (args.has("volumes") && !volumes.is_empty()))
     else {
+        // Containers removed by hand: nothing left for giong dev to stop.
+        for e in crate::procs::list(root).iter().filter(|e| e.kind == "db") {
+            crate::procs::remove(root, "db", &e.name)
+                .map_err(|err| io_failure(&procs_path(root), err))?;
+        }
         rep.line("giong db up started nothing in this project.");
         rep.data("removed", json!([]));
         rep.data("volumes_removed", json!([]));
@@ -1526,6 +1547,7 @@ fn down(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failure> {
                 format!("remove it by hand: {rt} rm -f {c}"),
             ));
         }
+        crate::procs::remove(root, "db", c).map_err(|e| io_failure(&procs_path(root), e))?;
         rep.line(format!("removed {c}"));
         removed.push(json!(c));
     }
