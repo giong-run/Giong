@@ -656,7 +656,8 @@ impl Server {
     ///
     /// At the limit, when a new client arrives, the connection that has
     /// been idle longest (HTTP/1.1 between requests, HTTP/2 with no request
-    /// open) is closed to make room for it, as nginx does with keep-alive
+    /// open; not an HTTP/1.1 connection still waiting for its first request,
+    /// nor one whose next request has arrived) is closed to make room for it, as nginx does with keep-alive
     /// connections: idle connections, from one client or from many
     /// browsers, cannot keep new clients out. The idle connection ends as
     /// if its client had closed it (HTTP/2 sends `GOAWAY`), and clients
@@ -1090,8 +1091,9 @@ impl Server {
 /// three bits and two numbers per connection, in places numbered from 0
 /// and reused: memory follows the connections this loop had open at once,
 /// not the file descriptor numbers of the process. A connection marks
-/// itself idle and busy; the search for the one idle longest runs only at
-/// the limit. Only on Unix: elsewhere connections are not marked, and the
+/// itself idle and busy (an HTTP/1.1 connection only after its first
+/// request); the search for the one idle longest runs only at the limit,
+/// and passes over a connection whose next request has arrived. Only on Unix: elsewhere connections are not marked, and the
 /// accept loop waits for one to close.
 struct Slots {
     open: Cell<usize>,
@@ -1156,6 +1158,7 @@ impl Slots {
                 Poll::Ready(Slot {
                     slots: self.clone(),
                     place: NO_PLACE,
+                    ready: Cell::new(false),
                 })
             } else {
                 self.waiter.set(Some(cx.waker().clone()));
@@ -1169,28 +1172,38 @@ impl Slots {
     }
 
     /// Asks the connection idle longest to close, if one is idle.
+    ///
+    /// A connection whose next request has already arrived is passed over
+    /// (it is about to be busy): shutting the reading side of a socket down
+    /// discards what it holds on macOS and the BSDs, where Linux keeps it
+    /// readable, and the request would be lost.
     #[cfg(unix)]
     fn evict_one(&self) {
         let mut idle = self.idle.borrow_mut();
         let places = self.places.borrow();
         let now = self.next_idle.get();
-        let mut oldest: Option<(u32, usize)> = None;
-        for (word, &bits) in idle.iter().enumerate() {
-            let mut bits = bits;
-            while bits != 0 {
-                let place = word * 64 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let age = now.wrapping_sub(places[place].since);
-                if oldest.map_or(true, |(a, _)| age > a) {
-                    oldest = Some((age, place));
+        let place = loop {
+            let mut oldest: Option<(u32, usize)> = None;
+            for (word, &bits) in idle.iter().enumerate() {
+                let mut bits = bits;
+                while bits != 0 {
+                    let place = word * 64 + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let age = now.wrapping_sub(places[place].since);
+                    if oldest.map_or(true, |(a, _)| age > a) {
+                        oldest = Some((age, place));
+                    }
                 }
             }
-        }
-        let Some((_, place)) = oldest else {
-            return;
+            let Some((_, place)) = oldest else {
+                return;
+            };
+            idle[place / 64] &= !(1u64 << (place % 64));
+            if !has_input(places[place].fd) {
+                break place;
+            }
         };
         let (word, bit) = (place / 64, 1u64 << (place % 64));
-        idle[word] &= !bit;
         let mut evicted = self.evicted.borrow_mut();
         if evicted[word] & bit == 0 {
             evicted[word] |= bit;
@@ -1220,6 +1233,10 @@ pub(crate) struct Slot {
     slots: Rc<Slots>,
     /// The connection's place in [`Slots`], or [`NO_PLACE`].
     place: u32,
+    /// The connection may be marked idle: it has received something (see
+    /// [`set_idle`](Self::set_idle)), or is HTTP/2. In the padding after
+    /// `place`.
+    ready: Cell<bool>,
 }
 
 impl Slot {
@@ -1258,8 +1275,17 @@ impl Slot {
     /// The connection waits for its next request (`true`) or is serving
     /// one (`false`). Becoming idle while the accept loop waits at the limit
     /// wakes it, to ask this connection or another idle one to close.
+    ///
+    /// A connection is marked idle only once it has been busy (it received
+    /// something), or after [`allow_idle`](Self::allow_idle): a new HTTP/1.1
+    /// connection waiting for its first request is not idle, as its client
+    /// would not retry a request lost on it (clients retry only on a
+    /// connection they have used before).
     pub(crate) fn set_idle(&self, idle: bool) {
-        if self.place == NO_PLACE {
+        if !idle {
+            self.ready.set(true);
+        }
+        if self.place == NO_PLACE || (idle && !self.ready.get()) {
             return;
         }
         let place = self.place as usize;
@@ -1285,6 +1311,15 @@ impl Slot {
     }
 }
 
+impl Slot {
+    /// Lets the connection be marked idle before it receives anything: an
+    /// HTTP/2 connection closes with a `GOAWAY` that tells its client which
+    /// requests were not served, and so may be retried.
+    pub(crate) fn allow_idle(&self) {
+        self.ready.set(true);
+    }
+}
+
 impl Drop for Slot {
     fn drop(&mut self) {
         let slots = &*self.slots;
@@ -1307,6 +1342,24 @@ impl Drop for Slot {
             waker.wake();
         }
     }
+}
+
+/// Whether bytes wait to be read on `fd`, without taking them and without
+/// blocking (sockets accepted by io_uring are blocking).
+#[cfg(unix)]
+fn has_input(fd: i32) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: `fd` is an open socket (see `Slots::evict_one`), and one byte
+    // of `byte` is writable. `MSG_PEEK` leaves the byte in the socket.
+    let n = unsafe {
+        libc::recv(
+            fd,
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n > 0
 }
 
 /// The socket of a connection, for [`Slots`].
@@ -2515,7 +2568,12 @@ mod tests {
             assert_eq!(slot.place, 130);
             held.push(slot);
             assert_eq!(slots.places.borrow().len(), 131);
+            // A connection that has received nothing is not marked idle.
+            held[0].set_idle(true);
+            assert_eq!(slots.idle.borrow()[0], 0);
             // Idle marks and the age order travel with the place.
+            held[0].set_idle(false);
+            held[1].allow_idle();
             held[0].set_idle(true);
             held[1].set_idle(true);
             held[0].set_idle(false);
@@ -2525,6 +2583,24 @@ mod tests {
             assert!(slots.used.borrow().iter().all(|&w| w == 0));
             assert!(slots.idle.borrow().iter().all(|&w| w == 0));
         });
+    }
+
+    /// The accept loop looks for input waiting on a socket without taking
+    /// it and without blocking.
+    #[cfg(unix)]
+    #[test]
+    fn input_waiting_on_a_socket_is_seen_and_left_there() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!has_input(b.as_raw_fd()));
+        a.write_all(b"GET").unwrap();
+        assert!(has_input(b.as_raw_fd()));
+        assert!(has_input(b.as_raw_fd()));
+        let mut got = [0u8; 3];
+        b.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"GET");
+        assert!(!has_input(b.as_raw_fd()));
     }
 
     /// The fixed refusal for low memory announces its own length.

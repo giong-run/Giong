@@ -2337,6 +2337,9 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
 ) {
     let mut s = Session::new(cfg, peer);
     s.start();
+    if let Some(slot) = slot {
+        slot.allow_idle();
+    }
 
     // The client's preface, within the request timeout.
     let preface_deadline = Instant::now() + cfg.request_timeout;

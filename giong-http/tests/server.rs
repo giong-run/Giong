@@ -1160,6 +1160,43 @@ fn at_the_connection_limit_a_connection_mid_request_keeps_its_place() {
     }
 }
 
+/// A new connection that has not sent its first request is not idle: its
+/// client would not retry a request lost on it, so it keeps its place.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_a_new_connection_keeps_its_place_until_its_first_request() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let err = second.stream.read(&mut [0u8; 64]).unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err}"
+    );
+
+    // The first connection is answered, then gives its place once idle.
+    first.send("GET /first HTTP/1.1\r\nHost: t\r\n\r\n");
+    let r = first.reply();
+    assert!(r.text().starts_with("GET /first "), "{}", r.text());
+    first.expect_closed();
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let r = second.reply();
+    assert!(r.text().starts_with("GET /second "), "{}", r.text());
+}
+
 /// At the limit, idle keep-alive connections do not keep new clients out:
 /// the one idle longest is closed to make room, as nginx does.
 #[cfg(unix)]
