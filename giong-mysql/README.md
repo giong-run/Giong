@@ -4,8 +4,8 @@ A MySQL and MariaDB client and connection pool for the [giong](../README.md) run
 
 ```toml
 [dependencies]
-giong = "1.3.0"
-giong-mysql = "1.3.0"
+giong = "1.4.0"
+giong-mysql = "1.4.0"
 ```
 
 ```rust,no_run
@@ -89,7 +89,7 @@ Each connection starts its session with:
 - the statement timeout, as `max_execution_time` and `lock_wait_timeout` on MySQL, as `max_statement_time` and `lock_wait_timeout` on MariaDB;
 - `autocommit` on, and the session tracker on, which tells the pool when a statement changed the session.
 
-`Config::session_variable("sql_mode", "'STRICT_ALL_TABLES'")` sets other session variables; the ones above are refused there, except `lock_wait_timeout`. They are all set again whenever a pooled connection's session is reset.
+`Config::session_variable("sql_mode", "'STRICT_ALL_TABLES'")` sets other session variables; the ones above are refused there, except `lock_wait_timeout`. A value is one SQL expression: one holding a `;`, a comment, a backslash or a `,` outside quotes and parentheses is refused, so it cannot set a refused variable too. They are all set again whenever a pooled connection's session is reset.
 
 **TLS.** Unless `Config::tls` or `ssl-mode` says otherwise:
 

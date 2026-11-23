@@ -1315,3 +1315,66 @@ fn large_bodies_received_straight_into_the_buffer_are_charged_as_they_arrive() {
     a.send(vec![b'a'; 50_000]);
     assert_eq!(a.reply().text(), "got 200000");
 }
+
+/// The write timeout counts from the last progress of a write, not from its
+/// start: a large answer to a client that keeps reading, slowly, goes out
+/// whole even when that takes far longer than the timeout. A client that
+/// stops reading loses the connection one timeout after the last progress.
+#[test]
+fn the_write_timeout_counts_from_the_last_progress() {
+    const LEN: usize = 32 << 20;
+    async fn large(_req: Request) -> Response {
+        Response::new(200).body(vec![b'x'; LEN])
+    }
+    let server = TestServer::start(Server::new().write_timeout(Duration::from_secs(1)), large);
+    // Read the whole answer: the head, then `LEN` bytes of body.
+    let read_all = |pace: Option<Duration>| {
+        let mut c = server.client();
+        c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        let start = Instant::now();
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut paced = 0;
+        loop {
+            match c.stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+            // A pause after each 256 KiB.
+            if let Some(pace) = pace {
+                if got - paced >= buf.len() {
+                    paced = got;
+                    std::thread::sleep(pace);
+                }
+            }
+            if got > LEN {
+                break;
+            }
+        }
+        (got, start.elapsed())
+    };
+    // About 10 MB a second: some seconds for the part that does not fit in
+    // the sockets' buffers, well past the 1 s timeout. The timeout leaves
+    // room for a slow CI machine that pauses the reader now and then (a
+    // 300 ms one cut the answer on a macOS runner).
+    let (got, took) = read_all(Some(Duration::from_millis(25)));
+    assert!(
+        got > LEN,
+        "the answer was cut after {got} bytes, in {took:?}"
+    );
+    assert!(took > Duration::from_secs(2), "{took:?}");
+
+    // A client that takes nothing more after its first read is dropped.
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut got = c.stream.read(&mut buf).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    loop {
+        match c.stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    assert!(got < LEN, "a stalled client got the whole answer");
+}
