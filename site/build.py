@@ -932,6 +932,26 @@ def doc_entries():
     for slug, title, path, group, lede in C.DOC_PAGES:
         if group != "Start" and released(path) is not None:
             out.append((slug, title, path, str(Path(path).parent), group, lede, None))
+    if any(e[0] == "errors" for e in out):
+        out += error_entries()
+    return out
+
+
+def error_entries():
+    """A page per error code, /docs/errors/E0001/, from docs/errors/E0001.md at the tag.
+    They are in no sidebar group: the error index links to every one."""
+    out = []
+    index = released("docs/errors/README.md") or ""
+    for code in dict.fromkeys(re.findall(r"\]\((E\d{4})\.md\)", index)):
+        path = f"docs/errors/{code}.md"
+        src = released(path)
+        if src is None:
+            continue
+        h = re.search(r"^#\s+(.+)$", src, re.M)
+        title = h.group(1).strip() if h else f"GIONG-{code}"
+        body = src.replace("\r\n", "\n").split("\n")
+        first = next((ln for ln in body if ln.strip() and not ln.startswith("#")), "")
+        out.append((f"errors/{code}", title, path, "docs/errors", "Errors", first, None))
     return out
 
 
@@ -1034,6 +1054,8 @@ def md_script(ident, text):
 
 
 def doc_sidebar(current):
+    if current.startswith("errors/"):
+        current = "errors"
     groups = {}
     for e in DOCS:
         groups.setdefault(e[4], []).append(e)
@@ -1204,7 +1226,7 @@ def use_version(minor, tag):
     saved = {k: g[k] for k in _VERSION_STATE}
     g.update(TAG=tag, VERSION=tag[1:], REL_BLOB=f"{REPO}/blob/{tag}/", REL_TREE=f"{REPO}/tree/{tag}/",
              TAG_HERE=True, SKILL_MD=None, DOC_PREFIX=minor)
-    g["DOCS"] = [e for e in doc_entries() if e[0] != "agent-skill"]
+    g["DOCS"] = [e for e in doc_entries() if e[0] != "agent-skill" and e[4] != "Errors"]
     g["DOC_BY_PATH"] = {e[2]: e for e in DOCS if e[2]}
     return saved
 
@@ -1867,7 +1889,8 @@ def llms():
         guides += (f"- [Agent skill]({SITE}skills/giong.zip): a skill for coding agents (SKILL.md and these "
                    f"docs as references); [SKILL.md]({SITE}skills/giong/SKILL.md)\n")
     pages = "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
-                    for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors"))
+                    for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors")
+                    and e[4] != "Errors")
     older = ("- Older versions, for code pinned to them: "
              + ", ".join(f"[{m}]({SITE}{md_file('get-started', m)})" for m, _ in OLD) + "\n") if OLD else ""
     extra_protocols = ", HTTP/3" if "giong-quic" in names else ""
@@ -1933,7 +1956,8 @@ Facts that are easy to get wrong:
 ## Docs
 
 {api}- [Get started]({SITE}docs/index.md): requirements, a first server, examples, limits
-{guides}{pages}- [Error codes]({SITE}docs/errors.md): what each `GIONG-E` code means and how to fix it
+{guides}{pages}- [Error codes]({SITE}docs/errors.md): what each `GIONG-E` code means and how to fix it;
+  one code's page is {SITE}docs/errors/E0001.md (any code in place of E0001)
 - [CHANGELOG.md]({REL_BLOB}CHANGELOG.md): what changed in each release
 - [Everything above in one file]({SITE}llms-full.txt): the READMEs, best practices and error pages of {TAG}
 {older}
