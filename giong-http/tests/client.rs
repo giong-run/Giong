@@ -378,6 +378,65 @@ fn a_kept_alive_connection_closing_as_the_request_goes_is_retried_only_when_safe
 }
 
 #[test]
+fn an_answer_sent_before_the_body_was_read_is_the_response() {
+    giong::block_on(async {
+        // The server answers 413 as soon as it sees the head, and closes
+        // without reading the 20 MB body: sending the rest fails, and the
+        // answer is what the client gets, not the broken pipe.
+        let base = scripted(|_, stream| async move {
+            let chunk = stream.recv().await.unwrap();
+            assert!(chunk.starts_with(b"POST "));
+            write(
+                &stream,
+                b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 8\r\n\
+                  Connection: close\r\n\r\ntoo big!",
+            )
+            .await;
+        });
+        let client = Client::new();
+        let body = vec![b'x'; 20 << 20];
+        let response = client.post(&base).body(body).send().await.unwrap();
+        assert_eq!(response.status(), 413);
+        assert_eq!(response.text().unwrap(), "too big!");
+
+        // A 408 on a kept-alive connection is the server closing it while
+        // idle, before it read the request: that request is sent again on
+        // a new connection, when it is safe to.
+        let base = scripted(|n, stream| async move {
+            let mut buf = Vec::new();
+            if n == 0 {
+                read_request(&stream, &mut buf).await;
+                write(
+                    &stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+                )
+                .await;
+                let _ = stream.recv().await;
+                write(
+                    &stream,
+                    b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            } else {
+                read_request(&stream, &mut buf).await;
+                write(
+                    &stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nretry",
+                )
+                .await;
+            }
+        });
+        assert_eq!(
+            client.put(&base).send().await.unwrap().text().unwrap(),
+            "first"
+        );
+        let response = client.put(&base).body(vec![b'x'; 20 << 20]).send();
+        assert_eq!(response.await.unwrap().text().unwrap(), "retry");
+    });
+}
+
+#[test]
 fn a_streamed_body_already_taken_is_not_sent_again() {
     giong::block_on(async {
         // The connection answers one request, then takes the head and body

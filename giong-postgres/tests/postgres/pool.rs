@@ -1211,3 +1211,75 @@ fn a_migration_locking_two_tables_is_not_rolled_back_by_a_batch() {
         });
     }
 }
+
+/// A local port nothing listens on.
+fn closed_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+#[test]
+fn tasks_waiting_while_the_server_is_down_share_one_connect_attempt() {
+    run(|s| async move {
+        let port = closed_port();
+        let pool = Pool::new(s.local().host("127.0.0.1").port(port), 4);
+        let calls = Rc::new(Cell::new(0u64));
+        let end = Instant::now() + Duration::from_millis(300);
+        let tasks: Vec<_> = (0..64)
+            .map(|_| {
+                let (pool, calls) = (pool.clone(), calls.clone());
+                giong::spawn(async move {
+                    while Instant::now() < end {
+                        let e = pool.query("SELECT 1", &[]).await.unwrap_err();
+                        // The server's own refusal, never a pool timeout.
+                        assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+                        calls.set(calls.get() + 1);
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let attempts = pool.stats().connect_errors;
+        let calls = calls.get();
+        // Each task used to make an attempt of its own, on every call.
+        assert!(
+            attempts * 8 <= calls,
+            "{attempts} connect attempts for {calls} calls"
+        );
+        // And it comes back at once with the server.
+        let pool = Pool::new(s.local(), 4);
+        pool.query("SELECT 1", &[]).await.unwrap();
+    });
+}
+
+#[test]
+fn a_pool_whose_server_stays_down_spaces_its_connect_attempts() {
+    run(|s| async move {
+        let port = closed_port();
+        let pool = Pool::new(s.local().host("127.0.0.1").port(port), 4);
+        let mut calls = 0u64;
+        let end = giong::time::Instant::now() + Duration::from_millis(400);
+        // One task calling over and over, as a request handler does.
+        while giong::time::Instant::now() < end {
+            let e = pool.query("SELECT 1", &[]).await.unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
+            calls += 1;
+            giong::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Each call used to make an attempt of its own. Pauses of 10 ms
+        // doubling (less up to half) allow at most 8 in 400 ms.
+        let attempts = pool.stats().connect_errors;
+        assert!(
+            (2..=8).contains(&attempts) && calls >= 100,
+            "{attempts} connect attempts for {calls} calls"
+        );
+        // A pause ends: the next call tries again (and only one does).
+        giong::time::sleep(Duration::from_millis(1050)).await;
+        pool.query("SELECT 1", &[]).await.unwrap_err();
+        pool.query("SELECT 1", &[]).await.unwrap_err();
+        assert_eq!(pool.stats().connect_errors, attempts + 1);
+    });
+}
