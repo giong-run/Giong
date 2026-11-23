@@ -202,6 +202,91 @@ fn quinn_client_against_giong_server() {
     drop(server);
 }
 
+/// Neither side offers DATAGRAM frames (RFC 9221): giong-quic cannot read
+/// them, and a peer could otherwise park megabytes of them on a connection.
+#[test]
+fn datagrams_are_offered_by_neither_side() {
+    // quinn as the client of a giong server.
+    let (tls, ca) = server_tls();
+    let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
+    let server = std::thread::spawn(move || {
+        giong::block_on(async move {
+            let ep = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap(),
+            )
+            .unwrap();
+            tx.send(ep.local_addr().unwrap()).unwrap();
+            let _ = giong::time::timeout(Duration::from_secs(30), serve(ep)).await;
+        });
+    });
+    let addr = rx.recv().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls(ca)).unwrap();
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+        let conn = ep.connect(addr, "localhost").unwrap().await.unwrap();
+        assert_eq!(
+            conn.max_datagram_size(),
+            None,
+            "the giong server offers datagrams"
+        );
+        conn.close(0u32.into(), b"done");
+        ep.wait_idle().await;
+    });
+    drop(server);
+
+    // A giong client of a quinn server.
+    let (tls, ca) = server_tls();
+    let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<Option<usize>>();
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+            let ep = quinn::Endpoint::server(
+                quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+            tx.send(ep.local_addr().unwrap()).unwrap();
+            let conn = ep.accept().await.unwrap().await.unwrap();
+            seen_tx.send(conn.max_datagram_size()).unwrap();
+            conn.close(0u32.into(), b"done");
+            ep.wait_idle().await;
+        });
+    });
+    let addr = rx.recv().unwrap();
+    giong::block_on(async move {
+        let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let cfg = ClientConfig::new(client_tls(ca)).unwrap();
+        let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
+        // Waits without blocking the worker, which still has to send the
+        // client's last handshake packets.
+        let mut waited = 0;
+        let seen = loop {
+            match seen_rx.try_recv() {
+                Ok(seen) => break seen,
+                Err(_) if waited < 1000 => {
+                    giong::time::sleep(Duration::from_millis(10)).await;
+                    waited += 1;
+                }
+                Err(e) => panic!("the quinn server saw no connection: {e}"),
+            }
+        };
+        assert_eq!(seen, None, "the giong client offers datagrams");
+        conn.close(0, b"done");
+    });
+    server.join().unwrap();
+}
+
 /// Unidirectional streams both ways, a stream the sender resets and one the
 /// receiver stops: each side sees the other's code as `GIONG-E3604`.
 #[test]
