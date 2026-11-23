@@ -16,7 +16,10 @@
 //! init`, `db up`, ...). What destroys data or hands out secrets (`db reset`,
 //! `db down --volumes`, `clean --all`, `env get`, `--reveal`, `image --push`)
 //! is never a tool: a person types it. A command with no policy is not a
-//! tool at all. Every tool carries MCP's `readOnlyHint`, `destructiveHint`
+//! tool at all. "Reads" is about the project's files and data: `check` runs
+//! cargo, which runs the project's build scripts and proc macros, the same
+//! trust as opening the project in an editor with rust-analyzer; `test`, which
+//! runs the project's own code, is not a tool. Every tool carries MCP's `readOnlyHint`, `destructiveHint`
 //! and `idempotentHint`, so a client can ask before a write.
 //!
 //! The protocol: JSON-RPC 2.0, one message per line (MCP's stdio transport),
