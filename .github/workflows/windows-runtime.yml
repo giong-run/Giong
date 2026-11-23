@@ -73,6 +73,8 @@ jobs:
       # The handle count after each of five runtime lives, for the log.
       - run: cargo test -p giong --release --locked --test soak -- --nocapture the_descriptor_count
       - run: cargo test -p giong --release --locked --test handles -- --nocapture
+      # Ctrl+Break sent to a child process in its own process group.
+      - run: cargo test -p giong --release --locked --test console
       # The long wake-up race tests and the other ignored ones.
       - run: cargo test -p giong --release --locked --no-fail-fast $SUITES -- --ignored
       # Cancellation and wake-up races depend on timing: one pass proves
