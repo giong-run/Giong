@@ -5,7 +5,7 @@
 //! |---|---|---|
 //! | `DATABASE_URL` | (required) | `postgres://user:password@host/db` |
 //! | `REDIS_URL` | `redis://127.0.0.1:6379` | |
-//! | `LISTEN` | `0.0.0.0:8443` | |
+//! | `LISTEN` | `127.0.0.1:8443` | this machine only; `0.0.0.0:8443` to take connections from the network (the Dockerfile sets it) |
 //! | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP |
 //! | `WORKERS` | every core | |
 //! | `DB_POOL`, `CACHE_POOL` | `2`, `1` | connections per worker |
@@ -74,7 +74,7 @@ fn settings() -> Result<Settings, String> {
     Ok(Settings {
         db,
         cache,
-        listen: var("LISTEN").unwrap_or_else(|| "0.0.0.0:8443".into()),
+        listen: var("LISTEN").unwrap_or_else(|| "127.0.0.1:8443".into()),
         tls,
         workers: var("WORKERS").map(|_| number("WORKERS", 1)).transpose()?,
         db_pool: number("DB_POOL", 2)?,

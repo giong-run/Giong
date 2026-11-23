@@ -34,7 +34,7 @@ Errors are problem+json bodies with a code (`{"status":404,"code":"user_not_foun
 |---|---|---|
 | `DATABASE_URL` | (required) | `postgres://user:password@host/db`; TLS to a remote host is on and verified by default |
 | `REDIS_URL` | `redis://127.0.0.1:6379` | `rediss://` for TLS, `redis+unix:///path` for a socket |
-| `LISTEN` | `0.0.0.0:8443` | |
+| `LISTEN` | `127.0.0.1:8443` | this machine only; `0.0.0.0:8443` to take connections from the network |
 | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP (behind a proxy that does TLS) |
 | `WORKERS` | every core | |
 | `DB_POOL`, `CACHE_POOL` | `2`, `1` | connections per worker: statements and commands pipeline over them, so a few go a long way |

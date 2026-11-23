@@ -18,6 +18,7 @@ RUN cargo build --release && cp target/release/{{name}} /{{name}}
 FROM gcr.io/distroless/cc-debian12
 COPY --from=build /{{name}} /{{name}}
 {{#if !worker}}
+# Every interface: the container's own network is the boundary.
 ENV LISTEN=0.0.0.0:{{default_port}}
 EXPOSE {{default_port}}
 {{/if}}

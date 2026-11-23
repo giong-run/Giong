@@ -16,7 +16,7 @@
 {{#if redis}}
 //! | `REDIS_URL` | `redis://127.0.0.1:6379` | |
 {{/if}}
-//! | `LISTEN` | `0.0.0.0:{{default_port}}` | |
+//! | `LISTEN` | `127.0.0.1:{{default_port}}` | this machine only; `0.0.0.0:{{default_port}}` to take connections from the network (the Dockerfile sets it) |
 {{#if tls}}
 //! | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP |
 {{/if}}
@@ -149,7 +149,7 @@ fn settings() -> Result<Settings, String> {
 {{#if redis & !sql}}
         redis,
 {{/if}}
-        listen: var("LISTEN").unwrap_or_else(|| "0.0.0.0:{{default_port}}".into()),
+        listen: var("LISTEN").unwrap_or_else(|| "127.0.0.1:{{default_port}}".into()),
 {{#if tls}}
         tls,
 {{/if}}

@@ -59,6 +59,10 @@ Without the `giong` command, plain cargo works too: `cargo run`, `cargo test`
 
 Everything comes from the environment; `.env.example` lists the variables. In
 development `giong dev` and the tests read `.env`; in production nothing reads it.
+{{#if !worker}}
+Without `LISTEN` the service listens on `127.0.0.1` only; the Dockerfile sets
+`LISTEN=0.0.0.0:{{default_port}}`, and a deployment without Docker sets it too.
+{{/if}}
 
 ## Deploy
 

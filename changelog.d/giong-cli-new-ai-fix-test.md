@@ -11,7 +11,8 @@
   `.proto` (no `protoc`); `worker` jobs claimed from a table (`FOR UPDATE SKIP LOCKED`, with
   retries), from a Redis list, or on a timer. Every combination is built, linted and tested
   against real servers in CI (`scripts/templates.sh`), and `examples/rest-api` is now the
-  `web` template's output.
+  `web` template's output. A service listens on `127.0.0.1` unless `LISTEN` says otherwise,
+  so in development nobody else on the network reaches it; the Dockerfile sets `0.0.0.0`.
 - **giong-cli**: `giong ai init` (also run by `giong new`) writes `AGENTS.md`, `CLAUDE.md`, a
   Cursor rule, the Gióng skill of the release in `.claude/skills/giong/`, and the `giong` MCP
   server in `.mcp.json`. It can run again at any time: it replaces only
