@@ -1075,6 +1075,10 @@ fn run(workers: usize, secs: u64) -> Run {
 /// and up to two new events whose open the trace places inside ws2_32 or
 /// mswsock are allowed, as in the soak. Anything else still fails, with
 /// where each new event was opened.
+/// New events Winsock may make for itself, at most, that the lives check
+/// allows when tracing places their open inside ws2_32 or mswsock.
+const WINSOCK_EVENTS: usize = 2;
+
 #[test]
 fn the_descriptor_count_is_flat_over_runtime_lives() {
     let before = open_fds();
@@ -1092,9 +1096,13 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
     let tracing = origins.is_some();
     #[cfg(unix)]
     let tracing = false;
+    // The Winsock events a traced life may leave (see below). Waiting for
+    // the count to come back below them would wait out the 15 seconds of
+    // `settled_fds` after each life for nothing.
+    let allowed = if tracing { WINSOCK_EVENTS } else { 0 };
     for _ in 0..4 {
         runtime_life();
-        counts.push(settled_fds(first));
+        counts.push(settled_fds(first + allowed));
     }
     #[cfg(windows)]
     let traced = origins.map(origins::Watcher::finish);
@@ -1108,7 +1116,6 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
     #[cfg(windows)]
     let (system, last) = match traced {
         Some(origins) => {
-            let last = settled_fds(first);
             let now = open_handles();
             let events: Vec<usize> = now
                 .iter()
@@ -1116,9 +1123,11 @@ fn the_descriptor_count_is_flat_over_runtime_lives() {
                 .map(|(n, _)| *n)
                 .collect();
             let (report, winsock) = origins.report(&events);
+            let system = winsock.min(WINSOCK_EVENTS);
+            let last = settled_fds(first + system);
             let since = new_handles(&handles_first);
             new = format!("; after tracing: {last}; new since the first life: {since}{report}");
-            (winsock.min(2), last)
+            (system, last)
         }
         None => (0, 0),
     };
