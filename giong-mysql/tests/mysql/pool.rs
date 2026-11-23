@@ -478,6 +478,9 @@ fn statements_that_change_the_session_are_refused_on_shared_connections() {
             "SELECT @v := 1",
             "PREPARE p FROM 'SELECT 1'",
             "HANDLER pool_tmp OPEN",
+            // A procedure may do any of the above, out of sight.
+            "CALL pool_p()",
+            "  /* c */ call pool_p(1, @out)",
             // Versioned comments, as dump tools write them, run as SQL.
             "/*!40103 SET time_zone = '+00:00' */",
             "/*!40101 SET NAMES latin1 */",
