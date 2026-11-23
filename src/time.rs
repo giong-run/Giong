@@ -6,7 +6,15 @@
 //! per wake-up, and arming or cancelling a timer costs no syscall at all — just
 //! an O(1) list operation.
 //!
-//! Timer resolution is one millisecond; a timer never fires early.
+//! A timer fires at its deadline, to the precision of the clock and of the
+//! kernel's wake-up, and never early: a sleep of 1 ms takes about 1.05 ms
+//! on Linux. Timers fire in the order of their deadlines to the
+//! millisecond; within one millisecond, in no set order.
+//!
+//! After timers fire, a worker waits for the next ones until at least a
+//! millisecond later, so that thousands of timers cost about one wake-up per
+//! millisecond, not one each. A loop of sleeps shorter than 1 ms therefore
+//! takes about 1 ms a turn.
 
 use std::fmt;
 use std::future::Future;
@@ -28,6 +36,13 @@ use crate::slab::Slab;
 // from the current time; when the wheel reaches the start of a higher-level
 // slot, the timers in it are redistributed ("cascaded") to lower levels.
 //
+// The ticks only place timers. Each timer keeps its exact deadline, and the
+// event loop sleeps until the earliest one, not until the start of its
+// millisecond: once a slot's millisecond has come, the timers in it whose
+// deadline has not wait on a short "due" list for it. Rounding every
+// deadline up to a whole tick instead made a timer armed just after one
+// fired (the usual `loop { sleep(d).await; .. }`) a whole tick late.
+//
 // Arming and cancelling are O(1) — a linked-list insert/unlink — which is
 // what matters for servers: nearly every timer is an I/O timeout that gets
 // cancelled long before it would fire.
@@ -44,15 +59,26 @@ const TICK: Duration = Duration::from_millis(1);
 pub(crate) type TimerKey = (usize, u64);
 
 struct Entry {
-    /// Deadline in ticks since `Timers::start`.
-    when: u64,
+    /// The deadline, in nanoseconds since `Timers::start`. Its millisecond,
+    /// [`tick_of`], places the timer in the wheel.
+    at: u64,
     /// Distinguishes this timer from earlier users of the same slab index.
     uid: u64,
     waker: Waker,
+    /// The wheel level, or [`DUE`] for the list of timers whose millisecond
+    /// has come.
     level: u8,
     slot: u8,
     prev: usize,
     next: usize,
+}
+
+/// The `level` of an entry in [`Timers::due`].
+const DUE: u8 = LEVELS as u8;
+
+/// The tick (millisecond) a deadline falls in.
+fn tick_of(at: u64) -> u64 {
+    at / NANOS_PER_TICK as u64
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +94,21 @@ pub(crate) struct Timers {
     elapsed: u64,
     entries: Slab<Entry>,
     levels: [Level; LEVELS],
+    /// For each slot of level 0, a time no later than the earliest deadline
+    /// in it: exact, unless a timer has been removed from it since. The event
+    /// loop wakes up then, not at the start of the slot's millisecond.
+    earliest: [u64; SLOTS],
+    /// Timers whose millisecond has come but whose deadline, later in it,
+    /// has not: the head of a list.
+    due: usize,
+    /// No later than the earliest deadline in `due`; `u64::MAX` when it is
+    /// empty.
+    due_at: u64,
+    /// One tick after the last time timers fired. The event loop does not
+    /// wake up for timers again before then: a lone timer still fires at its
+    /// deadline, while many timers close together fire in batches, at most
+    /// one wake-up per millisecond, as when deadlines were rounded to ticks.
+    quiet_until: u64,
     seq: u64,
 }
 
@@ -91,32 +132,32 @@ impl Timers {
                 occupied: 0,
                 heads: [NIL; SLOTS],
             }; LEVELS],
+            earliest: [u64::MAX; SLOTS],
+            due: NIL,
+            due_at: u64::MAX,
+            quiet_until: 0,
             seq: 0,
         }
     }
 
-    /// The first tick at or after `t` (deadlines round up: never fire early).
-    fn tick_ceil(&self, t: Instant) -> u64 {
+    /// `t` in nanoseconds since the wheel started.
+    fn nanos(&self, t: Instant) -> u64 {
         let nanos = t.saturating_duration_since(self.start).as_nanos();
-        nanos.div_ceil(NANOS_PER_TICK).min(u64::MAX as u128) as u64
-    }
-
-    /// The last tick at or before `t`.
-    fn tick_floor(&self, t: Instant) -> u64 {
-        let nanos = t.saturating_duration_since(self.start).as_nanos();
-        (nanos / NANOS_PER_TICK).min(u64::MAX as u128) as u64
+        nanos.min(u64::MAX as u128) as u64
     }
 
     fn insert(&mut self, deadline: Instant, waker: Waker) -> TimerKey {
-        // Strictly in the future of the wheel, and within its range. A timer
-        // beyond the range fires early; `Sleep` then simply re-arms itself.
-        let when = self
-            .tick_ceil(deadline)
-            .clamp(self.elapsed + 1, self.elapsed + MAX_TICKS - 1);
+        // Beyond the wheel's range, a timer is placed at its last tick and
+        // fires early; `Sleep` then simply re-arms itself.
+        let mut at = self.nanos(deadline);
+        let last = self.elapsed + MAX_TICKS - 1;
+        if tick_of(at) > last {
+            at = last * NANOS_PER_TICK as u64;
+        }
         self.seq += 1;
         let uid = self.seq;
         let idx = self.entries.insert(Entry {
-            when,
+            at,
             uid,
             waker,
             level: 0,
@@ -151,7 +192,24 @@ impl Timers {
     }
 
     fn link(&mut self, idx: usize) {
-        let when = self.entries.get(idx).expect("timer entry").when;
+        let at = self.entries.get(idx).expect("timer entry").at;
+        let when = tick_of(at);
+        if when <= self.elapsed {
+            // Its millisecond has come: it waits for the exact deadline.
+            let head = self.due;
+            {
+                let entry = self.entries.get_mut(idx).expect("timer entry");
+                entry.level = DUE;
+                entry.prev = NIL;
+                entry.next = head;
+            }
+            if head != NIL {
+                self.entries.get_mut(head).expect("timer entry").prev = idx;
+            }
+            self.due = idx;
+            self.due_at = self.due_at.min(at);
+            return;
+        }
         let level = level_for(self.elapsed, when);
         let slot = ((when >> (6 * level)) & SLOT_MASK) as usize;
         let head = self.levels[level].heads[slot];
@@ -164,6 +222,14 @@ impl Timers {
         }
         if head != NIL {
             self.entries.get_mut(head).expect("timer entry").prev = idx;
+        }
+        if level == 0 {
+            // Every timer in a slot of level 0 has the same millisecond.
+            self.earliest[slot] = if head == NIL {
+                at
+            } else {
+                self.earliest[slot].min(at)
+            };
         }
         self.levels[level].heads[slot] = idx;
         self.levels[level].occupied |= 1 << slot;
@@ -181,6 +247,11 @@ impl Timers {
         };
         if prev != NIL {
             self.entries.get_mut(prev).expect("timer entry").next = next;
+        } else if level == DUE as usize {
+            self.due = next;
+            if next == NIL {
+                self.due_at = u64::MAX;
+            }
         } else {
             self.levels[level].heads[slot] = next;
             if next == NIL {
@@ -220,16 +291,46 @@ impl Timers {
         None
     }
 
-    /// When the event loop must wake up next for timers.
+    /// When the event loop must wake up next for timers: at the earliest
+    /// deadline itself, not at the start of its millisecond, unless timers
+    /// fired less than a tick ago (see `quiet_until`).
+    #[inline]
     pub(crate) fn next_deadline(&self) -> Option<Instant> {
-        let (_, _, tick) = self.next_expiration()?;
-        Some(self.start + Duration::from_millis(tick))
+        let wheel = match self.next_expiration() {
+            Some((0, slot, _)) => self.earliest[slot],
+            // A slot to cascade, at the start of its millisecond.
+            Some((_, _, tick)) => tick * NANOS_PER_TICK as u64,
+            None if self.due == NIL => return None,
+            None => u64::MAX,
+        };
+        let at = wheel.min(self.due_at).max(self.quiet_until);
+        Some(self.start + Duration::from_nanos(at))
     }
 
-    /// Advances the wheel to `now` and returns the wakers of all due timers.
+    /// Advances the wheel to `now` and returns the wakers of all due timers:
+    /// those whose deadline is not after `now`.
     pub(crate) fn expired(&mut self, now: Instant) -> Vec<Waker> {
-        let now_tick = self.tick_floor(now);
+        let now_ns = self.nanos(now);
+        let now_tick = tick_of(now_ns);
         let mut fired = Vec::new();
+        if self.due_at <= now_ns {
+            let mut idx = self.due;
+            let mut earliest = u64::MAX;
+            while idx != NIL {
+                let (next, at) = {
+                    let entry = self.entries.get(idx).expect("timer entry");
+                    (entry.next, entry.at)
+                };
+                if at <= now_ns {
+                    self.unlink(idx);
+                    fired.push(self.entries.remove(idx).expect("timer entry").waker);
+                } else {
+                    earliest = earliest.min(at);
+                }
+                idx = next;
+            }
+            self.due_at = earliest;
+        }
         while let Some((level, slot, deadline)) = self.next_expiration() {
             if deadline > now_tick {
                 break;
@@ -238,14 +339,19 @@ impl Timers {
             self.levels[level].occupied &= !(1 << slot);
             self.elapsed = deadline;
             while idx != NIL {
-                let (next, when) = {
+                let (next, at) = {
                     let entry = self.entries.get(idx).expect("timer entry");
-                    (entry.next, entry.when)
+                    (entry.next, entry.at)
                 };
-                if when <= deadline {
+                // Only a timer of this slot's own millisecond fires here. The
+                // others go down a level and fire as the loop reaches their
+                // slots, so that timers fire in the order of their deadlines
+                // even when the loop wakes up late, past several of them.
+                if tick_of(at) <= deadline && at <= now_ns {
                     fired.push(self.entries.remove(idx).expect("timer entry").waker);
                 } else {
-                    // Cascade to a lower level, now that time has moved on.
+                    // Cascade to a lower level, now that time has moved on,
+                    // or, if its millisecond has come, to the due list.
                     self.link(idx);
                 }
                 idx = next;
@@ -253,6 +359,9 @@ impl Timers {
         }
         if now_tick > self.elapsed {
             self.elapsed = now_tick;
+        }
+        if !fired.is_empty() {
+            self.quiet_until = now_ns.saturating_add(NANOS_PER_TICK as u64);
         }
         fired
     }
@@ -266,6 +375,9 @@ impl Timers {
                 heads: [NIL; SLOTS],
             };
         }
+        self.due = NIL;
+        self.due_at = u64::MAX;
+        self.quiet_until = 0;
         self.entries
             .take_all()
             .into_iter()
@@ -386,6 +498,11 @@ impl fmt::Debug for Sleep {
 }
 
 /// Completes after `duration` has elapsed.
+///
+/// Never early, and late by about the kernel's wake-up time. Right after
+/// other timers of the worker fired, by up to a millisecond: a loop of
+/// sleeps shorter than 1 ms takes about 1 ms a turn (see the [module
+/// documentation](self)).
 pub fn sleep(duration: Duration) -> Sleep {
     let now = Instant::now();
     // Saturate instead of panicking on absurd durations.
@@ -524,6 +641,8 @@ mod tests {
         let mut live: BTreeMap<u64, (u128, TimerKey)> = BTreeMap::new();
         let mut now_ns: u128 = 0;
         let mut next_id = 0u64;
+        // A tick after timers last fired: the loop may wait until then.
+        let mut quiet_until: u128 = 0;
 
         for _ in 0..steps {
             match rng.below(10) {
@@ -554,15 +673,19 @@ mod tests {
                         waker.wake();
                     }
                     let mut got = std::mem::take(&mut *fired.lock().unwrap());
+                    // In the order of their deadlines, to the millisecond.
+                    let ticks: Vec<u128> =
+                        got.iter().map(|id| live[id].0 / NANOS_PER_TICK).collect();
+                    assert!(
+                        ticks.windows(2).all(|w| w[0] <= w[1]),
+                        "seed {seed}: timers fired out of order at {now_ns} ns: {ticks:?}"
+                    );
                     got.sort_unstable();
-                    // A timer is due once the wheel's clock (whole ms) reaches its
-                    // deadline rounded up to a whole ms.
-                    let now_tick = now_ns / NANOS_PER_TICK;
+                    // A timer is due once its deadline has passed, to the
+                    // nanosecond.
                     let mut expected: Vec<u64> = live
                         .iter()
-                        .filter(|(_, (deadline_ns, _))| {
-                            deadline_ns.div_ceil(NANOS_PER_TICK) <= now_tick
-                        })
+                        .filter(|(_, (deadline_ns, _))| *deadline_ns <= now_ns)
                         .map(|(id, _)| *id)
                         .collect();
                     expected.sort_unstable();
@@ -570,6 +693,9 @@ mod tests {
                         got, expected,
                         "seed {seed}: wrong set of timers fired at {now_ns} ns"
                     );
+                    if !got.is_empty() {
+                        quiet_until = now_ns + NANOS_PER_TICK;
+                    }
                     for id in &got {
                         let (deadline_ns, key) = live.remove(id).unwrap();
                         assert!(deadline_ns <= now_ns, "timer {id} fired early");
@@ -585,13 +711,14 @@ mod tests {
             match (wheel.next_deadline(), live.values().map(|(d, _)| *d).min()) {
                 (None, None) => {}
                 (Some(wake), Some(earliest_ns)) => {
+                    // At the earliest deadline, or a tick after timers last
+                    // fired if that is later: never later than both.
                     let wake_ns = wake.duration_since(start).as_nanos();
-                    let earliest_tick_ns = earliest_ns.div_ceil(NANOS_PER_TICK) * NANOS_PER_TICK;
-                    assert!(wake_ns <= earliest_tick_ns, "seed {seed}: would oversleep");
                     assert!(
-                        wake_ns > (now_ns / NANOS_PER_TICK) * NANOS_PER_TICK,
-                        "seed {seed}: wake-up in the past"
+                        wake_ns <= earliest_ns.max(quiet_until),
+                        "seed {seed}: would oversleep"
                     );
+                    assert!(wake_ns > now_ns, "seed {seed}: wake-up in the past");
                 }
                 (wake, earliest) => {
                     panic!("seed {seed}: next_deadline {wake:?} vs model {earliest:?}")
@@ -629,6 +756,27 @@ mod tests {
         for seed in 200..=215 {
             run_model(seed, 3_000, 30 * 86_400_000, 7_200_000_000);
         }
+    }
+
+    #[test]
+    fn timers_fire_in_deadline_order_when_the_loop_wakes_late() {
+        // Deadlines a few hundred milliseconds out share a slot of a coarse
+        // level. A loop that wakes up past all of them (as on Windows, whose
+        // waits can end late by a scheduler quantum) must still fire them in
+        // order.
+        let start = Instant::now();
+        let mut wheel = Timers::starting_at(start);
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        for ms in [290, 260, 280, 270, 300] {
+            let waker = Waker::from(Arc::new(Recorder(ms, fired.clone())));
+            wheel.insert(start + Duration::from_millis(ms), waker);
+        }
+        for late in [275, 400] {
+            for waker in wheel.expired(start + Duration::from_millis(late)) {
+                waker.wake();
+            }
+        }
+        assert_eq!(*fired.lock().unwrap(), [260, 270, 280, 290, 300]);
     }
 
     #[test]

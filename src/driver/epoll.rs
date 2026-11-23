@@ -101,7 +101,8 @@ impl Poller for Epoll {
         let n = loop {
             let res = if self.pwait2 {
                 let ts = timeout.map(|d| libc::timespec {
-                    tv_sec: d.as_secs().min(i64::MAX as u64) as libc::time_t,
+                    // `time_t` by inference: libc marks its alias deprecated on musl.
+                    tv_sec: d.as_secs().min(i64::MAX as u64) as _,
                     tv_nsec: d.subsec_nanos() as libc::c_long,
                 });
                 let ts_ptr = ts
