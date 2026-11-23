@@ -52,15 +52,15 @@ instructions per request.
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,624 | 4,510 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 4,138 | 4,832 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 196 | 248 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,416 | 10,276 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 30,939 | 31,990 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 43,563 | 44,449 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 373,372 | 374,185 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 43,175 | 44,191 |
-| `web` | a giong-web router with a path parameter, raw client | 13,381 | 14,254 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,642 | 9,507 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 22,570 | 23,614 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 31,631 | 32,532 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 253,593 | 254,715 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 34,649 | 35,667 |
+| `web` | a giong-web router with a path parameter, raw client | 12,711 | 13,571 |
 | `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,224 | 10,838 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 14,137 | 14,751 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,241 | 10,855 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,711 | 14,326 |
 
 `udp-echo` went down with the UDP changes of 0.9 (#139, #142): 5,358 to 4,137 on io_uring and
 5,031 to 4,783 on epoll, counted with glibc's malloc as all counts were until 2026-11-20, with

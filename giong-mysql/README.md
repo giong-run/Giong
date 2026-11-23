@@ -4,8 +4,8 @@ A MySQL and MariaDB client and connection pool for the [giong](../README.md) run
 
 ```toml
 [dependencies]
-giong = "1.4.0"
-giong-mysql = "1.4.0"
+giong = "1.4.1"
+giong-mysql = "1.4.1"
 ```
 
 ```rust,no_run
@@ -53,7 +53,7 @@ fn main() -> std::io::Result<()> {
 ## What it does
 
 - **Pipelining across tasks.** Tasks that share a connection send their statements together, and one round trip answers all of them. A few connections serve hundreds of concurrent tasks, none of them waiting for a free connection. The usual MySQL clients (libmysqlclient, mysql_async, SQLx) have one statement in flight per connection.
-- **Prepared statements, kept.** Every statement is prepared the first time a connection runs it and kept in a bounded cache (64 per connection by default), so from then on it takes one round trip, and parameters and rows travel in MySQL's binary format. The server's `max_prepared_stmt_count` bounds the statements of all its clients together; when it is reached anyway (error 1461), the connection closes its statements that are not in use and prepares again, once.
+- **Prepared statements, kept.** Every statement is prepared the first time a connection runs it and kept in a bounded cache (64 per connection by default), so from then on it takes one round trip, and parameters and rows travel in MySQL's binary format. The server's `max_prepared_stmt_count` bounds the statements of all its clients together; when it is reached anyway (error 1461), the connection's prepares take turns: each closes the statements not in use and tries again, pausing between tries, so a burst of new statements waits instead of failing; a prepare fails once none on the connection has succeeded for a second.
 - **A pool per worker.** Statements that stand alone share connections; `pool.get()` takes one connection for a transaction, session settings or a slow statement. A connection comes back clean: if its session may have changed (a `SET`, a temporary table, a lock, a transaction left open), it is reset before anything else runs on it, without waiting for a round trip; one that ran only plain statements keeps its prepared statements. Tasks waiting in `get()` are served in order, and shared statements cannot keep them waiting: a connection is set aside for the oldest and handed over once the statements on it are answered. Transactions and session changes never run on the shared connections: the pool's own methods refuse `BEGIN`, `COMMIT`, `SET`, `LOCK TABLES`, `CALL` and the like, and a batch that leaves a transaction open closes its connection rather than let the statements of other tasks run inside it. The pool steers new statements away from a connection whose oldest statement has been running for more than 5 ms, so a slow query does not hold up the fast ones behind it.
 - **Transactions that cannot end silently.** In MySQL, a deadlock rolls the whole transaction back, so does a lock wait timeout when the server has `innodb_rollback_on_timeout` on, and `CREATE`, `ALTER` or `DROP` commits it; the statements after that run on their own, outside any transaction, without a word. Here they fail instead, and so does `commit`. So does a transaction in which a statement was given up (its future dropped by a timeout), since it may have run.
 - **TLS on by default for remote hosts, always verified.** `caching_sha2_password` (MySQL 8's default) and `mysql_native_password`. A password is never sent where it could be read on the way (see [Passwords](#passwords)).
@@ -196,7 +196,7 @@ An error from the server affects only its own statement: the statements that oth
 | `Config::connect_timeout` | 10 s | `ErrorKind::Connect`, "connect timeout". |
 | `Config::statement_timeout` | 30 s | On MySQL, sent as the session's `max_execution_time`, so the server stops a `SELECT` that runs too long (error 3024), and as `lock_wait_timeout`, so a statement waiting for a table or metadata lock gives up (1205). A write waiting for a row lock gives up after `innodb_lock_wait_timeout` (50 s by default); one that holds its locks and runs long is not stopped. On MariaDB, sent as `max_statement_time`, which stops every statement (1969), and as `lock_wait_timeout`. |
 | `Config::max_result_size` | 64 MiB of row data | `ErrorKind::TooLarge`; the rest of the result is read and thrown away. |
-| `Config::statement_cache_capacity` | 64 per connection | The least recently used statement is closed. 0 prepares and closes every statement each time. The server's `max_prepared_stmt_count` (16,382 by default) bounds the statements of all its clients: processes × workers × pool size × this must stay below it (64 allows 255 connections). At that limit (error 1461), the connection closes its unused statements and prepares again, once. |
+| `Config::statement_cache_capacity` | 64 per connection | The least recently used statement is closed. 0 prepares and closes every statement each time. The server's `max_prepared_stmt_count` (16,382 by default) bounds the statements of all its clients: processes × workers × pool size × this must stay below it (64 allows 255 connections). At that limit (error 1461), the connection's prepares take turns, closing its unused statements and trying again, and fail once none has succeeded for a second. |
 | `Pool::wait_timeout` | 5 s | `ErrorKind::PoolTimeout`. |
 | `Pool::idle_timeout` | 10 min | The connection is closed. |
 | `Pool::max_lifetime` | 30 min, less up to 10% | The connection is closed once no statement uses it (one taken with `get()`, when it comes back), and a new one is opened when needed. |
