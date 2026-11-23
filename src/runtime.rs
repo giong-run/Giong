@@ -1427,7 +1427,11 @@ impl Runtime {
             match spawned {
                 Ok(t) => threads.push(t),
                 Err(e) => {
-                    spawn_err = Some(thread_limit_error(index, n, e));
+                    spawn_err = Some(if out_of_threads(&e) {
+                        thread_limit_error(index, n, e)
+                    } else {
+                        e
+                    });
                     break;
                 }
             }
@@ -1504,9 +1508,24 @@ fn raise_open_files_limit() {
 #[cfg(any(not(target_os = "linux"), miri))]
 fn raise_open_files_limit() {}
 
-/// The error for a worker thread that could not be started. The kernel says
-/// only `EAGAIN` ("Resource temporarily unavailable"), which is what a
-/// container's PID limit gives: each thread counts against it.
+/// Whether a worker thread could not be started because the process may not
+/// have more threads: the kernel says only `EAGAIN` ("Resource temporarily
+/// unavailable"), which is what a container's PID limit and `RLIMIT_NPROC`
+/// give, as each thread counts against them. Any other error (`ENOMEM` for
+/// the thread's stack, say) is returned as it is: raising a thread limit
+/// would not help. Windows has no such limit.
+fn out_of_threads(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(libc::EAGAIN);
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The error for a worker thread that could not be started for want of
+/// threads (see [`out_of_threads`]).
 fn thread_limit_error(index: usize, workers: usize, e: io::Error) -> io::Error {
     let limit = thread_limit()
         .map(|(file, max)| format!("; {file} allows {max} threads and processes"))
@@ -2177,6 +2196,16 @@ mod tests {
         assert!(text.contains("Builder::workers"), "{text}");
         let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
         assert_eq!(source.to_string(), words);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_eagain_is_a_thread_limit() {
+        use super::out_of_threads;
+        assert!(out_of_threads(&io::Error::from_raw_os_error(libc::EAGAIN)));
+        // No memory for the thread's stack: no thread limit to raise.
+        assert!(!out_of_threads(&io::Error::from_raw_os_error(libc::ENOMEM)));
+        assert!(!out_of_threads(&io::Error::from(io::ErrorKind::WouldBlock)));
     }
 
     #[test]

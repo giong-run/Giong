@@ -335,6 +335,14 @@ impl Config {
     ///   authorities, which is stricter than MySQL's client (it checks
     ///   nothing then, so anyone on the path could pose as the server).
     /// * `PREFERRED` is refused: it falls back to no TLS without a word.
+    ///
+    /// The user name, the password and the database name are
+    /// percent-decoded: write `/` as `%2F`, `?` as `%3F` and `@` as `%40`
+    /// in them. A URL with an `@` after the first `/` or `?` that would
+    /// otherwise not read, or with an `@` in its database name, is refused
+    /// with a message that quotes none of it, since a piece of a password
+    /// with an unescaped `/` or `?` would end up in the message (or, as the
+    /// database name, be sent to the wrong host).
     pub fn from_url(url: &str) -> Result<Self, Error> {
         parse_url(url)
     }
@@ -509,6 +517,42 @@ fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
 }
 
 fn parse_url(url: &str) -> Result<Config, Error> {
+    // An `@` after the first `/` or `?` is most likely the end of a password
+    // holding an unescaped `/` or `?`: the URL is cut in the wrong place, so
+    // a piece of the password would be read as the port, the database name
+    // or a parameter, and quoted in the error, or sent to the server as the
+    // database name. Say what to fix instead, quoting nothing.
+    let after_cut = |accepted: bool| {
+        let Some((_, rest)) = url.split_once("://") else {
+            return false;
+        };
+        let Some(cut) = rest.find(['/', '?']) else {
+            return false;
+        };
+        if accepted {
+            // Read without an error: only a database name holding an `@`
+            // gives it away (parameters may hold one).
+            let before_query = rest.split_once('?').map_or(rest, |(r, _)| r);
+            before_query.get(cut..).is_some_and(|db| db.contains('@'))
+        } else {
+            rest[cut..].contains('@')
+        }
+    };
+    let cut_password = |read: &str| {
+        Error::config(format!(
+            "the URL {read}has an @ after a / or ?: if the password (or the user name) holds one \
+             of them, percent-encode it (/ as %2F, ? as %3F, @ as %40); write an @ in the \
+             database name as %40 too"
+        ))
+    };
+    match parse(url) {
+        Ok(_) if after_cut(true) => Err(cut_password("")),
+        Err(_) if after_cut(false) => Err(cut_password("could not be read, and it ")),
+        result => result,
+    }
+}
+
+fn parse(url: &str) -> Result<Config, Error> {
     let rest = url.strip_prefix("mysql://").ok_or_else(|| {
         Error::config(
             "a connection URL starts with mysql://, as in mysql://user:password@host:3306/database",
@@ -820,5 +864,36 @@ mod tests {
                 .statement_timeout,
             Duration::from_millis(1)
         );
+    }
+    #[test]
+    fn a_password_cut_by_an_unescaped_slash_or_question_mark_is_never_quoted() {
+        for url in [
+            "mysql://app:s3cr/et@db/x",
+            "mysql://app:pa?ss@db/x",
+            "mysql://app:se:cr/et@db/x",
+            "mysql://app:pa?ss=1@db",
+            "mysql://app:pa%zz/ss@db",
+            // Read without an error, these would connect to the host "app"
+            // with a piece of the password as the port and the rest, with
+            // the real host, as the database name.
+            "mysql://app:12/34@db/x",
+            "mysql://app:p@ss/word@db/x",
+        ] {
+            let e = Config::from_url(url).unwrap_err().to_string();
+            assert!(e.contains("percent-encode"), "{url}: {e}");
+            for piece in ["s3cr", "et", "pa", "ss", "cr", "zz", "12", "34", "word"] {
+                assert!(!e.contains(&format!("\"{piece}")), "{url}: {e}");
+                assert!(!e.contains(&format!("{piece}\"")), "{url}: {e}");
+            }
+        }
+        // An @ in a parameter is fine when the URL reads.
+        let c = Config::from_url("mysql://db/x?application-name=me@here").unwrap();
+        assert_eq!(c.application_name.as_deref(), Some("me@here"));
+        // Encoded, the same passwords work, and so does an @ in the
+        // database name.
+        let c = Config::from_url("mysql://app:s3cr%2Fet@db/x%40y").unwrap();
+        assert_eq!(c.password.as_deref(), Some("s3cr/et"));
+        assert_eq!(c.target(), "db:3306");
+        assert_eq!(c.database.as_deref(), Some("x@y"));
     }
 }
