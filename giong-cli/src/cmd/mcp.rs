@@ -186,11 +186,14 @@ pub const POLICIES: &[Policy] = &[
     Policy {
         name: "bench",
         reads: "",
-        writes: "loads the service and writes results",
-        never: "",
+        writes: "loads the project's service, or a URL on this machine, and writes results",
+        never: "a URL that is not on this machine",
         destructive: false,
         idempotent: false,
-        access: |_, _| Access::Write,
+        access: |words, _| match words.first() {
+            Some(url) if !loopback_url(url) => Access::Never,
+            _ => Access::Write,
+        },
     },
     Policy {
         name: "image",
@@ -208,6 +211,24 @@ pub const POLICIES: &[Policy] = &[
         },
     },
 ];
+
+/// Whether a URL's host is this machine: 127.0.0.0/8, ::1 or localhost
+/// (with or without a scheme, a port, a path or user information).
+fn loopback_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = host_port.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
 
 const fn read_only(name: &'static str, reads: &'static str) -> Policy {
     Policy {
@@ -666,6 +687,25 @@ mod tests {
         assert_eq!(access("record", &["drop"], &[]), Access::Never);
         assert_eq!(access("image", &[], &["push"]), Access::Never);
         assert_eq!(access("openapi", &[], &["out"]), Access::Write);
+        assert_eq!(access("bench", &[], &["rate"]), Access::Write);
+        for here in [
+            "http://127.0.0.1:8080/users",
+            "127.0.0.2:9000",
+            "http://[::1]:8080",
+            "https://LOCALHOST/",
+            "http://u:p@localhost:1",
+        ] {
+            assert_eq!(access("bench", &[here], &[]), Access::Write, "{here}");
+        }
+        for away in [
+            "https://example.com",
+            "http://10.0.0.5:8080",
+            "http://localhost.example.com",
+            "http://127.0.0.1@example.com/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert_eq!(access("bench", &[away], &[]), Access::Never, "{away}");
+        }
         // Commands with no policy are not tools.
         for name in [
             "new",
