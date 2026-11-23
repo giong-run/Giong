@@ -2668,8 +2668,8 @@ Another process listens on the port the service is configured to use, so the ser
 
 ## How to fix it
 
-- Stop the other process (`ss -ltnp` on Linux or `lsof -i :PORT` on macOS shows which one), or use another port.
-- An older `giong dev` of the same project may still run in another terminal.
+- Stop the other process, or use another port. `giong dev` names the process that listens there when the system says (Linux, macOS); otherwise `ss -ltnp` on Linux or `lsof -i :PORT` on macOS shows which one.
+- When it is a `giong dev` of another project, the message names the project: `giong dev stop` there, or `giong dev stop --all` stops every `giong dev` on this machine. `giong dev status --all` lists them.
 
 [All error codes](README.md)
 "#),
@@ -2789,8 +2789,8 @@ Another `giong dev` is running for the same project: `.giong/dev.json` names its
 
 ## How to fix it
 
-- Use the one that runs: it rebuilds and restarts on every save. Its output is also in `.giong/dev.log`.
-- To start over, stop it first (Ctrl-C in its terminal, or `kill <pid>` with the pid the message gives).
+- Use the one that runs: it rebuilds and restarts on every save. `giong dev status` says where it serves and how its last build went; `giong dev logs` prints the service's output (all of it is in `.giong/dev.log`).
+- To start over, stop it first: `giong dev stop` (or Ctrl-C in its terminal), then `giong dev --background` or `giong dev`.
 
 [All error codes](README.md)
 "#),
