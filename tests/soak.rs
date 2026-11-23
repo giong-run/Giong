@@ -1062,6 +1062,10 @@ fn run(workers: usize, secs: u64) -> Run {
     (counters, samples, idle)
 }
 
+/// New events Winsock may make for itself, at most, that the lives check
+/// allows when tracing places their open inside ws2_32 or mswsock.
+const WINSOCK_EVENTS: usize = 2;
+
 /// What a runtime opens once per process (Winsock's helpers, the shared
 /// address's thread) stays; what each runtime opens goes with it. Five
 /// lives of a runtime: after the first, the count stays where the first
@@ -1075,10 +1079,6 @@ fn run(workers: usize, secs: u64) -> Run {
 /// and up to two new events whose open the trace places inside ws2_32 or
 /// mswsock are allowed, as in the soak. Anything else still fails, with
 /// where each new event was opened.
-/// New events Winsock may make for itself, at most, that the lives check
-/// allows when tracing places their open inside ws2_32 or mswsock.
-const WINSOCK_EVENTS: usize = 2;
-
 #[test]
 fn the_descriptor_count_is_flat_over_runtime_lives() {
     let before = open_fds();
