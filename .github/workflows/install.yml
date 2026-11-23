@@ -26,6 +26,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The same pinned toolchain as ci.yml and release.yml.
+  RUST_STABLE: "1.100.0"
 
 jobs:
   install:
@@ -44,7 +46,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked -p giong-cli --target ${{ matrix.target }}
       - name: Package as a release

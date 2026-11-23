@@ -32,7 +32,10 @@ on:
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
+  # A draft skips these jobs (they are not required checks); marking it ready
+  # for review runs them.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "giong-http/**"
       - "giong-postgres/**"
@@ -62,6 +65,7 @@ concurrency:
 jobs:
   # Which targets to run: all of them, except on a pull request.
   plan:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
