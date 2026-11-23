@@ -931,6 +931,20 @@ jobs:
                 "$t" -q
               done'
 
+  # The macOS and Windows workflows, run from here outside pull requests (the
+  # merge queue, a push to main that no queue run tested, a dispatch), so that
+  # `all-checks` fails when they do: main requires only this workflow's checks,
+  # and a red macOS run in the queue once merged #336 and broke main on macOS.
+  # A pull request runs them as workflows of their own, which do not gate
+  # merging; their `plan` sees the caller's event, so here they run in full.
+  macos:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/macos.yml
+
+  windows:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/windows-runtime.yml
+
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
   # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
@@ -939,15 +953,18 @@ jobs:
   # out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in the
   # merge queue every job must.
   all-checks:
-    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl]
+    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl, macos, windows]
     if: always()
     runs-on: ubuntu-24.04
     steps:
       - env:
           NEEDS: ${{ toJSON(needs) }}
           HEAVY: ${{ needs.plan.outputs.heavy }}
+          EVENT: ${{ github.event_name }}
         run: |
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          # On a pull request macOS and Windows run as workflows of their own.
+          if [ "$EVENT" = pull_request ]; then NEEDS="$(jq 'del(.macos, .windows)' <<<"$NEEDS")"; fi
           if [ "$HEAVY" = false ]; then
               jq -e '(.plan.result == "success" and .lint.result == "success" and .msrv.result == "success")
                   and all(.[]; .result == "success" or .result == "skipped")' <<<"$NEEDS" > /dev/null
