@@ -14,10 +14,11 @@
 //! choice, which names no one.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use bytes::BytesMut;
 use giong::sync::mpsc::{bounded, Receiver, Sender, TrySendError};
 use quinn_proto::{ConnectionId, ConnectionIdGenerator, InvalidCid};
 
@@ -27,9 +28,18 @@ use crate::native::cid::{self, owner};
 /// full socket buffer would.
 const QUEUE: usize = 1024;
 
-/// A datagram on its way to the worker that owns its connection.
+/// Bytes of datagrams one worker holds for the others, at most: a receive
+/// with GRO is up to 64 KiB, so `QUEUE` of them alone would let a worker
+/// that falls behind hold 64 MiB. The kernel bounds the same traffic to
+/// the socket's receive buffer. The connection IDs that steer a datagram
+/// are plaintext, so anyone can aim datagrams at one worker.
+const QUEUE_BYTES: usize = 4 << 20;
+
+/// A datagram on its way to the worker that owns its connection. Its
+/// bytes are copied once, on the worker that received it, into what the
+/// owner hands to QUIC.
 pub(crate) struct Forwarded {
-    pub(crate) data: Vec<u8>,
+    pub(crate) data: BytesMut,
     pub(crate) from: SocketAddr,
     pub(crate) ecn: u8,
     pub(crate) segment: Option<usize>,
@@ -57,7 +67,38 @@ pub(crate) struct Mixed;
 /// one; a second one bound on the same worker (a service that binds the
 /// new endpoint before it drops the old) waits behind the first, and takes
 /// its place when the first is dropped.
-type Group = HashMap<u16, Vec<(u64, Sender<Forwarded>)>>;
+type Group = HashMap<u16, Vec<(u64, Peer)>>;
+
+/// Where one worker's endpoint takes datagrams from the others.
+#[derive(Clone)]
+struct Peer {
+    tx: Sender<Forwarded>,
+    /// Bytes in its queue, shared with its [`Inbox`]: senders add before
+    /// they copy, so a full queue costs no allocation.
+    held: Arc<AtomicUsize>,
+}
+
+/// The datagrams the other workers pass on to this one.
+pub(crate) struct Inbox {
+    rx: Receiver<Forwarded>,
+    held: Arc<AtomicUsize>,
+}
+
+impl Inbox {
+    pub(crate) async fn recv(&mut self) -> Option<Forwarded> {
+        let d = self.rx.recv().await?;
+        Some(self.took(d))
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Option<Forwarded> {
+        self.rx.try_recv().ok().map(|d| self.took(d))
+    }
+
+    fn took(&self, d: Forwarded) -> Forwarded {
+        self.held.fetch_sub(d.data.len(), Ordering::Relaxed);
+        d
+    }
+}
 
 fn groups() -> &'static Mutex<HashMap<SocketAddr, Group>> {
     static GROUPS: OnceLock<Mutex<HashMap<SocketAddr, Group>>> = OnceLock::new();
@@ -77,7 +118,7 @@ pub(crate) struct Member {
     worker: u16,
     id: u64,
     seen: u64,
-    peers: HashMap<u16, Sender<Forwarded>>,
+    peers: HashMap<u16, Peer>,
     /// The workers of the group (the peers and this one), sorted; kept
     /// with `peers` so that an Initial packet allocates nothing.
     workers: Vec<u16>,
@@ -86,8 +127,13 @@ pub(crate) struct Member {
 impl Member {
     /// Joins the endpoints bound to `addr`; gives where the datagrams the
     /// others pass on arrive.
-    pub(crate) fn join(addr: SocketAddr, worker: u16) -> (Self, Receiver<Forwarded>) {
+    pub(crate) fn join(addr: SocketAddr, worker: u16) -> (Self, Inbox) {
         let (tx, rx) = bounded(QUEUE);
+        let held = Arc::new(AtomicUsize::new(0));
+        let inbox = Inbox {
+            rx,
+            held: held.clone(),
+        };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let mut groups = groups().lock().unwrap_or_else(|e| e.into_inner());
         groups
@@ -95,7 +141,7 @@ impl Member {
             .or_default()
             .entry(worker)
             .or_default()
-            .push((id, tx));
+            .push((id, Peer { tx, held }));
         GENERATION.fetch_add(1, Ordering::Release);
         let member = Member {
             addr,
@@ -106,26 +152,54 @@ impl Member {
             peers: HashMap::new(),
             workers: Vec::new(),
         };
-        (member, rx)
+        (member, inbox)
     }
 
     pub(crate) fn worker(&self) -> u16 {
         self.worker
     }
 
-    /// Passes a datagram on to `worker`. Gives it back if no endpoint of
-    /// that worker is bound to this address (a connection ID from before a
-    /// restart, or bytes that only look like one): the caller answers it
-    /// as it answers any packet it does not know. A datagram for a worker
-    /// whose queue is full is dropped, as the network drops.
-    pub(crate) fn forward(&mut self, worker: u16, datagram: Forwarded) -> Option<Forwarded> {
+    /// Passes a datagram (`data`, received from `from`) on to `worker`.
+    /// `false` if no endpoint of that worker is bound to this address (a
+    /// connection ID from before a restart, or bytes that only look like
+    /// one): the caller answers it as it answers any packet it does not
+    /// know. A datagram for a worker whose queue is full, in datagrams or
+    /// in bytes, is dropped, as the network drops, before it is copied.
+    pub(crate) fn forward(
+        &mut self,
+        worker: u16,
+        data: &[u8],
+        from: SocketAddr,
+        ecn: u8,
+        segment: Option<usize>,
+        local: Option<IpAddr>,
+    ) -> bool {
         self.refresh();
-        match self.peers.get(&worker) {
-            Some(peer) => match peer.try_send(datagram) {
-                Ok(()) | Err(TrySendError::Full(_)) => None,
-                Err(TrySendError::Closed(datagram)) => Some(datagram),
-            },
-            None => Some(datagram),
+        let Some(peer) = self.peers.get(&worker) else {
+            return false;
+        };
+        let len = data.len();
+        if peer.held.fetch_add(len, Ordering::Relaxed) + len > QUEUE_BYTES {
+            peer.held.fetch_sub(len, Ordering::Relaxed);
+            return true;
+        }
+        let datagram = Forwarded {
+            data: BytesMut::from(data),
+            from,
+            ecn,
+            segment,
+            local,
+        };
+        match peer.tx.try_send(datagram) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                peer.held.fetch_sub(len, Ordering::Relaxed);
+                true
+            }
+            Err(TrySendError::Closed(_)) => {
+                peer.held.fetch_sub(len, Ordering::Relaxed);
+                false
+            }
         }
     }
 }
@@ -256,14 +330,9 @@ mod tests {
         d
     }
 
-    fn datagram() -> Forwarded {
-        Forwarded {
-            data: vec![1],
-            from: "127.0.0.1:1".parse().unwrap(),
-            ecn: 0,
-            segment: None,
-            local: None,
-        }
+    /// Passes a one-byte datagram on to `worker`.
+    fn pass(member: &mut Member, worker: u16) -> bool {
+        member.forward(worker, &[1], "127.0.0.1:1".parse().unwrap(), 0, None, None)
     }
 
     #[test]
@@ -273,16 +342,16 @@ mod tests {
         let (old, mut old_rx) = Member::join(addr, 1);
         let (new, mut new_rx) = Member::join(addr, 1);
         // The first endpoint of worker 1 gets what worker 0 passes on.
-        assert!(sender.forward(1, datagram()).is_none());
-        assert!(old_rx.try_recv().is_ok());
-        assert!(new_rx.try_recv().is_err());
+        assert!(pass(&mut sender, 1));
+        assert!(old_rx.try_recv().is_some());
+        assert!(new_rx.try_recv().is_none());
         // Once it is gone, the second one does.
         drop((old, old_rx));
-        assert!(sender.forward(1, datagram()).is_none());
-        assert!(new_rx.try_recv().is_ok());
+        assert!(pass(&mut sender, 1));
+        assert!(new_rx.try_recv().is_some());
         // And with none left, the datagram comes back.
         drop((new, new_rx));
-        assert!(sender.forward(1, datagram()).is_some());
+        assert!(!pass(&mut sender, 1));
     }
 
     fn long(dcid: &[u8]) -> Vec<u8> {
@@ -382,30 +451,48 @@ mod tests {
     #[test]
     fn members_reach_each_other_until_they_leave() {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let datagram = || Forwarded {
-            data: vec![1],
-            from: addr,
-            ecn: 0,
-            segment: None,
-            local: None,
-        };
         let (mut a, _a_in) = Member::join(addr, 0);
         // No one there yet: it comes back.
-        assert!(a.forward(1, datagram()).is_some());
+        assert!(!pass(&mut a, 1));
         let (b, mut b_in) = Member::join(addr, 1);
-        assert!(a.forward(1, datagram()).is_none());
-        assert_eq!(b_in.try_recv().unwrap().data, [1]);
+        assert!(pass(&mut a, 1));
+        assert_eq!(b_in.try_recv().unwrap().data[..], [1]);
         // A second endpoint of the same worker does not take its place.
         let (c, _c_in) = Member::join(addr, 1);
         drop(c);
-        assert!(a.forward(1, datagram()).is_none());
-        assert!(b_in.try_recv().is_ok());
+        assert!(pass(&mut a, 1));
+        assert!(b_in.try_recv().is_some());
         // A full queue drops.
         for _ in 0..QUEUE + 10 {
-            assert!(a.forward(1, datagram()).is_none());
+            assert!(pass(&mut a, 1));
         }
-        assert_eq!(b_in.len(), QUEUE);
+        assert_eq!(b_in.rx.len(), QUEUE);
         drop(b);
-        assert!(a.forward(1, datagram()).is_some());
+        assert!(!pass(&mut a, 1));
+    }
+
+    /// A worker's queue holds `QUEUE_BYTES` at most, whatever the number of
+    /// datagrams: a sender drops past that before it copies, and the bytes
+    /// count again once the owner takes them.
+    #[test]
+    fn a_queue_is_bounded_in_bytes_too() {
+        let addr: SocketAddr = "127.0.0.1:3".parse().unwrap();
+        let (mut a, _a_in) = Member::join(addr, 0);
+        let (_b, mut b_in) = Member::join(addr, 1);
+        let receive = vec![0u8; 64 * 1024];
+        let from = "127.0.0.1:1".parse().unwrap();
+        for _ in 0..QUEUE {
+            assert!(a.forward(1, &receive, from, 0, Some(1200), None));
+        }
+        let held = QUEUE_BYTES / receive.len();
+        assert_eq!(b_in.rx.len(), held);
+        assert_eq!(b_in.held.load(Ordering::Relaxed), held * receive.len());
+        // Taking one makes room for one.
+        assert_eq!(b_in.try_recv().unwrap().data.len(), receive.len());
+        assert!(a.forward(1, &receive, from, 0, Some(1200), None));
+        assert!(a.forward(1, &receive, from, 0, Some(1200), None));
+        assert_eq!(b_in.rx.len(), held);
+        while b_in.try_recv().is_some() {}
+        assert_eq!(b_in.held.load(Ordering::Relaxed), 0);
     }
 }

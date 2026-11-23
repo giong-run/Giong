@@ -1,7 +1,8 @@
 # The kqueue driver and the portability layer, tested on Apple Silicon
 # runners. A draft pull request, and one that changes no code, skip the tests
-# (scripts/ci-scope.py, as in ci.yml); the merge queue always runs them, and
-# `macos-checks` is the one name to require for them.
+# (scripts/ci-scope.py, as in ci.yml). Outside pull requests (the merge queue,
+# a push to main, a dispatch of CI) ci.yml calls this workflow, so that its
+# `all-checks` holds a merge back when a job here fails.
 #
 # Every test binary runs on its own under a time limit (.github/macos-tests.sh),
 # so one run shows the whole picture: passed, failed, ignored and hung tests
@@ -12,8 +13,8 @@ name: macOS
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
