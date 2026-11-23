@@ -12,24 +12,65 @@ this page changes is how often a change has to go round that loop before it land
 
 ## Where the time goes
 
-Measured on this repository: a CI run takes about 17 to 22 minutes from push to result,
-and the merge queue runs the same jobs again. The time is lost to:
+Measured on this repository on 2026-11-22 (200 CI runs over 27 hours, raw data in the
+pull request that added the CI tiers): a full CI run is 46 jobs and 3.4 runner-hours; it
+took a median of 28 minutes on a pull request (55 at the 90th percentile, waiting for
+runners) and 24 in the merge queue. The time was lost to:
 
-1. **Red runs that a local check would have caught**: formatting, clippy, a broken doc
-   link, a malformed changelog, a test of the crate that changed. Each costs a run and a
-   second push.
-2. **Conflicts between pull requests in flight.** Most pull requests added a line to
-   `CHANGELOG.md`, so the first to merge put the others out of date, and the merge queue
-   ejected the ones it had already started.
-3. **Waiting.** An agent that finished a step and waits for CI, or for a person, does
-   nothing in the meantime.
-4. **Lost context.** A new session re-learns what the last one knew, when that lived only
-   in a conversation.
-
-5. **Leftovers.** Branches and draft pull requests that nobody owns any more hide the ones
+1. **Pushes that cancel the run before them.** 92 of 174 pull request runs (53%) were
+   cancelled by the next push to the same branch, after a median of 7 minutes; a branch
+   took 5.6 runs, and the median gap between two pushes (18 minutes) was shorter than one
+   run. Each push restarts the 28 minutes.
+2. **Every job for every change.** A pull request that changed only the site ran all 46
+   jobs, on the pull request and again in the queue. A draft that was still being written
+   ran them on each push.
+3. **Stalls outside CI.** Finished pull requests waited for hours with auto-merge on and
+   an unresolved review thread, which the branch protection requires resolved; release
+   pull requests needed lock files under `bench/`, `fuzz/` and `sim/` bumped by hand.
+4. **Conflicts between pull requests in flight**: shared lines in `CHANGELOG.md` (now
+   `changelog.d/`), README numbers, and limits two changes each stay under alone but not
+   together (`bench/instr/baseline.csv`). The queue failed 1 run in 24, for the last.
+5. **Red runs that a local check would have caught**, and **lost context** when a new
+   session re-learns what the last one knew.
+6. **Leftovers.** Branches and draft pull requests that nobody owns any more hide the ones
    that matter and get rebased, reviewed or merged by mistake.
 
-Each section below removes one of them.
+Each section below removes one of them. Fixing a bug is never one of the costs to cut:
+a red job is fixed at its cause, whatever it takes.
+
+## CI tiers
+
+The job `plan` (`scripts/ci-scope.py`) chooses what a run does; `scripts/preflight.sh
+--plan` prints its choice for a branch.
+
+| The run | What runs | Expected time |
+|---|---|---|
+| Pull request that changes no file a build or test reads: `site/`, `changelog.d/`, `bench/results/`, `assets/`, `skills/`, prose | `lint` (fmt, clippy, docs, `release.py check`, which builds the site) and `msrv` | 2 min |
+| Draft pull request | the above, default features, the release build, one round of the tests on io_uring; the Fuzz, gRPC, Proto and macOS workflows skip drafts | 16 min, 1,000 runner-seconds (a twelfth of a full run) |
+| Pull request ready for review | every job once: each suite one round on every tier, two ThreadSanitizer runs, the kernels and server versions four at a time, Miri, Kani, instr, macOS, Windows (when code it builds changed) | 17 min of jobs, 8,400 runner-seconds (two thirds of a full run) |
+| Merge queue, a push to `main` that no queue run tested, a dispatch | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, every matrix entry at once; macOS and Windows, called from `ci.yml` so that `all-checks` fails when they do | 24 min, 12,200 runner-seconds |
+
+The times are those of the pull request that introduced the tiers (#218) and of the queue
+runs before it. **Runners are the scarce resource**: the organisation gets 60 Linux jobs at
+a time, shared by every pull request and the merge queue, and GitHub has no priority
+between them. A full run asks for 46 jobs, so two pull requests running full sets starve
+the queue (the 1.4.0 release waited behind 60 queued runs). Every tier above exists to
+give runners back: a draft takes a twelfth, a ready pull request two thirds and its two
+largest matrices four jobs at a time, and a push that cancels a run frees its jobs.
+
+Prose counts as code where code reads it: `docs/errors/` (tests check every page) and
+every Markdown file a crate pulls in with `include_str!` (its code blocks are doc tests),
+such as the READMEs. Anything `ci-scope.py` cannot place counts as code. What lands on
+`main` is tested exactly as before: the queue runs everything, whatever the pull request
+ran. A failure that only a repetition shows (a race, a rare timing) is then found in the
+queue instead of on the pull request, and ejects the pull request from it: fix it like any
+red job.
+
+**One compiler.** CI's stable Rust is pinned (`RUST_STABLE` in the workflows), not
+`stable`, so a Rust release cannot turn `main` red overnight, and `scripts/preflight.sh`
+runs the same version (`--install` installs it; the gate warns when it is missing). Raise
+the pin in a pull request of its own after each Rust release, fixing what the new lints
+find in the same pull request.
 
 ## One change, start to finish
 
@@ -39,24 +80,38 @@ Each section below removes one of them.
    draft pull request open and lands in pieces.
 2. **Branch from the newest `main`**: `git fetch origin main && git switch -c <type>/<name> origin/main`.
 3. **Test first for a fix**: the test fails before the change and passes after.
-4. **Pass the gate, `scripts/preflight.sh`, before every push.** It reads the files the
+4. **Install the pre-push hook once per clone**: `scripts/preflight.sh --install-hook`.
+   Every `git push` then runs `scripts/preflight.sh --quick` first and stops on a failure.
+   Do not bypass it with `--no-verify`.
+5. **Pass the gate, `scripts/preflight.sh`, before marking a pull request ready.** It reads the files the
    branch changes and runs every check CI runs that they call for: the merge into `main`,
    `scripts/release.py check`, and when Rust changed fmt, clippy and docs with warnings as
-   errors, the Rust 1.80 check and the tests on io_uring and on epoll (of the crates that
+   errors, the minimum Rust versions (`scripts/msrv.sh`, the same script as CI's `msrv` job) and the tests on io_uring and on epoll (of the crates that
    changed, or of the whole workspace when the runtime did); `scripts/semver.sh` when a
    published crate's code changed; one round of ThreadSanitizer for unsafe code and
    anything that crosses threads; loom for the wake-ups; and every fuzz target of a crate
    whose parsing code changed. A missing tool fails the gate (`--install` installs them);
    nothing is skipped quietly. `--quick` runs the fast part while iterating, `--plan` only
    prints. The gate also says which soak a release containing the change will need.
-5. **Write the changelog entry as a file in [`changelog.d/`](../changelog.d/README.md)**,
+6. **Write the changelog entry as a file in [`changelog.d/`](../changelog.d/README.md)**,
    never in `CHANGELOG.md`.
-6. **Push and open the pull request**, as a draft until the preflight passes. Fill in the
-   template; the description is the handoff (see below).
-7. **Read CI, do not wait for it.** When a job fails, read its log (`gh run view <id>
+7. **Open the pull request as a draft** and fill in the template; the description is the
+   handoff (see below). A draft runs the short set of CI jobs. **Mark it ready for
+   review** when the work is complete and the full gate passes: that starts every job.
+8. **Push finished steps, not edits.** A push cancels the run in progress. Collect the
+   fixes for one round of CI or review into one push. Push sooner only when the running
+   job is already red, or when the fix is for a job that has not started.
+9. **Read CI, do not wait for it.** When a job fails, read its log (`gh run view <id>
    --log-failed`) and fix the cause. A failure is the author's to fix even when it looks
    unrelated; a test that fails only sometimes is a bug, not a reason to run CI again.
-8. **Before enqueueing, check the open pull requests**:
+10. **Answer every review thread** once its fix is pushed: reply `Fixed in <commit>` and
+   the Review threads workflow resolves it (`scripts/review-threads.py`; or resolve it by
+   hand), or reply why not. The branch protection holds the merge back while any thread is
+   open, silently, even with auto-merge on; that workflow's job summary lists the open ones.
+11. **Do not merge `main` in to stay current.** The queue tests the pull request merged
+   with the newest `main` anyway. Merge `main` in only for a conflict, or when a change on
+   `main` affects this one (a new baseline, an API it uses).
+12. **Before enqueueing, check the open pull requests**:
    `scripts/preflight.sh --against <n>,<n>` merges the branch with each of them and names
    the files that conflict. Agree the order with their authors when two conflict, rather
    than letting the queue eject one.
@@ -67,7 +122,7 @@ Each section below removes one of them.
    what must pass; it only means nobody has to press the button. Never turn it on for a
    release pull request (label `release`): merging one publishes to crates.io, which
    needs a maintainer's explicit approval.
-9. **After the merge**, check that the branch was deleted, remove the item from the
+13. **After the merge**, check that the branch was deleted, remove the item from the
    backlog, and take the next one.
 
 ## Working in parallel without collisions
@@ -80,6 +135,12 @@ Each section below removes one of them.
 - **Numbers in READMEs** (test counts, benchmark results) change only in the pull request
   that measured them. On a conflict, measure or count again; do not add the two sides up
   by hand.
+- **Lock files**: the release bumps the workspace crates in every `Cargo.lock`
+  (`scripts/release.py sync-locks`); a pull request never edits another workspace's lock
+  by hand for a version, and `release.py check` fails on a stale one.
+- **Limits shared by every change** (`bench/instr/baseline.csv`): two pull requests that
+  each stay inside a limit can cross it together. When one merges first, merge `main`
+  into the other and run `scripts/instr.py check` before it enters the queue.
 - **Long-lived branches** take `main` in with a merge commit. Never rebase or force-push a
   branch that another branch or pull request is based on.
 - **Stacked work** opens its pull request against the branch below it; when that one
@@ -100,7 +161,8 @@ Each section below removes one of them.
 
 The soak tiers are defined in [RELEASING.md](RELEASING.md#how-long-to-soak); a major
 release soaks for 72 hours whatever changed. CI runs every job on every pull request
-whatever the table says, including what no local machine runs (kernels 5.15 to 6.18, the
+ready for review and again in the merge queue whatever the table says, including what no
+local machine runs (kernels 5.15 to 6.18, the
 older ring tiers, Miri, Kani, instruction counts, other server versions): the gate makes a
 green run likely, it does not replace it.
 
