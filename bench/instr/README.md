@@ -47,7 +47,7 @@ instructions per request.
 | `spawn` | spawn a task that returns at once and await it | 1,405 | 1,124 |
 | `yield` | `yield_now`: one trip through the run queue | 501 | 361 |
 | `oneshot` | a oneshot channel: create, send, receive | 280 | 280 |
-| `channel` | a round trip between two tasks over two bounded channels | 1,764 | 1,484 |
+| `channel` | a round trip between two tasks over two bounded channels | 1,721 | 1,446 |
 | `timeout` | a timeout around a future that is ready at once | 100 | 100 |
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,624 | 4,510 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 4,138 | 4,832 |
@@ -85,6 +85,11 @@ in time, the epoll round trip got faster (`bench/core.sh` `tcp-rr` 5,741 to 5,30
 idle connection takes one allocation fewer (two with TLS); the task and its future now share
 one. Its heap grew by 40 to 64 bytes for `idle-http1` and `idle-h2` (1.0% to 2.7%), and moved
 by less than 20 bytes for `idle-https`.
+
+#227 (a channel receive or send that is ready at once counts against the task's budget)
+also stopped the bounded channel calling its grant and wake-up functions when no sender
+waits: `channel` 1,756 to 1,721 on io_uring and 1,481 to 1,446 on epoll, measured on the
+same machine before and after; the other cases did not move by more than 0.02%.
 
 ### The allocator is not counted as glibc's
 

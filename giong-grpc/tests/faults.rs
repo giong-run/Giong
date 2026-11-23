@@ -5,6 +5,8 @@
 mod common;
 
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +40,21 @@ impl Watched {
         }
         panic!("never saw {what:?}; saw {:?}", self.log.borrow());
     }
+}
+
+/// Polls `call`, which must not finish, until the handler has recorded
+/// `what`, then drops it: however slow the machine, the call is cancelled
+/// only once the server is running its handler.
+async fn drive_until(watched: &Watched, what: &str, call: impl Future) {
+    let mut call = pin!(call);
+    for _ in 0..1000 {
+        if watched.seen(what) {
+            return;
+        }
+        let poll = timeout(Duration::from_millis(5), call.as_mut()).await;
+        assert!(poll.is_err(), "the call finished");
+    }
+    panic!("never saw {what:?}; saw {:?}", watched.log.borrow());
 }
 
 /// Records `0` when it is dropped.
@@ -188,8 +205,7 @@ fn a_cancelled_unary_call_drops_its_handler() {
         let request = SimpleRequest::default();
         let call = client.unary_call(&request, CallOptions::new());
         // Dropped while the handler waits.
-        assert!(timeout(Duration::from_millis(100), call).await.is_err());
-        assert!(watched.seen("unary started"));
+        drive_until(&watched, "unary started", call).await;
         watched.eventually("unary dropped").await;
     });
 }
@@ -217,8 +233,7 @@ fn a_dropped_response_stream_drops_its_handler() {
             ..Default::default()
         };
         let call = client.streaming_output_call(&request, CallOptions::new());
-        assert!(timeout(Duration::from_millis(100), call).await.is_err());
-        assert!(watched.seen("output started"));
+        drive_until(&watched, "output started", call).await;
         watched.eventually("output dropped").await;
     });
 }
