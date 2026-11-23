@@ -6,7 +6,10 @@ name: gRPC
 # run in CI with the rest of the workspace.
 
 on:
+  # A draft skips these jobs (they are not required checks); marking it ready
+  # for review runs them.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "giong-grpc/**"
       - "giong-grpc-build/**"
@@ -24,18 +27,25 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # The stable compiler of every job that does not name one (MSRV, nightly and
+  # instr name their own). Pinned, not `stable`, so that a new Rust release
+  # (new lints, a new target/ layout) cannot turn main red overnight and so that
+  # scripts/preflight.sh runs the same compiler locally. Raise it in a pull
+  # request of its own when a Rust release comes out.
+  RUST_STABLE: "1.100.0"
   CARGO_TERM_COLOR: always
   GRPC_GO: v1.75.1
   GRPCURL: v1.9.3
 
 jobs:
   interop:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
       # The runner image ships Go; the script needs 1.24 or later.
       - run: go version
       # grpc-go's interop programs and grpcurl change only with their tags.
