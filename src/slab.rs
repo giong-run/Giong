@@ -85,6 +85,7 @@ impl<T> Slab<T> {
     }
 
     /// Like [`iter_mut`](Self::iter_mut), with each value's key.
+    #[cfg(target_os = "linux")]
     pub(crate) fn iter_keyed_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
         self.entries
             .iter_mut()
