@@ -20,6 +20,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The same pinned toolchain as ci.yml and release.yml.
+  RUST_STABLE: "1.100.0"
 
 jobs:
   templates:
@@ -55,7 +57,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_STABLE }}
           components: clippy, rustfmt
       - run: uname -r
       - run: scripts/templates.sh
