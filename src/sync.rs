@@ -171,28 +171,40 @@ pub mod mpsc {
         /// Receives the next value, or `None` once every sender is gone and
         /// the channel is empty.
         ///
+        /// A value that is ready at once costs the task one unit of its
+        /// budget (128 per turn), as socket operations do: after that `recv`
+        /// yields to the worker's other tasks first, so a channel kept full
+        /// cannot starve them. To drain what is queued without yielding, use
+        /// [`try_recv`](Self::try_recv). Do not poll it from another executor
+        /// inside a giong task: once the budget is spent, that executor would
+        /// poll it forever.
+        ///
         /// Cancel safe: if the future is dropped, no value is lost; the next
         /// call returns it.
         pub async fn recv(&mut self) -> Option<T> {
             poll_fn(|cx| {
                 let taken = self.taken.get_mut().unwrap_or_else(|e| e.into_inner());
-                if let Some(value) = taken.pop_front() {
-                    return Poll::Ready(Some(value));
-                }
-                let mut state = self.shared.lock();
-                if !state.queue.is_empty() {
+                if taken.is_empty() {
+                    let mut state = self.shared.lock();
+                    if state.queue.is_empty() {
+                        if state.senders == 0 {
+                            return Poll::Ready(None);
+                        }
+                        match &state.rx_waker {
+                            Some(w) if w.will_wake(cx.waker()) => {}
+                            _ => state.rx_waker = Some(cx.waker().clone()),
+                        }
+                        return Poll::Pending;
+                    }
                     std::mem::swap(&mut state.queue, taken);
-                    drop(state);
-                    return Poll::Ready(taken.pop_front());
                 }
-                if state.senders == 0 {
-                    return Poll::Ready(None);
+                // A value that is ready at once counts against the task's
+                // budget: a receiver that other threads keep fed must still
+                // let the worker's other tasks and its event loop run.
+                if !crate::driver::spend_or_yield(cx) {
+                    return Poll::Pending;
                 }
-                match &state.rx_waker {
-                    Some(w) if w.will_wake(cx.waker()) => {}
-                    _ => state.rx_waker = Some(cx.waker().clone()),
-                }
-                Poll::Pending
+                Poll::Ready(taken.pop_front())
             })
             .await
         }

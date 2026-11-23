@@ -396,7 +396,20 @@ struct Deferred {
 
 impl Deferred {
     fn is_empty(&self) -> bool {
-        self.multis.is_empty() && self.cancels.is_empty() && self.closes.is_empty()
+        // Destructured so that a field added later cannot be left out: the
+        // pattern stops compiling until it is named here.
+        let Deferred {
+            multis,
+            cancels,
+            closes,
+            #[cfg(windows)]
+            sock_closes,
+        } = self;
+        #[cfg(windows)]
+        if !sock_closes.is_empty() {
+            return false;
+        }
+        multis.is_empty() && cancels.is_empty() && closes.is_empty()
     }
 }
 
@@ -1132,6 +1145,12 @@ impl Builder {
 
     /// Request a runtime shutdown when the process receives SIGINT or SIGTERM
     /// (default: `false`). Only applies to [`Runtime::run`].
+    ///
+    /// A second SIGINT or SIGTERM ends the process at once, as it would
+    /// with no handler: a shutdown that hangs, or a main future that never
+    /// returns, can still be stopped with a second Ctrl-C. A signal within
+    /// 250 ms of the first counts as the same request, since one Ctrl-C can
+    /// arrive twice (wrappers such as cargo-watch forward it to their child).
     pub fn shutdown_on_signals(mut self, enable: bool) -> Self {
         self.signals = enable;
         self
@@ -1400,7 +1419,11 @@ impl Runtime {
             match spawned {
                 Ok(t) => threads.push(t),
                 Err(e) => {
-                    spawn_err = Some(thread_limit_error(index, n, e));
+                    spawn_err = Some(if out_of_threads(&e) {
+                        thread_limit_error(index, n, e)
+                    } else {
+                        e
+                    });
                     break;
                 }
             }
@@ -1437,9 +1460,24 @@ impl Runtime {
     }
 }
 
-/// The error for a worker thread that could not be started. The kernel says
-/// only `EAGAIN` ("Resource temporarily unavailable"), which is what a
-/// container's PID limit gives: each thread counts against it.
+/// Whether a worker thread could not be started because the process may not
+/// have more threads: the kernel says only `EAGAIN` ("Resource temporarily
+/// unavailable"), which is what a container's PID limit and `RLIMIT_NPROC`
+/// give, as each thread counts against them. Any other error (`ENOMEM` for
+/// the thread's stack, say) is returned as it is: raising a thread limit
+/// would not help. Windows has no such limit.
+fn out_of_threads(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(libc::EAGAIN);
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
+/// The error for a worker thread that could not be started for want of
+/// threads (see [`out_of_threads`]).
 fn thread_limit_error(index: usize, workers: usize, e: io::Error) -> io::Error {
     let limit = thread_limit()
         .map(|(file, max)| format!("; {file} allows {max} threads and processes"))
@@ -2085,9 +2123,31 @@ fn pin_to_cpu(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workers, pin_by_default, thread_limit_error};
+    use super::{default_workers, pin_by_default, thread_limit_error, Deferred};
     use crate::error::{code, Code};
     use std::io;
+
+    /// Every kind of deferred work keeps `close_deferred` from skipping the
+    /// turn: on Windows a socket alone was ignored, and stayed open (#289).
+    #[test]
+    fn a_deferred_close_of_any_kind_is_work() {
+        assert!(Deferred::default().is_empty());
+        #[cfg(unix)]
+        {
+            let mut deferred = Deferred::default();
+            deferred.closes.push(-1);
+            assert!(!deferred.is_empty());
+        }
+        let mut deferred = Deferred::default();
+        deferred.multis.push(0);
+        assert!(!deferred.is_empty());
+        #[cfg(windows)]
+        {
+            let mut deferred = Deferred::default();
+            deferred.sock_closes.push(super::sys::RawSock::MAX);
+            assert!(!deferred.is_empty());
+        }
+    }
 
     #[test]
     fn a_worker_thread_that_cannot_start_says_why() {
@@ -2110,6 +2170,16 @@ mod tests {
         assert!(text.contains("Builder::workers"), "{text}");
         let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
         assert_eq!(source.to_string(), words);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn only_eagain_is_a_thread_limit() {
+        use super::out_of_threads;
+        assert!(out_of_threads(&io::Error::from_raw_os_error(libc::EAGAIN)));
+        // No memory for the thread's stack: no thread limit to raise.
+        assert!(!out_of_threads(&io::Error::from_raw_os_error(libc::ENOMEM)));
+        assert!(!out_of_threads(&io::Error::from(io::ErrorKind::WouldBlock)));
     }
 
     #[test]
