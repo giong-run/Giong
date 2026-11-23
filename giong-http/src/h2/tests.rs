@@ -1156,6 +1156,62 @@ fn streams_beyond_the_limit_are_refused() {
 }
 
 #[test]
+fn a_first_flight_past_the_stream_limit_is_refused_not_cut_off() {
+    // Until the client has our SETTINGS, it cannot know the limit: 1,000
+    // streams in its first flight get 900 refusals and 100 answers.
+    let server = TestServer::start(Server::new());
+    let first_flight = |c: &mut Client, out: &mut Vec<u8>| -> Vec<u32> {
+        (0..1000)
+            .map(|_| {
+                let id = c.next_id;
+                c.next_id += 2;
+                let block = c.encode(&[
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":path", "/wait"),
+                    (":authority", "x"),
+                ]);
+                frame::write_headers(out, id, &block, true, frame::DEFAULT_FRAME_SIZE);
+                id
+            })
+            .collect()
+    };
+    let mut c = Client::connect(server.addr);
+    let mut out = PREFACE.to_vec();
+    frame::write_settings(&mut out, &[]);
+    let ids = first_flight(&mut c, &mut out);
+    c.write(&out);
+    while c.resets.len() < 900 && c.goaway.is_none() {
+        c.frame().expect("the connection stays open");
+    }
+    assert!(c.goaway.is_none(), "{:?}", c.goaway);
+    let refused = Reason::RefusedStream as u32;
+    assert!(c.resets.values().all(|&code| code == refused));
+    server.state.released.store(true, Ordering::SeqCst);
+    let answers = ids
+        .iter()
+        .filter(|&&id| c.reply(id).is_ok_and(|r| r.text() == "released"))
+        .count();
+    assert_eq!(answers, 100);
+    assert!(c.goaway.is_none(), "{:?}", c.goaway);
+
+    // Once our SETTINGS are acknowledged, opening past the limit breaks the
+    // protocol, and many such streams end the connection.
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let mut out = Vec::new();
+    first_flight(&mut c, &mut out);
+    c.try_write(&out);
+    match c.goaway() {
+        Ended::GoAway(code, debug) => {
+            assert_eq!(reason(code), "ENHANCE_YOUR_CALM");
+            assert!(debug.starts_with("GIONG-E1116"), "{debug}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_reset_drops_the_handler_at_once() {
     let server = TestServer::start(Server::new());
     let mut c = server.client();
