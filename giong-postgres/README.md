@@ -4,8 +4,8 @@ A PostgreSQL client and connection pool for the [giong](../README.md) runtime. I
 
 ```toml
 [dependencies]
-giong = "1.3.0"
-giong-postgres = "1.3.0"
+giong = "1.4.1"
+giong-postgres = "1.4.1"
 ```
 
 ```rust,no_run
@@ -112,7 +112,7 @@ Both are tested in CI against PgBouncer in transaction mode.
 | `client.execute(..)` | The number of rows affected. |
 | `client.batch_execute(sql)` | Several statements separated by `;`, through the simple protocol, with no parameters and no results. For migrations and setup. |
 | `client.transaction()` | Starts a transaction and borrows the client mutably until it ends. `tx.commit()` or `tx.rollback()`; dropping the transaction rolls it back. A `COMMIT` that the server turned into a rollback (because of an earlier error) is an error, not a success. |
-| `client.cancel_token()` | A `CancelToken` whose `cancel()` asks the server, over a separate connection, to stop the statement running now. A token taken from a `PooledClient` stops working when the connection goes back to the pool, so it cannot cancel another task's statement. |
+| `client.cancel_token()` | A `CancelToken` whose `cancel()` asks the server, over a separate connection, to stop the statement running now. A token taken from a `PooledClient` stops working when the connection goes back to the pool, and a connection that goes back while such a request is on its way is closed rather than lent again, so it cannot cancel another task's statement. |
 | `client.parameter(name)` | A setting the server reported, such as `server_version` or `TimeZone`. |
 | `client.is_closed()`, `client.in_flight()` | Whether the connection is closed; how many requests are waiting for their answer. |
 | `row.get::<T>(column)` | A column by position or name, converted to `T` (see [Types](#types)). Borrowed types (`&str`, `&[u8]`) borrow from the row. |

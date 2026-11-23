@@ -57,23 +57,24 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.3.0"
+version = "1.4.1"
 dependencies = [
  "io-uring",
  "libc",
  "socket2",
+ "windows-sys",
 ]
 
 [[package]]
 name = "giong-http"
-version = "1.3.0"
+version = "1.4.1"
 dependencies = [
  "giong",
 ]
 
 [[package]]
 name = "giong-web"
-version = "1.3.0"
+version = "1.4.1"
 dependencies = [
  "giong",
  "giong-http",
